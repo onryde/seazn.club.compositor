@@ -223,7 +223,7 @@ Fly sets `FLY_IMAGE_REF`. There is no inbound port.
   Every refusal is a bare 401. A terminal session returns 410 `SESSION_ENDED`. An unknown session
   returns 404.
 - **`POST …/heartbeat`** every `heartbeatIntervalMs`. The existing strict body keeps `state`
-  (`starting|playing|stalled|stopped`, mapped from the programme phase), `fps`, `bitrateKbps`,
+  (`starting|playing|stalled|stopped`; `playing` = output connected, slate or picture, per owner ruling 2026-10-14; the camera's state is in `programmePhase`/`input`), `fps`, `bitrateKbps`,
   `egressBytes`, `measuredLatencyMs`, `droppedFrames`, `encoderSpeed`, `cpuPct` and `memMb`. It adds
   these optional fields: `programmePhase`, `input`, `output`, `graphics`, `inputKicks`,
   `pipelineRebuilds` and `scoreStale`. Anything not measured is omitted, never zero. The reply is

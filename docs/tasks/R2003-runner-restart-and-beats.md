@@ -104,7 +104,14 @@ Pinned 2026-10-14 at main `09290de3c`. **Re-pin every line before editing.**
   6. `exit_78_fails_refused_without_retry`: playing → observed `destroyed` with exit code 78 →
      signal `failed(refused)`, no `create_started`. Positive pair: exit code 1 → the one retry still
      happens.
-  7. `create_body_uses_on_failure_restart`: `runner-fly.test.ts` captures the POST body and asserts
+  7. `slate_on_air_takes_a_composed_session_live` (owner ruling 2026-10-14, plan review F5 option A):
+     - a composed session in `warming`
+     - a beat `{state: "playing", programmePhase: "waiting", input: "connecting"}` through the
+       **real** heartbeat route
+     - assert the session is `live`, exactly one credit is consumed, and a later beat with
+       `programmePhase: "reconnecting"` leaves it `live`, with no second consume
+     - positive pair: `{state: "stalled"}` (output down) never takes it live
+  8. `create_body_uses_on_failure_restart`: `runner-fly.test.ts` captures the POST body and asserts
      `restart` deep-equals `{ policy: "on-failure", max_retries: 2 }`, with `2` taken from
      `RUNNER_INPLACE_RESTARTS`.
 - [ ] **Step 2: Run, expect a FAIL.**
@@ -126,7 +133,7 @@ Pinned 2026-10-14 at main `09290de3c`. **Re-pin every line before editing.**
 
 ## Acceptance
 
-- 7 new tests pass, and existing passthrough tests are unchanged and green.
+- 8 new tests pass, and existing passthrough tests are unchanged and green.
 - 3 mutants went red.
 - The D4 comment is rewritten with its new proof.
 - The PR is open.

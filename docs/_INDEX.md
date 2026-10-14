@@ -30,7 +30,8 @@ The entry point for any session working on this repository. Read this file first
 | 2026-10-14 | Plan: the soak runs on two Fly Machines (the real image on the production guest, plus a harness Machine), so the fakes don't steal the compositor's CPU. | — (plan, C15) |
 | 2026-10-14 | Plan: an image push is not a release. `RELAY_IMAGE` changes only through `promote.yml`, behind a required-reviewer environment. | — (plan, C16) |
 | 2026-10-14 | Plan: the web tasks are numbered R2001–R2006 (owner request; previously W01–W06), so they don't collide with other programmes' W-waves. Compositor tasks keep C00–C17. | — |
-| 2026-10-14 | Plan review (Fable, once): 3 blockers, 6 majors, 11 minors in `reviews/2026-10-14-plan-review-fable.md`. All fixed in the briefs except F5, which went to the owner. A 12th chaos case, `input-impaired`, covers spec §9.3's input impairment. | — |
+| 2026-10-14 | Plan review (Fable, once): 3 blockers, 6 majors, 11 minors in `reviews/2026-10-14-plan-review-fable.md`. All fixed in the briefs; F5 was decided by the owner (option A, next row). A 12th chaos case, `input-impaired`, covers spec §9.3's input impairment. | — |
+| 2026-10-14 | **Owner ruling (F5, option A):** a composed session is `playing` once its output reaches CF, whether it's showing the slate or the picture. That's when it goes `live` and uses its credit. The camera's state travels separately, in `programmePhase`/`input`. | — (spec §5.3, C06, R2003) |
 
 ## False premises found
 

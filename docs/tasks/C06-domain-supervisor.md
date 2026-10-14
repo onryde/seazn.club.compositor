@@ -240,7 +240,9 @@ gets 410 and exits 0. That sequence is tested here.
           let mut s = booted(0).decide(Event::Tick, 0).next;
           assert_eq!(s.health(0).state, BeatState::Starting);
           s = s.decide(Event::OutputConnected { gen: 1 }, 10).next;
-          assert_eq!(s.health(10).state, BeatState::Stalled, "connected but camera not live yet");
+          // F5 option A: the slate is on air, so the session is playing; the camera shows as Waiting
+          assert_eq!(s.health(10).state, BeatState::Playing, "slate on air counts as playing");
+          assert_eq!(s.health(10).programme_phase, ProgrammePhase::Waiting);
           let mut now = 10;
           while now < 10 + th.resume_after_ms + 100 {
               s = s.decide(Event::InputFrame, now).next;
@@ -249,6 +251,17 @@ gets 410 and exits 0. That sequence is tested here.
               now += 33;
           }
           assert_eq!(s.health(now).state, BeatState::Playing);
+          assert_eq!(s.health(now).programme_phase, ProgrammePhase::Live);
+          // camera drops while the output stays up: still playing, phase says so
+          let mut later = now;
+          while later < now + th.slate_after_ms + 100 {
+              s = s.decide(Event::OutputAck { gen: 1 }, later).next;
+              s = s.decide(Event::Tick, later).next;
+              later += 33;
+          }
+          assert_eq!(s.health(later).state, BeatState::Playing, "camera loss is not a stalled broadcast");
+          assert_eq!(s.health(later).programme_phase, ProgrammePhase::Reconnecting);
+          let now = later;
           s = s.decide(Event::OutputError { gen: 1 }, now).next;
           assert_eq!(s.health(now).state, BeatState::Stalled, "output dropped after having connected");
       }
@@ -512,8 +525,10 @@ gets 410 and exits 0. That sequence is tested here.
           let state = match self.lifecycle {
               Lifecycle::Draining { .. } | Lifecycle::Exited(_) => BeatState::Stopped,
               Lifecycle::Booting { .. } => BeatState::Starting,
-              Lifecycle::Running if self.output.is_connected() && self.programme.phase() == ProgrammePhase::Live => BeatState::Playing,
-              Lifecycle::Running if self.output.is_connected() || self.output_ever_connected => BeatState::Stalled,
+              // Owner ruling 2026-10-14 (plan review F5, option A): `playing` = the programme is on air,
+              // slate or picture. The camera's state travels in programme_phase / input, never in `state`.
+              Lifecycle::Running if self.output.is_connected() => BeatState::Playing,
+              Lifecycle::Running if self.output_ever_connected => BeatState::Stalled,   // was on air, output now down
               Lifecycle::Running => BeatState::Starting,
           };
           HealthReport {
