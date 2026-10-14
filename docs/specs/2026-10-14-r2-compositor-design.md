@@ -96,11 +96,26 @@ CF Live Input B (programme) ──CF Outputs──▶ YouTube / own player   sea
 On every programme tick (1/fps), the domain picks a `FrameChoice`:
 
 - `Emit`: the newest decoded camera frame
-- `Repeat`: the last camera frame, for at most 1 s
+- `Repeat`: the last camera frame, for as long as the programme is `Frozen` (from 0.5 s with no
+  frame until the 3 s slate threshold). The PDF's scheduler paragraph says "up to 1 s", but its
+  state machine and timing budget put the slate at 3 s. The state machine wins (owner ruling: the
+  PDF tables are adopted as written).
 - `Slate(kind)`: waiting or reconnecting
 
 The CEF layer is composited on top of whichever one is picked, so the score bug is on screen in every
-state. Audio follows the same choice (live audio, or silence generated on the programme clock).
+state.
+
+**How the isolation is realised (plan refinement).** No failing element may take down an element that
+must not fail. So the "programme pipeline" of §3.1 runs as four GStreamer pipelines inside one process:
+
+- **input**: `srtsrc → decode → appsink`. Rebuilt on loss.
+- **graphics**: `cefsrc → appsink`. Restarted on a CEF crash, with the last overlay frame held.
+- **programme**: `appsrc(camera|slate) + appsrc(overlay) + appsrc(audio) → compositor → x264 → appsink`.
+  Never rebuilt.
+- **output**: `appsrc(encoded) → flvmux → rtmp2sink`. Rebuilt on a sink failure, fed from a bounded
+  2 s encoded ring buffer, and resumed at a forced keyframe.
+
+The per-tick `FrameChoice` replaces the `SetCameraLayer` / `ShowSlate` effects named in §4.3. Audio follows the same choice (live audio, or silence generated on the programme clock).
 
 ### 3.4 What is reused from the POC
 
@@ -258,7 +273,11 @@ arrive in real time. With a delay of 0, the bug would show the point before view
   `seazn.club/apps/web/src/server/relay/config.ts` (the web repo's single authority for relay
   numbers), citing its F-id. The session GET serves it as `overlayDelayMs` when the fixture has no
   override.
-- **Override:** the existing per-fixture `overlay_delay_ms`, edited from the organiser UI (§8 item 7).
+- **Override:** a new **nullable** `fixture_stream_settings.overlay_delay_ms`, edited from the organiser
+  UI (§8 item 7). `null` means "use the default"; `0` is a real override, never read as "unset". At
+  session create, the effective value (override, or else the default) is copied into the existing
+  `fixture_stream_sessions.overlay_delay_ms`. That column exists today but is never written, so every
+  session currently reads 0 (a false premise, corrected 2026-10-14).
 - The capture app's `deliveredLagS` cannot be used for calibration. It is **relative** lag growth
   (`lagMs − minLag` on the HLS manifest, `DeliveryWatch.kt`), not absolute delay, and it is measured
   on a different path.
@@ -284,7 +303,10 @@ Briefs live in this repo's `docs/tasks/`. Code and PRs land in `seazn.club`, in 
 5. **Overlay page.** Accept `st` (scope `relay-page`) in place of the overlay key. Render a transparent
    body when `host=compositor`. Emit a readiness signal the CEF adapter can observe (the mechanism is
    pinned in spike T00.1). Surface `scoreStale` the same way.
-6. **Sweep thresholds** for 5 s beats: `degraded` after 2 missed beats, `lost` after 3.
+6. **Sweep thresholds** for 5 s beats: `lost` after 3 missed beats (15 s). This replaces today's
+   `STALE_HEARTBEAT_SECONDS = 90` for composed sessions. A `degraded` state after 2 missed beats is
+   **not** built in R2: nothing in R2 would read it, so it would be an inert seam. It arrives with
+   R4's console on-air view.
 7. **Organiser UI.** A composed-mode option in `components/v2/fixture-stream-panel.tsx`, behind the
    existing relay entitlement, plus the per-fixture delay override. This carries the full width bar
    (320 / 768 / 1280, seven-width e2e) and new strings in all 4 locales.

@@ -16,7 +16,9 @@ The capture app's `deliveredLagS` cannot calibrate this, for two reasons:
 ## Decision
 
 - **Default delay:** the camera→compositor delay measured in spike T00.2 with a clock in shot.
-- **Override:** the existing per-fixture `overlay_delay_ms`, editable from the organiser UI.
+- **Override:** a new nullable per-fixture `fixture_stream_settings.overlay_delay_ms`, editable from
+  the organiser UI. It is copied onto the session row at create time. See spec §7: the existing
+  session column is never written.
 - **Calibration UX:** moves to R4.
 - **Spike T00.3:** test whether an H.264 SEI wall-clock stamp survives CF Input A to SRT playback.
   - If it survives, an R3 capture change stamps NTP time into keyframes. The compositor then measures
