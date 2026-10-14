@@ -31,8 +31,10 @@ The domain owns stall detection (C04 `check_stall`), so the adapter has **no wat
 One source of truth.
 
 **SRT URI.** Build it as
-`srt://{host:port}?mode=caller&streamid={stream_id}&passphrase={passphrase}&latency={ms}`. Two rules:
+`srt://{host:port}?mode=caller&streamid={stream_id}&passphrase={passphrase}&latency={ms}`. Three rules:
 - URL-encode `streamid` and `passphrase`.
+- **Omit the `passphrase` key entirely when it's empty.** libsrt rejects a present passphrase shorter
+  than 10 characters, and the test listener runs unencrypted.
 - **Never log it.** Only `redact()` output reaches logs or events. GStreamer error messages can echo
   the URI, so run every bus message text through `redact` before logging. This is a memory trap:
   secrets in a URL leak through parse errors.
@@ -69,7 +71,7 @@ edits `domain/src/config.rs`, and is allowed **only** for this field.
   | `input_caps_change_does_not_reach_programme` | feed 640×360, then restart the listener at 1920×1080 and `rebuild(2)`; camera samples are W×H in both phases |
   | `listener_closing_reports_eos_loss_with_the_right_generation` | stop the listener → `InputLost{gen, Eos or Error}`; record which one F-002 says CF produces, and assert that one |
   | `rebuild_tears_down_the_old_pipeline` | `rebuild(1)`, then `rebuild(2)`; no `InputFrame` arrives tagged with an old pipeline (frames carry no gen, so assert that after `rebuild(2)` the old pipeline's appsink callback is detached: a `generation_of_last_frame()` test accessor equals 2) |
-  | `srt_uri_encodes_and_never_appears_in_logs` | `srt_uri` for a passphrase with `&` and `=` is percent-encoded; drive a failing connect to `127.0.0.1:9` and assert the logged and evented error text contains no passphrase |
+  | `srt_uri_encodes_and_never_appears_in_logs` | `srt_uri` for a passphrase with `&` and `=` is percent-encoded; an empty passphrase leaves no `passphrase` key in the URI; drive a failing connect to `127.0.0.1:9` and assert the logged and evented error text contains no passphrase |
   | `audio_reaches_the_ring` | after 1 s connected, `FrameStore::take_audio(6400)` is not all zeros |
 
 - [ ] **Step 2: Run, expect a FAIL.**

@@ -48,9 +48,13 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
   pub trait ControlQueue: Send { fn request(&mut self, req: ControlRequest); }
   #[derive(Debug, Clone, PartialEq)] pub enum Inbound { Event(Event), Session(SessionConfig) }
   pub struct Ports { pub input: Box<dyn InputSource>, pub programme: Box<dyn ProgrammeOutput>, pub graphics: Box<dyn GraphicsRenderer>, pub metrics: Box<dyn Metrics>, pub control: Box<dyn ControlQueue> }
+  // trait objects can't derive Debug, and C01's `missing_debug_implementations` + `clippy -D warnings` makes it fatal
+  impl std::fmt::Debug for Ports {
+      fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("Ports { input, programme, graphics, metrics, control }") }
+  }
 
   // driver.rs
-  pub struct Driver { /* supervisor, ports, session: Option<SessionConfig>, deadline_ms, tick bookkeeping, skipped_ticks */ }
+  #[derive(Debug)] pub struct Driver { /* supervisor, ports, session: Option<SessionConfig>, deadline_ms, tick bookkeeping, skipped_ticks */ }
   impl Driver {
       pub fn new(t: domain::config::Thresholds, ports: Ports, deadline_ms: u64, boot_ms: u64) -> Self;
       pub fn step(&mut self, msg: Inbound, now: u64) -> Option<i32>;   // Some(code) ⇒ exit
@@ -162,7 +166,7 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
           target: TargetSpec { url: "<fixture target.url>".into(), stream_key: "<fixture target.streamKey>".into() },
           output: OutputProfile::P720,
           heartbeat_interval_ms: 5_000, overlay_url: "<fixture overlayUrl>".into(),
-          overlay_delay_ms: 0 /* fixture overlayDelayMs */, max_duration_minutes: 0 /* fixture maxDurationMinutes */,
+          overlay_delay_ms: 0 /* fixture overlayDelayMs */,
       }
   }
   ```

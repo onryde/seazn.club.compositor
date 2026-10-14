@@ -155,7 +155,9 @@ impl Window {
       /// Overruns within `ladder_window_ms` needed to step down one rung.
       pub ladder_overruns_to_step: usize,
       pub ladder_window_ms: Ms,
-      /// R1 contract: on ending/SIGTERM flush and exit within 10 s.
+      /// R1 sends SIGINT and SIGKILLs after RUNNER_STOP_GRACE_SECONDS = 10 (seazn.club relay/config.ts).
+      /// The drain must finish with headroom for EOS to reach the sink and the process to exit: grace − 3 s.
+      /// C12's `drain_timeout_fits_inside_r1_stop_grace` pins it below the grace.
       pub drain_timeout_ms: Ms,
       /// Spec §5.3 default; the bootstrap's `heartbeatIntervalMs` overrides it.
       pub heartbeat_interval_ms: Ms,
@@ -189,7 +191,7 @@ impl Window {
               ladder_step_min_gap_ms: 10_000,
               ladder_overruns_to_step: 3,
               ladder_window_ms: 1_000,
-              drain_timeout_ms: 10_000,
+              drain_timeout_ms: 7_000,
               heartbeat_interval_ms: 5_000,
               bootstrap_backoff_base_ms: 1_000,
               bootstrap_backoff_cap_ms: 10_000,

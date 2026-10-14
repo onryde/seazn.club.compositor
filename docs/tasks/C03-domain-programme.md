@@ -237,7 +237,9 @@ See the spec §3.3 refinement.
           let out = drive(&[(0, 2_000), (8_000, 12_000), (18_000, 22_000)], 22_000);
           let a = first(&out, 8_000, Emit) - 8_000;
           let b = first(&out, 18_000, Emit) - 18_000;
-          assert_eq!(a, b);
+          // `drive` walks one global 33 ms grid, so the two outages start at different grid phases
+          // (8_019 vs 18_018): equal behaviour shows up as a difference under one frame period.
+          assert!((a as i64 - b as i64).abs() < period() as i64, "second outage recovered in {b} ms vs {a} ms");
       }
       #[test]
       fn stalled_tick_thread_skips_frozen_straight_to_slate() {

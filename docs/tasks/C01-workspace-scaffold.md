@@ -56,6 +56,10 @@ No GStreamer dependency yet. That arrives in C09, together with the CI apt step.
   print_stdout = "deny"
   todo = "deny"
   ```
+  One sanctioned exception, so nobody weakens the workspace rule later: `crates/harness` (C13) prints
+  its reports to stdout, so its `lib.rs` and each bin start with
+  `#![allow(clippy::print_stdout)] // harness tools report on stdout by design (C13)`. Every other crate
+  logs to stderr.
 
   `rust-toolchain.toml`:
   ```toml
@@ -304,7 +308,7 @@ No GStreamer dependency yet. That arrives in C09, together with the CI apt step.
      logged.
   8. **Cross-repo.**
      - Contracts are vendored by hand (C07) and never fetched in CI.
-     - `seazn.club` changes are W tasks, made in a `seazn.club` worktree.
+     - `seazn.club` changes are R2 web tasks, made in a `seazn.club` worktree.
   9. **Orchestration.**
      - Main thread orchestrates.
      - Every dispatch carries: files, acceptance, what not to touch, the verify command, and an output

@@ -11,7 +11,7 @@ and **one** smoke case that proves every part reports facts.
 ```
 fake-camera ──SRT publish──▶ mediamtx (fake CF)  ◀──SRT read── compositor ──RTMP──▶ mediamtx path live/dest (fake dest, records fmp4)
                                    ▲  API :9997 kick/close                 │  ▲
-netem sidecar (tc on compositor's netns, filters by dst port)              │  └── GET session / POST heartbeat / overlay page
+netem-out (tc on compositor's netns) · netem-in (tc on mediamtx's netns)              │  └── GET session / POST heartbeat / overlay page
                                                                            └────▶ fake-control
 checker ◀── reads the recorded fmp4 segments + fake-control's heartbeat log + camera's emit log
 ```
@@ -52,7 +52,7 @@ it to turn counters into camera wall time.
   on domain internals) with three bins:
   - `fake-camera`: appsrc draws the strip, plus an audio tone, then `x264enc key-int-max=30 ! mpegtsmux ! srtsink`
     to `srt://mediamtx:8890?streamid=publish:cam`. It also serves an HTTP control on `:7001` with
-    `POST /pause`, `POST /resume`, `POST /burst?ms=3000` (pause while still counting, then emit the
+    `POST /pause` (stop emitting; the counter keeps advancing at 30/s, so the gap is visible in `emit.jsonl`), `POST /resume`, `POST /burst?ms=3000` (pause while still counting, then emit the
     backlog as fast as possible with original PTS), and `POST /size?w=&h=`.
   - `fake-control`: tiny_http on `:7000`:
     - `GET /api/internal/relay/sessions/{sid}`: the vendored `session-composed-720p.json`, with
@@ -87,7 +87,9 @@ case and the soak.
     "freezes": [{"from_ms": 0, "ms": 0, "counter": 0}],
     "slates": [{"from_ms": 0, "ms": 0}],
     "counter_regressions": 0,
-    "latency_ms": {"p50": 0, "p95": 0, "max": 0}
+    "resumes": [{"first_emitted_counter": 0, "first_shown_counter": 0, "suppressed_ms": 0}],
+    "latency_ms": {"p50": 0, "p95": 0, "max": 0},
+    "latency_windows_ms": [{"from_wall_ms": 0, "to_wall_ms": 0, "p50": 0}]
   },
   "overlay": {"score_index_changes": [{"frame_wall_ms": 0, "index": 0, "due_wall_ms": 0}], "late_frames_max": 0, "future_dated": 0},
   "audio": {"av_offset_ms": {"p50": 0, "max_abs": 0}, "silent_gaps": [{"at_ms": 0, "ms": 0}]},
@@ -102,6 +104,13 @@ Field meanings:
   counter. Measured only on frames with a strip.
 - **`counter_regressions`:** a strip frame whose counter is lower than an earlier one. Must be 0 in
   every case, because a burst replay must never show older frames.
+- **`resumes`:** one entry per gap > 1 s in `emit.jsonl`. `first_emitted_counter` is the camera's
+  first counter after the gap, and `first_shown_counter` is the first strip counter in the recording
+  after the slate span that covers the gap. `suppressed_ms` = (shown − emitted) × frame period: how
+  long the programme held the slate after frames returned. That's the hysteresis, measured
+  independently of latency.
+- **`latency_windows_ms`:** `latency_ms.p50` per 10 s wall window. C14's input-impairment case
+  proves the impairment landed with it.
 - **`late_frames_max`:** for each score index change, the frames between `due_wall_ms` and the first
   frame that shows it.
 - **`future_dated`:** frames that show an index whose `due_wall_ms` is after the frame's wall time.
@@ -132,9 +141,17 @@ Field meanings:
   - **compositor service:** the C12 image with `COMPOSITOR_DRIVERS=live`,
     `APP_URL=http://fake-control:7000`, a random `SESSION_ID`/`JOB_TOKEN`, and a deadline from the case
     script. `restart: on-failure:2` emulates Fly. Resource limits: `cpus: 4`, `mem_limit: 8g`.
-  - **netem service:** `network_mode: "service:compositor"`, `cap_add: [NET_ADMIN]`.
-    `netem.sh in|out|clear <args>` adds a prio qdisc with a u32 filter on dport 8890 (in) or 1935
-    (out), with a netem child.
+  - **Two netem sidecars.** `tc` qdiscs act on **egress** only, so each leg is impaired at its
+    sender:
+    - `netem-out`: `network_mode: "service:compositor"`, `cap_add: [NET_ADMIN]`. Filter
+      `u32 match ip dport 1935 0xffff`: the compositor's RTMP media to the destination.
+    - `netem-in`: `network_mode: "service:mediamtx"`, `cap_add: [NET_ADMIN]`. Filter
+      `u32 match ip sport 8890 0xffff match ip dst <compositor ip>`: MediaMTX's SRT media **to the
+      compositor**, never to the camera.
+
+    `netem.sh in|out|clear <args>` runs `tc` in the matching sidecar: a prio qdisc, the filter, and a
+    netem child on the filtered band. A filter on the compositor's `dport 8890` would only delay SRT
+    ACKs, which is why the input leg lives on MediaMTX.
   - **`run-case.sh <case>`:** brings the stack up fresh (`down -v` first), runs `cases/<case>.sh`
     (which drives the controls and sleeps for its duration), brings the stack down, runs the
     checker, and writes `out/<case>/report.json`. It exits with the case's own verdict, which a

@@ -136,8 +136,8 @@ happen" turned into a tested guard.
               let gen = l.generation();
               l.on_lost(now, gen, LossReason::Error, &th); // fails instantly
           }
-          // first loss is from Connecting{attempt:0} ⇒ next attempt 1 ⇒ 2 s; derive expectation from backoff::delay
-          let want: Vec<Ms> = (1..7).map(|a| delay(a, th.input_backoff_base_ms, th.input_backoff_cap_ms)).collect();
+          // failure f (1-based) waits delay(f - 1): the first retry after a never-connected build is 1 s, like a loss from Running
+          let want: Vec<Ms> = (0..6).map(|a| delay(a, th.input_backoff_base_ms, th.input_backoff_cap_ms)).collect();
           let rounded: Vec<Ms> = gaps.iter().map(|g| g / 10 * 10).collect();
           assert_eq!(rounded, want);
       }
@@ -146,7 +146,7 @@ happen" turned into a tested guard.
           let th = t();
           let mut l = running(0);
           l.on_lost(5_000, 1, LossReason::Stalled, &th);
-          assert_eq!(l.state(), InputState::Backoff { attempt: 0, until: 5_000 + th.input_backoff_base_ms });
+          assert_eq!(l.state(), InputState::Backoff { attempt: 1, until: 5_000 + th.input_backoff_base_ms });
       }
       #[test]
       fn connect_that_hangs_times_out_into_backoff() {
@@ -221,7 +221,7 @@ happen" turned into a tested guard.
           l.check_stall(th.input_stall_after_ms - 1, None, &th);
           assert!(matches!(l.state(), InputState::Running { .. }));
           l.check_stall(th.input_stall_after_ms, None, &th);
-          assert!(matches!(l.state(), InputState::Backoff { attempt: 0, .. }));
+          assert!(matches!(l.state(), InputState::Backoff { attempt: 1, .. }));
       }
       #[test]
       fn stall_clock_runs_from_the_later_of_connect_and_last_frame() {
@@ -271,15 +271,16 @@ happen" turned into a tested guard.
   }
   pub fn on_lost(&mut self, now: Ms, gen: u64, reason: LossReason, t: &Thresholds) {
       if gen != self.generation { return; }
-      let attempt = match self.state {
+      // `attempt` counts consecutive failures; failure number f waits delay(f - 1): 1, 2, 4, 8, 10, 10 s.
+      let failed_before = match self.state {
           InputState::Running { .. } => {
               if reason == LossReason::Eos { self.kicks.record(now, t.kick_window_ms); }
               0
           }
-          InputState::Connecting { attempt, .. } => attempt.saturating_add(1),
+          InputState::Connecting { attempt, .. } => attempt,
           InputState::Backoff { .. } => return,
       };
-      self.state = InputState::Backoff { attempt, until: now + delay(attempt, t.input_backoff_base_ms, t.input_backoff_cap_ms) };
+      self.state = InputState::Backoff { attempt: failed_before + 1, until: now + delay(failed_before, t.input_backoff_base_ms, t.input_backoff_cap_ms) };
   }
   pub fn on_tick(&mut self, now: Ms, t: &Thresholds) -> bool {
       match self.state {
@@ -289,8 +290,7 @@ happen" turned into a tested guard.
               true
           }
           InputState::Connecting { attempt, since } if elapsed(now, since) >= t.input_connect_timeout_ms => {
-              let a = attempt.saturating_add(1);
-              self.state = InputState::Backoff { attempt: a, until: now + delay(a, t.input_backoff_base_ms, t.input_backoff_cap_ms) };
+              self.state = InputState::Backoff { attempt: attempt + 1, until: now + delay(attempt, t.input_backoff_base_ms, t.input_backoff_cap_ms) };
               false
           }
           _ => false,
@@ -430,12 +430,13 @@ happen" turned into a tested guard.
   }
   pub fn on_error(&mut self, now: Ms, gen: u64, t: &Thresholds) {
       if gen != self.generation { return; }
-      let attempt = match self.state {
+      // same counting as InputLink: failure number f waits delay(f - 1)
+      let failed_before = match self.state {
           OutputState::Connected { .. } => 0,
-          OutputState::Connecting { attempt, .. } => attempt.saturating_add(1),
+          OutputState::Connecting { attempt, .. } => attempt,
           OutputState::Backoff { .. } => return,
       };
-      self.state = OutputState::Backoff { attempt, until: now + delay(attempt, t.output_backoff_base_ms, t.output_backoff_cap_ms) };
+      self.state = OutputState::Backoff { attempt: failed_before + 1, until: now + delay(failed_before, t.output_backoff_base_ms, t.output_backoff_cap_ms) };
   }
   pub fn on_tick(&mut self, now: Ms, t: &Thresholds) -> bool {
       match self.state {
@@ -445,8 +446,7 @@ happen" turned into a tested guard.
               true
           }
           OutputState::Connecting { attempt, since } if elapsed(now, since) >= t.output_connect_timeout_ms => {
-              let a = attempt.saturating_add(1);
-              self.state = OutputState::Backoff { attempt: a, until: now + delay(a, t.output_backoff_base_ms, t.output_backoff_cap_ms) };
+              self.state = OutputState::Backoff { attempt: attempt + 1, until: now + delay(attempt, t.output_backoff_base_ms, t.output_backoff_cap_ms) };
               false
           }
           OutputState::Connected { last_ack } if elapsed(now, last_ack) >= t.output_ack_stall_ms => {

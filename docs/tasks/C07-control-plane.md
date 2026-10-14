@@ -1,6 +1,6 @@
 # C07: Vendor the contract; ControlPlane port and HTTP adapter
 
-**Repo:** `seazn.club.compositor`. **Depends on:** C06, and **W02 merged** in `seazn.club`. You need
+**Repo:** `seazn.club.compositor`. **Depends on:** C06, and **R2002 merged** in `seazn.club`. You need
 its commit sha.
 
 ## Context
@@ -46,8 +46,10 @@ repo.
   pub struct SessionConfig {
       pub session_id: String, pub fixture_id: String,
       pub input: InputSpec, pub target: TargetSpec, pub output: domain::config::OutputProfile,
-      pub heartbeat_interval_ms: u64, pub overlay_url: String, pub overlay_delay_ms: u64, pub max_duration_minutes: u64,
+      pub heartbeat_interval_ms: u64, pub overlay_url: String, pub overlay_delay_ms: u64,
   }
+  // `maxDurationMinutes` is deliberately NOT decoded: RELAY_DEADLINE_AT (env) is the one deadline authority.
+  // `overlay_delay_ms` has one reader: parse_session refuses a session whose overlayUrl `delay=` disagrees with it.
   #[derive(Debug, Clone, PartialEq, Eq)] pub enum FetchError { Refused(domain::supervisor::Refusal), Transient(String) }
   /// Values measured by adapters (absent ⇒ None ⇒ omitted on the wire).
   #[derive(Debug, Clone, Default, PartialEq)] pub struct Measured { pub fps: Option<f64>, pub bitrate_kbps: Option<u32>, pub egress_bytes: Option<u64>, pub measured_latency_ms: Option<u64>, pub encoder_speed: Option<f64>, pub cpu_pct: Option<f64>, pub mem_mb: Option<u64> }
@@ -82,7 +84,7 @@ repo.
     sed '$ s/,$//' "$tmp/pins"; echo '  }'; echo '}'; } > "$here/contracts/VENDORED.json"
   echo "vendored $(grep -c '": "' "$tmp/pins") files at $sha"
   ```
-  Run it with the W02 merge sha. Confirm the printed count equals the number of files under
+  Run it with the R2002 merge sha. Confirm the printed count equals the number of files under
   `docs/contracts/fixtures/relay-job.v1/` plus 1.
 
 - [ ] **Step 2: Dependencies.**
@@ -109,8 +111,9 @@ repo.
   }
   fn schema_def(def: &str) -> jsonschema::Validator {
       let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root().join("relay-job.v1.json")).unwrap()).unwrap();
-      let mut s = doc.clone();
-      s["$ref"] = serde_json::json!(format!("#/$defs/{def}"));
+      // A fresh wrapper, never a mutated copy of the doc: 2020-12 ANDs sibling keywords beside $ref,
+      // so a root that carried its own schema would leak into every def's validation.
+      let s = serde_json::json!({ "$schema": doc["$schema"], "$defs": doc["$defs"], "$ref": format!("#/$defs/{def}") });
       jsonschema::validator_for(&s).expect("schema compiles")
   }
 
@@ -177,6 +180,14 @@ repo.
   }
 
   #[test]
+  fn overlay_delay_must_agree_with_the_overlay_url() {
+      let mut odd = fixture("session-composed-720p.json");
+      let delay = odd["overlayDelayMs"].as_u64().unwrap();
+      odd["overlayDelayMs"] = serde_json::json!(delay + 1);
+      assert_eq!(parse_session(&odd), Err(FetchError::Refused(Refusal::WrongMode)), "two disagreeing delays: refuse, never pick one");
+  }
+
+  #[test]
   fn output_must_be_a_declared_profile() {
       use domain::config::OutputProfile;
       assert_eq!(parse_session(&fixture("session-composed-720p.json")).unwrap().output, OutputProfile::P720);
@@ -217,7 +228,8 @@ repo.
   - `parse_session(&Value) -> Result<SessionConfig, FetchError>` is pub. It reads the camelCase keys.
     It returns `WrongMode` if `mode != "composed"`, if any of `input`, `output`, `overlayUrl` or
     `heartbeatIntervalMs` is absent, or if `output` is not exactly `OutputProfile::P720` or `P1080`
-    (web's `relayOutputProfile`, W04, is pinned to the same fixtures).
+    (web's `relayOutputProfile`, R2004, is pinned to the same fixtures), or if the `delay=` query value
+    in `overlayUrl` differs from `overlayDelayMs`.
   - `heartbeat_wire(&HealthReport, &Measured) -> Value` builds a `serde_json::Map`:
     - `state`: `starting|playing|stalled|stopped`
     - `programmePhase`: lower-case

@@ -1,8 +1,8 @@
-# W03: Runner restarts in place (`on-failure`, ≤2), same-attempt accounting, 15 s stale for composed
+# R2003: Runner restarts in place (`on-failure`, ≤2), same-attempt accounting, 15 s stale for composed
 
 **Repo:** `onryde/seazn.club`. Worktree:
 `git worktree add ../seazn.club-wt/w03-runner-restart -b feat/relay-runner-restart origin/main`.
-**Depends on:** W02 merged. **Runs sequentially** with W04 and W05, because all three touch
+**Depends on:** R2002 merged. **Runs sequentially** with R2004 and R2005, because all three touch
 `apps/web/src/server/relay/*`.
 
 ## Context
@@ -46,8 +46,8 @@ Pinned 2026-10-14 at main `09290de3c`. **Re-pin every line before editing.**
    - Re-pin Fly's Machines API field name (`max_retries`) against the Fly docs and record it.
 2. **`config.ts`:** `STALE_HEARTBEAT_SECONDS_COMPOSED = 15`. Doc line: compositor spec §8 item 6, "3
    missed beats at the 5 s cadence of `heartbeatIntervalMs`". It must equal
-   `3 × RELAY_HEARTBEAT_INTERVAL_MS / 1000`, so **define it as that product**, using W02's
-   `RELAY_HEARTBEAT_INTERVAL_MS` (re-pin its name; it's the value W02 serves as
+   `3 × RELAY_HEARTBEAT_INTERVAL_MS / 1000`, so **define it as that product**, using R2002's
+   `RELAY_HEARTBEAT_INTERVAL_MS` (re-pin its name; it's the value R2002 serves as
    `heartbeatIntervalMs`). Then the beat cadence and the stale rule can't drift apart.
 3. **`domain/expiry.ts`:** the stale-beat rule picks the composed threshold when `s.mode === "composed"`.
    Passthrough keeps 90 s. Today's passthrough tests must stay green **unchanged**: that's the
@@ -133,7 +133,7 @@ Pinned 2026-10-14 at main `09290de3c`. **Re-pin every line before editing.**
 
 ## Do not touch
 
-Provisioning (W04), the overlay page (W05), and the UI (W06), except the locale strings this task
+Provisioning (R2004), the overlay page (R2005), and the UI (R2006), except the locale strings this task
 owes.
 
 ## Output cap

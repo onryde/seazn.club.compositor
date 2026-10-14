@@ -1,8 +1,8 @@
-# W04: Composed provisioning (CF Input B), composed session facts, and the delay override column
+# R2004: Composed provisioning (CF Input B), composed session facts, and the delay override column
 
 **Repo:** `onryde/seazn.club`. Worktree:
 `git worktree add ../seazn.club-wt/w04-input-b -b feat/relay-composed-input-b origin/main`.
-**Depends on:** W03 merged (runs sequentially in `server/relay/*`), and **C00 F-002** (the measured
+**Depends on:** R2003 merged (runs sequentially in `server/relay/*`), and **C00 F-002** (the measured
 camera→compositor delay, which becomes the default).
 
 ## Context
@@ -68,14 +68,17 @@ The orchestrator puts these to the owner if any re-pin contradicts them:
      (`settings.overlay_delay_ms ?? RELAY_OVERLAY_DELAY_DEFAULT_MS`) into
      `fixture_stream_sessions.overlay_delay_ms`. A running session therefore never changes when the
      default or the setting changes.
-   - Re-pin the session column's nullability. If it's nullable, keep it nullable for passthrough
-     (null), and write it for composed.
+   - `fixture_stream_sessions.overlay_delay_ms` is `integer not null default 0`
+     (`db/migration/deltas/V410__stream_sessions.sql:120`, pinned by the plan review; re-pin). So
+     passthrough keeps writing 0, the column default (the field is unused in that mode), and composed
+     writes the effective value. No ALTER to that column.
+
 5. **`overlayUrl`** =
    `${APP_URL}/overlay/fixtures/${fixtureId}?sid=${sessionId}&st=${pageToken}&host=compositor&delay=${overlayDelayMs}`.
    `sid` is there because `verifyRelayToken` (`server/relay/tokens.ts:80`) needs the expected sid; the
    page must never trust an unverified claim to find it. The token is in a query string, and
    compositor `redact()` strips every query string from logs (C07).
-6. **`heartbeatIntervalMs`** = `RELAY_HEARTBEAT_INTERVAL_MS` (W02).
+6. **`heartbeatIntervalMs`** = `RELAY_HEARTBEAT_INTERVAL_MS` (R2002).
 
 ## Changes
 
@@ -136,7 +139,7 @@ The orchestrator puts these to the owner if any re-pin contradicts them:
      with a job token. `RelayJobSession.parse(body)` succeeds, `input.streamId` equals A's playback
      stream id, `target.streamKey` equals B's key, and the destination's own key appears **nowhere**
      in the body (scan it).
-  4. `effective_delay_is_copied_at_create`:
+  4. `effective_delay_is_copied_at_create` (plus: a passthrough create leaves the session column at 0):
      - settings null: the session gets `RELAY_OVERLAY_DELAY_DEFAULT_MS`
      - settings 0: the session gets 0, and the body says `overlayDelayMs: 0`
      - settings 2500, then changed to 4000 after create: the running session still serves 2500
@@ -155,7 +158,7 @@ The orchestrator puts these to the owner if any re-pin contradicts them:
   2. Write the setting rather than the effective value. Expected red: test 4.
   3. Return the destination secret as `target`. Expected red: test 3.
 - [ ] **Step 7: Smoke and e2e.** Run the relay smoke spec (selected by behaviour) against a prod
-  build with `RELAY_DRIVERS=fake` for passthrough **and** composed (W01's refusal is lifted only
+  build with `RELAY_DRIVERS=fake` for passthrough **and** composed (R2001's refusal is lifted only
   where `RELAY_IMAGE` is set, so set a dummy for this run).
 - [ ] **Step 8: Scoped gate.** Run every touched test file, lint (`rtk proxy`), and the typecheck.
   Then open the PR: `feat(relay): composed sessions publish to their own Cloudflare input`. The PR
@@ -171,7 +174,7 @@ The orchestrator puts these to the owner if any re-pin contradicts them:
 
 ## Do not touch
 
-The overlay page (W05), the UI (W06), and the runner (W03).
+The overlay page (R2005), the UI (R2006), and the runner (R2003).
 
 ## Output cap
 

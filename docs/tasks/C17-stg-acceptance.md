@@ -1,6 +1,6 @@
 # C17: Stg end-to-end acceptance (owner-watched) and the runbook
 
-**Repos:** both. **Depends on:** everything (C14 3× green, C15 green, C16 stg promoted, W01–W06
+**Repos:** both. **Depends on:** everything (C14 3× green, C15 green, C16 stg promoted, R2001–R2006
 merged and deployed to stg).
 
 ## Context
@@ -46,7 +46,7 @@ the viewer sees**, **what to check**, and **what to do**.
 | Machine exit 70 | fatal: programme start failed |
 
 Also include:
-- the **post-match health review**: run `seazn.club` `docs/runbooks/relay-health-review.sql` (W02)
+- the **post-match health review**: run `seazn.club` `docs/runbooks/relay-health-review.sql` (R2002)
   against the session id
 - the **rollback**: `promote.yml` with the previous ref (C16)
 - **manual stop**: end the session in the organiser UI. **Never** `flyctl machine destroy` a live
@@ -55,7 +55,7 @@ Also include:
 ## Steps
 
 - [ ] **Step 1: Preflight** (orchestrator, no owner needed):
-  1. Stg web is on a commit containing W01–W06.
+  1. Stg web is on a commit containing R2001–R2006.
   2. `RELAY_IMAGE` on `seazn-club-stg` equals the C16 promoted ref.
   3. The stg fixture has a YouTube destination with a **private/unlisted** broadcast.
   4. The capture app build is the one in `seazn.club.capture` main.

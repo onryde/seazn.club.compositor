@@ -38,7 +38,7 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
 
 ## Files
 
-- Create: `crates/adapters/src/{frame_store.rs,gst_programme.rs,gst_output.rs,slate.rs}`
+- Create: `crates/adapters/src/{frame_store.rs,gst_programme.rs,gst_output.rs,slate.rs,stats.rs}`
 - Modify: `crates/adapters/Cargo.toml`, adding:
   - `gstreamer = { version = "0.24", features = ["v1_24"] }`
   - `gstreamer-app = { version = "0.24", features = ["v1_24"] }`
@@ -68,9 +68,23 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
   }
   // gst_programme.rs
   pub struct GstProgramme { /* … */ }
-  impl GstProgramme { pub fn new(frames: FrameStore, tx: crossbeam_channel::Sender<app::ports::Inbound>) -> Self; pub fn builds(&self) -> u32; pub fn overlay_pushes(&self) -> u64; }
+  impl GstProgramme { pub fn new(frames: FrameStore, tx: crossbeam_channel::Sender<app::ports::Inbound>) -> Self; pub fn builds(&self) -> u32; pub fn overlay_pushes(&self) -> u64; pub fn stats(&self) -> std::sync::Arc<Stats>; }
   impl app::ports::ProgrammeOutput for GstProgramme { … }
+  // stats.rs — the heartbeat's media numbers (C12 wires them; R1's panel health chips and C14/C15 read them)
+  #[derive(Debug, Default)] pub struct Stats { /* atomics + a Mutex'd 1 s window; adapters may read Instant */ }
+  #[derive(Debug, Clone, Copy, PartialEq, Default)]
+  pub struct StatsSnapshot { pub fps: Option<f64>, pub bitrate_kbps: Option<u32>, pub egress_bytes: Option<u64>, pub encoder_speed: Option<f64> }
+  impl Stats { pub fn snapshot(&self) -> StatsSnapshot; }
   ```
+
+  **Field definitions.** Each is a measurement, and `None` means "not measured yet", never 0:
+
+  | Field | Definition | `None` until |
+  |---|---|---|
+  | `fps` | frames `push()`ed into the programme in the last complete 1 s window | 1 s of pushes |
+  | `bitrate_kbps` | acked output bytes in the last complete 1 s window × 8 / 1000 (rtmp2sink `stats` poll, or the file size for `file://` targets) | the first ack poll on the current sink |
+  | `egress_bytes` | acked output bytes, cumulative across every sink generation | the first ack |
+  | `encoder_speed` | encoded video PTS advance in the last complete 1 s window ÷ wall time of that window (1.0 = real time; below 1 = the encoder is falling behind or starved) | 1 s of encoder output |
 
 ## Steps
 
@@ -116,6 +130,12 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
   #[test] fn errors_and_logs_never_contain_the_stream_key() { /* target rtmp://127.0.0.1:9/live/SECRETKEY; capture the error text from the event path /
        the adapter's log sink; assert !contains("SECRETKEY") */ }
   #[test] fn file_target_reports_connected_then_acks() { /* first buffer ⇒ OutputConnected{gen}; subsequent ⇒ OutputAck{gen} */ }
+  #[test] fn stats_are_absent_before_anything_is_measured() { /* fresh GstProgramme: snapshot() == StatsSnapshot::default() (all None) */ }
+  #[test] fn stats_fps_counts_pushes_per_second() { /* push Slate ticks at real 33 ms pace for 2.2 s; fps within 30 ± 1 (expected from OutputProfile::P720.fps) */ }
+  #[test] fn stats_egress_and_bitrate_follow_acked_bytes() { /* file target, 3 s real-pace pushes, drain; egress_bytes == final file size;
+       bitrate_kbps within ±50 % of OutputProfile::P720.video_kbps (CBR filler keeps it near the target) */ }
+  #[test] fn stats_encoder_speed_tracks_real_time_and_drops_when_starved() { /* 2 s real pace ⇒ speed in 0.9..=1.1; stop pushing 1.5 s ⇒ speed < 0.5;
+       resume 2 s ⇒ back in 0.9..=1.1. This is C14 case 6's witness that the field can move. */ }
   #[test] fn audio_ring_is_bounded_at_400ms_and_pads_silence() { /* unit on FrameStore: push 1 s of audio; take 1 s; first 600 ms worth is silence (zeros) */ }
   ```
   Write each body in full. The comments state exactly what to assert.
@@ -165,11 +185,19 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
   3. Send `gst_video::UpstreamForceKeyUnitEvent` to the programme's `h264parse` src pad.
   4. The feeder thread skips ring entries until the first video keyframe, rebases PTS, and pushes.
   5. A bus watch sends `OutputError{gen}`, which carries the message text after `redact`. A 1 s timer
-     reads rtmp2sink `stats` (field name pinned in step 1) and sends `OutputConnected{gen}` on the
-     first acked bytes, then `OutputAck{gen}` whenever the count increases.
+     reads the acked byte count and sends `OutputConnected{gen}` on the first acked bytes, then
+     `OutputAck{gen}` whenever the count increases. The count is rtmp2sink `stats` (field name
+     pinned in step 1) for `rtmp(s)://` targets, and the file's size on disk for `file://` targets,
+     which is what `file_target_reports_connected_then_acks` exercises. The same poll feeds `Stats`.
 
-  `drain()`: EOS on the programme appsrcs. When the encoders flush through the ring, the output's EOS
-  reaches the sink, and the bus EOS sends `OutputDrained`.
+  `drain()`:
+  1. Send EOS on the programme appsrcs. The encoders flush into the ring.
+  2. The **feeder thread**, on seeing the programme's EOS on its appsinks and the ring empty, calls
+     `end_of_stream()` on **both output appsrcs**. The two pipelines are joined only by the ring, so
+     without this step no EOS reaches the sink.
+  3. The output bus's `Eos` message sends `OutputDrained`.
+
+  `ninety_slate_ticks…` and the C12 fake-run both depend on this path.
 
 - [ ] **Step 8: Run, expect a PASS.** `cargo test -p adapters --test programme_output -- --test-threads=1 --nocapture`.
   The tests share GStreamer init, so run them single-threaded.
@@ -179,17 +207,20 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
      (`builds() == 1`).
   2. Remove the keyframe skip. Expected red: `first_is_key`.
   3. Drop `redact` from the error path. Expected red: `errors_and_logs_never_contain_the_stream_key`.
+  4. Remove the feeder's `end_of_stream()` on the output appsrcs. Expected red: `ninety_slate_ticks…` (it never sees `OutputDrained`).
+  5. Report `fps: Some(0.0)` before the first window. Expected red: `stats_are_absent_before_anything_is_measured`.
 
 - [ ] **Step 10: CI.** The `check.yml` apt step is added, and the job is green on the PR.
   **Commit:** `feat(media): programme pipeline on its own clock and a swappable output (C09)`
 
 ## Acceptance
 
-- All 10 tests pass, single-threaded.
+- All 14 tests pass, single-threaded.
+- Every `Stats` field has a test that drives it, and starts as `None`.
 - `builds() == 1` holds across swaps.
 - The output starts on a keyframe, with PTS rebased.
 - The stream key is never in errors.
-- 3 mutants went red.
+- 5 mutants went red.
 - `check.yml` is green with GStreamer installed.
 
 ## Do not touch

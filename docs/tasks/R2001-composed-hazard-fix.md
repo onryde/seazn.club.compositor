@@ -1,4 +1,4 @@
-# W01: Refuse composed mode until the compositor image exists, and repoint the docs
+# R2001: Refuse composed mode until the compositor image exists, and repoint the docs
 
 **Repo:** `onryde/seazn.club`. Work in a worktree:
 ```bash
@@ -18,8 +18,8 @@ hypothesis, not a source of truth.
 - `apps/web/src/server/usecases/stream-sessions.ts:1219` `createSession` → `:1255`
   `startBroadcast(actor, fixtureId, opts, deps)` passes `body.mode` straight through at `:1235`.
 - `admit()` (`apps/web/src/server/relay/domain/session.ts:94`) checks 9 refusals in this order:
-  1. `plan_lacks_overlay`
-  2. `overlay_required`
+  1. `overlay_required`
+  2. `plan_lacks_overlay`
   3. `plan_lacks_relay`
   4. `active_session`
   5. `phone_not_paired`
@@ -28,7 +28,8 @@ hypothesis, not a source of truth.
   8. `target_not_found`
   9. `storage_exhausted`
 
-  None of them looks at the mode.
+  None of them looks at the mode. (Order corrected by the plan review; re-pin it anyway. The table
+  test below builds an input with **all** other refusals true, so it doesn't depend on the order.)
 - The composed branch (`stream-sessions.ts:1493`/`:1515` `provisionSession`) applies runner
   `create_started`. Only then does `FlyRunner`'s constructor (`server/relay/runner-fly.ts:199-215`)
   throw on missing `RELAY_IMAGE`. `drivers.ts:90-112` `lazyRunner()` wraps that throw in
@@ -57,7 +58,9 @@ hypothesis, not a source of truth.
 
 - A new refusal `composed_unavailable` is checked **first** in `admit()`, when `mode === "composed"`
   and the composed runner is unavailable. Unavailable means `relayUnavailable()` is true, or
-  `RELAY_IMAGE` is unset. Read both facts in the usecase. `admit()` stays pure and receives a boolean.
+  `RELAY_IMAGE` is unset. Put that in **one** exported predicate, `composedUnavailable()`, beside
+  `relayUnavailable()` in `server/relay/drivers.ts`. The usecase reads it, and R2006 (the organiser UI)
+  imports it for `relayOffer`. `admit()` stays pure and receives a boolean.
 - It maps to **HTTP 503** with body code `composed_unavailable`.
 - **No write happens before it.** There's no session row, no `createLiveInput`, and no runner call.
 - Passthrough is unchanged. The phone path (`capture-phone.ts:709`) and auto path
@@ -122,7 +125,7 @@ hypothesis, not a source of truth.
 
 ## Do not touch
 
-`runner-fly.ts` (that's W03), the panel UI (W06), and the composed provisioning flow (W04).
+`runner-fly.ts` (that's R2003), the panel UI (R2006), and the composed provisioning flow (R2004).
 
 ## Output cap
 

@@ -49,7 +49,7 @@ records whether it works). CEF children get `1000` (C11).
 |---|---|
 | `cpu_pct` | `/proc/self/stat` + children (`utime+stime` delta ÷ wall delta ÷ ncpu × 100), summed over the process tree |
 | `mem_mb` | sum of `VmRSS` over the tree |
-| `fps`, `bitrate_kbps`, `egress_bytes`, `encoder_speed` | read from `GstProgramme`'s counters through a shared `Arc<Stats>` (C09 exposes the counters it already keeps; add a `stats()` accessor there only) |
+| `fps`, `bitrate_kbps`, `egress_bytes`, `encoder_speed` | `adapters::stats::Stats::snapshot()`, shared as `Arc<Stats>`. C09 defines and tests every field's arithmetic; C12 only wires the `Arc` into `ProcMetrics`. A field C09 reports as `None` stays absent on the wire. |
 | `measured_latency_ms` | **None** in R2 (needs SEI; F-003). Omitted, never 0. |
 
 The first sample after start returns `cpu_pct: None`, because there's no delta yet.
@@ -61,7 +61,6 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
   `start()` and `sink swap gen=<n> target=<redacted>` on `swap_sink`, then delegates. It wraps both the
   live and the fake programme, so the log lines tests rely on exist in both driver modes.
 - Create: `crates/adapters/src/metrics_proc.rs`
-- Modify: `crates/adapters/src/gst_programme.rs` (add `stats()` only)
 - Create: `docker/Dockerfile`, `docker/entrypoint.sh`, `.dockerignore`
 - Create: `.github/workflows/image.yml`
 - Test: `crates/compositor/tests/env.rs`, `crates/adapters/tests/metrics_proc.rs`,
@@ -83,9 +82,11 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
 ## Steps
 
 - [ ] **Step 1: Write the failing env tests** (`crates/compositor/tests/env.rs`):
-  - `parses_r1_iso_deadline_with_millis`: `2026-10-14T18:30:00.000Z` gives the right epoch ms.
-    Compute the expected value from the literal date arithmetic in the test (1_791_909_000_000);
-    don't call the parser to get it.
+  - `parses_r1_iso_deadline_with_millis`: `2026-10-14T18:30:00.000Z` gives `1_792_002_600_000`.
+    Write the arithmetic in the test, never the parser's output: 2026-10-14 is day 20_740 since
+    1970-01-01, so `20_740 × 86_400_000 + 18 × 3_600_000 + 30 × 60_000`. A second case,
+    `2026-10-14T18:30:00.250Z`, must give `1_792_002_600_250`, which catches a parser that drops the
+    fraction.
   - `missing_each_required_key_is_refused_naming_the_key`: a table over the 4 keys. Each error
     string contains the key and does **not** contain the other values (use a token value of
     `SECRET-TOKEN-VALUE`, and assert it's absent).
@@ -103,14 +104,24 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
   These need Linux. Gate them with `#[cfg(target_os = "linux")]` and print `skipped: not linux`
   elsewhere. CI runs Linux, so the gate is not vacuous there; `check.yml` greps for the passed count.
 
-- [ ] **Step 3: Write the failing fake-run test** (`crates/compositor/tests/fake_run.rs`). Spawn the
+- [ ] **Step 3: Write the failing fake-run test** (`crates/compositor/tests/fake_run.rs`).
+
+  **Fake mode drains for real.** `wiring.rs` wraps testkit's `FakeProgramme` in
+  `DrainingFake { inner, tx }` (in `crates/compositor/src/wiring.rs`). Its `drain()` delegates, then
+  sends `Inbound::Event(Event::OutputDrained)` on `tx`. Without it, the supervisor would leave fake
+  mode only via `drain_timeout_ms`, and this test would be judging the timeout, not the drain path.
+
+  Spawn the
   built binary (`env!("CARGO_BIN_EXE_compositor")`) with these settings:
   - `COMPOSITOR_DRIVERS=fake`
   - a deadline 3 s in the future
   - a dummy token and URLs
 
   Assert all of:
-  - exit code 0, no earlier than 2.5 s and within 6 s (the deadline, not an early refusal)
+  - exit code 0, no earlier than 2.5 s, and **sooner than** `3 s + Thresholds::default().drain_timeout_ms`
+    (both from constants, never a flat number: AGENTS.md class 20). An exit through the drain
+    timeout lands at the bound or later and goes red. That's the point of the bound: it proves
+    `OutputDrained` ended the run.
   - stderr contains `programme started` and `exit code=0`
   - stderr never contains the token
   - a second run with a deadline 1 h in the past exits 0 within 1 s and logs **no**

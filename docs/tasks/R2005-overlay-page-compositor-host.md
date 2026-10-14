@@ -1,8 +1,8 @@
-# W05: Overlay page for the compositor (`sid`+`st` access, `host=compositor` signals, stale, clamp)
+# R2005: Overlay page for the compositor (`sid`+`st` access, `host=compositor` signals, stale, clamp)
 
 **Repo:** `onryde/seazn.club`. Worktree:
 `git worktree add ../seazn.club-wt/w05-overlay-host -b feat/overlay-compositor-host origin/main`.
-**Depends on:** W04 merged (sequential with W03/W04), and **C00 F-001** (the readiness mechanism the
+**Depends on:** R2004 merged (sequential with R2003/R2004), and **C00 F-001** (the readiness mechanism the
 CEF adapter observes). **Use the `frontend-design` skill** (house rule for every UI task), even
 though the page is transparent: the compositor output is what viewers see.
 
@@ -26,7 +26,7 @@ Also relevant:
 - **Re-pin the page's poll interval and realtime path** before step 1. The `lib/overlay-delay.ts`
   comment says `POLL_MS` 15 s.
 - `verifyRelayToken(token, { sid, scope })` (`server/relay/tokens.ts:80`) has an expected sid and is
-  **unconsumed** for `relay-page` today. W04 builds
+  **unconsumed** for `relay-page` today. R2004 builds
   `overlayUrl = …?sid=<sid>&st=<token>&host=compositor&delay=<ms>`.
 
 A composed session can stream a fixture that is **not public**: unlisted, or a private competition.
@@ -140,7 +140,7 @@ score bug. That's an inert seam the owner would only see live.
 
 ## Do not touch
 
-The organiser UI (W06), and the relay usecases (W04).
+The organiser UI (R2006), and the relay usecases (R2004).
 
 ## Output cap
 

@@ -148,7 +148,7 @@ Secrets go in Fly secrets or local env only, never in the repo, argv or logs.
   **Method:** …  **Raw:** second reader → first closed after … ; p50 gap … ms, p99 … ms, max … ms;
   camera→compositor delay median … ms (n=10, spread …)
   **Verdict:** PASS
-  **Changes:** `Thresholds::default().input_*` unchanged; web `relay/config.ts` default overlay delay = … ms (W02)
+  **Changes:** `Thresholds::default().input_*` unchanged; web `relay/config.ts` default overlay delay = … ms (R2002)
   ```
   ```bash
   git switch main && git add _FINDINGS.md && git commit -m "docs(findings): T00 spike gate F-001..F-005"

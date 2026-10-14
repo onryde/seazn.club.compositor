@@ -1,8 +1,8 @@
-# W06: Organiser UI (composed-mode option and score-delay override)
+# R2006: Organiser UI (composed-mode option and score-delay override)
 
 **Repo:** `onryde/seazn.club`. Worktree:
 `git worktree add ../seazn.club-wt/w06-composed-ui -b feat/stream-panel-composed origin/main`.
-**Depends on:** W04 and W05 merged. **Use the `frontend-design` skill.** It's a house rule for
+**Depends on:** R2004 and R2005 merged. **Use the `frontend-design` skill.** It's a house rule for
 every UI task; put the invocation in the dispatch.
 
 ## Context
@@ -11,12 +11,16 @@ Pinned 2026-10-14 at `09290de3c`. **Re-pin everything.**
 
 - `components/v2/fixture-stream-panel.tsx:1140` starts a session with a **hardcoded**
   `mode: "passthrough"` (testid `stream-go-live`).
-- `relayOffer` lives in `components/v2/stream-panel-context.ts:37`. Re-pin what it carries:
-  entitlement, availability, and whether W01's `composed_unavailable` refusal is surfaced.
-- W01: the API refuses composed with `composed_unavailable` (HTTP 503) while the image is
+- `relayOffer` lives in `apps/web/src/server/stream-panel-context.ts:37` (server, not a component). It
+  returns `{ entitled, relayEntitled, relayDisabled }`, where
+  `relayDisabled = relayEntitled && relayUnavailable()` (`server/relay/drivers.ts:135`). This task adds
+  `composedAvailable: relayEntitled && !composedUnavailable()` to that return. `composedUnavailable()`
+  is R2001's predicate in `server/relay/drivers.ts`, the same one its usecase refusal reads. Import it;
+  never restate it.
+- R2001: the API refuses composed with `composed_unavailable` (HTTP 503) while the image is
   unconfigured. **The UI must not offer an option the API will refuse.** It reads availability from
   the same authority, never a second copy of the rule (memory: one authority per fact).
-- W04: `fixture_stream_settings.overlay_delay_ms` is nullable. `null` means default
+- R2004: `fixture_stream_settings.overlay_delay_ms` is nullable. `null` means default
   (`RELAY_OVERLAY_DELAY_DEFAULT_MS`), and `0` is a real override. Re-pin the settings write route
   (the settings PUT/PATCH and its zod schema). Extend it with
   `overlayDelayMs: z.number().int().min(0).max(30000).nullable().optional()`, where absent means
@@ -59,7 +63,7 @@ existing tone.
 
 ## Files
 
-- Modify: `components/v2/fixture-stream-panel.tsx`, `components/v2/stream-panel-context.ts`
+- Modify: `components/v2/fixture-stream-panel.tsx`, `server/stream-panel-context.ts`
 - Modify: the settings route and its schema (re-pin), plus the generated OpenAPI artifacts
 - Modify: `apps/web/dictionaries/{en,es,fr,nl}/ui.json`, plus the regenerated keys file
 - Test: the panel's unit tests (re-pin), the settings route test, and the e2e spec. Re-pin the
@@ -115,7 +119,7 @@ existing tone.
 
 ## Do not touch
 
-The overlay page (W05), relay usecases (W04), and `/admin`.
+The overlay page (R2005), relay usecases (R2004), and `/admin`.
 
 ## Output cap
 

@@ -79,13 +79,13 @@ These apply to every task. Values are copied from the spec and ADRs.
   - Test the sequence: a second call, empty input, after an interruption, and the other mode.
 - **Secrets** never appear in logs. Redact everything after `/live/` and every query string. No
   secret is ever passed as argv or formatted into an error.
-- **Scoped verification only.** Run the tests that cover the changed files. For W tasks this means
+- **Scoped verification only.** Run the tests that cover the changed files. For R2 web tasks (R2001–R2006) this means
   never the full vitest or e2e suite locally (house rule). Judge vitest green from
   `--reporter=json` (`numPassedTests`/`numTotalTests`), not from the `rtk` summary.
 - **Commits:** Conventional Commits, ending with
   `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. PR bodies end with
   `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
-- **UI (W06 only):** screenshots at 320, 768 and 1280 with no horizontal scroll; e2e at all seven
+- **UI (R2006 only):** screenshots at 320, 768 and 1280 with no horizontal scroll; e2e at all seven
   widths; every string in all 4 locales; the `frontend-design` skill is used.
 
 ## Review Focus
@@ -109,7 +109,7 @@ line names the input and the expected behaviour, and points to the task that own
    `RELAY_DEADLINE_AT`). Exit `0` within one tick; never start the pipelines. Owner: **C06**, test
    `deadline_in_past_at_bootstrap_exits_clean`.
 5. **Fly restarting the Machine in place after a crash, seen from web.** The sweep keeps the same
-   attempt number `r<n>` and does not create `r<n+1>` while beats resume. Owner: **W03**, test
+   attempt number `r<n>` and does not create `r<n+1>` while beats resume. Owner: **R2003**, test
    `in_place_restart_keeps_attempt`.
 
 ---
@@ -160,7 +160,7 @@ contracts/                         vendored relay-job.v1 + VENDORED.json        
 docker/Dockerfile, entrypoint.sh   build + runtime (GStreamer, gstcefsrc, CEF, xvfb, tini) (C12)
 docker/GSTCEF_COMMIT               the one pin both image.yml and deploy-*.yml read (C12/C16)
 harness/                           compose + fakes + checker                      (C13)
-harness/cases/                     smoke (C13) + 11 chaos cases .sh/.jq (C14)
+harness/cases/                     smoke (C13) + 12 chaos cases .sh/.jq (C14)
 harness/thresholds.json            generated from Thresholds + budgets; drift-gated (C14)
 harness/soak/                      split-Machine soak, verdict.jq + fixtures      (C15)
 docs/runbooks/relay-compositor.md  one entry per heartbeat signal                 (C17)
@@ -173,7 +173,7 @@ fly/stg.toml, fly/prod.toml        (C16)
 
 | ID | Task | Repo | Depends on | Brief |
 |---|---|---|---|---|
-| W01 | Composed-mode hazard fix + docs pointer | seazn.club | — | `tasks/W01-composed-hazard-fix.md` |
+| R2001 | Composed-mode hazard fix + docs pointer | seazn.club | — | `tasks/R2001-composed-hazard-fix.md` |
 | C00 | **Spike gate** (throwaway; HALTS the plan on a fail of item 1 or 2) | compositor | — | `tasks/C00-spike-gate.md` |
 | C01 | Workspace scaffold, rulebook, CI check, guard tests | compositor | — | `tasks/C01-workspace-scaffold.md` |
 | C02 | Domain foundations: time, config, backoff, window | compositor | C01 | `tasks/C02-domain-foundations.md` |
@@ -181,8 +181,8 @@ fly/stg.toml, fly/prod.toml        (C16)
 | C04 | Domain: InputLink + OutputLink | compositor | C02 | `tasks/C04-domain-links.md` |
 | C05 | Domain: Graphics + DegradeLadder | compositor | C02 | `tasks/C05-domain-graphics-ladder.md` |
 | C06 | Domain: Lifecycle, HealthReport, Supervisor, properties | compositor | C03, C04, C05 | `tasks/C06-domain-supervisor.md` |
-| W02 | relay-job.v1 contract + schema extension | seazn.club | W01 | `tasks/W02-relay-job-contract.md` |
-| C07 | Vendor contract, ControlPlane port + HTTP adapter | compositor | C06, W02 merged | `tasks/C07-control-plane.md` |
+| R2002 | relay-job.v1 contract + schema extension | seazn.club | R2001 | `tasks/R2002-relay-job-contract.md` |
+| C07 | Vendor contract, ControlPlane port + HTTP adapter | compositor | C06, R2002 merged | `tasks/C07-control-plane.md` |
 | C08 | Ports, testkit fakes, event loop, scenario tests | compositor | C07 | `tasks/C08-app-event-loop.md` |
 | C09 | Programme + output pipelines | compositor | C08, **C00 pass** | `tasks/C09-gst-programme-output.md` |
 | C10 | Input pipeline | compositor | C09 | `tasks/C10-gst-input.md` |
@@ -191,20 +191,20 @@ fly/stg.toml, fly/prod.toml        (C16)
 | C13 | Harness: fakes + reference checker | compositor | C12 | `tasks/C13-harness.md` |
 | C14 | Chaos suite | compositor | C13 | `tasks/C14-chaos-suite.md` |
 | C15 | Soak | compositor | C14 | `tasks/C15-soak.md` |
-| W03 | Runner `on-failure`, same-attempt sweep, 15 s composed stale, exit 78 never retries | seazn.club | W02 | `tasks/W03-runner-restart-and-beats.md` |
-| W04 | Composed provisioning: Input B, composed session facts, delay column | seazn.club | W03, **C00 F-002** | `tasks/W04-input-b-provisioning.md` |
-| W05 | Overlay page: `sid`+`st` access, `host=compositor` signals, stale, clamp | seazn.club | W04, **C00 F-001** | `tasks/W05-overlay-page-compositor-host.md` |
-| W06 | Organiser UI: composed option + delay override | seazn.club | W04, W05 | `tasks/W06-organiser-composed-ui.md` |
+| R2003 | Runner `on-failure`, same-attempt sweep, 15 s composed stale, exit 78 never retries | seazn.club | R2002 | `tasks/R2003-runner-restart-and-beats.md` |
+| R2004 | Composed provisioning: Input B, composed session facts, delay column | seazn.club | R2003, **C00 F-002** | `tasks/R2004-input-b-provisioning.md` |
+| R2005 | Overlay page: `sid`+`st` access, `host=compositor` signals, stale, clamp | seazn.club | R2004, **C00 F-001** | `tasks/R2005-overlay-page-compositor-host.md` |
+| R2006 | Organiser UI: composed option + delay override | seazn.club | R2004, R2005 | `tasks/R2006-organiser-composed-ui.md` |
 | C16 | Deploy workflows, Fly apps config | compositor | C12 | `tasks/C16-deploy.md` |
 | C17 | Stg end-to-end acceptance + runbook | both | all | `tasks/C17-stg-acceptance.md` |
 
 **Parallel lanes:**
 - Safe to run in parallel (provably disjoint): C00 alongside C01–C06 (spike branch vs main), and
-  W01 alongside any C task.
+  R2001 alongside any C task.
 - After C02: C03, C04 and C05 touch disjoint files, but all three add a line to
   `crates/domain/src/lib.rs`. **Run them sequentially**, or give them worktree isolation and merge
   `lib.rs` by hand.
-- W03, W04 and W05 all touch `seazn.club/apps/web/src/server/relay/*`, so they run **sequentially**.
+- R2003, R2004 and R2005 all touch `seazn.club/apps/web/src/server/relay/*`, so they run **sequentially**.
 
 **Wave gates:**
 1. After C06: domain review plus all domain tests and properties.

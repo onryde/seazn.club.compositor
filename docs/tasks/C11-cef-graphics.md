@@ -23,7 +23,7 @@ cefsrc url=<overlayUrl> <readiness property from F-001> → video/x-raw,format=B
 | The page's readiness signal (F-001 mechanism) | `CefReady{gen}` |
 | Each appsink sample | `FrameStore::set_overlay(sample)` |
 | Bus error, renderer process exit, or the CEF child disappearing (poll the pids F-001 identified, every 1 s) | `CefCrashed{gen}` |
-| Page signals score-stale (W05 adds a JS signal on the same channel as ready) | `ScoreStale(true/false)` |
+| Page signals score-stale (R2005 adds a JS signal on the same channel as ready) | `ScoreStale(true/false)` |
 
 **There is no load timeout in the adapter.** The domain owns it (C05 `cef_load_timeout_ms`). One
 source of truth.
@@ -95,7 +95,7 @@ source of truth.
 
 ## Do not touch
 
-The programme and input adapters, and the page in `seazn.club` (that's W05).
+The programme and input adapters, and the page in `seazn.club` (that's R2005).
 
 ## Output cap
 
