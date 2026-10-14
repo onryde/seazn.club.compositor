@@ -100,6 +100,11 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
   - `busy_loop_raises_cpu`: spin a thread for 300 ms between two samples, then assert `cpu_pct > 0`
   - `mem_is_positive`
   - `latency_is_never_reported`
+  - `copies_every_stats_field_into_measured`: not Linux-gated. Build a `Stats`, set known values
+    with `force_snapshot` (C09; enable `adapters/test-hooks` in `crates/adapters` dev-dependencies), call `ProcMetrics::sample()`, and assert `fps`, `bitrate_kbps`,
+    `egress_bytes` and `encoder_speed` equal the snapshot. The same test with a fresh `Stats` asserts
+    all four are `None`. This is the join between C09's counters and the heartbeat, so it's caught
+    here, not in C14.
 
   These need Linux. Gate them with `#[cfg(target_os = "linux")]` and print `skipped: not linux`
   elsewhere. CI runs Linux, so the gate is not vacuous there; `check.yml` greps for the passed count.
@@ -214,6 +219,8 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
      `drivers_unset_refuses_in_release…`.
   2. Include the token value in `EnvError`'s message. Expected red:
      `missing_each_required_key_is_refused_naming_the_key`.
+  3. Drop the `encoder_speed` copy in `ProcMetrics::sample`. Expected red:
+     `copies_every_stats_field_into_measured`.
 
 - [ ] **Step 10: Commit and open the PR.** `feat(compositor): binary wiring, proc metrics and the relay image (C12)`
 
@@ -221,7 +228,7 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
 
 - Env, metrics and fake-run tests pass.
 - `image.yml` is green on the PR: plugin present, 7 cef tests, smoke exits 0, size under the cap.
-- 2 mutants went red.
+- 3 mutants went red.
 - The image runs as non-root.
 
 ## Do not touch

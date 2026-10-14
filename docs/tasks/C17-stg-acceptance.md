@@ -69,7 +69,7 @@ Also include:
   |---|---|---|---|---|
   | 1 | Organiser picks *Composed*, delay default, Go live | panel shows starting → live; YouTube live ≤ cold start + 15 s | | |
   | 2 | Score 3 rallies on the pad | each appears on YouTube at about real time + delay; the bug matches the public page | | |
-  | 3 | Phone: background the capture app for 20 s | YouTube freezes ≤ 0.5 s, then slate by 3 s; panel shows camera reconnecting | | |
+  | 3 | Phone: background the capture app for 20 s | YouTube freezes ≤ 0.5 s, then slate by 3 s; session stays live; panel shows R2006's *camera reconnecting* chip (from the beat's `programmePhase`) | | |
   | 4 | Foreground the app | live again ≤ 1.2 s after frames return; score bug intact | | |
   | 5 | Void the last rally | bug re-derives on YouTube | | |
   | 6 | Set the delay override to 0, start a second session | score lands ahead of video by about the measured delay (proves the override reaches the page) | | |

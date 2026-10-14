@@ -1,8 +1,8 @@
-# R2001: Refuse composed mode until the compositor image exists, and repoint the docs
+# R2001: Refuse composed mode until the compositor image exists
 
 **Repo:** `onryde/seazn.club`. Work in a worktree:
 ```bash
-cd /Users/ashokhein/github/seazn.club && git worktree add ../seazn.club-wt/w01-composed-hazard -b fix/composed-mode-refusal origin/main
+cd /Users/ashokhein/github/seazn.club && git worktree add ../seazn.club-wt/r2001-composed-hazard -b fix/composed-mode-refusal origin/main
 ```
 Follow the `seazn-local-env` skill for the DB and worktree setup (`~/.claude/skills/seazn-local-env/SKILL.md`).
 
@@ -43,11 +43,15 @@ hypothesis, not a source of truth.
 
 ## Files
 
+- Modify: `apps/web/src/server/relay/drivers.ts` (the new `composedUnavailable()` predicate)
 - Modify: `apps/web/src/server/relay/domain/session.ts` (the `AdmitRefusal` union and `admit()`)
 - Modify: `apps/web/src/server/usecases/stream-sessions.ts` (pass the availability fact into `admit`;
   map the refusal in `refuse()`)
 - Modify: the OpenAPI/zod error enum, if refusal codes are enumerated there. Grep for
   `storage_exhausted` with `git grep -a`.
+- Test: `apps/web/src/server/relay/__tests__/drivers.test.ts` (re-pin; create if absent):
+  `composedUnavailable()` across the 2×2 table relay up/down × `RELAY_IMAGE` set/unset. Only
+  up+set is available. Each side of the OR is witnessed alone.
 - Test: `apps/web/src/server/relay/domain/__tests__/session.test.ts`,
   `apps/web/src/app/api/v1/fixtures/[id]/stream-sessions/__tests__/routes.test.ts`,
   `apps/web/src/server/usecases/__tests__/stream-sessions.test.ts`
@@ -77,7 +81,7 @@ hypothesis, not a source of truth.
   - passthrough + unavailable → no `composed_unavailable`
 - [ ] **Step 2: Run it and watch it fail.**
   ```bash
-  cd apps/web && pnpm vitest run src/server/relay/domain/__tests__/session.test.ts --reporter=json --outputFile=/tmp/w01-a.json
+  cd apps/web && pnpm vitest run src/server/relay/domain/__tests__/session.test.ts --reporter=json --outputFile=$SCRATCH/r2001-a.json
   ```
   Read `numFailedTests`. Use your own scratch subdir for the output file, not a shared path.
 - [ ] **Step 3: Implement it in `admit()`.**
@@ -98,8 +102,13 @@ hypothesis, not a source of truth.
   - `stream-sessions.test.ts`
   - `stream-go-live-phone.test.ts` (phone path regression)
   - `drivers.test.ts`
-- [ ] **Step 7: Mutate once.** Move `composed_unavailable` to the last position in the `admit` order.
-  The "first in order" domain test must go red. Revert, and note it in the commit body.
+- [ ] **Step 7: Mutate once each.**
+  1. Move `composed_unavailable` to the last position in the `admit` order. The "first in order"
+     domain test must go red.
+  2. `composedUnavailable()` returns `relayUnavailable()` only. The 2×2 table goes red (up+unset).
+  3. `composedUnavailable()` returns `!RELAY_IMAGE` only. The 2×2 table goes red (down+set).
+
+  Revert each, and note all three in the commit body.
 - [ ] **Step 8: Docs.** Nothing to do (PR #957). Confirm it merged: the note is at the top of
   `docs/superpowers/specs/2026-09-05-stream-overlay-prompts/_INDEX.md`.
 - [ ] **Step 9: Lint and typecheck the changed files.** Run `rtk proxy pnpm --filter web lint` and read

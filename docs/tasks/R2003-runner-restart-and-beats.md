@@ -1,7 +1,7 @@
 # R2003: Runner restarts in place (`on-failure`, ≤2), same-attempt accounting, 15 s stale for composed
 
 **Repo:** `onryde/seazn.club`. Worktree:
-`git worktree add ../seazn.club-wt/w03-runner-restart -b feat/relay-runner-restart origin/main`.
+`git worktree add ../seazn.club-wt/r2003-runner-restart -b feat/relay-runner-restart origin/main`.
 **Depends on:** R2002 merged. **Runs sequentially** with R2004 and R2005, because all three touch
 `apps/web/src/server/relay/*`.
 
@@ -75,6 +75,8 @@ Pinned 2026-10-14 at main `09290de3c`. **Re-pin every line before editing.**
   - `__tests__/expiry.test.ts`
   - `__tests__/runner-fly.test.ts`
   - `__tests__/config.test.ts`
+  - `apps/web/src/server/usecases/__tests__/relay-internal-routes.test.ts` (test 7; the heartbeat
+    route `app/api/internal/relay/sessions/[sid]/heartbeat/route.ts`)
 - Possibly modify: the 4 locale dictionaries, plus `pnpm i18n:gen-keys`, if a new failure reason
   needs copy.
 
@@ -104,7 +106,12 @@ Pinned 2026-10-14 at main `09290de3c`. **Re-pin every line before editing.**
   6. `exit_78_fails_refused_without_retry`: playing → observed `destroyed` with exit code 78 →
      signal `failed(refused)`, no `create_started`. Positive pair: exit code 1 → the one retry still
      happens.
-  7. `slate_on_air_takes_a_composed_session_live` (owner ruling 2026-10-14, plan review F5 option A):
+  7. `slate_on_air_takes_a_composed_session_live` (owner ruling 2026-10-14, plan review F5 option A).
+     **Green on base, a regression pin:** web already promotes on `state === "playing"`
+     (`stream-sessions.ts` `callback_playing`, `runner.ts` `went_live`; re-pin). It pins that the new
+     `programmePhase`/`input` keys never gate going live. Preconditions: `RELAY_IMAGE` set (or R2001's
+     `composedUnavailable()` refuses the start), and the runner in `booting` (`callback_playing` is
+     handled only from `booting`/`playing`).
      - a composed session in `warming`
      - a beat `{state: "playing", programmePhase: "waiting", input: "connecting"}` through the
        **real** heartbeat route
@@ -114,8 +121,8 @@ Pinned 2026-10-14 at main `09290de3c`. **Re-pin every line before editing.**
   8. `create_body_uses_on_failure_restart`: `runner-fly.test.ts` captures the POST body and asserts
      `restart` deep-equals `{ policy: "on-failure", max_retries: 2 }`, with `2` taken from
      `RUNNER_INPLACE_RESTARTS`.
-- [ ] **Step 2: Run, expect a FAIL.**
-  `cd apps/web && pnpm vitest run src/server/relay/__tests__/{runner,expiry,runner-fly,config}.test.ts --reporter=json --outputFile=$SCRATCH/w03.json`.
+- [ ] **Step 2: Run, expect a FAIL** (tests 1–6 and 8; test 7 is green on base).
+  `cd apps/web && pnpm vitest run src/server/relay/__tests__/{runner,expiry,runner-fly,config}.test.ts src/server/usecases/__tests__/relay-internal-routes.test.ts --reporter=json --outputFile=$SCRATCH/r2003.json`.
   Read `numFailedTests`, and confirm `.testResults[].name` resolved to the worktree.
 - [ ] **Step 3: Implement changes 1–4.**
 - [ ] **Step 4: Run, expect a PASS.** Paste `numPassedTests`/`numTotalTests`.
@@ -123,10 +130,11 @@ Pinned 2026-10-14 at main `09290de3c`. **Re-pin every line before editing.**
   1. In `expiry.ts`, use 90 s for composed. Expected red: test 1 or 2.
   2. Allow `create_started` from `lost`. Expected red: test 3.
   3. Drop the exit-78 arm. Expected red: test 6.
+  4. Gate `callback_playing` on `programmePhase === "live"`. Expected red: test 7.
 - [ ] **Step 6: Smoke.** Run the relay smoke spec that covers session start/stop. Re-pin it with
   `grep -arl "relay" apps/web/e2e`, choosing **by behaviour, not filename** (AGENTS.md class 16).
   Run it against a local prod build with `RELAY_DRIVERS=fake`.
-- [ ] **Step 7: Scoped gate.** Run the four test files, plus `stream-sessions` tests touching
+- [ ] **Step 7: Scoped gate.** Run the five test files (including `relay-internal-routes.test.ts`), plus `stream-sessions` tests touching
   `retryRunner` (re-pin). Lint with `rtk proxy` and typecheck.
 - [ ] **Step 8: Commit and open the PR.**
   `feat(relay): in-place restart for the compositor, a 15 s composed stale rule, and refused exits never retry`
@@ -134,7 +142,7 @@ Pinned 2026-10-14 at main `09290de3c`. **Re-pin every line before editing.**
 ## Acceptance
 
 - 8 new tests pass, and existing passthrough tests are unchanged and green.
-- 3 mutants went red.
+- 4 mutants went red.
 - The D4 comment is rewritten with its new proof.
 - The PR is open.
 

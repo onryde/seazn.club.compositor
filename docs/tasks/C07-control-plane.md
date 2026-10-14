@@ -185,6 +185,12 @@ repo.
       let delay = odd["overlayDelayMs"].as_u64().unwrap();
       odd["overlayDelayMs"] = serde_json::json!(delay + 1);
       assert_eq!(parse_session(&odd), Err(FetchError::Refused(Refusal::WrongMode)), "two disagreeing delays: refuse, never pick one");
+      let mut bare = fixture("session-composed-720p.json");
+      let url = bare["overlayUrl"].as_str().unwrap().to_owned();
+      let stripped = url.split('&').filter(|kv| !kv.starts_with("delay=") && !kv.contains("?delay=")).collect::<Vec<_>>().join("&");
+      assert!(!stripped.contains("delay="), "test setup: delay= must be gone from {stripped}");
+      bare["overlayUrl"] = serde_json::json!(stripped);
+      assert_eq!(parse_session(&bare), Err(FetchError::Refused(Refusal::WrongMode)), "an absent delay= is refused, never read as 0");
   }
 
   #[test]
@@ -229,7 +235,8 @@ repo.
     It returns `WrongMode` if `mode != "composed"`, if any of `input`, `output`, `overlayUrl` or
     `heartbeatIntervalMs` is absent, or if `output` is not exactly `OutputProfile::P720` or `P1080`
     (web's `relayOutputProfile`, R2004, is pinned to the same fixtures), or if the `delay=` query value
-    in `overlayUrl` differs from `overlayDelayMs`.
+    in `overlayUrl` differs from `overlayDelayMs`. An **absent** `delay=` (or absent `overlayDelayMs`)
+    is also `WrongMode`: both authorities must be present and agree, never one defaulted.
   - `heartbeat_wire(&HealthReport, &Measured) -> Value` builds a `serde_json::Map`:
     - `state`: `starting|playing|stalled|stopped`
     - `programmePhase`: lower-case

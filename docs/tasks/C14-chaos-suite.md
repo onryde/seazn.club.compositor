@@ -13,7 +13,7 @@ Each case is a `harness/cases/<name>.sh` that:
 **Every expected number is read from `harness/thresholds.json`**, which this task generates from the
 domain: `cargo run -p harness --bin dump-thresholds > harness/thresholds.json` serialises
 `Thresholds::default()` plus the spec §6 budgets, which are added to `config.rs` here as named consts
-with doc lines. **No number is typed into a `.jq` file.** If a `.jq` needs a number, it must come from
+with doc lines, plus C02's `ENCODER_SPEED_REALTIME_MIN` (exported as `encoder_speed_realtime_min`). **No number is typed into a `.jq` file.** If a `.jq` needs a number, it must come from
 `thresholds.json` (`$t.slate_after_ms` etc.) or from the case's own timeline variables. When the
 spike re-pins a threshold, the cases move with it.
 
@@ -47,13 +47,13 @@ The PDF's kill-switch case is replaced by "CEF killed".
 | 3 | `reader-kicked` | kick the SRT reader every 20 s, 6 times | after each kick, strip frames return ≤ `BUDGET_RETURN_TO_LIVE_MS + input_backoff_cap_ms`; heartbeats show `inputKickAlert: true` once `kick_alert_count` kicks fall in `kick_window_ms`, and **not before** (assert the first `true` beat comes after kick #`kick_alert_count`); `output_outages == []` |
 | 4 | `dest-disconnect` | at 20 s `netem out loss 100%`; at 50 s `clear`; run 80 s | output resumes ≤ `BUDGET_OUTPUT_RECONNECT_MS` after clear; the programme lost per outage, measured as the counter gap across the outage minus the outage wall span, is ≤ `BUDGET_OUTPUT_LOST_MAX_MS` worth of frames; heartbeats show `input: connected` throughout (input untouched); `pipelineRebuilds` unchanged |
 | 5 | `dest-stall` | at 20 s `netem out rate 1kbit` (accepts, but no acks); at 50 s `clear` | a `sinkSwaps` increase appears in a beat ≤ `output_ack_stall_ms + heartbeat_interval_ms` after 20 s; output recovers after clear as in case 4 |
-| 6 | `cpu-starved` | start a `stress-ng --cpu 4` sidecar in the compositor netns/cgroup at 20 s, for 40 s | `fps_mean` over the window stays ≥ 29.5 (the clock holds); `pts_gaps == []`; heartbeats show `droppedFrames` increase **or** `rung != "full"`, and at least one of them changes; after stress ends, `encoderSpeed ≥ 1.0` within `BUDGET_LADDER_REALTIME_MS` |
+| 6 | `cpu-starved` | start a `stress-ng --cpu 4` sidecar in the compositor netns/cgroup at 20 s, for 40 s | `fps_mean` over the window stays ≥ 29.5 (the clock holds); `pts_gaps == []`; heartbeats show `droppedFrames` increase **or** `rung != "full"`, and at least one of them changes; after stress ends, `encoderSpeed ≥ $t.encoder_speed_realtime_min` within `BUDGET_LADDER_REALTIME_MS` |
 | 7 | `score-down` | `POST fake-control /control/score-down?ms=60000` at 20 s | heartbeats show `scoreStale: true` within 10 s (spec §6, page side) + one beat interval; the overlay index never changes during the outage and never regresses; `scoreStale: false` after the first poll following recovery |
 | 8 | `cef-killed` | at 20 s `docker exec compositor pkill -KILL -f cef` | the overlay strip shows the **same** index (held frame) with no transparent gap; camera strip frames continue (no freeze > 2 frames); heartbeats go `graphics: restarting` → `ready`; `output_outages == []` |
 | 9 | `process-killed` | at 20 s `docker exec compositor pkill -KILL -x compositor` (tini exits non-zero, compose's `on-failure:2` restarts it) | output resumes ≤ `BUDGET_PROCESS_RESTART_OUTPUT_MS` after the kill; heartbeats resume; fake-control sees the **same** `SESSION_ID`; `counter_regressions == 0` |
-| 10 | `input-impaired` | at 20 s `netem.sh in delay 400ms 100ms loss 2%`; at 80 s `clear`; run 100 s | the programme clock holds through a bad camera leg: `pts_gaps == []`, `fps_mean ≥ 29.5`, `counter_regressions == 0`, `output_outages == []`; anti-vacuity: the `latency_windows_ms` p50 inside 20–80 s is ≥ the pre-20 s p50 + 300 ms, which proves the impairment actually reached the media |
+| 10 | `input-impaired` | at 20 s `netem.sh in delay 400ms 100ms loss 2%`; at 80 s `clear`; run 100 s | the programme clock holds through a bad camera leg: `pts_gaps == []`, `fps_mean ≥ 29.5`, `counter_regressions == 0`, `output_outages == []`; anti-vacuity is witnessed **where the fault is injected**, because SRT's fixed 1 000 ms TSBPD latency absorbs a 400 ± 100 ms delay and keeps glass-to-glass flat: (a) `tc -s` on `netem-in` shows the filter's hit count > 0 and the netem child's `dropped` grew during 20–80 s; (b) MediaMTX's reader stats for the compositor's SRT connection show retransmitted packets > 0 in the window (field name pinned with the MediaMTX tag in C13's F-entry). `latency_windows_ms` is reported, never gated |
 
-**Case 10** (`input-impaired`) is not in spec §9.4's original table. It covers spec §9.3's input
+**Case 10** (`input-impaired`, spec §9.4 "Camera uplink impaired") covers spec §9.3's input
 impairment (100–800 ms latency, 1–5 % loss), which no other case exercises.
 
 **Score correction (void) and clock skew are not chaos cases.** Both are **page** logic, owned and
@@ -95,7 +95,8 @@ measured in C00 (F-002), copied into the MediaMTX config and case scripts, and p
   to the owner as a finding, and do not edit the budget.
 - [ ] **Step 5: Mutate once each.**
   1. Set `resume_after_ms` to 0 in a scratch build. Expected red: case 2 (a phase change faster than
-     hysteresis).
+     hysteresis). The verdict reads the **committed** `harness/thresholds.json`, never one regenerated
+     from the scratch build, or the mutant moves its own oracle.
   2. Disable the held overlay frame (C11 mutant). Expected red: case 8.
   3. Comment out the fault-injection line of case 1 (the `/pause`), so the run happens and the
      report exists with zero slates. The `.jq` must fail **on its anti-vacuity clause**, and the

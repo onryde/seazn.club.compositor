@@ -56,7 +56,11 @@ it to turn counters into camera wall time.
     backlog as fast as possible with original PTS), and `POST /size?w=&h=`.
   - `fake-control`: tiny_http on `:7000`:
     - `GET /api/internal/relay/sessions/{sid}`: the vendored `session-composed-720p.json`, with
-      `input.url`, `target.url` and `overlayUrl` rewritten to harness hosts by an env map
+      `input.url`, `target.url` and `overlayUrl` rewritten to harness hosts by an env map. The
+      rewrite changes **only scheme, host and port**, and keeps every query parameter (`sid`, `st`,
+      `host`, `delay`). A startup self-check parses the rewritten session with the same rules as C07
+      (`delay=` equals `overlayDelayMs`), and fake-control refuses to start otherwise. A rewrite that
+      drops `delay=` would turn every run into an exit-78 refusal.
     - `POST …/heartbeat`: appends the body + `received_ms` to `heartbeats.jsonl`, and replies
       `{desiredState}` from its state
     - `POST /control/desired?state=ending|live`
@@ -102,13 +106,18 @@ Field meanings:
   counter. Measured only on frames with a strip.
 - **`counter_regressions`:** a strip frame whose counter is lower than an earlier one. Must be 0 in
   every case, because a burst replay must never show older frames.
-- **`resumes`:** one entry per gap > 1 s in `emit.jsonl`. `first_emitted_counter` is the camera's
+- **`resumes`:** one entry per gap ≥ `slate_after_ms` in `emit.jsonl`. Shorter gaps never slate
+  (the programme repeats, then freezes), so they have no "slate span that covers the gap" and are
+  left out; `counter_regressions` still covers them. `first_emitted_counter` is the camera's
   first counter after the gap, and `first_shown_counter` is the first strip counter in the recording
   after the slate span that covers the gap. `suppressed_ms` = (shown − emitted) × frame period: how
   long the programme held the slate after frames returned. That's the hysteresis, measured
   independently of latency.
-- **`latency_windows_ms`:** `latency_ms.p50` per 10 s wall window. C14's input-impairment case
-  proves the impairment landed with it.
+- **`latency_windows_ms`:** `latency_ms.p50` per 10 s wall window. Reported only; no case gates on
+  it (SRT's TSBPD buffer holds it flat under moderate delay; C14 case 10 witnesses the fault at `tc`).
+- **`late_frames_max`** and **`future_dated`** are **report-only**: void and clock skew moved to
+  R2005, so no case gates on them. They stay because they cost nothing, and they make a CEF render
+  regression visible in any report.
 - **`late_frames_max`:** for each score index change, the frames between `due_wall_ms` and the first
   frame that shows it.
 - **`future_dated`:** frames that show an index whose `due_wall_ms` is after the frame's wall time.
@@ -144,8 +153,11 @@ Field meanings:
     - `netem-out`: `network_mode: "service:compositor"`, `cap_add: [NET_ADMIN]`. Filter
       `u32 match ip dport 1935 0xffff`: the compositor's RTMP media to the destination.
     - `netem-in`: `network_mode: "service:mediamtx"`, `cap_add: [NET_ADMIN]`. Filter
-      `u32 match ip sport 8890 0xffff match ip dst <compositor ip>`: MediaMTX's SRT media **to the
-      compositor**, never to the camera.
+      `u32 match ip sport 8890 0xffff match ip dst 172.28.0.10`: MediaMTX's SRT media **to the
+      compositor**, never to the camera. The address is fixed in compose: a `harness` network with
+      subnet `172.28.0.0/24`, and the compositor service at `ipv4_address: 172.28.0.10`.
+      `netem.sh` asserts the filter matched (`tc -s filter show` hit count > 0) before a case may
+      claim the fault was applied.
 
     `netem.sh in|out|clear <args>` runs `tc` in the matching sidecar: a prio qdisc, the filter, and a
     netem child on the filtered band. A filter on the compositor's `dport 8890` would only delay SRT
@@ -179,7 +191,7 @@ Field meanings:
 
 - The strip and checker tests pass, with counts.
 - The smoke case is green locally and in CI.
-- The report has every field populated.
+- The report has every field populated (`late_frames_max`/`future_dated` may be 0; they're report-only).
 - 2 mutants went red.
 
 ## Do not touch

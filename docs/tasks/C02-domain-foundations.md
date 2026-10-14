@@ -166,6 +166,11 @@ impl Window {
       pub bootstrap_backoff_cap_ms: Ms,
   }
 
+  /// The floor for "the encoder keeps real time". A 1 s window at 30 fps holds 29–31 frames
+  /// (0.967–1.033), so 1.0 would fail a third of healthy windows. A const, not a `Thresholds` field,
+  /// because `Thresholds` derives `Eq`. C09's band and C14 case 6 both read it.
+  pub const ENCODER_SPEED_REALTIME_MIN: f64 = 0.95;
+
   impl Default for Thresholds {
       fn default() -> Self {
           Self {

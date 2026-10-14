@@ -39,6 +39,7 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
 ## Files
 
 - Create: `crates/adapters/src/{frame_store.rs,gst_programme.rs,gst_output.rs,slate.rs,stats.rs}`
+- Modify: `crates/adapters/src/lib.rs` (`pub mod` for each new file, including `stats`)
 - Modify: `crates/adapters/Cargo.toml`, adding:
   - `gstreamer = { version = "0.24", features = ["v1_24"] }`
   - `gstreamer-app = { version = "0.24", features = ["v1_24"] }`
@@ -74,7 +75,12 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
   #[derive(Debug, Default)] pub struct Stats { /* atomics + a Mutex'd 1 s window; adapters may read Instant */ }
   #[derive(Debug, Clone, Copy, PartialEq, Default)]
   pub struct StatsSnapshot { pub fps: Option<f64>, pub bitrate_kbps: Option<u32>, pub egress_bytes: Option<u64>, pub encoder_speed: Option<f64> }
-  impl Stats { pub fn snapshot(&self) -> StatsSnapshot; }
+  impl Stats {
+      pub fn snapshot(&self) -> StatsSnapshot;
+      /// Test hook for C12's join test only: the next snapshot() returns `s`. Behind the `adapters`
+      /// feature `test-hooks`, which only dev-dependencies enable. Release builds don't have it.
+      #[cfg(feature = "test-hooks")] pub fn force_snapshot(&self, s: StatsSnapshot);
+  }
   ```
 
   **Field definitions.** Each is a measurement, and `None` means "not measured yet", never 0:
@@ -132,10 +138,11 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
   #[test] fn file_target_reports_connected_then_acks() { /* first buffer ⇒ OutputConnected{gen}; subsequent ⇒ OutputAck{gen} */ }
   #[test] fn stats_are_absent_before_anything_is_measured() { /* fresh GstProgramme: snapshot() == StatsSnapshot::default() (all None) */ }
   #[test] fn stats_fps_counts_pushes_per_second() { /* push Slate ticks at real 33 ms pace for 2.2 s; fps within 30 ± 1 (expected from OutputProfile::P720.fps) */ }
-  #[test] fn stats_egress_and_bitrate_follow_acked_bytes() { /* file target, 3 s real-pace pushes, drain; egress_bytes == final file size;
+  #[test] fn stats_egress_and_bitrate_follow_acked_bytes() { /* file target, 3 s real-pace pushes, drain, wait OutputDrained;
+       the drain path takes one FINAL stats sample after the sink's EOS (step 7), so egress_bytes == final file size exactly;
        bitrate_kbps within ±50 % of OutputProfile::P720.video_kbps (CBR filler keeps it near the target) */ }
-  #[test] fn stats_encoder_speed_tracks_real_time_and_drops_when_starved() { /* 2 s real pace ⇒ speed in 0.9..=1.1; stop pushing 1.5 s ⇒ speed < 0.5;
-       resume 2 s ⇒ back in 0.9..=1.1. This is C14 case 6's witness that the field can move. */ }
+  #[test] fn stats_encoder_speed_tracks_real_time_and_drops_when_starved() { /* 2 s real pace ⇒ speed in ENCODER_SPEED_REALTIME_MIN..=1.1; stop pushing 1.5 s ⇒ speed < 0.5;
+       resume 2 s ⇒ back in ENCODER_SPEED_REALTIME_MIN..=1.1 (domain::config). This is C14 case 6's witness that the field can move. */ }
   #[test] fn audio_ring_is_bounded_at_400ms_and_pads_silence() { /* unit on FrameStore: push 1 s of audio; take 1 s; first 600 ms worth is silence (zeros) */ }
   ```
   Write each body in full. The comments state exactly what to assert.
@@ -195,7 +202,8 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
   2. The **feeder thread**, on seeing the programme's EOS on its appsinks and the ring empty, calls
      `end_of_stream()` on **both output appsrcs**. The two pipelines are joined only by the ring, so
      without this step no EOS reaches the sink.
-  3. The output bus's `Eos` message sends `OutputDrained`.
+  3. On the output bus's `Eos`, take one **final** acked-bytes sample into `Stats` (so the last
+     snapshot equals what the sink wrote), then send `OutputDrained`.
 
   `ninety_slate_ticks…` and the C12 fake-run both depend on this path.
 

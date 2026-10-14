@@ -30,10 +30,11 @@ The entry point for any session working on this repository. Read this file first
 | 2026-10-14 | Plan: the soak runs on two Fly Machines (the real image on the production guest, plus a harness Machine), so the fakes don't steal the compositor's CPU. | — (plan, C15) |
 | 2026-10-14 | Plan: an image push is not a release. `RELAY_IMAGE` changes only through `promote.yml`, behind a required-reviewer environment. | — (plan, C16) |
 | 2026-10-14 | Plan: the web tasks are numbered R2001–R2006 (owner request; previously W01–W06), so they don't collide with other programmes' W-waves. Compositor tasks keep C00–C17. | — |
-| 2026-10-14 | Plan review (Fable, once): 3 blockers, 6 majors, 11 minors in `reviews/2026-10-14-plan-review-fable.md`. All fixed in the briefs; F5 was decided by the owner (option A, next row). A 12th chaos case, `input-impaired`, covers spec §9.3's input impairment. | — |
+| 2026-10-14 | Plan review (Fable, once): 3 blockers, 6 majors, 11 minors in `reviews/2026-10-14-plan-review-fable.md`. All fixed in the briefs; F5 was decided by the owner (option A, next row). Chaos case 10, `input-impaired`, covers spec §9.3's input impairment. | — |
 | 2026-10-14 | **Owner ruling (F5, option A):** a composed session is `playing` once its output reaches CF, whether it's showing the slate or the picture. That's when it goes `live` and uses its credit. The camera's state travels separately, in `programmePhase`/`input`. | — (spec §5.3, C06, R2003) |
 | 2026-10-14 | **Owner ruling:** the soak is 3 h (was 8 h). One GitHub Actions job drives it, and the media runs on Fly Machines on the production guest. | — (spec §9.5, ADR 0003, C15) |
 | 2026-10-14 | **Owner ruling:** the fake Cloudflare is the off-the-shelf MediaMTX image (pinned), not custom code. It runs only on our CI and Machines, never a public instance. Chaos and soak stay on it because real stg would need a fake paired phone (admission requires one) and caps a session at 300 min. Real CF behaviour comes from C00/F-002 and is proven live in C17. | — (C13–C15) |
+| 2026-10-14 | Plan re-review (Opus): 19 fixed, F9 partial, 1 major + 9 minor new in `reviews/2026-10-14-plan-rereview-opus.md`. All applied: case 10 witnessed at `tc` + SRT retrans (TSBPD holds latency flat), compositor fixed at 172.28.0.10, `ENCODER_SPEED_REALTIME_MIN` = 0.95 shared by C09/C14, ProcMetrics join test (C12), R2003 test 7 a regression pin + mutant 4, C06 mutant 4, R2001 2×2 predicate table, absent `delay=` refused, R2006 composed camera chip. | — |
 
 ## False premises found
 

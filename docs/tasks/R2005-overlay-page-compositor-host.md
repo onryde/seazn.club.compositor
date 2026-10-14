@@ -1,7 +1,7 @@
 # R2005: Overlay page for the compositor (`sid`+`st` access, `host=compositor` signals, stale, clamp)
 
 **Repo:** `onryde/seazn.club`. Worktree:
-`git worktree add ../seazn.club-wt/w05-overlay-host -b feat/overlay-compositor-host origin/main`.
+`git worktree add ../seazn.club-wt/r2005-overlay-host -b feat/overlay-compositor-host origin/main`.
 **Depends on:** R2004 merged (sequential with R2003/R2004), and **C00 F-001** (the readiness mechanism the
 CEF adapter observes). **Use the `frontend-design` skill** (house rule for every UI task), even
 though the page is transparent: the compositor output is what viewers see.

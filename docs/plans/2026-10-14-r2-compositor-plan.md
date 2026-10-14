@@ -38,8 +38,8 @@ feeds and destroys it.
 
 These apply to every task. Values are copied from the spec and ADRs.
 
-- **Two repos.** Tasks `C*` land in `onryde/seazn.club.compositor`. Tasks `W*` land in
-  `onryde/seazn.club`, in a worktree, never on the main checkout. Every W task obeys
+- **Two repos.** Tasks `C*` land in `onryde/seazn.club.compositor`. Tasks `R2*` land in
+  `onryde/seazn.club`, in a worktree, never on the main checkout. Every R2 task obeys
   `seazn.club/AGENTS.md`, `docs/superpowers/RULES.md` and `docs/superpowers/TEST-STRATEGY.md`.
 - **Pipelines:** two-pipeline rule (spec §3.2.1), realised as four pipelines (spec §3.3 refinement).
   The programme pipeline is **never rebuilt** during a session.
@@ -147,6 +147,7 @@ crates/testkit/src/                fakes for every port, session_720p()         
 crates/adapters/src/
   control_http.rs                  ureq ControlPlane                              (C07)
   frame_store.rs                   latest-frame slots shared by pipelines         (C09)
+  stats.rs                         fps/bitrate/egress/encoder-speed counters      (C09)
   slate.rs                         pre-rendered slate frames                      (C09)
   gst_programme.rs                 programme pipeline (never rebuilt)            (C09)
   gst_output.rs                    output pipeline + 2 s encoded ring             (C09)
@@ -173,7 +174,7 @@ fly/stg.toml, fly/prod.toml        (C16)
 
 | ID | Task | Repo | Depends on | Brief |
 |---|---|---|---|---|
-| R2001 | Composed-mode hazard fix + docs pointer | seazn.club | — | `tasks/R2001-composed-hazard-fix.md` |
+| R2001 | Composed-mode hazard fix | seazn.club | — | `tasks/R2001-composed-hazard-fix.md` |
 | C00 | **Spike gate** (throwaway; HALTS the plan on a fail of item 1 or 2) | compositor | — | `tasks/C00-spike-gate.md` |
 | C01 | Workspace scaffold, rulebook, CI check, guard tests | compositor | — | `tasks/C01-workspace-scaffold.md` |
 | C02 | Domain foundations: time, config, backoff, window | compositor | C01 | `tasks/C02-domain-foundations.md` |

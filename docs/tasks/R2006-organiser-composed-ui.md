@@ -1,7 +1,7 @@
 # R2006: Organiser UI (composed-mode option and score-delay override)
 
 **Repo:** `onryde/seazn.club`. Worktree:
-`git worktree add ../seazn.club-wt/w06-composed-ui -b feat/stream-panel-composed origin/main`.
+`git worktree add ../seazn.club-wt/r2006-composed-ui -b feat/stream-panel-composed origin/main`.
 **Depends on:** R2004 and R2005 merged. **Use the `frontend-design` skill.** It's a house rule for
 every UI task; put the invocation in the dispatch.
 
@@ -64,6 +64,8 @@ existing tone.
 ## Files
 
 - Modify: `components/v2/fixture-stream-panel.tsx`, `server/stream-panel-context.ts`
+- Modify: `lib/stream-session-view.ts` (the composed camera chip, read from the session's
+  `last_heartbeat.programmePhase`; plan re-review N2)
 - Modify: the settings route and its schema (re-pin), plus the generated OpenAPI artifacts
 - Modify: `apps/web/dictionaries/{en,es,fr,nl}/ui.json`, plus the regenerated keys file
 - Test: the panel's unit tests (re-pin), the settings route test, and the e2e spec. Re-pin the
@@ -85,6 +87,14 @@ existing tone.
      - the default selection is *Camera only*, so the existing behaviour holds
   3. **Effective-delay display.** With null it shows the default from the server, never a hardcoded
      number. With 0 it shows 0.0 s.
+  4. **Composed camera chip** (ruling A: the session stays `live` while the camera is out, so the
+     panel is the only place the organiser learns of it). Fold R2002's real
+     `heartbeat-full.json` fixture, with `programmePhase` set to each wire value, through the
+     view builder in `lib/stream-session-view.ts`: `live` → no camera chip; `frozen` and
+     `reconnecting` → a *camera reconnecting* chip; `waiting` → *waiting for camera*. Enumerate every
+     `programmePhase` value from R2002's schema enum (never a list typed in the test), and print
+     `phases checked: N`, failing on `N == 0`. A passthrough session never shows the chip. The copy
+     goes in all 4 locales.
 - [ ] **Step 3: Write the failing e2e,** extending the stream-panel spec.
   - At all **seven** widths (`mobile.spec.ts` projects 320/360/375/390/430/768/834), plus desktop
     1280:
@@ -105,6 +115,7 @@ existing tone.
 - [ ] **Step 7: Mutate once each.**
   1. Hardcode `passthrough` again. Expected red: panel test 2.
   2. Send `0` as null. Expected red: route test 1 and the e2e.
+  3. Map `reconnecting` to no chip. Expected red: panel test 4.
 - [ ] **Step 8: Run the scoped gate:** touched unit files plus the e2e spec, lint (`rtk proxy`),
   the typecheck, and the OpenAPI drift check. **Commit and open the PR:**
   `feat(stream): organisers can go live with the score composited, and tune its timing`
@@ -114,7 +125,7 @@ existing tone.
 - The owner picked an option.
 - Unit, route and e2e tests pass at 7 widths plus 1280.
 - The 4 locales are filled and keys regenerated.
-- 2 mutants went red.
+- 3 mutants went red.
 - Screenshots are posted, with per-screen owner verdicts.
 
 ## Do not touch

@@ -1,7 +1,7 @@
 # R2002: The `relay-job.v1` contract and the heartbeat extension
 
 **Repo:** `onryde/seazn.club`. Worktree:
-`git worktree add ../seazn.club-wt/w02-relay-contract -b feat/relay-job-contract origin/main`.
+`git worktree add ../seazn.club-wt/r2002-relay-contract -b feat/relay-job-contract origin/main`.
 Use the `seazn-local-env` skill for setup.
 **Depends on:** R2001 merged.
 
@@ -131,6 +131,8 @@ it's defined**.
   - the generated JSON equals the committed file (sha256)
   - every `valid-*`/named fixture parses
   - every `invalid-*` fixture is rejected
+  - each `session-composed-*` fixture's `overlayUrl` carries `delay=<overlayDelayMs>`, and the two
+    agree (C07 refuses a session where either is absent or they differ)
 - Modify: `relay-internal-routes.test.ts`
 
 ## Persistence of the new heartbeat fields

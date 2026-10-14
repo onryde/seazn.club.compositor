@@ -1,7 +1,7 @@
 # R2004: Composed provisioning (CF Input B), composed session facts, and the delay override column
 
 **Repo:** `onryde/seazn.club`. Worktree:
-`git worktree add ../seazn.club-wt/w04-input-b -b feat/relay-composed-input-b origin/main`.
+`git worktree add ../seazn.club-wt/r2004-input-b -b feat/relay-composed-input-b origin/main`.
 **Depends on:** R2003 merged (runs sequentially in `server/relay/*`), and **C00 F-002** (the measured
 camera→compositor delay, which becomes the default).
 

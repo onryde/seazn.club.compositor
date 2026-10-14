@@ -705,15 +705,18 @@ gets 410 and exits 0. That sequence is tested here.
 - [ ] **Step 8: Run, expect a PASS.** `cargo test -p domain --test properties -- --nocapture`. Read the
   printed counts. `cases checked` must be 512 in both tests, and `transitions into Live` must be > 0.
 
-- [ ] **Step 9: Mutate once each. All three must go red.**
+- [ ] **Step 9: Mutate once each. All four must go red.**
   1. In `running`, `Tick` arm: push `SendHeartbeat` on every tick. Expected red:
      `heartbeat_every_interval_not_every_tick`.
   2. In `booting`, remove the `deadline_at <= now` check. Expected red:
      `deadline_in_past_at_bootstrap_exits_clean`.
   3. In `C03 programme.rs`, change `resume_after_ms` to `frozen_after_ms` in `feed`. Expected red:
      property P2, which is the oracle-based check. Also expected red: C03's own budget test.
+  4. In `health()`, map output connected → `Playing` only when the programme phase is `Live`
+     (the pre-ruling-A shape). Expected red: `beat_state_follows_output_and_programme` (slate on air
+     must be `Playing`).
 
-  Revert every mutant, and record all three in the commit body.
+  Revert every mutant, and record all four in the commit body.
 
 - [ ] **Step 10: Gate (wave 1).**
   ```bash
@@ -726,7 +729,7 @@ gets 410 and exits 0. That sequence is tested here.
 
 - All domain tests pass, including 15 supervisor scenarios and 2 properties at 512 cases with non-zero
   counts.
-- 3 mutants went red.
+- 4 mutants went red.
 - Purity and deps guards are still green.
 
 ## Do not touch
