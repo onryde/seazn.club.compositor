@@ -61,14 +61,12 @@ it to turn counters into camera wall time.
       `{desiredState}` from its state
     - `POST /control/desired?state=ending|live`
     - `POST /control/score-down?ms=60000`
-    - `POST /control/skew?ms=5000` (serve timeline events stamped that far ahead; C14 case 11)
     - `GET /score.json`, `/overlay-test.html`: static from `harness/pages`
     - it checks the bearer token equals the env `JOB_TOKEN` and returns 401 otherwise
   - `checker`: `checker --recordings <dir> --emit <emit.jsonl> --heartbeats <hb.jsonl> --timeline <score.json> --out report.json`
 - Create: `harness/compose.yml`, `harness/mediamtx.yml`, `harness/netem.sh`, `harness/run-case.sh`,
   `harness/cases/smoke.sh`
-- Create: `harness/pages/score.json` (a scripted 20-event timeline at fixed offsets from the run start;
-  includes one void at event 12)
+- Create: `harness/pages/score.json` (a scripted 20-event timeline at fixed offsets from the run start)
 - Test: `crates/harness/tests/{strip.rs,checker.rs}`
 
 ## Report schema (`report.json`)

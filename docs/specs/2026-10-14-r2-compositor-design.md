@@ -25,7 +25,7 @@ Success, in the PDF's ranked order (a higher rank wins a conflict):
 1. **The output never stops.** Constant-rate frames for the whole event. When the camera drops, a
    slate appears within 3 s with the score still on screen. No single process failure ends the
    broadcast.
-2. **Bounded resources.** Every buffer has a limit, and memory stays flat over an 8 h soak (±10 %).
+2. **Bounded resources.** Every buffer has a limit, and memory stays flat over a 3 h soak (±10 %).
 3. **Latency.** The compositor adds ≤500 ms. A score change appears on screen within one frame of its
    scheduled time.
 4. **Sync.** A/V within ±40 ms. A score is applied at event time plus the calibrated delay.
@@ -370,18 +370,25 @@ Findings are recorded as F-ids in `_FINDINGS.md`, and `config.rs` numbers cite t
 | Destination accepts but stalls | Detected ≤5 s; sink replaced |
 | CPU starved (another process at 100 %) | Frames dropped before encoder; clock holds; ladder steps down |
 | Score feed down 60 s | Last score stays; `scoreStale` reported; recovers on first poll |
-| Score correction (void) | Screen re-derives within one frame of effective time |
+| Camera uplink impaired (400 ms ± 100, 2 % loss, 60 s) | Programme clock holds; no output gap |
 | CEF killed | Last overlay frame held; overlay back; video never paused |
 | Process killed | Fly restarts it; output back ≤15 s |
-| Clock skew +5 s on scorer | Events clamped; nothing future-dated on screen |
 
 The CEF-killed case replaces the PDF's operator kill-switch case, which moves to R4 with slots.
 
+Score correction (void) and scorer clock skew are **page** rules, so they're tested where the page
+lives (`seazn.club` R2005: unit + e2e) and proven live in R2 acceptance, not re-implemented in a
+harness page (owner ruling 2026-10-14). The fake CF is the off-the-shelf MediaMTX image at a pinned
+tag. It runs only on our CI and Machines, and its behaviour is set from the spike's measurement of
+real Cloudflare (F-002).
+
 ### 9.5 Soak
 
-8 h at 720p30, with the fake camera, a scripted match every 20 min, a dropout every 5 min and one
-destination disconnect per hour. GitHub Actions caps a job at 6 h, so the soak runs **as a Fly
-Machine job** against the harness and uploads a report. Pass: memory within ±10 % of the first hour,
+3 h at 720p30 (owner ruling 2026-10-14), with the fake camera, a scripted match every 20 min, a
+dropout every 5 min and one destination disconnect per hour. One GitHub Actions job drives it. The
+media runs on Fly Machines (the real image on the production guest, plus a harness Machine), because
+private-repo runners have 2 vCPU. It uploads a report. It can't run through real stg web: R1 caps a
+session at `MAX_DURATION_MINUTES = 300`, and admission needs a paired, beating phone. Pass: memory within ±10 % of the first hour,
 zero output gaps, zero programme-pipeline rebuilds caused by input events, dropped frames <0.1 %.
 
 ### 9.6 Main-repo PRs

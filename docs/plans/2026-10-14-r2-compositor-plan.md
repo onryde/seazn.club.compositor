@@ -160,13 +160,13 @@ contracts/                         vendored relay-job.v1 + VENDORED.json        
 docker/Dockerfile, entrypoint.sh   build + runtime (GStreamer, gstcefsrc, CEF, xvfb, tini) (C12)
 docker/GSTCEF_COMMIT               the one pin both image.yml and deploy-*.yml read (C12/C16)
 harness/                           compose + fakes + checker                      (C13)
-harness/cases/                     smoke (C13) + 12 chaos cases .sh/.jq (C14)
+harness/cases/                     smoke (C13) + 10 chaos cases .sh/.jq (C14)
 harness/thresholds.json            generated from Thresholds + budgets; drift-gated (C14)
 harness/soak/                      split-Machine soak, verdict.jq + fixtures      (C15)
 docs/runbooks/relay-compositor.md  one entry per heartbeat signal                 (C17)
 fly/stg.toml, fly/prod.toml        (C16)
 .github/workflows/                 check (C01), image (C12), harness (C13), chaos (C14),
-                                   soak-start/soak-collect (C15), deploy-stg/deploy-prod/promote (C16)
+                                   soak (C15), deploy-stg/deploy-prod/promote (C16)
 ```
 
 ## Task order and dependencies

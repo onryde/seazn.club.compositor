@@ -72,7 +72,7 @@ score bug. That's an inert seam the owner would only see live.
    - **If any is device-sourced:** an event whose time is more than 2 000 ms past
      `now + delayMs` is treated as `now + delayMs` (`OVERLAY_FUTURE_CLAMP_MS = 2_000`).
    - **If all are server-assigned:** record that as a false premise in compositor `docs/_INDEX.md`;
-     C14 case 11 then runs against the harness page only. Add a test that pins the server-assigned
+     Clock skew is then a non-issue for R2, and no chaos case covers it. Add a test that pins the server-assigned
      fact, so a future device-sourced timestamp reds it.
 4. **Void re-derivation.** Re-pin that a void yields a snapshot the page re-derives from (no
    append-only display state). Add a test only if no existing one covers "void after delay window".

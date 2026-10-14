@@ -51,8 +51,7 @@ hypothesis, not a source of truth.
 - Test: `apps/web/src/server/relay/domain/__tests__/session.test.ts`,
   `apps/web/src/app/api/v1/fixtures/[id]/stream-sessions/__tests__/routes.test.ts`,
   `apps/web/src/server/usecases/__tests__/stream-sessions.test.ts`
-- Docs: `docs/superpowers/specs/2026-09-05-stream-overlay-prompts/_INDEX.md` (a pointer row) and
-  `docs/superpowers/specs/2026-09-05-stream-overlay-prompts/R2-compositor.md` (a superseded header)
+- Docs: none. The pointer note and the superseded header shipped separately in `seazn.club` PR #957.
 
 ## Behaviour
 
@@ -101,11 +100,8 @@ hypothesis, not a source of truth.
   - `drivers.test.ts`
 - [ ] **Step 7: Mutate once.** Move `composed_unavailable` to the last position in the `admit` order.
   The "first in order" domain test must go red. Revert, and note it in the commit body.
-- [ ] **Step 8: Docs.**
-  - Add a row at the top of `_INDEX.md`'s status table: *"R2 moved to
-    `onryde/seazn.club.compositor` → `docs/_INDEX.md` (2026-10-14). B2 chroma-key and B3 rulings are
-    superseded by compositor ADR 0001. Do not build from `R2-compositor.md`."*
-  - Prepend a blockquote with the same text to `R2-compositor.md`.
+- [ ] **Step 8: Docs.** Nothing to do (PR #957). Confirm it merged: the note is at the top of
+  `docs/superpowers/specs/2026-09-05-stream-overlay-prompts/_INDEX.md`.
 - [ ] **Step 9: Lint and typecheck the changed files.** Run `rtk proxy pnpm --filter web lint` and read
   `✖ N problems`. Run the repo's typecheck command for `apps/web`.
 - [ ] **Step 10: Commit, push and open the PR.** Smoke runs on PRs only, and this is a behaviour
@@ -121,7 +117,7 @@ hypothesis, not a source of truth.
   ingest calls and 0 runner calls.
 - Passthrough and the phone path stay green.
 - The mutant went red.
-- The docs pointer is in place.
+- PR #957's docs pointer is on `main`.
 
 ## Do not touch
 

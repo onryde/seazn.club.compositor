@@ -18,7 +18,7 @@ fails.
 Acceptance:
 
 - chaos suite green on 3 consecutive runs
-- 8 h soak passed
+- 3 h soak passed (owner ruling 2026-10-14; was 8 h)
 - one owner-watched real end-to-end on stg
 
 R3 is already taken: the native capture apps in `seazn.club.capture`. The remaining PDF phases 2–4
