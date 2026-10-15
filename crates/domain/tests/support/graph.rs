@@ -35,6 +35,8 @@ fn kind_of(v: &Value) -> Kind {
 }
 
 impl Graph {
+    /// The workspace's graph. `--locked`: a stale `Cargo.lock` fails here rather than being
+    /// re-resolved into a graph nobody committed.
     pub fn load() -> Graph {
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
@@ -44,6 +46,7 @@ impl Graph {
                 "--format-version",
                 "1",
                 "--all-features",
+                "--locked",
                 "--manifest-path",
                 manifest,
             ])
@@ -54,7 +57,11 @@ impl Graph {
             "cargo metadata failed:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let meta: Value = serde_json::from_slice(&out.stdout).expect("cargo metadata is JSON");
+        Graph::from_metadata(&serde_json::from_slice(&out.stdout).expect("cargo metadata is JSON"))
+    }
+
+    /// The graph in a `cargo metadata --format-version 1` document.
+    pub fn from_metadata(meta: &Value) -> Graph {
         let str_of = |v: &Value, key: &str| v[key].as_str().unwrap_or_else(|| panic!("no {key}")).to_string();
         let names = meta["packages"]
             .as_array()

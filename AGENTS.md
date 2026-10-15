@@ -60,12 +60,16 @@ ports, so it depends on app, and app takes it as a dev-dependency only.
 
 Three guard tests make that the architecture rather than a picture of it:
 
-- `crates/domain/tests/purity.rs`: the code under `domain/src` (comments removed, string and char
-  literals emptied by a small lexer, so `//` inside a string is not a comment) never names
-  `std::env`, `std::fs`, `std::net`, `std::os`, `std::thread`, `std::process`, a `std::*` glob,
-  `env!`, `option_env!` or `include!`, and never names `Instant` or `SystemTime` at all, so an alias
-  cannot hide them. It also refuses a `std as …` alias and a `path = …` attribute (`cfg_attr`
-  included), and it sees paths split over lines or inside a `use std::{…}` group.
+- `crates/domain/tests/purity.rs`: an **allowlist**. The code under `domain/src` may name only
+  these `std` / `core` / `alloc` modules: `borrow`, `cmp`, `collections`, `convert`, `default`,
+  `fmt`, `hash`, `iter`, `marker`, `num`, `ops`, `option`, `result`, `str`, `string`, `vec`. Any
+  other path is refused (env, fs, io, net, os, process, sync, thread, time and anything nobody
+  listed), and so are a glob (`std::*`), a macro splice (`std::$m`), an alias (`std as …`,
+  `std::{self as …}`), `env!`, `option_env!`, `include!`, a `path = …` attribute (`cfg_attr`
+  included), and the bare names `Instant` and `SystemTime`. It reads tokens from a small lexer
+  (comments removed, literals emptied, `r#fs` read as `fs`), so spacing, line breaks and `use`
+  groups cannot hide a path. Adding a module to the allowlist is a decision: its own commit, with
+  the reason.
 - `crates/domain/tests/deps.rs`: the domain's normal and build closure in the **resolved graph**
   (`cargo metadata --all-features`, every platform) contains no `gstreamer*`, `gst*`, `glib*`, `cef*`,
   `ureq`, `reqwest`, `hyper`, `tokio`, `tiny_http`, `crossbeam` or `cairo` package. Because it reads
@@ -76,9 +80,10 @@ Three guard tests make that the architecture rather than a picture of it:
   `tests/`, `benches/`, `examples/` or `build.rs` names the crate as a path. Cargo refuses a normal
   dependency on adapters as a cycle, but it **allows a dev-dependency cycle**, so this test is the
   only thing that refuses one.
-- Both dependency guards share `crates/domain/tests/support/graph.rs`, and each proves its traversal
-  reaches something real (the binary reaches the domain; app reaches the domain), so an empty graph
-  cannot pass them.
+- Both dependency guards share `crates/domain/tests/support/graph.rs` (`cargo metadata --locked`),
+  and each proves its traversal reaches something real (the binary reaches the domain; app reaches
+  the domain), so an empty graph cannot pass them. Its edge-kind handling is pinned by
+  `graph_closure_follows_edge_kinds_at_and_past_the_root` on a hand-written metadata fixture.
 
 And two more guards:
 
@@ -153,8 +158,8 @@ and a mutation proving the new form still bites.
   `cmd > out.log 2>&1; echo "EXIT=$?"`.
 - CI is `.github/workflows/check.yml`, on every PR and every push to `main`: portability guard,
   fmt, clippy `-D warnings`, `cargo test` with `--show-output`, then a step that refuses a run whose
-  passed total is 0, any ignored test, and any of the four layering guards missing its own
-  `test <name> ... ok` line. A guard renamed in code is renamed in that step too. The job runs under
+  passed total is 0, any ignored test, and any of the four layering guards (or the graph fixture
+  test) missing its own `test <name> ... ok` line. A guard renamed in code is renamed in that step too. The job runs under
   an explicit `shell: bash`, which is what gives it `pipefail`. Never remove it (see
   `docs/_RULES.md`).
 - Harness (C13): the image under `docker compose` with fakes, MediaMTX standing in for Cloudflare.

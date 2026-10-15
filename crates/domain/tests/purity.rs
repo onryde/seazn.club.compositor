@@ -1,29 +1,39 @@
-//! Guard: the domain crate's source never reaches for the clock, env, filesystem, network, threads
-//! or OS, and never pulls in source from outside `domain/src` where this scan cannot see it.
+//! Guard: the domain crate reaches into `std`, `core` or `alloc` only through an ALLOWLIST of pure
+//! modules, and never pulls in source from outside `domain/src` where this scan cannot see it.
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Paths and macros refused anywhere in code (comments and string contents are not code).
-const FORBIDDEN: &[&str] = &[
-    "SystemTime::now",
-    "Instant::now",
-    "std::env",
-    "std::fs",
-    "std::net",
-    "std::os",
-    "std::thread",
-    "std::process",
-    // A glob of std brings `fs`, `env`, … into scope under their bare names.
-    "std::*",
-    "env!(",
-    "option_env!(",
-    // Splices a file this scan never reads.
-    "include!",
+/// The std/core/alloc modules the domain may name. Everything else is refused, so a module this
+/// list never thought of (env, fs, io, net, os, process, sync, thread, time, …) is refused too.
+/// Adding one is a decision: its own commit, with the reason.
+const ALLOWED_MODULES: &[&str] = &[
+    "borrow",
+    "cmp",
+    "collections",
+    "convert",
+    "default",
+    "fmt",
+    "hash",
+    "iter",
+    "marker",
+    "num",
+    "ops",
+    "option",
+    "result",
+    "str",
+    "string",
+    "vec",
 ];
 
-/// Clock types refused as bare names, so an alias (`use std::time::Instant as Clock`) cannot hide
-/// them. Time is `Ms`, passed in.
+/// The crates whose paths the allowlist governs.
+const STD_ROOTS: &[&str] = &["std", "core", "alloc"];
+
+/// Clock types refused as bare names too, so no import route or alias can bring them in. Time is
+/// `Ms`, passed in.
 const BARE_NAMES: &[&str] = &["Instant", "SystemTime"];
+
+/// Macros that read the build environment, or splice in a file this scan never reads.
+const FORBIDDEN_MACROS: &[&str] = &["env", "option_env", "include"];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).expect("read_dir domain/src") {
@@ -127,73 +137,122 @@ fn code_only(text: &str) -> String {
     out
 }
 
-/// Identifiers in order.
-fn idents(code: &str) -> Vec<&str> {
-    code.split(|c: char| !is_ident(c))
-        .filter(|t| !t.is_empty())
-        .collect()
+/// Identifiers, `::` and single punctuation characters of `code_only` output, each with its line.
+/// A raw identifier reads as its plain name (`r#fs` is `fs`).
+fn tokens(code: &str) -> Vec<(usize, String)> {
+    let c: Vec<char> = code.chars().collect();
+    let (mut i, mut line, mut out) = (0, 1, Vec::new());
+    while i < c.len() {
+        let raw_ident = c[i] == 'r'
+            && c.get(i + 1) == Some(&'#')
+            && c.get(i + 2).is_some_and(|&n| is_ident(n))
+            && (i == 0 || !is_ident(c[i - 1]));
+        if raw_ident {
+            i += 2;
+        } else if is_ident(c[i]) {
+            let start = i;
+            while i < c.len() && is_ident(c[i]) {
+                i += 1;
+            }
+            out.push((line, c[start..i].iter().collect()));
+        } else if c[i] == ':' && c.get(i + 1) == Some(&':') {
+            out.push((line, "::".to_string()));
+            i += 2;
+        } else {
+            if c[i] == '\n' {
+                line += 1;
+            } else if !c[i].is_whitespace() {
+                out.push((line, c[i].to_string()));
+            }
+            i += 1;
+        }
+    }
+    out
 }
 
-/// `use std::{fs, env};` never spells `std::fs`. Expand each `std::{…}` group in compacted code into
-/// one `std::<item>` path per top-level item, so the FORBIDDEN needles see it.
-fn expand_std_groups(compact: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    let mut rest = compact;
-    while let Some(at) = rest.find("std::{") {
-        rest = &rest[at + "std::{".len()..];
-        let mut depth = 1usize;
-        let mut item = String::new();
-        for ch in rest.chars() {
-            match ch {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-            if depth == 0 || (depth == 1 && ch == ',') {
-                paths.push(format!("std::{item}"));
-                item.clear();
-                if depth == 0 {
-                    break;
+/// Why the item that starts a `std::{…}` group (at `toks[j]`) is refused, if it is.
+fn group_item_refusal(toks: &[(usize, String)], j: usize) -> Option<String> {
+    let at = |k: usize| toks.get(k).map(|(_, t)| t.as_str());
+    match at(j) {
+        Some("self") if at(j + 1) == Some("as") => Some("`self as …` aliases the whole crate".into()),
+        Some("self") => None,
+        Some(m) if ALLOWED_MODULES.contains(&m) => None,
+        Some(m) => Some(format!("`{m}` is not on the allowlist")),
+        None => Some("an unterminated group".into()),
+    }
+}
+
+/// Every refusal in one file's tokens, with its line.
+fn refusals(toks: &[(usize, String)]) -> Vec<(usize, String)> {
+    let at = |k: usize| toks.get(k).map(|(_, t)| t.as_str());
+    let mut out = Vec::new();
+    for (k, (line, t)) in toks.iter().enumerate() {
+        let t = t.as_str();
+        if STD_ROOTS.contains(&t) && at(k + 1) == Some("as") {
+            out.push((*line, format!("`{t} as …` (an alias hides every path)")));
+        }
+        if STD_ROOTS.contains(&t) && at(k + 1) == Some("::") {
+            match at(k + 2) {
+                Some(m) if ALLOWED_MODULES.contains(&m) => {}
+                Some("{") => {
+                    // Walk the group: check the first segment of every top-level item.
+                    let (mut j, mut depth, mut item_start) = (k + 3, 1usize, true);
+                    while j < toks.len() && depth > 0 {
+                        if item_start && depth == 1 {
+                            if let Some(why) = group_item_refusal(toks, j) {
+                                out.push((toks[j].0, format!("`{t}::{{…}}`: {why}")));
+                            }
+                            item_start = false;
+                        }
+                        match toks[j].1.as_str() {
+                            "{" => depth += 1,
+                            "}" => depth -= 1,
+                            "," if depth == 1 => item_start = true,
+                            _ => {}
+                        }
+                        j += 1;
+                    }
                 }
-            } else {
-                item.push(ch);
+                Some(m) if m.chars().all(is_ident) => {
+                    out.push((*line, format!("`{t}::{m}` is not on the allowlist")))
+                }
+                other => out.push((
+                    *line,
+                    format!(
+                        "`{t}::{}` (a glob or macro splice the scan cannot read)",
+                        other.unwrap_or("")
+                    ),
+                )),
+            }
+        }
+        if BARE_NAMES.contains(&t) {
+            out.push((*line, format!("`{t}` (a clock type; time is `Ms`)")));
+        }
+        if FORBIDDEN_MACROS.contains(&t) && at(k + 1) == Some("!") {
+            out.push((*line, format!("`{t}!`")));
+        }
+        // `#[path = …]` / `#![…]` / `cfg_attr(…, path = …)` load a module from outside domain/src.
+        if t == "#" {
+            let open = if at(k + 1) == Some("!") { k + 2 } else { k + 1 };
+            if at(open) == Some("[") {
+                let mut depth = 0usize;
+                for (j, (tline, tok)) in toks.iter().enumerate().skip(open) {
+                    match tok.as_str() {
+                        "[" => depth += 1,
+                        "]" => depth -= 1,
+                        "path" if at(j + 1) == Some("=") => {
+                            out.push((*tline, "`path = …` attribute".to_string()))
+                        }
+                        _ => {}
+                    }
+                    if depth == 0 {
+                        break;
+                    }
+                }
             }
         }
     }
-    paths
-}
-
-/// Whether any attribute (`#[…]`, `#![…]`, `cfg_attr` included) sets `path = …`, which loads a
-/// module file from outside `domain/src`.
-fn has_path_attribute(compact: &str) -> bool {
-    let mut rest = compact;
-    while let Some(at) = rest.find('#') {
-        rest = &rest[at + 1..];
-        let body = rest.strip_prefix('!').unwrap_or(rest);
-        let Some(body) = body.strip_prefix('[') else {
-            continue;
-        };
-        let mut depth = 1usize;
-        let end = body
-            .char_indices()
-            .find(|&(_, ch)| {
-                match ch {
-                    '[' => depth += 1,
-                    ']' => depth -= 1,
-                    _ => {}
-                }
-                depth == 0
-            })
-            .map_or(body.len(), |(j, _)| j);
-        let attr = &body[..end];
-        let sets_path = attr
-            .match_indices("path=")
-            .any(|(j, _)| attr[..j].chars().next_back().is_none_or(|p| !is_ident(p)));
-        if sets_path {
-            return true;
-        }
-    }
-    false
+    out
 }
 
 #[test]
@@ -201,53 +260,24 @@ fn domain_source_has_no_clock_env_fs_net_thread_or_process() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     rust_files(&src, &mut files);
-    eprintln!("purity scan checked {} files", files.len());
     assert!(
         !files.is_empty(),
         "purity scan checked 0 files: the scan itself is broken"
     );
-    let mut hits = Vec::new();
+    let (mut hits, mut std_paths) = (Vec::new(), 0);
     for f in &files {
-        let code = code_only(&fs::read_to_string(f).expect("read source"));
-        let mut seen = Vec::new();
-        for (i, line) in code.lines().enumerate() {
-            for bad in FORBIDDEN.iter().filter(|bad| line.contains(*bad)) {
-                hits.push(format!("{}:{}: {bad}", f.display(), i + 1));
-                seen.push(*bad);
-            }
-            for name in idents(line).into_iter().filter(|t| BARE_NAMES.contains(t)) {
-                hits.push(format!(
-                    "{}:{}: `{name}` (a clock type; time is `Ms`)",
-                    f.display(),
-                    i + 1
-                ));
-            }
-        }
-        // Second pass for what no single line spells out: a path split across lines or spaced
-        // out, a grouped import, a `std as` alias, a `path` attribute.
-        let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
-        let mut haystacks = expand_std_groups(&compact);
-        haystacks.push(compact.clone());
-        for bad in FORBIDDEN.iter().filter(|bad| !seen.contains(*bad)) {
-            if haystacks.iter().any(|h| h.contains(bad)) {
-                hits.push(format!(
-                    "{}: {bad} (split across lines or inside a `std::{{…}}` group)",
-                    f.display()
-                ));
-            }
-        }
-        if idents(&code).windows(2).any(|w| w == ["std", "as"]) {
-            hits.push(format!(
-                "{}: `std as …` (an alias of std hides every path above)",
-                f.display()
-            ));
-        }
-        if has_path_attribute(&compact) {
-            hits.push(format!(
-                "{}: `#[path = …]` (loads a module from outside domain/src)",
-                f.display()
-            ));
+        let toks = tokens(&code_only(&fs::read_to_string(f).expect("read source")));
+        std_paths += toks
+            .windows(2)
+            .filter(|w| STD_ROOTS.contains(&w[0].1.as_str()) && w[1].1 == "::")
+            .count();
+        for (line, why) in refusals(&toks) {
+            hits.push(format!("{}:{line}: {why}", f.display()));
         }
     }
+    eprintln!(
+        "purity scan checked {} files, {std_paths} std/core/alloc paths",
+        files.len()
+    );
     assert!(hits.is_empty(), "domain must stay pure:\n{}", hits.join("\n"));
 }

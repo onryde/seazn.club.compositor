@@ -35,9 +35,13 @@ The orchestrator re-runs each wave's scoped gate itself and pastes the raw count
 - **A manifest is not the dependency graph.** `clock = { workspace = true }` reads as `clock` in a
   member's manifest while the workspace table renames it to `tokio`, and a transitive dependency is
   in no manifest of ours at all. The dependency guards read `cargo metadata`'s resolved graph.
+- **The dependency guards run `cargo metadata --locked`.** A cold cargo cache needs the network once
+  to read the registry index; offline it fails safe (the guard goes red), and so does a stale
+  `Cargo.lock`. Never drop `--locked` to make an offline run pass.
 - **An `#[ignore]`d guard still passes `cargo test`.** CI fails on any ignored test and requires each
   layering guard's own `... ok` line.
 - **`find -type f` never follows a symlink**, so a link under `crates/` or `docker/` would carry
   content past `check-portable.sh`. The script refuses every symlink there.
-- **A `//` inside a string is not a comment.** A line scan that splits on `//` drops the code after
-  `"http://…"`; `purity.rs` lexes comments and literals instead.
+- **A denylist of std paths always has one more door** (`std::r#fs`, `use std::{self as s}`, a
+  `macro_rules!` splice `std::$m`). `purity.rs` is an allowlist of std/core/alloc modules instead,
+  over a lexer that knows `//` inside a string is not a comment.
