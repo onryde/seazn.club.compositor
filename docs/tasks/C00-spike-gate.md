@@ -3,7 +3,7 @@
 **Repo:** `seazn.club.compositor`, branch `spike/t00`. This branch is **never merged**. Only
 `_FINDINGS.md` and the measured numbers carry forward, via a separate docs commit on `main`.
 **Depends on:** nothing. Runs in parallel with C01–C06.
-**Gate:** if **item 1 or item 2 fails**, STOP. Write the finding and report to the orchestrator, which
+**Gate:** if **item 1, item 2 or item 5 at 720p30 fails**, STOP. Write the finding and report to the orchestrator, which
 takes it to the owner. No further C task starts. If item 3, 4 or 5 fails, record it and continue:
 each one changes a default, not the architecture.
 
@@ -97,7 +97,8 @@ Secrets go in Fly secrets or local env only, never in the repo, argv or logs.
     "ready" log.
   - the cold-start time from `fly machine start` to the first cefsrc buffer
 
-  **FAIL** = it does not build, fps < 29.5, or > 1.5 cores.
+  **FAIL** = it does not build, fps < 29.5, or > 2.0 cores (a runaway). CEF's cores are otherwise a
+  recorded diagnostic; the cost gate is item 5 (owner ruling 2026-10-15).
 
 - [ ] **Step 5: Item 2, Cloudflare SRT playback.** With the phone streaming to Input A:
   ```bash
@@ -139,6 +140,9 @@ Secrets go in Fly secrets or local env only, never in the repo, argv or logs.
 - [ ] **Step 8: Item 5, cost numbers.** Run the full chain in one `gst-launch` (SRT in → compositor with
   a cefsrc overlay → x264 → RTMPS to B) at 720p30 and at 1080p30, for 5 min each. Record in
   **F-005**: total CPU %, RSS, `droppedFrames` (`queue` overruns) and encoder speed.
+  **GATE (owner ruling 2026-10-15):** at 720p30 the full chain averages ≤ 3.0 of 4 cores with no
+  sustained dropped frames and encoder speed ≥ 0.95. A fail stops the plan like items 1–2. 1080p is
+  recorded only.
 
 - [ ] **Step 9: Write `_FINDINGS.md` on main.** Each entry gives an ID, date, item, method, raw
   numbers, verdict (PASS/FAIL), and "what changes": which `config.rs` default or which ADR. Use this

@@ -13,6 +13,10 @@ Pinned 2026-10-14 in `seazn.club`; re-pin before relying on it.
 - The image comes from the web env `RELAY_IMAGE` (`runner-fly.ts:200`). Unset ⇒ the live runner
   refuses to construct.
 
+**Portability (ADR 0007):** the registry is one repo variable, `RELAY_REGISTRY` (default
+`registry.fly.io`), read by every workflow. No workflow hardcodes the Fly registry outside that
+default. Moving host changes the variable and the web runner driver, nothing in `crates/`.
+
 So a deploy has two parts:
 1. **Push** `registry.fly.io/seazn-relay-<env>:<sha>`. This changes nothing live. A Machine uses an
    image only when web creates one.

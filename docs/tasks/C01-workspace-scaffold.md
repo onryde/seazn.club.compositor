@@ -282,7 +282,7 @@ No GStreamer dependency yet. That arrives in C09, together with the CI apt step.
 
 - [ ] **Step 8: Rulebook.** `CLAUDE.md` contains exactly `@AGENTS.md`. `AGENTS.md` has these sections.
   Write them out in full prose, about 150–250 lines, using the facts given here:
-  1. **What this repo is.** The Seazn relay compositor: one per match, on Fly. Link to the spec, the
+  1. **What this repo is.** The Seazn relay compositor: one per match, on any OCI host that meets ADR 0007's contract (Fly today). Link to the spec, the
      plan and `docs/_INDEX.md`. Read `_INDEX.md` first.
   2. **Scope lock.** R2 is ADR 0003. Anything in spec §12 (R4) is refused, not half-built.
   3. **Layering, enforced.** domain → app → adapters → compositor. The three guard tests and what each
@@ -334,6 +334,15 @@ No GStreamer dependency yet. That arrives in C09, together with the CI apt step.
   git add -A && git commit -m "feat(scaffold): workspace, rulebook, CI check and layering guards (C01)"
   ```
   The commit body lists the three mutations and their red results.
+
+## Portability guard (ADR 0007, owner ruling 2026-10-15)
+
+- Create `scripts/check-portable.sh`, run by `check.yml`: it scans `crates/` and `docker/` for
+  `fly`, `FLY_`, `.internal` and `registry.fly.io` (case-insensitive) and fails on any hit. It prints
+  `files scanned: N` and fails on `N == 0` (anti-vacuity). Comments are not exempt: a comment naming
+  Fly is how a dependency starts.
+- **Mutate once:** add `std::env::var("FLY_REGION")` to any crate file. Expected red: the script.
+  Revert.
 
 ## Acceptance
 
