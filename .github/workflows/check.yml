@@ -25,5 +25,28 @@ jobs:
       - name: Refuse a vacuous run
         run: |
           total=$({ grep -Eo 'test result: ok\. [0-9]+ passed' test.log || true; } | awk '{s+=$4} END {print s+0}')
-          echo "tests passed: $total"
-          test "$total" -gt 0
+          ignored=$({ grep -E 'test result: ' test.log || true; } | { grep -Eo '[0-9]+ ignored' || true; } \
+            | awk '{s+=$1} END {print s+0}')
+          echo "tests passed: $total, ignored: $ignored"
+          # Every check reports before the step fails, so one run names every reason.
+          fail=0
+          if [ "$total" -le 0 ]; then
+            echo "::error::0 tests passed: a vacuous run"
+            fail=1
+          fi
+          if [ "$ignored" -ne 0 ]; then
+            echo "::error::$ignored test(s) ignored: an ignored guard guards nothing"
+            fail=1
+          fi
+          # Each layering guard must have run AND passed by name, so a renamed, deleted or
+          # skipped guard cannot hide behind the total.
+          for guard in domain_source_has_no_clock_env_fs_net_thread_or_process domain_has_no_io_dependencies \
+            app_dependency_graph_has_no_adapters app_sources_never_name_adapters; do
+            if grep -Fq "test $guard ... ok" test.log; then
+              echo "guard passed: $guard"
+            else
+              echo "::error::guard did not pass: $guard"
+              fail=1
+            fi
+          done
+          exit "$fail"

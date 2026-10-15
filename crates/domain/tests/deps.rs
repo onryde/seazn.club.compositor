@@ -1,8 +1,13 @@
-//! Guard: the domain crate depends on nothing that does I/O.
+//! Guard: the domain crate links nothing that does I/O, directly or transitively.
 //!
-//! Every table that links code into the domain is checked: `[dependencies]`, `[build-dependencies]`
-//! and their `[target.'cfg(…)'.…]` twins. `[dev-dependencies]` is exempt, because tests may do I/O
-//! (this file reads the manifest).
+//! Read from the resolved graph (`support/graph.rs`), so a workspace-inherited, renamed,
+//! target-specific, optional, build-time or transitive dependency is seen under its real package
+//! name. Dev-dependencies are exempt: tests may do I/O (this one runs `cargo metadata`).
+mod support {
+    pub mod graph;
+}
+use support::graph::{Graph, Kind};
+
 const FORBIDDEN_PREFIXES: &[&str] = &[
     "gstreamer",
     "gst",
@@ -17,57 +22,28 @@ const FORBIDDEN_PREFIXES: &[&str] = &[
     "cairo",
 ];
 
-const LINKED_SECTIONS: &[&str] = &["dependencies", "build-dependencies"];
-
-/// Every dependency table that links into the domain, top-level and per target.
-fn linked_dependency_tables(doc: &toml::Table) -> Vec<toml::Table> {
-    let mut scopes = vec![doc];
-    if let Some(targets) = doc.get("target").and_then(|t| t.as_table()) {
-        scopes.extend(targets.values().filter_map(|cfg| cfg.as_table()));
-    }
-    scopes
-        .into_iter()
-        .flat_map(|scope| {
-            LINKED_SECTIONS
-                .iter()
-                .filter_map(|s| scope.get(*s).and_then(|d| d.as_table()))
-        })
-        .cloned()
-        .collect()
-}
-
 #[test]
 fn domain_has_no_io_dependencies() {
-    let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).expect("manifest");
-    let doc: toml::Table = text.parse().expect("toml");
-    let package = doc
-        .get("package")
-        .and_then(|p| p.get("name"))
-        .and_then(|n| n.as_str());
-    assert_eq!(package, Some("domain"), "the deps guard read the wrong manifest");
-    let tables = linked_dependency_tables(&doc);
-    let mut names: Vec<String> = Vec::new();
-    for deps in &tables {
-        names.extend(deps.keys().cloned());
-        // A renamed dependency (`gst = { package = "gstreamer" }`) is checked by its real package name too.
-        for v in deps.values() {
-            if let Some(pkg) = v
-                .as_table()
-                .and_then(|t| t.get("package"))
-                .and_then(|p| p.as_str())
-            {
-                names.push(pkg.to_string());
-            }
-        }
-    }
-    let bad: Vec<&String> = names
+    let graph = Graph::load();
+    // Anti-vacuity: the domain has no dependencies today, so its closure is legitimately empty.
+    // Prove the traversal itself reaches through the graph: the binary must reach the domain.
+    let binary = graph.closure("compositor", &[Kind::Normal, Kind::Build]);
+    assert!(
+        binary.contains("domain"),
+        "graph traversal is broken: compositor does not reach domain"
+    );
+    let linked = graph.closure("domain", &[Kind::Normal, Kind::Build]);
+    let bad: Vec<&String> = linked
         .iter()
         .filter(|n| FORBIDDEN_PREFIXES.iter().any(|p| n.starts_with(p)))
         .collect();
     eprintln!(
-        "deps guard checked {} dependency names in {} tables",
-        names.len(),
-        tables.len()
+        "deps guard checked {} packages in domain's normal+build closure (traversal sanity: compositor reaches {})",
+        linked.len(),
+        binary.len()
     );
-    assert!(bad.is_empty(), "domain must not depend on I/O crates: {bad:?}");
+    assert!(
+        bad.is_empty(),
+        "domain must not link I/O crates, directly or transitively: {bad:?}"
+    );
 }

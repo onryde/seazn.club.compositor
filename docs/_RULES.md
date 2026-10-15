@@ -32,3 +32,12 @@ The orchestrator re-runs each wave's scoped gate itself and pastes the raw count
 - **Cargo allows a dev-dependency cycle.** `adapters` as a normal dependency of `app` is refused by
   cargo as a cycle before any test runs; as a dev-dependency it builds, and only `boundary.rs`
   refuses it.
+- **A manifest is not the dependency graph.** `clock = { workspace = true }` reads as `clock` in a
+  member's manifest while the workspace table renames it to `tokio`, and a transitive dependency is
+  in no manifest of ours at all. The dependency guards read `cargo metadata`'s resolved graph.
+- **An `#[ignore]`d guard still passes `cargo test`.** CI fails on any ignored test and requires each
+  layering guard's own `... ok` line.
+- **`find -type f` never follows a symlink**, so a link under `crates/` or `docker/` would carry
+  content past `check-portable.sh`. The script refuses every symlink there.
+- **A `//` inside a string is not a comment.** A line scan that splits on `//` drops the code after
+  `"http://…"`; `purity.rs` lexes comments and literals instead.

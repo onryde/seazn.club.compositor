@@ -9,6 +9,8 @@
 # reword it rather than exempting it.
 #
 # Prints `files scanned: N` and fails when N is 0: a scan of nothing proves nothing.
+# Fails on any symlink under the roots: `find -type f` never follows one, so a link would carry
+# content past this scan.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -17,6 +19,7 @@ ROOTS=(crates docker)
 PATTERN='fly|\.internal'
 
 files=()
+links=()
 for root in "${ROOTS[@]}"; do
   if [ ! -d "$root" ]; then
     echo "check-portable: $root/ is absent, skipped"
@@ -25,11 +28,20 @@ for root in "${ROOTS[@]}"; do
   while IFS= read -r -d '' f; do
     files+=("$f")
   done < <(find "$root" -type f -print0)
+  while IFS= read -r -d '' l; do
+    links+=("$l")
+  done < <(find "$root" -type l -print0)
 done
 
 echo "files scanned: ${#files[@]}"
+echo "symlinks found: ${#links[@]}"
 if [ "${#files[@]}" -eq 0 ]; then
   echo "check-portable: FAIL: scanned 0 files under ${ROOTS[*]}; the scan itself is broken" >&2
+  exit 1
+fi
+if [ "${#links[@]}" -gt 0 ]; then
+  echo "check-portable: FAIL: symlink(s) under ${ROOTS[*]}, which this scan cannot follow:" >&2
+  printf '  %s\n' "${links[@]}" >&2
   exit 1
 fi
 

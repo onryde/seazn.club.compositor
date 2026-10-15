@@ -2,7 +2,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const DEPENDENCY_SECTIONS: &[&str] = &["dependencies", "dev-dependencies", "build-dependencies"];
+#[path = "../../domain/tests/support/graph.rs"]
+mod graph;
+use graph::{Graph, Kind};
+
+/// The crate app must never reach. The source scan builds its patterns from this at run time, so
+/// this file's own text never matches them.
+const CRATE: &str = "adapters";
+/// Every directory cargo compiles app code from, plus `build.rs`.
+const SOURCE_DIRS: &[&str] = &["src", "tests", "benches", "examples"];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).expect("read_dir") {
@@ -15,73 +23,97 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every dependency table in the manifest, named for the failure message: the three top-level
-/// sections and their `[target.'cfg(…)'.…]` twins. A dev-dependency on adapters is no cargo cycle
-/// error (cargo allows dev-dependency cycles), so this test is the only thing that refuses it.
-fn dependency_tables(doc: &toml::Table) -> Vec<(String, toml::Table)> {
-    let mut scopes = vec![(String::new(), doc)];
-    if let Some(targets) = doc.get("target").and_then(|t| t.as_table()) {
-        for (cfg, body) in targets {
-            if let Some(body) = body.as_table() {
-                scopes.push((format!("target.{cfg}."), body));
+/// Identifiers, `::`, and single punctuation characters, in order, each with its line number.
+/// Comments and strings are NOT skipped: a comment that names the crate's path is a finding here too.
+fn tokens(text: &str) -> Vec<(usize, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let (mut i, mut line) = (0, 1);
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_alphanumeric() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
             }
+            out.push((line, chars[start..i].iter().collect()));
+        } else if c == ':' && chars.get(i + 1) == Some(&':') {
+            out.push((line, "::".to_string()));
+            i += 2;
+        } else {
+            if c == '\n' {
+                line += 1;
+            } else if !c.is_whitespace() {
+                out.push((line, c.to_string()));
+            }
+            i += 1;
         }
     }
-    let mut tables = Vec::new();
-    for (prefix, scope) in scopes {
-        for section in DEPENDENCY_SECTIONS {
-            if let Some(t) = scope.get(*section).and_then(|d| d.as_table()) {
-                tables.push((format!("{prefix}{section}"), t.clone()));
-            }
-        }
-    }
-    tables
+    out
 }
 
 #[test]
-fn app_manifest_has_no_adapters_dependency() {
-    let text = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).expect("manifest");
-    let doc: toml::Table = text.parse().expect("toml");
-    let package = doc
-        .get("package")
-        .and_then(|p| p.get("name"))
-        .and_then(|n| n.as_str());
-    assert_eq!(package, Some("app"), "the boundary guard read the wrong manifest");
-    let tables = dependency_tables(&doc);
-    let mut checked = 0;
-    for (section, deps) in &tables {
-        for (key, v) in deps {
-            checked += 1;
-            // A renamed dependency (`live = { package = "adapters" }`) is caught by its real package name.
-            let package = v
-                .as_table()
-                .and_then(|t| t.get("package"))
-                .and_then(|p| p.as_str());
-            assert!(
-                key != "adapters" && package != Some("adapters"),
-                "app/{section} must not include adapters (entry `{key}`)"
-            );
-        }
-    }
+fn app_dependency_graph_has_no_adapters() {
+    let graph = Graph::load();
+    // Every kind at app itself: a dev-dependency on adapters builds (cargo allows dev cycles), so
+    // only this refuses it. Past app, normal and build edges, e.g. a testkit that took adapters.
+    let reached = graph.closure("app", &[Kind::Normal, Kind::Build, Kind::Dev]);
     eprintln!(
-        "boundary guard checked {checked} dependency entries in {} tables",
-        tables.len()
+        "boundary guard checked {} packages in app's closure of every kind",
+        reached.len()
     );
     assert!(
-        checked > 0,
-        "boundary guard checked 0 dependency entries: app depends on domain at least"
+        reached.contains("domain"),
+        "graph traversal is broken: app does not reach domain"
+    );
+    assert!(
+        !reached.contains(CRATE),
+        "app must not reach {CRATE}, directly or transitively"
     );
 }
 
 #[test]
-fn app_source_never_names_adapters() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+fn app_sources_never_name_adapters() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
-    rust_files(&src, &mut files);
-    eprintln!("boundary scan checked {} files", files.len());
-    assert!(!files.is_empty(), "boundary scan checked 0 files");
-    for f in &files {
-        let text = fs::read_to_string(f).expect("read");
-        assert!(!text.contains("adapters::"), "{} names adapters::", f.display());
+    for dir in SOURCE_DIRS {
+        let dir = root.join(dir);
+        if dir.is_dir() {
+            rust_files(&dir, &mut files);
+        }
     }
+    let build = root.join("build.rs");
+    if build.is_file() {
+        files.push(build);
+    }
+    eprintln!(
+        "boundary scan checked {} files under {SOURCE_DIRS:?} and build.rs",
+        files.len()
+    );
+    // Anti-vacuity: the scan must cover tests/, which this very file proves by being in it.
+    assert!(
+        files.iter().any(|f| f.ends_with("tests/boundary.rs")),
+        "boundary scan did not reach tests/ (checked {} files)",
+        files.len()
+    );
+    let mut hits = Vec::new();
+    for f in &files {
+        let toks = tokens(&fs::read_to_string(f).expect("read"));
+        let tok = |j: Option<usize>| j.and_then(|j| toks.get(j)).map(|(_, t)| t.as_str());
+        for (i, (line, t)) in toks.iter().enumerate() {
+            let names_crate = t == CRATE
+                && (tok(Some(i + 1)) == Some("::")
+                    || tok(i.checked_sub(1)) == Some("::")
+                    || tok(i.checked_sub(1)) == Some("use")
+                    || (tok(i.checked_sub(1)) == Some("crate") && tok(i.checked_sub(2)) == Some("extern")));
+            if names_crate {
+                hits.push(format!("{}:{line}", f.display()));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "app code names the {CRATE} crate:\n{}",
+        hits.join("\n")
+    );
 }

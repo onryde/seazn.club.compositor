@@ -60,23 +60,32 @@ ports, so it depends on app, and app takes it as a dev-dependency only.
 
 Three guard tests make that the architecture rather than a picture of it:
 
-- `crates/domain/tests/purity.rs`: nothing under `domain/src` names `SystemTime::now`, `Instant::now`,
-  `std::env`, `std::fs`, `std::net`, `std::thread`, `std::process`, `env!(` or `option_env!(`. It
-  also sees them through a `use std::{…}` group or a path split over lines. `//` comments are skipped.
-- `crates/domain/tests/deps.rs`: the domain's `[dependencies]`, `[build-dependencies]` and their
-  `[target.'cfg(…)']` twins name no `gstreamer*`, `gst*`, `glib*`, `cef*`, `ureq`, `reqwest`, `hyper`,
-  `tokio`, `tiny_http`, `crossbeam` or `cairo` crate, by key or by renamed `package`.
-  `[dev-dependencies]` are exempt.
-- `crates/app/tests/boundary.rs`: no dependency table in app's manifest, dev and target tables
-  included, names `adapters` by key or `package`, and nothing under `app/src` contains `adapters::`.
-  Cargo refuses a normal dependency as a cycle, but it **allows a dev-dependency cycle**, so this test
-  is the only thing that refuses `adapters` as a dev-dependency.
+- `crates/domain/tests/purity.rs`: the code under `domain/src` (comments removed, string and char
+  literals emptied by a small lexer, so `//` inside a string is not a comment) never names
+  `std::env`, `std::fs`, `std::net`, `std::os`, `std::thread`, `std::process`, a `std::*` glob,
+  `env!`, `option_env!` or `include!`, and never names `Instant` or `SystemTime` at all, so an alias
+  cannot hide them. It also refuses a `std as …` alias and a `path = …` attribute (`cfg_attr`
+  included), and it sees paths split over lines or inside a `use std::{…}` group.
+- `crates/domain/tests/deps.rs`: the domain's normal and build closure in the **resolved graph**
+  (`cargo metadata --all-features`, every platform) contains no `gstreamer*`, `gst*`, `glib*`, `cef*`,
+  `ureq`, `reqwest`, `hyper`, `tokio`, `tiny_http`, `crossbeam` or `cairo` package. Because it reads
+  the graph, not the manifest, a renamed, workspace-inherited, target-specific, optional or transitive
+  dependency is caught by its real package name. Dev-dependencies are exempt.
+- `crates/app/tests/boundary.rs`: app's resolved closure of every kind (normal, build and dev at app
+  itself; normal and build past it) never reaches `adapters`, and no file under app's `src/`,
+  `tests/`, `benches/`, `examples/` or `build.rs` names the crate as a path. Cargo refuses a normal
+  dependency on adapters as a cycle, but it **allows a dev-dependency cycle**, so this test is the
+  only thing that refuses one.
+- Both dependency guards share `crates/domain/tests/support/graph.rs`, and each proves its traversal
+  reaches something real (the binary reaches the domain; app reaches the domain), so an empty graph
+  cannot pass them.
 
 And two more guards:
 
 - `scripts/check-portable.sh` (ADR 0007): no `fly` (case-insensitive, so `FLY_` and
   `registry.fly.io` too) and no `.internal` anywhere in `crates/` or `docker/`. Comments are not
-  exempt: a comment naming Fly is how a dependency starts. It prints `files scanned: N` and fails on 0.
+  exempt: a comment naming Fly is how a dependency starts. It prints `files scanned: N` and fails on
+  0, and it fails on any symlink under those roots, which its file scan cannot follow.
 - Workspace lints in `Cargo.toml`, opted into by every crate with `[lints] workspace = true`:
   `unsafe_code` is forbidden; `missing_debug_implementations` warns (an error under CI's
   `-D warnings`); clippy's `dbg_macro`, `print_stdout` and `todo` are denied. **One sanctioned
@@ -144,8 +153,10 @@ and a mutation proving the new form still bites.
   `cmd > out.log 2>&1; echo "EXIT=$?"`.
 - CI is `.github/workflows/check.yml`, on every PR and every push to `main`: portability guard,
   fmt, clippy `-D warnings`, `cargo test` with `--show-output`, then a step that refuses a run whose
-  passed total is 0. The job runs under an explicit `shell: bash`, which is what gives it `pipefail`.
-  Never remove it (see `docs/_RULES.md`).
+  passed total is 0, any ignored test, and any of the four layering guards missing its own
+  `test <name> ... ok` line. A guard renamed in code is renamed in that step too. The job runs under
+  an explicit `shell: bash`, which is what gives it `pipefail`. Never remove it (see
+  `docs/_RULES.md`).
 - Harness (C13): the image under `docker compose` with fakes, MediaMTX standing in for Cloudflare.
   Its commands are added here when C13 lands; until then there is no harness.
 - `GST_DEBUG=3` for pipeline issues. `GST_DEBUG=cefconsole:4` shows the overlay page's console,
