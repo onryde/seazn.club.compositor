@@ -3,3 +3,8 @@
 #![forbid(unsafe_code)]
 // The domain never writes to stderr; adapters and app own it (C12 logs there). Pinned by tests/purity.rs.
 #![forbid(clippy::print_stderr)]
+
+pub mod backoff;
+pub mod config;
+pub mod time;
+pub mod window;
