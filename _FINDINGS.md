@@ -201,6 +201,47 @@ The laptop display's own render/scan-out lag (≈1 refresh) was **not** subtract
 
 **Recommendation:** default `overlayDelayMs` = **3300 ms** (median rounded to 100 ms) for the passthrough capture path with playback latency 1000. If C10 ships a different `latency`, the default moves with it.
 
+**Step B: phone background/reconnect. PENDING the owner's report.**
+
+The owner was asked to background the capture app at 12:08:00 London for 20 s.
+
+*What the Machine saw:* `bg_watch.py` read 12:07:00–12:11:00 London, with a 5 s stall rebuild armed.
+- One connection, never closed and never stalled; 7090 AUs (≈30 fps).
+- The only gap over 300 ms was **328 ms** (12:08:36.296–12:08:36.624).
+- CF showed input `d98e98…` connected throughout, with no disconnect in its history.
+
+*Two readings, undecided:*
+- If the app was backgrounded, the capture app keeps streaming in the background: no reconnect, worst gap 328 ms.
+- Otherwise the background did not happen, and B is still owed.
+
+*Related observations:*
+- When the phone itself stops publishing, the CF playback socket stays open and silent, as in F-002. When the first session ended (10:58:58Z), the reader got 0 frames until it was rebuilt onto the new input.
+- The new session's input was live 26 s after the old one ended.
+
+**Steps C and D: ran 12:13:00–12:21:50 London WITHOUT an owner view (no YouTube verdict).** The owner stepped away, and the HOLD arrived after the run.
+
+*Step C* (5 min to Input B):
+- Settings as C09 ships: 720p30, x264 4000 kbps, `vbv-buf-capacity=1000`, `nal-hrd=cbr:filler=1`, keyint 60, bframes 0, scenecut on.
+- Camera = SRT playback of the phone, plus the `overlay-test.html` overlay.
+- Results:
+  - filler share **0.21 %** (real video 3989 kbps); keyframes 148 in 290 s (≈1.96 s);
+  - egress 3931–4367 kbps per 10 s window; encoder ≥ 29.8 fps after the first window; 0 queue overruns;
+  - Machine 1.168 cores average (p95 1.38, max 1.557).
+- The scene content was not verified (no snapshot); it was presumably still the laptop/clock scene. Even so, real camera footage carries almost no filler at 4000 kbps, unlike the 56–78 % of the test-pattern runs in F-004.
+
+*Step D* (each stop is SIGKILL of the chain, i.e. a crashed compositor; each restart opens a new RTMPS connection to B). Wall times (London):
+
+| Gap | Kill | Restart | First 10 s window after restart |
+|---|---|---|---|
+| 5 s | 12:18:00.831 | 12:18:05.837 | encoder 28.45 fps, camera 23.1 fps |
+| 15 s | 12:19:05.854 | 12:19:20.860 | encoder 28.39 fps, camera 20.3 fps |
+| 30 s | 12:20:20.882 | 12:20:50.888 | encoder 28.44 fps, camera 20.7 fps |
+
+- Final kill at 12:21:50.914.
+- Each run lasted 60 s, with 0 overruns and egress 3938–4241 kbps.
+- CF Input B's status history only keeps the latest connect: 11:20:52.023Z, then `client_disconnect` at 11:21:51.249Z. CF does not retain a per-gap history, so the YouTube side of each gap is unobserved.
+- The phone input itself disconnected at 11:21:38.413Z. In the last D30 window (12:21:31–41) the camera fell to 22.6 fps, and **the compositor output fell with it to 25.7 fps.** A plain GStreamer `compositor` in live mode is not fully clock-driven when the camera starves, which supports C09's own frame-tick design.
+
 **Changes:**
 - **Spec, reported only (ADRs and spec not edited).** The spec says "CF SRT playback is single-reader / a second reader kicks the first" (§3.1 topology diagram; §3.2 "Exactly one reader per SRT playback stream"; §4.2 InputLink kicks; §6 failure table; §9.1 Q2; risk table). That is **false as measured**: CF served two concurrent readers from the same IP and from different IPs, with no kick. "One reader" stays a valid *design* choice. C04's kick counting stays for CF-side closes and maintenance, but C13's fake CF should not model "a second reader kicks the first" as CF behaviour.
 - **`Thresholds::input_stall_after_ms` = 5 000:** unchanged and confirmed necessary. CF holds an encrypted, silent playback socket open indefinitely when the ingest carries no usable video.
