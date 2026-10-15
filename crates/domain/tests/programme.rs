@@ -256,6 +256,7 @@ struct Seen {
     row_hits: Vec<usize>,
     phase_ticks: [usize; 4],
     late_accepted: usize,
+    early_ticks: usize,
     late_ignored: usize,
     age_at_frozen_after: usize,
     age_one_past_frozen_after: usize,
@@ -301,6 +302,7 @@ impl Sim<'_> {
             self.tail()
         );
         let age = self.m.age(now);
+        self.seen.early_ticks += usize::from(self.m.frames.last().is_some_and(|&l| now < l));
         if feed == Feed::Continuous || feed == Feed::Fresh {
             let span = self.m.span(t);
             self.seen.span_one_short += usize::from(span == t.resume_after_ms - 1);
@@ -376,6 +378,7 @@ fn programme_matches_the_reference_model_over_generated_schedules() {
     let stalls = [2_999, 3_000, 3_001, 4_000];
     let late_by = [1, 50, 100, 200, 300, 400, 499, 600, 5_000];
     let continue_by = [1, 100, 250, 400, 499, 500];
+    let early_by = [1, 100, 499, 500, 501, 2_999, 3_000, 3_001];
     for _case in 0..CASES {
         let mut sim = Sim {
             p: Programme::default(),
@@ -390,7 +393,7 @@ fn programme_matches_the_reference_model_over_generated_schedules() {
         let mut now: Ms = rng.next(50);
         for _seg in 0..SEGMENTS {
             let ti = rng.pick(&tick_intervals);
-            match rng.next(12) {
+            match rng.next(13) {
                 // The camera delivers frames every `fi` while the ticks run every `ti`; at a shared
                 // instant either may come first.
                 0..=4 => {
@@ -426,6 +429,12 @@ fn programme_matches_the_reference_model_over_generated_schedules() {
                     sim.frame(now.saturating_sub(rng.pick(&late_by)), true);
                     sim.tick(now);
                 }
+                // A tick stamped before the latest frame: a clock that stepped back (C08/C12 owe a
+                // monotonic `now`, docs/_INDEX.md). The age reads 0, and the run is unchanged.
+                12 => {
+                    let latest = sim.m.frames.last().copied().unwrap_or(0);
+                    sim.tick(latest.saturating_sub(rng.pick(&early_by)));
+                }
                 // A frame delivered late: stamped just after the latest frame but before the latest
                 // tick. It is the only way a Frozen programme meets a Continuous feed (the run
                 // survives the gap the tick already saw), so row (Frozen, Continuous) gets a witness.
@@ -439,11 +448,12 @@ fn programme_matches_the_reference_model_over_generated_schedules() {
         seen = sim.seen;
     }
     eprintln!(
-        "reference-model sweep: {CASES} cases, {} ticks, {} frames ({} late accepted, {} late \
-         ignored); ticks per phase {:?} (Waiting, Live, Frozen, Reconnecting); hits per table row \
+        "reference-model sweep: {CASES} cases, {} ticks ({} before the latest frame), {} frames \
+         ({} late accepted, {} late ignored); ticks per phase {:?} (Waiting, Live, Frozen, Reconnecting); hits per table row \
          {:?}; boundary ticks: age 500 = {}, 501 = {}, 2 999 = {}, 3 000 = {}; span 999 = {}, \
          1 000 = {}",
         seen.ticks,
+        seen.early_ticks,
         seen.frames,
         seen.late_accepted,
         seen.late_ignored,
@@ -464,6 +474,10 @@ fn programme_matches_the_reference_model_over_generated_schedules() {
         assert!(n > 0, "the sweep never ticked in {:?}", PHASES[i]);
     }
     assert!(seen.late_accepted > 0, "no late frame was accepted");
+    assert!(
+        seen.early_ticks > 0,
+        "no tick was stamped before the latest frame"
+    );
     assert!(
         seen.late_ignored > 0,
         "no frame stamped before the latest was sent"
@@ -488,6 +502,140 @@ fn programme_matches_the_reference_model_over_generated_schedules() {
 const SLATE_BUDGET_MS: Ms = 3_100;
 const LIVE_BUDGET_MS: Ms = 1_200;
 
+/// The documented cost of measuring "1 s of continuous frames" as the span of the frames received
+/// (docs/_INDEX.md, C03): live comes back at most `resume_after_ms` + the largest gap inside the
+/// returned run + one tick after the first returned frame. The frame that completes the 1 s span is
+/// at most one gap past the 1 s mark, and the next tick sees it. At 30 fps the 1.2 s budget therefore
+/// holds for in-run gaps up to 1 200 − 1 000 − 34 = 166 ms.
+fn live_bound(t: &Thresholds, max_gap: Ms, tick_step: Ms) -> Ms {
+    t.resume_after_ms + max_gap + tick_step
+}
+
+/// What a gap row must show, beyond `live_bound`, which every row holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expect {
+    /// Every case inside the 1.2 s budget.
+    Budget,
+    /// The bound only: the gap is past the 166 ms the budget is proven for.
+    Bound,
+    /// The bound, and at least one case past the budget, so the documented cost is real, not stale.
+    BoundAndAMiss,
+}
+
+/// Gap rows: one long gap inside the returned run, swept across every position of its first 1.2 s.
+/// - 110 ms, F-002's worst measured inter-frame gap (108.8 ms) rounded up: holds the 1.2 s budget.
+/// - 200 ms, past the 166 ms the budget is proven for: holds the bound.
+/// - 300 ms, a burst gap still inside the 0.5 s run rule: holds the bound and misses the budget.
+///
+/// Every row must also show a case slower than the steady camera's bound, which proves its gap
+/// landed on the 1 s mark rather than somewhere harmless.
+const GAP_ROWS: [(Ms, Expect); 3] = [
+    (110, Expect::Budget),
+    (200, Expect::Bound),
+    (300, Expect::BoundAndAMiss),
+];
+
+/// What one outage case showed after the camera came back.
+struct Outcome {
+    slated: bool,
+    /// From the instant the camera returned (`back`) to the first `Emit` after it.
+    live_from_back: Ms,
+    /// From the first returned frame to the first `Emit` after it.
+    live_from_first: Ms,
+}
+
+/// Feeds `frames` and runs `ticks` (a frame first at a shared instant), then checks everything
+/// about the loss at `loss` and the return at `back` except the return-to-live budget, which the
+/// caller owns because it depends on the camera's gaps.
+fn check_outage(
+    ctx: &str,
+    t: &Thresholds,
+    tick_step: Ms,
+    frames: &[Ms],
+    ticks: &[Ms],
+    loss: Ms,
+    back: Ms,
+) -> Outcome {
+    let last_before = *frames
+        .iter()
+        .rfind(|&&f| f < loss)
+        .expect("frames before the loss");
+    let first_after = *frames
+        .iter()
+        .find(|&&f| f >= back)
+        .expect("frames after the return");
+    // From the schedule alone: does any tick fall where the latest frame is ≥ 3 s old?
+    let expect_slate = ticks
+        .iter()
+        .any(|&n| n >= last_before + t.slate_after_ms && n < first_after);
+
+    let (mut m, mut fi) = (Programme::default(), 0);
+    let mut out: Vec<(Ms, FrameChoice)> = Vec::with_capacity(ticks.len());
+    for &n in ticks {
+        while fi < frames.len() && frames[fi] <= n {
+            m.on_frame(frames[fi], t);
+            fi += 1;
+        }
+        out.push((n, m.on_tick(n, t)));
+    }
+    let first_at = |from: Ms, want: FrameChoice| {
+        out.iter()
+            .find(|&&(n, c)| n >= from && c == want)
+            .map(|&(n, _)| n)
+    };
+
+    let live = first_at(0, FrameChoice::Emit).expect("never live");
+    let since_first = live - frames[0];
+    assert!(
+        since_first >= t.resume_after_ms,
+        "{ctx}: live after {since_first} ms"
+    );
+    assert!(
+        since_first <= LIVE_BUDGET_MS,
+        "{ctx}: first live after {since_first} ms"
+    );
+
+    let frozen = first_at(loss, FrameChoice::Repeat).expect("never froze") - last_before;
+    assert!(frozen > t.frozen_after_ms, "{ctx}: froze at +{frozen}");
+    assert!(
+        frozen <= t.frozen_after_ms + tick_step,
+        "{ctx}: froze late, at +{frozen}"
+    );
+
+    let back_live = first_at(first_after, FrameChoice::Emit).expect("never back");
+    let slated = match first_at(loss, FrameChoice::Slate(SlateKind::Reconnecting)) {
+        Some(slate) => {
+            let slate = slate - last_before;
+            assert!(expect_slate, "{ctx}: slate at +{slate} with no 3 s gap");
+            assert!(slate >= t.slate_after_ms, "{ctx}: slate at +{slate}");
+            assert!(
+                slate <= SLATE_BUDGET_MS,
+                "{ctx}: PDF budget slate ≤ 3.1 s, got +{slate}"
+            );
+            assert!(
+                back_live - first_after >= t.resume_after_ms,
+                "{ctx}: live {} ms after the return",
+                back_live - first_after
+            );
+            true
+        }
+        None => {
+            assert!(!expect_slate, "{ctx}: a 3 s gap and no slate");
+            assert!(
+                back_live - first_after <= tick_step,
+                "{ctx}: resume took {}",
+                back_live - first_after
+            );
+            false
+        }
+    };
+    Outcome {
+        slated,
+        live_from_back: back_live - back,
+        live_from_first: back_live - first_after,
+    }
+}
+
 // Both modes are 30 fps (ADR 0005), so they share one tick grid; the sweep runs both so that a profile
 // at another rate would be checked too. A tick lands on the first whole millisecond at or after its
 // due time, i · period, as C08's `tick_due` reads them; frames use the same rounding on their grid.
@@ -496,129 +644,128 @@ const LIVE_BUDGET_MS: Ms = 1_200;
 fn the_pdf_budgets_hold_in_both_modes_at_every_grid_phase() {
     let t = Thresholds::default();
     let (mut checked, mut slated, mut frozen_only) = (0usize, 0usize, 0usize);
+    // Per gap row: cases, slated cases, worst live latency from the first returned frame and from
+    // the return, and the cases past the 1.2 s budget.
+    let mut rows = [(0usize, 0usize, 0, 0, 0usize); GAP_ROWS.len()];
     let outages = [
         600, 1_000, 2_000, 2_900, 2_990, 3_000, 3_010, 3_100, 3_500, 5_000, 10_000,
     ];
+    let loss = 5_000;
+    // The gap rows need less timeline: an earlier loss and 2 s after the return still cover the
+    // first live, the freeze, the slate and the return.
+    let (gap_outages, gap_loss) = ([1_000, 3_500], 2_000);
+    let step30 = OutputProfile::P720.frame_period_ms().ceil() as Ms;
     for profile in [OutputProfile::P720, OutputProfile::P1080] {
         let period = profile.frame_period_ms();
         let tick_step = period.ceil() as Ms;
+        assert_eq!(tick_step, step30, "{profile:?}: both modes are 30 fps (ADR 0005)");
         let at = |i: u64, offset: Ms| offset + (i as f64 * period).ceil() as Ms;
+        let grid = |phase: Ms, end: Ms| (0..).map(move |k| at(k, phase)).take_while(move |&f| f < end);
+        let ticks_until = |end: Ms| {
+            (0..)
+                .map(|i| at(i, 0))
+                .take_while(|&n| n < end)
+                .collect::<Vec<_>>()
+        };
         for phase in 0..tick_step {
+            // A steady 30 fps camera.
             for outage in outages {
-                let loss = 5_000;
-                let back = loss + outage;
-                let end = back + 3_000;
-                let camera = |at: Ms| at < loss || at >= back;
-                let frames: Vec<Ms> = (0..)
-                    .map(|k| at(k, phase))
-                    .take_while(|&f| f < end)
-                    .filter(|&f| camera(f))
-                    .collect();
-                let ticks: Vec<Ms> = (0..).map(|i| at(i, 0)).take_while(|&n| n < end).collect();
-                let last_before = *frames
-                    .iter()
-                    .rfind(|&&f| f < loss)
-                    .expect("frames before the loss");
-                let first_after = *frames
-                    .iter()
-                    .find(|&&f| f >= back)
-                    .expect("frames after the return");
-                // From the schedule alone: does any tick fall where the latest frame is ≥ 3 s old?
-                let expect_slate = ticks
-                    .iter()
-                    .any(|&n| n >= last_before + t.slate_after_ms && n < first_after);
-
-                let (th, mut m, mut fi) = (&t, Programme::default(), 0);
-                let mut out: Vec<(Ms, FrameChoice)> = Vec::with_capacity(ticks.len());
-                for &n in &ticks {
-                    while fi < frames.len() && frames[fi] <= n {
-                        m.on_frame(frames[fi], th);
-                        fi += 1;
-                    }
-                    out.push((n, m.on_tick(n, th)));
-                }
-                let first_at = |from: Ms, want: FrameChoice| {
-                    out.iter()
-                        .find(|&&(n, c)| n >= from && c == want)
-                        .map(|&(n, _)| n)
-                };
+                let (back, end) = (loss + outage, loss + outage + 3_000);
+                let frames: Vec<Ms> = grid(phase, end).filter(|&f| f < loss || f >= back).collect();
                 let ctx = format!("{profile:?} phase {phase} outage {outage}");
-
-                let live = first_at(0, FrameChoice::Emit).expect("never live");
-                assert!(
-                    live - frames[0] >= t.resume_after_ms,
-                    "{ctx}: live after {} ms",
-                    live - frames[0]
-                );
-                assert!(
-                    live - frames[0] <= LIVE_BUDGET_MS,
-                    "{ctx}: first live after {} ms",
-                    live - frames[0]
-                );
-
-                let frozen = first_at(loss, FrameChoice::Repeat).expect("never froze");
-                assert!(
-                    frozen - last_before > t.frozen_after_ms,
-                    "{ctx}: froze at +{}",
-                    frozen - last_before
-                );
-                assert!(
-                    frozen - last_before <= t.frozen_after_ms + tick_step,
-                    "{ctx}: froze late, at +{}",
-                    frozen - last_before
-                );
-
-                let back_live = first_at(first_after, FrameChoice::Emit).expect("never back");
-                match first_at(loss, FrameChoice::Slate(SlateKind::Reconnecting)) {
-                    Some(slate) => {
-                        assert!(
-                            expect_slate,
-                            "{ctx}: slate at +{} with no 3 s gap",
-                            slate - last_before
-                        );
-                        assert!(
-                            slate - last_before >= t.slate_after_ms,
-                            "{ctx}: slate at +{}",
-                            slate - last_before
-                        );
-                        assert!(
-                            slate - last_before <= SLATE_BUDGET_MS,
-                            "{ctx}: PDF budget slate ≤ 3.1 s, got +{}",
-                            slate - last_before
-                        );
-                        assert!(
-                            back_live - first_after >= t.resume_after_ms,
-                            "{ctx}: live {} ms after the return",
-                            back_live - first_after
-                        );
-                        assert!(
-                            back_live - back <= LIVE_BUDGET_MS,
-                            "{ctx}: PDF budget live ≤ 1.2 s after the camera returns, got {}",
-                            back_live - back
-                        );
-                        slated += 1;
-                    }
-                    None => {
-                        assert!(!expect_slate, "{ctx}: a 3 s gap and no slate");
-                        assert!(
-                            back_live - first_after <= tick_step,
-                            "{ctx}: resume took {}",
-                            back_live - first_after
-                        );
-                        frozen_only += 1;
-                    }
+                let o = check_outage(&ctx, &t, tick_step, &frames, &ticks_until(end), loss, back);
+                if o.slated {
+                    assert!(
+                        o.live_from_back <= LIVE_BUDGET_MS,
+                        "{ctx}: PDF budget live ≤ 1.2 s after the camera returns, got {}",
+                        o.live_from_back
+                    );
+                    assert!(o.live_from_first <= live_bound(&t, tick_step, tick_step), "{ctx}");
+                    slated += 1;
+                } else {
+                    frozen_only += 1;
                 }
                 checked += 1;
             }
+            // A camera that comes back with one long gap after its `after`-th frame.
+            for (row, &(gap, expect)) in GAP_ROWS.iter().enumerate() {
+                for outage in gap_outages {
+                    let (back, end) = (gap_loss + outage, gap_loss + outage + 2_000);
+                    let before: Vec<Ms> = grid(phase, gap_loss).collect();
+                    let returned: Vec<Ms> = grid(phase, end).filter(|&f| f >= back).collect();
+                    for after in 0..=(LIVE_BUDGET_MS / tick_step) as usize {
+                        let shift = gap - (returned[after + 1] - returned[after]);
+                        let shifted = returned
+                            .iter()
+                            .enumerate()
+                            .map(|(k, &f)| if k > after { f + shift } else { f });
+                        let frames: Vec<Ms> = before
+                            .iter()
+                            .copied()
+                            .chain(shifted)
+                            .filter(|&f| f < end)
+                            .collect();
+                        let ctx =
+                            format!("{profile:?} phase {phase} outage {outage} gap {gap} after {after}");
+                        let o = check_outage(&ctx, &t, tick_step, &frames, &ticks_until(end), gap_loss, back);
+                        let r = &mut rows[row];
+                        r.0 += 1;
+                        if o.slated {
+                            let bound = live_bound(&t, gap, tick_step);
+                            assert!(
+                                o.live_from_first <= bound,
+                                "{ctx}: live {} ms after the first returned frame, bound {bound}",
+                                o.live_from_first
+                            );
+                            if expect == Expect::Budget {
+                                assert!(
+                                    o.live_from_back <= LIVE_BUDGET_MS,
+                                    "{ctx}: PDF budget live ≤ 1.2 s after the camera returns, got {}",
+                                    o.live_from_back
+                                );
+                            }
+                            r.1 += 1;
+                            r.2 = r.2.max(o.live_from_first);
+                            r.3 = r.3.max(o.live_from_back);
+                            r.4 += usize::from(o.live_from_back > LIVE_BUDGET_MS);
+                        }
+                        checked += 1;
+                    }
+                }
+            }
         }
     }
-    eprintln!(
-        "budget sweep: {checked} (mode, grid phase, outage) cases: {slated} slated, {frozen_only} \
-         frozen only"
-    );
+    eprintln!("budget sweep: {checked} cases: steady camera {slated} slated, {frozen_only} frozen only");
+    for (&(gap, expect), r) in GAP_ROWS.iter().zip(&rows) {
+        eprintln!(
+            "  gap {gap} ms ({expect:?}): {} cases, {} slated, worst live {} ms after the first \
+             returned frame (bound {}), {} ms after the return; {} past the 1.2 s budget",
+            r.0,
+            r.1,
+            r.2,
+            live_bound(&t, gap, step30),
+            r.3,
+            r.4
+        );
+    }
     assert!(checked > 0, "the budget sweep checked 0 cases");
     assert!(
         slated > 0 && frozen_only > 0,
         "both outcomes must be exercised: {slated} / {frozen_only}"
     );
+    for (&(gap, expect), r) in GAP_ROWS.iter().zip(&rows) {
+        assert!(r.1 > 0, "gap {gap} ms: no slated case checked");
+        assert!(
+            r.2 > live_bound(&t, step30, step30),
+            "gap {gap} ms: worst live {} ms is no slower than a steady camera's; the gap never \
+             landed on the 1 s mark",
+            r.2
+        );
+        if expect == Expect::BoundAndAMiss {
+            assert!(
+                r.4 > 0,
+                "gap {gap} ms never missed the 1.2 s budget: the documented cost is stale"
+            );
+        }
+    }
 }

@@ -84,7 +84,8 @@ pub fn choice_for(phase: ProgrammePhase) -> FrameChoice {
 }
 
 /// The unbroken run of camera frames: its first frame and its latest. `since <= last` always: a run
-/// starts with both at one frame, and `last` only grows.
+/// starts with both at one frame, and `last` only grows. `feed` still reads the span through
+/// `elapsed`, so a broken invariant would read as a short run (the slate holds), never a wrapped one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Run {
     since: Ms,
@@ -143,7 +144,7 @@ impl Programme {
         if age > t.frozen_after_ms {
             return Feed::Gap;
         }
-        if r.last - r.since >= t.resume_after_ms {
+        if elapsed(r.last, r.since) >= t.resume_after_ms {
             Feed::Continuous
         } else {
             Feed::Fresh
@@ -625,6 +626,23 @@ mod tests {
             "the run 0..=1 400 spans 1.4 s"
         );
         assert_eq!(m.on_tick(now, &th), Emit);
+    }
+
+    // A tick stamped BEFORE the latest frame (a clock that stepped back; C08/C12 owe a monotonic
+    // `now`, docs/_INDEX.md): the frame's age reads 0, never a wrapped age, and the run is still the
+    // span of the frames received (1 s here), not the 995 ms from its first frame to `now`.
+    #[test]
+    fn a_tick_before_the_latest_frame_reads_age_zero_and_the_whole_run() {
+        let th = t();
+        let mut m = Programme::default();
+        let r = th.resume_after_ms;
+        assert_eq!(frames(&mut m, 0, r - 10, 10, &th), Slate(SlateKind::Waiting));
+        m.on_frame(r, &th);
+        let early = r - 5;
+        assert_eq!(m.feed(early, &th), Feed::Continuous, "age 0, frames span 1 s");
+        assert_eq!(m.feed(0, &th), Feed::Continuous, "a tick before the run began");
+        assert_eq!(m.on_tick(early, &th), Emit);
+        assert_eq!(m.last_frame_at(), Some(r), "the tick moved the latest frame");
     }
 
     // ---- loss while already lost ----
