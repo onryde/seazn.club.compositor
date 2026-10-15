@@ -30,11 +30,12 @@ pub struct Thresholds {
     pub kick_alert_count: usize,
     /// PDF failure table: the "5 min" of "> 3 times in 5 min".
     pub kick_window_ms: Ms,
-    /// PDF chaos "destination accepts but stalls: detected within 5 s". F-005: CF Input B never acked
-    /// RTMP bytes (rtmp2sink `out-bytes-acked` stayed 0 in its 290 s pushes while `out-bytes-total`
-    /// grew), so "no bytes acked" cannot be the live signal behind this stall or behind C09's "first
-    /// acked bytes → OutputConnected" (docs/_INDEX.md false premises).
-    pub output_ack_stall_ms: Ms,
+    /// PDF chaos "destination accepts but stalls: detected within 5 s": a Connected output whose
+    /// bytes-SENT total has not grown for this long is stalled, and its sink is swapped at once (C04
+    /// `OutputLink::on_progress`). Not an ack stall: F-005 found CF Input B sends no RTMP
+    /// acknowledgements (rtmp2sink `out-bytes-acked` stayed 0 in its 290 s pushes while
+    /// `out-bytes-total` grew), so C09 feeds `out-bytes-total` (docs/_INDEX.md false premises).
+    pub output_stall_after_ms: Ms,
     /// C02 brief default, sized to the PDF budget "output reconnect ≤ 5 s": back-off 0.5 s → 2 s keeps
     /// attempts inside it. The first wait.
     pub output_backoff_base_ms: Ms,
@@ -83,6 +84,12 @@ pub struct Thresholds {
 /// not a `Thresholds` field, because `Thresholds` derives `Eq`. C09's band and C14 case 6 both read it.
 pub const ENCODER_SPEED_REALTIME_MIN: f64 = 0.95;
 
+/// F-004 (owner-observed; docs/_INDEX.md decision log, the C00 owner session): YouTube kept the
+/// organiser's broadcast through 5 s and 15 s output gaps and started a new broadcast after a 30 s
+/// one. So every recovery path the broadcast must survive finishes its output gap UNDER this. A const,
+/// not a `Thresholds` field: it is YouTube's behaviour, not a setting of ours.
+pub const OUTPUT_GAP_BUDGET_MS: Ms = 15_000;
+
 impl Default for Thresholds {
     fn default() -> Self {
         Self {
@@ -95,7 +102,7 @@ impl Default for Thresholds {
             input_stall_after_ms: 5_000,
             kick_alert_count: 3,
             kick_window_ms: 300_000,
-            output_ack_stall_ms: 5_000,
+            output_stall_after_ms: 5_000,
             output_backoff_base_ms: 500,
             output_backoff_cap_ms: 2_000,
             output_connect_timeout_ms: 5_000,
@@ -213,9 +220,10 @@ mod tests {
     }
 
     // Each number against its own source. The plan's Global Constraints: input back-off 1 s → 10 s; a
-    // kick alert at MORE than 3 kicks in 5 min; output stall after 5 s with no ack; a heartbeat every
-    // 5000 ms; CEF recycled every 2 h. Spec §4.2: CEF Failed after 3 failures in 5 min. The C02 brief
-    // default: output back-off 0.5 s → 2 s, sized to the PDF's 5 s reconnect budget.
+    // kick alert at MORE than 3 kicks in 5 min; output stall after 5 s (the plan says "no bytes acked";
+    // F-005 makes it no bytes sent); a heartbeat every 5000 ms; CEF recycled every 2 h. Spec §4.2: CEF
+    // Failed after 3 failures in 5 min. The C02 brief default: output back-off 0.5 s → 2 s, sized to
+    // the PDF's 5 s reconnect budget.
     #[test]
     fn link_and_lifecycle_numbers_match_their_sources() {
         let t = Thresholds::default();
@@ -225,7 +233,7 @@ mod tests {
             "input back-off"
         );
         assert_eq!((t.kick_alert_count, t.kick_window_ms), (3, 300_000), "kick alert");
-        assert_eq!(t.output_ack_stall_ms, 5_000, "output stall");
+        assert_eq!(t.output_stall_after_ms, 5_000, "output stall");
         assert_eq!(
             (t.output_backoff_base_ms, t.output_backoff_cap_ms),
             (500, 2_000),
@@ -268,8 +276,14 @@ mod tests {
     #[test]
     fn output_stall_and_one_reconnect_fit_inside_youtubes_15_s_split() {
         let t = Thresholds::default();
-        let gap = t.output_ack_stall_ms + t.output_backoff_cap_ms + t.output_connect_timeout_ms;
-        assert!(gap < 15_000, "output recovery gap {gap} ms");
+        let gap = t.output_stall_after_ms + t.output_backoff_cap_ms + t.output_connect_timeout_ms;
+        assert!(gap < OUTPUT_GAP_BUDGET_MS, "output recovery gap {gap} ms");
+    }
+
+    // F-004: the same broadcast survived a 15 s gap, and a 30 s gap split it.
+    #[test]
+    fn output_gap_budget_is_the_15_s_youtube_kept_in_f004() {
+        assert_eq!(OUTPUT_GAP_BUDGET_MS, 15_000);
     }
 
     // The C00 cost gate is "encoder speed ≥ 0.95"; F-005's worst 10 s window (0.9963) and a healthy
