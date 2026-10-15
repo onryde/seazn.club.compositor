@@ -1,0 +1,73 @@
+<!doctype html>
+<!-- C00 spike test page (THROWAWAY). Transparent body, ticking ms clock, moving box, and four
+     fixed probe patches whose expected BGRA values are known, so a frame dump can tell
+     straight alpha from premultiplied alpha.
+
+     Query switches:
+       ?noready=1  never send the readiness signal (negative proof)
+       ?static=1   no animation at all (measures what cefsrc emits for an idle page)
+
+     Readiness (pinned in F-001): window.gstSendMsg({request: "ready", ...}) 500 ms after load.
+     That function only exists inside cefsrc (injected by gstcefsubprocess's message router). -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; width: 1920px; height: 1080px; background: transparent; overflow: hidden; }
+  .abs { position: absolute; }
+  /* C11 parity: opaque blue square at top-left, 100x100. */
+  #blue  { left: 0;    top: 0;   width: 100px; height: 100px; background: #0000ff; }
+  /* Alpha probes. Straight alpha => BGRA (255,255,255,128) / (0,0,255,128);
+     premultiplied => (128,128,128,128) / (0,0,128,128). */
+  #white50 { left: 100px; top: 300px; width: 200px; height: 100px; background: rgba(255,255,255,0.5); }
+  #red50   { left: 400px; top: 300px; width: 200px; height: 100px; background: rgba(255,0,0,0.5); }
+  #green25 { left: 700px; top: 300px; width: 200px; height: 100px; background: rgba(0,255,0,0.25); }
+  #clock { left: 100px; top: 500px; font: bold 96px/1 monospace; color: #fff; text-shadow: 0 0 6px #000; }
+  #counter { left: 100px; top: 640px; font: bold 48px/1 monospace; color: #ff0; }
+  /* Moving box: opaque core with a 20px semi-transparent edge. */
+  #box { left: 0; top: 800px; width: 160px; height: 160px; background: rgb(0,200,0);
+         border: 20px solid rgba(255,255,0,0.5); box-sizing: content-box; will-change: transform; }
+</style>
+</head>
+<body>
+  <div id="blue" class="abs"></div>
+  <div id="white50" class="abs"></div>
+  <div id="red50" class="abs"></div>
+  <div id="green25" class="abs"></div>
+  <div id="clock" class="abs">0</div>
+  <div id="counter" class="abs">0</div>
+  <div id="box" class="abs"></div>
+<script>
+  const q = new URLSearchParams(location.search);
+  const isStatic = q.get("static") === "1";
+  const noReady = q.get("noready") === "1";
+  let frames = 0;
+  const clock = document.getElementById("clock");
+  const counter = document.getElementById("counter");
+  const box = document.getElementById("box");
+  function tick() {
+    frames++;
+    const now = Date.now();
+    clock.textContent = String(now);
+    counter.textContent = "f" + frames;
+    box.style.transform = "translateX(" + ((now / 4) % 1700) + "px)";
+    requestAnimationFrame(tick);
+  }
+  if (!isStatic) requestAnimationFrame(tick);
+
+  function signalReady() {
+    console.info("seazn:ready-attempt");
+    if (typeof window.gstSendMsg !== "function") {
+      console.warn("seazn:no-gstSendMsg");
+      return;
+    }
+    window.gstSendMsg({
+      request: "ready",
+      onSuccess: function (response) { console.info("seazn:ready-ack " + response); },
+      onFailure: function (code, message) { console.warn("seazn:ready-fail " + code + " " + message); },
+    });
+  }
+  if (!noReady) setTimeout(signalReady, 500);
+</script>
+</body>
+</html>

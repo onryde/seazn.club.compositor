@@ -1,0 +1,10 @@
+# C00 spike only (THROWAWAY). No [http_service]: nothing listens.
+app = "seazn-relay-spike"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[[vm]]
+  size = "performance-4x"
+  memory = "8gb"
