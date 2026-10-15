@@ -31,8 +31,8 @@
 //!   `cef_fail_count` attempts again.
 //! - **Hide.** After a `Hide` the next action is always the `Restart` at `retry_at`. Nothing of the
 //!   hidden generation may reach the programme before it; under F-001's console readiness a page that
-//!   never signals ready keeps painting, so the adapters must hold the hide against its frames
-//!   (`docs/_INDEX.md`, the C05 false-premise rows).
+//!   never signals ready keeps painting, so the adapters must hold the hide against its frames, and
+//!   lift it once the retried generation signals ready (`docs/_INDEX.md` Owed 17).
 //! - **Recycle.** `cef_recycle_every_ms` after the ready signal the browser is restarted (spec §6, every
 //!   2 h). It is planned, so it records no failure.
 //! - **Generations.** Every restart is a new generation, and every adapter event carries the

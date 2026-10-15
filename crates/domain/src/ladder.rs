@@ -9,7 +9,8 @@
 //!   within 10 s): the next step may come once that long has passed since the last. The first step
 //!   waits for nothing.
 //! - **No way back up in R2** (C05 brief): the match finishes on the degraded rung, and the heartbeat
-//!   reports it (C06 `HealthReport.rung`). YAGNI until the soak shows a need.
+//!   reports it (C06 `HealthReport.rung`). YAGNI until the soak shows a need. With C09's `FastPreset`
+//!   that costs the score bug for the rest of the match; the owner decides (`docs/_INDEX.md` Owed 20).
 //! - **What `FastPreset` does is C09's.** The spec names an x264 preset step (`veryfast` →
 //!   `superfast`), but F-001 found x264enc's `speed-preset` cannot change in PLAYING, and the
 //!   programme pipeline is never rebuilt. C09's decision rule then makes this rung "drop the overlay

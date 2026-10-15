@@ -177,6 +177,8 @@ fn after_failure(n: usize, at: Ms, t: &Thresholds) -> (GraphicsState, Option<Gra
 
 /// The brief's transitions (C05 Context and Step 3), written from its prose: the state and action
 /// after `e` at `at`, from `from`, where `n` is the failures in the window if `e` is a failure.
+/// One row is NOT the brief: `(Failed, Tick)` encodes C05's deliberate deviation (docs/_INDEX.md, the
+/// C05 decision row), so this matrix is no independent witness of the brief on that row.
 fn brief(
     from: GraphicsState,
     e: GEvent,
@@ -188,9 +190,11 @@ fn brief(
     use Kind as K;
     let restart = (GraphicsState::Starting { since: at }, Some(Restart));
     match (kind(from), e) {
-        (K::Backoff, E::Tick) => restart,                  // the back-off is over
-        (K::Ready, E::Tick) => restart,                    // the planned recycle
-        (K::Failed, E::Tick) => restart,                   // the cooldown is over
+        (K::Backoff, E::Tick) => restart, // the back-off is over
+        (K::Ready, E::Tick) => restart,   // the planned recycle
+        // C05 DEVIATION, not Step 3: the brief went Failed → `Backoff { 0, now }` with no action and
+        // restarted on the next tick; C05 restarts on the tick the cooldown ends (docs/_INDEX.md).
+        (K::Failed, E::Tick) => restart,
         (K::Starting, E::Tick) => after_failure(n, at, t), // the load timed out
         (K::Starting | K::Ready, E::Crashed) => after_failure(n, at, t),
         (K::Starting, E::Ready) => (GraphicsState::Ready { since: at }, None),
@@ -450,17 +454,21 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
 
 // Plan, review focus 2: a score page that never signals ready (a deploy mid-match, a JS error, a
 // 500). Under F-001's console readiness its frames still flow, so only the domain's load timeout
-// catches it. On the real tick grid of both modes, at every phase: the page is never Ready, it is
-// restarted `cef_fail_count` times and hidden once, `cef_fail_count` load timeouts plus the back-offs
-// between them after the first restart (each timed step waits for the next tick, so the hide is late
-// by under one tick spacing per step), retried a cooldown after the hide, and hidden again after a
-// fresh full set of attempts.
+// catches it. On the real tick grid of both modes, at every phase: the page is restarted
+// `cef_fail_count` times and hidden once, `cef_fail_count` load timeouts plus the back-offs between
+// them after the first restart (each timed step waits for the next tick, so the hide is late by under
+// one tick spacing per step), retried a cooldown after the hide, and hidden again after a fresh full
+// set of attempts. Ready signals the machine must ignore arrive on every tick: one from the previous
+// generation (an earlier attempt that loaded late), and, while backing off or Failed, one from the
+// current generation (the timed-out page that loaded after its timeout). None may make it Ready, and
+// the run counts what it offered, so "never Ready" is a claim that can fail.
 #[test]
 fn a_page_that_never_signals_ready_hides_on_the_frame_tick_grid() {
     let t = Thresholds::default();
     let count = t.cef_fail_count;
     let to_hide = count as Ms * t.cef_load_timeout_ms + (0..count - 1).map(|k| wait(&t, k)).sum::<Ms>();
     let (mut cases, mut ticked) = (0usize, 0usize);
+    let (mut stale_offered, mut late_offered, mut ready_transitions) = (0usize, 0usize, 0usize);
     for mode in BOTH_MODES {
         let spacing = widest(mode);
         assert!(
@@ -483,16 +491,30 @@ fn a_page_that_never_signals_ready_hides_on_the_frame_tick_grid() {
                     Some(Hide) => hides.push(now),
                     None => {}
                 }
-                assert!(
-                    !matches!(g.state(), GraphicsState::Ready { .. }),
-                    "{mode:?} φ{phase}: Ready at {now}"
-                );
+                let gen = g.generation();
+                if gen >= 2 {
+                    g.on_ready(now, gen - 1);
+                    stale_offered += 1;
+                }
+                if matches!(kind(g.state()), Kind::Backoff | Kind::Failed) && gen >= 1 {
+                    g.on_ready(now, gen);
+                    late_offered += 1;
+                }
                 ticked += 1;
+                if kind(g.state()) == Kind::Ready {
+                    // Stop here, so this run's own check below reports it before any timing check.
+                    ready_transitions += 1;
+                    break;
+                }
                 if hides.len() == 2 {
                     break;
                 }
             }
             let ctx = format!("{mode:?} φ{phase}: restarts {restarts:?}, hides {hides:?}");
+            assert_eq!(
+                ready_transitions, 0,
+                "{ctx}: a never-ready page went Ready on an ignorable ready signal"
+            );
             assert_eq!(restarts.len(), 2 * count, "{ctx}");
             assert_eq!(restarts[0], phase, "{ctx}: the first tick restarts");
             assert!(restarts[..count].iter().all(|&r| r < hides[0]), "{ctx}");
@@ -515,8 +537,20 @@ fn a_page_that_never_signals_ready_hides_on_the_frame_tick_grid() {
             cases += 1;
         }
     }
-    eprintln!("never-ready runs checked: {cases} (mode × phase), {ticked} ticks never Ready; hide after {to_hide} ms + < one tick per timed step");
+    eprintln!(
+        "never-ready runs checked: {cases} (mode × phase), {ticked} ticks driven; ready signals offered and \
+         ignored: {stale_offered} from the previous generation, {late_offered} late from a timed-out page; \
+         Ready transitions: {ready_transitions}; hide after {to_hide} ms + < one tick per timed step"
+    );
     assert!(cases > 0 && ticked > 0, "checked 0 runs");
+    assert!(
+        stale_offered > 0 && late_offered > 0,
+        "offered no ready to ignore: the Ready check is vacuous"
+    );
+    assert_eq!(
+        ready_transitions, 0,
+        "a never-ready page went Ready on an ignorable signal"
+    );
 }
 
 // ---- the ladder ----
