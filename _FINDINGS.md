@@ -584,6 +584,67 @@ The snapshot of the composite (overlay over camera) was checked visually. It is 
 
 ---
 
+## F-007: what the Machines API reports while `restart: on-failure` restarts a crashed Machine (2026-10-15)
+
+**Question (R2003):** the web polls `GET /v1/apps/<app>/machines/<id>`. If it reads `stopped`/`failed` in the gap between a crash and the in-place restart, it declares the runner lost and destroys it mid-restart.
+
+**Method:**
+- `spike/fly_restart_probe.py` drives the Machines API directly. The token comes from `fly auth token`, captured in-process, never in argv or logs, and refreshed on 403: these tokens expired after about 4.7 min.
+- App `seazn-relay-spike`, region `lhr`, `alpine:3.20`, guest shared-cpu-1x / 256 MB, `auto_destroy: false`.
+- Each Machine runs `sh -c 'sleep N; exit C'` under `restart: {policy: "on-failure", max_retries: R}`.
+- Polling: every 200 ms (M1, M3) or 1 s (M2). Each poll records `state` and every new `events[]` entry: type, status, timestamp, `request.exit_event`, and `request.restart_count`.
+- No 429s in 1,110 polls. Three polls on M1 failed client-side (HTTP 0, 18:13:54–18:14:18).
+
+| Machine | exit code | sleep | max_retries | What it answers |
+|---|---|---|---|---|
+| M1 `89499ea6e97298` | 1 | 20 s | 2 | gap states, gap ms, exhaustion; then a manual `start` 5 min 23 s after exhaustion |
+| M3 `7849236f05e078` | 78 | 10 s | 2 | (a) is 78 restarted? |
+| M2 `1859231fd01668` | 1 | 330 s | 1 | does the retry budget reset after a long healthy run? |
+
+Total Machine run time ≈ 13.7 min. All three were destroyed, and `fly machine list` shows "No machines are available".
+
+### Results
+
+**1. States in the gap.** The sequence is: crash → `exit` event (status `stopped`, `exit_event.restarting: true`) → about 110 ms → `restart` event (status `starting`) → about 1.3 s → `start` event (status `started`).
+- The polled `state` reads **`stopped` for about 110 ms**, then **`starting` for about 1.2–1.4 s**, then `started`.
+- At 200 ms polling, 1 of 4 restarting gaps was caught as `stopped` (M3, 18:12:33.913); the other 3 went straight to `starting`.
+- **`failed` was never seen.**
+- So **a poller CAN read `stopped` mid-restart**: rarely, at about a 110/200 chance per crash with 200 ms polling, and more often with slower polling that lands in the window.
+- The only reliable discriminator is the latest `exit` event's **`request.exit_event.restarting`**: `true` on every restarting exit, `false` on the final one. `restart_count` is also present on the `exit` event's `request`.
+
+**2. (a) Exit code 78 IS restarted.** `on-failure` treats 78 like any non-zero code: two restarts with `restarting: true`, then `restarting: false` once `max_retries` was spent (M3). **R2 cannot rely on exit 78 to mean "don't restart" under `on-failure`.** Exit 0 under `on-failure` was **not** tested.
+
+**3. (b) Gap from exit to the restarted process:**
+
+| Crash | exit → `restart` event | exit → `start: started` event |
+|---|---|---|
+| M1 #1 (exit 1) | 109 ms | 1407 ms |
+| M1 #2 (exit 1) | 109 ms | 1507 ms |
+| M3 #1 (exit 78) | 116 ms | 1426 ms |
+| M3 #2 (exit 78) | 113 ms | 1463 ms |
+| M2 #1 (exit 1) | 108 ms | 1417 ms |
+| M2 #2 (exit 1) | 113 ms | 1400 ms |
+
+Median: about **110 ms** to `restart`, about **1.42 s** to `started`. These are Fly event timestamps; the process's own start is a few ms later.
+
+**4. (c) After `max_retries` is exhausted:**
+- The final exit carries `restarting: false` and `restart_count: 2`, and the Machine **stays `stopped`**: never `failed`, with no automatic restart over 5 min 23 s.
+- A **manual `POST /start`** 5 min 23 s later ran the process again. Its crash 20 s later was **not** restarted (`restarting: false`, `restart_count` still 2), so a manual start does not refill the budget.
+- **But the budget refills after a long healthy run.** On M2 (max_retries 1), a crash after 330 s healthy was restarted (`restart_count: 1`). The next crash, after another 330 s healthy run, was **also** restarted, again with `restart_count: 1`. The reset threshold lies somewhere below 5.5 min of healthy run; it is not measured more finely.
+
+### Verdict and changes (proposals; R2003, C13 and ADR 0004 are not edited)
+
+- **R2003's in-place restart survives only if the web's "lost" rule ignores a `stopped` whose latest `exit` event says `restarting: true`.** Proposed rule:
+  - lost = `state ∈ {stopped, failed, destroyed}` **and** the latest `exit` event's `request.exit_event.restarting == false`;
+  - or `starting` for more than about 10 s (observed about 1.4 s).
+  - A plain "`stopped` ⇒ lost" rule is racy (1 in 4 gaps hit at 200 ms).
+- **Exit 78 is not a no-restart signal under `on-failure`.** For a refusal that must not restart, the options are:
+  - (i) the web destroys a Machine whose latest exit has `exit_code 78`, without waiting for the restart;
+  - (ii) the runner exits **0** on refusal; not tested here, so that is owed;
+  - (iii) `policy: "no"` plus a web-driven restart.
+- **The retry budget is per crash burst, not per lifetime.** A runner that crashes rarely, at least about 5.5 min apart, is restarted indefinitely. A runner that crash-loops gets exactly `max_retries` restarts, then sits in `stopped` with `restarting: false`, and the web must reap it.
+- `fly auth token` tokens expire after about 5 min. Any long-lived poller must use a real deploy or org token.
+
 ## Platform notes (Fly-specific; nothing inside the image depends on them)
 
 - **CPU:** performance-4x reports AMD EPYC with 4 vCPU.
@@ -672,3 +733,134 @@ Re-check ADR 0004 and the C14 chaos budgets against 15 s, and add it to the C17 
   beat for a composed session. The final beat on a `fatal` exit is also `stopped`, so R2003 must
   decide explicitly whether `exitReason: fatal` ends the session or books `r<n+1>`. Pending the
   R2002 review's read of the handler.
+
+## Appendix F-007: raw polled state and events
+
+Generated from the probe's per-poll JSONL. Every poll is counted in a run; consecutive identical states are merged.
+
+#### M1 exit 1, max_retries 2, sleep 20
+
+Polls: 532 (interval 200 ms for M1/M3, 1 s for M2). HTTP non-200: 3.
+
+**Events (`events[]`, Fly timestamps, UTC):**
+
+| UTC | type | status | exit_code | restarting | oom_killed | restart_count |
+|---|---|---|---|---|---|---|
+| 18:12:18.290 | launch | pending |  |  |  |  |
+| 18:12:18.434 | launch | created |  |  |  |  |
+| 18:12:21.347 | start | started |  |  |  |  |
+| 18:12:41.655 | exit | stopped | 1 | True | False | 1 |
+| 18:12:41.764 | restart | starting |  |  |  |  |
+| 18:12:43.062 | start | started |  |  |  |  |
+| 18:13:03.480 | exit | stopped | 1 | True | False | 2 |
+| 18:13:03.589 | restart | starting |  |  |  |  |
+| 18:13:04.987 | start | started |  |  |  |  |
+| 18:13:26.084 | exit | stopped | 1 | False | False | 2 |
+| 18:18:48.988 | start | starting |  |  |  |  |
+| 18:18:50.180 | start | started |  |  |  |  |
+| 18:19:10.591 | exit | stopped | 1 | False | False | 2 |
+
+**Polled `state` runs (consecutive identical states merged):**
+
+| from (UTC) | to (UTC) | state | polls | HTTP |
+|---|---|---|---|---|
+| 18:12:31.908 | 18:12:41.465 | started | 45 | 200 |
+| 18:12:41.667 | 18:12:42.678 | starting | 6 | 200 |
+| 18:12:42.975 | 18:13:03.312 | started | 81 | 200 |
+| 18:13:03.519 | 18:13:04.743 | starting | 7 | 200 |
+| 18:13:04.945 | 18:13:25.975 | started | 98 | 200 |
+| 18:13:26.179 | 18:13:48.729 | stopped | 101 | 200 |
+| 18:13:54.014 | 18:13:54.014 | None | 1 | 0 |
+| 18:14:03.450 | 18:14:03.450 | None | 1 | 0 |
+| 18:14:18.681 | 18:14:18.681 | None | 1 | 0 |
+| 18:14:26.321 | 18:14:26.321 | stopped | 1 | 200 |
+| 18:18:44.537 | 18:18:48.888 | stopped | 10 | 200 |
+| 18:18:49.096 | 18:18:49.917 | starting | 5 | 200 |
+| 18:18:50.126 | 18:19:10.491 | started | 87 | 200 |
+| 18:19:10.693 | 18:19:49.993 | stopped | 88 | 200 |
+
+**Crash gaps:**
+
+| exit (UTC) | exit_code | restarting | exit→restart event ms | exit→started event ms | states polled in the gap |
+|---|---|---|---|---|---|
+| 18:12:41.655 | 1 | True | 109 | 1407 | starting → started |
+| 18:13:03.480 | 1 | True | 109 | 1507 | starting → started |
+| 18:13:26.084 | 1 | False | — | — | started → stopped |
+| 18:19:10.591 | 1 | False | — | — | started → stopped |
+
+#### M3 exit 78, max_retries 2, sleep 10
+
+Polls: 294 (interval 200 ms for M1/M3, 1 s for M2). HTTP non-200: 0.
+
+**Events (`events[]`, Fly timestamps, UTC):**
+
+| UTC | type | status | exit_code | restarting | oom_killed | restart_count |
+|---|---|---|---|---|---|---|
+| 18:12:20.553 | launch | pending |  |  |  |  |
+| 18:12:20.698 | launch | created |  |  |  |  |
+| 18:12:23.672 | start | started |  |  |  |  |
+| 18:12:34.003 | exit | stopped | 78 | True | False | 1 |
+| 18:12:34.119 | restart | starting |  |  |  |  |
+| 18:12:35.429 | start | started |  |  |  |  |
+| 18:12:46.087 | exit | stopped | 78 | True | False | 2 |
+| 18:12:46.200 | restart | starting |  |  |  |  |
+| 18:12:47.550 | start | started |  |  |  |  |
+| 18:12:57.927 | exit | stopped | 78 | False | False | 2 |
+
+**Polled `state` runs (consecutive identical states merged):**
+
+| from (UTC) | to (UTC) | state | polls | HTTP |
+|---|---|---|---|---|
+| 18:12:31.870 | 18:12:33.705 | started | 10 | 200 |
+| 18:12:33.913 | 18:12:33.913 | stopped | 1 | 200 |
+| 18:12:34.113 | 18:12:34.999 | starting | 5 | 200 |
+| 18:12:35.200 | 18:12:45.562 | started | 50 | 200 |
+| 18:12:45.767 | 18:12:45.767 | stopped | 1 | 200 |
+| 18:12:46.098 | 18:12:47.316 | starting | 6 | 200 |
+| 18:12:47.522 | 18:12:57.447 | started | 33 | 200 |
+| 18:12:57.686 | 18:13:38.353 | stopped | 188 | 200 |
+
+**Crash gaps:**
+
+| exit (UTC) | exit_code | restarting | exit→restart event ms | exit→started event ms | states polled in the gap |
+|---|---|---|---|---|---|
+| 18:12:34.003 | 78 | True | 116 | 1426 | stopped → starting → started |
+| 18:12:46.087 | 78 | True | 113 | 1463 | starting → started |
+| 18:12:57.927 | 78 | False | — | — | stopped |
+
+#### M2 exit 1, max_retries 1, sleep 330
+
+Polls: 284 (interval 200 ms for M1/M3, 1 s for M2). HTTP non-200: 0.
+
+**Events (`events[]`, Fly timestamps, UTC):**
+
+| UTC | type | status | exit_code | restarting | oom_killed | restart_count |
+|---|---|---|---|---|---|---|
+| 18:12:23.335 | launch | created |  |  |  |  |
+| 18:12:26.237 | start | started |  |  |  |  |
+| 18:17:56.960 | exit | stopped | 1 | True | False | 1 |
+| 18:17:57.068 | restart | starting |  |  |  |  |
+| 18:17:58.377 | start | started |  |  |  |  |
+| 18:23:29.415 | exit | stopped | 1 | True | False | 1 |
+| 18:23:29.528 | restart | starting |  |  |  |  |
+| 18:23:30.815 | start | started |  |  |  |  |
+| 18:24:05.880 | destroy | destroying |  |  |  |  |
+| 18:24:12.276 | destroy | destroyed |  |  |  |  |
+
+**Polled `state` runs (consecutive identical states merged):**
+
+| from (UTC) | to (UTC) | state | polls | HTTP |
+|---|---|---|---|---|
+| 18:19:13.208 | 18:23:28.604 | started | 237 | 200 |
+| 18:23:29.604 | 18:23:30.610 | starting | 2 | 200 |
+| 18:23:31.615 | 18:24:05.755 | started | 35 | 200 |
+| 18:24:06.756 | 18:24:11.953 | destroying | 6 | 200 |
+| 18:24:12.957 | 18:24:15.966 | destroyed | 4 | 200 |
+
+**Crash gaps:**
+
+| exit (UTC) | exit_code | restarting | exit→restart event ms | exit→started event ms | states polled in the gap |
+|---|---|---|---|---|---|
+| 18:17:56.960 | 1 | True | 108 | 1417 |  |
+| 18:23:29.415 | 1 | True | 113 | 1400 | starting |
+
