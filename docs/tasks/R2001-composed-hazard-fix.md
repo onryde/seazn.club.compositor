@@ -47,8 +47,15 @@ hypothesis, not a source of truth.
 - Modify: `apps/web/src/server/relay/domain/session.ts` (the `AdmitRefusal` union and `admit()`)
 - Modify: `apps/web/src/server/usecases/stream-sessions.ts` (pass the availability fact into `admit`;
   map the refusal in `refuse()`)
-- Modify: the OpenAPI/zod error enum, if refusal codes are enumerated there. Grep for
-  `storage_exhausted` with `git grep -a`.
+- Modify: every place a refusal code travels. Pinned 2026-10-15 by following `storage_exhausted`
+  (`git grep -al storage_exhausted -- apps/web/src`; re-pin, and cover every hit):
+  - `server/api-v1/schemas.ts` + `server/api-v1/openapi.ts` (the refusal enum), then regenerate the
+    OpenAPI artifacts (CI's drift check reds otherwise)
+  - `lib/stream-session-view.ts` (refusal → what the organiser sees)
+  - `dictionaries/{en,es,fr,nl}/ui.json` (the refusal's copy), then `pnpm i18n:gen-keys`
+    (`lib/i18n-keys.ts` is generated, never hand-edited)
+  - tests: `server/api-v1/__tests__/stream-contract.test.ts`, `lib/__tests__/stream-session-view.test.ts`,
+    `components/v2/__tests__/fixture-stream-panel.test.tsx`
 - Test: `apps/web/src/server/relay/__tests__/drivers.test.ts` (re-pin; create if absent):
   `composedUnavailable()` across the 2×2 table relay up/down × `RELAY_IMAGE` set/unset. Only
   up+set is available. Each side of the OR is witnessed alone.

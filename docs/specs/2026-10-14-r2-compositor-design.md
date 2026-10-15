@@ -206,7 +206,8 @@ convention).
 ### 5.2 Machine environment (from R1, unchanged)
 
 `SESSION_ID`, `JOB_TOKEN` (HS256, `{sid, scope:"relay-job"}`), `APP_URL`, `RELAY_DEADLINE_AT` (ISO).
-Fly sets `FLY_IMAGE_REF`. There is no inbound port.
+The compositor reads no other env and no platform-specific variable (ADR 0007: any OCI host that meets
+the host contract runs it unchanged). There is no inbound port.
 
 ### 5.3 Endpoints
 

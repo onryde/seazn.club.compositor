@@ -35,6 +35,8 @@ The entry point for any session working on this repository. Read this file first
 | 2026-10-14 | **Owner ruling:** the soak is 3 h (was 8 h). One GitHub Actions job drives it, and the media runs on Fly Machines on the production guest. | — (spec §9.5, ADR 0003, C15) |
 | 2026-10-14 | **Owner ruling:** the fake Cloudflare is the off-the-shelf MediaMTX image (pinned), not custom code. It runs only on our CI and Machines, never a public instance. Chaos and soak stay on it because real stg would need a fake paired phone (admission requires one) and caps a session at 300 min. Real CF behaviour comes from C00/F-002 and is proven live in C17. | — (C13–C15) |
 | 2026-10-14 | Plan re-review (Opus): 19 fixed, F9 partial, 1 major + 9 minor new in `reviews/2026-10-14-plan-rereview-opus.md`. All applied: case 10 witnessed at `tc` + SRT retrans (TSBPD holds latency flat), compositor fixed at 172.28.0.10, `ENCODER_SPEED_REALTIME_MIN` = 0.95 shared by C09/C14, ProcMetrics join test (C12), R2003 test 7 a regression pin + mutant 4, C06 mutant 4, R2001 2×2 predicate table, absent `delay=` refused, R2006 composed camera chip. | — |
+| 2026-10-15 | **Owner ruling:** the compositor must not depend on Fly. ADR 0007 defines a 6-item host contract; Fly is allowed only in web's runner driver, the deploy workflows (one `RELAY_REGISTRY` variable) and the soak runner. `check-portable.sh` (C01) fails on any Fly reference in `crates/`/`docker/`. | ADR 0007 |
+| 2026-10-15 | **Owner ruling:** C00 CPU gate moves from CEF-alone (≤1 core) to the full chain: item 5 at 720p30 ≤ 3.0 of 4 cores with encoder speed ≥ 0.95 is a gate; CEF > 2.0 cores is the item-1 runaway fail; CEF ≤ 1 is recorded only. | — (C00) |
 
 ## False premises found
 

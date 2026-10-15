@@ -23,7 +23,7 @@ programme pipeline. This mirrors `seazn.club`'s `session.ts` `decide()`.
 | `78` | Refused (401/404/wrong mode) |
 | `70` | Fatal |
 
-A crash after `ending` exits 70, and Fly restarts the Machine. The restarted Machine's bootstrap then
+A crash after `ending` exits 70, and the host restarts the container (ADR 0004; ADR 0007 item 5). The restarted Machine's bootstrap then
 gets 410 and exits 0. That sequence is tested here.
 
 ## Files
