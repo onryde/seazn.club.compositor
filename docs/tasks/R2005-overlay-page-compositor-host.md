@@ -44,7 +44,11 @@ score bug. That's an inert seam the owner would only see live.
 1. **Relay access path.** If `sid` and `st` are both present:
    - verify with `verifyRelayToken(st, { sid, scope: "relay-page" })`
    - then load the session row and require all of: `session.fixture_id === fixtureId`, the session
-     is not ended, and `mode === "composed"`
+     is not ended, and `mode === "composed"`. **(Defined 2026-10-15, review I5)** "Not ended" means
+     `!isTerminal(session.state)` (`server/relay/domain/session.ts:20`; `TERMINAL_STATES` =
+     `completed`, `failed` at `:19`). So `ending`, the state web holds during the compositor's final
+     hold, counts as active: a CEF reload during the hold must load, and fallback B must still be able
+     to deliver `final`.
    - any failure ⇒ `notFound()`, the same opaque 404 as today. Never a 401: the route's contract is
      "indistinguishable from missing"
 
@@ -100,7 +104,9 @@ score bug. That's an inert seam the owner would only see live.
   - Create: `apps/web/src/components/overlay/overlay-scene.tsx` (`sceneFor`, the backdrop and the scene
     card) and `apps/web/src/components/overlay/use-programme-phase.ts` (the channel hook)
   - Modify: `components/overlay/overlay-scenes.ts` (append three scenes), `overlay-slate.tsx` (two card
-    variants), `overlay-stage.tsx` (`host`, `sceneOverride`, moment discard), `moment-queue.ts` (a
+    variants), `overlay-stage.tsx` (`host`, `sceneOverride`, moment discard),
+    `components/overlay/overlay-preview.tsx` (R2007's render function: pass `sceneOverride={scene}`;
+    review I6), `moment-queue.ts` (a
     `discard` action), `app/api/v1/public/fixtures/[id]/overlay/route.ts` and
     `components/public-site/live-score-data.ts` `fetchOverlayFixture` (fallback B), `app/globals.css`
   - Modify: `apps/web/src/dictionaries/{en,es,fr,nl}/public.json` and `ui.json`, then
@@ -124,7 +130,9 @@ score bug. That's an inert seam the owner would only see live.
   2. The same without `st`: 404.
   3. `st` for another session's sid: 404.
   4. `st` with scope `relay-job`: 404.
-  5. An ended session: 404.
+  5. An ended session (`completed`, and `failed`): 404.
+  5b. **(Added 2026-10-15, review I5)** An `ending` session (the final hold): 200, so a CEF reload
+     during the hold loads.
   6. A session on a different fixture: 404.
   7. **Cache isolation:** a bypass read of a private fixture, then the public read of it, is still
      404.
@@ -132,6 +140,9 @@ score bug. That's an inert seam the owner would only see live.
      (AGENTS.md trap).
   9. **(Amendment 2026-10-15)** test A4 from the amendment section (the overlay route's fallback-B
      field and its cache isolation).
+  10. **(Review I6)** The page never sets `sceneOverride`. With `host=compositor` and without it, the
+     stage element `page.tsx` renders has no `sceneOverride` prop: inspect the returned element tree,
+     because the markup alone can't show an absent prop.
 - [ ] **Step 3: Write the failing e2e** (`overlay-compositor.spec.ts`). Against a local prod build,
   seed a composed session with fakes (`RELAY_DRIVERS=fake`) and open the overlay URL from
   `sessionFactsForJob` (the **real producer**, not a hand-built URL).
@@ -146,14 +157,16 @@ score bug. That's an inert seam the owner would only see live.
   - **(Amendment 2026-10-15)** e2e cases E1–E7 from the amendment section.
 - [ ] **Step 4: Run, expect a FAIL** (vitest JSON reporter; the Playwright spec run alone from
   `apps/web` with `BASE=http://localhost:<port>`).
-- [ ] **Step 5: Implement changes 1–4.**
+- [ ] **Step 5: Implement changes 1–4, then changes 5–7** (the amendment: scene layer, phase channel,
+  moments). Run each change's unit tests (A1–A3) before moving to the next, then the page tests (A4,
+  5b) and the e2e.
 - [ ] **Step 6: Run, expect a PASS.** Paste the counts.
 - [ ] **Step 7: Mutate once each.**
   1. Skip the `session.fixture_id === fixtureId` check. Expected red: page test 6.
   2. Share the cache key. Expected red: page test 7.
   3. Emit ready on mount. The e2e "exactly once, after data" assertion must go red. Make it assert
      ready comes **after** the first snapshot's DOM is present.
-  4–9. **(Amendment 2026-10-15)** mutants M4–M9 from the amendment section.
+  4–11. **(Amendment 2026-10-15)** mutants M4–M11 from the amendment section.
 - [ ] **Step 8: Run the existing overlay e2e specs** (grep by route `/overlay/fixtures`, not by
   filename). All green and unchanged. **Commit and open the PR:**
   `feat(overlay): compositor access by relay page token, readiness and score-stale signals`
@@ -162,7 +175,7 @@ score bug. That's an inert seam the owner would only see live.
 
 - Unit, page and e2e tests pass.
 - Existing overlay e2e is unchanged and green.
-- ~~3 mutants~~ 9 mutants went red (amended 2026-10-15).
+- ~~3 mutants~~ ~~9~~ 11 mutants went red (amended 2026-10-15; M10 and M11 from the review fixes).
 - Cache isolation is proven, for the page read **and** for the overlay route's `programmePhase`
   (amended 2026-10-15).
 - The false premises (transparent body, timestamps) are recorded.
@@ -173,12 +186,19 @@ score bug. That's an inert seam the owner would only see live.
 ## Amendment 2026-10-15 (overlay templates spec)
 
 Authority: `seazn.club: docs/superpowers/specs/2026-10-15-overlay-templates-and-scenes-design.md`
-§4.1–4.3, §4.8 and §5. Spec §6: "R2005 (amend): adds the scene layer, the Reconnecting and
-Stream-ended card variants (4 locales), the loopback client with fallback B. Depends on R2007."
+§4.1–4.3, §4.8 and §5. Spec §6, R2005 row (verbatim, `29fa9f59c`): "Adds the scene layer (§4.1–4.2),
+the Reconnecting and Stream-ended card variants (4 locales), the loopback client with fallback B
+(§4.3). Depends on R2007."
 
 ### Scene layer (change 5)
 
-`host=compositor` is the only way the scene layer mounts. OBS users have their own scenes.
+**(Corrected 2026-10-15, review I6)** The scene layer mounts in exactly two cases:
+- the page with `host=compositor`, where the phase comes from the channel (change 6)
+- the preview render function (`OverlayPreview`, R2007) via the stage's `sceneOverride` prop, where
+  the scene is the one the gallery cell or picker toggle names
+
+The overlay **page** never sets `sceneOverride` (M4 checks it), so an OBS URL shows no scene; OBS
+users have their own scenes.
 
 `sceneFor(phase, slate)` in `overlay-scene.tsx` is pure. `phase` is the channel's
 `ProgrammePhaseWire | null` (`null` when `host` is absent), and `slate` is `slateStateOf(model)`
@@ -192,7 +212,7 @@ The table comes from spec §4.2 (each row's reason in brackets):
 | `live` | no scene, `upcoming` | no scene, no card | no scene, `result` | §4.2 last row: the card layer as today |
 | `frozen` | no scene, `upcoming` | no scene, no card | no scene, `result` | "a short glitch never flashes a card" |
 | `reconnecting` | `reconnecting`, `reconnecting` | `reconnecting`, `reconnecting` | `reconnecting`, `result` | §5: "reconnecting while the match is decided (Result card + backdrop)" |
-| `final` | `final`, `ended` | `final`, `ended` | `final`, `result` | "the Result card if decided or void; otherwise a Stream ended card with the current score" |
+| `final` | `final`, `ended` | `final`, `ended` | `final`, `result` | §4.2: "The existing **Result** card if the match is decided or void. Otherwise a **Stream ended** card variant with the current score." |
 
 **Spec ambiguities resolved here** (record them in the PR body and the compositor `_INDEX.md`):
 - **Starting soon while the match is already live.** No card exists for `live`, so the scene is the
@@ -223,9 +243,16 @@ Copy, all 4 locales, translated properly in each dictionary's tone, then `pnpm i
 | `ui.json` | `stream.scene.final` | "Final" |
 
 Append `starting`, `reconnecting` and `final` to `OVERLAY_SCENES` (R2007's file) with those label keys.
-The stage gains `sceneOverride?: SceneId`, preview only: `OverlayPreview` already passes `scene`, and
-from this task on the gallery and R2006's picker show each scene. `live` as an override means "no
-scene", whatever the phase.
+The stage gains `sceneOverride?: SceneId`, preview only. R2007's `OverlayPreview` takes a `scene` prop
+and writes `data-scene`, but doesn't pass anything to the stage; this task makes it pass
+`sceneOverride={scene}` (Files). From then on the gallery and R2006's picker show each scene. `live` as
+an override means "no scene", whatever the phase.
+
+**The scene card renders inside the card layer's `.ovl-slate-content` wrapper, as an
+`[data-testid="ovl-slate-card"]` element** (the existing `OverlayMatchCard`). So R2007's card layout
+(cards placed from the template's `sceneCardSafeArea` through `--ovl-card-*`, R2007 step 9b) and its
+gallery check 4 (keyed on that element's presence) cover every scene card with **no gallery edit**.
+Only the backdrop is a new element (`[data-testid="ovl-scene"]`, below the template).
 
 ### Phase channel (change 6)
 
@@ -240,18 +267,23 @@ scene", whatever the phase.
       so there is no in-page flapping. (Spec ambiguity: §4.3 says when to switch, not whether to come
       back. Resolved here; record it.)
     - a reply whose `seq` is ≤ the held `seq` is ignored (a guard, with a test)
+    - **(review m12)** a reply whose `phase` is not in `PROGRAMME_PHASES` (`lib/relay-phase.ts`; the
+      client page can't import `schemas.ts`), whose `seq` is not a non-negative integer, or that
+      carries any other key, counts as a **`loopbackFailed`**, never as a phase
     - in `loopback`, `webPhase` events are ignored, and vice versa
 - `use-programme-phase.ts`: `useProgrammePhase({ enabled, webPhase })`. When `enabled` is false it
   returns `null` and **makes no request**. In loopback it long-polls
   `http://127.0.0.1:${RELAY_PHASE_PORT}${RELAY_PHASE_PATH}?after=${seq}` (`lib/relay-phase.ts`, R2007
   PR B). An `AbortController` counts any reply later than `RELAY_PHASE_LONG_POLL_MAX_MS + 2_000` as a
-  failure. Unless C11 Step 0 recorded outcome (c), "blocked", **in which case the hook starts in `web`**
+  failure. The reply is validated as above before it reaches the reducer. Unless C11 Step 0 recorded
+  outcome (c), "blocked", **in which case the hook starts in `web`**
   and never fetches loopback; the `_FINDINGS.md` F-id is cited at the constant.
 - **Channel signal:** `console.info("seazn:phase-channel=loopback" | "seazn:phase-channel=web")` through
   F-001's console mechanism, once on the first settled channel and again on each change. C11 relays it,
   C06 stores it, and C07 puts `phaseChannel` on the beat, so the heartbeat records it (spec §4.3).
 - **Fallback B data.** The overlay route (`app/api/v1/public/fixtures/[id]/overlay/route.ts`) calls the
-  same relay-access check as change 1 (`sid` + `st` + composed + not ended + same fixture). On success
+  same relay-access check as change 1 (`sid` + `st` + composed + not ended, which is
+  `!isTerminal(state)` so `ending` passes, + same fixture). On success
   it reads the fixture through the bypass read, adds `programmePhase` (from
   `fixture_stream_sessions.last_heartbeat->>'programmePhase'`; an absent key stays absent, never
   defaulted) and sends `Cache-Control: private, no-store` in place of `LIVE_CACHE_CONTROL` (`:14`).
@@ -268,6 +300,11 @@ scene", whatever the phase.
   the scene ends. In `reconnecting`, moments fire as usual and the slab sits above the scene card
   (§4.8: "the slab is the only way a viewer learns a goal happened").
 - Timing: at `host=compositor` the slab follows the same `delay` presentation as today.
+- **Owner question pending** (compositor `_INDEX.md`, "Owner questions"): should moments fire during
+  Starting soon when the stream starts after the match has begun (`waiting × live`)? The
+  recommendation, not a ruling, is yes, with only Final discarding. Build the spec's rule as written
+  (discard in `starting`). If the owner says yes, `starting` stops discarding, and A3's first row, E7's
+  last line and M7 flip with it.
 
 ### Tests
 
@@ -280,6 +317,13 @@ scene", whatever the phase.
   - after `web`: `loopbackOk` ignored, `webPhase("reconnecting")` adopted
   - a stale `seq` ignored
   - `PHASE_LOOPBACK_FAILURES_TO_FALLBACK` equals spec §4.3's 3, typed in the test
+  - **(review m12)** the hook's reply validator, over 4 replies:
+    - `{ phase: "paused", seq: 1 }` → `loopbackFailed`
+    - `{ phase: "live", seq: -1 }` → `loopbackFailed`
+    - `{ phase: "live", seq: 1, x: 1 }` → `loopbackFailed`
+    - `{ phase: "final", seq: 1 }` → `loopbackOk`
+
+    Every `PROGRAMME_PHASES` value is accepted: print `phases checked: 5`; fail on 0.
 - **A3** `moment-queue.test.ts`, through the real reducer and the stage's scene rule:
   - a goal while `starting` is discarded; after the scene ends it never shows, and a **new** goal does
   - a goal while `reconnecting` is enqueued and shows
@@ -293,9 +337,15 @@ scene", whatever the phase.
     and has `LIVE_CACHE_CONTROL`
   - a wrong `st` returns the public answer
   - a beat without `programmePhase` leaves the key absent
+  - **(review I5)** an `ending` session whose `last_heartbeat` carries `programmePhase: "final"` →
+    the route serves `programmePhase: "final"`. A `completed` session → the public answer.
 
 **E2E** (`overlay-compositor.spec.ts`, local prod build, `RELAY_DRIVERS=fake`; the phase is served by
-`page.route("http://127.0.0.1:7419/phase**", …)` from a scripted list). Every case asserts the score
+`page.route("http://127.0.0.1:7419/phase**", …)` from a scripted list). **(Review m13)** Every fulfilled
+response carries `Access-Control-Allow-Origin: <the page's origin>`, and an `OPTIONS` is answered 204
+with that header plus `Access-Control-Allow-Private-Network: true`, because the page at `localhost:<port>`
+calling `127.0.0.1:7419` is cross-origin. These tests can't witness Private Network Access; only C11
+Step 0 and C17 can. Every case asserts the score
 bug is **visible and on top**: `document.elementFromPoint` at the template's centre returns a node
 inside the template (AGENTS.md class 2), and the scene card's box doesn't intersect the template's box.
 - **E1 Sequence** (spec §5): live → frozen → reconnecting → live → final. Per step, the expected
@@ -314,6 +364,11 @@ inside the template (AGENTS.md class 2), and the scene card's box doesn't inters
   - POST a real heartbeat with `programmePhase: "reconnecting"` through the internal route with the
     seeded session's job token: the Reconnecting scene appears within `STREAM_POLL_MS + 3 000`
   - a run where the route succeeds logs `seazn:phase-channel=loopback` exactly once
+  - **(review I5) The hold under fallback B:**
+    - stop the session through the organiser's real stop API, so it goes `ending`
+    - POST a beat with `programmePhase: "final"` with the same job token: the Final scene appears
+      within `STREAM_POLL_MS + 3 000`
+    - **reload the page**: it loads (200), and shows the Final scene again
 - **E7 Moments:** with `delay=3000`, serve `reconnecting` and score a goal through the API at T0. The
   slab is visible no sooner than T0 + 3 000 (the URL's `delay`; the spec's guard) and no later than
   T0 + 3 000 + `STREAM_POLL_MS` + 2 000 (so the test can't pass by never showing it), and it is on top
@@ -324,12 +379,14 @@ inside the template (AGENTS.md class 2), and the scene card's box doesn't inters
 
 | # | Mutant | Expected red |
 |---|---|---|
-| M4 | the scene layer mounts without `host=compositor` | A1's `null` rows, E5 |
+| M4 | the scene layer mounts without `host=compositor` (and without a `sceneOverride`); also: the page passes `sceneOverride` | A1's `null` rows, E5; a page test that asserts the stage element rendered by `page.tsx` has no `sceneOverride` prop |
 | M5 | fallback never engages (failures never switch to `web`) | A2, E6 |
 | M6 | moments suppressed during `reconnecting` (discard in every scene) | A3, E7 |
 | M7 | no discard in `starting` | A3, E7's last line |
 | M8 | the overlay route adds `programmePhase` without the relay check | A4 |
 | M9 | `web` not sticky (a later `loopbackOk` switches back) | A2, E6's handler count |
+| M10 | "not ended" read as `state === "live"` (refuses `ending`) | page test 5b, A4's `ending` row, E6's hold leg |
+| M11 | the reply validator dropped (any JSON is a phase) | A2's validator rows |
 
 ### Not this task
 

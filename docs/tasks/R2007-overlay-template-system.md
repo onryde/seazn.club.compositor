@@ -4,13 +4,19 @@
 
 - **PR A (the template system):** worktree
   `git worktree add ../seazn.club-wt/r2007-overlay-templates -b feat/overlay-template-system origin/main`.
-  **Depends on:** the end-card-undo fix (branch `fix/overlay-end-card-undo`) **merged to `main`**. It
-  edits the overlay stage and the live-fixture hook this task also edits, so start PR A only after it
-  lands, and re-pin the stage from the merged `main`.
+  **Depends on:** the end-card-undo fix (branch `fix/overlay-end-card-undo`) **merged to `main`**.
+  (Corrected 2026-10-15 review: the fix does not touch `overlay-stage.tsx`.) At `e9356a944` it changes
+  `use-live-fixture.ts`, `e2e/stream-overlay.spec.ts` and `e2e/overlay-kit.ts`, plus tests. This task
+  extends `stream-overlay.spec.ts` (step 11), and `snapshotOnly` relies on the hook's fetcher
+  semantics, which the fix changes. So start PR A only after the fix lands, and re-pin from the merged
+  `main`.
 - **PR B (the owed R2002 contract follow-up, §"PR B" below):** worktree
   `git worktree add ../seazn.club-wt/r2007-relay-final-phase -b feat/relay-contract-final-phase origin/main`.
   **Does not wait for the undo fix**: it touches no `components/overlay/**` file. It must merge
-  **before C07 vendors the contract**.
+  **before C07 vendors the contract**. **(Corrected 2026-10-15, briefs review) Branch it after R2003
+  (#967) merges.** #967 also edits `server/api-v1/schemas.ts`, `openapi/v1.json` and
+  `relay-internal-routes.test.ts` (+340 lines), all three of which PR B edits. Rebase onto the merged
+  `main` and regenerate OpenAPI and the contract there.
 
 **Use the `frontend-design` skill** (house rule for every UI task; put the invocation in the dispatch).
 **Spec (authority):** `seazn.club: docs/superpowers/specs/2026-10-15-overlay-templates-and-scenes-design.md`
@@ -21,7 +27,8 @@
 ## Context
 
 Pinned 2026-10-15 at `seazn.club` `origin/main` `b01d07cd5`. **Re-pin everything after the undo fix
-merges**: it moves lines in `overlay-stage.tsx`.
+merges.** It changes `use-live-fixture.ts` and `stream-overlay.spec.ts`; the stage pins below should
+hold, but confirm them.
 
 `apps/web/src/components/overlay/theme-registry.ts` (the module this task turns into the template
 registry):
@@ -72,9 +79,13 @@ Other pins:
 | `apps/web/e2e/capture-records-admin.spec.ts` | the admin e2e precedent: a fresh org whose owner is made staff, 1280 only |
 | `scripts/smoke.ts:918` | `streamOverlaySuite()`, the overlay route over real HTTP |
 
-**Hypothesis to settle in step 9, not to assume:** CSS arithmetic puts the match card at about
-x 410–1510 and the bug box at x 60–540, so they may overlap in x. Whether they overlap on screen is
-for the e2e containment check to say.
+**The card overlaps the bug today (review 2026-10-15, from the CSS).** `.ovl-slate-content`
+(`globals.css:1702-1706`) is `inset: 0` with padding `72px 96px <bar stack + 24px>`. It centres a card
+up to 1100 px wide (x 410–1510) and clears only the **bar**. The bug sits at x 60–540 from y 54, and it
+paints over the card (z-index 3 vs 1), so nobody noticed. The 30 px floor makes the bug wider. That
+geometry is bar-only, so a new template's `sceneCardSafeArea` could never move a card, which breaks
+spec §4.7's "nothing else changes". **Step 9b replaces it:** cards are laid out from the registry
+entry's box (coordinator decision G2).
 
 ## Decisions this brief makes
 
@@ -161,7 +172,9 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
     component: ComponentType<OverlayThemeProps>;
     /** Where the moment slab attaches. Replaces `slabPlacementFor`. */
     slabPlacement: "bar" | "bug";
-    /** The box scene and match cards must keep clear. The e2e proves the template renders inside it. */
+    /** The box scene and match cards must keep clear. DECLARED from the template's CSS layout rule (step 7,
+     *  re-declared in step 9), never copied from a measurement. The stage lays every card out from it
+     *  (`cardRegionFor`, step 9b), and the e2e proves the rendered template stays inside it. */
     sceneCardSafeArea: CanvasBox;
     /** Kept so stored choices and OBS URLs resolve. Hidden from the picker. */
     retired?: { replacedBy: Id };
@@ -177,6 +190,15 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
   export function resolveTemplate(requested: string | null | undefined, sportKey: string): OverlayTemplateDef;
   /** `template` when present and non-empty, else `style`. Array values take the first element. */
   export function templateParam(q: { template?: string | string[]; style?: string | string[] }): string | undefined;
+  /** Step 9b (coordinator decision G2). The canvas region where scene and match cards are laid out: the
+   *  largest of the four inset-canvas strips beside `box` (right, above, left, below; ties in that
+   *  order), kept `CARD_CLEARANCE_PX` clear of it. `null` when none is at least CARD_MIN_W × CARD_MIN_H,
+   *  in which case no card renders. */
+  export const CARD_INSET = { top: 72, right: 96, bottom: 72, left: 96 } as const; // today's .ovl-slate-content padding, globals.css:1702-1706
+  export const CARD_CLEARANCE_PX = 24;   // today's gap above the bar stack, globals.css:1705
+  export const CARD_MIN_W = 640;         // design rule: a third of the canvas width
+  export const CARD_MIN_H = 360;         // design rule: a third of the canvas height
+  export function cardRegionFor(box: CanvasBox): CanvasBox | null;
 
   // components/overlay/overlay-scenes.ts
   export const OVERLAY_SCENES = [{ id: "live", labelKey: "stream.scene.live" }] as const; // R2005 appends starting, reconnecting, final
@@ -203,14 +225,26 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
   export const GALLERY_SNAPSHOT_KINDS: readonly GallerySnapshotKind[]; // ["warming", "live", "ended"]
   export interface MomentSample { id: string; sportKey: string; ruleKey: string; event: RecentEvent }
   export const GALLERY_MOMENT_SAMPLES: readonly MomentSample[];
-  export interface GalleryCell { key: string; templateId: string; sportKey: string; scene: SceneId; snapshot: GallerySnapshotKind; momentSampleId: string | null }
+  /** A Result-card variant other than "decided by play" (void, walkover, abandoned, …; review m11). */
+  export interface ResultVariant { status: string; sportKey: string }
+  /** The two sports result variants are drawn for: cricket (the bar default, the longest card text) and
+   *  badminton (the bug default). The card layout is sport-agnostic apart from the score line, so two
+   *  sports cover both templates' defaults. */
+  export const GALLERY_RESULT_VARIANT_SPORTS = ["cricket", "badminton"] as const;
+  export interface GalleryCell { key: string; templateId: string; sportKey: string; scene: SceneId; snapshot: GallerySnapshotKind; momentSampleId: string | null; resultStatus: string | null }
   /** Plain cells: every non-retired template suiting the sport × sport × scene × snapshot kind.
-   *  Moment cells: every non-retired template suiting the sample's sport × sample (scene "live", snapshot "live"). */
-  export function galleryMatrix(registry: TemplateRegistry, sports: readonly string[], scenes: readonly SceneId[], samples: readonly MomentSample[]): GalleryCell[];
+   *  Moment cells: every non-retired template suiting the sample's sport × sample (scene "live", snapshot "live").
+   *  Variant cells: every non-retired template suiting the variant's sport × variant (scene "live", snapshot "ended"). */
+  export function galleryMatrix(registry: TemplateRegistry, sports: readonly string[], scenes: readonly SceneId[], samples: readonly MomentSample[], variants: readonly ResultVariant[]): GalleryCell[];
+  /** The gallery's ONE cell source (review I3): `galleryMatrix` over the shipped sports, scenes and samples.
+   *  The page calls it with `OVERLAY_TEMPLATES`, and the extensibility test with a probe registry. */
+  export function galleryCells(registry: TemplateRegistry, variants: readonly ResultVariant[]): GalleryCell[];
 
   // server/overlay/gallery-snapshots.ts (server-only)
   export const GALLERY_SIDES: readonly [OverlaySideInput, OverlaySideInput];
   export function gallerySnapshots(): Record<string /* OVERLAY_SPORT_KEYS */, Record<GallerySnapshotKind, OverlayLiveData>>;
+  /** Every fixture status whose Result card is not "decided by play", for each GALLERY_RESULT_VARIANT_SPORTS sport. */
+  export function galleryResultVariants(): { variant: ResultVariant; snapshot: OverlayLiveData }[];
   ```
   `GALLERY_SIDES` is `[{ id: "home", name: "Milton Keynes Rovers" }, { id: "away", name: "Northbridge Athletic Football & Social Club" }]`.
   The second name is 43 characters, the length that exposed the `truncate`/`min-w-0` defect before
@@ -243,29 +277,50 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
      picker can't show.
   6. `templateParam`: `{template:"bug", style:"bar"}` → `"bug"`; `{style:"bar"}` → `"bar"`;
      `{template:"", style:"bar"}` → `"bar"`; `{template:["bug","bar"]}` → `"bug"`; `{}` → `undefined`.
+  7. **`cardRegionFor`** (step 9b; coordinator decision G2). Expected values come from the rule and
+     the constants, never from a call:
+     - a top-left box `{ x: 60, y: 54, width: 480, height: 600 }` → the right strip:
+       `x = 60 + 480 + CARD_CLEARANCE_PX`, `y = CARD_INSET.top`, `width = 1920 − CARD_INSET.right − x`,
+       `height = 1080 − CARD_INSET.top − CARD_INSET.bottom`
+     - a bottom strip `{ x: 72, y: 741, width: 1776, height: 177 }` → the strip above:
+       `x = CARD_INSET.left`, `y = CARD_INSET.top`, `width = 1920 − CARD_INSET.left − CARD_INSET.right`,
+       `height = 741 − CARD_CLEARANCE_PX − CARD_INSET.top`
+     - the full canvas `{ x: 0, y: 0, width: 1920, height: 1080 }` → `null` (the guard; the stage then
+       renders no card)
+     - for **every** `OVERLAY_TEMPLATES` entry, the region is non-null and does not intersect the
+       entry's box. Print `templates checked: 2`; fail on 0.
 
 - [ ] **Step 2: Write the failing extensibility test** (`template-extensibility.test.ts`, spec §5).
   Define a throwaway registry **in the test only**:
   ```ts
   const PROBE: OverlayTemplateDef<string> = {
     id: "probe", labelKey: "stream.tab.bug", sports: ["badminton"], component: OverlayBug,
-    slabPlacement: "bug", sceneCardSafeArea: OVERLAY_TEMPLATES.bug.sceneCardSafeArea,
+    // Its own box (top-right), so the test can prove a new template moves the cards with no other edit.
+    slabPlacement: "bug", sceneCardSafeArea: { x: 1380, y: 54, width: 480, height: 600 },
   };
   const REG: TemplateRegistry = { ...OVERLAY_TEMPLATES, probe: PROBE };
   const RETIRED: TemplateRegistry = { ...REG, gone: { ...PROBE, id: "gone", retired: { replacedBy: "probe" } } };
   ```
   Assert, with no other edit anywhere:
   - `templatesForSportFrom(REG, "badminton")` ends with `probe`; for cricket it doesn't contain it
-  - `galleryMatrix(REG, OVERLAY_SPORT_KEYS, OVERLAY_SCENES.map(s => s.id), GALLERY_MOMENT_SAMPLES)`
-    has exactly `OVERLAY_SCENES.length × 3` plain cells for `probe`, all badminton, plus one moment
-    cell per badminton sample, and **no** cricket cell for `probe`. Compute the expected counts from
-    the declarations (`OVERLAY_SCENES`, `GALLERY_SNAPSHOT_KINDS`, the samples filtered by sport),
-    never from `galleryMatrix`'s output.
-  - the readability sweep's cell list **is** `galleryMatrix` (the e2e renders it 1:1; step 9), so
-    the probe is in the sweep. Assert the sweep's exported cell source is that function by identity.
+  - `galleryCells(REG, VARIANTS)`, with `VARIANTS = [{ status: "walkover", sportKey: "badminton" }]`
+    typed in the test, has exactly `OVERLAY_SCENES.length × GALLERY_SNAPSHOT_KINDS.length` plain cells
+    for `probe`, all badminton, plus one moment cell per badminton sample, plus one variant cell, and
+    **no** cricket cell for `probe`. Compute the expected counts from the declarations
+    (`OVERLAY_SCENES`, `GALLERY_SNAPSHOT_KINDS`, the samples filtered by sport, `VARIANTS`), never from
+    `galleryCells`'s output.
+  - **The sweep's cell source is `galleryCells` (review I3).** Call the gallery page's default export
+    directly. It is an async server component, so `await Page({ searchParams: Promise.resolve({}) })`
+    returns a React element without rendering. Do this with `vi.mock` of the template-registry module
+    (importOriginal, `OVERLAY_TEMPLATES` replaced by `REG`), of `requireStaff` (re-pin its module;
+    resolves) and of `galleryResultVariants` (returns `[]`). Find the `<OverlayGallery>` element in the
+    returned tree and assert its `cells` prop includes the probe's badminton cells and equals
+    `galleryCells(REG, [])`. The e2e renders those cells 1:1 (step 10), so the probe is in every sweep.
+  - **A new box moves the cards:** `cardRegionFor(PROBE.sceneCardSafeArea)` does not intersect the
+    probe's box and differs from `cardRegionFor(OVERLAY_TEMPLATES.bug.sceneCardSafeArea)`.
   - retired resolution: `resolveTemplateFrom(RETIRED, "gone", "badminton", "bug").id === "probe"`
-    (a stored choice); the page's resolution of `?template=gone` takes the same function (page test,
-    step 4). `templatesForSportFrom(RETIRED, "badminton")` does not contain `gone`.
+    (a stored choice). The page's resolution of `?template=gone` takes the same function (page test
+    4.1, retired row). `templatesForSportFrom(RETIRED, "badminton")` does not contain `gone`.
 
 - [ ] **Step 3: Write the failing readability CSS scan** (`overlay-readability-css.test.ts`).
   Use `parseCss` / `readGlobalsCss` / `declaredValue` from
@@ -280,7 +335,12 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
     assumption is a guard, so the scan can't skip what it can't read. Print
     `font-size declarations checked: N`; fail on 0.
   - `--ovl-bar-bottom` on `.ovl-canvas` parses to px `>= BAR_BOTTOM_MIN_PX`.
-  - Expect red at pin: 26 rules below the floor, and `--ovl-bar-bottom` at 54.
+  - **The card layout consumes the registry (G2):** `.ovl-slate-content` declares `left`, `top`,
+    `width` and `height` as `var(--ovl-card-x)`, `var(--ovl-card-y)`, `var(--ovl-card-w)` and
+    `var(--ovl-card-h)`, and declares neither `inset: 0` nor a padding that names `--ovl-bar-`. That
+    is a guard: a card centred on the whole canvas is the defect.
+  - Expect red at pin: 26 rules below the floor, `--ovl-bar-bottom` at 54, and the card rule at
+    `inset: 0`.
 
 - [ ] **Step 4: Write the failing page and stage tests.**
   1. `page.test.ts` (re-pin its harness: `vi.mock` of the data reads, real `resolveTemplate`): for a
@@ -289,6 +349,10 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
      - `?style=bar` → `data-style="bar"` (the alias)
      - `?template=nope&style=bar` → `data-style="bug"` (decision 2)
      - no params on cricket → `data-style="bar"`
+     - **retired row (review m5b):** `vi.mock` the template-registry module (importOriginal) so that
+       `OVERLAY_TEMPLATES` gains `gone: { …bug, id: "gone", retired: { replacedBy: "bug" } }` and
+       `resolveTemplate` is the real `resolveTemplateFrom` over that registry. Then
+       `?template=gone` → `data-style="bug"`, so an OBS URL with a retired id keeps working.
 
      Anchor every assertion on `="` (AGENTS.md: an omitted prop serialises as `"$undefined"`).
   2. `overlay-slab-placement.test.tsx`: for **each** `OVERLAY_TEMPLATES` entry, render the stage with
@@ -297,6 +361,10 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
      (bar → `bar`, bug → `bug`) so a registry edit that swaps them goes red too. Move its
      bar-geometry pins to the lifted bottom: the expected numbers come from the CSS custom properties
      (`--ovl-bar-bottom`, `--ovl-bar-main-h`, `--ovl-bar-band-h`), never from a rendered value.
+  2b. **Card variables (G2):** for each `OVERLAY_TEMPLATES` entry, the stage's `.ovl-canvas` element
+     carries the inline custom properties `--ovl-card-x/y/w/h` equal to `cardRegionFor(def.sceneCardSafeArea)`,
+     and `--ovl-safe-x/y/w/h` equal to the def's box, in px. The expected values are the def's own box,
+     taken from the registry declaration. Print `templates checked: 2`.
   3. `overlay-preview.test.tsx` (`renderToStaticMarkup`, node): for each template,
      `<OverlayPreview frameWidth={390} …/>` renders `data-testid="ovl-preview"`,
      `data-template="<id>"` and `data-style="<id>"`, and a wrapper scale of `390 / 1920`. With
@@ -311,14 +379,32 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
        returns at least one moment, using the real `en/public.json` dictionary for `msg`. Cricket's
        three samples must yield the six, four and out headlines (`overlay.moment.six`, `.four`, `.out`).
      - Matrix size equals the sum, over sports, of `templatesForSport(sport).length × OVERLAY_SCENES.length × 3`,
-       plus the sum over samples of `templatesForSport(sample.sportKey).length`. Keys are unique.
+       plus the sum over samples of `templatesForSport(sample.sportKey).length`, plus the sum over the
+       variants passed of `templatesForSport(variant.sportKey).length`. Keys are unique.
   2. `gallery-snapshots.test.ts` (server, node; no DB): `gallerySnapshots()` returns all 11 sports ×
      3 kinds. Print `snapshots: 33`. Run each through the real `overlayModel` (en dictionary) and
      `slateStateOf` (`overlay-slate.tsx:18`), the card layer's own authority, and assert the result
      equals the kind's name: `warming` → `"warming"`, `live` → `"live"`, `ended` → `"ended"`. Also:
-     every `live` sample has at least one side with a non-zero score in the model, and every `ended`
-     sample has a non-null `outcome`. Fail on 0. (`ENDED_STATUSES`, `lib/overlay-model.ts:341`, is not
-     exported; don't export it for this, because `slateStateOf` is the reader that matters.)
+     - every `ended` sample has a non-null `outcome`
+     - **(corrected by the briefs review)** every `live` sample of a sport with at least one `MOMENT_RULES`
+       entry has at least one side with a non-zero score in the model. Those sports score as they go,
+       which is why they have moment rules. Boardgame, carrom and generic (empty `MOMENT_RULES` at pin)
+       can have no running score before their result, so for **every** sport the `live` model carries
+       both `GALLERY_SIDES` names. Derive the score-checked set from `MOMENT_RULES`, never a typed list.
+       Print `live samples score-checked: N, name-checked: 11`; fail if either is 0.
+
+     Fail on 0. (`ENDED_STATUSES`, `lib/overlay-model.ts:341`, is not exported; don't export it for
+     this, because `slateStateOf` is the reader that matters.)
+  3. **Result variants (review m11)**, in `gallery-snapshots.test.ts`. `galleryResultVariants()`:
+     - Re-pin the fixture-status union (the `fixtures.status` type and its check constraint). Keep the
+       statuses whose projection `slateStateOf` reads `"ended"`, other than the one `ended` already
+       covers (decided by play).
+     - Produce each through the real producers. Re-pin how each status gets its outcome: for example,
+       a walkover is an award folded from the engine's forfeit event through `foldFrom`, while void,
+       abandoned and `needs_decision` come from the row's status in `projectOverlayLiveData`.
+     - For each variant, assert `slateStateOf(overlayModel(..)) === "ended"`.
+     - Print `result variants: N (statuses: …)`; fail on 0. At pin, expect void, walkover, abandoned
+       and `needs_decision` (review m11); a status the re-pin finds is added, not skipped.
 
 - [ ] **Step 6: Run, expect a FAIL.**
   `cd apps/web && npx vitest run --reporter=json --outputFile=/tmp/r2007-red.json <the 8 test paths>`, then
@@ -327,10 +413,17 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
   exports and the 26 low rules, not a harness error.
 
 - [ ] **Step 7: Implement the registry migration** (decisions 1–4). `git mv` both files; rename the
-  exports; add `slabPlacement: "bar"` / `"bug"` to the two entries. Give each a **provisional**
-  `sceneCardSafeArea` from today's CSS: bar `{ x: 72, y: 1080 − bottom − main − band, width: 1776, height: main + band }`
-  from the three custom properties; bug `{ x: 60, y: 54, width: 480, height: 972 }`, a deliberately
-  loose bound that step 10 tightens from measurement. Delete `slabPlacementFor` and
+  exports; add `slabPlacement: "bar"` / `"bug"` to the two entries. **Declare** each
+  `sceneCardSafeArea` from the template's CSS layout rule, with the derivation as a comment beside the
+  numbers (review m1: a box copied from a measurement passes check 4 by construction, so it's a
+  ratchet, not an oracle):
+  - bar: `{ x: 72, y: 1080 − bottom − main − band, width: 1776, height: main + band }`, from the three
+    custom properties and `.ovl-bar`'s left/right 72
+  - bug: `{ x: 60, y: 54, width: <.ovl-bug width>, height: <header + the most data rows any sport's bug
+    shows × row height + footer> }`. Re-pin each term from the bug's CSS and the sport with the most
+    rows (sets or innings).
+
+  Step 9 re-declares both from the redesigned CSS. Delete `slabPlacementFor` and
   read `OVERLAY_TEMPLATES[props.style].slabPlacement` in the stage; the page reads
   `templateParam({ template, style })` and adds `template` to its query type. Update every caller's
   import (Context table). Leave the panel's and capture-phone's **behaviour** untouched: R2006 owns
@@ -344,7 +437,9 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
   - `OverlayPreview` lifts the panel's canvas-in-an-aspect-ratio-strip pattern
     (`fixture-stream-panel.tsx:566-610`) and renders `<OverlayStage realtime={false} snapshotOnly …/>`.
     It is the **only** preview path: the gallery uses it now, and R2006's picker must use it.
-  - `gallery-matrix.ts` and `GALLERY_MOMENT_SAMPLES` (decision 7). Each sample's `event` is a
+  - `gallery-matrix.ts`: `galleryMatrix`, and `galleryCells(registry, variants)`, which is
+    `galleryMatrix(registry, OVERLAY_SPORT_KEYS, OVERLAY_SCENES.map(s => s.id), GALLERY_MOMENT_SAMPLES, variants)`.
+    `GALLERY_MOMENT_SAMPLES` (decision 7): each sample's `event` is a
     `RecentEvent` carrying exactly the fields its rule reads (re-pin `server/overlay/recent.ts` for the
     shape, `derived.setWon` / `derived.pointState` included).
   - `gallery-snapshots.ts` (decision 6): per sport, `resolveModule` + the sport's default cfg (re-pin
@@ -352,9 +447,10 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
     and a scripted envelope list. `warming` folds nothing (`folded: null`). `live` folds the script's
     prefix. `ended` folds the whole script, which must decide the match by **play**, not by an award;
     pick the shortest legal cfg the sport declares, such as a short cricket innings. Project each
-    through `projectOverlayLiveData` with `GALLERY_SIDES`.
+    through `projectOverlayLiveData` with `GALLERY_SIDES`. `galleryResultVariants()` as step 5.3.
 
-  Run steps 1, 2, 4 and 5's files. Expect a PASS; paste the counts.
+  Run steps 1, 2, 4 and 5's files. Expect a PASS, except step 1.7, step 2's card leg, step 4.2b and
+  the CSS card guard, which go green in step 9b. Paste the counts.
 
 - [ ] **Step 9: The readability redesign** (D9 + D11; `frontend-design`; house theme only).
   - Lift every sub-30 px `.ovl-` font-size to ≥ 30 px. Numerals keep their larger sizes. Use only
@@ -363,17 +459,37 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
     `.superpowers/brainstorm/` are layout references only.
   - Set `--ovl-bar-bottom: 162px` (decision 5). Every rule derived from it (the moment slot, the slate
     content padding) follows the variable; re-pin each.
-  - Run the CSS scan (step 3): PASS. Paste `font-size declarations checked: N`.
+  - **Re-declare both `sceneCardSafeArea` boxes** from the redesigned CSS (the bug grows with the
+    floor), with the derivation comment updated. Never copy a measured box in.
+  - Run the CSS scan (step 3): the font-size and bar legs PASS. Paste `font-size declarations checked: N`.
+
+- [ ] **Step 9b: Cards are laid out from the registry (coordinator decision G2; `frontend-design`).**
+  - `cardRegionFor` in `template-registry.ts`, as in Interfaces.
+  - The stage writes, on `.ovl-canvas`, the inline custom properties `--ovl-safe-x/y/w/h` (the def's
+    box) and `--ovl-card-x/y/w/h` (`cardRegionFor(def.sceneCardSafeArea)`), in px. A `null` region
+    renders no match card (the guard; step 1.7 reaches it with an injected box).
+  - `.ovl-slate-content` becomes `position: absolute; left: var(--ovl-card-x); top: var(--ovl-card-y);
+    width: var(--ovl-card-w); height: var(--ovl-card-h)`, centring the card inside that region. Drop
+    `inset: 0` and the bar-stack padding. `.ovl-slate-card` keeps its `max-width: 1100px` and
+    `max-height: 100%`, so a narrow region shrinks it.
+  - R2005's scene cards render inside the same `.ovl-slate-content` wrapper, so they inherit this
+    layout and check 4 with no gallery edit.
+  - Run step 1.7, the extensibility test, step 4.2b and the CSS scan: PASS. Owner screen: the card
+    beside the bug, and the card above the bar (step 14).
 
 - [ ] **Step 10: The gallery page and its e2e** (1280 only: `/admin` exemption, owner 2026-09-28).
   - `page.tsx` (server): `await requireStaff()`; `searchParams` `sport` (one of `OVERLAY_SPORT_KEYS`;
     absent or unknown → all) and `frame` (`full` → 960 px wide, `844` → 844 × 475, `390` → 390 × 219,
-    spec §4.5; absent or unknown → `full`). Build `gallerySnapshots()` and
-    `galleryMatrix(OVERLAY_TEMPLATES, …)`, and pass plain data to the client component.
+    spec §4.5; absent or unknown → `full`). Build `gallerySnapshots()`, `galleryResultVariants()` and
+    `galleryCells(OVERLAY_TEMPLATES, variants.map(v => v.variant))` (the one cell source; step 2), and
+    pass plain data to the client component `OverlayGallery`: `cells`, the snapshots, and the variant
+    snapshots keyed `${status}:${sportKey}`. A variant cell (`resultStatus` non-null) renders its
+    variant's snapshot, and a cell whose key finds no snapshot throws (a guard, so a cell is never
+    rendered from the wrong data).
   - `overlay-gallery.tsx`: one `OverlayPreview` per cell, over a checkerboard so transparency shows.
     Each cell root carries `data-gallery-cell=<key>`, `data-template`, `data-sport`, `data-scene`,
-    `data-snapshot`, `data-moment`, `data-slab-placement` (the def's) and `data-safe-area` (the def's
-    box as JSON). The page root carries `data-cell-count`.
+    `data-snapshot`, `data-moment`, `data-result-status`, `data-slab-placement` (the def's) and
+    `data-safe-area` (the def's box as JSON). The page root carries `data-cell-count`.
   - Admin nav: `t(dict, "admin.overlayGallery.nav")` beside capture-records.
   - Copy (`ui.json`, all 4 locales, translated properly in the dictionary's tone; then
     `pnpm i18n:gen-keys`):
@@ -406,10 +522,19 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
        `cells: M, text elements checked: N` and list each violator by cell key, class and size.
     3. **Bar lift:** in every `bar` cell, `(canvas.bottom − bar.bottom) / scale >= 150`, where
        `scale = canvasRect.width / 1920`.
-    4. **Safe area:** in every cell, the template element's box (canvas px) lies inside
-       `data-safe-area`. In every `warming` and `ended` cell, the match card's box does not intersect
-       it. This is where the Context hypothesis about the card and the bug is settled. Record the
-       answer in the PR body.
+    4. **Safe area (rewritten; coordinator decision G2 / review I2):**
+       - In every cell, the template element's box (canvas px) lies inside `data-safe-area`.
+       - The card leg is keyed on **DOM presence, not on the snapshot kind**: in every cell containing
+         `[data-testid="ovl-slate-card"]`, the card's box does not intersect `data-safe-area`. That
+         includes R2005's scene cards (Reconnecting, Stream ended), which use the same element.
+       - The sweep covers every scene × every template × the `live` and `ended` snapshots (and
+         `warming`, and the result variants), because the cells are `galleryCells`. When R2005 appends
+         its scenes, this check covers them with no edit.
+       - Anti-vacuity: every `warming`, `ended` and variant cell must contain a card. Print
+         `cells: M, cards checked: K, cards expected ≥ W` (W from the cell list); fail if K is 0 or
+         K < W.
+       - A failure is fixed in the template's CSS or by re-declaring the box with its design reason,
+         **never** by writing a measured box in.
     5. **Slab placement:** in every moment cell, the slot's class is
        `ovl-moment-slot--<data-slab-placement>`, and the slot holds a slab.
     6. **No transport:** over 16 s after load (longer than `POLL_MS`), zero requests match
@@ -418,9 +543,10 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
     7. `?frame=844` and `?frame=390`: each preview's box width equals the frame (±1 px).
   - Run, expect a FAIL; implement; run, expect a PASS. Run it alone from `apps/web` with
     `BASE=http://localhost:<port>` against a prod build (the `seazn-local-env` skill).
-  - **Tighten each `sceneCardSafeArea`:** check 4 logs the union box of the template element over
-    every sport × snapshot. Round it outward to whole px and write it into the registry, replacing
-    the provisional box from step 7. Re-run: check 4 now pins the declared box.
+  - (Superseded 2026-10-15, review m1: the box is no longer tightened from the measured union box.
+    Check 4 now tests the rendered template against the declared box; see step 7.) Check 4 still
+    **logs** the measured union box per template. If that box is much smaller than the declared one,
+    note it in the PR body for the owner; it is information only.
 
 - [ ] **Step 11: The existing overlay e2e, by route.** `grep -arln "/overlay/fixtures" apps/web/e2e`.
   Extend `stream-overlay.spec.ts`: `?template=bug` on a cricket fixture shows the bug, and
@@ -445,13 +571,34 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
   | 6 | `templatesForSportFrom` stops hiding retired | step 1.4 and the extensibility test |
   | 7 | `galleryMatrix` iterates `OVERLAY_TEMPLATES` instead of its argument | extensibility test |
   | 8 | `OverlayPreview` drops `snapshotOnly` | e2e check 6 |
+  | 9 | `.ovl-slate-content` back to `inset: 0` + bar padding (ignores the card variables) | CSS card guard and e2e check 4 (bug cells) |
+  | 10 | `cardRegionFor` ignores `box` (always the strip above a bar) | step 1.7, the extensibility card leg, e2e check 4 |
 
-  Record all 8 in the commit body.
+  Record all 10 in the commit body.
 
 - [ ] **Step 14: Owner visual review.** Screenshots at 1280 of the gallery, at `frame=full`, `844`
   and `390`, cropped per template × sport. Post them in the PR comment, **never committed**
   (owner 10-09). Get a per-screen verdict on each (AGENTS.md class 11). The checks pass only if the
   images exist and differ between frames (class 10).
+
+- [ ] **Step 14b: OBS compatibility (coordinator decision G1; spec §5 "Compatibility"; manual, every
+  release).** OBS's browser source runs its own CEF, which isn't the compositor's, so the page is
+  checked in it by hand, once per release that touches `components/overlay/**` or `globals.css`'s
+  `.ovl-` rules, and once for this PR:
+  - In OBS (record its version and the CEF version from its About box), add a 1920×1080 browser source
+    with the panel's OBS URL for a stg fixture: `?template=bar` and then `?template=bug`. Score a goal
+    and check that the slab shows, at the template's placement.
+  - Add a source with a **scene URL**: the same fixture with `&host=compositor`, and run
+    `harness/phase-probe-server.py --variant pna --script waiting:5000,reconnecting:5000,final:5000`
+    from the compositor repo (C11 Step 0's file) on the same machine. The scenes cycle only if OBS's
+    CEF allows the loopback call; if it doesn't, record that too, since OBS users never use
+    `host=compositor`.
+  - Check visually: text is legible at the 1920 canvas, the bar sits clear of the bottom, no card
+    covers the template, and the background is transparent.
+  - Record the result in the compositor `_FINDINGS.md` as `F-0xx: OBS browser source compatibility,
+    <release>` (versions, URLs, verdict per check), or in the web release checklist if one exists
+    (re-pin). Post the screenshots in the PR comment, never in the repo. C17's acceptance lists this
+    record.
 
 - [ ] **Step 15: Scoped gate, commit, PR.** Touched unit files (JSON reporter, counts pasted), the two
   e2e files, `rtk proxy pnpm lint` on touched paths (read `✖ N problems`), and the typecheck.
@@ -522,8 +669,10 @@ The PR body gives the contract sha256 and the web commit sha that C07 pins.
 - PR A: the registry migrated, with `?template=` and `?style=` alias resolution, retired → replacement,
   and unknown → default, all unit-pinned; the extensibility probe appears in the picker list and the
   gallery matrix with no other edit; the CSS scan and the computed sweep pass with non-zero counts;
-  `/admin/overlay-gallery` renders every cell at 1280; the existing overlay e2e is green and
-  unchanged apart from the new cases; smoke extended; 8 mutants red; owner verdicts per screen.
+  `/admin/overlay-gallery` renders every cell at 1280; cards are laid out from `sceneCardSafeArea`
+  and check 4 covers every card in every cell; the existing overlay e2e is green and unchanged apart
+  from the new cases; smoke extended; 10 mutants red; owner verdicts per screen; the OBS
+  compatibility record (step 14b) exists.
 - PR B: merged before C07 vendors; the contract sha is in the PR body; 2 mutants red.
 - The false premises and the resolved ambiguities (decisions 2–4, the card/bug answer) are in the PR
   bodies, and in compositor `docs/_INDEX.md` through the orchestrator.

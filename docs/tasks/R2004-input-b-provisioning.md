@@ -4,8 +4,10 @@
 `git worktree add ../seazn.club-wt/r2004-input-b -b feat/relay-composed-input-b origin/main`.
 **Depends on:** R2003 merged (runs sequentially in `server/relay/*`), and **C00 F-002** (the measured
 camera→compositor delay, which becomes the default). **Amended 2026-10-15:** also **R2007 PR A merged**
-(`resolveTemplate` in `components/overlay/template-registry.ts`), and the owner's answer to the stop-grace
-question in Step 0 below. See "Amendment 2026-10-15 (overlay templates spec)" at the end.
+(`resolveTemplate` in `components/overlay/template-registry.ts`). See "Amendment 2026-10-15 (overlay
+templates spec)" at the end. **The stop contract (stop signals and the grace) is not in this PR**: it
+ships as its own small PR 0, described in that amendment, ahead of C12 and not gated on R2007
+(review m9).
 
 ## Context
 
@@ -92,7 +94,8 @@ The orchestrator puts these to the owner if any re-pin contradicts them:
    session never changes when the setting changes, the same rule as the delay. `overlayUrl` carries
    `template=${resolveTemplate(row.theme_id, row.sport_key).id}`: resolved, so the compositor's URL
    always names a live, non-retired id. `row.sport_key` is the session's admission snapshot (same
-   insert). R2006 is the writer of `overlay_template`; this task adds the column and its one reader.
+   insert). R2006 is the writer of `overlay_template`; this task adds the column and ~~its one reader~~
+   its two readers (corrected 2026-10-15, review m10: the capture descriptor too; see change 7).
 
 ## Changes
 
@@ -126,20 +129,25 @@ The orchestrator puts these to the owner if any re-pin contradicts them:
    reads `settings.overlay_template` in the same statement it already uses for the destination.
    Decide whether passthrough even has a Machine (re-pin); if it doesn't, the passthrough branch
    stays for contract completeness only.
+7. **(Amended 2026-10-15, review m10)** The capture descriptor's `overlayUrl` resolves the stored
+   choice. See "Second reader" in the amendment.
 
 ## Files
 
 - Create: `db/migration/V<next>__relay_composed_input_b.sql`
 - Modify:
-  - `apps/web/src/server/relay/{ingest-cf.ts,ports.ts,fakes.ts,config.ts}`
+  - `apps/web/src/server/relay/{ingest-cf.ts,ports.ts,fakes.ts,config.ts}` (`config.ts` for
+    `RELAY_OUTPUT_PROFILE`; the stop grace is PR 0's)
   - `apps/web/src/server/usecases/stream-sessions.ts`
   - the provisioning usecase (re-pin)
   - `secret-columns.ts` (re-pin its path)
+  - (Amended 2026-10-15, review m10) `apps/web/src/server/usecases/capture-phone.ts` (change 7)
 - Test:
   - `server/relay/__tests__/ingest-cf.test.ts`
   - `server/usecases/__tests__/relay-internal-routes.test.ts`
   - the provisioning usecase's test file
-  - `server/relay/__tests__/config.test.ts`
+  - `server/relay/__tests__/config.test.ts` (the output profile; the grace pin is PR 0's)
+  - (Amended 2026-10-15) the capture-GET test file (re-pin; test 11)
   - `enc-boundary.test.ts` (it must still pass: the new sealed columns are named only in
     `secret-columns.ts`)
 - Read only (amendment 2026-10-15): `apps/web/src/components/overlay/template-registry.ts`
@@ -205,9 +213,9 @@ The orchestrator puts these to the owner if any re-pin contradicts them:
 
 ## Acceptance
 
-- ~~8 tests pass~~ 10 tests pass (amended 2026-10-15), with passthrough tests unchanged.
-- ~~3 mutants~~ 5 mutants went red (amended 2026-10-15).
-- The owner's stop-grace answer (Step 0 of the amendment) is implemented and recorded.
+- ~~8 tests pass~~ ~~10~~ 11 tests pass (amended 2026-10-15), with passthrough tests unchanged.
+- ~~3 mutants~~ ~~5~~ 6 mutants went red (amended 2026-10-15).
+- (Amended 2026-10-15) PR 0 (the stop contract) is a **separate** PR; this PR doesn't carry it.
 - The migration applies on a fresh DB.
 - The destination key never reaches the Machine.
 - The PR is open.
@@ -215,8 +223,8 @@ The orchestrator puts these to the owner if any re-pin contradicts them:
 ## Amendment 2026-10-15 (overlay templates spec)
 
 Authority: `seazn.club: docs/superpowers/specs/2026-10-15-overlay-templates-and-scenes-design.md`
-§4.4 and §6 ("R2004 (amend): the composed `overlayUrl` carries `template=` from the fixture's stored
-choice"). The edits above are marked in place: decision 5 (superseded), decision 7, change 1, change 6,
+§4.4 and §6, R2004 row (verbatim, `29fa9f59c`): "The composed `overlayUrl` carries `template=` from the
+fixture's stored choice." The edits above are marked in place: decision 5 (superseded), decision 7, change 1, change 6,
 tests 8–10, mutants 4–5, Acceptance.
 
 **False premise recorded:** the 2026-09-05 ruling "style in the URL, not the DB" read as if nothing
@@ -227,29 +235,120 @@ writes it (its go-live posts `{ mode, targetId }`, `fixture-stream-panel.tsx:120
 the choice on the fixture's settings and copies it into that existing column. It adds no second column
 on the session.
 
-- [ ] **Step 0 (before Step 1): the stop-grace question, for the owner.** The orchestrator asks it; this
-  task does not guess.
-  - **The facts.** R1's runner moves to `stopping` and sends `SIGINT` the moment the organiser stops
-    (`server/relay/runner.ts:101`, `:117-118`, `:251-252`). Fly SIGKILLs `RUNNER_STOP_GRACE_SECONDS = 10`
-    later (`server/relay/config.ts:141`). The amended C06 holds the Final card for
-    `FINAL_HOLD_MS = 10 000` (spec §4.2, D4), and then drains for up to `drain_timeout_ms = 7 000`.
-    10 + 7 = 17 s, which is longer than 10 s, so the Machine is killed mid-drain on every organiser
-    stop: no EOS, and the final exit beat may be lost.
-  - **Options:** (A) raise `RUNNER_STOP_GRACE_SECONDS` to `20`, which fits hold 10 + drain 7 + 3
-    headroom (`ENDING_TIMEOUT_SECONDS = 300` still bounds the whole stop), or (B) shorten the final hold
-    to fit 10 s, which leaves 0 s for it after drain and headroom. **Recommendation (this brief's, not
-    an owner ruling): A.** Passthrough has no Machine, so the grace changes nothing there; re-pin that
-    before relying on it.
-  - **Implement the owner's pick**, with a test in `server/relay/__tests__/config.test.ts` that pins
-    the constant against the compositor's budget: `RUNNER_STOP_GRACE_SECONDS * 1000 >= 10_000 + 7_000 + 3_000`,
-    with each number commented from its source (spec §4.2, compositor `config.rs` `drain_timeout_ms`, the
-    3 s headroom in that field's doc line). Record the pick in compositor `docs/_INDEX.md`. C12's
-    `final_hold_and_drain_fit_inside_r1_stop_grace` reads the same value.
+**Second reader: the capture descriptor's `overlayUrl` (review m10; coordinator decision).**
+`capture-phone.ts:176` builds the capture API's `overlayUrl` as `s.themeId ?? defaultThemeFor(ctx.sport_key)`.
+`s.themeId` is the latest session's `theme_id`, passed at `:226` and `:631`. So before any session, or
+after a re-pick, the field names the sport default or the old template, not the stored choice.
+- **Change 7:** add `st.overlay_template` to the context select. That query already joins
+  `fixture_stream_settings st` at `:159`. Then
+  `theme = resolveTemplate(s.themeId ?? ctx.overlay_template, ctx.sport_key).id`. That is the
+  coordinator's `s.themeId ?? resolveTemplate(settings.overlay_template, sport).id`, except that a
+  retired session id also resolves. The URL keeps `?style=` (the page reads both, R2007 decision 2).
+- **Test 11:** in the capture-GET tests (re-pin the file), with no session and
+  `overlay_template = 'bug'` on a cricket fixture, the descriptor's `overlayUrl` carries `style=bug`.
+  With no stored choice, it carries `style=bar`, cricket's default from the registry entry.
+- **Mutant 6:** read `defaultThemeFor` again. Expected red: test 11.
+- The 'one reader' in decision 7 becomes **two readers**: `sessionFactsForJob` and `captureCommon`.
+- **Recorded fact, not a reason to skip:** today no phone reads this field. The score preview
+  WebView was removed by owner ruling 2026-10-08 (`seazn.club.capture` `AGENTS.md` §7: "The
+  descriptor still sends `overlayUrl`; nothing on the phone reads it"). The field is still public
+  API v1 (`capture-schemas.ts:62`, `:169`), so it must not name a stale template. No e2e can witness
+  it, so test 11 is the only witness.
+
+### PR 0: the relay stop contract (its own small PR; replaces the old Step 0)
+
+**Why it's separate (review m9).** C12's grace test can't go green until this ships. Inside R2004 it
+would wait on R2007 PR A, and so on the end-card-undo fix, which puts the compositor on the overlay
+critical path. As its own PR, it waits only on R2003.
+
+- **Worktree:** `git worktree add ../seazn.club-wt/relay-stop-contract -b fix/relay-stop-contract origin/main`,
+  **after R2003 (#967) merges**: #967 edits `runner-fly.ts`, `fly-client.ts`, `config.ts` and
+  `domain/runner.ts`.
+- **The facts.** These are re-pinned on R2003's tree (`origin/feat/relay-runner-restart` `f9034f575`),
+  with the main `b01d07cd5` lines in brackets. The file is `server/relay/domain/runner.ts`, not
+  `server/relay/runner.ts` (corrected, review):
+  - `STOP` = `{ stop_machine, signal: RUNNER_STOP_SIGNAL, timeoutSeconds: RUNNER_STOP_GRACE_SECONDS }`
+    is at `:143` (`:101`), and `toStopping` at `:160-161` (`:117-118`).
+  - The playing row's `deadline` and `session_stop` are at `:324-325` (`:251-252`).
+  - In `config.ts`, `RUNNER_STOP_GRACE_SECONDS = 10` is at `:146` (`:141`) and
+    `RUNNER_STOP_SIGNAL = "SIGINT"` at `:161` (`:147`).
+  - `fly-client.ts:464-468` `stopMachine` POSTs `{ signal, timeout: "<n>s" }` and doesn't wait.
+  - `runner-fly.ts:230-238` creates the Machine with no `stop_config`.
+- **Fly's API (docs.fly.io, fetched 2026-10-15; cite these in the code comments):**
+  - `docs.fly.io/machines/api/machines-resource`, "Stop a Machine": the body takes `signal` ("Signal
+    to stop the Machine with. (default: SIGINT)") and `timeout` ("Seconds to wait before sending
+    SIGKILL to the Machine"). So web's explicit `signal` on its own stop is supported.
+  - The same page, "Machine `config` object properties", defines `stop_config`. Its `signal` is "The
+    name of the signal to send to the entrypoint process on the Machine to initiate shutdown", and
+    its `timeout` is "How long in nanoseconds to wait, after signaling the entrypoint process, before
+    hard-shutdown of the Machine". Both default to nil.
+  - `docs.fly.io/reference/configuration`: `kill_signal` defaults to SIGINT, and `kill_timeout`
+    defaults to **5 s** (max 300). They apply "during controlled shutdowns such as" `fly deploy`,
+    `fly machine stop` and `auto_stop_machines`.
+
+  So **today a platform-initiated stop arrives as SIGINT with a 5 s timeout** (review I4). C06 would
+  show "Stream ended" for a host stop and be killed mid-hold.
+- **Part 1: the signal split (coordinator decision I4, 2026-10-15).**
+  - Composed Machines are created with `stop_config: { signal: "SIGTERM", timeout: <RUNNER_STOP_GRACE_SECONDS in the docs' unit> }`.
+    Re-pin whether `runner-fly.ts` creates anything but composed Machines; if it doesn't, that's every
+    create. `MachineCreateInput` (`fly-client.ts`) gains the optional field.
+  - Web's own stop keeps passing `signal: RUNNER_STOP_SIGNAL` (SIGINT) explicitly.
+  - Result: **our stop arrives as SIGINT and C06 holds the Final scene**. A Fly-initiated controlled
+    stop arrives as **SIGTERM, and C06 drains at once** (no Final card), within our grace instead of
+    Fly's 5 s.
+  - Fly literals stay in `runner-fly.ts` and `fly-client.ts` (ADR 0007).
+  - **The timeout's unit is checked, not assumed.** The docs type it as an int in nanoseconds; send
+    that. The live leg reads the Machine back and asserts `config.stop_config` equals what was sent.
+    If Fly normalises it to another form, use the form that round-trips and record it.
+  - **Precedence is measured, not assumed.** Does the stop request's explicit `signal` win over
+    `stop_config.signal`? If it didn't, our own stop would arrive as SIGTERM and the Final scene would
+    never show.
+    - Measure once on the stg Fly app with a throwaway probe Machine created with
+      `stop_config.signal = SIGTERM`. Its entrypoint is
+      `sh -c 'trap "exit 3" INT; trap "exit 4" TERM; while :; do sleep 1; done'`, a public `busybox`
+      image, and it has no `auto_destroy`.
+    - Send `POST /stop { "signal": "SIGINT" }`, then read the exit code from the Machine's events.
+      Expected: **3**. Also send a stop with no `signal`. Expected: **4**.
+    - Destroy the probe and confirm it's gone.
+    - Record the result as `F-0xx: Fly stop signal precedence` in compositor `_FINDINGS.md`.
+    - **If the explicit signal loses, halt** and route to the coordinator. Don't ship Part 1.
+- **Part 2: the grace. OWNER DECISION PENDING (option A).**
+  - **Recommendation, not a ruling:** raise `RUNNER_STOP_GRACE_SECONDS` from 10 to 20, which fits
+    hold 10 + drain 7 + 3 headroom. Option B, shortening the final hold to fit 10 s, leaves 0 s for
+    the hold.
+  - **Part 2 ships only on the owner's yes.** If the owner picks B, Part 2 doesn't ship; C06's
+    `final_hold_ms` and its spec-number test change by owner ruling instead. Part 1 ships either way.
+  - With A, update the arithmetic comment above `ENDING_TIMEOUT_SECONDS` (`config.ts:125-135` on main;
+    re-pin on R2003's tree):
+    - ordinary teardown: 20 + 20 + 55 + 55 = **150 s** < 300
+    - with a destroy wait: 40 + 55 + 55 + 55 = **205 s** < 300
+
+    `ENDING_TIMEOUT_SECONDS` stays at 300. The doc comment on `RUNNER_STOP_GRACE_SECONDS` itself
+    (today "the supervisor's flush budget is ≤ 10 s", from R0's ffmpeg) gains the compositor's budget:
+    hold 10 + drain 7 + headroom 3. Also confirm:
+    - `grace_expired` (grace + `RUNNER_OBSERVE_SLACK_SECONDS` = 40 s) stays below it
+    - `MACHINE_MINUTES_BOUND` is unchanged (`ceil(20 / 60)` = 1; `domain/runner.ts:93-94` on main)
+    - `runner-fly.test.ts`'s composed-teardown term moves with the constant
+- **Tests (failing first; JSON reporter):**
+  - `runner-fly.test.ts`: the create body carries `stop_config: { signal: "SIGTERM", timeout: … }`, with
+    the timeout derived from `RUNNER_STOP_GRACE_SECONDS`; the stop still posts `signal: "SIGINT"`.
+  - `runner-fly.live.test.ts` (opt-in, `RELAY_LIVE_FLY=1`, the file's existing residue rule): a
+    composed create reads back the same `stop_config`.
+  - With A, `config.test.ts` pins `RUNNER_STOP_GRACE_SECONDS * 1000 >= 10_000 + 7_000 + 3_000`, each
+    number commented from its source: spec §4.2, compositor `config.rs` `drain_timeout_ms`, and the
+    3 s headroom in that field's doc line.
+- **Mutants:**
+  - `stop_config.signal` set to `"SIGINT"`. Expected red: the runner-fly test.
+  - `stop_config` dropped. Expected red: the same test.
+  - With A, the grace back to 10. Expected red: `config.test.ts`.
+- **Commit:** `fix(relay): composed Machines stop on SIGTERM from the platform and SIGINT from us`,
+  plus `, with a 20 s grace` when A ships. Record the parts that shipped in compositor `docs/_INDEX.md`.
+  C12's `final_hold_and_drain_fit_inside_r1_stop_grace` reads the same value.
 
 ## Do not touch
 
-The overlay page (R2005), the UI (R2006), and the runner (R2003; the one constant in Step 0 of the
-amendment is the exception, and only with the owner's pick).
+The overlay page (R2005), the UI (R2006), and the runner (R2003). (Amended 2026-10-15) The stop
+contract is PR 0's, not this PR's.
 
 ## Output cap
 

@@ -210,13 +210,14 @@ fly/stg.toml, fly/prod.toml        (C16)
 | C09 | Programme + output pipelines. **Amended 2026-10-15:** the textless slate | compositor | C08, **C00 pass** | `tasks/C09-gst-programme-output.md` |
 | C10 | Input pipeline | compositor | C09 | `tasks/C10-gst-input.md` |
 | C11 | Graphics pipeline (CEF). **Amended 2026-10-15:** Step 0 (the loopback probe) needs only C00 pass and runs **first**; R2005 waits on it | compositor | C09, **C00 pass** | `tasks/C11-cef-graphics.md` |
-| C12 | Binary wiring, metrics, Dockerfile, image CI. **Amended 2026-10-15:** the `/phase` endpoint and the stop-grace test | compositor | C10, C11, **the owner's stop-grace pick shipped on web** (R2004 amendment Step 0) | `tasks/C12-binary-and-image.md` |
+| C12 | Binary wiring, metrics, Dockerfile, image CI. **Amended 2026-10-15:** the `/phase` endpoint and the stop-grace test | compositor | C10, C11, **R2004 PR 0 deployed to stg** (the stop contract; corrected by review m9) | `tasks/C12-binary-and-image.md` |
 | C13 | Harness: fakes + reference checker | compositor | C12 | `tasks/C13-harness.md` |
 | C14 | Chaos suite | compositor | C13 | `tasks/C14-chaos-suite.md` |
 | C15 | Soak | compositor | C14 | `tasks/C15-soak.md` |
 | R2003 | Runner `on-failure`, same-attempt sweep, 15 s composed stale, exit 78 never retries | seazn.club | R2002 | `tasks/R2003-runner-restart-and-beats.md` |
-| R2007 | **New 2026-10-15.** PR A: the overlay template registry, text floor and bar lift, `/admin/overlay-gallery`, `OverlayPreview`. PR B: the owed R2002 contract follow-up (`final`, `phaseChannel`, the phase endpoint `$defs`) | seazn.club | PR A: the end-card-undo fix (`fix/overlay-end-card-undo`) merged. PR B: none | `tasks/R2007-overlay-template-system.md` |
-| R2004 | Composed provisioning: Input B, composed session facts, delay column. **Amended 2026-10-15:** `template=` in `overlayUrl`, the stored choice, Step 0 stop grace | seazn.club | R2003, **C00 F-002**, **R2007 PR A**, **the owner's stop-grace answer** | `tasks/R2004-input-b-provisioning.md` |
+| R2007 | **New 2026-10-15.** PR A: the overlay template registry, text floor and bar lift, `/admin/overlay-gallery`, `OverlayPreview`. PR B: the owed R2002 contract follow-up (`final`, `phaseChannel`, the phase endpoint `$defs`) | seazn.club | PR A: the end-card-undo fix (`fix/overlay-end-card-undo`) merged. PR B: **R2003 (#967) merged** (corrected by the briefs review: they share three files) | `tasks/R2007-overlay-template-system.md` |
+| R2004 PR 0 | **New 2026-10-15.** The relay stop contract, its own small web PR: composed Machines get `stop_config { signal: "SIGTERM" }` while web's stop stays an explicit SIGINT (coordinator decision I4), a measured signal-precedence F-id, and the grace raised to 20 s (**OWNER DECISION PENDING**) | seazn.club | R2003 (#967) merged. **Not** R2007 or the undo fix | `tasks/R2004-input-b-provisioning.md` ("PR 0") |
+| R2004 | Composed provisioning: Input B, composed session facts, delay column. **Amended 2026-10-15:** `template=` in `overlayUrl`, the stored choice | seazn.club | R2003, **C00 F-002**, **R2007 PR A** | `tasks/R2004-input-b-provisioning.md` |
 | R2005 | Overlay page: `sid`+`st` access, `host=compositor` signals, stale, clamp. **Amended 2026-10-15:** scenes, cards, the phase channel with fallback B | seazn.club | R2004, **C00 F-001**, **R2007 PR A + PR B**, **C11 Step 0 finding** | `tasks/R2005-overlay-page-compositor-host.md` |
 | R2006 | Organiser UI: composed option + delay override. **Amended 2026-10-15:** the template picker with live previews, persisted | seazn.club | R2004, R2005, **R2007 PR A + PR B** | `tasks/R2006-organiser-composed-ui.md` |
 | C16 | Deploy workflows, Fly apps config | compositor | C12 | `tasks/C16-deploy.md` |
@@ -234,10 +235,17 @@ fly/stg.toml, fly/prod.toml        (C16)
   R2003 and with every C task. The one possible overlap is the 4 locale dictionaries, if R2003 owes
   failure-reason copy; whichever merges second rebases and re-runs `pnpm i18n:gen-keys`. It runs
   **after** the end-card-undo fix, because both touch `components/overlay/**`.
-- (Amended 2026-10-15) **R2007 PR B** (`lib/relay-phase.ts`, `server/api-v1/schemas.ts`,
-  `server/relay/sanitise.ts`, `scripts/gen-relay-contracts.ts`, `docs/contracts/**`) shares no file with
-  R2003 (which touches `runner-fly.ts`, `config.ts`, `domain/expiry.ts` and `domain/runner.ts`), so it
-  can run alongside it. It must merge **before C07 vendors** the contract.
+- (Amended 2026-10-15; **corrected by the review**) **R2007 PR B** (`lib/relay-phase.ts`,
+  `server/api-v1/schemas.ts`, `server/relay/sanitise.ts`, `scripts/gen-relay-contracts.ts`,
+  `docs/contracts/**`, `openapi/v1.json`, `relay-internal-routes.test.ts`) **does share files with
+  R2003**. The earlier "shares no file" claim was false. R2003 (#967, `origin/feat/relay-runner-restart`
+  `f9034f575`, not merged at `b01d07cd5`) also edits `server/api-v1/schemas.ts`, `openapi/v1.json` and
+  `relay-internal-routes.test.ts` (+340 lines), as well as `stream-sessions.ts`,
+  `stream-session-view.ts`, `fly-client.ts`, `runner-fly.ts` and `config.ts`. So **PR B branches after
+  #967 merges**, and it must merge **before C07 vendors** the contract.
+- (Amended 2026-10-15) **R2004 PR 0** (the stop contract: `runner-fly.ts`, `fly-client.ts`, `config.ts`
+  and their tests) branches after #967 merges, too. It shares no file with R2007 PR A, so they can run
+  in parallel; with PR B it shares none either, but both wait on #967.
 - (Amended 2026-10-15) **C11 Step 0** is a docs/harness commit on the compositor `main`. It can run as
   soon as C00 has passed, in parallel with C06–C08.
 
@@ -252,10 +260,11 @@ The orchestrator re-runs each wave's **scoped** gate itself and pastes the raw c
 ## Dependency graph (amended 2026-10-15)
 
 ```
-end-card-undo fix ──▶ R2007 PR A ──┬──▶ R2004 (+ R2003, C00 F-002, owner stop-grace answer)
+end-card-undo fix ──▶ R2007 PR A ──┬──▶ R2004 (+ R2003, C00 F-002)
                                    ├──▶ R2005 (+ R2004, C00 F-001, C11 Step 0, R2007 PR B)
                                    └──▶ R2006 (+ R2004, R2005, R2007 PR B)
-R2007 PR B ──▶ C07 vendors the contract ──▶ C08 ──▶ … ──▶ C12 (+ owner stop-grace pick on web)
+R2003 (#967) ──┬──▶ R2007 PR B ──▶ C07 vendors the contract ──▶ C08 ──▶ … ──▶ C12
+               └──▶ R2004 PR 0 (stop contract; grace OWNER-PENDING) ──────────▶ C12
 C00 PASS ──▶ C11 Step 0 (_FINDINGS F-0xx) ──▶ R2005
 ```
 
@@ -283,10 +292,16 @@ the relevant line.
   - `run-case.sh` must wait `final_hold_ms + drain_timeout_ms` after the case's end request before
     `down`, or it cuts the drain.
   - Any verdict that counts slate spans must exclude the span that starts at the end request.
-- **C17 (stg acceptance):**
-  - Row 1 shows Starting soon before the first camera frame.
-  - Row 3 expects the **Reconnecting scene**, with the score bug visible, by 3 s, not a bare slate.
-  - Row 7 expects the Final scene (Result card, or Stream ended) for about 10 s before YouTube ends.
-  - Row 8's health query shows `phaseChannel: "loopback"`. That is the permanent proof of C11 Step 0
-    on a real Fly CEF; `web` there is a finding against C11/C12, not a pass.
-  - Add a row: the organiser picks a non-default template in R2006, and YouTube shows that template.
+- **C17 (stg acceptance):** now edited in its brief (review 2026-10-15). See C17's "Amendment
+  2026-10-15": rows 1, 3, 7 and 8 amended, rows 9–11 added (picked template, platform stop, OBS
+  record), and the compatibility records in Acceptance.
+
+**Plan decisions recorded by the 2026-10-15 review** (not owner rulings):
+- **`overlay_template` has two readers** (review m10; coordinator decision). One is
+  `sessionFactsForJob`'s composed `overlayUrl`. The other is the capture descriptor's `overlayUrl`
+  (`capture-phone.ts:176`), which today falls back to the sport default before any session. R2004
+  change 7 resolves the stored choice there. No phone reads that field today (owner ruling
+  2026-10-08, capture `AGENTS.md` §7), but it is public API v1, so it must not name a stale template.
+- **Compatibility is checked every release in both browsers** (coordinator decision G1): C11's
+  `cefsrc` scene check and R2007 step 14b's OBS check, each recorded as an F-id, with C17 requiring
+  both.

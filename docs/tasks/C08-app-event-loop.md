@@ -62,6 +62,9 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
       pub fn tick_due(&mut self, now: u64) -> Option<i32>;              // runs every due tick index up to `now`
       pub fn next_tick_at(&self) -> u64;
       pub fn skipped_ticks(&self) -> u64;
+      /// (Amended 2026-10-15, review I1) The supervisor's current programme phase, read-only; it
+      /// delegates to `supervisor.programme_phase()`. Tests compare it with the last published phase.
+      pub fn programme_phase(&self) -> domain::programme::ProgrammePhase;
   }
   // control_worker.rs
   pub fn spawn(cp: Box<dyn ControlPlane>, tx: crossbeam_channel::Sender<Inbound>) -> ControlHandle; // ControlHandle: ControlQueue
@@ -319,8 +322,10 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
      `fetch_is_never_dropped_behind_a_slow_heartbeat` if no test goes red, then re-run.
   4. **(Amendment 2026-10-15)** Publish the phase on every tick, not on change. Expected red:
      `phase_is_published_on_change_only_with_a_rising_seq`.
-  5. **(Amendment 2026-10-15)** Publish before `decide` (the old phase). Expected red: the same test
-     (the sequence lags by one).
+  5. **(Amendment 2026-10-15)** Publish before `decide` (the old phase). Expected red: the same test's
+     per-call order assertion (corrected 2026-10-15, review I1: the published list is unchanged under
+     this mutant, so only the order leg kills it). If it survives, the order leg is missing, so fix the
+     test, not the mutant list.
 
 - [ ] **Step 8: Commit.** `feat(app): driver, control worker, ports and fakes (C08)`
 
@@ -334,8 +339,8 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
 ## Amendment 2026-10-15 (overlay templates spec)
 
 Authority: `seazn.club: docs/superpowers/specs/2026-10-15-overlay-templates-and-scenes-design.md`
-§4.3 (D10) and §6 ("C08/C12 (amend): adds the loopback `/phase` endpoint (127.0.0.1 only; CORS + PNA
-headers; long-poll)").
+§4.3 (D10) and §6, C08/C12 row (verbatim, `29fa9f59c`): "Adds the loopback `/phase` endpoint
+(127.0.0.1 only; CORS + PNA headers; long-poll)."
 
 **Ownership split, stated in both briefs:**
 - **C08 owns** the port (`PhasePublisher`), the driver's publication rule, and the testkit fake.
@@ -370,7 +375,14 @@ impl PhasePublisher for FakePhase { fn publish(&mut self, p: ProgrammePhase, seq
 
   Every duration comes from `Thresholds::default()`. Assert the `Call::Phase` list is exactly
   `[(Live,1), (Frozen,2), (Reconnecting,3), (Live,4), (Final,5)]`, with no repeats across the hundreds
-  of ticks in between. Print `ticks driven: N, phases published: 5`; fail if N is 0.
+  of ticks in between.
+
+  **Order, within each call (review I1):** after **every** `d.step(..)` and `d.tick_due(..)` call, the
+  phase of the last `Call::Phase` in the log, or `Waiting` if there is none yet, equals
+  `d.programme_phase()`. So the publication for a change lands in the same call as the `decide` that
+  made it, never one call later. The list assertion alone can't see that: a one-call lag publishes the
+  same list. Advance `now` by one tick period per `tick_due` call, so each call runs exactly one tick;
+  a call that ran several would let a later tick in it hide the lag. Print `ticks driven: N, calls checked: M, phases published: 5`; fail if N or M is 0.
 - `ending_holds_final_then_drains_stops_children_and_exits_zero`, replacing the superseded test:
   - an `Ending` reply at 20: no `Call::Drain` yet
   - every push from 20 to `20 + final_hold_ms` is `Slate(SlateKind::Final)`

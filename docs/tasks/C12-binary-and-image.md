@@ -1,9 +1,10 @@
 # C12: Binary wiring, process metrics, Dockerfile, image CI
 
 **Repo:** `seazn.club.compositor`. **Depends on:** C10, C11. Read F-001 (gstcefsrc commit and CEF
-version) and F-005 (cold start). **Amended 2026-10-15:** also the owner's stop-grace decision (R2004's
-amendment Step 0) shipped on web, and C11 Step 0's loopback finding. See "Amendment 2026-10-15
-(overlay templates spec)" at the end.
+version) and F-005 (cold start). **Amended 2026-10-15:** also **R2004's PR 0** (the standalone web
+"relay stop contract" PR: the SIGTERM `stop_config`, and the grace if the owner picks A) deployed to
+stg, and C11 Step 0's loopback finding. (Corrected 2026-10-15, review m9: C12 waits on PR 0 alone,
+not on R2004 or R2007.) See "Amendment 2026-10-15 (overlay templates spec)" at the end.
 
 ## Context
 
@@ -15,6 +16,11 @@ re-pin before relying on it) creates the Machine with:
   string** from `Date.toISOString()`, e.g. `2026-10-14T18:30:00.000Z`.
 - the stop signal is `SIGINT` (`config.ts` `RUNNER_STOP_SIGNAL`), with a grace of
   `RUNNER_STOP_GRACE_SECONDS = 10`
+- **(Amended 2026-10-15, coordinator decision I4)** after R2004's PR 0, also
+  `stop_config: { signal: "SIGTERM", timeout: <grace> }`. So web's own stop (an explicit
+  `signal: "SIGINT"` on the stop call) arrives as SIGINT, while a Fly-initiated stop (deploy,
+  `fly machine stop`, auto-stop) arrives as SIGTERM. Without PR 0, Fly's default is SIGINT with a 5 s
+  timeout (docs.fly.io `kill_signal`/`kill_timeout`). Re-pin `runner-fly.ts` after PR 0.
 
 The binary reads those four values, builds every adapter, and runs `app::run::run`. It is the only
 place that reads `std::env`, the system clock, or signals.
@@ -66,6 +72,8 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
 - Create: `crates/adapters/src/metrics_proc.rs`
 - Create: `docker/Dockerfile`, `docker/entrypoint.sh`, `.dockerignore`
 - Create: `.github/workflows/image.yml`
+- (Amended 2026-10-15, review m4) Create: `crates/compositor/examples/smoke_budget.rs`. Modify: the
+  workspace `Cargo.toml` lint comment (the second sanctioned `print_stdout` exception).
 - Test: `crates/compositor/tests/env.rs`, `crates/adapters/tests/metrics_proc.rs`,
   `crates/compositor/tests/fake_run.rs`
 - `crates/compositor/Cargo.toml`: `signal-hook = "0.3"`,
@@ -222,9 +230,21 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
      (`--target rust-build` plus the cef plugin path) with `cargo test -p adapters --features cef --test graphics -- --test-threads=1`.
      Fail if the passed count is < ~~7~~ 8 (amended 2026-10-15: C11's `phase_channel_signal_is_relayed`).
   4. **60 s smoke:** start the image with `COMPOSITOR_DRIVERS=fake`, a deadline 60 s ahead and the
-     dummy env. Expect exit 0 within ~~75 s~~ 85 s (amended 2026-10-15: 60 s + `final_hold_ms` 10 s +
-     `drain_timeout_ms` 7 s = 77 s, plus 8 s for container start; write that sum as a comment beside
-     the number), and stderr containing `programme started` and `exit code=0`.
+     dummy env. Expect exit 0 within ~~75 s~~ ~~85 s~~ the **computed** budget (corrected 2026-10-15,
+     review m4: a typed number goes stale the moment a threshold moves), and stderr containing
+     `programme started` and `exit code=0`.
+     - Create `crates/compositor/examples/smoke_budget.rs`. It prints one integer to stdout:
+       `60_000 + t.final_hold_ms + t.drain_timeout_ms + 8_000`, with `t = Thresholds::default()`.
+       The terms are the deadline, the final hold, the drain, and container start; each gets a
+       comment naming its source.
+     - It starts with `#![allow(clippy::print_stdout)] // prints the smoke budget for image.yml (C12 Step 8)`.
+       Amend the workspace `Cargo.toml` lint comment, which today names one sanctioned
+       `print_stdout` exception (C13's harness), to name this as the second.
+     - `image.yml` runs it in the `rust-build` stage container
+       (`cargo run -q -p compositor --example smoke_budget`), refuses an empty or non-numeric
+       output, and uses `timeout $(( (BUDGET_MS + 999) / 1000 ))s` on the smoke. Print
+       `smoke budget: <n> ms` in the log. At today's thresholds that is 85 000; the workflow never
+       contains the number.
   5. Print the image size, and fail above 2.5 GB (CEF is large; the cap stops bloat creep).
 
   Push is C16's job; this workflow never pushes.
@@ -270,9 +290,11 @@ ended").
 ## Amendment 2026-10-15 (overlay templates spec)
 
 Authority: `seazn.club: docs/superpowers/specs/2026-10-15-overlay-templates-and-scenes-design.md`
-§4.3 (D10: "Primary (A): the compositor serves its programme phase on a loopback HTTP endpoint
-(`127.0.0.1` only, read by its own CEF; never exposed by Fly)") and §6 ("C08/C12 (amend): adds the
-loopback `/phase` endpoint (127.0.0.1 only; CORS + PNA headers; long-poll)").
+§4.3 (D10; verbatim, `29fa9f59c`): "the compositor serves `GET http://127.0.0.1:<RELAY_PHASE_PORT>/phase`
+on loopback inside the Machine. It returns `{ phase, seq }` and supports long-poll (`?after=<seq>`,
+held ≤ 10 s)" and "It is never exposed outside the Machine and is not part of the outbound-only host
+contract (ADR 0007)". §6, C08/C12 row: "Adds the loopback `/phase` endpoint (127.0.0.1 only; CORS + PNA
+headers; long-poll)."
 
 **Ownership split, stated in both briefs.** C08 owns the `PhasePublisher` port, the driver's
 publish-on-change rule and the fake. **C12 owns the HTTP adapter**, its wiring in `main`, and the
@@ -375,8 +397,8 @@ module.
 - `final_hold_and_drain_fit_inside_r1_stop_grace`, replacing the superseded test:
   `t.final_hold_ms + t.drain_timeout_ms + EXIT_HEADROOM_MS <= R1_STOP_GRACE_MS`, where
   `EXIT_HEADROOM_MS = 3_000` (the headroom in `config.rs`'s `drain_timeout_ms` doc line). With R1's grace
-  at 10 s, this is **red** (10 + 7 + 3 = 20 > 10). It goes green only with the owner's pick from R2004's
-  amendment Step 0:
+  at 10 s, this is **red** (10 + 7 + 3 = 20 > 10). It goes green only with the owner's pick, which
+  ships in R2004's PR 0 Part 2 (**OWNER DECISION PENDING**; the recommendation is A, not a ruling):
   - **(A)** set `R1_STOP_GRACE_MS` to the new web value, citing the web commit that changed
     `RUNNER_STOP_GRACE_SECONDS`. This PR merges only after that web change is deployed to stg, because
     otherwise Fly kills mid-drain.

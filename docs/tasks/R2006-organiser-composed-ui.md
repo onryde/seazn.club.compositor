@@ -153,9 +153,9 @@ existing tone.
 ## Amendment 2026-10-15 (overlay templates spec)
 
 Authority: `seazn.club: docs/superpowers/specs/2026-10-15-overlay-templates-and-scenes-design.md`
-§4.4 (D5, D6, D7), §4.7 and §6 ("R2006 (amend): adds the per-fixture template picker with live
-previews, on mobile and desktop, plus persisting the choice and using it in the OBS URL and the
-composed `overlayUrl`").
+§4.4 (D5, D6, D7), §4.7 and §6, R2006 row (verbatim, `29fa9f59c`): "Adds the per-fixture template
+picker with live previews, on mobile and desktop, plus persisting the choice and using it in the OBS
+URL and the composed `overlayUrl`."
 
 **This amends the 2026-09-05 owner ruling "style in the URL, not the DB"** (spec §4.4: the composed
 path needs the choice server-side, because no human pastes the compositor's URL). It was half a false

@@ -1,7 +1,8 @@
 # C17: Stg end-to-end acceptance (owner-watched) and the runbook
 
 **Repos:** both. **Depends on:** everything (C14 3× green, C15 green, C16 stg promoted, R2001–R2006
-merged and deployed to stg).
+merged and deployed to stg). **Amended 2026-10-15:** also R2007 PR A + PR B and R2004's PR 0 (the
+relay stop contract) deployed to stg. See "Amendment 2026-10-15 (overlay templates spec)" at the end.
 
 ## Context
 
@@ -92,9 +93,48 @@ Also include:
 
 ## Acceptance
 
-- All 8 rows have the owner's **pass** verdict, recorded verbatim.
+- All ~~8~~ 11 rows (amended 2026-10-15) have the owner's **pass** verdict, recorded verbatim.
 - The runbook covers every signal in the table.
 - Both pointer docs are updated.
+- (Amended 2026-10-15, coordinator decision G1) **The compatibility records exist for the release
+  under test**: C11's `cefsrc` scene check (`_FINDINGS.md` F-0xx, with the scene leg run, not owed)
+  and R2007 step 14b's OBS browser-source check. Link both from the acceptance doc. A missing record
+  fails acceptance; if C11 recorded the scene leg as owed, this run's rows 1, 3 and 7 discharge it,
+  and the acceptance doc says so.
+
+## Amendment 2026-10-15 (overlay templates spec)
+
+Authority: `seazn.club: docs/superpowers/specs/2026-10-15-overlay-templates-and-scenes-design.md`
+§4.2, §4.3, §5 and §6. These rows were owed by the plan's "Amendments 2026-10-15" note and now live
+here; the plan keeps a pointer only.
+
+**Preflight additions (Step 1):**
+5. Stg web contains R2007 PR A + PR B and R2004 PR 0 (record the refs).
+6. The composed Machine's config shows `stop_config.signal = "SIGTERM"` (read it from the Machines
+   API by id; record the value). This is coordinator decision I4, as PR 0 shipped it.
+
+**Row changes (Step 3).** The rows keep their numbers; the expected column changes as follows.
+
+| # | Expected, amended |
+|---|---|
+| 1 | Before the first camera frame, YouTube shows the **Starting soon** scene: the opaque backdrop and the Upcoming card (or the live/decided card if the match has started). Then live. |
+| 3 | By 3 s, the **Reconnecting scene**: the backdrop and the Reconnecting card ("Camera reconnecting, back shortly"), with the score template still visible. It is not a bare slate. A rally scored during it raises its moment slab above the card. |
+| 7 | The **Final scene** (the Result card if decided or void, else Stream ended with the score) for about `FINAL_HOLD_MS` = 10 s, then YouTube ends cleanly. The Machine exits 0. Its last beat's `exitReason` is `signalled` (web's SIGINT came first, the usual case) or `ended` (the `ending` reply came first); record which. An earlier beat carries `programmePhase: "final"`. |
+| 8 | Also: the health query shows `phaseChannel: "loopback"`, the permanent proof of C11 Step 0 on a real Fly CEF. `web` there is a finding against C11/C12, not a pass. If C11 Step 0 recorded outcome (c), the expected value is `web`, and the acceptance doc cites that F-id. |
+
+**New rows:**
+
+| # | Action | Expected | Seen | Verdict |
+|---|---|---|---|---|
+| 9 | Before row 6's second session: the organiser picks the non-default template (R2006's picker), then Go live | YouTube shows the picked template, at its placement; a moment slab appears at that template's `slabPlacement` | | |
+| 10 | On row 6's second session, the orchestrator runs `fly machine stop <machine id>` with **no** signal flag (a platform stop) | YouTube ends **without** the Final scene; the last beat carries `exitReason: "signalled"`; no beat carries `programmePhase: "final"`. Record what web does with the session afterwards; an `r<n+1>` attempt row is a finding against R2003 | | |
+| 11 | The owner opens the OBS browser source from R2007 step 14b's record for this release | The record exists and its verdicts are all pass | | |
+
+Row 10 is the live proof of the SIGINT/SIGTERM split, and its expected result follows from C06's signal
+table. If a platform stop shows the Final scene, PR 0's `stop_config` did not take, so route it to PR 0.
+
+**Screens (Step 4):** add YouTube crops of the Starting soon, Reconnecting and Final scenes (rows 1, 3
+and 7) and of the picked template (row 9). The same rule applies: never in the repo.
 
 ## Do not touch
 

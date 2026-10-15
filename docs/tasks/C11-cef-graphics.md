@@ -104,15 +104,19 @@ source of truth.
 - The readiness mechanism matches F-001 verbatim.
 - (Amended 2026-10-15) Step 0's finding is in `_FINDINGS.md`, with one of the outcomes (a), (b) or (c)
   and the raw console and server lines.
+- (Amended 2026-10-15, G1) The first `cefsrc` compatibility record (the "Compatibility" section) is in
+  `_FINDINGS.md`, with the scene leg either run or recorded as owed to C17.
 
 ## Amendment 2026-10-15 (overlay templates spec)
 
 Authority: `seazn.club: docs/superpowers/specs/2026-10-15-overlay-templates-and-scenes-design.md`
-§4.3 (D10): "Primary (A): the compositor serves its programme phase on a loopback HTTP endpoint …
-Chromium may require Private Network Access headers or a CEF switch for a public HTTPS origin calling
-`127.0.0.1`; this is to be proven in C11." §6: "C11 (amend): proves CEF can call the loopback endpoint
-from the public HTTPS overlay origin (Private Network Access); if not, B becomes primary and the
-reason is recorded in `_FINDINGS.md`."
+§4.3 (D10; verbatim, `29fa9f59c`): "the page is https and the endpoint is loopback, so the compositor
+answers the preflight with `Access-Control-Allow-Private-Network: true` and a CORS origin locked to
+the app origin. **CEF 139 behaviour must be verified as C11's first step.** If it's blocked, the
+fallback becomes primary." §6, C11 row: "**Step 0:** verify a https page → `127.0.0.1` fetch in CEF 139
+with the PNA preflight. Record the result in `_FINDINGS.md`; if it's blocked, R2005 flips to fallback B
+as primary." §5: "the page is tested in OBS's browser source and in the compositor's `cefsrc` every
+release (PDF §4). The C11/C12 image tests load a scene URL in CEF."
 
 ### Step 0: Loopback probe (run first; its own docs commit on `main`)
 
@@ -130,6 +134,11 @@ measured.
     `Access-Control-Allow-Private-Network: true` and `Vary: Origin`, and `GET` answers carry the same
     `Access-Control-Allow-Origin`.
   - `--hold-ms N`, default 2 000: wait before answering `GET /phase?after=S`.
+  - **(Added 2026-10-15, coordinator decision G1)** `--script waiting:5000,reconnecting:5000,final:5000`:
+    instead of a fixed answer, serve that phase sequence. Each entry holds for its milliseconds,
+    `seq` rises by one per entry, and a long-poll on the current `seq` is answered at the next change.
+    After the last entry, it serves `live`. An entry naming a phase outside the five programme phases
+    is refused at start-up (exit 2), never served. The compatibility step below uses it.
 
   The answer is `{"phase":"live","seq":S+1}`, R2007 PR B's `RelayPhaseReply` shape. **Every** request
   logs one line to stdout: method, path, `Origin`, `Access-Control-Request-Private-Network` and
@@ -180,6 +189,45 @@ measured.
   observed form (scheme + host, no trailing slash), not against an assumed one.
 - Commit: `docs(findings): CEF loopback phase channel probe (C11 Step 0)`, with the harness files, on
   `main`, before R2005 starts.
+
+### Compatibility: a scene URL through `cefsrc`, every release (coordinator decision G1)
+
+Spec §5: "the page is tested in OBS's browser source and in the compositor's `cefsrc` every release
+(PDF §4). The C11/C12 image tests load a scene URL in CEF." This step is the `cefsrc` half; R2007
+step 14b is the OBS half, and C17's acceptance lists both records.
+
+- **When:** once in this task, after Step 4, and then on every compositor release image and every web
+  release that touches `components/overlay/**`. Each run is recorded, never assumed.
+- **Pre-condition:** R2005 is live on stg (the scene layer exists). If it isn't when this task
+  reaches here, run the **template leg** only (no `--script`; the template renders and `seazn:ready`
+  arrives), and record the scene leg as owed to C17. Don't skip the record. The same applies if
+  Step 0 recorded outcome (c): the page then reads its phase from web (fallback B), which needs a
+  real composed session, so only C17 can drive the scenes.
+- **The page:** a public stg fixture whose org has the overlay entitlement. C00 used
+  `/overlay/fixtures/02786dd0-…` (F-001); re-pin a live one, since that fixture may have ended or
+  moved. The URL is `https://<stg app>/overlay/fixtures/<id>?host=compositor&template=<id>`, once per
+  `OVERLAY_TEMPLATES` id (re-pin the list from R2007's registry). There is no `sid`/`st`: a public
+  fixture needs no relay access path, and `host=compositor` alone turns on the signals and the scene
+  layer.
+- **The run:** in the release image, run `Xvfb :99`, then
+  `harness/phase-probe-server.py --variant pna --script waiting:5000,reconnecting:5000,final:5000`,
+  then
+  `cefsrc url=<that URL> … ! videorate ! video/x-raw,framerate=1/1 ! videoconvert ! pngenc ! multifilesink location=frame-%03d.png`
+  for 25 s. The probe server is the same stand-in for C12's endpoint that Step 0 uses.
+- **Assert, per template:**
+  - `seazn:ready` arrives (F-001's mechanism)
+  - the probe server logs at least 3 `GET /phase` lines (the page followed the script)
+  - for the frames at 3 s, 8 s and 13 s (mid-`waiting`, mid-`reconnecting`, mid-`final`), the pixel
+    at the centre of the card region (`cardRegionFor(<template's sceneCardSafeArea>)`, R2007 step 9b)
+    has alpha 255, because the scene backdrop is opaque
+  - the frame at 20 s (`live` again) has alpha 0 at that same pixel (no scene, transparent canvas)
+
+  Print `templates checked: N, frames checked: 4N`; fail on 0.
+- **Look at the PNGs** (one per scene per template) for a scene card that's legible, clear of the
+  template, and not clipped. **Never commit them** (owner rule): they stay in the run's scratch
+  directory. Post them in the PR or release comment.
+- **Record** `F-0xx: cefsrc scene compatibility, <image tag>` in `_FINDINGS.md`, with the CEF version,
+  the URLs, the probe log and a verdict per check.
 
 ### The channel signal (Steps 1–4)
 

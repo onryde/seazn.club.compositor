@@ -781,29 +781,46 @@ Tests (add to `supervisor_props.rs`):
 ## Amendment 2026-10-15 (overlay templates spec)
 
 Authority: `seazn.club: docs/superpowers/specs/2026-10-15-overlay-templates-and-scenes-design.md`
-§4.2 (D4) and §6 ("C06 (amend): adds the final-hold phase: on `Desired::Ending`, hold for
-`FINAL_HOLD_MS`, with `programmePhase = final`, then drain. Adds `ProgrammePhase::Final` to the merged
-C03 domain enum (`crates/domain/src/programme.rs:23`); `Final` is terminal and wins over every camera
-state."). Re-pinned 2026-10-15 on `main` `21284d6`: `ProgrammePhase` at `programme.rs:23` has the
+§4.2 (D4) and §6, C06 row (quoted verbatim from `29fa9f59c`): "Adds the final-hold phase: on
+`Desired::Ending`, hold for `FINAL_HOLD_MS`, with `programmePhase = final`, then drain. Adds
+`ProgrammePhase::Final` to the merged C03 domain enum (`crates/domain/src/programme.rs:23`); `Final` is
+terminal and wins over every camera state". Re-pinned 2026-10-15 on `main` `21284d6`: `ProgrammePhase` at `programme.rs:23` has the
 variants `{Waiting, Live, Frozen, Reconnecting}`, `SlateKind` is at `:31`, `PROGRAMME_TABLE` at `:60`
 (an unlisted pair holds its phase), and `choice_for` at `:77` (an exhaustive match).
 
 ### False premise: the organiser's end does not arrive as an Ending reply first
 
 The spec says "on `Desired::Ending`". R1's runner moves to `stopping` and sends `SIGINT` **immediately**
-on the organiser's stop and on the deadline (`seazn.club` `server/relay/runner.ts:101`, `:117-118`,
-`:251-252`). Fly SIGKILLs `RUNNER_STOP_GRACE_SECONDS = 10` later (`server/relay/config.ts:141`, `:147`).
+on the organiser's stop and on the deadline. The file is `seazn.club`
+`apps/web/src/server/relay/domain/runner.ts` (path corrected by the review): `:101`, `:117-118` and
+`:251-252` on main `b01d07cd5`, which R2003 (#967) moves to `:143`, `:160-161` and `:324-325`. Fly
+SIGKILLs `RUNNER_STOP_GRACE_SECONDS = 10` later (`server/relay/config.ts:141` and `:147` on main;
+`:146` and `:161` after #967).
 The `ending` heartbeat reply can arrive up to one beat (5 s) after the signal, or never. So:
 
 - **The hold is entered on whichever end request comes first while `Running`:** an `Ending` reply
   (reason `Ended`), `Signal(SignalKind::Int)` (R1's stop signal; reason `Signalled`), or the deadline
   tick (reason `Deadline`). Holding only on the reply would make the Final scene an inert seam: the
   `SIGINT` would cut the programme before the reply landed.
-- **`Signal(SignalKind::Term)` still drains at once.** SIGTERM is the host's or platform's stop, not
-  the organiser's, and viewers must not see "Stream ended" for a host restart.
-- **Budget:** hold 10 000 + `drain_timeout_ms` 7 000 = 17 s, and R1 grants 10 s. **This is an owner
-  decision, owed through R2004's amendment Step 0.** The recommendation there is to raise R1's grace
-  to 20 s; it is a recommendation, not a ruling. C12's
+- **`Signal(SignalKind::Term)` still drains at once.** Viewers must not see "Stream ended" for a host
+  restart. **(Corrected 2026-10-15, review I4)** SIGTERM is the platform's stop **only because web
+  makes it so**. Fly's default stop signal is SIGINT (docs.fly.io `kill_signal`, default 5 s
+  timeout), so without a change a Fly-initiated stop would look like ours. R2004's PR 0 (coordinator
+  decision I4) creates composed Machines with `stop_config: { signal: "SIGTERM", timeout: <grace> }`,
+  and web's own stop keeps passing `signal: "SIGINT"` explicitly. PR 0 measures that the explicit
+  signal wins (`_FINDINGS` F-0xx).
+
+  | Signal | Who sends it | C06 behaviour |
+  |---|---|---|
+  | `SIGINT` | web's organiser stop and deadline stop (`stopMachine`, explicit `signal: "SIGINT"`) | `Running` → hold (`Signalled`), Final scene, then drain |
+  | `SIGTERM` | Fly's controlled stops (`fly machine stop`, deploy, auto-stop) via `stop_config.signal` | drain at once (`Signalled`), no Final scene |
+  | `SIGKILL` | Fly, `timeout` after either | none (the process dies) |
+
+  Until PR 0 ships, a Fly-initiated stop arrives as SIGINT and shows the Final card. That's
+  cosmetic, and C17 must not run before PR 0.
+- **Budget:** hold 10 000 + `drain_timeout_ms` 7 000 = 17 s, and R1 grants 10 s. **OWNER DECISION
+  PENDING**, owed through R2004's PR 0 Part 2. The recommendation there is to raise R1's grace to
+  20 s; it is a recommendation, not a ruling. C12's
   `final_hold_and_drain_fit_inside_r1_stop_grace` stays red until web ships the owner's pick, so the
   budget can't be forgotten. This task does **not** shorten the hold on its own.
 
@@ -840,9 +857,15 @@ impl Programme {
 
 ### `crates/domain/tests/programme.rs` (C03's sweeps), exact edits
 
-These go red the moment `Final` exists (`PHASES` names 4 variants, `unlisted_pairs_hold_their_phase`
+These go red the moment `Final` exists. `PHASES` names 4 variants, `unlisted_pairs_hold_their_phase`
 hardcodes 16, the reachability test expects every phase from Waiting, and the reference sweep asserts
-every phase is ticked):
+every phase is ticked. Two more spots break the **compile** (briefs review):
+- the import at `:10`: `use ProgrammePhase::{Final, Frozen, Live, Reconnecting, Waiting};`
+- the reference model's exhaustive `match choice` (`:328-338`) gains the arm
+  `FrameChoice::Slate(SlateKind::Final) => panic!("Final slate from a camera feed at {now}")`.
+  No feed reaches `Final` (see the sweep below), so this arm is a guard: reaching it is a failure.
+
+The rest of the list:
 - `const PHASES: [ProgrammePhase; 5] = [Waiting, Live, Frozen, Reconnecting, Final];` and a new
   `const FEED_PHASES: [ProgrammePhase; 4] = [Waiting, Live, Frozen, Reconnecting];` with a doc line:
   "the phases a camera feed can reach (C03); `Final` is entered only by `Programme::finish` (C06)".

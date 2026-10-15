@@ -260,10 +260,10 @@ and route stayed Excellent for 10 min. voaacenc encodes digital zeros as ~95 % 0
 ## Amendment 2026-10-15 (overlay templates spec)
 
 Authority: `seazn.club: docs/superpowers/specs/2026-10-15-overlay-templates-and-scenes-design.md`
-§4.2 ("Fallback when the overlay renderer is dead (`graphics: failed`): the compositor's native slate
-shows no text, only the house backdrop colour and the Seazn logo, so the fallback never shows
-untranslated English") and §6 ("C09 (amend): the native slate becomes textless (house backdrop +
-logo); it is used only when graphics have failed"). **The Audio section above is unchanged and still
+§4.2 (verbatim, `29fa9f59c`): "Fallback when the overlay renderer is dead (`graphics: failed`): the
+compositor's native slate (C09) shows no text, only the house backdrop colour and the Seazn logo, so
+the fallback never shows untranslated English." §6, C09 row: "The native slate becomes textless (house
+backdrop + logo); it is used only when graphics have failed." **The Audio section above is unchanged and still
 overrides**: the slate is a video layer only.
 
 **What "used only when graphics have failed" means here.** In every slate phase (Waiting,
