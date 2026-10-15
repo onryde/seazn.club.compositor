@@ -218,7 +218,7 @@ The owner was asked to background the capture app at 12:08:00 London for 20 s.
 - When the phone itself stops publishing, the CF playback socket stays open and silent, as in F-002. When the first session ended (10:58:58Z), the reader got 0 frames until it was rebuilt onto the new input.
 - The new session's input was live 26 s after the old one ended.
 
-**Steps C and D: ran 12:13:00–12:21:50 London WITHOUT an owner view (no YouTube verdict).** The owner stepped away, and the HOLD arrived after the run.
+**Steps C and D: ran 12:13:00–12:21:50 London WITHOUT an owner view. YouTube side OWED: rerun.** The owner stepped away, and the HOLD arrived after the run. The Machine-side numbers below are valid; nothing on the YouTube side of C or D was observed.
 
 *Step C* (5 min to Input B):
 - Settings as C09 ships: 720p30, x264 4000 kbps, `vbv-buf-capacity=1000`, `nal-hrd=cbr:filler=1`, keyint 60, bframes 0, scenecut on.
@@ -278,7 +278,7 @@ The owner was asked to background the capture app at 12:08:00 London for 20 s.
 
 ---
 
-## F-004: RTMPS to Input B → YouTube. OWED: owner session (partial, owner-observed)
+## F-004: RTMPS to Input B → YouTube. OWED: rerun on clean channels (today's YouTube readings UNRELIABLE; see caveat)
 
 The full item (go-live, B-frames question, time to live, health) is owed to an owner session. The rows below are the owner's YouTube Studio observations during the item-5 pushes, relayed by the coordinator, set next to this session's own measurements.
 
@@ -315,6 +315,13 @@ The full item (go-live, B-frames question, time to live, health) is owed to an o
 - **C09 slate and frozen frame.** A static slate encodes to almost pure filler, which is exactly the case YouTube flags Poor. Proposal: composite a full-frame, low-amplitude, animated noise/grain layer, or a continuously moving element, under every slate and frozen-frame output, so real bits approach the target. The exact amplitude is unmeasured.
 - **C09 acceptance test:** measure the **non-filler** bitrate (bytes outside NAL type 12) on a slate-only run. The current test, "bitrate within ±50 % (CBR filler keeps it near the target)", passes on the wire while YouTube flags Poor.
 - **R2 restart policy (ADR 0004):** a compositor restart, or any output stop, ends the organiser's YouTube broadcast. Whether YouTube resumes the *same* broadcast after a short reconnect is unmeasured.
+
+**CAVEAT (owner, 2026-10-15): today's YouTube readings are UNRELIABLE, not evidence.**
+- The owner reports that two stream keys on the same YouTube channel appear not to work at the same time.
+- The fixture's own `B_YoutubeTest` output, carrying the phone feed, and this spike's `r2-c0` key may share a channel.
+- So every health flip in the table above, the "each stop ends the broadcast" observation, and the filler-vs-health hypothesis may be contaminated by the other key's stream.
+- The Machine-side numbers stand: egress, filler share, keyframe interval, encoder fps, overruns.
+- **Owed for the rerun:** each key bound to its own scheduled stream on its own channel (owner to confirm before starting); then the deciding C push (real camera motion, C09 settings, filler logged) and the D gaps (5/15/30 s, same vs new broadcast per gap). Owner-session step C ran on real phone footage at 4000 kbps with filler share 0.21 % (F-002 owner-session section). If health still goes Poor on a clean channel at that filler share, the filler hypothesis is dead.
 
 ---
 
@@ -390,3 +397,16 @@ The snapshot of the composite (overlay over camera) was checked visually. It is 
   - Input A (disconnected 10:19:48Z, recording off);
   - Input B (disconnected, recording off, 1 Output: YouTube).
 - The YouTube Output was **not** removed (dispatch ruling overrides brief Step 10).
+
+## Teardown record (owner session, partial teardown per coordinator)
+
+2026-10-15 ≈11:11Z.
+
+- Owner-session Machines: `28655e54c4e358` was destroyed at ≈11:04Z, because `fly machine restart` does not pick up a re-staged secret. Its replacement `8ed9e13b302d98` was destroyed at ≈11:11Z.
+- `fly machine list -a seazn-relay-spike`: "No machines are available on this app".
+- **Kept, for the C/D rerun:**
+  - the app;
+  - all staged secrets (including `SPIKE_FIX_SRT_PLAY_URL`);
+  - CF Inputs A and B;
+  - B's YouTube Output (`8448ee…`).
+- Nothing touched the fixture's own session, nor its YouTube target.
