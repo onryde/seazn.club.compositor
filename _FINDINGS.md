@@ -305,7 +305,7 @@ The owner was asked to background the capture app at 12:08:00 London for 20 s.
 
 ---
 
-## F-004: RTMPS to Input B → YouTube. Filler REFUTED; CF relay REFUTED (direct push also Poor); our stream is real-time with no backlog; gaps up to 15 s keep the same broadcast; about 60–90 s of no data ends it
+## F-004: RTMPS → YouTube. VERDICT: the SILENT AAC track causes YouTube "Poor" ("not receiving enough video"); real audio is Excellent for 10 min (same session, scene, encode and route). Gaps up to 15 s keep the same broadcast; about 60–90 s of no data ends it
 
 The full item (go-live, B-frames question, time to live, health) is owed to an owner session. The rows below are the owner's YouTube Studio observations during the item-5 pushes, relayed by the coordinator, set next to this session's own measurements.
 
@@ -342,6 +342,53 @@ The full item (go-live, B-frames question, time to live, health) is owed to an o
 - **C09 slate and frozen frame.** A static slate encodes to almost pure filler, which is exactly the case YouTube flags Poor. Proposal: composite a full-frame, low-amplitude, animated noise/grain layer, or a continuously moving element, under every slate and frozen-frame output, so real bits approach the target. The exact amplitude is unmeasured.
 - **C09 acceptance test:** measure the **non-filler** bitrate (bytes outside NAL type 12) on a slate-only run. The current test, "bitrate within ±50 % (CBR filler keeps it near the target)", passes on the wire while YouTube flags Poor.
 - **R2 restart policy (ADR 0004):** a compositor restart, or any output stop, ends the organiser's YouTube broadcast. Whether YouTube resumes the *same* broadcast after a short reconnect is unmeasured.
+
+### Audio A/B: both legs DIRECT to YouTube; real audio vs silent AAC (2026-10-15, 17:17–17:40 London). THE DECIDING RUN
+
+**Setup:**
+- Session `36f00d16-…`, input `4c7298e7…`, fresh Machine `784ee345b637d8`.
+- Scene: the phone on a **garden** (natural motion), mic on, for both legs.
+- The fixture's YouTube output was disabled and B's output paused. Both legs pushed `SPIKE_YT_DIRECT_URL` (r2-c0).
+- Identical C09 video encode on both legs. The **only** variable is `chain.py --audio`.
+- Input tracks (`probe_tracks.py`): **audio PRESENT**, AAC (MPEG-4, ADTS), 48 kHz, stereo, about 47 frames/s; video H.264 1280x720 (framerate 0/1, i.e. variable).
+
+| | **A1: real audio** (17:17:00–17:27:00) | **A2: silent AAC, the C09 control** (17:30:00–17:40:00) |
+|---|---|---|
+| Audio path | tsdemux audio → decodebin → audioconvert → audioresample → 48 kHz stereo → `voaacenc bitrate=128000` → aacparse | `audiotestsrc is-live=true wave=silence` → 48 kHz stereo → `voaacenc bitrate=128000` → aacparse |
+| Audio kbps per 10 s window | 127.3–128.9 (median 128.0) | 127.8–128.3 (median 128.1) |
+| AAC frames/s | 46.6–47.2 (median 46.9) | 46.8–47.0 (median 46.9) |
+| Audio PTS − wall | +464 to +526 ms, flat (the camera's own timeline) | +1.4 to +3.3 ms, flat (the pipeline clock) |
+| Video out PTS − wall | −46 to −132 ms, flat | −0.5 to −53 ms, flat |
+| Egress | 4050–4310 kbps | 4106–4228 kbps |
+| Encoder fps / overruns | about 30 / 4 (startup only, before the first audio caps) | about 30 / 0 |
+| Video filler | 0.0 % | 0.0 % |
+| send-q > 1 KB samples / max | 3 of 60 / 21.6 KB | 5 of 60 / 24.1 KB |
+| TCP retransmits | 11 of 262k segments | 10 of 261k segments |
+| Machine cores average | 1.136 | 1.083 |
+| **Owner, r2-c0 health** | **Excellent from start to 17:27, the whole 10 min**; garden audio audible on the player | Excellent at 17:31:22 → **Poor at about 17:31:50 (about 1:50 in)**: "YouTube is not receiving enough video to maintain smooth streaming. As such, viewers will experience buffering." Stayed Poor through at least 17:38:11, no recovery |
+
+- The broadcast ended in the 3 min gap between the legs (more than 30 s with no data), as expected.
+
+**What the silent track looks like on the wire:**
+- It is **not** degenerate by rate or timing: 128 kbps CBR, 46.9 frames/s, continuous PTS, no drift.
+- It **is** degenerate by content. An offline encode of the same branch (`audiotestsrc wave=silence ! voaacenc bitrate=128000 ! aacparse`, 470 frames) gives 348 B/frame, but **94.7 % of the bytes are 0x00 and only 20 distinct byte values occur**. voaacenc pads digital silence to the CBR target, much as x264 pads with filler NALs.
+- The same encode of `wave=pink-noise volume=0.001` (about −60 dBFS) gives 347 B/frame, 3.9 % zero bytes, and all 256 byte values: real coded content.
+
+**Verdict:**
+- **The silent AAC track causes YouTube's "Poor".** A1 and A2 shared one session, one scene, one encode and one route; only the audio changed, and only the silent leg went Poor (about 2 min in, persistent).
+- **YouTube's wording "not receiving enough *video*" is misleading**: the cause tracks the *audio* track.
+- This also explains every earlier Poor: all of them used the silent AAC, whatever the filler share, the route (CF or direct) or the channel.
+- It does not establish *what* YouTube keys on. Candidates are a near-empty AAC payload (zero-padded frames) or digital-zero content.
+
+**C09 recommendation (C09 is not edited):**
+- **Pass the input's real audio through:** demux → decode → resample to 48 kHz stereo → AAC-LC 128 kbps, on the camera's own timeline. Verified Excellent for 10 min.
+- **When the input has no audio:** do NOT send digital-zero AAC (that is the A2 failure). Exactly which substitute makes YouTube happy is **not shown by this data**. The bitrate, sample rate, frame rate and timestamp continuity of A2 were already normal, so changing them is not the fix.
+- The candidate with on-wire evidence: **continuous low-level noise**, e.g. pink noise at about −60 dBFS (`audiotestsrc wave=pink-noise volume=0.001`) into the same AAC 128k 48 kHz stereo encoder. It yields fully coded frames, not zero padding. **Owed:** a 10 min direct push of that variant, plus a no-audio-track variant, before C09 fixes the rule.
+- **C09's acceptance test:** add audio checks for frames/s ≈ 46.9, kbps ≈ 128, and a zero-byte share well below 94 %. The current test cannot see this defect.
+
+**Also measured:** with `--audio camera`, the first 10 s show 4–54 encoder-queue drops while flvmux waits for the first audio caps. That is startup only; C09 should pre-roll or accept it.
+
+**Superseded by this run:** the "structure" candidates listed in the direct-vs-CF A/B below (the silent `voaacenc` track was one of them; it is now confirmed). Leg 2 of that A/B (via CF), which had no owner health reading, is no longer needed for the verdict.
 
 ### A/B: direct to YouTube vs via CF Output, one phone session (2026-10-15, 15:51–16:14 London)
 
@@ -596,3 +643,11 @@ The snapshot of the composite (overlay over camera) was checked visually. It is 
 - Machine `891e574f434d38` was destroyed.
 - `fly machine list -a seazn-relay-spike`: "No machines are available on this app".
 - Kept: the app, all staged secrets (including `SPIKE_YT_DIRECT_URL`), CF Inputs A and B, and B's YouTube Output.
+
+## Teardown record (audio A/B)
+
+2026-10-15 ≈16:41Z.
+
+- Machine `784ee345b637d8` was destroyed.
+- `fly machine list -a seazn-relay-spike`: "No machines are available on this app".
+- Kept: the app, all staged secrets, CF Inputs A and B, and B's YouTube Output.
