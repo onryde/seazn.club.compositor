@@ -165,10 +165,15 @@ mod tests {
         o
     }
 
-    /// Ticks forward from `now` in 10 ms steps until the next build; returns its time.
+    /// Ticks forward from `now` in 10 ms steps until the next build; returns its time. From Backoff
+    /// or Connecting the next build is due within one connect timeout (Connecting gives up) plus the
+    /// capped back-off, so a link that never builds fails here instead of hanging the suite.
     fn next_build(o: &mut OutputLink, mut now: Ms, th: &Thresholds) -> Ms {
+        const STEP: Ms = 10;
+        let horizon = now + th.output_connect_timeout_ms + th.output_backoff_cap_ms + STEP;
         while !o.on_tick(now, th) {
-            now += 10;
+            now += STEP;
+            assert!(now <= horizon, "no build by {horizon} ms: {:?}", o.state());
         }
         now
     }

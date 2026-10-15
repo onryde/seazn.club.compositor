@@ -171,9 +171,18 @@ mod tests {
     }
 
     /// Ticks forward from `now` in 10 ms steps until the next build; returns its time.
-    fn next_build(l: &mut InputLink, mut now: Ms, th: &Thresholds) -> Ms {
+    fn next_build(l: &mut InputLink, now: Ms, th: &Thresholds) -> Ms {
+        next_build_every(l, now, 10, th)
+    }
+
+    /// Ticks forward from `now` in `step` ms steps until the next build; returns its time. From
+    /// Backoff or Connecting the next build is due within one connect timeout (Connecting gives up)
+    /// plus the capped back-off, so a link that never builds fails here instead of hanging the suite.
+    fn next_build_every(l: &mut InputLink, mut now: Ms, step: Ms, th: &Thresholds) -> Ms {
+        let horizon = now + th.input_connect_timeout_ms + th.input_backoff_cap_ms + step;
         while !l.on_tick(now, th) {
-            now += 10;
+            now += step;
+            assert!(now <= horizon, "no build by {horizon} ms: {:?}", l.state());
         }
         now
     }
@@ -207,10 +216,8 @@ mod tests {
         let mut gaps = Vec::new();
         let mut last_build = None;
         for _ in 0..7 {
-            // wait for the next build
-            while !l.on_tick(now, &th) {
-                now += 10;
-            }
+            // wait for the next build (bounded, so a link that never builds fails rather than hangs)
+            now = next_build(&mut l, now, &th);
             if let Some(b) = last_build {
                 gaps.push(now - b);
             }
@@ -294,9 +301,7 @@ mod tests {
             now += 20_000; // PDF chaos: relay kicks the reader every 20 s
             let gen = l.generation();
             l.on_lost(now, gen, LossReason::Eos, &th);
-            while !l.on_tick(now, &th) {
-                now += 100;
-            }
+            now = next_build_every(&mut l, now, 100, &th);
             l.on_connected(now, l.generation());
             assert_eq!(l.kick_alert(now, &th), k > th.kick_alert_count, "after {k} kicks");
         }
@@ -304,6 +309,49 @@ mod tests {
             !l.kick_alert(now + th.kick_window_ms + 1, &th),
             "alert clears once kicks age out"
         );
+    }
+
+    // The window's edge, from C02's `Window` rule rather than this module: a stamp exactly `span` old
+    // still counts, and one 1 ms older does not (window::tests::stamp_exactly_span_old_still_counts,
+    // counts_only_inside_span). So `kick_alert_count + 1` kicks whose first and last lie exactly
+    // `kick_window_ms` apart raise the alert at the last kick's instant, and it clears 1 ms later.
+    #[test]
+    fn kicks_exactly_the_window_apart_raise_the_alert_and_clear_1_ms_later() {
+        let th = t();
+        let (n, w) = (th.kick_alert_count as Ms, th.kick_window_ms);
+        let t0 = 10_000;
+        let mut l = running(0);
+        for i in 0..=n {
+            let at = t0 + w * i / n;
+            assert!(
+                matches!(l.state(), InputState::Running { .. }),
+                "kick {i} must come from Running"
+            );
+            if i == n {
+                assert!(!l.kick_alert(at, &th), "{n} kicks are not yet more than {n}");
+            }
+            l.on_lost(at, l.generation(), LossReason::Eos, &th);
+            if i < n {
+                // The 1 s back-off after a kick, then the rebuild's first frame: long before the next.
+                let rebuilt = at + th.input_backoff_base_ms;
+                assert!(rebuilt < t0 + w * (i + 1) / n);
+                assert!(l.on_tick(rebuilt, &th), "the kick's back-off ends at {rebuilt}");
+                l.on_connected(rebuilt, l.generation());
+            }
+        }
+        let last = t0 + w;
+        assert_eq!(
+            l.kicks(last, &th),
+            th.kick_alert_count + 1,
+            "the first kick is exactly the window old, so it still counts"
+        );
+        assert!(l.kick_alert(last, &th));
+        assert_eq!(
+            l.kicks(last + 1, &th),
+            th.kick_alert_count,
+            "1 ms later it is out"
+        );
+        assert!(!l.kick_alert(last + 1, &th));
     }
 
     #[test]
@@ -315,9 +363,7 @@ mod tests {
             now += 1_000;
             let gen = l.generation();
             l.on_lost(now, gen, LossReason::Stalled, &th);
-            while !l.on_tick(now, &th) {
-                now += 100;
-            }
+            now = next_build_every(&mut l, now, 100, &th);
             l.on_connected(now, l.generation());
         }
         assert_eq!(l.generation(), 11, "ten rebuilds happened");
