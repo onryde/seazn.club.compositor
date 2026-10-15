@@ -549,3 +549,12 @@ The snapshot of the composite (overlay over camera) was checked visually. It is 
 - `fly machine list -a seazn-relay-spike`: "No machines are available on this app".
 - Kept: the app, all staged secrets, CF Inputs A and B, and B's YouTube Output (`8448ee…`).
 - The fixture sessions and their YouTube targets were not touched by this agent. The owner disabled and enabled outputs in CF.
+
+
+### F-004 addendum (2026-10-15, owner-confirmed after the redo)
+The **30 s gap (14:52:20–14:52:50 London) did NOT keep the same broadcast**: YouTube started a new one.
+Combined with the 5 s and 15 s gaps (same broadcast), YouTube's split threshold for this setup
+(scheduled stream, Normal latency) lies **between 15 s and 30 s**. One sample per gap.
+**Changes:** every recovery path the organiser's broadcast must survive has to finish its output gap
+**under 15 s**. A new-attempt cold start (~25 s Machine boot plus warm-up) will likely split it.
+Re-check ADR 0004 and the C14 chaos budgets against 15 s, and add it to the C17 runbook.
