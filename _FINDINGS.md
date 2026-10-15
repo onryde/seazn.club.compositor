@@ -645,6 +645,82 @@ Median: about **110 ms** to `restart`, about **1.42 s** to `started`. These are 
 - **The retry budget is per crash burst, not per lifetime.** A runner that crashes rarely, at least about 5.5 min apart, is restarted indefinitely. A runner that crash-loops gets exactly `max_retries` restarts, then sits in `stopped` with `restarting: false`, and the web must reap it.
 - `fly auth token` tokens expire after about 5 min. Any long-lived poller must use a real deploy or org token.
 
+## F-008: Fly stop signal precedence, and the `stop_config` timeout form (2026-10-15)
+
+**Questions (R2004 PR 0, coordinator decision I4):** web creates composed Machines with `stop_config: { signal: "SIGTERM", timeout: <grace> }`, and sends its own stop with an explicit `signal: "SIGINT"`.
+1. Does the stop request's explicit `signal` win over `stop_config.signal`? If not, our own stop arrives as SIGTERM, C06 drains at once, and the Final scene never shows.
+2. The docs type `stop_config.timeout` as an integer of nanoseconds. Which form reads back as sent?
+3. Does a stop that names no signal and no timeout (the shape of a stop Fly starts) wait `stop_config.timeout`, instead of Fly's 5 s default?
+
+**Method:**
+- App `seazn-relay-spike`, region `lhr`, image `busybox:1.36` (Docker Hub library), guest shared-cpu-1x / 256 MB, `restart: {policy: "no"}`, `auto_destroy: false`.
+- Two entrypoints:
+  - **trap:** `sh -c 'trap "exit 3" INT; trap "exit 4" TERM; while :; do sleep 1; done'`. The exit code names the signal that arrived.
+  - **ignore:** `sh -c 'trap "" INT; trap "" TERM; while :; do sleep 1; done'`. Only SIGKILL ends it, so the stop's duration shows which timeout Fly used.
+- The Machines API is driven directly (`api.machines.dev/v1`):
+  - runs 1 and 2: from one-off Node scripts;
+  - run 3: from the committed opt-in legs in `seazn.club` #971 (`fly-client.live.test.ts` leg 5, and the R2004 PR 0 leg in `runner-fly.live.test.ts`).
+- The token came from the environment only, never argv or logs.
+- What each reading is:
+  - **Read-back:** `config.stop_config` on the create response, and on a later `GET /machines/{id}`.
+  - **Exit code:** the newest `exit` event's `request.exit_event.exit_code`, from `GET /machines/{id}/events`.
+  - **Duration:** the client's wall clock, from `POST /stop` until `GET /wait?state=stopped` answers.
+- 8 Machines in 3 runs (≈ 20:56Z, 21:00Z and 21:14Z), about 5 Machine-minutes in all. Each Machine was destroyed with `force=true` and re-read as `destroyed`. The app listed 0 Machines after each run, and again at 21:15Z.
+
+### Results
+
+**1. The explicit stop signal wins.** Both Machines had `stop_config.signal` SIGTERM and the trap entrypoint:
+- `POST /stop {"signal":"SIGINT","timeout":"20s"}` exited **3** (the INT trap);
+- `POST /stop {}` exited **4** (the TERM trap).
+
+Run 1 (a script) and run 3 (the committed leg) agree, and every one of these exits carries `requested_stop: true`. So **our stop arrives as SIGINT, and a stop that names no signal gets `stop_config.signal`**.
+
+**2. Only the string form round-trips.**
+- `timeout: 20000000000` (the docs' nanoseconds) is accepted, and both the create response and the GET answer `"20s"`.
+- `timeout: "20s"` answers `"20s"`.
+
+The docs' unit is right (20 × 10⁹ ns is `"20s"`), but Fly normalises the value to a duration string. Web sends `"<n>s"` (`flyDuration()` in `seazn.club` `fly-client.ts`), the same spelling its stop request's `timeout` already used.
+
+**3. A signal-less, timeout-less stop waits `stop_config.timeout`.** These runs used the ignore entrypoint and `POST /stop {}`:
+
+| `stop_config` | stop → `stopped` |
+|---|---|
+| none (the control) | 11.97 s |
+| `"20s"` | 31.99 s, 27.92 s |
+
+Fly's default is 5 s (`kill_timeout`), so in both cases `stopped` lands about 7–12 s after the timeout. That is one control sample and two with `stop_config`. This measures stop → `stopped`, not the instant of SIGKILL.
+
+**4. No exit event after a forced kill.** In all 3 ignore runs, the Machine's events carried **no `exit` event** once it read `stopped`. A compositor the host has to SIGKILL therefore reaches web as a stopped Machine with no recorded exit: F-007's "unrecorded" shape (`runner-fly.ts` `observe`).
+
+**5. The adapter's own create.** A Machine created by `seazn.club`'s `FlyRunner.create` (nginx image, `auto_destroy: true`, `restart: on-failure`, max_retries 2) read back `{"timeout":"20s","signal":"SIGTERM"}`. Web's STOP effect (explicit SIGINT, `"20s"`) ended it with exit 0 and `requested_stop: true`.
+
+### Verdict and changes
+
+- **I4 holds as designed.** Our stop (explicit SIGINT) reaches C06 as SIGINT and can hold the Final scene. A stop that names no signal arrives as SIGTERM and drains at once, within the grace instead of 5 s.
+- **R2004 PR 0 shipped this way** (`seazn.club` #971, in review): `stop_config: { signal: "SIGTERM", timeout: "20s" }` on every composed create; our stop names SIGINT on every attempt, a retried one too; `RUNNER_STOP_GRACE_SECONDS` = 20 (D15).
+- **A web host driver must always name its stop signal.** Leaving it out silently becomes the platform's SIGTERM.
+- **C06 and C12 can't rely on an exit record after a SIGKILL.** Web reads that run as unrecorded. The drain has to finish inside the grace: hold 10 s + drain 7 s + 3 s headroom = 20 s.
+- **Not measured:**
+  - Whether Fly's own platform stops (`fly deploy`, host maintenance, `auto_stop_machines`) use `stop_config` exactly as a signal-less API stop does. The docs say `kill_signal` / `kill_timeout` cover those stops, and `stop_config` is the Machine-config form of the same pair.
+  - The teardown overhead beyond these three samples.
+
+### F-008 appendix: raw readings
+
+Times are 2026-10-15, UTC. "—" means the reading wasn't logged.
+
+| Run | Machine | Entrypoint | `stop_config` sent | Read back (create / GET) | Stop request | Stop → `stopped` | Newest `exit` event |
+|---|---|---|---|---|---|---|---|
+| 1 (≈ 20:56Z) | A `81744df943d018` | trap | `{SIGTERM, 20000000000}` | `{"timeout":"20s","signal":"SIGTERM"}` / same | `{"signal":"SIGINT","timeout":"20s"}` | ≈ 1.0 s | `exit_code 3`, `guest_exit_code 0`, `guest_signal -1`, `signal -1`, `requested_stop true`, `oom_killed false`, `restarting false`, exited 20:56:49.149Z |
+| 1 | B `811d23eb5d9218` | trap | `{SIGTERM, "20s"}` | `{"timeout":"20s","signal":"SIGTERM"}` / same | `{}` | ≈ 1.3 s | `exit_code 4`, `guest_exit_code 0`, `guest_signal -1`, `signal -1`, `requested_stop true`, `oom_killed false`, `restarting false`, exited 20:56:50.629Z |
+| 1 | C `86d552ae119458` | ignore | `{SIGTERM, "20s"}` | `{"timeout":"20s","signal":"SIGTERM"}` / same | `{}` | 31 990 ms | none |
+| 2 (≈ 21:00Z) | D `8d96953b119258` | ignore | none | absent / absent | `{}` | 11 968 ms | none |
+| 2 | E `683ddd21ce22e8` | ignore | `{SIGTERM, "20s"}` | `{"timeout":"20s","signal":"SIGTERM"}` / same | `{}` | 27 924 ms | none |
+| 3 (≈ 21:14Z), leg 5 | "ns" (id —) | trap | `{SIGTERM, 20000000000}` | — / `{"timeout":"20s","signal":"SIGTERM"}` | `{}` (raw POST, HTTP 200) | — | `exitCode 4`, `oomKilled false`, `requestedStop true` |
+| 3, leg 5 | "str" (id —) | trap | `{SIGTERM, "20s"}` | — / `{"timeout":"20s","signal":"SIGTERM"}` | `{"signal":"SIGINT","timeout":"20s"}` (production client) | — | `exitCode 3`, `oomKilled false`, `requestedStop true` |
+| 3, `runner-fly` leg | `d8d3741b541008` (nginx `1.27-alpine`, `FlyRunner.create`) | the image's own | `{SIGTERM, "20s"}` (adapter) | — / `{"timeout":"20s","signal":"SIGTERM"}` | `{"signal":"SIGINT","timeout":"20s"}` (`FlyRunner.stop`, from the domain's STOP effect) | — (`auto_destroy`; wait `destroyed` ok) | `exitCode 0`, `oomKilled false`, `requestedStop true` |
+
+Run 3's leg-5 rows are the leg's parsed output (`exitInfoFrom`), not the raw event. Runs 1 and 2 waited 3 s after `started` before the first stop, and run 3 waited 2 s, so the shell's traps were installed first.
+
 ## Platform notes (Fly-specific; nothing inside the image depends on them)
 
 - **CPU:** performance-4x reports AMD EPYC with 4 vCPU.

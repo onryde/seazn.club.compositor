@@ -23,6 +23,23 @@ unchanged:
 | 5 | Restart the container in place on a non-zero exit, at most 2 times, and never after exit 0 | ADR 0004. Exit 78 may restart: the restarted process is refused at bootstrap and exits 78 again, so the cap still bounds it |
 | 6 | Nothing else. Liveness is the heartbeat to web, never a host health check | spec §5.3 |
 
+**Superseded in part (2026-10-16, I4).** Item 4's last sentence, "Both signals are handled the same", no longer
+holds. Coordinator decision I4 (2026-10-15) gives the two signals different meanings:
+- **SIGINT** is web's own stop: the organiser's, or the deadline's. The compositor holds the Final scene, then drains.
+- **SIGTERM** is a stop the host starts: a deploy, maintenance or a scale-down. The compositor drains at once and shows no Final card.
+
+The rest of item 4 stands: accept either signal, then wait before SIGKILL. A SIGTERM drain still fits in 10 s (drain
+7 s + 3 s headroom). A SIGINT stop holds the Final scene first, so it needs web's grace:
+`RUNNER_STOP_GRACE_SECONDS` = 20 s (owner ruling D15: hold 10 s + drain 7 s + 3 s headroom).
+
+What a host driver owes:
+- name SIGINT explicitly on web's own stop;
+- leave SIGTERM to the host's own stops.
+
+On Fly that is `stop_config: { signal: "SIGTERM", timeout: "20s" }` plus an explicit `signal: "SIGINT"` on web's stop
+request. F-008 measured both: the explicit signal wins, and a stop that names none gets `stop_config`'s. The table
+above is left as accepted on 2026-10-15. See `docs/_INDEX.md`, Decision log, 2026-10-16.
+
 Equivalents for item 5: Fly `restart: on-failure, max_retries: 2`; Docker
 `--restart on-failure:2`; Kubernetes Job `backoffLimit: 2` + `restartPolicy: OnFailure`; Nomad
 `restart { attempts = 2 }`; Cloud Run jobs `maxRetries: 2`.
