@@ -98,12 +98,22 @@ def main():
     wall0 = time.time()
     lock = threading.Lock()
     c = {"enc": [], "kf": [], "pts": [], "bytes": 0, "filler_bytes": 0, "sei_bytes": 0, "mix": 0, "cam": 0, "cef": 0, "over": {"qcam": [], "qgfx": [], "qenc": []},
-         "qos": 0, "first_enc_s": None, "first_cam_s": None, "first_cef_s": None}
+         "qos": 0, "first_enc_s": None, "first_cam_s": None, "first_cef_s": None, "campts": []}
 
     def counter(key, first=None):
         def probe(_pad, _info):
             with lock:
                 c[key] += 1
+                if key == "cam":
+                    try:
+                        p = _info.get_buffer().pts
+                    except Exception:  # noqa: BLE001  (a raising probe would DROP the buffer)
+                        p = Gst.CLOCK_TIME_NONE
+                    if p != Gst.CLOCK_TIME_NONE:
+                        if not c["campts"]:
+                            c["campts"] = [p, time.monotonic(), p, time.monotonic()]
+                        else:
+                            c["campts"][2:] = [p, time.monotonic()]
                 if first and c[first] is None:
                     c[first] = time.monotonic() - t0
             return Gst.PadProbeReturn.OK
@@ -264,6 +274,11 @@ def main():
         with lock:
             n_enc, n_mix, n_cam, n_cef = len(c["enc"]), c["mix"], c["cam"], c["cef"]
             over = {k: len(v) for k, v in c["over"].items()}
+            vp = [(pp, m) for pp, m in zip(c["pts"], c["enc"]) if pp != Gst.CLOCK_TIME_NONE]
+            drift_out = round((vp[-1][0] - vp[0][0]) / 1e6 - (vp[-1][1] - vp[0][1]) * 1000, 1) if len(vp) > 1 else None
+            cp_ = list(c["campts"])
+            drift_cam = round((cp_[2] - cp_[0]) / 1e6 - (cp_[3] - cp_[1]) * 1000, 1) if cp_ else None
+            frames_vs_wall = round(n_enc - 30 * (c["enc"][-1] - c["enc"][0]), 1) if n_enc > 1 else None
         dt = now - last["t"]
         ab = acked_bytes()
         w = {
@@ -272,6 +287,7 @@ def main():
             "cam_fps": round((n_cam - last["cam"]) / dt, 2), "cef_fps": round((n_cef - last["cef"]) / dt, 2),
             "overruns": over, "filler_share_cum": round(c["filler_bytes"] / c["bytes"], 4) if c["bytes"] else None,
             "real_kbps_cum": round((c["bytes"] - c["filler_bytes"]) * 8 / 1000 / (now - t0 - a.warmup), 1) if c["bytes"] and now - t0 > a.warmup else None,
+            "media_minus_wall_ms_out": drift_out, "media_minus_wall_ms_cam": drift_cam, "frames_minus_30xwall_out": frames_vs_wall,
             "keyframes_cum": len(c["kf"]), "wall": round(time.time(), 3), "egress_kbps": None if ab is None or last["acked"] is None else round((ab - last["acked"]) * 8 / 1000 / dt, 1),
         }
         last.update({"enc": n_enc, "mix": n_mix, "cam": n_cam, "cef": n_cef, "t": now, "acked": ab})

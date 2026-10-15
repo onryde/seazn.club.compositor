@@ -305,7 +305,7 @@ The owner was asked to background the capture app at 12:08:00 London for 20 s.
 
 ---
 
-## F-004: RTMPS to Input B → YouTube. Clean-channel redo DONE: filler hypothesis REFUTED; gaps up to 15 s keep the same broadcast; about 60–90 s of no data ends it
+## F-004: RTMPS to Input B → YouTube. Filler REFUTED; CF relay REFUTED (direct push also Poor); our stream is real-time with no backlog; gaps up to 15 s keep the same broadcast; about 60–90 s of no data ends it
 
 The full item (go-live, B-frames question, time to live, health) is owed to an owner session. The rows below are the owner's YouTube Studio observations during the item-5 pushes, relayed by the coordinator, set next to this session's own measurements.
 
@@ -342,6 +342,45 @@ The full item (go-live, B-frames question, time to live, health) is owed to an o
 - **C09 slate and frozen frame.** A static slate encodes to almost pure filler, which is exactly the case YouTube flags Poor. Proposal: composite a full-frame, low-amplitude, animated noise/grain layer, or a continuously moving element, under every slate and frozen-frame output, so real bits approach the target. The exact amplitude is unmeasured.
 - **C09 acceptance test:** measure the **non-filler** bitrate (bytes outside NAL type 12) on a slate-only run. The current test, "bitrate within ±50 % (CBR filler keeps it near the target)", passes on the wire while YouTube flags Poor.
 - **R2 restart policy (ADR 0004):** a compositor restart, or any output stop, ends the organiser's YouTube broadcast. Whether YouTube resumes the *same* broadcast after a short reconnect is unmeasured.
+
+### A/B: direct to YouTube vs via CF Output, one phone session (2026-10-15, 15:51–16:14 London)
+
+**Setup:**
+- Session `dab4c6c3-…`, input `1602d142…`, fresh Machine `891e574f434d38`. Phone on the clock.
+- The fixture's own YouTube output was disabled.
+- Both legs used the identical C09 encode (720p30, 4000k CBR+filler, keyint 2 s, bframes 0) from the phone's SRT playback. The only difference was the destination env (`--out-env`).
+- **Leg 1 DIRECT:** `SPIKE_YT_DIRECT_URL` (rtmps://a.rtmps.youtube.com:443/live2/<r2-c0 key>), with B's YouTube output **paused**.
+- **Leg 2 VIA CF:** `SPIKE_B_RTMPS_URL`, with B's output resumed in the 3 min gap.
+- `run-ab.sh` retries an early exit up to 3 times, 2 s apart. Both legs connected on attempt 1, and there were no `rtmp2sink` errors.
+- A scheduling bug (a start time already in the past) launched both legs at 15:47:10 and killed them 15 ms later, before python started. No bytes were sent. `run-ab.sh` now refuses a start time in the past.
+
+| | Leg 1 DIRECT, 15:51:00–16:01:00 | Leg 2 VIA CF, 16:04:00–16:14:00 |
+|---|---|---|
+| Egress per 10 s window | 4100–4206 kbps; at 15:55 3938–4239; at 15:56 3970–4369 | 4126–4194 kbps |
+| Encoder fps after warm-up | ≥29.89 | ≥29.69 (16:11 camera dip to 26.5 fps) |
+| Queue overruns | 0 | 0 |
+| Filler, cumulative | ≤0.15 % (real video about 3994 kbps) | 0.0 % (real video about 3999 kbps) |
+| Machine cores average / p95 | 1.185 / 1.363 | 1.142 / 1.232 |
+| Output media − wall (encoder PTS vs arrival) | not instrumented (added after leg 1) | **−73 to −120 ms, flat across all 10 min** |
+| Camera PTS − wall | not instrumented | **+395 to +473 ms, flat** |
+| Encoded frames − 30×wall (PTS-independent) | not instrumented | **−1.2 to −2.6 frames, flat** |
+| RTMPS socket send-q (`/proc/net/tcp`; no `ss` in the image) | not sampled | 0 in 56 of 60 samples; one spike of 128 KB at 16:06:30; otherwise ≤376 B |
+| TCP retransmits, machine-wide | not sampled | 14 segments out of 263k (0.005 %) |
+| **Owner, r2-c0 health** | **"3:55 PM Error — YouTube is not receiving enough video to maintain smooth streaming. As such, viewers will experience buffering."** (about 4 min in) | **pending from the owner** |
+
+**Verdict (partial; leg 2's owner health is pending):**
+- **The CF relay is NOT the cause.** The DIRECT push went Poor about 4 min in, with our side flat. That is the fourth clean-path Poor (14:18, 14:48, 15:55), each 1–4 min into a push.
+- On leg 2, the stream we send is provably real-time: the media-time offset is constant, not growing, and the frame count matches 30×wall to within about 2 frames. Nothing queues on the socket (send-q about 0) and retransmits are negligible.
+- So **"not receiving enough video" is not explained by us sending less than 1 s of media per second, nor by an upstream bottleneck from Fly lhr**, at the 10 s resolution measured.
+- Rule for leg 2:
+  - if leg 2 also went Poor, the remaining suspects are our stream's *structure* or YouTube itself;
+  - if leg 2 stayed Excellent, the Poor flips are transient.
+- Structure means anything still untested: FLV timestamps, the silent `voaacenc` track, `profile=main`, CBR+HRD signalling, and 2 s GOPs against YouTube's recommendation of 2 s *or less*.
+
+**Next probes (not run):**
+1. A real-audio or no-audio variant (the silent AAC track is a candidate).
+2. An ffmpeg-encoded control from the same Machine and the same source, to split GStreamer's mux from x264 settings.
+3. A 30–60 min soak to see whether Poor is persistent or episodic.
 
 ### Redo, on a clean channel (2026-10-15, 14:43–14:56 London). THIS SUPERSEDES the morning readings and rerun 1's YouTube side
 
@@ -549,3 +588,11 @@ The snapshot of the composite (overlay over camera) was checked visually. It is 
 - `fly machine list -a seazn-relay-spike`: "No machines are available on this app".
 - Kept: the app, all staged secrets, CF Inputs A and B, and B's YouTube Output (`8448ee…`).
 - The fixture sessions and their YouTube targets were not touched by this agent. The owner disabled and enabled outputs in CF.
+
+## Teardown record (A/B probe)
+
+2026-10-15 ≈15:14Z.
+
+- Machine `891e574f434d38` was destroyed.
+- `fly machine list -a seazn-relay-spike`: "No machines are available on this app".
+- Kept: the app, all staged secrets (including `SPIKE_YT_DIRECT_URL`), CF Inputs A and B, and B's YouTube Output.

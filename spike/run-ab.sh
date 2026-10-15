@@ -5,6 +5,8 @@
 # 3 times, 2 s apart, and every attempt is logged. The only difference between the legs is the destination env.
 . /spike/env.sh
 T1=$1; LEG=${2:-600}; GAP=${3:-180}
+# Guard: a start time in the past would make `sleep` refuse a negative count and push at once.
+if [ "$T1" -le "$(date +%s)" ]; then echo "REFUSED: T1 $T1 is not in the future (now $(date +%s))"; exit 2; fi
 start_xvfb
 now() { echo "wall=$(date +%s.%3N) london=$(TZ=Europe/London date +%T.%3N)"; }
 leg() {  # leg <tag> <out env> <start epoch> <stop epoch>
