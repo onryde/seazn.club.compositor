@@ -70,6 +70,7 @@ The entry point for any session working on this repository. Read this file first
 | 2026-10-15 | **Coordinator decision I5:** "the session is not ended" (R2005's relay access path and fallback-B route) means `!isTerminal(state)`, with `TERMINAL_STATES = completed, failed` (`server/relay/domain/session.ts:19-20`). `ending` counts as active, so a reload during the final hold loads, and fallback B can deliver `final`. | — (R2005) |
 | 2026-10-15 | **Coordinator decision I6:** the scene layer mounts when `host=compositor`, or in the preview render function via `sceneOverride`. The page never sets `sceneOverride`. | — (R2005) |
 | 2026-10-15 | **Coordinator decision m10:** `overlay_template` has two readers, the composed `overlayUrl` and the capture descriptor's `overlayUrl` (R2004 change 7). | — (R2004) |
+| 2026-10-15 | Plan (confirm pass N1): C06's `start_hold` resets `next_beat_at`, so the first hold tick sends a `final` beat. This is an engineering fix, not an owner question. Lengthening the hold instead would cost grace (15 + 7 + 3 = 25 s > the recommended 20). | — (C06 test 10, mutant 10) |
 | 2026-10-15 | Plan (review m9): the stop contract ships as **R2004 PR 0**, a small web PR after R2003 (#967) merges and gated on nothing overlay-side, so C12 waits on it alone. | — (R2004, C12, plan) |
 
 ## False premises found
@@ -119,10 +120,10 @@ The entry point for any session working on this repository. Read this file first
 | 4 | C07: emit `final` + `phaseChannel`, extract `programme_phase_wire`, and drive the contract test through `Holding`/`Final` (plan, "Amendments 2026-10-15") | C12's phase-word drift test; R2006's chip on real beats | C07 implementer |
 | 5 | C13/C14: wait out the final hold before `down`; exclude the end-of-run slate span from slate-counting verdicts | C14's first green run after C06 merges | C13/C14 implementers |
 | 6 | ~~C17: Starting soon, Reconnecting scene, Final hold and `phaseChannel: "loopback"` rows, plus a picked-template row~~ Now in C17's brief ("Amendment 2026-10-15", rows 1, 3, 7–11) | — | — |
-| 7 | R2003 (#967) merged to `main` | R2007 PR B and R2004 PR 0 branch from it | R2003 implementer and reviewer |
+| 7 | R2003 (#967) merged to `main` | R2007 PR B and R2004 PR 0 branch from it; R2004's main PR waits for both (plan, "Parallel lanes", merge order) | R2003 implementer and reviewer |
 | 8 | R2004 PR 0 Part 1: measure whether an explicit stop `signal` wins over `stop_config.signal` (F-id), and which `stop_config.timeout` form round-trips | Part 1 ships only if the explicit signal wins | R2004 PR 0 implementer |
 | 9 | **Owner question:** should moments fire during Starting soon when the stream starts after the match has begun (`waiting × live`)? The spec says none fire before the start. The recommendation, not a ruling, is yes, with only Final discarding. R2005 builds the spec as written until answered. | R2005's A3/E7/M7 rows, if the answer is yes | **the owner** |
-| 10 | **Owner question:** under fallback B the page learns `final` about one beat (`RELAY_HEARTBEAT_INTERVAL_MS` = 5 s) plus one poll (`STREAM_POLL_MS` = 5 s, `lib/stream-session-view.ts:37`) late, which is ≥ `FINAL_HOLD_MS` = 10 s, so the Final scene can be missed entirely. Accept that for B, or lengthen the hold when the beat reports `phaseChannel: "web"`? (No recommendation yet: it hinges on C11 Step 0, since B is the fallback unless outcome (c).) | C06's hold length if the answer changes it; C17 row 7 under outcome (c) | **the owner** |
+| 10 | **Owner note (residual only; no decision needed unless the owner wants more):** C06 now beats at the start of the hold (confirm pass N1: `start_hold` resets `next_beat_at`; test 10, mutant 10), so web learns `final` at once. Under fallback B the page still waits up to one poll (`STREAM_POLL_MS` = 5 s, `lib/stream-session-view.ts:37`) plus render, so the Final scene shows for **≥ ~4 s instead of the full 10 s**. Under loopback (A) it shows the full hold. The hold and the grace budget are unchanged. | Nothing blocks on it; C17 row 7 under C11 outcome (c) expects the shorter Final | **the owner** (informational) |
 
 ## Session handoffs
 

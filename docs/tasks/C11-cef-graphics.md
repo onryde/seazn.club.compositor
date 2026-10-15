@@ -137,7 +137,9 @@ measured.
   - **(Added 2026-10-15, coordinator decision G1)** `--script waiting:5000,reconnecting:5000,final:5000`:
     instead of a fixed answer, serve that phase sequence. Each entry holds for its milliseconds,
     `seq` rises by one per entry, and a long-poll on the current `seq` is answered at the next change.
-    After the last entry, it serves `live`. An entry naming a phase outside the five programme phases
+    After the last entry, it serves `live`. **The script clock starts at the first `GET /phase`**, not
+    at server start, and the server logs every transition with its wall-clock time in ms
+    (`transition <phase> seq=<n> at=<epoch ms>`). An entry naming a phase outside the five programme phases
     is refused at start-up (exit 2), never served. The compatibility step below uses it.
 
   The answer is `{"phase":"live","seq":S+1}`, R2007 PR B's `RelayPhaseReply` shape. **Every** request
@@ -203,26 +205,39 @@ step 14b is the OBS half, and C17's acceptance lists both records.
   arrives), and record the scene leg as owed to C17. Don't skip the record. The same applies if
   Step 0 recorded outcome (c): the page then reads its phase from web (fallback B), which needs a
   real composed session, so only C17 can drive the scenes.
-- **The page:** a public stg fixture whose org has the overlay entitlement. C00 used
-  `/overlay/fixtures/02786dd0-…` (F-001); re-pin a live one, since that fixture may have ended or
-  moved. The URL is `https://<stg app>/overlay/fixtures/<id>?host=compositor&template=<id>`, once per
+- **The page:** a public stg fixture whose org has the overlay entitlement and which is **in
+  progress** at run time: started, not decided (confirm pass N2). An upcoming or decided fixture shows
+  a match card while the phase is `live` (R2007 check 4 counts cards in `warming` and `ended` cells),
+  so the `live` alpha-0 check below would false-red. Start one on the stg pad if none is in progress
+  (one scored point is enough). Read its status from the public fixture read just before the run and
+  record it; if it isn't in progress, **refuse the run** rather than skip the check. C00 used
+  `/overlay/fixtures/02786dd0-…` (F-001), which may have ended or moved. The URL is `https://<stg app>/overlay/fixtures/<id>?host=compositor&template=<id>`, once per
   `OVERLAY_TEMPLATES` id (re-pin the list from R2007's registry). There is no `sid`/`st`: a public
   fixture needs no relay access path, and `host=compositor` alone turns on the signals and the scene
   layer.
 - **The run:** in the release image, run `Xvfb :99`, then
   `harness/phase-probe-server.py --variant pna --script waiting:5000,reconnecting:5000,final:5000`,
   then
-  `cefsrc url=<that URL> … ! videorate ! video/x-raw,framerate=1/1 ! videoconvert ! pngenc ! multifilesink location=frame-%03d.png`
-  for 25 s. The probe server is the same stand-in for C12's endpoint that Step 0 uses.
+  `cefsrc url=<that URL> … ! videorate ! video/x-raw,framerate=1/1 ! videoconvert ! pngenc ! multifilesink location=frame-%03d.png`.
+  Stop it 8 s after the server logs its `live` transition, or 45 s after start if it never does
+  (then fail: the page never followed the script). The probe server is the same stand-in for C12's
+  endpoint that Step 0 uses.
+- **Timing (confirm pass N2):** frames are timed by their file's mtime (`os.stat(..).st_mtime`,
+  sub-second; same container, same clock), and each phase by the server's transition log, so CEF's
+  cold start in Xvfb doesn't matter. A phase's window runs from its transition to the next one,
+  shrunk by 1 s at each end to cover render latency. The `live` window ends at the last frame.
 - **Assert, per template:**
   - `seazn:ready` arrives (F-001's mechanism)
   - the probe server logs at least 3 `GET /phase` lines (the page followed the script)
-  - for the frames at 3 s, 8 s and 13 s (mid-`waiting`, mid-`reconnecting`, mid-`final`), the pixel
-    at the centre of the card region (`cardRegionFor(<template's sceneCardSafeArea>)`, R2007 step 9b)
-    has alpha 255, because the scene backdrop is opaque
-  - the frame at 20 s (`live` again) has alpha 0 at that same pixel (no scene, transparent canvas)
+  - each of the four windows (`waiting`, `reconnecting`, `final`, then `live`) holds at least one
+    frame; a window with none fails
+  - in every frame inside the `waiting`, `reconnecting` and `final` windows, the pixel at the centre
+    of the card region (`cardRegionFor(<template's sceneCardSafeArea>)`, R2007 step 9b) has alpha
+    255, because the scene backdrop is opaque
+  - in every frame inside the `live` window, that same pixel has alpha 0: no scene, and no card,
+    because the fixture is in progress
 
-  Print `templates checked: N, frames checked: 4N`; fail on 0.
+  Print `templates checked: N, frames checked: M (per window: …)`; fail if N or M is 0.
 - **Look at the PNGs** (one per scene per template) for a scene card that's legible, clear of the
   template, and not clipped. **Never commit them** (owner rule): they stay in the run's scratch
   directory. Post them in the PR or release comment.

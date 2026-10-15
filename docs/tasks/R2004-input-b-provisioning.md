@@ -7,7 +7,9 @@ camera→compositor delay, which becomes the default). **Amended 2026-10-15:** a
 (`resolveTemplate` in `components/overlay/template-registry.ts`). See "Amendment 2026-10-15 (overlay
 templates spec)" at the end. **The stop contract (stop signals and the grace) is not in this PR**: it
 ships as its own small PR 0, described in that amendment, ahead of C12 and not gated on R2007
-(review m9).
+(review m9). **(Confirm pass N4) This PR branches only after PR 0 and R2007 PR B have both merged.**
+It shares `config.ts` and `config.test.ts` with PR 0, and `relay-internal-routes.test.ts` with PR B.
+The order is in the plan's "Parallel lanes".
 
 ## Context
 

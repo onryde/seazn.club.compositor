@@ -217,7 +217,7 @@ fly/stg.toml, fly/prod.toml        (C16)
 | R2003 | Runner `on-failure`, same-attempt sweep, 15 s composed stale, exit 78 never retries | seazn.club | R2002 | `tasks/R2003-runner-restart-and-beats.md` |
 | R2007 | **New 2026-10-15.** PR A: the overlay template registry, text floor and bar lift, `/admin/overlay-gallery`, `OverlayPreview`. PR B: the owed R2002 contract follow-up (`final`, `phaseChannel`, the phase endpoint `$defs`) | seazn.club | PR A: the end-card-undo fix (`fix/overlay-end-card-undo`) merged. PR B: **R2003 (#967) merged** (corrected by the briefs review: they share three files) | `tasks/R2007-overlay-template-system.md` |
 | R2004 PR 0 | **New 2026-10-15.** The relay stop contract, its own small web PR: composed Machines get `stop_config { signal: "SIGTERM" }` while web's stop stays an explicit SIGINT (coordinator decision I4), a measured signal-precedence F-id, and the grace raised to 20 s (**OWNER DECISION PENDING**) | seazn.club | R2003 (#967) merged. **Not** R2007 or the undo fix | `tasks/R2004-input-b-provisioning.md` ("PR 0") |
-| R2004 | Composed provisioning: Input B, composed session facts, delay column. **Amended 2026-10-15:** `template=` in `overlayUrl`, the stored choice | seazn.club | R2003, **C00 F-002**, **R2007 PR A** | `tasks/R2004-input-b-provisioning.md` |
+| R2004 | Composed provisioning: Input B, composed session facts, delay column. **Amended 2026-10-15:** `template=` in `overlayUrl`, the stored choice | seazn.club | R2003, **C00 F-002**, **R2007 PR A**, **R2004 PR 0 and R2007 PR B merged** (shared files; merge order under "Parallel lanes") | `tasks/R2004-input-b-provisioning.md` |
 | R2005 | Overlay page: `sid`+`st` access, `host=compositor` signals, stale, clamp. **Amended 2026-10-15:** scenes, cards, the phase channel with fallback B | seazn.club | R2004, **C00 F-001**, **R2007 PR A + PR B**, **C11 Step 0 finding** | `tasks/R2005-overlay-page-compositor-host.md` |
 | R2006 | Organiser UI: composed option + delay override. **Amended 2026-10-15:** the template picker with live previews, persisted | seazn.club | R2004, R2005, **R2007 PR A + PR B** | `tasks/R2006-organiser-composed-ui.md` |
 | C16 | Deploy workflows, Fly apps config | compositor | C12 | `tasks/C16-deploy.md` |
@@ -246,6 +246,17 @@ fly/stg.toml, fly/prod.toml        (C16)
 - (Amended 2026-10-15) **R2004 PR 0** (the stop contract: `runner-fly.ts`, `fly-client.ts`, `config.ts`
   and their tests) branches after #967 merges, too. It shares no file with R2007 PR A, so they can run
   in parallel; with PR B it shares none either, but both wait on #967.
+- (Confirm pass N4) **The web relay merge order, stated explicitly:**
+  1. **R2003 (#967)** merges.
+  2. **R2004 PR 0** and **R2007 PR B** branch from that `main` and run in parallel. Their files are
+     disjoint: PR 0 has `runner-fly.ts`, `fly-client.ts`, `config.ts`, `config.test.ts` and the
+     runner-fly tests; PR B has `schemas.ts`, `openapi/v1.json`, `sanitise.ts`, `lib/relay-phase.ts`,
+     the contracts and `relay-internal-routes.test.ts`. Either may merge first.
+  3. **R2004 (main PR)** branches only after **both** have merged, plus R2007 PR A. It shares
+     `config.ts` and `config.test.ts` with PR 0 (its `RELAY_OUTPUT_PROFILE`), and
+     `relay-internal-routes.test.ts` with PR B (tests 1–10). So PR B goes **before** R2004, not after:
+     PR B is on C07's critical path, and R2004 already waits on PR A.
+  4. **R2005**, then **R2006**, as before.
 - (Amended 2026-10-15) **C11 Step 0** is a docs/harness commit on the compositor `main`. It can run as
   soon as C00 has passed, in parallel with C06–C08.
 
@@ -260,7 +271,7 @@ The orchestrator re-runs each wave's **scoped** gate itself and pastes the raw c
 ## Dependency graph (amended 2026-10-15)
 
 ```
-end-card-undo fix ──▶ R2007 PR A ──┬──▶ R2004 (+ R2003, C00 F-002)
+end-card-undo fix ──▶ R2007 PR A ──┬──▶ R2004 (+ R2003, C00 F-002, R2004 PR 0, R2007 PR B)
                                    ├──▶ R2005 (+ R2004, C00 F-001, C11 Step 0, R2007 PR B)
                                    └──▶ R2006 (+ R2004, R2005, R2007 PR B)
 R2003 (#967) ──┬──▶ R2007 PR B ──▶ C07 vendors the contract ──▶ C08 ──▶ … ──▶ C12

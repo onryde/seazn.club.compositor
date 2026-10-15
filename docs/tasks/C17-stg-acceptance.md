@@ -127,11 +127,13 @@ here; the plan keeps a pointer only.
 | # | Action | Expected | Seen | Verdict |
 |---|---|---|---|---|
 | 9 | Before row 6's second session: the organiser picks the non-default template (R2006's picker), then Go live | YouTube shows the picked template, at its placement; a moment slab appears at that template's `slabPlacement` | | |
-| 10 | On row 6's second session, the orchestrator runs `fly machine stop <machine id>` with **no** signal flag (a platform stop) | YouTube ends **without** the Final scene; the last beat carries `exitReason: "signalled"`; no beat carries `programmePhase: "final"`. Record what web does with the session afterwards; an `r<n+1>` attempt row is a finding against R2003 | | |
+| 10 | On row 6's second session, the orchestrator runs `fly machine stop <machine id>` with **no** signal flag (a platform stop) | The picture stops **without** the Final scene; the last beat carries `exitReason: "signalled"`; no beat carries `programmePhase: "final"`. Then, per R2003's ruling (corrected by confirm pass N3; `domain/runner.ts:96-100` on `f9034f575`): `signalled` is record-only, exit 0 is never restarted, `auto_destroy` removes the Machine, and the composed stale window takes the runner `lost` → force_destroy → **the ONE retry**. So expect exactly one `r2` attempt row and the stream resuming on it after a cold start (F-004 addendum: the broadcast splits, 15–30 s). Record the gap seen and whether YouTube kept the broadcast. Then end the session from the organiser UI: r2 shows the Final scene (row 7's check) | | |
 | 11 | The owner opens the OBS browser source from R2007 step 14b's record for this release | The record exists and its verdicts are all pass | | |
 
 Row 10 is the live proof of the SIGINT/SIGTERM split, and its expected result follows from C06's signal
-table. If a platform stop shows the Final scene, PR 0's `stop_config` did not take, so route it to PR 0.
+table and R2003's retry rule. If a platform stop shows the Final scene, PR 0's `stop_config` did not
+take, so route it to PR 0. The retry is **expected** behaviour, not a finding. If the owner would
+rather a platform stop not retry, that is an owner question for R2003, not a defect.
 
 **Screens (Step 4):** add YouTube crops of the Starting soon, Reconnecting and Final scenes (rows 1, 3
 and 7) and of the picked template (row 9). The same rule applies: never in the repo.

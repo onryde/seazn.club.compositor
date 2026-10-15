@@ -734,9 +734,9 @@ gets 410 and exits 0. That sequence is tested here.
      (the pre-ruling-A shape). Expected red: `beat_state_follows_output_and_programme` (slate on air
      must be `Playing`).
 
-  5–9. **(Amendment 2026-10-15)** mutants 5–9 from the amendment section.
+  5–10. **(Amendment 2026-10-15)** mutants 5–10 from the amendment section.
 
-  Revert every mutant, and record all ~~four~~ nine in the commit body.
+  Revert every mutant, and record all ~~four~~ ~~nine~~ ten in the commit body.
 
 - [ ] **Step 10: Gate (wave 1).**
   ```bash
@@ -749,7 +749,7 @@ gets 410 and exits 0. That sequence is tested here.
 
 - All domain tests pass, including ~~15~~ 22 supervisor scenarios (amended 2026-10-15) and 2 properties
   at 512 cases with non-zero counts, including the amendment's `holds entered` and `final ticks`.
-- ~~4~~ 9 mutants went red (amended 2026-10-15).
+- ~~4~~ ~~9~~ 10 mutants went red (amended 2026-10-15; mutant 10 from the confirm pass).
 - Purity and deps guards are still green.
 - (Amended 2026-10-15) C03's sweeps pass with `Final` added: `unlisted pairs checked` is
   `5 × 4 − PROGRAMME_TABLE.len()`, and `final ticks checked` is > 0 from all four camera phases.
@@ -927,6 +927,10 @@ pub enum PhaseChannel { Loopback, Web }
 fn start_hold(&mut self, now: Ms, reason: ExitReason) {
     self.lifecycle = Lifecycle::Holding { since: now, reason };
     self.programme.finish();
+    // (Confirm pass N1, 2026-10-15) The first hold tick beats at once, so web learns `final` at the start of
+    // the hold, not up to `heartbeat_interval_ms` later. Under fallback B that is the difference between the
+    // Final scene showing for most of the hold and being missed (`_INDEX.md` Owed 10).
+    self.next_beat_at = now;
 }
 
 // running(), changed arms:
@@ -1026,6 +1030,18 @@ frames and ticks into each camera phase exactly as `final_is_terminal_against_ev
    `SendHeartbeat`s over the hold: at least one, and every one reports `Final`.
 9. `phase_channel_reaches_the_report_and_is_absent_until_told`: `None` after boot (absent, never
    defaulted); `Some(PhaseChannel::Web)` after `Event::PhaseChannel(PhaseChannel::Web)`.
+10. **(Confirm pass N1)** `the_first_hold_tick_beats_final_at_once`. For each of the three end
+    requests (an `Ending` reply, `Signal(Int)`, and the deadline), from a fresh `booted(0)` with the
+    output connected:
+    - tick until a scheduled `SendHeartbeat` has just gone out, at time `B`; the next scheduled beat is
+      then `B + heartbeat_interval_ms` (5 000 by default)
+    - send the end request at `B + 100`, or set `deadline_at` there
+    - the first `Tick` at or after `B + 100` emits a `SendHeartbeat` whose report has
+      `programme_phase == Final`
+
+    Without the reset, that beat waits until `B + heartbeat_interval_ms`. The expected beat time comes
+    from `Thresholds::default()` and the tick period, never from `decide`. Print
+    `end paths checked: 3`; fail on 0.
 
 **Properties** (`properties.rs`):
 - P1 becomes P1′: a tick yields a frame iff the lifecycle before **and** after is `Running` or
@@ -1045,6 +1061,7 @@ frames and ticks into each camera phase exactly as `final_is_terminal_against_ev
 | 7 | `Signal(Int)` drains at once | test 5 |
 | 8 | `holding` also runs the links' and graphics' `on_tick` | test 2 (the due rebuild appears) |
 | 9 | `health()` maps `Holding` to `Stopped` | test 8 |
+| 10 | `start_hold` drops `self.next_beat_at = now` (confirm pass N1) | test 10 (all three paths) |
 
 ### Owed elsewhere (not this task)
 

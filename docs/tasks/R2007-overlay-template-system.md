@@ -191,7 +191,7 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
   /** `template` when present and non-empty, else `style`. Array values take the first element. */
   export function templateParam(q: { template?: string | string[]; style?: string | string[] }): string | undefined;
   /** Step 9b (coordinator decision G2). The canvas region where scene and match cards are laid out: the
-   *  largest of the four inset-canvas strips beside `box` (right, above, left, below; ties in that
+   *  largest, by area, of the four inset-canvas strips beside `box` (right, above, left, below; ties in that
    *  order), kept `CARD_CLEARANCE_PX` clear of it. `null` when none is at least CARD_MIN_W × CARD_MIN_H,
    *  in which case no card renders. */
   export const CARD_INSET = { top: 72, right: 96, bottom: 72, left: 96 } as const; // today's .ovl-slate-content padding, globals.css:1702-1706
