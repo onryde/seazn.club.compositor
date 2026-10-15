@@ -1,7 +1,9 @@
 # C12: Binary wiring, process metrics, Dockerfile, image CI
 
 **Repo:** `seazn.club.compositor`. **Depends on:** C10, C11. Read F-001 (gstcefsrc commit and CEF
-version) and F-005 (cold start).
+version) and F-005 (cold start). **Amended 2026-10-15:** also the owner's stop-grace decision (R2004's
+amendment Step 0) shipped on web, and C11 Step 0's loopback finding. See "Amendment 2026-10-15
+(overlay templates spec)" at the end.
 
 ## Context
 
@@ -32,7 +34,8 @@ run fakes. The Dockerfile sets `COMPOSITOR_DRIVERS=live`.
 ### Signals
 
 `SIGINT` → `Inbound::Event(Event::Signal(SignalKind::Int))` and `SIGTERM` → `…Signal(SignalKind::Term)`, via the `signal-hook` crate's iterator on a
-dedicated thread. A second signal during drain is ignored. The domain owns the drain deadline
+dedicated thread. A second signal during drain is ignored. (Amended 2026-10-15: `SIGINT` now starts
+C06's final hold and `SIGTERM` still drains at once; a second `SIGINT` during the hold is ignored.) The domain owns the drain deadline
 (C06 `drain_timeout_ms`, which must be below the 10 s grace; **assert that in a test here**, deriving
 10 s from a constant `R1_STOP_GRACE_MS` in `crates/compositor/src/main.rs` with a doc line citing
 `config.ts RUNNER_STOP_GRACE_SECONDS`).
@@ -92,8 +95,9 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
     `SECRET-TOKEN-VALUE`, and assert it's absent).
   - `drivers_unset_refuses_in_release_and_defaults_fake_in_debug`
   - `drivers_rejects_unknown_value`
-  - `drain_timeout_fits_inside_r1_stop_grace`:
-    `Thresholds::default().drain_timeout_ms < R1_STOP_GRACE_MS`
+  - ~~`drain_timeout_fits_inside_r1_stop_grace`:
+    `Thresholds::default().drain_timeout_ms < R1_STOP_GRACE_MS`~~ SUPERSEDED 2026-10-15 by
+    `final_hold_and_drain_fit_inside_r1_stop_grace` (amendment).
 
 - [ ] **Step 2: Write the failing metrics tests** (`crates/adapters/tests/metrics_proc.rs`):
   - `first_sample_has_no_cpu`
@@ -124,7 +128,9 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
 
   Assert all of:
   - exit code 0, no earlier than 2.5 s, and **sooner than** `3 s + Thresholds::default().drain_timeout_ms`
-    (both from constants, never a flat number: AGENTS.md class 20). An exit through the drain
+    (both from constants, never a flat number: AGENTS.md class 20). **Amended 2026-10-15:** the deadline
+    now holds the Final scene first, so the bounds are `2.5 s + final_hold_ms` and
+    `3 s + final_hold_ms + drain_timeout_ms`, both from `Thresholds::default()`. An exit through the drain
     timeout lands at the bound or later and goes red. That's the point of the bound: it proves
     `OutputDrained` ended the run.
   - stderr contains `programme started` and `exit code=0`
@@ -214,10 +220,11 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
   2. **Plugin check:** `docker run --rm seazn-relay:$SHA gst-inspect-1.0 cefsrc`, which must exit 0.
   3. **cef tests:** run C11's graphics tests inside a build-stage image
      (`--target rust-build` plus the cef plugin path) with `cargo test -p adapters --features cef --test graphics -- --test-threads=1`.
-     Fail if the passed count is < 7.
+     Fail if the passed count is < ~~7~~ 8 (amended 2026-10-15: C11's `phase_channel_signal_is_relayed`).
   4. **60 s smoke:** start the image with `COMPOSITOR_DRIVERS=fake`, a deadline 60 s ahead and the
-     dummy env. Expect exit 0 within 75 s, and stderr containing `programme started` and
-     `exit code=0`.
+     dummy env. Expect exit 0 within ~~75 s~~ 85 s (amended 2026-10-15: 60 s + `final_hold_ms` 10 s +
+     `drain_timeout_ms` 7 s = 77 s, plus 8 s for container start; write that sum as a comment beside
+     the number), and stderr containing `programme started` and `exit code=0`.
   5. Print the image size, and fail above 2.5 GB (CEF is large; the cap stops bloat creep).
 
   Push is C16's job; this workflow never pushes.
@@ -229,14 +236,17 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
      `missing_each_required_key_is_refused_naming_the_key`.
   3. Drop the `encoder_speed` copy in `ProcMetrics::sample`. Expected red:
      `copies_every_stats_field_into_measured`.
+  4–8. **(Amendment 2026-10-15)** mutants 4–8 from the amendment section.
 
 - [ ] **Step 10: Commit and open the PR.** `feat(compositor): binary wiring, proc metrics and the relay image (C12)`
 
 ## Acceptance
 
 - Env, metrics and fake-run tests pass.
-- `image.yml` is green on the PR: plugin present, 7 cef tests, smoke exits 0, size under the cap.
-- 3 mutants went red.
+- `image.yml` is green on the PR: plugin present, ~~7~~ 8 cef tests, smoke exits 0, size under the cap.
+- ~~3~~ 8 mutants went red (amended 2026-10-15).
+- (Amended 2026-10-15) The phase endpoint tests pass, and `final_hold_and_drain_fit_inside_r1_stop_grace`
+  is green against the owner's pick. It is never ignored or weakened to get there.
 - The image runs as non-root.
 
 
@@ -250,9 +260,155 @@ fake-control received has `state: "stopped"` and `exitReason: "ended"`. Add a se
 Exits **before** a session exists (`EnvError`, exit 78 at config parse) cannot send a beat, because
 they have no URL or token yet. They stay stderr-only, and that's expected, not a gap.
 
+(Amended 2026-10-15) The Ended path now holds first: a fake-control `reply-ending.json` run lasts
+`final_hold_ms` longer. Assert also that **an earlier POST carries `programmePhase: "final"`** (C07's
+wire, owed by the plan's C07 note), so the Final scene reaches the heartbeat. A third run sends `SIGTERM`
+to the child 2 s after `programme started`: exit 0 within `drain_timeout_ms + 1 s`, the last POST
+carries `exitReason: "signalled"`, and **no** POST carries `final` (a host stop never shows "Stream
+ended").
+
+## Amendment 2026-10-15 (overlay templates spec)
+
+Authority: `seazn.club: docs/superpowers/specs/2026-10-15-overlay-templates-and-scenes-design.md`
+§4.3 (D10: "Primary (A): the compositor serves its programme phase on a loopback HTTP endpoint
+(`127.0.0.1` only, read by its own CEF; never exposed by Fly)") and §6 ("C08/C12 (amend): adds the
+loopback `/phase` endpoint (127.0.0.1 only; CORS + PNA headers; long-poll)").
+
+**Ownership split, stated in both briefs.** C08 owns the `PhasePublisher` port, the driver's
+publish-on-change rule and the fake. **C12 owns the HTTP adapter**, its wiring in `main`, and the
+stop-grace test. C11 Step 0's finding decides whether the page reads this endpoint first (outcomes
+(a)/(b)) or only as a later upgrade (outcome (c)). The endpoint ships either way.
+
+### Files
+
+- Create: `crates/adapters/src/phase_http.rs`. Test: `crates/adapters/tests/phase_http.rs`.
+- Modify: `crates/adapters/Cargo.toml`: move `tiny_http = "0.12"` from C07's `[dev-dependencies]`
+  to `[dependencies]` (same version; one HTTP server crate in the workspace).
+- Modify: `crates/compositor/src/{env.rs,wiring.rs,main.rs}`, and the tests above.
+
+### Interface
+
+```rust
+// phase_http.rs
+/// The loopback programme-phase endpoint (overlay templates spec 2026-10-15 §4.3). The page reads it;
+/// Fly never exposes it. Values are drift-tested against the vendored contract's `$defs.phaseEndpoint`.
+pub const RELAY_PHASE_PORT: u16 = 7419;
+pub const RELAY_PHASE_PATH: &str = "/phase";
+pub const RELAY_PHASE_LONG_POLL_MAX_MS: u64 = 10_000;
+/// The page holds one poll; a CEF reload can briefly hold two. 4 bounds a stuck client; the 5th gets 503.
+pub const PHASE_HTTP_MAX_CONCURRENT: usize = 4;
+
+pub struct PhaseHttp { /* Arc<(Mutex<(ProgrammePhase, u64)>, Condvar)>, accept thread */ }
+impl PhaseHttp {
+    /// Refuses a non-loopback `addr` (`PhaseBindError::NotLoopback`) before binding. That's the guard
+    /// for "127.0.0.1 only".
+    pub fn bind(addr: SocketAddr, allowed_origin: String) -> Result<Self, PhaseBindError>;
+    pub fn local_addr(&self) -> SocketAddr;
+}
+impl app::ports::PhasePublisher for PhaseHttp { fn publish(&mut self, phase: ProgrammePhase, seq: u64); }
+```
+
+It serves `(Waiting, 0)` until the first `publish`, which matches C08's driver start.
+
+### Behaviour
+
+| Request | Answer |
+|---|---|
+| `OPTIONS /phase`, `Origin` == `allowed_origin` | 204 with `Access-Control-Allow-Origin: <origin>`, `Access-Control-Allow-Methods: GET`, `Access-Control-Allow-Private-Network: true` and `Vary: Origin` |
+| `GET /phase?after=S`, allowed `Origin`, current `seq` > S | 200 at once, `{"phase":<word>,"seq":<seq>}` |
+| same, `seq` ≤ S | wait on the condvar until a publish raises `seq`, or `RELAY_PHASE_LONG_POLL_MAX_MS`, then 200 with the current value |
+| any request whose `Origin` differs or is missing | 403, no `Access-Control-*` header |
+| `after` missing or not a `u64` | 400 |
+| another path | 404; another method → 405 |
+| a 5th concurrent request | 503 |
+
+- Every 200 and 204 carries `Cache-Control: no-store`.
+- `allowed_origin` is `Env.app_origin`: APP_URL's scheme + host + port, no path and no trailing slash.
+  That's the form C11 Step 0 observed in the `Origin` header; cite its F-id at the derivation.
+- `<word>` comes from the **same** function C07's `heartbeat_wire` uses for `programmePhase`
+  (`programme_phase_wire`, owed by the plan's C07 note). If C07 merged without that function, extract
+  it in C07's module and record a one-function deviation in the commit body. Two mappings would drift.
+- Wiring in `main`: bind `127.0.0.1:RELAY_PHASE_PORT` **before** the driver starts and before CEF loads
+  the page, so the page's first poll can't race the bind. A bind failure logs
+  `level=warn msg=phase endpoint unavailable` once and wires `NoopPhase`, and the run continues: the
+  page falls back to B after 3 failures, and the run must never die for a graphics hint.
+
+### Tests (write them failing first)
+
+`crates/adapters/tests/phase_http.rs` binds `127.0.0.1:0` (an ephemeral port) for every test, so
+tests run in parallel. Expected values come from the vendored contract or the spec, never from the
+module.
+1. `serves_the_published_phase_with_cors_for_the_app_origin`: `publish(Live, 1)`; `GET after=0` → 200;
+   the body validates against the vendored `$defs.phaseReply` (C07's `schema_def` helper) and equals
+   `{"phase":"live","seq":1}`; `Access-Control-Allow-Origin` is exactly the origin (not `*`); `Vary:
+   Origin`; `Cache-Control: no-store`.
+2. `preflight_allows_private_network_for_the_app_origin_only`, over 3 origins:
+   - the allowed origin with `Access-Control-Request-Private-Network: true` → 204 carrying
+     `Access-Control-Allow-Private-Network: true`
+   - `https://evil.example` → 403 with no `Access-Control-*` header
+   - no `Origin` → 403
+
+   Print `origins checked: 3`.
+3. `long_poll_waits_for_a_newer_seq_and_answers_at_once_when_behind`:
+   - `publish(Live, 1)`. A `GET after=1` blocks; `publish(Frozen, 2)` 300 ms later answers it with
+     `seq 2` in under 800 ms.
+   - `GET after=0` answers in under 200 ms.
+   - `GET after=2` with no publish answers no sooner than `RELAY_PHASE_LONG_POLL_MAX_MS − 100` and no
+     later than `+ 1 000`, with `seq 2` unchanged.
+4. `binds_loopback_only`: `bind("0.0.0.0:0")` → `Err(NotLoopback)`; `bind("127.0.0.1:0")` →
+   `local_addr().ip()` is `127.0.0.1`.
+5. `fifth_concurrent_poll_is_refused_503`: 4 parked polls, then a 5th → 503. Release one, and a new
+   poll is accepted again.
+6. `before_any_publish_serves_waiting_seq_0`.
+7. `bad_requests_are_refused`: unknown path 404, `POST` 405, `after=abc` 400.
+8. `endpoint_constants_match_the_vendored_contract`: port, path and long-poll max each equal
+   `$defs.phaseEndpoint.properties.<field>.const`.
+9. `phase_word_matches_the_heartbeat_wire_for_every_phase`: for every `ProgrammePhase` (an exhaustive
+   `match` builds the list, so a new variant fails to compile here), the served word equals
+   `heartbeat_wire`'s `programmePhase` and is a member of the vendored
+   `$defs.phaseReply.properties.phase.enum`. Print `phases checked: 5`; fail on 0.
+
+`crates/compositor/tests/env.rs`:
+- `app_origin_is_scheme_host_port`: `https://seazn.club` → `https://seazn.club`;
+  `https://stg.seazn.club/` → `https://stg.seazn.club`; `http://localhost:3000/x` →
+  `http://localhost:3000`.
+- `final_hold_and_drain_fit_inside_r1_stop_grace`, replacing the superseded test:
+  `t.final_hold_ms + t.drain_timeout_ms + EXIT_HEADROOM_MS <= R1_STOP_GRACE_MS`, where
+  `EXIT_HEADROOM_MS = 3_000` (the headroom in `config.rs`'s `drain_timeout_ms` doc line). With R1's grace
+  at 10 s, this is **red** (10 + 7 + 3 = 20 > 10). It goes green only with the owner's pick from R2004's
+  amendment Step 0:
+  - **(A)** set `R1_STOP_GRACE_MS` to the new web value, citing the web commit that changed
+    `RUNNER_STOP_GRACE_SECONDS`. This PR merges only after that web change is deployed to stg, because
+    otherwise Fly kills mid-drain.
+  - **(B)** C06's `final_hold_ms` and its spec-number test change by owner ruling.
+
+  Never `#[ignore]` it.
+
+`crates/compositor/tests/fake_run.rs` (the tests hold a file-level `static SERIAL: Mutex<()>`, so two
+spawned binaries never race for port 7419):
+- `fake_run_serves_final_on_the_loopback_endpoint_at_the_deadline`. This is the seam, from the real
+  driver through the real publisher to the real endpoint:
+  - start the fake run with a 3 s deadline
+  - loop `GET http://127.0.0.1:7419/phase?after=<last seq>` with `Origin: <the dummy APP_URL origin>`
+  - assert that `final` arrives no sooner than 2.5 s, with every `seq` strictly rising, and that the
+    process then exits 0
+- `phase_port_taken_still_runs_to_exit_zero`: hold a `TcpListener` on `127.0.0.1:7419`, then run the
+  3 s fake run. It exits 0, and stderr contains `phase endpoint unavailable` exactly once.
+
+**Mutants:**
+
+| # | Mutant | Expected red |
+|---|---|---|
+| 4 | wiring binds `0.0.0.0` (drop the `NotLoopback` guard) | 4 |
+| 5 | `Access-Control-Allow-Origin: *` | 1, 2 |
+| 6 | drop `Access-Control-Allow-Private-Network` | 2 |
+| 7 | answer at once, never wait | 3 |
+| 8 | a bind failure returns `Err` from `main` (exit 70) | `phase_port_taken_still_runs_to_exit_zero` |
+
 ## Do not touch
 
-Domain and app crates (except to read them), and fly configs (C16).
+Domain and app crates (except to read them), and fly configs (C16). (Amended 2026-10-15) No Fly
+service or port config for 7419: it is loopback-only and never exposed.
 
 ## Output cap
 

@@ -48,6 +48,7 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
   pub trait ControlQueue: Send { fn request(&mut self, req: ControlRequest); }
   #[derive(Debug, Clone, PartialEq)] pub enum Inbound { Event(Event), Session(SessionConfig) }
   pub struct Ports { pub input: Box<dyn InputSource>, pub programme: Box<dyn ProgrammeOutput>, pub graphics: Box<dyn GraphicsRenderer>, pub metrics: Box<dyn Metrics>, pub control: Box<dyn ControlQueue> }
+  // ^ amended 2026-10-15: + `pub phase: Box<dyn PhasePublisher>` (see the amendment; the Debug string names it too)
   // trait objects can't derive Debug, and C01's `missing_debug_implementations` + `clippy -D warnings` makes it fatal
   impl std::fmt::Debug for Ports {
       fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("Ports { input, programme, graphics, metrics, control }") }
@@ -96,6 +97,11 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
 - **`tick_due(now)`** runs `Event::Tick` for every index `i` with `start + i·period ≤ now`, capped at
   `fps` ticks per call. When the cap is hit, it jumps the index forward and adds the jump to
   `skipped_ticks`. Each tick's `frame` is passed as `programme.push(i, choice)`.
+- **(Amended 2026-10-15) Phase publication.** After **every** `decide` (in `step` and in `tick_due`), if
+  `supervisor.programme_phase()` differs from the last published phase, the driver increments its
+  `phase_seq` and calls `phase.publish(phase, phase_seq)`. The driver starts at `(Waiting, 0)`, which is
+  what C12's endpoint serves before the first change, so the first change publishes `seq 1`. The value
+  is a projection of domain state, not a domain `Effect`, so the domain API doesn't change for it.
 
 ## Steps
 
@@ -249,6 +255,8 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
       assert!(p.iter().any(|x| x.1 == FrameChoice::Repeat));
       assert_eq!(p.last().unwrap().1, FrameChoice::Slate(SlateKind::Reconnecting));
   }
+  // SUPERSEDED 2026-10-15 by `ending_holds_final_then_drains_stops_children_and_exits_zero` (amendment):
+  // an Ending reply now holds the Final scene for final_hold_ms before the drain (C06). Do not write this test.
   #[test]
   fn ending_drains_stops_children_and_exits_zero_on_drained() {
       let log = Log::default();
@@ -309,6 +317,10 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
   2. Apply effects after `Exit`. Expected red: `ending_drains…` ("nothing is applied after exit").
   3. Make `FetchSession` droppable by sending it through the heartbeat channel. Add a test
      `fetch_is_never_dropped_behind_a_slow_heartbeat` if no test goes red, then re-run.
+  4. **(Amendment 2026-10-15)** Publish the phase on every tick, not on change. Expected red:
+     `phase_is_published_on_change_only_with_a_rising_seq`.
+  5. **(Amendment 2026-10-15)** Publish before `decide` (the old phase). Expected red: the same test
+     (the sequence lags by one).
 
 - [ ] **Step 8: Commit.** `feat(app): driver, control worker, ports and fakes (C08)`
 
@@ -316,12 +328,63 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
 
 - The scenario and control-worker tests pass.
 - Boundary guard is green.
-- 3 mutants went red.
+- ~~3 mutants~~ 5 mutants went red (amended 2026-10-15).
 - `cargo clippy --workspace --all-targets -- -D warnings` is clean.
+
+## Amendment 2026-10-15 (overlay templates spec)
+
+Authority: `seazn.club: docs/superpowers/specs/2026-10-15-overlay-templates-and-scenes-design.md`
+§4.3 (D10) and §6 ("C08/C12 (amend): adds the loopback `/phase` endpoint (127.0.0.1 only; CORS + PNA
+headers; long-poll)").
+
+**Ownership split, stated in both briefs:**
+- **C08 owns** the port (`PhasePublisher`), the driver's publication rule, and the testkit fake.
+- **C12 owns** the HTTP endpoint adapter (`crates/adapters/src/phase_http.rs`), its bind, CORS and
+  Private Network Access headers, the long-poll, and the wiring in `main`.
+
+The app crate never names the adapter (C01's boundary guard).
+
+```rust
+// ports.rs (addition)
+use domain::programme::ProgrammePhase;
+/// The compositor's programme phase, served to the overlay page on loopback (overlay spec §4.3). `seq`
+/// rises by one per change. The adapter (C12) holds the latest value and wakes long-polls.
+pub trait PhasePublisher: Send { fn publish(&mut self, phase: ProgrammePhase, seq: u64); }
+// Ports gains `pub phase: Box<dyn PhasePublisher>`; the Debug impl prints "Ports { input, programme, graphics, metrics, control, phase }".
+
+// testkit fakes.rs
+// Call gains `Phase(ProgrammePhase, u64)`.
+#[derive(Debug)] pub struct FakePhase(pub Log);
+impl PhasePublisher for FakePhase { fn publish(&mut self, p: ProgrammePhase, seq: u64) { self.0.push(Call::Phase(p, seq)) } }
+// `ports()` wires `phase: Box::new(FakePhase(log.clone()))`.
+```
+
+**Tests** (in `crates/app/tests/scenarios.rs`, failing first):
+- `phase_is_published_on_change_only_with_a_rising_seq`. Walk spec §5's sequence through the real
+  driver with the fakes:
+  - frames until Live
+  - stop frames past `frozen_after_ms` (Frozen), then past `slate_after_ms` (Reconnecting)
+  - frames past `resume_after_ms` (Live)
+  - an `Ending` reply (Final)
+  - tick through `final_hold_ms` and drain
+
+  Every duration comes from `Thresholds::default()`. Assert the `Call::Phase` list is exactly
+  `[(Live,1), (Frozen,2), (Reconnecting,3), (Live,4), (Final,5)]`, with no repeats across the hundreds
+  of ticks in between. Print `ticks driven: N, phases published: 5`; fail if N is 0.
+- `ending_holds_final_then_drains_stops_children_and_exits_zero`, replacing the superseded test:
+  - an `Ending` reply at 20: no `Call::Drain` yet
+  - every push from 20 to `20 + final_hold_ms` is `Slate(SlateKind::Final)`
+  - the first tick at or after `20 + final_hold_ms` → `Call::Drain`
+  - `OutputDrained` → `Some(0)`; input and graphics stopped
+  - nothing is applied after the exit
+- `holding_ticks_still_push_frames_at_the_profile_rate`: over the hold, the pushed indices are
+  consecutive (the hold never pauses the programme clock: a frozen output would trip YouTube's gap
+  timer, F-004).
 
 ## Do not touch
 
-The domain crate's API, and the adapters (except to keep them compiling).
+The domain crate's API, and the adapters (except to keep them compiling). (Amended 2026-10-15) The
+endpoint's HTTP code is C12's; this task adds no adapter.
 
 ## Output cap
 

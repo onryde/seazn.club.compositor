@@ -3,7 +3,9 @@
 **Repo:** `onryde/seazn.club`. Worktree:
 `git worktree add ../seazn.club-wt/r2004-input-b -b feat/relay-composed-input-b origin/main`.
 **Depends on:** R2003 merged (runs sequentially in `server/relay/*`), and **C00 F-002** (the measured
-camera→compositor delay, which becomes the default).
+camera→compositor delay, which becomes the default). **Amended 2026-10-15:** also **R2007 PR A merged**
+(`resolveTemplate` in `components/overlay/template-registry.ts`), and the owner's answer to the stop-grace
+question in Step 0 below. See "Amendment 2026-10-15 (overlay templates spec)" at the end.
 
 ## Context
 
@@ -74,15 +76,28 @@ The orchestrator puts these to the owner if any re-pin contradicts them:
      writes the effective value. No ALTER to that column.
 
 5. **`overlayUrl`** =
-   `${APP_URL}/overlay/fixtures/${fixtureId}?sid=${sessionId}&st=${pageToken}&host=compositor&delay=${overlayDelayMs}`.
+   ~~`${APP_URL}/overlay/fixtures/${fixtureId}?sid=${sessionId}&st=${pageToken}&host=compositor&delay=${overlayDelayMs}`~~
+   **(superseded 2026-10-15, decision 7)**
+   `${APP_URL}/overlay/fixtures/${fixtureId}?sid=${sessionId}&st=${pageToken}&host=compositor&delay=${overlayDelayMs}&template=${templateId}`.
    `sid` is there because `verifyRelayToken` (`server/relay/tokens.ts:80`) needs the expected sid; the
    page must never trust an unverified claim to find it. The token is in a query string, and
    compositor `redact()` strips every query string from logs (C07).
 6. **`heartbeatIntervalMs`** = `RELAY_HEARTBEAT_INTERVAL_MS` (R2002).
+7. **Template (amendment 2026-10-15, overlay spec §4.4 / §6).** New column
+   `fixture_stream_settings.overlay_template text null`, with **no** check constraint: templates live in
+   code (`OVERLAY_TEMPLATES`), and a stored id that is later retired or removed must still read, then
+   resolve. `null` means the sport default. At session create, copy the **choice**:
+   `theme_id = body.themeId ?? settings.overlay_template ?? null` (the existing column,
+   `V410__stream_sessions.sql:119`, already inserted at `stream-sessions.ts:1452-1457`). The running
+   session never changes when the setting changes, the same rule as the delay. `overlayUrl` carries
+   `template=${resolveTemplate(row.theme_id, row.sport_key).id}`: resolved, so the compositor's URL
+   always names a live, non-retired id. `row.sport_key` is the session's admission snapshot (same
+   insert). R2006 is the writer of `overlay_template`; this task adds the column and its one reader.
 
 ## Changes
 
-1. **Migration:** `role` + constraint, plus `fixture_stream_settings.overlay_delay_ms`. Sealed
+1. **Migration:** `role` + constraint, plus `fixture_stream_settings.overlay_delay_ms`, plus
+   `fixture_stream_settings.overlay_template text null` (decision 7, amendment 2026-10-15). Sealed
    columns for B's RTMPS stream key and A's SRT playback stream id and passphrase follow
    `secret-columns.ts`'s existing pattern. Re-pin how A's SRT ingest secrets are sealed today, and
    mirror it exactly.
@@ -105,6 +120,10 @@ The orchestrator puts these to the owner if any re-pin contradicts them:
 5. **`sessionFactsForJob`:** for composed, return
    `{ …today, target: { url: B.rtmps.url, streamKey: B.rtmps.streamKey }, input: { protocol: "srt", url: A.srtPlayback.url, streamId, passphrase }, output: relayOutputProfile(), heartbeatIntervalMs, overlayUrl, overlayDelayMs: row.overlay_delay_ms }`,
    validated by `RelayJobSession.parse` before returning. For passthrough, return today's shape.
+   (Amended 2026-10-15: `overlayUrl` per decision 5 as superseded, with `template=`; `sessionFactsForJob`
+   is now at `stream-sessions.ts:2202`.)
+6. **Session create copies the template choice** (decision 7): the insert at `stream-sessions.ts:1452-1457`
+   reads `settings.overlay_template` in the same statement it already uses for the destination.
    Decide whether passthrough even has a Machine (re-pin); if it doesn't, the passthrough branch
    stays for contract completeness only.
 
@@ -123,6 +142,9 @@ The orchestrator puts these to the owner if any re-pin contradicts them:
   - `server/relay/__tests__/config.test.ts`
   - `enc-boundary.test.ts` (it must still pass: the new sealed columns are named only in
     `secret-columns.ts`)
+- Read only (amendment 2026-10-15): `apps/web/src/components/overlay/template-registry.ts`
+  (`resolveTemplate`, from R2007). The usecase imports it the way `capture-phone.ts:19` already imports
+  the registry today.
 
 ## Steps
 
@@ -147,8 +169,22 @@ The orchestrator puts these to the owner if any re-pin contradicts them:
   6. `teardown_deletes_both_inputs_videos_first`: through the real end/sweep path. Assert the delete
      order per input.
   7. `output_profile_matches_contract_fixtures`: as decision 3.
-  8. `overlay_url_carries_st_host_and_delay`: parse the URL and assert the four params. The `st`
-     value verifies with `verifyRelayToken` scope `relay-page`.
+  8. ~~`overlay_url_carries_st_host_and_delay`: parse the URL and assert the four params.~~
+     **(Superseded 2026-10-15.)** `overlay_url_carries_st_host_delay_and_template`: parse the URL and
+     assert the **five** params (`sid`, `st`, `host`, `delay`, `template`). The `st` value verifies with
+     `verifyRelayToken` scope `relay-page`.
+  9. `overlay_url_template_follows_the_stored_choice` (amendment 2026-10-15), through the real route.
+     Expected values come from spec §3's default rule (cricket → `bar`, every other sport → `bug`),
+     typed in the test, never read from `defaultTemplateFor`:
+     - settings `null`, cricket fixture → `template=bar`
+     - settings `null`, badminton fixture → `template=bug`
+     - settings `'bar'`, football fixture → `template=bar`
+     - settings `'gone'` (written by SQL, an id no registry holds), football → `template=bug`, and the
+       create does not throw
+  10. `template_choice_is_copied_at_create` (amendment 2026-10-15): settings `'bar'` → create → change
+      the setting to `'bug'` → the running session's facts still say `template=bar`, and
+      `fixture_stream_sessions.theme_id` is `'bar'`. A passthrough create copies it too (`capture-phone.ts:176`
+      reads `themeId` for the phone overlay), and a `body.themeId` given at create wins over the setting.
 - [ ] **Step 3: Run, expect a FAIL** (JSON reporter, scoped files).
 - [ ] **Step 4: Implement changes 1–5.**
 - [ ] **Step 5: Run, expect a PASS.** Paste the counts. Apply the migration to a **fresh** local DB per
@@ -157,6 +193,9 @@ The orchestrator puts these to the owner if any re-pin contradicts them:
   1. `addOutput(A.id…)` for composed. Expected red: test 1.
   2. Write the setting rather than the effective value. Expected red: test 4.
   3. Return the destination secret as `target`. Expected red: test 3.
+  4. (Amendment 2026-10-15) Build `template=` from the live `fixture_stream_settings` row at GET time
+     instead of the session's copy. Expected red: test 10.
+  5. (Amendment 2026-10-15) Drop `template=` from `overlayUrl`. Expected red: tests 8 and 9.
 - [ ] **Step 7: Smoke and e2e.** Run the relay smoke spec (selected by behaviour) against a prod
   build with `RELAY_DRIVERS=fake` for passthrough **and** composed (R2001's refusal is lifted only
   where `RELAY_IMAGE` is set, so set a dummy for this run).
@@ -166,15 +205,51 @@ The orchestrator puts these to the owner if any re-pin contradicts them:
 
 ## Acceptance
 
-- 8 tests pass, with passthrough tests unchanged.
-- 3 mutants went red.
+- ~~8 tests pass~~ 10 tests pass (amended 2026-10-15), with passthrough tests unchanged.
+- ~~3 mutants~~ 5 mutants went red (amended 2026-10-15).
+- The owner's stop-grace answer (Step 0 of the amendment) is implemented and recorded.
 - The migration applies on a fresh DB.
 - The destination key never reaches the Machine.
 - The PR is open.
 
+## Amendment 2026-10-15 (overlay templates spec)
+
+Authority: `seazn.club: docs/superpowers/specs/2026-10-15-overlay-templates-and-scenes-design.md`
+§4.4 and §6 ("R2004 (amend): the composed `overlayUrl` carries `template=` from the fixture's stored
+choice"). The edits above are marked in place: decision 5 (superseded), decision 7, change 1, change 6,
+tests 8–10, mutants 4–5, Acceptance.
+
+**False premise recorded:** the 2026-09-05 ruling "style in the URL, not the DB" read as if nothing
+server-side held a style. In fact `fixture_stream_sessions.theme_id` has existed since
+`V410__stream_sessions.sql:119`. `CreateStreamSession.themeId` accepts it (`schemas.ts:1387`), the job
+facts serve it (`stream-sessions.ts:2207`), and `capture-phone.ts:176` reads it. Only the panel never
+writes it (its go-live posts `{ mode, targetId }`, `fixture-stream-panel.tsx:1205`). This task stores
+the choice on the fixture's settings and copies it into that existing column. It adds no second column
+on the session.
+
+- [ ] **Step 0 (before Step 1): the stop-grace question, for the owner.** The orchestrator asks it; this
+  task does not guess.
+  - **The facts.** R1's runner moves to `stopping` and sends `SIGINT` the moment the organiser stops
+    (`server/relay/runner.ts:101`, `:117-118`, `:251-252`). Fly SIGKILLs `RUNNER_STOP_GRACE_SECONDS = 10`
+    later (`server/relay/config.ts:141`). The amended C06 holds the Final card for
+    `FINAL_HOLD_MS = 10 000` (spec §4.2, D4), and then drains for up to `drain_timeout_ms = 7 000`.
+    10 + 7 = 17 s, which is longer than 10 s, so the Machine is killed mid-drain on every organiser
+    stop: no EOS, and the final exit beat may be lost.
+  - **Options:** (A) raise `RUNNER_STOP_GRACE_SECONDS` to `20`, which fits hold 10 + drain 7 + 3
+    headroom (`ENDING_TIMEOUT_SECONDS = 300` still bounds the whole stop), or (B) shorten the final hold
+    to fit 10 s, which leaves 0 s for it after drain and headroom. **Recommendation (this brief's, not
+    an owner ruling): A.** Passthrough has no Machine, so the grace changes nothing there; re-pin that
+    before relying on it.
+  - **Implement the owner's pick**, with a test in `server/relay/__tests__/config.test.ts` that pins
+    the constant against the compositor's budget: `RUNNER_STOP_GRACE_SECONDS * 1000 >= 10_000 + 7_000 + 3_000`,
+    with each number commented from its source (spec §4.2, compositor `config.rs` `drain_timeout_ms`, the
+    3 s headroom in that field's doc line). Record the pick in compositor `docs/_INDEX.md`. C12's
+    `final_hold_and_drain_fit_inside_r1_stop_grace` reads the same value.
+
 ## Do not touch
 
-The overlay page (R2005), the UI (R2006), and the runner (R2003).
+The overlay page (R2005), the UI (R2006), and the runner (R2003; the one constant in Step 0 of the
+amendment is the exception, and only with the owner's pick).
 
 ## Output cap
 
