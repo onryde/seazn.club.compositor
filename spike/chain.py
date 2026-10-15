@@ -45,6 +45,9 @@ def main():
     ap.add_argument("--snapshot-at", type=float, default=60)
     ap.add_argument("--snapshot-every", type=float, default=0, help=">0: keep writing <snapshot>-<wall_ms>.ayuv every N s after --snapshot-at")
     ap.add_argument("--out-env", default="SPIKE_B_RTMPS_URL", help="env var holding the RTMP(S) push URL")
+    ap.add_argument("--audio", choices=["silence", "camera", "none"], default="silence",
+                    help="silence = audiotestsrc AAC (C09 today); camera = the SRT input's own audio, decoded and re-encoded "
+                         "AAC 128k 48 kHz stereo; none = no audio track in the FLV at all")
     ap.add_argument("--no-push", action="store_true", help="fakesink instead of rtmp2sink (calibration runs; nothing reaches B)")
     # encoder knobs (YouTube health follow-up): defaults are the C09 settings measured in F-005
     ap.add_argument("--x264-bitrate", type=int, default=0, help="kbps; 0 = profile default (720: 4000, 1080: 6000)")
@@ -82,9 +85,11 @@ def main():
         + (f'option-string="{a.x264_opts}" ' if a.x264_opts else "") +
         "! video/x-h264,profile=main ! h264parse config-interval=-1 ! queue name=qmux "
         + ("! flvmux name=mux streamable=true ! fakesink name=out sync=false " if a.no_push else
-           "! flvmux name=mux streamable=true ! rtmp2sink name=out ") +
-        "audiotestsrc is-live=true wave=silence ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 "
-        "! voaacenc bitrate=128000 ! aacparse ! queue ! mux. "
+           "! flvmux name=mux streamable=true ! rtmp2sink name=out ")
+        + ("audiotestsrc is-live=true wave=silence ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 "
+           "! voaacenc name=aenc bitrate=128000 ! aacparse ! queue ! mux. " if a.audio == "silence" else
+           "audioconvert name=acv ! audioresample ! audio/x-raw,rate=48000,channels=2 "
+           "! voaacenc name=aenc bitrate=128000 ! aacparse ! queue name=qaud ! mux. " if a.audio == "camera" else "")
     )
     pipe = Gst.parse_launch(desc)
     if a.bg == "camera":
@@ -98,7 +103,7 @@ def main():
     wall0 = time.time()
     lock = threading.Lock()
     c = {"enc": [], "kf": [], "pts": [], "bytes": 0, "filler_bytes": 0, "sei_bytes": 0, "mix": 0, "cam": 0, "cef": 0, "over": {"qcam": [], "qgfx": [], "qenc": []},
-         "qos": 0, "first_enc_s": None, "first_cam_s": None, "first_cef_s": None, "campts": []}
+         "qos": 0, "first_enc_s": None, "first_cam_s": None, "first_cef_s": None, "campts": [], "audpts": [], "aud_bytes": 0, "aud_bufs": 0}
 
     def counter(key, first=None):
         def probe(_pad, _info):
@@ -186,6 +191,23 @@ def main():
         return Gst.PadProbeReturn.OK
 
     mix.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, snap_probe)
+
+    def aud_probe(_pad, info):
+        try:
+            b = info.get_buffer()
+            with lock:
+                c["aud_bytes"] += b.get_size()
+                c["aud_bufs"] += 1
+                if b.pts != Gst.CLOCK_TIME_NONE:
+                    if not c["audpts"]:
+                        c["audpts"] = [b.pts, time.monotonic(), b.pts, time.monotonic()]
+                    else:
+                        c["audpts"][2:] = [b.pts, time.monotonic()]
+        except Exception:  # noqa: BLE001  (a raising probe would DROP the buffer)
+            pass
+        return Gst.PadProbeReturn.OK
+    if pipe.get_by_name("aenc") is not None:
+        pipe.get_by_name("aenc").get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, aud_probe)
     pipe.get_by_name("cef").get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, counter("cef", "first_cef_s"))
 
     def overrun(name):
@@ -221,6 +243,22 @@ def main():
                 e.sync_state_with_parent()
             pad.link(els[0].get_static_pad("sink"))
             els[1].get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, counter("cam", "first_cam_s"))
+        elif name.startswith("audio/") and a.audio == "camera" and not c.get("aud_linked"):
+            c["aud_linked"] = True
+            print("AUDIOIN " + json.dumps({"demux_caps": name}), flush=True)
+            q = Gst.ElementFactory.make("queue", "qaudin")
+            db = Gst.ElementFactory.make("decodebin", None)
+            for e in (q, db):
+                pipe.add(e)
+            q.link(db)
+
+            def on_dec(_db, dpad):
+                print("AUDIODEC " + json.dumps({"caps": (dpad.get_current_caps() or dpad.query_caps(None)).to_string()[:160]}), flush=True)
+                dpad.link(pipe.get_by_name("acv").get_static_pad("sink"))
+            db.connect("pad-added", on_dec)
+            for e in (q, db):
+                e.sync_state_with_parent()
+            pad.link(q.get_static_pad("sink"))
         else:
             s = Gst.ElementFactory.make("fakesink", None)
             s.set_property("sync", False)
@@ -279,6 +317,9 @@ def main():
             cp_ = list(c["campts"])
             drift_cam = round((cp_[2] - cp_[0]) / 1e6 - (cp_[3] - cp_[1]) * 1000, 1) if cp_ else None
             frames_vs_wall = round(n_enc - 30 * (c["enc"][-1] - c["enc"][0]), 1) if n_enc > 1 else None
+            ap_ = list(c["audpts"])
+            drift_aud = round((ap_[2] - ap_[0]) / 1e6 - (ap_[3] - ap_[1]) * 1000, 1) if ap_ else None
+            aud_b, aud_n = c["aud_bytes"], c["aud_bufs"]
         dt = now - last["t"]
         ab = acked_bytes()
         w = {
@@ -287,10 +328,12 @@ def main():
             "cam_fps": round((n_cam - last["cam"]) / dt, 2), "cef_fps": round((n_cef - last["cef"]) / dt, 2),
             "overruns": over, "filler_share_cum": round(c["filler_bytes"] / c["bytes"], 4) if c["bytes"] else None,
             "real_kbps_cum": round((c["bytes"] - c["filler_bytes"]) * 8 / 1000 / (now - t0 - a.warmup), 1) if c["bytes"] and now - t0 > a.warmup else None,
+            "audio": a.audio, "aud_kbps": round((aud_b - last.get("aud_b", 0)) * 8 / 1000 / dt, 1), "aud_bufs_per_s": round((aud_n - last.get("aud_n", 0)) / dt, 1),
+            "media_minus_wall_ms_aud": drift_aud,
             "media_minus_wall_ms_out": drift_out, "media_minus_wall_ms_cam": drift_cam, "frames_minus_30xwall_out": frames_vs_wall,
             "keyframes_cum": len(c["kf"]), "wall": round(time.time(), 3), "egress_kbps": None if ab is None or last["acked"] is None else round((ab - last["acked"]) * 8 / 1000 / dt, 1),
         }
-        last.update({"enc": n_enc, "mix": n_mix, "cam": n_cam, "cef": n_cef, "t": now, "acked": ab})
+        last.update({"enc": n_enc, "mix": n_mix, "cam": n_cam, "cef": n_cef, "t": now, "acked": ab, "aud_b": aud_b, "aud_n": aud_n})
         windows.append(w)
         print("CHAINSTAT " + json.dumps(w), flush=True)
         if now - t0 > a.seconds:
