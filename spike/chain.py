@@ -44,6 +44,7 @@ def main():
     ap.add_argument("--snapshot", default="", help="write one raw AYUV compositor frame here at --snapshot-at s")
     ap.add_argument("--snapshot-at", type=float, default=60)
     ap.add_argument("--snapshot-every", type=float, default=0, help=">0: keep writing <snapshot>-<wall_ms>.ayuv every N s after --snapshot-at")
+    ap.add_argument("--out-env", default="SPIKE_B_RTMPS_URL", help="env var holding the RTMP(S) push URL")
     ap.add_argument("--no-push", action="store_true", help="fakesink instead of rtmp2sink (calibration runs; nothing reaches B)")
     # encoder knobs (YouTube health follow-up): defaults are the C09 settings measured in F-005
     ap.add_argument("--x264-bitrate", type=int, default=0, help="kbps; 0 = profile default (720: 4000, 1080: 6000)")
@@ -59,7 +60,7 @@ def main():
     kbps = a.x264_bitrate or KBPS[H]
 
     play = os.environ.get(a.play_env)
-    out = os.environ.get("SPIKE_B_RTMPS_URL")
+    out = os.environ.get(a.out_env)
     if not play or not out:
         print("FATAL SPIKE_A_SRT_PLAY_URL / SPIKE_B_RTMPS_URL not set", flush=True)
         sys.exit(2)

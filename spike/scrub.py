@@ -12,7 +12,7 @@ for _k, _v in os.environ.items():
             for _m in re.finditer(r"[?&]([^=&\s]+)=([^&\s]+)", _c):
                 _parts.add(_m.group(2))
                 _parts.add(urllib.parse.unquote(_m.group(2)))
-            _m = re.search(r"/live/([^?\s]+)", _c)
+            _m = re.search(r"/live2?/([^?\s]+)", _c)
             if _m:
                 _parts.add(_m.group(1))
                 _parts.update(_m.group(1).split("/"))
@@ -25,7 +25,7 @@ def scrub(s):
     for p in _parts:
         s = s.replace(p, "<redacted>")
     s = re.sub(r"\b(srt|rtmps?)://[^\s\"'<>]+", lambda m: m.group(1) + "://<redacted>", s, flags=re.I)
-    s = re.sub(r"/live/[^\s\"'<>]+", "/live/<redacted>", s)
+    s = re.sub(r"/live2?/[^\s\"'<>]+", "/live/<redacted>", s)
     s = re.sub(r"\?[^\s\"'<>]+", "?<q>", s)
     s = re.sub(r"passphrase|streamid", "<cred-field>", s, flags=re.I)
     return s

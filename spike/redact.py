@@ -24,7 +24,7 @@ for k, v in os.environ.items():
         for m in re.finditer(r"[?&]([^=&\s]+)=([^&\s]+)", cand):
             parts.add(m.group(2))
             parts.add(urllib.parse.unquote(m.group(2)))
-        m = re.search(r"/live/([^?\s]+)", cand)
+        m = re.search(r"/live2?/([^?\s]+)", cand)
         if m:
             parts.add(m.group(1))
             for seg in m.group(1).split("/"):
@@ -32,7 +32,7 @@ for k, v in os.environ.items():
 parts = sorted((p for p in parts if len(p) >= 8), key=len, reverse=True)
 
 URL = re.compile(r"\b(srt|rtmps?)://[^\s\"'<>]+", re.I)
-LIVE = re.compile(r"/live/[^\s\"'<>]+")
+LIVE = re.compile(r"/live2?/[^\s\"'<>]+")
 QUERY = re.compile(r"\?[^\s\"'<>]+")
 DROP = re.compile(r"passphrase|streamid", re.I)
 
