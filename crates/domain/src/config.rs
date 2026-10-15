@@ -1,6 +1,7 @@
 //! THE number authority. Every tunable lives here, each with the source that set it.
 //! "PDF" = Live Sports Streaming Compositor — Production Design & Specification (2026-10-03).
 //! "Spec" = `docs/specs/2026-10-14-r2-compositor-design.md`; "plan" = its Global Constraints.
+//! "C02 brief default" = a number the C02 brief chose where no PDF, spec, plan or spike number exists.
 //! A spike measurement (F-id in `_FINDINGS.md`) overrides a PDF value and must be cited.
 use crate::time::Ms;
 
@@ -29,11 +30,15 @@ pub struct Thresholds {
     pub kick_alert_count: usize,
     /// PDF failure table: the "5 min" of "> 3 times in 5 min".
     pub kick_window_ms: Ms,
-    /// PDF chaos "destination accepts but stalls: detected within 5 s".
+    /// PDF chaos "destination accepts but stalls: detected within 5 s". F-005: CF Input B never acked
+    /// RTMP bytes (rtmp2sink `out-bytes-acked` stayed 0 in its 290 s pushes while `out-bytes-total`
+    /// grew), so "no bytes acked" cannot be the live signal behind this stall or behind C09's "first
+    /// acked bytes → OutputConnected" (docs/_INDEX.md false premises).
     pub output_ack_stall_ms: Ms,
-    /// PDF budget "output reconnect ≤ 5 s": back-off 0.5 s → 2 s keeps attempts inside it. The first wait.
+    /// C02 brief default, sized to the PDF budget "output reconnect ≤ 5 s": back-off 0.5 s → 2 s keeps
+    /// attempts inside it. The first wait.
     pub output_backoff_base_ms: Ms,
-    /// PDF budget "output reconnect ≤ 5 s": back-off 0.5 s → 2 s. The cap.
+    /// C02 brief default, sized to the PDF budget "output reconnect ≤ 5 s": the 2 s cap.
     pub output_backoff_cap_ms: Ms,
     /// Spec §4.2: "a reconnect is expected to complete within 5 s". F-004 addendum: stall detection,
     /// one capped back-off and one whole connect must stay under YouTube's 15 s broadcast split.
@@ -47,16 +52,16 @@ pub struct Thresholds {
     pub cef_load_timeout_ms: Ms,
     /// Spec §6: CEF recycled every 2 h with its last frame held.
     pub cef_recycle_every_ms: Ms,
-    /// Plan default: spec §6 says "restart with backoff" and names no number, so CEF mirrors the input
-    /// back-off, 1 s → 10 s. The first wait.
+    /// C02 brief default: spec §6 says "restart with backoff" and names no number, so CEF mirrors the
+    /// input back-off, 1 s → 10 s. The first wait.
     pub cef_backoff_base_ms: Ms,
-    /// Plan default: the cap of the CEF back-off (1 s → 10 s, mirroring the input).
+    /// C02 brief default: the cap of the CEF back-off (1 s → 10 s, mirroring the input).
     pub cef_backoff_cap_ms: Ms,
     /// PDF failure table "real time restored within 10 s": at most one ladder rung per this gap.
     pub ladder_step_min_gap_ms: Ms,
-    /// Plan default (no PDF number): overruns within `ladder_window_ms` needed to step down one rung.
+    /// C02 brief default (no PDF number): overruns within `ladder_window_ms` needed to step down a rung.
     pub ladder_overruns_to_step: usize,
-    /// Plan default (no PDF number): the window `ladder_overruns_to_step` is counted in.
+    /// C02 brief default (no PDF number): the window `ladder_overruns_to_step` is counted in.
     pub ladder_window_ms: Ms,
     /// R1 sends SIGINT and SIGKILLs after RUNNER_STOP_GRACE_SECONDS = 10 (seazn.club
     /// `apps/web/src/server/relay/config.ts`). The drain must finish with headroom for EOS to reach the
@@ -65,10 +70,10 @@ pub struct Thresholds {
     pub drain_timeout_ms: Ms,
     /// Spec §5.3 default (`heartbeatIntervalMs`: 5000); the bootstrap's `heartbeatIntervalMs` overrides it.
     pub heartbeat_interval_ms: Ms,
-    /// Plan default (no PDF number): bootstrap GET retry back-off while web is unreachable at boot.
+    /// C02 brief default (no PDF number): bootstrap GET retry back-off while web is unreachable at boot.
     /// The first wait.
     pub bootstrap_backoff_base_ms: Ms,
-    /// Plan default (no PDF number): the cap of the bootstrap GET retry back-off.
+    /// C02 brief default (no PDF number): the cap of the bootstrap GET retry back-off.
     pub bootstrap_backoff_cap_ms: Ms,
 }
 
@@ -207,11 +212,12 @@ mod tests {
         }
     }
 
-    // The plan's Global Constraints, copied there from the spec: input back-off 1 s → 10 s; a kick
-    // alert at MORE than 3 kicks in 5 min; output stall after 5 s with no ack, back-off 0.5 s → 2 s
-    // (PDF); a heartbeat every 5000 ms; CEF Failed after 3 failures in 5 min, recycled every 2 h.
+    // Each number against its own source. The plan's Global Constraints: input back-off 1 s → 10 s; a
+    // kick alert at MORE than 3 kicks in 5 min; output stall after 5 s with no ack; a heartbeat every
+    // 5000 ms; CEF recycled every 2 h. Spec §4.2: CEF Failed after 3 failures in 5 min. The C02 brief
+    // default: output back-off 0.5 s → 2 s, sized to the PDF's 5 s reconnect budget.
     #[test]
-    fn link_and_lifecycle_numbers_match_the_plan_global_constraints() {
+    fn link_and_lifecycle_numbers_match_their_sources() {
         let t = Thresholds::default();
         assert_eq!(
             (t.input_backoff_base_ms, t.input_backoff_cap_ms),
