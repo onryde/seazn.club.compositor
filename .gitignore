@@ -1,0 +1,5 @@
+/target
+# Evidence PNGs never live in the repo.
+*.png
+.DS_Store
+harness/out/

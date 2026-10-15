@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/domain", "crates/app", "crates/adapters", "crates/testkit", "crates/compositor"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.91"
+publish = false
+license = "UNLICENSED"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+# One sanctioned exception to `print_stdout`, so nobody weakens this rule later: `crates/harness` (C13)
+# prints its reports to stdout, so its `lib.rs` and each bin start with
+# `#![allow(clippy::print_stdout)] // harness tools report on stdout by design (C13)`.
+# Every other crate logs to stderr.
+[workspace.lints.clippy]
+dbg_macro = "deny"
+print_stdout = "deny"
+todo = "deny"
