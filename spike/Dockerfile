@@ -7,7 +7,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
       libx11-dev libxcomposite-dev libxdamage-dev libxrandr-dev libnss3 libatk-bridge2.0-0 \
       libgbm1 libasound2t64 libxkbcommon0 libdrm2 \
+      libcups2t64 libpango-1.0-0 libcairo2 libatk1.0-0 libatspi2.0-0 libxfixes3 libxext6 libxshmfence1 libdbus-1-3 libexpat1 \
     && rm -rf /var/lib/apt/lists/*
+# F-001: the brief's list was short. Linking gstcefsubprocess against libcef.so (CEF 139) needs
+# libcups, libpango and libcairo present at link time (undefined ipp*/cups*/pango*/cairo* refs).
 WORKDIR /src
 # F-001 pin: gstcefsrc HEAD of main on 2026-10-15 ("cefsrc: discard data in the PAUSED state", 2026-08-24).
 ARG GSTCEF_COMMIT=204b01b02df23d143316b11e51516171ab7fae0a
