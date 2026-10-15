@@ -199,7 +199,29 @@ The laptop display's own render/scan-out lag (≈1 refresh) was **not** subtract
 - Both sessions together, n=25: median 3311 ms (3263–3332).
 - The delay moves about 50 ms between sessions and is stable to ±10 ms within one.
 
-**Recommendation:** default `overlayDelayMs` = **3300 ms** (median rounded to 100 ms) for the passthrough capture path with playback latency 1000. If C10 ships a different `latency`, the default moves with it.
+~~Recommendation: default `overlayDelayMs` = 3300 ms~~ is **SUPERSEDED** by the redo below. The decoder-out reader turned out to overstate the in-chain delay by about 300 ms.
+
+**Redo, fourth session** (`5346c02c-…`, input `3a358122…`):
+- Decoder-out sample (same `delay_snap.py`), n=10, 14:43:35–14:44:20 London: 3416, 3412, 3422, 3399, 3412, 3401, 3409, 3408, 3418, 3413 ms. **Median 3412 ms** (3399–3422, sd 7.1).
+- Across the three decoder-out sessions, n=35: median 3322 ms. **Session medians differ by up to 140 ms** (3270 / 3320 / 3412).
+
+**In-chain delay (the quantity ADR 0006 actually needs).**
+- `overlay-test.html` prints the CEF `Date.now()` in the overlay.
+- In a composite frame, overlay time minus the clock seen through the camera, +15 ms laptop offset, is exactly how far the camera lags the overlay in what the viewer sees.
+
+| Session | London | Overlay ms − clock ms + 15 |
+|---|---|---|
+| `afe2c9f9…` (rerun 1) | 14:17:27 | **3083 ms** |
+| `5346c02c…` (redo) | 14:47:28 | **3105 ms** |
+
+- On the redo session, the decoder-out reader read **3412 ms**, against **3105 ms** in-chain on the same session: the separate reader is about **307 ms higher**.
+- A 60 s in-chain calibration run (`chain.py --no-push --snapshot-every 5`, 14:55:00–14:56:00, 11 frames) was **owed**: the phone was no longer on the clock (the laptop showed a terminal).
+
+**Recommendation:**
+- Default `overlayDelayMs` = **3100 ms**, taken from the in-chain readings. n=2, which is thin.
+- **Owed:** an in-chain n≥10 sample (`chain.py --no-push --snapshot <p> --snapshot-at 10 --snapshot-every 5`, phone on the clock) before C11 freezes the default.
+- Expect ±100 ms session-to-session drift (decoder-out session medians spread by 140 ms). This argues for the per-match nudge ADR 0006 already provides.
+- If C10 ships a different SRT `latency`, the default moves with it.
 
 **Step B: phone background/reconnect. PENDING the owner's report.**
 
@@ -218,7 +240,12 @@ The owner was asked to background the capture app at 12:08:00 London for 20 s.
 - When the phone itself stops publishing, the CF playback socket stays open and silent, as in F-002. When the first session ended (10:58:58Z), the reader got 0 frames until it was rebuilt onto the new input.
 - The new session's input was live 26 s after the old one ended.
 
-**Steps C and D: ran 12:13:00–12:21:50 London WITHOUT an owner view. YouTube side OWED: rerun.** The owner stepped away, and the HOLD arrived after the run. The Machine-side numbers below are valid; nothing on the YouTube side of C or D was observed.
+**Step B, rerun (14:09–14:13 London, session `afe2c9f9…`):**
+- CF kept input `4e7a53…` connected from 13:05:33Z to the owner's stop at 13:21:34Z.
+- The watcher saw no gap over 300 ms between 14:09:09 and 14:13:00 (6932 AUs).
+- The owner's own background/foreground times were **never reported back**. So B ends with no reconnect observed in either attempt. If the backgrounds happened, the capture app keeps publishing while backgrounded (worst gap 328 ms). **The time to first frame after an iOS background stays OWED**, pending owner confirmation that the app was really backgrounded.
+
+**Steps C and D: ran 12:13:00–12:21:50 London WITHOUT an owner view. YouTube side OWED: rerun.** (Superseded by F-004 "Redo".) The owner stepped away, and the HOLD arrived after the run. The Machine-side numbers below are valid; nothing on the YouTube side of C or D was observed.
 
 *Step C* (5 min to Input B):
 - Settings as C09 ships: 720p30, x264 4000 kbps, `vbv-buf-capacity=1000`, `nal-hrd=cbr:filler=1`, keyint 60, bframes 0, scenecut on.
@@ -278,7 +305,7 @@ The owner was asked to background the capture app at 12:08:00 London for 20 s.
 
 ---
 
-## F-004: RTMPS to Input B → YouTube. OWED: rerun on clean channels (today's YouTube readings UNRELIABLE; see caveat)
+## F-004: RTMPS to Input B → YouTube. Clean-channel redo DONE: filler hypothesis REFUTED; gaps up to 15 s keep the same broadcast; about 60–90 s of no data ends it
 
 The full item (go-live, B-frames question, time to live, health) is owed to an owner session. The rows below are the owner's YouTube Studio observations during the item-5 pushes, relayed by the coordinator, set next to this session's own measurements.
 
@@ -305,16 +332,71 @@ The full item (go-live, B-frames question, time to live, health) is owed to an o
 - The owner changed YouTube latency from Low to Normal before item5-1080. Owner ruling: organisers will be told to use Normal.
 - The snow picture is heavily blocky (incompressible at 2.5 Mbps). That is expected, not a defect.
 
-**Cause:**
+**Cause (morning, HISTORY; superseded by the Redo: filler hypothesis REFUTED):**
 - **Hypothesis SUPPORTED by owner observation through LIVE 2:20 of the snow run, not pinned.** The hypothesis: YouTube judges health on *real* video bits, so filler-padded CBR on low-entropy content reads as "not receiving enough video".
 - Across bitrates 2.5/4/6 Mbps and latency Low/Normal, every filler-heavy run (56–78 % filler) went Poor about 1 min in. Only the 0 %-filler run stayed Excellent.
 - **Open confound:** the snow run also had an IDR every 0.2 s against 2.0 s in all the others.
 - **Deciding experiment owed (owner session):** real phone camera footage, with realistic motion, 2 s keyframes and scenecut as C09 will ship, while logging filler share. No further B pushes were spent disambiguating, per the coordinator.
 
-**Changes (proposals; C09 is not edited):**
+**Changes (morning proposals, HISTORY; see the Redo for current proposals):**
 - **C09 slate and frozen frame.** A static slate encodes to almost pure filler, which is exactly the case YouTube flags Poor. Proposal: composite a full-frame, low-amplitude, animated noise/grain layer, or a continuously moving element, under every slate and frozen-frame output, so real bits approach the target. The exact amplitude is unmeasured.
 - **C09 acceptance test:** measure the **non-filler** bitrate (bytes outside NAL type 12) on a slate-only run. The current test, "bitrate within ±50 % (CBR filler keeps it near the target)", passes on the wire while YouTube flags Poor.
 - **R2 restart policy (ADR 0004):** a compositor restart, or any output stop, ends the organiser's YouTube broadcast. Whether YouTube resumes the *same* broadcast after a short reconnect is unmeasured.
+
+### Redo, on a clean channel (2026-10-15, 14:43–14:56 London). THIS SUPERSEDES the morning readings and rerun 1's YouTube side
+
+**Setup:**
+- Session `5346c02c-…`, input `3a358122…`, fresh Machine `7811141db04698`.
+- The fixture's own YouTube output was **disabled**; Input B → `r2-c0` was **enabled** (coordinator-verified at 14:37).
+- Phone on the laptop clock: real camera, low-motion scene.
+- Settings: C09 (720p30, `bitrate=4000 vbv-buf-capacity=1000 nal-hrd=cbr:filler=1`, keyint 60, bframes 0).
+- D restarts retried up to 3 times, 2 s apart, on an early exit. No retry was needed: every attempt connected first time.
+
+**Step C, 14:45:00–14:50:00. Our side, per 10 s window, set against owner observations:**
+
+| London | Egress kbps | Encoder fps | Camera fps | Overruns | Filler, cumulative | Owner, r2-c0 Stream health (verbatim) |
+|---|---|---|---|---|---|---|
+| 14:45:11 | (warm-up) | 26.66 | 19.43 | 0 | — | |
+| 14:45:21–14:47:41 | 4144.4–4182.0 | 29.9–30.1 | 29.9–30.1 | 0 | **0.0 %** | |
+| 14:47:51 | 4171.8 | 30.09 | 29.99 | 0 | 0.0 % | |
+| 14:48:01 | 4156.2 | 29.9 | 30.0 | 0 | 0.0 % | **"2:48 PM Error — YouTube is not receiving enough video to maintain smooth streaming. As such, viewers will experience buffering."** |
+| 14:48:11–14:49:41 | 4149.0–4171.3 | 29.9–30.12 | 30.0–30.1 | 0 | 0.0 % | |
+| 14:49:51 | 4073.8 | 30.2 | 29.9 | 0 | 0.0 % | |
+| (14:50:00.040 kill) | | | | | | **"2:50 PM Stream is healthy — Stream health is excellent."** The minute granularity cannot place it before or after the kill. |
+
+- Total: 147 keyframes in 290 s (1.97 s); real video 4001 kbps; **filler 0.0 %**.
+- Machine 1.107 cores average (p95 1.238, max 1.509).
+- The composite snapshot at 14:47:28 showed the overlay over the camera, with the clock in shot. It is not committed.
+
+**Verdict on the filler hypothesis: REFUTED for real camera content.** This is the third clean-path "Poor":
+- 14:18 in rerun 1, at 0.3 % filler;
+- 14:48 here, at **0.0 %** filler;
+- each about 1–3 min into a push, with our egress flat at 4.15–4.18 Mbps.
+
+Health recovered to Excellent by 14:50 with no change on our side.
+
+The morning's filler-heavy runs also went Poor about 1–3 min in. Not concluded: the common factor may be the push's age, or the CF Output relay. **The CF Input B → YouTube leg is unmeasured**: CF exposes no Output egress metrics.
+
+**Candidate next probe (not run):** push the same encode **directly** to `rtmp://a.rtmp.youtube.com/live2` with the r2-c0 key, bypassing the CF Output, for 5 min. That splits our encode from CF's relay.
+
+**Step D. SIGKILL stop, then restart on a new RTMPS connection; owner observations (verbatim where given):**
+
+| Gap | Kill | Restart | Attempts | Push after restart | Owner, r2-c0 |
+|---|---|---|---|---|---|
+| 5 s | 14:50:00.040 | 14:50:05.050 | 1 | 60 s; egress 3928–4372 kbps; 0 overruns | "2:50 PM … excellent" (see above) |
+| 15 s | 14:51:05.424 | 14:51:20.434 | 1 | 60 s; egress 4107–4223 kbps; 0 overruns | **2:51 PM "No data", then "Healthy"** |
+| 30 s | 14:52:20.296 | 14:52:50.305 | 1 | 60 s; egress 4137–4177 kbps; 35 encoder-queue overruns in the first (warm-up) 10 s window only | (same-broadcast confirmation for this gap pending) |
+| final stop | 14:53:50.165 | — | — | — | **"2:54 PM No data — YouTube is not currently receiving data for this stream…"**; the broadcast **FINISHED by itself at about 14:55** |
+
+- Owner at about 14:54: **"same broadcast in youtube"**. The r2-c0 broadcast survived the 5 s and 15 s gaps without splitting; the 30 s gap is pending owner confirmation.
+- After the final stop, YouTube showed No data, then auto-ended the broadcast after roughly **60–90 s without data**. So the auto-stop grace is somewhere above 30 s (if the 30 s gap is confirmed) and around 90 s at most. One sample.
+- **Contrast with the morning:** there, every push stop ended the broadcast. Those stops were followed by minutes of no data before the next push, and that morning's channel and binding is now in doubt (see the caveat). Possible differences: scheduled-stream binding, auto-stop setting, stop duration. Recorded, not concluded.
+
+**Changes (proposals; nothing in crates/specs/ADRs is edited):**
+- **ADR 0004 (restart policy):** a compositor outage, kill to first packet, must stay **well under about 60 s**, or the organiser's YouTube broadcast splits. A crash restart in about 5–15 s (cold start 7.5 s from a stopped Machine, F-001) is inside the grace in this sample. A fresh-host cold start (25 s) plus reconnect is likely still inside. One sample; the C13 runbook should say "about 1 min", not an exact limit.
+- **C04/C09:** `rtmp2sink` connect needs **retry with backoff**. Rerun 1's single-shot D15 restart failed with "Socket I/O timed out" (finding stands).
+- **C09 slate/frozen-frame grain:** it no longer carries the YouTube-health argument, because filler is refuted. Keep it only if C09 wants it for its own reasons.
+- **C09's acceptance test** should still log non-filler kbps. It is cheap, and it is how this hypothesis was refuted.
 
 ### Rerun 1, on a clean channel (2026-10-15, 14:05–14:24 London)
 
@@ -364,7 +446,7 @@ The full item (go-live, B-frames question, time to live, health) is owed to an o
 - Step B (rerun): the phone input `4e7a53…` stayed connected in CF from 13:05:33Z until the owner's stop at 13:21:34Z. The watcher saw no gap over 300 ms from 14:09:09 to 14:13:00 London (6932 AUs).
 - The watcher's FIRST connect STALLED at exactly 5.0 s before any AU arrived. Time to first AU on SRT playback is 2.6–4.4 s here, so a stall timer that starts at connect sits within about 0.6 s of the 5 s `input_stall_after_ms`. **C10 should start the stall timer from the first AU, or give connect its own budget.**
 
-**CAVEAT (owner, 2026-10-15): today's YouTube readings are UNRELIABLE, not evidence.**
+**CAVEAT (owner, 2026-10-15): the MORNING YouTube readings (the table at the top of F-004) are UNRELIABLE, not evidence.** They are kept as history; the Redo above supersedes them.
 - The owner reports that two stream keys on the same YouTube channel appear not to work at the same time.
 - The fixture's own `B_YoutubeTest` output, carrying the phone feed, and this spike's `r2-c0` key may share a channel.
 - So every health flip in the table above, the "each stop ends the broadcast" observation, and the filler-vs-health hypothesis may be contaminated by the other key's stream.
@@ -458,3 +540,12 @@ The snapshot of the composite (overlay over camera) was checked visually. It is 
   - CF Inputs A and B;
   - B's YouTube Output (`8448ee…`).
 - Nothing touched the fixture's own session, nor its YouTube target.
+
+## Teardown record (owner rerun and redo)
+
+2026-10-15 ≈13:57Z.
+
+- Machines `8747092f6575d8` (rerun 1) and `7811141db04698` (redo) were destroyed.
+- `fly machine list -a seazn-relay-spike`: "No machines are available on this app".
+- Kept: the app, all staged secrets, CF Inputs A and B, and B's YouTube Output (`8448ee…`).
+- The fixture sessions and their YouTube targets were not touched by this agent. The owner disabled and enabled outputs in CF.

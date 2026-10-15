@@ -43,6 +43,8 @@ def main():
     ap.add_argument("--js-ready", action="store_true", help="listen-for-js-signals=true (F-001: errors beside other live sources)")
     ap.add_argument("--snapshot", default="", help="write one raw AYUV compositor frame here at --snapshot-at s")
     ap.add_argument("--snapshot-at", type=float, default=60)
+    ap.add_argument("--snapshot-every", type=float, default=0, help=">0: keep writing <snapshot>-<wall_ms>.ayuv every N s after --snapshot-at")
+    ap.add_argument("--no-push", action="store_true", help="fakesink instead of rtmp2sink (calibration runs; nothing reaches B)")
     # encoder knobs (YouTube health follow-up): defaults are the C09 settings measured in F-005
     ap.add_argument("--x264-bitrate", type=int, default=0, help="kbps; 0 = profile default (720: 4000, 1080: 6000)")
     ap.add_argument("--x264-opts", default="nal-hrd=cbr:filler=1", help="x264enc option-string")
@@ -78,14 +80,16 @@ def main():
         + (f"vbv-buf-capacity={a.vbv_ms} " if a.vbv_ms >= 0 else "")
         + (f'option-string="{a.x264_opts}" ' if a.x264_opts else "") +
         "! video/x-h264,profile=main ! h264parse config-interval=-1 ! queue name=qmux "
-        "! flvmux name=mux streamable=true ! rtmp2sink name=out "
+        + ("! flvmux name=mux streamable=true ! fakesink name=out sync=false " if a.no_push else
+           "! flvmux name=mux streamable=true ! rtmp2sink name=out ") +
         "audiotestsrc is-live=true wave=silence ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 "
         "! voaacenc bitrate=128000 ! aacparse ! queue ! mux. "
     )
     pipe = Gst.parse_launch(desc)
     if a.bg == "camera":
         pipe.get_by_name("src").set_property("uri", play)
-    pipe.get_by_name("out").set_property("location", out)
+    if not a.no_push:
+        pipe.get_by_name("out").set_property("location", out)
     del play, out
 
     mix = pipe.get_by_name("mix")
@@ -156,11 +160,16 @@ def main():
 
     def snap_probe(_pad, info):
         if not snap["done"] and time.monotonic() - t0 >= a.snapshot_at:
-            snap["done"] = True
+            if a.snapshot_every > 0:
+                a.snapshot_at += a.snapshot_every
+                path = f"{a.snapshot}-{time.time_ns() // 1_000_000}.ayuv"
+            else:
+                snap["done"] = True
+                path = a.snapshot
             b = info.get_buffer()
             ok, mi = b.map(Gst.MapFlags.READ)
             if ok:
-                with open(a.snapshot, "wb") as f:
+                with open(path, "wb") as f:
                     f.write(bytes(mi.data))
                 b.unmap(mi)
         return Gst.PadProbeReturn.OK
