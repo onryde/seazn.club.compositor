@@ -231,6 +231,27 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
 - 5 mutants went red.
 - `check.yml` is green with GStreamer installed.
 
+
+## Audio (C00 audio A/B, 2026-10-15; F-004 verdict, overrides anything above)
+
+**The digital-silence AAC track makes YouTube report "Poor"** ("not receiving enough video"), even
+though video, egress, timing and transport are clean. Real audio in the same session, scene, encode
+and route stayed Excellent for 10 min. voaacenc encodes digital zeros as ~95 % 0x00 bytes.
+
+- **Default:** pass the input's real audio through, decoded and re-encoded to **AAC-LC 128 kbps,
+  48 kHz, stereo**. This is the verified fix. The audio branch follows the input across rebuilds; on
+  camera loss (slate / frozen frame), the programme continues the audio track with no gap in PTS.
+- **No input audio, or camera lost:** **never** send digital-zero AAC. Use low-level noise
+  (~−60 dBFS pink noise encodes normally, ~3.9 % zero bytes) as the PROVISIONAL filler. It is untested
+  on YouTube; a 10 min direct YouTube test of noise filler, plus a no-audio-track variant, is owed
+  before this task closes. Record the result in `_FINDINGS.md`.
+- **Startup:** flvmux waits for audio caps, which costs 4–54 encoder drops in the first 10 s. Start the
+  audio branch with the programme so caps exist before the first video buffer.
+- **Acceptance additions:** the harness checker reports audio frames/s (≈46.9 at 48 kHz), audio kbps
+  (≈128) and the **zero-byte share** of the AAC payload (fail if > 50 %), for the live-audio case and
+  for the camera-lost case. Mutant: switch the filler to digital silence; the zero-byte check must go
+  RED.
+
 ## Do not touch
 
 Domain and app crates. If you find a port signature problem, report it as a deviation and don't
