@@ -38,6 +38,9 @@ feeds and destroys it.
 
 These apply to every task. Values are copied from the spec and ADRs.
 
+- **`_FINDINGS.md` (repo root) overrides any brief it contradicts.** C00 measured the real platform;
+  read the F-entries your task touches before starting (C09–C12, C14 and R2005 especially).
+
 - **Two repos.** Tasks `C*` land in `onryde/seazn.club.compositor`. Tasks `R2*` land in
   `onryde/seazn.club`, in a worktree, never on the main checkout. Every R2 task obeys
   `seazn.club/AGENTS.md`, `docs/superpowers/RULES.md` and `docs/superpowers/TEST-STRATEGY.md`.

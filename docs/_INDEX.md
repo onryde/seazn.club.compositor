@@ -37,11 +37,19 @@ The entry point for any session working on this repository. Read this file first
 | 2026-10-14 | Plan re-review (Opus): 19 fixed, F9 partial, 1 major + 9 minor new in `reviews/2026-10-14-plan-rereview-opus.md`. All applied: case 10 witnessed at `tc` + SRT retrans (TSBPD holds latency flat), compositor fixed at 172.28.0.10, `ENCODER_SPEED_REALTIME_MIN` = 0.95 shared by C09/C14, ProcMetrics join test (C12), R2003 test 7 a regression pin + mutant 4, C06 mutant 4, R2001 2×2 predicate table, absent `delay=` refused, R2006 composed camera chip. | — |
 | 2026-10-15 | **Owner ruling:** the compositor must not depend on Fly. ADR 0007 defines a 6-item host contract; Fly is allowed only in web's runner driver, the deploy workflows (one `RELAY_REGISTRY` variable) and the soak runner. `check-portable.sh` (C01) fails on any Fly reference in `crates/`/`docker/`. | ADR 0007 |
 | 2026-10-15 | **Owner ruling:** C00 CPU gate moves from CEF-alone (≤1 core) to the full chain: item 5 at 720p30 ≤ 3.0 of 4 cores with encoder speed ≥ 0.95 is a gate; CEF > 2.0 cores is the item-1 runaway fail; CEF ≤ 1 is recorded only. | — (C00) |
+| 2026-10-15 | **Owner ruling:** organisers are told to use YouTube stream latency **Normal** (burned-in score can't desync; least rebuffering; accepted cost: ~15–30 s behind the public page's live score). | — (C17 runbook) |
+| 2026-10-15 | **C00 gate PASS** (items 1, 2-partial, 3, 5; `_FINDINGS.md` F-001..F-005, spike `spike/t00` @738eb88, never merged). 720p30 full chain 0.83 of 4 cores; SEI survives (ADR 0006 takes the "survives" branch). **`_FINDINGS.md` overrides any brief it contradicts.** Owed to the owner session: delay median, phone reconnect, YouTube go-live + gap tolerance, Poor-health cause with real footage. | F-001..F-005 |
 
 ## False premises found
 
 | Premise | Reality | Found |
 |---|---|---|
+| CF SRT playback is single-reader; a second reader kicks the first (spec §3.1–3.2; C14 case 3 `reader-kicked`; `inputKickAlert`) | No kick from the same or a different IP (F-002). A closed playback is still possible (CF maintenance), so the reconnect path and case 3 stay; the alert's wording and the runbook must not claim "a second reader" as the cause | C00 F-002 |
+| The C00/C12 Dockerfile deps are enough to link gstcefsrc | Also needs `libcups2t64`, `libpango-1.0-0`, `libcairo2` (C12's image) | C00 F-001 |
+| `cefsrc ! video/x-raw,framerate=30/1` sets the rate | Caps don't negotiate; use cefsrc's `max-video-framerate` (C10/C11) | C00 F-001 |
+| CEF alpha is straight | Premultiplied: C11 must unpremultiply (or composite as premultiplied) | C00 F-001 |
+| Readiness via js-signals | `listen-for-js-signals=false` + page `console.info("seazn:ready")` read from the `cefconsole` category. The js-signal route hangs `start()` and `set_state(NULL)` when the page never signals (C11, R2005's page) | C00 F-001 |
+| YouTube health reflects our send rate | Static, filler-padded content went Poor ~1 min in at 2.5/4/6 Mbps with a steady send; 0 %-filler snow stayed Excellent (confounded by keyframe density). Slate must carry real picture (C09); decided with real footage | C00 F-004 |
 | `R2-compositor.md` in `seazn.club` describes the R2 to build | It describes B3, which the bench showed fails (156 dup / 84 gap) and which was struck in Sept. B2 replaced it, and ADR 0001 now supersedes B2. | 2026-10-14 |
 | The capture app's `deliveredLagS` gives the camera delay | It is relative lag growth on the HLS manifest, not absolute delay. | 2026-10-14 |
 | `composed` is unreachable because the organiser UI only posts `passthrough` | The API accepts `mode: "composed"`, and `runner-fly.ts` then throws because `RELAY_IMAGE` is unset. This is a live hazard (spec §8 item 1). | 2026-10-14 |
