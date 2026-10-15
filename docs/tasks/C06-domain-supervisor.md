@@ -12,6 +12,9 @@ programme pipeline. This mirrors `seazn.club`'s `session.ts` `decide()`.
 - `Booting` fetches the session, retrying on backoff.
 - `Running` is entered from `BootstrapOk`. The `Ready`/`Streaming` distinction in spec §4.2 is
   *derived* from output and programme state for the heartbeat; it is not stored.
+- (Amended 2026-10-15) `Holding { since, reason }`: the final hold. The programme shows the Final scene
+  for `final_hold_ms`, then drains with `reason`. It is entered from `Running` on an `Ending` reply, a
+  `SIGINT`, or the deadline. See "Amendment 2026-10-15 (overlay templates spec)" at the end.
 - `Draining` sends EOS to the output and exits once drained, or after `drain_timeout_ms`.
 - `Exited(reason)` is terminal and ignores every later event.
 
@@ -31,6 +34,10 @@ gets 410 and exits 0. That sequence is tested here.
 - Create: `crates/domain/src/{lifecycle.rs,health.rs,supervisor.rs}`
 - Create: `crates/domain/tests/properties.rs`
 - Modify: `crates/domain/src/lib.rs`
+- (Amendment 2026-10-15) Modify: `crates/domain/src/programme.rs` (C03, merged: `Final`,
+  `SlateKind::Final`, `SlateKind::ALL`, `Programme::finish`), `crates/domain/src/config.rs`
+  (`final_hold_ms`), and `crates/domain/tests/programme.rs` (C03's sweeps; exact edits in the
+  amendment). This is the one sanctioned change to an earlier module's public API.
 
 ## Interfaces
 
@@ -43,6 +50,7 @@ gets 410 and exits 0. That sequence is tested here.
   impl ExitReason { pub fn code(self) -> i32; }
   #[derive(Debug, Clone, Copy, PartialEq, Eq)]
   pub enum Lifecycle { Booting { attempt: u32, retry_at: Option<Ms> }, Running, Draining { since: Ms, reason: ExitReason }, Exited(ExitReason) }
+  // ^ superseded 2026-10-15: `Holding { since: Ms, reason: ExitReason }` sits between Running and Draining (amendment)
 
   // health.rs
   #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)] pub enum BeatState { Starting, Playing, Stalled, Stopped }
@@ -63,7 +71,9 @@ gets 410 and exits 0. That sequence is tested here.
       pub rung: Rung,
       pub score_stale: Option<bool>,
       pub heartbeat_failures: u32,
+      // + (amendment 2026-10-15) pub phase_channel: Option<PhaseChannel>,
   }
+  // + (amendment 2026-10-15) #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)] pub enum PhaseChannel { Loopback, Web }
 
   // supervisor.rs
   #[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum Desired { Live, Ending }
@@ -82,6 +92,7 @@ gets 410 and exits 0. That sequence is tested here.
       HeartbeatReply(Desired), HeartbeatFailed,
       Signal(SignalKind),
       Fatal,
+      // + (amendment 2026-10-15) PhaseChannel(PhaseChannel),  // the page's channel signal, relayed by C11
   }
   #[derive(Debug, Clone, PartialEq, Eq)]
   pub enum Effect {
@@ -265,6 +276,8 @@ gets 410 and exits 0. That sequence is tested here.
           s = s.decide(Event::OutputError { gen: 1 }, now).next;
           assert_eq!(s.health(now).state, BeatState::Stalled, "output dropped after having connected");
       }
+      // SUPERSEDED 2026-10-15 by `ending_reply_holds_the_final_card_then_drains` (amendment): an Ending
+      // reply now holds the Final scene for final_hold_ms first. Do not write this test.
       #[test]
       fn ending_reply_drains_then_exits_zero_on_drained() {
           let s = booted(0).decide(Event::Tick, 0).next;
@@ -283,6 +296,8 @@ gets 410 and exits 0. That sequence is tested here.
           assert_eq!(exit_code(&s.decide(Event::Tick, 100 + th.drain_timeout_ms - 1)), None);
           assert_eq!(exit_code(&s.decide(Event::Tick, 100 + th.drain_timeout_ms)), Some(0));
       }
+      // SUPERSEDED 2026-10-15 by `deadline_holds_then_drains_with_reason_deadline` (amendment).
+      // Do not write this test.
       #[test]
       fn deadline_while_running_drains() {
           let s = Supervisor::new(t()).decide(Event::Tick, 0).next;
@@ -503,6 +518,8 @@ gets 410 and exits 0. That sequence is tested here.
               }
               Event::ScoreStale(b) => self.score_stale = Some(b),
               Event::HeartbeatReply(Desired::Live) => self.heartbeat_failures = 0,
+              // SUPERSEDED 2026-10-15 (amendment): Ending → start_hold(now, Ended); Signal(Int) → start_hold(now, Signalled);
+              // Signal(Term) → start_drain as below; the deadline tick → start_hold(now, Deadline).
               Event::HeartbeatReply(Desired::Ending) => self.start_drain(now, ExitReason::Ended, fx),
               Event::HeartbeatFailed => self.heartbeat_failures = self.heartbeat_failures.saturating_add(1),
               Event::Signal(_) => self.start_drain(now, ExitReason::Signalled, fx),
@@ -564,7 +581,8 @@ gets 410 and exits 0. That sequence is tested here.
   ```
   `use crate::ladder::Rung` is referenced through `Effect::StepDown(Rung)`. Keep it.
 
-- [ ] **Step 6: Run, expect a PASS.** `cargo test -p domain supervisor`. Expected: 15 passed.
+- [ ] **Step 6: Run, expect a PASS.** `cargo test -p domain supervisor`. Expected: ~~15 passed~~
+  22 passed (amended 2026-10-15: 15 − 2 superseded + 9 from the amendment).
 
 - [ ] **Step 7: Write the property tests, with an independent oracle.**
   `crates/domain/tests/properties.rs`:
@@ -716,7 +734,9 @@ gets 410 and exits 0. That sequence is tested here.
      (the pre-ruling-A shape). Expected red: `beat_state_follows_output_and_programme` (slate on air
      must be `Playing`).
 
-  Revert every mutant, and record all four in the commit body.
+  5–10. **(Amendment 2026-10-15)** mutants 5–10 from the amendment section.
+
+  Revert every mutant, and record all ~~four~~ ~~nine~~ ten in the commit body.
 
 - [ ] **Step 10: Gate (wave 1).**
   ```bash
@@ -727,10 +747,12 @@ gets 410 and exits 0. That sequence is tested here.
 
 ## Acceptance
 
-- All domain tests pass, including 15 supervisor scenarios and 2 properties at 512 cases with non-zero
-  counts.
-- 4 mutants went red.
+- All domain tests pass, including ~~15~~ 22 supervisor scenarios (amended 2026-10-15) and 2 properties
+  at 512 cases with non-zero counts, including the amendment's `holds entered` and `final ticks`.
+- ~~4~~ ~~9~~ 10 mutants went red (amended 2026-10-15; mutant 10 from the confirm pass).
 - Purity and deps guards are still green.
+- (Amended 2026-10-15) C03's sweeps pass with `Final` added: `unlisted pairs checked` is
+  `5 × 4 − PROGRAMME_TABLE.len()`, and `final ticks checked` is > 0 from all four camera phases.
 
 
 ## Final heartbeat with the exit reason (owner ruling 2026-10-15)
@@ -751,10 +773,308 @@ Tests (add to `supervisor_props.rs`):
   lower than the `Exit` index and that `exit.reason` matches. The test prints `exit paths checked: 6`,
   and fewer than 6 fails it.
 - **Mutant:** drop the final beat on the Fatal path. Expected red: that test.
+- (Amended 2026-10-15) The Ended, Deadline and Signalled(`Int`) paths now pass through the final hold
+  before draining, so the test ticks through `final_hold_ms` before looking for the drain-start beat.
+  Signalled via `Term` still drains at once. Drive both signals: `exit paths checked: 7`, and fewer than
+  7 fails it.
+
+## Amendment 2026-10-15 (overlay templates spec)
+
+Authority: `seazn.club: docs/superpowers/specs/2026-10-15-overlay-templates-and-scenes-design.md`
+§4.2 (D4) and §6, C06 row (quoted verbatim from `29fa9f59c`): "Adds the final-hold phase: on
+`Desired::Ending`, hold for `FINAL_HOLD_MS`, with `programmePhase = final`, then drain. Adds
+`ProgrammePhase::Final` to the merged C03 domain enum (`crates/domain/src/programme.rs:23`); `Final` is
+terminal and wins over every camera state". Re-pinned 2026-10-15 on `main` `21284d6`: `ProgrammePhase` at `programme.rs:23` has the
+variants `{Waiting, Live, Frozen, Reconnecting}`, `SlateKind` is at `:31`, `PROGRAMME_TABLE` at `:60`
+(an unlisted pair holds its phase), and `choice_for` at `:77` (an exhaustive match).
+
+### False premise: the organiser's end does not arrive as an Ending reply first
+
+The spec says "on `Desired::Ending`". R1's runner moves to `stopping` and sends `SIGINT` **immediately**
+on the organiser's stop and on the deadline. The file is `seazn.club`
+`apps/web/src/server/relay/domain/runner.ts` (path corrected by the review): `:101`, `:117-118` and
+`:251-252` on main `b01d07cd5`, which R2003 (#967) moves to `:143`, `:160-161` and `:324-325`. Fly
+SIGKILLs `RUNNER_STOP_GRACE_SECONDS = 10` later (`server/relay/config.ts:141` and `:147` on main;
+`:146` and `:161` after #967).
+The `ending` heartbeat reply can arrive up to one beat (5 s) after the signal, or never. So:
+
+- **The hold is entered on whichever end request comes first while `Running`:** an `Ending` reply
+  (reason `Ended`), `Signal(SignalKind::Int)` (R1's stop signal; reason `Signalled`), or the deadline
+  tick (reason `Deadline`). Holding only on the reply would make the Final scene an inert seam: the
+  `SIGINT` would cut the programme before the reply landed.
+- **`Signal(SignalKind::Term)` still drains at once.** Viewers must not see "Stream ended" for a host
+  restart. **(Corrected 2026-10-15, review I4)** SIGTERM is the platform's stop **only because web
+  makes it so**. Fly's default stop signal is SIGINT (docs.fly.io `kill_signal`, default 5 s
+  timeout), so without a change a Fly-initiated stop would look like ours. R2004's PR 0 (coordinator
+  decision I4) creates composed Machines with `stop_config: { signal: "SIGTERM", timeout: <grace> }`,
+  and web's own stop keeps passing `signal: "SIGINT"` explicitly. PR 0 measures that the explicit
+  signal wins (`_FINDINGS` F-0xx).
+
+  | Signal | Who sends it | C06 behaviour |
+  |---|---|---|
+  | `SIGINT` | web's organiser stop and deadline stop (`stopMachine`, explicit `signal: "SIGINT"`) | `Running` → hold (`Signalled`), Final scene, then drain |
+  | `SIGTERM` | Fly's controlled stops (`fly machine stop`, deploy, auto-stop) via `stop_config.signal` | drain at once (`Signalled`), no Final scene |
+  | `SIGKILL` | Fly, `timeout` after either | none (the process dies) |
+
+  Until PR 0 ships, a Fly-initiated stop arrives as SIGINT and shows the Final card. That's
+  cosmetic, and C17 must not run before PR 0.
+- **Budget:** hold 10 000 + `drain_timeout_ms` 7 000 = 17 s, and R1 grants 10 s today. **Ruled:**
+  `RUNNER_STOP_GRACE_SECONDS` = 20 (owner ruling 2026-10-16, spec D15 (`seazn.club` PR #969, `9bf31b38a`)), which fits hold 10 + drain 7 + headroom 3. R2004's PR 0
+  Part 2 ships it. C12's `final_hold_and_drain_fit_inside_r1_stop_grace` stays red until PR 0 is
+  deployed, so the budget can't be forgotten. The hold stays at 10 s.
+
+### `programme.rs` (C03's module)
+
+```rust
+pub enum ProgrammePhase {
+    Waiting,
+    Live,
+    Frozen,
+    Reconnecting,
+    /// Overlay templates spec 2026-10-15 §4.2 (D4): the final hold before EOS. Terminal: PROGRAMME_TABLE has no
+    /// row from it, so no feed leaves it, and only `Programme::finish` enters it. It wins over every camera state.
+    Final,
+}
+
+pub enum SlateKind { Waiting, Reconnecting, Final }
+impl SlateKind {
+    /// Every kind once. C09 renders the one textless slate for each, and its test enumerates this.
+    pub const ALL: [SlateKind; 3] = [SlateKind::Waiting, SlateKind::Reconnecting, SlateKind::Final];
+}
+
+// choice_for: one new arm. Spec §4.2's Final backdrop is opaque, so the camera is not shown; with
+// graphics up the page's Final scene covers the slate, and with graphics failed C09's textless slate shows.
+Final => Slate(SlateKind::Final),
+
+impl Programme {
+    /// Enter the final hold (C06). Idempotent. Later frames and ticks keep it Final.
+    pub fn finish(&mut self) { self.phase = Final; }
+}
+```
+`PROGRAMME_TABLE` is **unchanged**: no row into `Final`, and none out of it. The inline
+`choice_per_phase` test gains `assert_eq!(choice_for(Final), Slate(SlateKind::Final));`.
+
+### `crates/domain/tests/programme.rs` (C03's sweeps), exact edits
+
+These go red the moment `Final` exists. `PHASES` names 4 variants, `unlisted_pairs_hold_their_phase`
+hardcodes 16, the reachability test expects every phase from Waiting, and the reference sweep asserts
+every phase is ticked. Two more spots break the **compile** (briefs review):
+- the import at `:10`: `use ProgrammePhase::{Final, Frozen, Live, Reconnecting, Waiting};`
+- the reference model's exhaustive `match choice` (`:328-338`) gains the arm
+  `FrameChoice::Slate(SlateKind::Final) => panic!("Final slate from a camera feed at {now}")`.
+  No feed reaches `Final` (see the sweep below), so this arm is a guard: reaching it is a failure.
+
+The rest of the list:
+- `const PHASES: [ProgrammePhase; 5] = [Waiting, Live, Frozen, Reconnecting, Final];` and a new
+  `const FEED_PHASES: [ProgrammePhase; 4] = [Waiting, Live, Frozen, Reconnecting];` with a doc line:
+  "the phases a camera feed can reach (C03); `Final` is entered only by `Programme::finish` (C06)".
+- `phase_index`: `Final => 4`.
+- `PDF` becomes `[[ProgrammePhase; 4]; 5]`, with the row `[Final, Final, Final, Final], // Final` and
+  this source line: "overlay templates spec 2026-10-15 §6, C06 row: Final is terminal and wins over
+  every camera state".
+- `spec_choice`: `Final => FrameChoice::Slate(SlateKind::Final)` (spec §4.2: an opaque backdrop).
+- `unlisted_pairs_hold_their_phase`: `assert_eq!(checked, PHASES.len() * FEEDS.len() - PROGRAMME_TABLE.len());`
+- `every_phase_is_reachable_from_waiting`: `assert_eq!(seen.len(), FEED_PHASES.len(), …)` and
+  `assert!(!seen.contains(&Final), "no feed reaches Final")`.
+- The reference sweep: `phase_ticks: [usize; 5]`. Assert `n > 0` for every `FEED_PHASES` entry and
+  `phase_ticks[phase_index(Final)] == 0`. That second assertion is a positive statement: a table row
+  into `Final` would turn it red.
+- New, `final_is_terminal_against_every_feed`: for each `FEED_PHASES` start, reach it from
+  `Programme::default()` with frames and ticks (Live: 33 ms frames for `resume_after_ms` + 100;
+  Frozen: then no frame for `frozen_after_ms` + 100; Reconnecting: then no frame up to
+  `slate_after_ms` + 100), then call `finish()`. Then run a schedule that produces every `Feed`:
+  33 ms frames for 1 200 ms (Fresh, then Continuous), silence for 600 ms (Gap), and silence for
+  3 100 ms (LongGap), with every number from `Thresholds::default()`. On every tick, assert
+  `phase() == Final` and `on_tick == Slate(SlateKind::Final)`. Print
+  `final ticks checked: N, starts: 4, feeds seen: [..]`; fail if N is 0 or any feed count is 0.
+
+### `config.rs`
+
+```rust
+/// Overlay templates spec 2026-10-15 §4.2 (D4): FINAL_HOLD_MS, how long the Final scene holds before
+/// EOS. C12's `final_hold_and_drain_fit_inside_r1_stop_grace` pins final_hold + drain + 3 s inside R1's grace.
+pub final_hold_ms: Ms,          // default 10_000
+```
+Also rewrite the `drain_timeout_ms` doc line (`config.rs:66-69`, re-pinned at `21284d6`), which names
+C12's superseded `drain_timeout_fits_inside_r1_stop_grace`. It now says that C12's
+`final_hold_and_drain_fit_inside_r1_stop_grace` pins `final_hold_ms + drain_timeout_ms + 3 s` inside
+R1's grace. Keep the 3 s headroom sentence: R2004's and C12's budget tests both cite it.
+
+### `lifecycle.rs`, `health.rs`, `supervisor.rs`
+
+```rust
+// lifecycle.rs
+pub enum Lifecycle {
+    Booting { attempt: u32, retry_at: Option<Ms> },
+    Running,
+    /// The final hold: the Final scene is on air for `final_hold_ms`, then the drain starts with `reason`.
+    Holding { since: Ms, reason: ExitReason },
+    Draining { since: Ms, reason: ExitReason },
+    Exited(ExitReason),
+}
+
+// health.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PhaseChannel { Loopback, Web }
+// HealthReport gains: pub phase_channel: Option<PhaseChannel>,   // None until the page reports one: absent, never defaulted
+
+// supervisor.rs
+// Event gains: PhaseChannel(PhaseChannel),
+// Supervisor gains the field `phase_channel: Option<PhaseChannel>` (None in `new`).
+// decide(): Lifecycle::Holding { since, reason } => frame = next.holding(event, now, since, reason, &mut fx),
+
+fn start_hold(&mut self, now: Ms, reason: ExitReason) {
+    self.lifecycle = Lifecycle::Holding { since: now, reason };
+    self.programme.finish();
+    // (Confirm pass N1, 2026-10-15) The first hold tick beats at once, so web learns `final` at the start of
+    // the hold, not up to `heartbeat_interval_ms` later. Under fallback B that is the difference between the
+    // Final scene showing for most of the hold and being missed (`_INDEX.md` Owed 10).
+    self.next_beat_at = now;
+}
+
+// running(), changed arms:
+Event::Tick => {
+    if now >= self.deadline_at {
+        self.start_hold(now, ExitReason::Deadline);
+        return self.holding(Event::Tick, now, now, ExitReason::Deadline, fx);
+    }
+    /* … unchanged … */
+}
+Event::HeartbeatReply(Desired::Ending) => self.start_hold(now, ExitReason::Ended),
+Event::Signal(SignalKind::Int) => self.start_hold(now, ExitReason::Signalled),
+Event::Signal(SignalKind::Term) => self.start_drain(now, ExitReason::Signalled, fx),
+Event::PhaseChannel(c) => self.phase_channel = Some(c),
+
+fn holding(&mut self, event: Event, now: Ms, since: Ms, reason: ExitReason, fx: &mut Vec<Effect>) -> Option<FrameChoice> {
+    let t = self.t.clone();
+    match event {
+        Event::Tick => {
+            if elapsed(now, since) >= t.final_hold_ms {
+                self.start_drain(now, reason, fx);
+                return None;
+            }
+            // No link or graphics on_tick here: nothing is rebuilt during the hold (no rebuild could finish inside it).
+            let choice = self.programme.on_tick(now, &t); // Final ⇒ Slate(SlateKind::Final)
+            if now >= self.next_beat_at {
+                fx.push(Effect::SendHeartbeat(self.health(now)));
+                self.next_beat_at = now + self.heartbeat_interval_ms;
+            }
+            return Some(choice);
+        }
+        Event::InputFrame => self.programme.on_frame(now, &t),
+        Event::InputConnected { gen } => self.input.on_connected(now, gen),
+        Event::InputLost { gen, reason: r } => self.input.on_lost(now, gen, r, &t),
+        Event::OutputConnected { gen } => {
+            self.output.on_connected(now, gen);
+            if self.output.is_connected() { self.output_ever_connected = true; }
+        }
+        Event::OutputAck { gen } => self.output.on_ack(now, gen),
+        Event::OutputError { gen } => self.output.on_error(now, gen, &t),
+        Event::CefReady { gen } => self.graphics.on_ready(now, gen),
+        Event::ScoreStale(b) => self.score_stale = Some(b),
+        Event::PhaseChannel(c) => self.phase_channel = Some(c),
+        Event::HeartbeatReply(Desired::Live) => self.heartbeat_failures = 0,
+        Event::HeartbeatFailed => self.heartbeat_failures = self.heartbeat_failures.saturating_add(1),
+        Event::Signal(SignalKind::Term) => self.start_drain(now, ExitReason::Signalled, fx),
+        Event::Fatal => self.exit(ExitReason::Fatal, fx),
+        // A second end request (the reply after the SIGINT, or the reverse) keeps the FIRST hold's clock. An
+        // overrun or a CEF crash changes nothing: the hold is ≤ final_hold_ms and the held overlay frame stays (C11).
+        Event::HeartbeatReply(Desired::Ending) | Event::Signal(SignalKind::Int) | Event::EncoderOverrun
+        | Event::CefCrashed { .. } | Event::OutputDrained | Event::BootstrapOk { .. } | Event::BootstrapFailed
+        | Event::BootstrapRefused(_) => {}
+    }
+    None
+}
+
+// health(): the Final scene is on air, so Holding maps like Running
+Lifecycle::Running | Lifecycle::Holding { .. } if self.output.is_connected() => BeatState::Playing,
+Lifecycle::Running | Lifecycle::Holding { .. } if self.output_ever_connected => BeatState::Stalled,
+Lifecycle::Running | Lifecycle::Holding { .. } => BeatState::Starting,
+// and `phase_channel: self.phase_channel,`
+```
+`Booting` is unchanged: a signal or a past deadline there exits at once, because nothing is on air.
+
+### Tests (inline in `supervisor.rs`; write them failing first)
+
+Every expected number comes from `Thresholds::default()` or the spec, never from `decide`. Use the
+existing `t()`, `booted` and `exit_code` helpers, and add `reach(phase)`, which drives `booted(0)` with
+frames and ticks into each camera phase exactly as `final_is_terminal_against_every_feed` does.
+
+1. `final_hold_is_the_spec_number`: `assert_eq!(t().final_hold_ms, 10_000, "overlay spec §4.2 FINAL_HOLD_MS")`.
+2. `ending_reply_holds_the_final_card_then_drains`, replacing the superseded drain test:
+   - boot, connect the output (gen 1), and send `InputLost { gen: 1, reason: LossReason::Error }` at
+     20, so a rebuild **falls due inside the hold**
+   - an `Ending` reply at 100: no `DrainOutput`, `programme_phase() == Final`
+   - every 33 ms tick in `[100, 100 + final_hold_ms)`: `frame == Some(Slate(SlateKind::Final))`, and
+     none of `DrainOutput`, `RebuildInput`, `SwapSink` or `RestartGraphics`
+   - the tick at exactly `100 + final_hold_ms`: `DrainOutput`, a `Stopped` beat whose `exit.reason` is
+     `Ended`, and `frame == None`
+   - `OutputDrained` → exit 0
+   - the assertion message carries the tick count, and it must be > 0
+3. `final_wins_over_every_camera_state`: for each of Waiting, Live, Frozen and Reconnecting (via
+   `reach`), send `Ending`, then 1 200 ms of 33 ms frames, 600 ms of silence and 3 100 ms of silence
+   (all inside the hold). Every tick: `programme_phase() == Final`. Assert 4 starts were checked.
+4. `a_second_end_request_during_the_hold_changes_nothing`: an `Ending` reply at 100, then a second
+   `Ending` at 2 000 and `Signal(Int)` at 3 000. Each gives no effects, no frame, and an unchanged
+   `lifecycle()`. The tick at `100 + final_hold_ms − 1` doesn't drain; the tick at `100 + final_hold_ms` does.
+5. `int_signal_holds_and_term_signal_drains_at_once`: `Signal(Int)` while Running →
+   `Holding { reason: Signalled }` with no `DrainOutput`; `Signal(Term)` while Running →
+   `DrainOutput`, `Draining { reason: Signalled }`; `Signal(Term)` during a hold → `DrainOutput`.
+6. `deadline_holds_then_drains_with_reason_deadline`, replacing the superseded deadline test: the
+   tick at `deadline_at` yields `Some(Slate(SlateKind::Final))`, no `DrainOutput`, and
+   `Holding { reason: Deadline }`; the tick at `deadline_at + final_hold_ms` → `Draining { reason: Deadline }`.
+7. `fatal_during_the_hold_exits_70`.
+8. `health_during_the_hold_reports_final_and_stays_on_air`: with the output connected,
+   `health().state == Playing` and `programme_phase == Final` throughout the hold. Collect the
+   `SendHeartbeat`s over the hold: at least one, and every one reports `Final`.
+9. `phase_channel_reaches_the_report_and_is_absent_until_told`: `None` after boot (absent, never
+   defaulted); `Some(PhaseChannel::Web)` after `Event::PhaseChannel(PhaseChannel::Web)`.
+10. **(Confirm pass N1)** `the_first_hold_tick_beats_final_at_once`. For each of the three end
+    requests (an `Ending` reply, `Signal(Int)`, and the deadline), from a fresh `booted(0)` with the
+    output connected:
+    - tick until a scheduled `SendHeartbeat` has just gone out, at time `B`; the next scheduled beat is
+      then `B + heartbeat_interval_ms` (5 000 by default)
+    - send the end request at `B + 100`, or set `deadline_at` there
+    - the first `Tick` at or after `B + 100` emits a `SendHeartbeat` whose report has
+      `programme_phase == Final`
+
+    Without the reset, that beat waits until `B + heartbeat_interval_ms`. The expected beat time comes
+    from `Thresholds::default()` and the tick period, never from `decide`. Print
+    `end paths checked: 3`; fail on 0.
+
+**Properties** (`properties.rs`):
+- P1 becomes P1′: a tick yields a frame iff the lifecycle before **and** after is `Running` or
+  `Holding` (`on_air`). The deadline tick (Running → Holding) yields the Final frame; the hold-end tick
+  (Holding → Draining) yields none.
+- In `exit_is_emitted_at_most_once_and_nothing_follows_it`, add P5: once `programme_phase()` is
+  `Final`, it stays `Final` until exit, and no `RebuildInput`, `SwapSink` or `RestartGraphics` follows
+  it. Print `holds entered: N, final ticks: M`, and assert both are > 0. If `final ticks` is 0, lower
+  the `Fatal` weight in that generator; never weaken the assertion.
+
+**Mutants** (restore each one; record all in the commit body):
+
+| # | Mutant | Expected red |
+|---|---|---|
+| 5 | add `(Final, Feed::Continuous, Live)` to `PROGRAMME_TABLE` | C03's table-vs-PDF test, `final_is_terminal_against_every_feed`, test 3, P5 |
+| 6 | an `Ending` reply calls `start_drain` (skips the hold) | test 2 |
+| 7 | `Signal(Int)` drains at once | test 5 |
+| 8 | `holding` also runs the links' and graphics' `on_tick` | test 2 (the due rebuild appears) |
+| 9 | `health()` maps `Holding` to `Stopped` | test 8 |
+| 10 | `start_hold` drops `self.next_beat_at = now` (confirm pass N1) | test 10 (all three paths) |
+
+### Owed elsewhere (not this task)
+
+- **C07**: `heartbeat_wire` emits `programmePhase: "final"` and `phaseChannel` (`"loopback"`/`"web"`,
+  only when `Some`). Its contract test's script must reach `Final`. It vendors the contract only after
+  R2007 PR B merges (web's strict schema returns 400 for `final` until then). This is recorded in the
+  plan and `_INDEX.md`.
+- **C08**: the driver publishes phase changes to the loopback endpoint (amended).
 
 ## Do not touch
 
 Earlier modules' public APIs. A change needed there is a deviation: report it, don't make it silently.
+(Amended 2026-10-15) **Exception:** the `programme.rs` additions, the `config.rs` field and the C03
+test edits listed in the amendment. Nothing else in C03's module changes.
 
 ## Output cap
 

@@ -106,11 +106,15 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
   deviation **in the commit body and in `_FINDINGS.md`**. The programme pipeline is still never
   rebuilt.
 
-- [ ] **Step 2: Slate buffers.** `slate.rs` renders one I420 frame per `SlateKind` at `start()`:
-  - pipeline: `videotestsrc pattern=solid-color foreground-color=0xff111827 num-buffers=1 ! video/x-raw,width=W,height=H ! textoverlay text="…" valignment=center halignment=center font-desc="Sans 36" ! videoconvert ! video/x-raw,format=I420 ! appsink`
-  - texts: `"Starting soon"` (Waiting) and `"Reconnecting…"` (Reconnecting). English-only here; the
-    overlay page carries the localised score bug.
-  - The two buffers are cached.
+- [ ] **Step 2: Slate buffers.** ~~`slate.rs` renders one I420 frame per `SlateKind` at `start()`:~~
+  - ~~pipeline: `videotestsrc pattern=solid-color foreground-color=0xff111827 num-buffers=1 ! video/x-raw,width=W,height=H ! textoverlay text="…" valignment=center halignment=center font-desc="Sans 36" ! videoconvert ! video/x-raw,format=I420 ! appsink`~~
+  - ~~texts: `"Starting soon"` (Waiting) and `"Reconnecting…"` (Reconnecting). English-only here; the
+    overlay page carries the localised score bug.~~
+  - ~~The two buffers are cached.~~
+
+  **SUPERSEDED 2026-10-15:** the slate is textless (house backdrop + Seazn logo), one buffer for every
+  `SlateKind`. See "Amendment 2026-10-15 (overlay templates spec)" below the Audio section, which is
+  untouched.
 
 - [ ] **Step 3: Write the failing tests.** `crates/adapters/tests/programme_output.rs`. Each test uses
   a `file://` target in a temp dir and decodes the result with a test helper that runs
@@ -217,18 +221,19 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
   3. Drop `redact` from the error path. Expected red: `errors_and_logs_never_contain_the_stream_key`.
   4. Remove the feeder's `end_of_stream()` on the output appsrcs. Expected red: `ninety_slate_ticks…` (it never sees `OutputDrained`).
   5. Report `fps: Some(0.0)` before the first window. Expected red: `stats_are_absent_before_anything_is_measured`.
+  6–7. **(Amendment 2026-10-15)** mutants 6–7 from the amendment section.
 
 - [ ] **Step 10: CI.** The `check.yml` apt step is added, and the job is green on the PR.
   **Commit:** `feat(media): programme pipeline on its own clock and a swappable output (C09)`
 
 ## Acceptance
 
-- All 14 tests pass, single-threaded.
+- All ~~14~~ 17 tests pass, single-threaded (amended 2026-10-15: plus the three slate tests).
 - Every `Stats` field has a test that drives it, and starts as `None`.
 - `builds() == 1` holds across swaps.
 - The output starts on a keyframe, with PTS rebased.
 - The stream key is never in errors.
-- 5 mutants went red.
+- ~~5 mutants~~ 7 mutants went red (amended 2026-10-15).
 - `check.yml` is green with GStreamer installed.
 
 
@@ -252,10 +257,67 @@ and route stayed Excellent for 10 min. voaacenc encodes digital zeros as ~95 % 0
   for the camera-lost case. Mutant: switch the filler to digital silence; the zero-byte check must go
   RED.
 
+## Amendment 2026-10-15 (overlay templates spec)
+
+Authority: `seazn.club: docs/superpowers/specs/2026-10-15-overlay-templates-and-scenes-design.md`
+§4.2 (verbatim, `29fa9f59c`): "Fallback when the overlay renderer is dead (`graphics: failed`): the
+compositor's native slate (C09) shows no text, only the house backdrop colour and the Seazn logo, so
+the fallback never shows untranslated English." §6, C09 row: "The native slate becomes textless (house
+backdrop + logo); it is used only when graphics have failed." **The Audio section above is unchanged and still
+overrides**: the slate is a video layer only.
+
+**What "used only when graphics have failed" means here.** In every slate phase (Waiting,
+Reconnecting, and C06's new Final), the slate is the base layer and CEF's overlay is composited on top.
+While the overlay page is alive, its scene (R2005: an opaque night backdrop + card) covers the slate
+completely, so viewers never see the slate. They see it only when the overlay is hidden
+(`HideOverlay`, graphics failed) or has not produced a frame yet. No branch decides "show the slate";
+the composition order does. The tests below pin both halves.
+
+**The slate:**
+- **Backdrop:** `#150b36`, seazn.club's `--mk-night` (`apps/web/src/app/globals.css:535`, the stadium
+  night that `--sport-board` resolves to at `:1175`). One constant, `SLATE_BACKDROP_RGB: [u8; 3] = [0x15, 0x0b, 0x36]`
+  in `slate.rs`, with that doc line.
+- **Logo:** vendor `seazn.club` `apps/web/public/logo-wide-night.png` byte-for-byte as
+  `crates/adapters/assets/logo-wide-night.png` (800 × 280 RGBA: the cream "SEAZN CLUB" wordmark,
+  the lime line and the red ball, **no tagline**; the print SVGs carry an English tagline and are
+  **not** used). Its sha256 at pin is
+  `bee2648f76fa2590ac81d2c1e14050fe4c62687b8630437b0d6e6b080c2f90e8`. Embed it with `include_bytes!`.
+- **Geometry:** logo width = `W × 3 / 8`, height = width × 280 / 800, centred. That is 480 × 168 at
+  720p and 720 × 252 at 1080p, both even, as I420 needs.
+- **Pipeline** (built once at `start()`, one buffer, shared by every `SlateKind`):
+  `videotestsrc pattern=solid-color foreground-color=0xff150b36 num-buffers=1 ! video/x-raw,format=AYUV,width=W,height=H ! compositor name=c sink_1::xpos=X sink_1::ypos=Y ! videoconvert ! video/x-raw,format=I420 ! appsink`
+  with `appsrc (the PNG bytes, caps image/png) ! pngdec ! videoconvert ! videoscale ! video/x-raw,format=AYUV,width=LW,height=LH ! c.sink_1`.
+  `pngdec` is in `gstreamer1.0-plugins-good`, which C12's image already installs.
+- `SlateKind::ALL` (C06) lists every kind. `slate_for(kind)` returns the same `Arc` for each.
+- **No `textoverlay` element anywhere in `slate.rs`.** The slate can never carry English.
+
+**Tests** (add to `programme_output.rs`; write them failing first):
+1. `slate_is_textless_house_backdrop_and_logo_for_every_kind`:
+   - for each `SlateKind::ALL` entry, the buffer is the same `Arc` (pointer-equal)
+   - decode it: pixels at (10, 10) and (W−10, H−10) equal `SLATE_BACKDROP_RGB` within ±4 per channel
+     after I420 → RGB (BT.601, the expected value computed from the constant)
+   - the centre `LW × LH` box has at least 10 % of its pixels more than 40 away from the backdrop on
+     any channel (the logo is there)
+   - the slate builder's element list (collect the factory names it creates) contains no
+     `textoverlay`
+   - print `slate kinds checked: 3`; fail on 0
+2. `vendored_logo_matches_its_pinned_sha256`: hash `include_bytes!` and compare with the sha above.
+   A re-vendor must change the pin on purpose.
+3. `an_opaque_overlay_covers_the_slate_and_hiding_it_reveals_the_slate`:
+   - `set_overlay` with a full-frame opaque BGRA in a colour that is not the backdrop; push
+     `Slate(SlateKind::Reconnecting)`; the decoded centre pixel is the overlay's colour
+   - `hide_overlay()`; push again; the centre pixel is now the logo region and a corner pixel is the
+     backdrop
+
+**Mutants:**
+6. Restore a `textoverlay` for `SlateKind::Reconnecting`. Expected red: test 1 (the factory-name check,
+   and the buffers stop being pointer-equal).
+7. Backdrop back to `0xff111827`. Expected red: test 1's corner pixels.
+
 ## Do not touch
 
 Domain and app crates. If you find a port signature problem, report it as a deviation and don't
-change the port.
+change the port. (Amended 2026-10-15) The Audio section above: this amendment is video only.
 
 ## Output cap
 
