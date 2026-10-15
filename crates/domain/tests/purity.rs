@@ -32,6 +32,16 @@ const STD_ROOTS: &[&str] = &["std", "core", "alloc"];
 /// `Ms`, passed in.
 const BARE_NAMES: &[&str] = &["Instant", "SystemTime"];
 
+/// Hash containers seeded from the OS at runtime: iteration order changes run to run, and the
+/// domain's decisions must be deterministic. Refused as bare names, so no alias or glob brings them
+/// in; `std::collections` itself stays allowed for `BTreeMap` / `BTreeSet`.
+const SEEDED_NAMES: &[&str] = &["HashMap", "HashSet", "RandomState"];
+
+/// The crate-root attribute that keeps the domain off stderr (C12 logs there, from adapters and
+/// app). It is an attribute, not a `[lints]` entry, because cargo refuses a member's own lint table
+/// beside `workspace = true`, and `forbid` so no inner `#[allow]` can lift it.
+const STDERR_FORBID: &str = "#![forbid(clippy::print_stderr)]";
+
 /// Macros that read the build environment, or splice in a file this scan never reads.
 const FORBIDDEN_MACROS: &[&str] = &["env", "option_env", "include"];
 
@@ -228,6 +238,12 @@ fn refusals(toks: &[(usize, String)]) -> Vec<(usize, String)> {
         if BARE_NAMES.contains(&t) {
             out.push((*line, format!("`{t}` (a clock type; time is `Ms`)")));
         }
+        if SEEDED_NAMES.contains(&t) {
+            out.push((
+                *line,
+                format!("`{t}` (OS-seeded, nondeterministic order; use BTreeMap / BTreeSet)"),
+            ));
+        }
         if FORBIDDEN_MACROS.contains(&t) && at(k + 1) == Some("!") {
             out.push((*line, format!("`{t}!`")));
         }
@@ -274,6 +290,14 @@ fn domain_source_has_no_clock_env_fs_net_thread_or_process() {
         for (line, why) in refusals(&toks) {
             hits.push(format!("{}:{line}: {why}", f.display()));
         }
+    }
+    let root = fs::read_to_string(src.join("lib.rs")).expect("read domain/src/lib.rs");
+    let root_code: String = code_only(&root).chars().filter(|c| !c.is_whitespace()).collect();
+    if !root_code.contains(STDERR_FORBID) {
+        hits.push(format!(
+            "{}: crate root lacks `{STDERR_FORBID}`",
+            src.join("lib.rs").display()
+        ));
     }
     eprintln!(
         "purity scan checked {} files, {std_paths} std/core/alloc paths",

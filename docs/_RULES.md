@@ -44,4 +44,10 @@ The orchestrator re-runs each wave's scoped gate itself and pastes the raw count
   content past `check-portable.sh`. The script refuses every symlink there.
 - **A denylist of std paths always has one more door** (`std::r#fs`, `use std::{self as s}`, a
   `macro_rules!` splice `std::$m`). `purity.rs` is an allowlist of std/core/alloc modules instead,
-  over a lexer that knows `//` inside a string is not a comment.
+  over a lexer that knows `//` inside a string is not a comment. The same holds for packages:
+  `deps.rs` is an allowlist that starts empty, because a clock crate (`chrono`, `time`) passed the
+  old prefix denylist.
+- **`HashMap` iteration order changes run to run** (`RandomState` is seeded from the OS). The domain
+  uses `BTreeMap` / `BTreeSet`; `purity.rs` refuses the seeded names.
+- **A member cannot add one lint beside `[lints] workspace = true`**: cargo refuses the manifest.
+  A crate-specific lint goes on the crate root as `#![forbid(...)]`.

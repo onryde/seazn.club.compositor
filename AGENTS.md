@@ -66,15 +66,20 @@ Three guard tests make that the architecture rather than a picture of it:
   other path is refused (env, fs, io, net, os, process, sync, thread, time and anything nobody
   listed), and so are a glob (`std::*`), a macro splice (`std::$m`), an alias (`std as …`,
   `std::{self as …}`), `env!`, `option_env!`, `include!`, a `path = …` attribute (`cfg_attr`
-  included), and the bare names `Instant` and `SystemTime`. It reads tokens from a small lexer
+  included), the bare clock names `Instant` and `SystemTime`, and the OS-seeded hash types
+  `HashMap`, `HashSet` and `RandomState` (supervisor decisions must be deterministic: use
+  `BTreeMap` / `BTreeSet`). It also requires the crate root's `#![forbid(clippy::print_stderr)]`.
+  It reads tokens from a small lexer
   (comments removed, literals emptied, `r#fs` read as `fs`), so spacing, line breaks and `use`
   groups cannot hide a path. Adding a module to the allowlist is a decision: its own commit, with
   the reason.
-- `crates/domain/tests/deps.rs`: the domain's normal and build closure in the **resolved graph**
-  (`cargo metadata --all-features`, every platform) contains no `gstreamer*`, `gst*`, `glib*`, `cef*`,
-  `ureq`, `reqwest`, `hyper`, `tokio`, `tiny_http`, `crossbeam` or `cairo` package. Because it reads
-  the graph, not the manifest, a renamed, workspace-inherited, target-specific, optional or transitive
-  dependency is caught by its real package name. Dev-dependencies are exempt.
+- `crates/domain/tests/deps.rs`: an **allowlist that starts empty**. Every package in the domain's
+  normal and build closure in the **resolved graph** (`cargo metadata --all-features`, every
+  platform) must be listed in `ALLOWED` with a one-line reason, and today nothing is, so a clock
+  (`chrono`, `time`), an RNG or any I/O crate is refused. A listed package that is no longer linked
+  is refused too. Because it reads the graph, not the manifest, a renamed, workspace-inherited,
+  target-specific, optional or transitive dependency is caught by its real package name.
+  Dev-dependencies are exempt. Adding a package is a decision: its own commit, with the reason.
 - `crates/app/tests/boundary.rs`: app's resolved closure of every kind (normal, build and dev at app
   itself; normal and build past it) never reaches `adapters`, and no file under app's `src/`,
   `tests/`, `benches/`, `examples/` or `build.rs` names the crate as a path. Cargo refuses a normal
@@ -96,7 +101,10 @@ And two more guards:
   `-D warnings`); clippy's `dbg_macro`, `print_stdout` and `todo` are denied. **One sanctioned
   exception:** `crates/harness` (C13) reports on stdout, so its `lib.rs` and each bin start with
   `#![allow(clippy::print_stdout)] // harness tools report on stdout by design (C13)`. Every other
-  crate logs to stderr.
+  crate logs to stderr, **except the domain**, which writes to neither: `crates/domain/src/lib.rs`
+  carries `#![forbid(clippy::print_stderr)]` (an attribute, because cargo refuses a member's own
+  `[lints.clippy]` table beside `workspace = true`; `forbid`, so no inner `#[allow]` lifts it).
+  Its integration tests are separate crates and keep their `eprintln!` count lines.
 
 **A violation is fixed, never allow-listed.** No exemption list, `#[allow]`, path skip or weakened
 needle to get a guard green. If a guard itself is wrong, change it in its own commit with the reason,

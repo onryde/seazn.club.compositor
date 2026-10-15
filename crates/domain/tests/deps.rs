@@ -1,4 +1,4 @@
-//! Guard: the domain crate links nothing that does I/O, directly or transitively.
+//! Guard: the domain crate links only ALLOWLISTED packages, directly or transitively.
 //!
 //! Read from the resolved graph (`support/graph.rs`), so a workspace-inherited, renamed,
 //! target-specific, optional, build-time or transitive dependency is seen under its real package
@@ -81,19 +81,11 @@ fn graph_closure_follows_edge_kinds_at_and_past_the_root() {
     eprintln!("graph fixture checked {} closures", cases.len());
 }
 
-const FORBIDDEN_PREFIXES: &[&str] = &[
-    "gstreamer",
-    "gst",
-    "glib",
-    "cef",
-    "ureq",
-    "reqwest",
-    "hyper",
-    "tokio",
-    "tiny_http",
-    "crossbeam",
-    "cairo",
-];
+/// The packages domain's normal + build closure may contain, every platform, each with a one-line
+/// reason. EMPTY: the domain links nothing. A denylist always misses the next crate (a clock such as
+/// `chrono` or `time`, an RNG, a thread pool), so every package is refused unless listed here.
+/// Adding one is a decision: its own commit, with the reason.
+const ALLOWED: &[(&str, &str)] = &[];
 
 #[test]
 fn domain_has_no_io_dependencies() {
@@ -106,10 +98,18 @@ fn domain_has_no_io_dependencies() {
         "graph traversal is broken: compositor does not reach domain"
     );
     let linked = graph.closure("domain", &[Kind::Normal, Kind::Build]);
-    let bad: Vec<&String> = linked
-        .iter()
-        .filter(|n| FORBIDDEN_PREFIXES.iter().any(|p| n.starts_with(p)))
-        .collect();
+    let allowed: BTreeSet<&str> = ALLOWED.iter().map(|(name, _)| *name).collect();
+    for (name, reason) in ALLOWED {
+        assert!(
+            !reason.trim().is_empty(),
+            "allowlisted package {name} has no reason"
+        );
+        assert!(
+            linked.contains(*name),
+            "allowlisted package {name} is no longer linked: drop it"
+        );
+    }
+    let bad: Vec<&String> = linked.iter().filter(|n| !allowed.contains(n.as_str())).collect();
     eprintln!(
         "deps guard checked {} packages in domain's normal+build closure (traversal sanity: compositor reaches {})",
         linked.len(),
@@ -117,6 +117,6 @@ fn domain_has_no_io_dependencies() {
     );
     assert!(
         bad.is_empty(),
-        "domain must not link I/O crates, directly or transitively: {bad:?}"
+        "domain links packages outside its allowlist (deps.rs `ALLOWED`), directly or transitively: {bad:?}"
     );
 }
