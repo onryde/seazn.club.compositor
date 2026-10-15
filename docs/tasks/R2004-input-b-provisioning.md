@@ -314,13 +314,10 @@ critical path. As its own PR, it waits only on R2003.
     - Destroy the probe and confirm it's gone.
     - Record the result as `F-0xx: Fly stop signal precedence` in compositor `_FINDINGS.md`.
     - **If the explicit signal loses, halt** and route to the coordinator. Don't ship Part 1.
-- **Part 2: the grace. OWNER DECISION PENDING (option A).**
-  - **Recommendation, not a ruling:** raise `RUNNER_STOP_GRACE_SECONDS` from 10 to 20, which fits
-    hold 10 + drain 7 + 3 headroom. Option B, shortening the final hold to fit 10 s, leaves 0 s for
-    the hold.
-  - **Part 2 ships only on the owner's yes.** If the owner picks B, Part 2 doesn't ship; C06's
-    `final_hold_ms` and its spec-number test change by owner ruling instead. Part 1 ships either way.
-  - With A, update the arithmetic comment above `ENDING_TIMEOUT_SECONDS` (`config.ts:125-135` on main;
+- **Part 2: the grace. RULED: 20 s** (owner ruling 2026-10-16, spec D15 (`seazn.club` PR #969, `9bf31b38a`): "`RUNNER_STOP_GRACE_SECONDS` = 20, so the 10 s hold
+  plus the ~7 s drain fit before the platform's forced kill").
+  - Raise `RUNNER_STOP_GRACE_SECONDS` from 10 to 20, which fits hold 10 + drain 7 + 3 headroom.
+  - Update the arithmetic comment above `ENDING_TIMEOUT_SECONDS` (`config.ts:125-135` on main;
     re-pin on R2003's tree):
     - ordinary teardown: 20 + 20 + 55 + 55 = **150 s** < 300
     - with a destroy wait: 40 + 55 + 55 + 55 = **205 s** < 300
@@ -336,15 +333,15 @@ critical path. As its own PR, it waits only on R2003.
     the timeout derived from `RUNNER_STOP_GRACE_SECONDS`; the stop still posts `signal: "SIGINT"`.
   - `runner-fly.live.test.ts` (opt-in, `RELAY_LIVE_FLY=1`, the file's existing residue rule): a
     composed create reads back the same `stop_config`.
-  - With A, `config.test.ts` pins `RUNNER_STOP_GRACE_SECONDS * 1000 >= 10_000 + 7_000 + 3_000`, each
+  - `config.test.ts` pins `RUNNER_STOP_GRACE_SECONDS * 1000 >= 10_000 + 7_000 + 3_000`, each
     number commented from its source: spec §4.2, compositor `config.rs` `drain_timeout_ms`, and the
     3 s headroom in that field's doc line.
 - **Mutants:**
   - `stop_config.signal` set to `"SIGINT"`. Expected red: the runner-fly test.
   - `stop_config` dropped. Expected red: the same test.
-  - With A, the grace back to 10. Expected red: `config.test.ts`.
-- **Commit:** `fix(relay): composed Machines stop on SIGTERM from the platform and SIGINT from us`,
-  plus `, with a 20 s grace` when A ships. Record the parts that shipped in compositor `docs/_INDEX.md`.
+  - The grace back to 10. Expected red: `config.test.ts`.
+- **Commit:** `fix(relay): composed Machines stop on SIGTERM from the platform and SIGINT from us, with a 20 s grace`.
+  Record that it shipped in compositor `docs/_INDEX.md`.
   C12's `final_hold_and_drain_fit_inside_r1_stop_grace` reads the same value.
 
 ## Do not touch

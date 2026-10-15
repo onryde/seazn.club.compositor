@@ -103,7 +103,8 @@ score bug. That's an inert seam the owner would only see live.
 - **Amendment 2026-10-15:**
   - Create: `apps/web/src/components/overlay/overlay-scene.tsx` (`sceneFor`, the backdrop and the scene
     card) and `apps/web/src/components/overlay/use-programme-phase.ts` (the channel hook)
-  - Modify: `components/overlay/overlay-scenes.ts` (append three scenes), `overlay-slate.tsx` (two card
+  - Modify: `components/overlay/overlay-scenes.ts` (append three scenes, each with its `momentsFire`:
+    `starting` true, `reconnecting` true, `final` false; R2007 decision 8), `overlay-slate.tsx` (two card
     variants), `overlay-stage.tsx` (`host`, `sceneOverride`, moment discard),
     `components/overlay/overlay-preview.tsx` (R2007's render function: pass `sceneOverride={scene}`;
     review I6), `moment-queue.ts` (a
@@ -166,7 +167,7 @@ score bug. That's an inert seam the owner would only see live.
   2. Share the cache key. Expected red: page test 7.
   3. Emit ready on mount. The e2e "exactly once, after data" assertion must go red. Make it assert
      ready comes **after** the first snapshot's DOM is present.
-  4–11. **(Amendment 2026-10-15)** mutants M4–M11 from the amendment section.
+  4–12. **(Amendment 2026-10-15)** mutants M4–M12 from the amendment section.
 - [ ] **Step 8: Run the existing overlay e2e specs** (grep by route `/overlay/fixtures`, not by
   filename). All green and unchanged. **Commit and open the PR:**
   `feat(overlay): compositor access by relay page token, readiness and score-stale signals`
@@ -175,7 +176,8 @@ score bug. That's an inert seam the owner would only see live.
 
 - Unit, page and e2e tests pass.
 - Existing overlay e2e is unchanged and green.
-- ~~3 mutants~~ ~~9~~ 11 mutants went red (amended 2026-10-15; M10 and M11 from the review fixes).
+- ~~3 mutants~~ ~~9~~ ~~11~~ 12 mutants went red (amended 2026-10-15; M10 and M11 from the review
+  fixes; M7 rewritten and M12 added for owner ruling D14, 2026-10-16).
 - Cache isolation is proven, for the page read **and** for the overlay route's `programmePhase`
   (amended 2026-10-15).
 - The false premises (transparent body, timestamps) are recorded.
@@ -295,16 +297,21 @@ Only the backdrop is a new element (`[data-testid="ovl-scene"]`, below the templ
 
 ### Moments during scenes (change 7)
 
+**Owner ruling D14 (2026-10-16; spec §4.8 at `seazn.club` `9bf31b38a`, PR #969):** "**Starting soon:**
+moments **fire** (owner ruling 2026-10-16). A stream can start after the match has begun, and a goal
+scored before the first camera frame must still reach viewers, the same reasoning as Reconnecting.
+**Final:** none fire; the deciding moment has already shown, and the Result card carries the outcome."
+
 - `moment-queue.ts` gains a `discard` action: the moment is marked seen and is never enqueued.
-- While the scene is `starting` or `final`, every new moment is discarded, so it can never replay when
-  the scene ends. In `reconnecting`, moments fire as usual and the slab sits above the scene card
-  (§4.8: "the slab is the only way a viewer learns a goal happened").
+- The stage reads the active scene's `momentsFire` (R2007 decision 8; the declaration in
+  `overlay-scenes.ts` is the one authority) and never compares scene ids itself:
+  - `starting` (`momentsFire: true`): moments fire as usual. With the match in play (slate `live`)
+    there's no card, so the slab sits on the night backdrop.
+  - `reconnecting` (`true`): moments fire, and the slab sits above the scene card (§4.8: "the slab is
+    the only way a viewer learns a goal happened").
+  - `final` (`false`): every new moment is discarded, so it can never replay. Final is terminal, so no
+    later scene could show it anyway.
 - Timing: at `host=compositor` the slab follows the same `delay` presentation as today.
-- **Owner question pending** (compositor `_INDEX.md`, "Owner questions"): should moments fire during
-  Starting soon when the stream starts after the match has begun (`waiting × live`)? The
-  recommendation, not a ruling, is yes, with only Final discarding. Build the spec's rule as written
-  (discard in `starting`). If the owner says yes, `starting` stops discarding, and A3's first row, E7's
-  last line and M7 flip with it.
 
 ### Tests
 
@@ -324,10 +331,15 @@ Only the backdrop is a new element (`[data-testid="ovl-scene"]`, below the templ
     - `{ phase: "final", seq: 1 }` → `loopbackOk`
 
     Every `PROGRAMME_PHASES` value is accepted: print `phases checked: 5`; fail on 0.
-- **A3** `moment-queue.test.ts`, through the real reducer and the stage's scene rule:
-  - a goal while `starting` is discarded; after the scene ends it never shows, and a **new** goal does
+- **A3** `moment-queue.test.ts`, through the real reducer and the stage's scene rule (amended
+  2026-10-16, D14):
+  - a goal while `starting` with the match in play (slate `live`) is **enqueued and shows**
   - a goal while `reconnecting` is enqueued and shows
-  - a goal while `final` is discarded
+  - a goal while `final` is discarded, and stays unseen through the rest of the hold
+  - every `OVERLAY_SCENES` entry's `momentsFire` equals the spec's rule, typed in the test from §4.8
+    and D14: `live` true, `starting` true, `reconnecting` true, `final` false. Print
+    `scenes checked: 4`; fail on 0. The values come from the spec, never read back from the
+    declaration.
 
 **Page / route:**
 - **A4**, through the real overlay route:
@@ -372,8 +384,12 @@ inside the template (AGENTS.md class 2), and the scene card's box doesn't inters
 - **E7 Moments:** with `delay=3000`, serve `reconnecting` and score a goal through the API at T0. The
   slab is visible no sooner than T0 + 3 000 (the URL's `delay`; the spec's guard) and no later than
   T0 + 3 000 + `STREAM_POLL_MS` + 2 000 (so the test can't pass by never showing it), and it is on top
-  of the scene card (`elementFromPoint`). Serve `waiting`, score a goal, switch to `live`: the slab
-  never appears.
+  of the scene card (`elementFromPoint`).
+  - **(Amended 2026-10-16, D14)** On a fixture already in play, serve `waiting` and score a goal at
+    T1. The slab appears inside the same `[T1 + 3 000, T1 + 3 000 + STREAM_POLL_MS + 2 000]` window,
+    over the Starting soon backdrop. Starting soon shows the moment.
+  - Serve `final` and score a goal at T2. Over `FINAL_HOLD_MS`, the slab never appears (poll every
+    250 ms and assert none is attached). Final drops the moment.
 
 **Mutants** (spec §5's list, plus this task's guards). Restore each from a `cp` backup.
 
@@ -382,11 +398,12 @@ inside the template (AGENTS.md class 2), and the scene card's box doesn't inters
 | M4 | the scene layer mounts without `host=compositor` (and without a `sceneOverride`); also: the page passes `sceneOverride` | A1's `null` rows, E5; a page test that asserts the stage element rendered by `page.tsx` has no `sceneOverride` prop |
 | M5 | fallback never engages (failures never switch to `web`) | A2, E6 |
 | M6 | moments suppressed during `reconnecting` (discard in every scene) | A3, E7 |
-| M7 | no discard in `starting` | A3, E7's last line |
+| M7 | (rewritten 2026-10-16, D14) moments suppressed during Starting soon (`starting` discards, or declared `momentsFire: false`) | A3's `starting` row and its declaration row, E7's Starting-soon leg |
 | M8 | the overlay route adds `programmePhase` without the relay check | A4 |
 | M9 | `web` not sticky (a later `loopbackOk` switches back) | A2, E6's handler count |
 | M10 | "not ended" read as `state === "live"` (refuses `ending`) | page test 5b, A4's `ending` row, E6's hold leg |
 | M11 | the reply validator dropped (any JSON is a phase) | A2's validator rows |
+| M12 | (added 2026-10-16) no discard in `final` (moments fire in every scene) | A3's `final` row and its declaration row, E7's Final leg |
 
 ### Not this task
 

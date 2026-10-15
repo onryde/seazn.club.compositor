@@ -216,7 +216,8 @@ fly/stg.toml, fly/prod.toml        (C16)
 | C15 | Soak | compositor | C14 | `tasks/C15-soak.md` |
 | R2003 | Runner `on-failure`, same-attempt sweep, 15 s composed stale, exit 78 never retries | seazn.club | R2002 | `tasks/R2003-runner-restart-and-beats.md` |
 | R2007 | **New 2026-10-15.** PR A: the overlay template registry, text floor and bar lift, `/admin/overlay-gallery`, `OverlayPreview`. PR B: the owed R2002 contract follow-up (`final`, `phaseChannel`, the phase endpoint `$defs`) | seazn.club | PR A: the end-card-undo fix (`fix/overlay-end-card-undo`) merged. PR B: **R2003 (#967) merged** (corrected by the briefs review: they share three files) | `tasks/R2007-overlay-template-system.md` |
-| R2004 PR 0 | **New 2026-10-15.** The relay stop contract, its own small web PR: composed Machines get `stop_config { signal: "SIGTERM" }` while web's stop stays an explicit SIGINT (coordinator decision I4), a measured signal-precedence F-id, and the grace raised to 20 s (**OWNER DECISION PENDING**) | seazn.club | R2003 (#967) merged. **Not** R2007 or the undo fix | `tasks/R2004-input-b-provisioning.md` ("PR 0") |
+| R2004 PR 0 | **New 2026-10-15.** The relay stop contract, its own small web PR: composed Machines get `stop_config { signal: "SIGTERM" }` while web's stop stays an explicit SIGINT (coordinator decision I4), a measured signal-precedence F-id, and the grace raised to 20 s (**owner ruling 2026-10-16, spec D15**) | seazn.club | R2003 (#967) merged. **Not** R2007 or the undo fix | `tasks/R2004-input-b-provisioning.md` ("PR 0") |
+| R2003b | **New 2026-10-16 (owner-approved follow-up).** Crash-loop cap: a session fails as `machine_crash` after 3 fatal crashes, with a schema addition | seazn.club | R2003 (#967) merged. It touches `server/relay/*`, so the coordinator places it in the web relay merge order when dispatching | none here (dispatched separately by the coordinator) |
 | R2004 | Composed provisioning: Input B, composed session facts, delay column. **Amended 2026-10-15:** `template=` in `overlayUrl`, the stored choice | seazn.club | R2003, **C00 F-002**, **R2007 PR A**, **R2004 PR 0 and R2007 PR B merged** (shared files; merge order under "Parallel lanes") | `tasks/R2004-input-b-provisioning.md` |
 | R2005 | Overlay page: `sid`+`st` access, `host=compositor` signals, stale, clamp. **Amended 2026-10-15:** scenes, cards, the phase channel with fallback B | seazn.club | R2004, **C00 F-001**, **R2007 PR A + PR B**, **C11 Step 0 finding** | `tasks/R2005-overlay-page-compositor-host.md` |
 | R2006 | Organiser UI: composed option + delay override. **Amended 2026-10-15:** the template picker with live previews, persisted | seazn.club | R2004, R2005, **R2007 PR A + PR B** | `tasks/R2006-organiser-composed-ui.md` |
@@ -275,7 +276,7 @@ end-card-undo fix ──▶ R2007 PR A ──┬──▶ R2004 (+ R2003, C00 F-
                                    ├──▶ R2005 (+ R2004, C00 F-001, C11 Step 0, R2007 PR B)
                                    └──▶ R2006 (+ R2004, R2005, R2007 PR B)
 R2003 (#967) ──┬──▶ R2007 PR B ──▶ C07 vendors the contract ──▶ C08 ──▶ … ──▶ C12
-               └──▶ R2004 PR 0 (stop contract; grace OWNER-PENDING) ──────────▶ C12
+               └──▶ R2004 PR 0 (stop contract; grace 20 s, ruled D15) ───────▶ C12
 C00 PASS ──▶ C11 Step 0 (_FINDINGS F-0xx) ──▶ R2005
 ```
 

@@ -818,11 +818,10 @@ The `ending` heartbeat reply can arrive up to one beat (5 s) after the signal, o
 
   Until PR 0 ships, a Fly-initiated stop arrives as SIGINT and shows the Final card. That's
   cosmetic, and C17 must not run before PR 0.
-- **Budget:** hold 10 000 + `drain_timeout_ms` 7 000 = 17 s, and R1 grants 10 s. **OWNER DECISION
-  PENDING**, owed through R2004's PR 0 Part 2. The recommendation there is to raise R1's grace to
-  20 s; it is a recommendation, not a ruling. C12's
-  `final_hold_and_drain_fit_inside_r1_stop_grace` stays red until web ships the owner's pick, so the
-  budget can't be forgotten. This task does **not** shorten the hold on its own.
+- **Budget:** hold 10 000 + `drain_timeout_ms` 7 000 = 17 s, and R1 grants 10 s today. **Ruled:**
+  `RUNNER_STOP_GRACE_SECONDS` = 20 (owner ruling 2026-10-16, spec D15 (`seazn.club` PR #969, `9bf31b38a`)), which fits hold 10 + drain 7 + headroom 3. R2004's PR 0
+  Part 2 ships it. C12's `final_hold_and_drain_fit_inside_r1_stop_grace` stays red until PR 0 is
+  deployed, so the budget can't be forgotten. The hold stays at 10 s.
 
 ### `programme.rs` (C03's module)
 

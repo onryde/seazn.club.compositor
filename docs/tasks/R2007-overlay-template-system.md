@@ -114,6 +114,12 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
 7. **Moment samples:** at least one per `(sport, rule key)` in `MOMENT_RULES`, and three for cricket's
    `cricket.ball` (six, four, wicket: spec §4.8 names all three), so 19 samples at pin. Each sample is
    a `RecentEvent`; the gallery derives the slab from it through the real `momentsFor`.
+8. **(Added 2026-10-16) Which scenes show moments is declared once, on the scene entry.** Owner
+   ruling D14 (spec §4.8 at `seazn.club` `9bf31b38a`, PR #969): moments **fire** during Starting soon
+   and Reconnecting, and only Final drops them. Each `OVERLAY_SCENES` entry carries
+   `momentsFire: boolean`. This task's one scene, `live`, is `true`, and R2005 appends `starting`
+   (`true`, D14), `reconnecting` (`true`, §4.8) and `final` (`false`, §4.8). The gallery's moment cells
+   and R2005's stage discard rule both read that field, so the rule has one authority.
 
 ## Files (PR A)
 
@@ -201,7 +207,9 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
   export function cardRegionFor(box: CanvasBox): CanvasBox | null;
 
   // components/overlay/overlay-scenes.ts
-  export const OVERLAY_SCENES = [{ id: "live", labelKey: "stream.scene.live" }] as const; // R2005 appends starting, reconnecting, final
+  /** Decision 8: `momentsFire` is the one authority for whether moment slabs show in a scene (D14, §4.8). */
+  export interface OverlaySceneDef { id: string; labelKey: string; momentsFire: boolean }
+  export const OVERLAY_SCENES = [{ id: "live", labelKey: "stream.scene.live", momentsFire: true }] as const satisfies readonly OverlaySceneDef[]; // R2005 appends starting (true), reconnecting (true), final (false)
   export type SceneId = (typeof OVERLAY_SCENES)[number]["id"];
 
   // components/overlay/overlay-preview.tsx
@@ -233,9 +241,10 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
   export const GALLERY_RESULT_VARIANT_SPORTS = ["cricket", "badminton"] as const;
   export interface GalleryCell { key: string; templateId: string; sportKey: string; scene: SceneId; snapshot: GallerySnapshotKind; momentSampleId: string | null; resultStatus: string | null }
   /** Plain cells: every non-retired template suiting the sport × sport × scene × snapshot kind.
-   *  Moment cells: every non-retired template suiting the sample's sport × sample (scene "live", snapshot "live").
+   *  Moment cells: every non-retired template suiting the sample's sport × sample × every scene whose
+   *  `momentsFire` is true (snapshot "live"; decision 8). A scene with `momentsFire: false` gets none.
    *  Variant cells: every non-retired template suiting the variant's sport × variant (scene "live", snapshot "ended"). */
-  export function galleryMatrix(registry: TemplateRegistry, sports: readonly string[], scenes: readonly SceneId[], samples: readonly MomentSample[], variants: readonly ResultVariant[]): GalleryCell[];
+  export function galleryMatrix(registry: TemplateRegistry, sports: readonly string[], scenes: readonly OverlaySceneDef[], samples: readonly MomentSample[], variants: readonly ResultVariant[]): GalleryCell[];
   /** The gallery's ONE cell source (review I3): `galleryMatrix` over the shipped sports, scenes and samples.
    *  The page calls it with `OVERLAY_TEMPLATES`, and the extensibility test with a probe registry. */
   export function galleryCells(registry: TemplateRegistry, variants: readonly ResultVariant[]): GalleryCell[];
@@ -305,7 +314,8 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
   - `templatesForSportFrom(REG, "badminton")` ends with `probe`; for cricket it doesn't contain it
   - `galleryCells(REG, VARIANTS)`, with `VARIANTS = [{ status: "walkover", sportKey: "badminton" }]`
     typed in the test, has exactly `OVERLAY_SCENES.length × GALLERY_SNAPSHOT_KINDS.length` plain cells
-    for `probe`, all badminton, plus one moment cell per badminton sample, plus one variant cell, and
+    for `probe`, all badminton, plus one moment cell per badminton sample × `momentsFire` scene, plus
+    one variant cell, and
     **no** cricket cell for `probe`. Compute the expected counts from the declarations
     (`OVERLAY_SCENES`, `GALLERY_SNAPSHOT_KINDS`, the samples filtered by sport, `VARIANTS`), never from
     `galleryCells`'s output.
@@ -379,8 +389,16 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
        returns at least one moment, using the real `en/public.json` dictionary for `msg`. Cricket's
        three samples must yield the six, four and out headlines (`overlay.moment.six`, `.four`, `.out`).
      - Matrix size equals the sum, over sports, of `templatesForSport(sport).length × OVERLAY_SCENES.length × 3`,
-       plus the sum over samples of `templatesForSport(sample.sportKey).length`, plus the sum over the
-       variants passed of `templatesForSport(variant.sportKey).length`. Keys are unique.
+       plus the sum over samples of `templatesForSport(sample.sportKey).length × (the number of
+       OVERLAY_SCENES with momentsFire)`, plus the sum over the variants passed of
+       `templatesForSport(variant.sportKey).length`. Keys are unique.
+     - **(Added 2026-10-16, D14) The scene × moment rule:** call `galleryMatrix` with the scenes
+       `[{ id: "live", …, momentsFire: true }, { id: "held", …, momentsFire: false }]`, typed in the
+       test. Every moment cell's scene is `live`, and the `held` scene has plain cells but **no**
+       moment cell. Then, for every shipped `OVERLAY_SCENES` entry, the moment cells in that scene
+       number `momentsFire ? <samples' template count> : 0`. Print
+       `scenes checked: N, moment-firing: F`; fail if N is 0 or F is 0. When R2005 appends its scenes,
+       this sweep covers Starting soon (fires) and Final (doesn't) with no edit.
   2. `gallery-snapshots.test.ts` (server, node; no DB): `gallerySnapshots()` returns all 11 sports ×
      3 kinds. Print `snapshots: 33`. Run each through the real `overlayModel` (en dictionary) and
      `slateStateOf` (`overlay-slate.tsx:18`), the card layer's own authority, and assert the result
@@ -438,7 +456,7 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
     (`fixture-stream-panel.tsx:566-610`) and renders `<OverlayStage realtime={false} snapshotOnly …/>`.
     It is the **only** preview path: the gallery uses it now, and R2006's picker must use it.
   - `gallery-matrix.ts`: `galleryMatrix`, and `galleryCells(registry, variants)`, which is
-    `galleryMatrix(registry, OVERLAY_SPORT_KEYS, OVERLAY_SCENES.map(s => s.id), GALLERY_MOMENT_SAMPLES, variants)`.
+    `galleryMatrix(registry, OVERLAY_SPORT_KEYS, OVERLAY_SCENES, GALLERY_MOMENT_SAMPLES, variants)`.
     `GALLERY_MOMENT_SAMPLES` (decision 7): each sample's `event` is a
     `RecentEvent` carrying exactly the fields its rule reads (re-pin `server/overlay/recent.ts` for the
     shape, `derived.setWon` / `derived.pointState` included).
@@ -574,7 +592,9 @@ The orchestrator puts these to the owner if a re-pin contradicts them.
   | 9 | `.ovl-slate-content` back to `inset: 0` + bar padding (ignores the card variables) | CSS card guard and e2e check 4 (bug cells) |
   | 10 | `cardRegionFor` ignores `box` (always the strip above a bar) | step 1.7, the extensibility card leg, e2e check 4 |
 
-  Record all 10 in the commit body.
+  | 11 | (Added 2026-10-16, D14) `galleryMatrix` ignores `momentsFire` (moment cells in every scene) | step 5.1's scene × moment rule (the `held` scene gets moment cells) |
+
+  Record all 11 in the commit body.
 
 - [ ] **Step 14: Owner visual review.** Screenshots at 1280 of the gallery, at `frame=full`, `844`
   and `390`, cropped per template × sport. Post them in the PR comment, **never committed**
@@ -671,7 +691,7 @@ The PR body gives the contract sha256 and the web commit sha that C07 pins.
   gallery matrix with no other edit; the CSS scan and the computed sweep pass with non-zero counts;
   `/admin/overlay-gallery` renders every cell at 1280; cards are laid out from `sceneCardSafeArea`
   and check 4 covers every card in every cell; the existing overlay e2e is green and unchanged apart
-  from the new cases; smoke extended; 10 mutants red; owner verdicts per screen; the OBS
+  from the new cases; smoke extended; 11 mutants red; owner verdicts per screen; the OBS
   compatibility record (step 14b) exists.
 - PR B: merged before C07 vendors; the contract sha is in the PR body; 2 mutants red.
 - The false premises and the resolved ambiguities (decisions 2–4, the card/bug answer) are in the PR

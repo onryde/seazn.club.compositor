@@ -2,7 +2,8 @@
 
 **Repo:** `seazn.club.compositor`. **Depends on:** C10, C11. Read F-001 (gstcefsrc commit and CEF
 version) and F-005 (cold start). **Amended 2026-10-15:** also **R2004's PR 0** (the standalone web
-"relay stop contract" PR: the SIGTERM `stop_config`, and the grace if the owner picks A) deployed to
+"relay stop contract" PR: the SIGTERM `stop_config`, and the 20 s grace ruled by the owner on
+2026-10-16, spec D15) deployed to
 stg, and C11 Step 0's loopback finding. (Corrected 2026-10-15, review m9: C12 waits on PR 0 alone,
 not on R2004 or R2007.) See "Amendment 2026-10-15 (overlay templates spec)" at the end.
 
@@ -15,7 +16,7 @@ re-pin before relying on it) creates the Machine with:
 - `env: { SESSION_ID, JOB_TOKEN, APP_URL, RELAY_DEADLINE_AT }`. `RELAY_DEADLINE_AT` is an **ISO-8601
   string** from `Date.toISOString()`, e.g. `2026-10-14T18:30:00.000Z`.
 - the stop signal is `SIGINT` (`config.ts` `RUNNER_STOP_SIGNAL`), with a grace of
-  `RUNNER_STOP_GRACE_SECONDS = 10`
+  `RUNNER_STOP_GRACE_SECONDS = 10` (20 after R2004 PR 0: owner ruling 2026-10-16, spec D15)
 - **(Amended 2026-10-15, coordinator decision I4)** after R2004's PR 0, also
   `stop_config: { signal: "SIGTERM", timeout: <grace> }`. So web's own stop (an explicit
   `signal: "SIGINT"` on the stop call) arrives as SIGINT, while a Fly-initiated stop (deploy,
@@ -44,7 +45,8 @@ dedicated thread. A second signal during drain is ignored. (Amended 2026-10-15: 
 C06's final hold and `SIGTERM` still drains at once; a second `SIGINT` during the hold is ignored.) The domain owns the drain deadline
 (C06 `drain_timeout_ms`, which must be below the 10 s grace; **assert that in a test here**, deriving
 10 s from a constant `R1_STOP_GRACE_MS` in `crates/compositor/src/main.rs` with a doc line citing
-`config.ts RUNNER_STOP_GRACE_SECONDS`).
+`config.ts RUNNER_STOP_GRACE_SECONDS`). (Amended 2026-10-16: the grace is 20 s by owner ruling, spec
+D15, and the test is the amendment's `final_hold_and_drain_fit_inside_r1_stop_grace`.)
 
 ### Process priorities (spec §6)
 
@@ -266,7 +268,7 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
 - `image.yml` is green on the PR: plugin present, ~~7~~ 8 cef tests, smoke exits 0, size under the cap.
 - ~~3~~ 8 mutants went red (amended 2026-10-15).
 - (Amended 2026-10-15) The phase endpoint tests pass, and `final_hold_and_drain_fit_inside_r1_stop_grace`
-  is green against the owner's pick. It is never ignored or weakened to get there.
+  is green against the ruled 20 s grace (D15). It is never ignored or weakened to get there.
 - The image runs as non-root.
 
 
@@ -397,12 +399,10 @@ module.
 - `final_hold_and_drain_fit_inside_r1_stop_grace`, replacing the superseded test:
   `t.final_hold_ms + t.drain_timeout_ms + EXIT_HEADROOM_MS <= R1_STOP_GRACE_MS`, where
   `EXIT_HEADROOM_MS = 3_000` (the headroom in `config.rs`'s `drain_timeout_ms` doc line). With R1's grace
-  at 10 s, this is **red** (10 + 7 + 3 = 20 > 10). It goes green only with the owner's pick, which
-  ships in R2004's PR 0 Part 2 (**OWNER DECISION PENDING**; the recommendation is A, not a ruling):
-  - **(A)** set `R1_STOP_GRACE_MS` to the new web value, citing the web commit that changed
-    `RUNNER_STOP_GRACE_SECONDS`. This PR merges only after that web change is deployed to stg, because
-    otherwise Fly kills mid-drain.
-  - **(B)** C06's `final_hold_ms` and its spec-number test change by owner ruling.
+  at 10 s, this is **red** (10 + 7 + 3 = 20 > 10). It goes green with the ruled 20 s grace
+  (owner ruling 2026-10-16, spec D15 (`seazn.club` PR #969, `9bf31b38a`)), which ships in R2004's PR 0 Part 2: set `R1_STOP_GRACE_MS` to `20_000`, citing D15 and the
+  web commit that changed `RUNNER_STOP_GRACE_SECONDS`. This PR merges only after that web change is
+  deployed to stg, because otherwise Fly kills mid-drain.
 
   Never `#[ignore]` it.
 
