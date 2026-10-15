@@ -71,7 +71,7 @@ def main():
         desc += (
             "t. ! queue max-size-buffers=4 leaky=downstream ! mix.sink_1 "
             f"videotestsrc is-live=true pattern=black ! video/x-raw,format=BGRA,width={W},height={H},framerate=30/1 ! mix.sink_0 "
-            "compositor name=mix background=black sink_1::zorder=1 "
+            "compositor name=mix background=black sink_0::zorder=0 sink_1::zorder=1 "
             f"! video/x-raw,format=BGRA,width={W},height={H},framerate=30/1 "
             "! appsink name=mixed sync=false emit-signals=true max-buffers=4 drop=true "
         )
@@ -88,6 +88,11 @@ def main():
         b = s.get_buffer()
         now = time.monotonic()
         with lock:
+            if b.get_size() != W * H * 4:
+                st["bad_size"] = st.get("bad_size", 0) + 1
+            if b.pts == Gst.CLOCK_TIME_NONE:
+                st["no_pts"] = st.get("no_pts", 0) + 1
+            st["last_buf"] = b
             if st["first_buffer_s"] is None:
                 st["first_buffer_s"] = now - t0
                 st["first_buffer_wall"] = time.time()
@@ -141,7 +146,7 @@ def main():
             msgs.append({"t": t, "type": "progress", "ptype": typ.value_nick, "code": code, "text": text})
         elif m.type == Gst.MessageType.ERROR:
             e, dbg = m.parse_error()
-            msgs.append({"t": t, "type": "error", "src": m.src.get_name(), "text": e.message})
+            msgs.append({"t": t, "type": "error", "src": m.src.get_name(), "text": e.message, "debug": (dbg or "")[:240]})
         elif m.type == Gst.MessageType.WARNING:
             e, dbg = m.parse_warning()
             msgs.append({"t": t, "type": "warning", "src": m.src.get_name(), "text": e.message})
@@ -195,12 +200,27 @@ def main():
     while ctx.iteration(False):
         pass
 
+    if st["probes_raw"] is None and st.get("last_buf") is not None:
+        # a static page paints rarely: probe (and dump) the last frame it did paint
+        ok, mi = st["last_buf"].map(Gst.MapFlags.READ)
+        if ok:
+            data = bytes(mi.data)
+            st["last_buf"].unmap(mi)
+            st["probes_raw"] = {n: px(data, x, y) for n, x, y, _, _ in PROBES}
+            st["probes_raw_from"] = "last frame"
+            if a.dump_dir:
+                p = os.path.join(a.dump_dir, f"{a.tag or 'cef'}-raw.bgra")
+                with open(p, "wb") as f:
+                    f.write(data)
+                st["dumped"].append(p)
     arr = st["arrivals"]
     res = {"tag": a.tag, "js_ready": a.js_ready, "composite": a.composite, "wall_start": round(wall0, 3)}
     res["set_state_playing"] = play
     res["first_buffer_s"] = None if st["first_buffer_s"] is None else round(st["first_buffer_s"], 3)
     res["first_buffer_wall"] = st["first_buffer_wall"]
     res["buffers"] = len(arr)
+    res["buffers_wrong_size"] = st.get("bad_size", 0)
+    res["buffers_without_pts"] = st.get("no_pts", 0)
     if len(arr) >= 2:
         span = arr[-1] - arr[0]
         gaps = [(arr[i] - arr[i - 1]) * 1000 for i in range(1, len(arr))]
@@ -222,6 +242,7 @@ def main():
             "gap_ms_mean": round(statistics.mean(gaps), 2),
         })
     res["probes_raw"] = st["probes_raw"]
+    res["probes_raw_from"] = st.get("probes_raw_from", f"frame at +{a.dump_at}s")
     res["probes_mixed"] = st["probes_mixed"]
     res["mixed_buffers"] = st["mixed_count"]
     res["expected"] = {n: {"straight": s, "premultiplied": p} for n, _, _, s, p in PROBES}

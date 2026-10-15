@@ -14,6 +14,7 @@ argv[0] basenames and Chromium `--type=` values, never full command lines.
 import argparse
 import json
 import os
+import re
 import statistics
 import time
 
@@ -67,15 +68,12 @@ def proc_info(pid):
     for line in sr.splitlines():
         if line.startswith("Pss:"):
             pss = int(line.split()[1])
-    cmd = (read(f"/proc/{pid}/cmdline") or "").split("\0")
-    name = os.path.basename(cmd[0]) if cmd and cmd[0] else s[s.find("(") + 1:s.rfind(")")]
+    # Chromium rewrites its argv in place (process title), so read comm, and find --type= anywhere.
+    name = (read(f"/proc/{pid}/comm") or "?").strip()
     if name.startswith("python"):
         name = "host(python)"
-    typ = ""
-    for a in cmd:
-        if a.startswith("--type="):
-            typ = a[len("--type="):]
-    return ticks, rss, pss, f"{name}{'[' + typ + ']' if typ else ''}"
+    m = re.search(r"--type=([a-z-]+)", read(f"/proc/{pid}/cmdline") or "")
+    return ticks, rss, pss, f"{name}[{m.group(1)}]" if m else name
 
 
 def machine_cpu():

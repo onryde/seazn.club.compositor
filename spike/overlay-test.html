@@ -6,6 +6,7 @@
      Query switches:
        ?noready=1  never send the readiness signal (negative proof)
        ?static=1   no animation at all (measures what cefsrc emits for an idle page)
+       ?stress=1   also repaint a full-frame semi-transparent layer every frame (CEF cost upper bound)
 
      Readiness (pinned in F-001): window.gstSendMsg({request: "ready", ...}) 500 ms after load.
      That function only exists inside cefsrc (injected by gstcefsubprocess's message router). -->
@@ -37,10 +38,14 @@
   <div id="clock" class="abs">0</div>
   <div id="counter" class="abs">0</div>
   <div id="box" class="abs"></div>
+  <div id="stress" class="abs" style="display:none;left:0;top:0;width:1920px;height:1080px;"></div>
 <script>
   const q = new URLSearchParams(location.search);
   const isStatic = q.get("static") === "1";
   const noReady = q.get("noready") === "1";
+  const stress = q.get("stress") === "1";
+  const stressEl = document.getElementById("stress");
+  if (stress) stressEl.style.display = "block";
   let frames = 0;
   const clock = document.getElementById("clock");
   const counter = document.getElementById("counter");
@@ -51,6 +56,10 @@
     clock.textContent = String(now);
     counter.textContent = "f" + frames;
     box.style.transform = "translateX(" + ((now / 4) % 1700) + "px)";
+    if (stress) {
+      const h = (now / 10) % 360;
+      stressEl.style.background = "linear-gradient(" + h + "deg, hsla(" + h + ",80%,50%,0.35), hsla(" + ((h + 180) % 360) + ",80%,50%,0.15))";
+    }
     requestAnimationFrame(tick);
   }
   if (!isStatic) requestAnimationFrame(tick);
