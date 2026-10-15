@@ -6,7 +6,7 @@
   srtsrc($SPIKE_A_SRT_PLAY_URL) ! tsdemux
      video -> h264parse -> avdec_h264 -> videoconvert -> videoscale -> I420 WxH -> queue qcam(leaky) -> mix.sink_0
      audio -> fakesink (camera audio is not used here)
-  cefsrc(overlay, listen-for-js-signals=true, max-video-framerate=30/1) BGRA 1920x1080 -> queue qgfx(leaky) -> mix.sink_1 (scaled by the pad to WxH)
+  cefsrc(overlay, listen-for-js-signals=false by default, max-video-framerate=30/1) BGRA 1920x1080 -> queue qgfx(leaky) -> mix.sink_1 (scaled by the pad to WxH)
   compositor(AYUV WxH @30) -> videoconvert -> I420 -> queue qenc(leaky=downstream, 30 buffers)
      -> x264enc (C09 settings) -> h264parse -> flvmux -> rtmp2sink($SPIKE_B_RTMPS_URL)
   audiotestsrc(silence) -> voaacenc 128k -> flvmux
@@ -40,13 +40,20 @@ def main():
     ap.add_argument("--seconds", type=float, default=290)
     ap.add_argument("--overlay", default="file:///spike/overlay-test.html")
     ap.add_argument("--warmup", type=float, default=15)
-    ap.add_argument("--no-js-ready", action="store_true", help="page does not signal (e.g. today's stg overlay)")
+    ap.add_argument("--js-ready", action="store_true", help="listen-for-js-signals=true (F-001: errors beside other live sources)")
     ap.add_argument("--snapshot", default="", help="write one raw AYUV compositor frame here at --snapshot-at s")
     ap.add_argument("--snapshot-at", type=float, default=60)
+    # encoder knobs (YouTube health follow-up): defaults are the C09 settings measured in F-005
+    ap.add_argument("--x264-bitrate", type=int, default=0, help="kbps; 0 = profile default (720: 4000, 1080: 6000)")
+    ap.add_argument("--x264-opts", default="nal-hrd=cbr:filler=1", help="x264enc option-string")
+    ap.add_argument("--vbv-ms", type=int, default=1000, help="x264enc vbv-buf-capacity in ms; -1 = leave at element default")
+    ap.add_argument("--bg", choices=["camera", "snow"], default="camera",
+                    help="camera = SRT playback of Input A; snow = local high-entropy videotestsrc (diagnostic)")
     a = ap.parse_args()
     H = a.height
     W = 1280 if H == 720 else 1920
     fps = 30
+    kbps = a.x264_bitrate or KBPS[H]
 
     play = os.environ.get("SPIKE_A_SRT_PLAY_URL")
     out = os.environ.get("SPIKE_B_RTMPS_URL")
@@ -56,23 +63,27 @@ def main():
 
     Gst.init(None)
     desc = (
-        "srtsrc name=src ! queue name=qsrt ! tsdemux name=demux "
+        ("srtsrc name=src ! queue name=qsrt ! tsdemux name=demux " if a.bg == "camera" else
+         f"videotestsrc name=bg is-live=true pattern=snow ! video/x-raw,format=I420,width={W},height={H},framerate={fps}/1 "
+         f"! queue name=qcam leaky=downstream max-size-buffers={fps} max-size-bytes=0 max-size-time=0 ! mix.sink_0 ") +
         f'cefsrc name=cef url="{a.overlay}" max-video-framerate=30/1 '
-        f"listen-for-js-signals={'false' if a.no_js_ready else 'true'} "
+        f"listen-for-js-signals={'true' if a.js_ready else 'false'} "
         "! video/x-raw,format=BGRA,width=1920,height=1080 "
         "! queue name=qgfx leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 ! mix.sink_1 "
         f"compositor name=mix background=black sink_0::zorder=0 sink_1::zorder=1 sink_1::width={W} sink_1::height={H} "
         f"! video/x-raw,format=AYUV,width={W},height={H},framerate={fps}/1 ! videoconvert ! video/x-raw,format=I420 "
         f"! queue name=qenc leaky=downstream max-size-buffers={fps} max-size-bytes=0 max-size-time=0 "
-        f"! x264enc name=enc tune=zerolatency speed-preset=veryfast bitrate={KBPS[H]} key-int-max={fps * 2} bframes=0 "
-        'vbv-buf-capacity=1000 option-string="nal-hrd=cbr:filler=1" '
+        f"! x264enc name=enc tune=zerolatency speed-preset=veryfast bitrate={kbps} key-int-max={fps * 2} bframes=0 "
+        + (f"vbv-buf-capacity={a.vbv_ms} " if a.vbv_ms >= 0 else "")
+        + (f'option-string="{a.x264_opts}" ' if a.x264_opts else "") +
         "! video/x-h264,profile=main ! h264parse config-interval=-1 ! queue name=qmux "
         "! flvmux name=mux streamable=true ! rtmp2sink name=out "
         "audiotestsrc is-live=true wave=silence ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 "
         "! voaacenc bitrate=128000 ! aacparse ! queue ! mux. "
     )
     pipe = Gst.parse_launch(desc)
-    pipe.get_by_name("src").set_property("uri", play)
+    if a.bg == "camera":
+        pipe.get_by_name("src").set_property("uri", play)
     pipe.get_by_name("out").set_property("location", out)
     del play, out
 
@@ -80,7 +91,7 @@ def main():
     t0 = time.monotonic()
     wall0 = time.time()
     lock = threading.Lock()
-    c = {"enc": [], "mix": 0, "cam": 0, "cef": 0, "over": {"qcam": [], "qgfx": [], "qenc": []},
+    c = {"enc": [], "kf": [], "pts": [], "bytes": 0, "filler_bytes": 0, "sei_bytes": 0, "mix": 0, "cam": 0, "cef": 0, "over": {"qcam": [], "qgfx": [], "qenc": []},
          "qos": 0, "first_enc_s": None, "first_cam_s": None, "first_cef_s": None}
 
     def counter(key, first=None):
@@ -92,10 +103,48 @@ def main():
             return Gst.PadProbeReturn.OK
         return probe
 
-    def enc_probe(_pad, _info):
+    def nal_sizes(data):
+        """(nal_type, size) for each NAL in an access unit, Annex-B or 4-byte AVC length-prefixed."""
+        out = []
+        if data[:4] == b"\x00\x00\x00\x01" or data[:3] == b"\x00\x00\x01":
+            starts, i = [], 0
+            while True:
+                j = data.find(b"\x00\x00\x01", i)
+                if j < 0:
+                    break
+                starts.append(j + 3)
+                i = j + 3
+            for k, st in enumerate(starts):
+                end = (starts[k + 1] - 3) if k + 1 < len(starts) else len(data)
+                out.append((data[st] & 0x1F, end - st))
+        else:
+            i = 0
+            while i + 4 <= len(data):
+                n = int.from_bytes(data[i:i + 4], "big")
+                if n <= 0 or i + 4 + n > len(data):
+                    break
+                out.append((data[i + 4] & 0x1F, n))
+                i += 4 + n
+        return out
+
+    def enc_probe(_pad, info):
         now = time.monotonic()
+        b = info.get_buffer()
+        key = not b.has_flags(Gst.BufferFlags.DELTA_UNIT)
+        ok, mi = b.map(Gst.MapFlags.READ)
+        nals = nal_sizes(bytes(mi.data)) if ok else []
+        size = b.get_size()
+        if ok:
+            b.unmap(mi)
         with lock:
             c["enc"].append(now)
+            c["pts"].append(b.pts)
+            if key:
+                c["kf"].append(len(c["enc"]) - 1)
+            if now - t0 > a.warmup:
+                c["bytes"] += size
+                c["filler_bytes"] += sum(n for t, n in nals if t == 12)
+                c["sei_bytes"] += sum(n for t, n in nals if t == 6)
             if c["first_enc_s"] is None:
                 c["first_enc_s"] = now - t0
         return Gst.PadProbeReturn.OK
@@ -158,7 +207,11 @@ def main():
             s.sync_state_with_parent()
             pad.link(s.get_static_pad("sink"))
 
-    pipe.get_by_name("demux").connect("pad-added", on_pad)
+    if a.bg == "camera":
+        pipe.get_by_name("demux").connect("pad-added", on_pad)
+    else:
+        pipe.get_by_name("bg").get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, counter("cam", "first_cam_s"))
+        pipe.get_by_name("qcam").connect("overrun", overrun("qcam"))
 
     msgs = []
     loop = GLib.MainLoop()
@@ -188,7 +241,9 @@ def main():
     def acked_bytes():
         try:
             s = out_el.get_property("stats")
-            ok, v = s.get_uint64("out-bytes-acked")
+            # CF's RTMP ingest sent no acknowledgements in a 50 s control run (out-bytes-acked stayed 0),
+            # so egress is measured on bytes SENT.
+            ok, v = s.get_uint64("out-bytes-total")
             return v if ok else None
         except Exception:  # noqa: BLE001
             return None
@@ -215,7 +270,8 @@ def main():
         return True
 
     GLib.timeout_add_seconds(10, report)
-    print("CHAINSTART " + json.dumps({"t": round(wall0, 3), "w": W, "h": H, "kbps": KBPS[H]}), flush=True)
+    print("CHAINSTART " + json.dumps({"t": round(wall0, 3), "w": W, "h": H, "kbps": kbps, "x264_opts": a.x264_opts,
+                                      "vbv_ms": a.vbv_ms, "bg": a.bg}), flush=True)
     pipe.set_state(Gst.State.PLAYING)
     loop.run()
     end = time.monotonic()
@@ -230,8 +286,30 @@ def main():
     span = (enc_steady[-1] - enc_steady[0]) if len(enc_steady) > 1 else 0
     enc_fps = (len(enc_steady) - 1) / span if span else None
     over_steady = {k: sum(1 for x in v if x > a.warmup) for k, v in c["over"].items()}
+    # keyframe interval (frames, and seconds by PTS) and media-time vs wall-time over the steady window
+    kf = c["kf"]
+    kf_frames = [y - x for x, y in zip(kf, kf[1:])]
+    pts = c["pts"]
+    kf_secs = [(pts[y] - pts[x]) / 1e9 for x, y in zip(kf, kf[1:]) if pts[x] != Gst.CLOCK_TIME_NONE and pts[y] != Gst.CLOCK_TIME_NONE]
+    idx = [i for i, x in enumerate(enc) if x - t0 > a.warmup]
+    media_per_wall = None
+    if len(idx) > 1 and pts[idx[0]] != Gst.CLOCK_TIME_NONE and pts[idx[-1]] != Gst.CLOCK_TIME_NONE:
+        media_per_wall = round(((pts[idx[-1]] - pts[idx[0]]) / 1e9) / (enc[idx[-1]] - enc[idx[0]]), 4)
+    steady_s = (enc[idx[-1]] - enc[idx[0]]) if len(idx) > 1 else 0
+    def kb(x):
+        return round(x * 8 / 1000 / steady_s, 1) if steady_s else None
+    encoder_bits = {
+        "video_kbps_total": kb(c["bytes"]), "filler_kbps": kb(c["filler_bytes"]), "sei_kbps": kb(c["sei_bytes"]),
+        "video_kbps_excluding_filler": kb(c["bytes"] - c["filler_bytes"]),
+        "filler_share": round(c["filler_bytes"] / c["bytes"], 4) if c["bytes"] else None,
+        "keyframes": len(kf), "keyframe_interval_frames": sorted(set(kf_frames))[:8],
+        "keyframe_interval_s_max": round(max(kf_secs), 3) if kf_secs else None,
+        "keyframe_interval_s_min": round(min(kf_secs), 3) if kf_secs else None,
+        "media_seconds_per_wall_second": media_per_wall,
+    }
     res = {
-        "wall_start": round(wall0, 3), "w": W, "h": H, "kbps": KBPS[H], "ran_s": round(end - t0, 1),
+        "wall_start": round(wall0, 3), "w": W, "h": H, "kbps": kbps, "x264_opts": a.x264_opts, "vbv_ms": a.vbv_ms, "bg": a.bg,
+        "encoder_bits": encoder_bits, "ran_s": round(end - t0, 1),
         "first_cam_frame_s": None if c["first_cam_s"] is None else round(c["first_cam_s"], 2),
         "first_cef_frame_s": None if c["first_cef_s"] is None else round(c["first_cef_s"], 2),
         "first_enc_frame_s": None if c["first_enc_s"] is None else round(c["first_enc_s"], 2),

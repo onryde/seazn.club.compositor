@@ -6,7 +6,6 @@ redact_all "item5-$H.log"
 start_xvfb
 echo "ITEM5 start $(date -u +%FT%TZ) h=$H secs=$SECS"
 EXTRA=()
-case "$OV" in file://*) ;; *) EXTRA=(--no-js-ready);; esac
 "${AS[@]}" python3 "$SPIKE_DIR/chain.py" --height "$H" --seconds "$SECS" --overlay "$OV" "${EXTRA[@]}" \
   --snapshot "$OUT/item5-$H.ayuv" --snapshot-at 60 > >(python3 -u "$SPIKE_DIR/redact.py" > "$OUT/item5-$H.raw") 2>&1 &
 CP=$!   # the runuser/python pid itself (process substitution keeps $! on the chain, not the redactor)
