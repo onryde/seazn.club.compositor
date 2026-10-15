@@ -46,6 +46,10 @@ the viewer sees**, **what to check**, and **what to do**.
 | Machine exit 70 | fatal: programme start failed |
 
 Also include:
+- the **YouTube settings organisers should use** (owner ruling 2026-10-15): stream latency **Normal**.
+  The score is burned into the picture, so latency never desyncs it, and Normal rebuffers least on
+  phones and club Wi-Fi. The cost: YouTube runs ~15–30 s behind the public fixture page's live
+  score. Add auto-stop guidance from C00's YouTube gap-tolerance measurement.
 - the **post-match health review**: run `seazn.club` `docs/runbooks/relay-health-review.sql` (R2002)
   against the session id
 - the **rollback**: `promote.yml` with the previous ref (C16)
