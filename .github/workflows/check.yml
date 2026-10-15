@@ -1,0 +1,29 @@
+name: check
+on:
+  push: { branches: [main] }
+  pull_request: {}
+permissions: { contents: read }
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      # An explicit `shell: bash` runs `bash -eo pipefail`. The implicit default is `bash -e` with no
+      # pipefail, under which `cargo test … | tee` exits with tee's 0 and a failing suite passes.
+      run: { shell: bash }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Portability guard (ADR 0007)
+        run: scripts/check-portable.sh
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.91.0", components: "rustfmt, clippy" }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # --show-output prints each guard's "checked N" line on a passing run, too.
+      - run: cargo test --workspace --no-fail-fast -- --show-output 2>&1 | tee test.log
+      - name: Refuse a vacuous run
+        run: |
+          total=$({ grep -Eo 'test result: ok\. [0-9]+ passed' test.log || true; } | awk '{s+=$4} END {print s+0}')
+          echo "tests passed: $total"
+          test "$total" -gt 0

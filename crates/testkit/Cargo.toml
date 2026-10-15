@@ -1,0 +1,15 @@
+[package]
+name = "testkit"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Fakes implement app's port traits, so testkit depends on app. app's dev-dependency on testkit is the
+# conventional Rust cycle, which cargo allows for dev-dependencies.
+[dependencies]
+domain = { path = "../domain" }
+app = { path = "../app" }
