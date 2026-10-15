@@ -732,6 +732,26 @@ gets 410 and exits 0. That sequence is tested here.
 - 4 mutants went red.
 - Purity and deps guards are still green.
 
+
+## Final heartbeat with the exit reason (owner ruling 2026-10-15)
+
+Machine logs disappear when the Machine is destroyed, so the exit cause must reach the DB.
+**Every** path that ends in `Effect::Exit(code)` emits a `SendHeartbeat` first, with
+`state: Stopped` and a new `HealthReport.exit: Option<ExitInfo>`, where
+`pub struct ExitInfo { pub reason: ExitReason, pub detail: Option<String> }`. A draining path
+(`Draining { reason }`) emits it when draining **starts**; an immediate exit (Refused, Fatal) emits it
+in the **same** `Decision`, ordered before `Exit`. `health()` returns `exit: None` in every other state.
+Exception: `SessionGone` (the session GET or heartbeat returned 404) still emits the beat; the adapter
+drops it, because web has nothing to attach it to.
+
+Tests (add to `supervisor_props.rs`):
+- `every_exit_is_preceded_by_a_final_beat_with_its_reason`. Drive each `ExitReason` from its real
+  trigger event (Ending reply → Ended, deadline tick → Deadline, `Signal` → Signalled, 404 → SessionGone,
+  401 at bootstrap → Refused, `ProgrammeStartFailed` → Fatal). Assert the `SendHeartbeat` index is
+  lower than the `Exit` index and that `exit.reason` matches. The test prints `exit paths checked: 6`,
+  and fewer than 6 fails it.
+- **Mutant:** drop the final beat on the Fatal path. Expected red: that test.
+
 ## Do not touch
 
 Earlier modules' public APIs. A change needed there is a deviation: report it, don't make it silently.

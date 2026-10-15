@@ -197,6 +197,20 @@ C17 runs it.
 - The mutant went red.
 - The PR is open, with the sha noted for C07.
 
+
+## Final heartbeat with the exit reason (owner ruling 2026-10-15)
+
+Two more optional, nullable `RelayHeartbeat` fields:
+
+```ts
+exitReason: z.enum(["ended", "deadline", "signalled", "session_gone", "refused", "fatal"]).nullish(),
+exitDetail: z.string().max(200).nullish(),   // compositor-redacted; human text, never parsed
+```
+
+They go everywhere the other new fields go: the schema `$defs`, OpenAPI, `ALLOWED_KEYS`, and both
+stores. Add a `heartbeat-final-fatal.json` fixture and an invalid `exitReason: "crashed"` fixture.
+The health-review SQL selects `exit_reason`. How web **reacts** to a stopped beat stays R2003's job.
+
 ## Do not touch
 
 The composed provisioning (R2004), the runner (R2003), and the UI.

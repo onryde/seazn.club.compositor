@@ -231,6 +231,17 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
 - 3 mutants went red.
 - The image runs as non-root.
 
+
+## Final heartbeat with the exit reason (owner ruling 2026-10-15)
+
+The main loop executes the supervisor's final `SendHeartbeat` before `std::process::exit`. Add to
+the fake-mode smoke a run where fake-control serves `reply-ending.json`, then assert that the last POST
+fake-control received has `state: "stopped"` and `exitReason: "ended"`. Add a second run with
+`ProgrammeStartFailed` forced via the fake driver: exit 70, and the last POST carries
+`exitReason: "fatal"` with a non-empty `exitDetail`.
+Exits **before** a session exists (`EnvError`, exit 78 at config parse) cannot send a beat, because
+they have no URL or token yet. They stay stderr-only, and that's expected, not a gap.
+
 ## Do not touch
 
 Domain and app crates (except to read them), and fly configs (C16).
