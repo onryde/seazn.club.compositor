@@ -119,3 +119,108 @@ fn window_matches_the_reference_model_over_generated_sequences() {
     eprintln!("window model sweep checked {checked} operations");
     assert!(checked > 0, "window model sweep checked 0 operations");
 }
+
+/// The contract as an executable model for ANY arrival order, written without the window's data
+/// structure: on a record at `t`, forget every stamp more than `span` older than `t`, add `t`, and
+/// past `cap` forget the oldest stamp BY VALUE (possibly `t` itself). `held` stays in arrival order,
+/// so the two counters see the cases where "the first to arrive" is not "the oldest": a stale stamp
+/// behind a fresh one, and an eviction that front-eviction would have got wrong.
+struct Model {
+    held: Vec<Ms>,
+    cap: usize,
+    pruned_out_of_turn: usize,
+    evicted_out_of_turn: usize,
+}
+
+impl Model {
+    fn age(now: Ms, s: Ms) -> Ms {
+        now.saturating_sub(s)
+    }
+
+    fn record(&mut self, t: Ms, span: Ms) -> usize {
+        let first_fresh = self.held.iter().position(|&s| Self::age(t, s) <= span);
+        if first_fresh.is_some_and(|f| self.held[f..].iter().any(|&s| Self::age(t, s) > span)) {
+            self.pruned_out_of_turn += 1;
+        }
+        self.held.retain(|&s| Self::age(t, s) <= span);
+        self.held.push(t);
+        if self.held.len() > self.cap {
+            let oldest = self.held.iter().copied().min().expect("held is non-empty");
+            let at = self
+                .held
+                .iter()
+                .position(|&s| s == oldest)
+                .expect("the minimum is held");
+            if at != 0 {
+                self.evicted_out_of_turn += 1;
+            }
+            self.held.remove(at);
+        }
+        self.count(t, span)
+    }
+
+    fn count(&self, now: Ms, span: Ms) -> usize {
+        self.held.iter().filter(|&&s| Self::age(now, s) <= span).count()
+    }
+}
+
+#[test]
+fn window_matches_the_contract_model_when_stamps_arrive_out_of_order() {
+    let mut rng = Lcg(0x0000_0C02_0002);
+    let (mut checked, mut backwards) = (0usize, 0usize);
+    let (mut pruned_out_of_turn, mut evicted_out_of_turn) = (0usize, 0usize);
+    for cap in 1..=6usize {
+        for span in [0, 1, 3, 10, 100] {
+            for _seed in 0..4 {
+                let mut w = Window::new(cap);
+                let mut m = Model {
+                    held: Vec::new(),
+                    cap,
+                    pruned_out_of_turn: 0,
+                    evicted_out_of_turn: 0,
+                };
+                let mut now: Ms = 1_000 + rng.next(1_000);
+                for _op in 0..80 {
+                    if rng.next(4) == 0 {
+                        now = now.saturating_sub([1, span, span + 1, 50][rng.next(4) as usize]);
+                        backwards += 1;
+                    } else {
+                        now += [0, 1, 2, 5, span, span + 1, 37][rng.next(7) as usize];
+                    }
+                    if rng.next(3) < 2 {
+                        let want = m.record(now, span);
+                        assert_eq!(
+                            w.record(now, span),
+                            want,
+                            "record cap={cap} span={span} now={now}"
+                        );
+                    } else {
+                        let want = m.count(now, span);
+                        assert_eq!(w.count(now, span), want, "count cap={cap} span={span} now={now}");
+                    }
+                    let held = w.count(now, Ms::MAX);
+                    assert_eq!(held, m.held.len(), "retained cap={cap} span={span} now={now}");
+                    assert!(held <= cap, "bounded: {held} retained with cap {cap}");
+                    checked += 1;
+                }
+                pruned_out_of_turn += m.pruned_out_of_turn;
+                evicted_out_of_turn += m.evicted_out_of_turn;
+            }
+        }
+    }
+    eprintln!(
+        "out-of-order window sweep checked {checked} operations: {backwards} backward steps, \
+         {pruned_out_of_turn} stale stamps behind a fresh one, {evicted_out_of_turn} evictions of a \
+         stamp that was not the first to arrive"
+    );
+    assert!(checked > 0, "out-of-order window sweep checked 0 operations");
+    assert!(backwards > 0, "the sweep never stepped back in time");
+    assert!(
+        pruned_out_of_turn > 0,
+        "the sweep never put a stale stamp behind a fresh one"
+    );
+    assert!(
+        evicted_out_of_turn > 0,
+        "the sweep never reached an eviction where arrival order is wrong"
+    );
+}

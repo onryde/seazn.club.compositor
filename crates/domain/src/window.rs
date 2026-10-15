@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Window {
+    /// Sorted by value, oldest first, whatever order the stamps were recorded in.
     stamps: VecDeque<Ms>,
     cap: usize,
 }
@@ -17,10 +18,8 @@ impl Window {
         }
     }
 
-    /// Drops the stamps more than `span` old from the front. Stamps on a monotonic clock arrive in time
-    /// order, so the stale ones are all at the front. A reordered stamp can only delay pruning behind
-    /// it; `record` returns `count`, not the buffer length, so the answer never depends on the order,
-    /// and the cap bounds the buffer either way.
+    /// Drops the stamps more than `span` old. The stamps are sorted, so the stale ones (older than
+    /// `now - span`) are a prefix, even after a stamp recorded out of time order.
     fn prune(&mut self, now: Ms, span: Ms) {
         while self.stamps.front().is_some_and(|&s| elapsed(now, s) > span) {
             self.stamps.pop_front();
@@ -28,13 +27,17 @@ impl Window {
     }
 
     /// Records an event at `now` and returns how many events lie within `span`, this one included.
-    /// At the cap the oldest stamp is dropped.
+    /// At the cap the oldest stamp BY VALUE is dropped, never merely the first to arrive. When `now`
+    /// is older than every stamp held, `now` is that oldest stamp, and the cap drops it.
     pub fn record(&mut self, now: Ms, span: Ms) -> usize {
         self.prune(now, span);
-        if self.stamps.len() == self.cap {
+        let at = self.stamps.partition_point(|&s| s <= now);
+        if self.stamps.len() < self.cap {
+            self.stamps.insert(at, now);
+        } else if at > 0 {
             self.stamps.pop_front();
+            self.stamps.insert(at - 1, now);
         }
-        self.stamps.push_back(now);
         self.count(now, span)
     }
 
@@ -188,6 +191,33 @@ mod tests {
         w.record(50, 10);
         assert_eq!(w.record(105, 10), 2);
         assert_eq!(w.count(105, 10), 2);
+    }
+
+    // Arrival order must not change what the cap keeps: 100, 50, 105 holds what 50, 100, 105 holds.
+    // Evicting the FRONT dropped 100 (the first to arrive) and kept the stale 50, and counted 1.
+    #[test]
+    fn at_the_cap_an_out_of_order_stamp_never_evicts_a_newer_one() {
+        let mut late = Window::new(2);
+        late.record(100, 10);
+        late.record(50, 10);
+        assert_eq!(late.record(105, 10), 2, "100 and 105 are inside the span at 105");
+        assert_eq!(late.count(105, 10), 2);
+        let mut ordered = Window::new(2);
+        ordered.record(50, 10);
+        ordered.record(100, 10);
+        assert_eq!(ordered.record(105, 10), 2, "the same stamps in time order");
+    }
+
+    // At the cap the oldest BY VALUE goes, even when that is the stamp being recorded: 100 and 105
+    // stay, the late 50 goes. At 150 with a 50 ms span, 100 and 105 are inside and 50 is not.
+    #[test]
+    fn at_the_cap_a_stamp_older_than_all_held_is_the_one_dropped() {
+        let mut w = Window::new(2);
+        w.record(100, 1_000);
+        w.record(105, 1_000);
+        w.record(50, 1_000);
+        assert_eq!(w.count(150, 50), 2, "100 and 105 are kept");
+        assert_eq!(w.count(150, Ms::MAX), 2, "bounded at the cap");
     }
 
     // time.rs: a reordered stamp has age 0, never a wrapped, huge age.
