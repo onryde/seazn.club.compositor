@@ -277,6 +277,23 @@ repo.
 - The token never appears in errors.
 - 3 mutants went red.
 
+
+## Final heartbeat with the exit reason (owner ruling 2026-10-15)
+
+`heartbeat_wire` emits `exitReason` (snake_case of `ExitReason`) and `exitDetail` only when
+`report.exit` is `Some`. Otherwise both keys are **absent**, never null and never "".
+`exitDetail` = `redact(detail)`, truncated to 200 chars on a char boundary.
+The final beat is **best-effort**: one attempt, 2 s timeout, never retried. Its failure is logged
+(redacted) and never delays `Exit`. A 404 reply to it is not an error.
+
+Tests:
+- The contract test's sweep includes the 6 exit beats, and every one validates against the vendored
+  `heartbeat` def (which gains both fields in R2002).
+- `exit_detail_is_redacted_and_capped`: a detail containing an `rtmps://…/live2/<key>` URL and 500
+  chars. The wire carries no key, and its length is ≤ 200.
+- `non_final_beats_have_no_exit_keys`: assert absence, not null.
+- **Mutant:** skip `redact` on `exitDetail`. Expected red: the redaction test.
+
 ## Do not touch
 
 `contracts/` by hand (only the script writes it), and the domain crate.
