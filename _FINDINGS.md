@@ -316,6 +316,54 @@ The full item (go-live, B-frames question, time to live, health) is owed to an o
 - **C09 acceptance test:** measure the **non-filler** bitrate (bytes outside NAL type 12) on a slate-only run. The current test, "bitrate within ±50 % (CBR filler keeps it near the target)", passes on the wire while YouTube flags Poor.
 - **R2 restart policy (ADR 0004):** a compositor restart, or any output stop, ends the organiser's YouTube broadcast. Whether YouTube resumes the *same* broadcast after a short reconnect is unmeasured.
 
+### Rerun 1, on a clean channel (2026-10-15, 14:05–14:24 London)
+
+**Clean-channel setup:**
+- The fixture's own YouTube output (`YouTubeTest001`, a different channel) was **disabled** in CF by the owner.
+- Only Input B → `r2-c0` reached YouTube.
+- Session `afe2c9f9-…`, input `4e7a53cb9c112620625695e2da31e6b9`, fresh Machine `8747092f6575d8`.
+- The phone stayed **on the laptop clock** (owner decision, so gaps could be timed). The run is therefore a *real camera, low-motion clock scene*, not natural motion.
+
+**Step C**, 14:15:00–14:20:00 London:
+- Settings: C09 (720p30, `bitrate=4000 vbv-buf-capacity=1000 nal-hrd=cbr:filler=1`, keyint 60, bframes 0).
+- **Owner: health "Poor" at about 14:18 (message text pending).**
+- Our side per 10 s window:
+
+| London | Egress kbps | Encoder fps | Camera fps | Overruns | Filler share, cumulative |
+|---|---|---|---|---|---|
+| 14:15:10 | (warm-up) | 27.14 | 22.09 | 0 | — |
+| 14:15:20 | 4208.5 | 30.09 | 29.99 | 0 | 0.0 % |
+| 14:15:30 | 3929.9 | 28.2 | 25.0 | 0 | 2.4 % |
+| 14:15:40–14:17:50 | 4137.8–4338.1 | 29.8–31.6 | 29.2–30.1 | 0 | 1.35 % → 0.22 % |
+| 14:18:00 | 4002.4 | 30.1 | 30.0 | 0 | 0.26 % |
+| 14:18:10 | 4198.6 | 30.0 | 30.1 | 0 | 0.33 % |
+| 14:18:20–14:19:50 | 4015.3–4323.2 | 29.9–30.1 | 29.9–30.1 | 0 | 0.35 % → 0.31 % |
+
+- Total: 149 keyframes in 290 s (≈1.95 s); real video 3984 kbps; **filler 0.31 %**. Machine 1.145 cores average (p95 1.424). There is no feature on our side at 14:18.
+- The composite snapshot at 150 s (14:17:27) showed the overlay over the camera, with the laptop clock in shot. It is not committed.
+- Its overlay text (CEF `Date.now()`) against the clock in the camera gives one in-chain camera→compositor reading: **3083 ms**. That is below the 3270–3320 ms decoder-out samples from earlier sessions. With n=1 on a different session, it is not used for the default.
+- **Reading:** YouTube went Poor on a single clean stream at 0.3 % filler and a flat 4.0–4.3 Mbps. **This weakens the filler hypothesis**: filler share is not what flips health. It is not forced to a conclusion. Other candidates, all unmeasured:
+  - RTMP timestamps or a cadence YouTube dislikes (wall-clock vs media-time stamping on `flvmux`);
+  - the CF Output relay itself;
+  - the silent `voaacenc` audio track;
+  - YouTube's own ingest heuristics on a fresh key.
+
+**Step D:**
+- Push SIGKILLs, then a restart each time on a new RTMPS connection. Phone on the clock.
+- The owner stopped the stg session at 14:21:33 London (`operator_stopped`), mid-D; the coordinator then ordered D aborted. By then D had already run to completion on the Machine.
+
+| Gap | Kill | Restart | Push result | Camera | Owner (YouTube) |
+|---|---|---|---|---|---|
+| 5 s | 14:20:00.167 | 14:20:05.173 | ran 60 s; egress 3929–4317 kbps; 0 overruns | live (30 fps) | pending |
+| 15 s | 14:21:05.191 | 14:21:20.196 | **FAILED at +7.9 s (14:21:28)**: `rtmp2sink` "Connection error: Socket I/O timed out"; 78 encoder-queue overruns while the sink stalled; chain exited | live until 14:21:33 | pending |
+| 30 s | 14:22:20.217 | 14:22:50.223 | ran 60 s; egress 4164–4168 kbps; 0 overruns | **none**: input gone at 13:21:34Z; overlay only, filler 77 % | not a valid gap test |
+
+- CF Input B status history keeps only the last connect: 13:22:51.684Z → `client_disconnect` 13:23:50.548Z.
+- The D15 RTMPS timeout to CF Input B is one sample; the D15 restart in the morning run connected fine. **C09/C13 owe a reconnect retry with backoff on `rtmp2sink` connect timeout.** A single failed reconnect must not end the output.
+- With the camera gone entirely (D30), the compositor kept 30.0 fps on the CEF branch alone.
+- Step B (rerun): the phone input `4e7a53…` stayed connected in CF from 13:05:33Z until the owner's stop at 13:21:34Z. The watcher saw no gap over 300 ms from 14:09:09 to 14:13:00 London (6932 AUs).
+- The watcher's FIRST connect STALLED at exactly 5.0 s before any AU arrived. Time to first AU on SRT playback is 2.6–4.4 s here, so a stall timer that starts at connect sits within about 0.6 s of the 5 s `input_stall_after_ms`. **C10 should start the stall timer from the first AU, or give connect its own budget.**
+
 **CAVEAT (owner, 2026-10-15): today's YouTube readings are UNRELIABLE, not evidence.**
 - The owner reports that two stream keys on the same YouTube channel appear not to work at the same time.
 - The fixture's own `B_YoutubeTest` output, carrying the phone feed, and this spike's `r2-c0` key may share a channel.

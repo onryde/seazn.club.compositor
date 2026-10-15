@@ -10,6 +10,7 @@ seg() {  # seg <tag> <start epoch> <stop epoch>
   echo "SEG $tag start_wall=$(date +%s.%3N) start_london=$(TZ=Europe/London date +%T.%3N)"
   "${AS[@]}" python3 /spike/chain.py --height 720 --seconds 900 --play-env SPIKE_FIX_SRT_PLAY_URL \
      --x264-bitrate 4000 --vbv-ms 1000 --x264-opts nal-hrd=cbr:filler=1 \
+     $( [ "$tag" = C ] && echo "--snapshot $OUT/cd-C.ayuv --snapshot-at 150" ) \
      > >(python3 -u /spike/redact.py > "$OUT/cd-$tag.raw") 2>&1 &
   local cp=$!
   if [ "$tag" = C ]; then sleep 15; python3 /spike/proc_sample.py --root-pid "$cp" --seconds 270 --tag cd-C > "$OUT/cd-C.proc" 2>&1 & fi
