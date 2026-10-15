@@ -168,9 +168,32 @@ Why not the built-in JS signal (`listen-for-js-signals=true` + `window.gstSendMs
 
 **Verdict:** **PASS** for the in-scope parts. Playback is usable; the worst gap is 70–109 ms against the 3 s fail line.
 
-**Owed (owner session, phone):**
-- the camera→compositor delay median (n=10, clock in shot), which sets the ADR 0006 default;
-- the time to first frame after an iOS background/return.
+### Owner session, with the real phone (2026-10-15)
+
+**Step A: camera→compositor delay (sets the ADR 0006 default).**
+
+*Method:*
+- The owner's phone ran the seazn capture app on stg fixture `cb72e011-…`, session `c1405214-…`. Mode: passthrough. Ingest: SRT into CF input `f23f022e303a0badff34b9cb2816a71e`.
+- The phone camera pointed at a laptop showing a UTC clock and epoch ms. The laptop runs +15 ms ahead of time.apple.com (±8 ms).
+- On a performance-4x Machine, `delay_snap.py` ran `srtsrc` (`SPIKE_FIX_SRT_PLAY_URL`, latency 1000) → `tsdemux` → `h264parse` → `avdec_h264` → `jpegenc`. One frame was written every 5 s, named with the Machine's wall-clock ms when the frame left the decoder.
+- I read the clock digits in each JPEG myself. Each frame shows two superimposed display states, so a reading is good to ±10 ms.
+- Delay = machine_ms − clock_ms + 15 (the laptop offset).
+- Machine clock by SNTP: −0.7 to +2.7 ms vs time.cloudflare.com and +0.2 to +2.3 ms vs time.google.com (rtt 2–11 ms); +6 ms vs time.apple.com (rtt 14 ms). Treated as 0 ±6 ms. `chronyc` is not in the image.
+
+*Raw:* n = 16 frames over 75 s (11:55:53–11:57:08 London).
+
+| Statistic | Value |
+|---|---|
+| Delays, ms | 3318, 3323, 3325, 3307, 3323, 3312, 3311, 3298, 3322, 3332, 3324, 3316, 3330, 3323, 3318, 3303 |
+| **Median** | **3320 ms** |
+| Spread | 3298–3332 ms (34 ms) |
+| Mean / sd | 3317.8 / 9.5 ms |
+| First frame after reader start | 2.614 s |
+| Decoded rate | 2340 frames in 80 s (29.3 fps) |
+
+The laptop display's own render/scan-out lag (≈1 refresh) was **not** subtracted, so 3320 ms is an upper bound by about 10–20 ms. The path includes the SRT playback latency of 1000 ms.
+
+**Recommendation:** default `overlayDelayMs` = **3300 ms** (median rounded to 100 ms) for the passthrough capture path with playback latency 1000. If C10 ships a different `latency`, the default moves with it.
 
 **Changes:**
 - **Spec, reported only (ADRs and spec not edited).** The spec says "CF SRT playback is single-reader / a second reader kicks the first" (§3.1 topology diagram; §3.2 "Exactly one reader per SRT playback stream"; §4.2 InputLink kicks; §6 failure table; §9.1 Q2; risk table). That is **false as measured**: CF served two concurrent readers from the same IP and from different IPs, with no kick. "One reader" stays a valid *design* choice. C04's kick counting stays for CF-side closes and maintenance, but C13's fake CF should not model "a second reader kicks the first" as CF behaviour.

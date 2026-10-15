@@ -47,6 +47,7 @@ def main():
     ap.add_argument("--x264-bitrate", type=int, default=0, help="kbps; 0 = profile default (720: 4000, 1080: 6000)")
     ap.add_argument("--x264-opts", default="nal-hrd=cbr:filler=1", help="x264enc option-string")
     ap.add_argument("--vbv-ms", type=int, default=1000, help="x264enc vbv-buf-capacity in ms; -1 = leave at element default")
+    ap.add_argument("--play-env", default="SPIKE_A_SRT_PLAY_URL", help="env var holding the camera SRT playback URL")
     ap.add_argument("--bg", choices=["camera", "snow"], default="camera",
                     help="camera = SRT playback of Input A; snow = local high-entropy videotestsrc (diagnostic)")
     a = ap.parse_args()
@@ -55,7 +56,7 @@ def main():
     fps = 30
     kbps = a.x264_bitrate or KBPS[H]
 
-    play = os.environ.get("SPIKE_A_SRT_PLAY_URL")
+    play = os.environ.get(a.play_env)
     out = os.environ.get("SPIKE_B_RTMPS_URL")
     if not play or not out:
         print("FATAL SPIKE_A_SRT_PLAY_URL / SPIKE_B_RTMPS_URL not set", flush=True)
@@ -259,7 +260,9 @@ def main():
             "t": round(now - t0, 1),
             "enc_fps": round((n_enc - last["enc"]) / dt, 2), "mix_fps": round((n_mix - last["mix"]) / dt, 2),
             "cam_fps": round((n_cam - last["cam"]) / dt, 2), "cef_fps": round((n_cef - last["cef"]) / dt, 2),
-            "overruns": over, "egress_kbps": None if ab is None or last["acked"] is None else round((ab - last["acked"]) * 8 / 1000 / dt, 1),
+            "overruns": over, "filler_share_cum": round(c["filler_bytes"] / c["bytes"], 4) if c["bytes"] else None,
+            "real_kbps_cum": round((c["bytes"] - c["filler_bytes"]) * 8 / 1000 / (now - t0 - a.warmup), 1) if c["bytes"] and now - t0 > a.warmup else None,
+            "keyframes_cum": len(c["kf"]), "wall": round(time.time(), 3), "egress_kbps": None if ab is None or last["acked"] is None else round((ab - last["acked"]) * 8 / 1000 / dt, 1),
         }
         last.update({"enc": n_enc, "mix": n_mix, "cam": n_cam, "cef": n_cef, "t": now, "acked": ab})
         windows.append(w)
