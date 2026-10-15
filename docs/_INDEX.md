@@ -59,6 +59,7 @@ The entry point for any session working on this repository. Read this file first
 | An existing per-fixture `overlay_delay_ms` can be overridden | The column is on `fixture_stream_sessions` with default 0, and no code path or API ever writes it. Every session reads 0. | 2026-10-14 |
 | The hazard throw is harmless because nothing gets provisioned | The throw happens after the session row, the CF input and provisioning already exist. R2001 must refuse in `admit()` before any write. | 2026-10-14 |
 | R1 has a "degraded" heartbeat state to reuse | There is no degraded concept. Staleness is one `STALE_HEARTBEAT_SECONDS = 90` check in `expiry.ts`. | 2026-10-14 |
+| A domain unit test can print its count with `eprintln!` (C03 `unlisted_pairs_hold_their_phase`) | The crate root's `#![forbid(clippy::print_stderr)]` (C01) covers inline `#[cfg(test)]` modules too: clippy `--all-targets -D warnings` refuses it (run in C02). A sweep that must print goes in `crates/domain/tests/` (C02's `foundations.rs`, C06's `properties.rs`); an inline one carries its count in the assertion. | C02, 2026-10-15 |
 
 ## Session handoffs
 
