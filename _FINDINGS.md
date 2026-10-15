@@ -193,6 +193,12 @@ Why not the built-in JS signal (`listen-for-js-signals=true` + `window.gstSendMs
 
 The laptop display's own render/scan-out lag (≈1 refresh) was **not** subtracted, so 3320 ms is an upper bound by about 10–20 ms. The path includes the SRT playback latency of 1000 ms.
 
+**Second session.** The owner went live again, which created session `d13d8b23-…` with input `d98e9879e99187cd8d2d66c007a1911f`.
+- The new session went live at 10:59:24Z, only 26 s after the first session ended at 10:58:58Z.
+- Second sample, n=9, 12:07:06–12:07:48 London: 3284, 3267, 3263, 3269, 3272, 3271, 3270, 3270, 3266 ms. **Median 3270 ms** (3263–3284, sd 5.9).
+- Both sessions together, n=25: median 3311 ms (3263–3332).
+- The delay moves about 50 ms between sessions and is stable to ±10 ms within one.
+
 **Recommendation:** default `overlayDelayMs` = **3300 ms** (median rounded to 100 ms) for the passthrough capture path with playback latency 1000. If C10 ships a different `latency`, the default moves with it.
 
 **Changes:**
