@@ -144,8 +144,16 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
   - `main`: parse env → build `FrameStore`, `(tx, rx)` channels, adapters → spawn the control worker
     → spawn the signal thread → `Driver::new(Thresholds::default(), ports, env.deadline_ms, now_ms())`
     → `let code = run(driver, rx, &now_ms); eprintln!(… "exit code={code}"); std::process::exit(code)`.
-  - `now_ms` = `SystemTime::now()` since `UNIX_EPOCH` in ms. This is the **only** clock read in the
-    workspace.
+  - `now_ms` is **monotonic**: `Instant::now()` minus one `Instant` captured at process start, in ms,
+    plus one epoch offset captured once at the same moment (`SystemTime::now()` since `UNIX_EPOCH`).
+    The domain needs both meanings, so they come from one function: frame ages, thresholds and
+    backoff run on it, and because the offset is fixed at start it also stays comparable with the
+    epoch `deadline_ms`. A wall-clock step (NTP or a VM resume) can never move `now` backwards. That
+    matters, because a backward step makes a frame's age read 0: Reconnecting would go Live with no new
+    frames, and a camera loss would be detected late (C03 review, `_INDEX`). This is the **only**
+    clock read in the workspace.
+  - Test: `now_ms_is_monotonic_across_a_wall_clock_step`. Inject the wall source, step it back 5 s,
+    and assert that `now_ms` never decreases. Mutant: read `SystemTime` per call; the test goes RED.
 
 - [ ] **Step 6: Run, expect a PASS.** Paste the counts.
 
