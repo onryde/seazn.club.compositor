@@ -5,4 +5,5 @@
 #![forbid(clippy::print_stderr)]
 
 pub mod backoff;
+pub mod config;
 pub mod time;
