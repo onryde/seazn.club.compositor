@@ -868,7 +868,7 @@ Not investigated, but it bears on "on stg": `stg.yml`'s last three runs on main 
   - a gstcefsrc `CefPermissionHandler` that grants only the LNA permission, and only for `Env.app_origin`;
   - the Chrome policy `LocalNetworkAccessAllowedForUrls` set to the app origin, if CEF reads managed policies (unverified);
   - as a last resort, `disable-features=LocalNetworkAccessChecks` via `GST_CEF_CHROME_EXTRA_FLAGS`. It is global to every `cefsrc`, and Chromium deletes feature flags after launch.
-- **The failure is safe on paper.** R2005 aborts a poll with an `AbortController` at `LONG_POLL_MAX_MS + 2 000` and counts it as a failure (R2005 brief, change 6, the hook, :284-285). So a pending, never-answered prompt still reaches fallback B, and the hook doesn't hang. The beat's `phaseChannel: web` is what shows it.
+- **The failure is safe on paper.** R2005 aborts a poll with an `AbortController` at `LONG_POLL_MAX_MS + 2 000` and counts it as a failure (R2005 brief, change 6, the hook, :296). So a pending, never-answered prompt still reaches fallback B, and the hook doesn't hang. The beat's `phaseChannel: web` is what shows it.
 - **Element fact (C11):** at this gstcefsrc pin, `chrome-extra-flags` is deprecated, and the value is global across every `cefsrc` instance. gstcefsrc.cc:1214–1218 warns: "set GST_CEF_CHROME_EXTRA_FLAGS instead". It splits on `,`, then on `=` (gstcefsrc.cc:676–699). Under outcome (a) the adapter sets no flag. If a later CEF needs one, the warning's env var is the supported route; it is just as global.
 
 **Not measured:**
@@ -886,7 +886,7 @@ Not investigated, but it bears on "on stg": `stg.yml`'s last three runs on main 
 
 ### F-009 appendix: raw lines
 
-Every line below is verbatim and complete, in order, from each run's output: first the runner's own lines (`RUN`, `GST start`, `FIRST_SERVER_LINE`, `STOP`), then the probe server's stdout, then the `cefconsole` messages. Only the dbus and GCM lines are left out (they are counted in result 8). The server's `at=` values are epoch ms. These `reply` lines carry no `cors=` field, because the runs predate it (see "Evidence for the headers sent").
+Every line below is verbatim and complete, in order, from each run's output: first the runner's own lines (`RUN`, `GST start`, `FIRST_SERVER_LINE`, `STOP`), then the probe server's stdout, then the `cefconsole` messages. Left out: the dbus and GCM lines (counted in result 8), the runner's BUILDINFO line, the probe server's stderr, and the gst pipeline lines. The server's `at=` values are epoch ms. These `reply` lines carry no `cors=` field, because the runs predate it (see "Evidence for the headers sent").
 
 **V1**
 
