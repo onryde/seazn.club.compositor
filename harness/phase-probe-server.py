@@ -18,7 +18,8 @@ Python stdlib only. Bound to 127.0.0.1:7419, web's RELAY_PHASE_PORT (lib/relay-p
 
 Every request logs one `request …` line to stdout at arrival (method, path, Origin,
 Access-Control-Request-Private-Network, Access-Control-Request-Method, then every header as JSON);
-every answer logs one `reply …` line, and every script transition one
+every answer logs one `reply …` line (with `cors=<the CORS and Vary headers sent, as JSON>`; added after
+the F-009 runs, whose reply lines carry no `cors=`), and every script transition one
 `transition <phase> seq=<n> at=<epoch ms>` line. Start-up and refusals go to stderr, so the first
 stdout line is the first request.
 """
@@ -140,8 +141,9 @@ def make_handler(variant, hold_ms, script):
                 result = f"failed:{type(e).__name__}"
             extra = f" held_ms={held_ms}" if held_ms is not None else ""
             shown = body.decode() if body else "-"
+            sent = json.dumps(cors or {}, separators=(",", ":"))  # the CORS and Vary headers sent, verbatim
             log(f"reply method={self.command} path={self.path} status={status}{extra} "
-                f"write={result} at={now_ms()} body={shown}")
+                f"write={result} cors={sent} at={now_ms()} body={shown}")
 
         def _route(self):
             """The `after` value for a well-formed /phase request, or None once refused."""

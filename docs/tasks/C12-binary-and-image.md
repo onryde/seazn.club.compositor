@@ -349,6 +349,26 @@ It serves `(Waiting, 0)` until the first `publish`, which matches C08's driver s
 - Every 200 and 204 carries `Cache-Control: no-store`.
 - `allowed_origin` is `Env.app_origin`: APP_URL's scheme + host + port, no path and no trailing slash.
   That's the form C11 Step 0 observed in the `Origin` header; cite its F-id at the derivation.
+  **(Amended 2026-10-16, C11 Step 0 = F-009, and its review on PR #20):**
+  - **The observed form** is `https://<host>`: scheme + host, the default port omitted, no trailing slash. A
+    non-default port stays. Serialize APP_URL exactly that way, and cite F-009.
+  - **The check must match the page's real origin (review M6).** stg serves `/overlay` on two hosts,
+    `stg.seazn.club` and `seazn-club-stg.fly.dev`; both answered on 2026-10-16. The page's `Origin` is the host
+    its `overlayUrl` names. Web builds that URL's base from `captureOrigin()` = `OAUTH_BASE_URL ||
+    NEXT_PUBLIC_BASE_URL || appUrl` (`seazn.club` `server/usecases/capture-phone.ts:97-99`, `c64e0a217`; re-pin
+    R2004's composed `overlayUrl`). A single `allowed_origin` from a different base answers that page 403, and the
+    page silently drops to fallback B. Pick one of these, record the choice and cite F-009:
+    - (i) the check accepts both stg hosts;
+    - (ii) C12 configures the allowed origin per environment, from the same base URL web uses.
+  - A test owes the cross-check: the `Origin` of the `overlayUrl` the job facts carry equals `allowed_origin` (or
+    is in the accepted set). C17's stg run is the live witness.
+  - **`Access-Control-Allow-Private-Network: true` stays, but it future-proofs nothing.** CEF 139 sends the
+    PNA preflight without enforcing its result (F-009 result 3). Chromium replaced PNA enforcement with Local
+    Network Access, a permission that no response header satisfies (Owed 22). It's kept because it's harmless
+    and the spec asks for it.
+  - **No `Access-Control-Allow-Headers`, by design.** F-009 proved only a CORS-simple GET. R2005's hook must
+    stay one (GET, no request headers; R2005 amendment 2026-10-16). A non-safelisted header would bring an
+    enforced CORS preflight, and this table's 204, which carries no `Access-Control-Allow-Headers`, fails it.
 - `<word>` comes from the **same** function C07's `heartbeat_wire` uses for `programmePhase`
   (`programme_phase_wire`, owed by the plan's C07 note). If C07 merged without that function, extract
   it in C07's module and record a one-function deviation in the commit body. Two mappings would drift.

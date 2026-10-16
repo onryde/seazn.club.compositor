@@ -62,9 +62,14 @@ class Server:
         self.proc.terminate()
         self.proc.wait(5)
         self._reader.join(2)
+        self.proc.stdout.close()
+        self.proc.stderr.close()
 
     def requests(self):
         return [ln for ln in self.lines if ln.startswith("request ")]
+
+    def replies(self):
+        return [ln for ln in self.lines if ln.startswith("reply ")]
 
     def transitions(self):
         return [ln for ln in self.lines if ln.startswith("transition ")]
@@ -169,6 +174,39 @@ class PhaseProbeServerTest(unittest.TestCase):
             self.assertIn(f"acrpn={headers.get('Access-Control-Request-Private-Network', '-')} ", line)
             self.assertIn(f"acrm={headers.get('Access-Control-Request-Method', '-')} ", line)
             self.assertRegex(line, r" at=\d{13} ")
+
+    def test_every_reply_logs_the_cors_headers_it_sent(self):
+        # The run record, not the code, must show what a preflight was answered with (review M1). The
+        # expected value is what the client actually received, header by header.
+        pre = {
+            "Origin": ORIGIN,
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Private-Network": "true",
+        }
+        checked = 0
+        for variant in ("pna", "none"):
+            server = self.start("--variant", variant, "--hold-ms", "0")
+            got = []
+            for method, headers in (("OPTIONS", pre), ("GET", {"Origin": ORIGIN})):
+                _, h, _, _ = call(method, "/phase?after=0", headers)
+                got.append({k: v for k, v in h.items() if k.startswith("access-control-") or k == "vary"})
+            time.sleep(0.2)
+            replies = server.replies()
+            self.assertEqual(len(replies), 2, replies)
+            for line, received in zip(replies, got):
+                m = re.search(r" cors=(\{[^ ]*\}) ", line)
+                self.assertIsNotNone(m, line)
+                logged = {k.lower(): v for k, v in json.loads(m.group(1)).items()}
+                self.assertEqual(logged, received, line)
+                checked += 1
+            if variant == "pna":
+                self.assertEqual(got[0].get(ACAPN.lower()), "true", "the positive pair: pna logs a non-empty set")
+            else:
+                self.assertEqual(got, [{}, {}])
+            server.stop()
+            self.server = None
+        print(f"\nreply lines checked: {checked}")
+        self.assertEqual(checked, 4)
 
     def test_bad_requests_are_refused(self):
         self.start("--variant", "pna", "--hold-ms", "0")
