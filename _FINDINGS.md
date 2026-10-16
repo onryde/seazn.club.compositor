@@ -721,6 +721,237 @@ Times are 2026-10-15, UTC. "—" means the reading wasn't logged.
 
 Run 3's leg-5 rows are the leg's parsed output (`exitInfoFrom`), not the raw event. Runs 1 and 2 waited 3 s after `started` before the first stop, and run 3 waited 2 s, so the shell's traps were installed first.
 
+## F-009: CEF loopback phase channel (C11 Step 0, 2026-10-16). OUTCOME (a): a public HTTPS page in CEF 139 reaches `http://127.0.0.1:7419` with C12's headers and no flags
+
+**Question (C11 amendment 2026-10-15, Step 0; spec §4.3 D10, §6 C11 row):** can an HTTPS page from a public origin, in CEF `139.0.28+g55ab8a8+chromium-139.0.7258.139`, `fetch("http://127.0.0.1:7419/phase?after=0")`, with and without the PNA preflight headers? R2005's phase hook starts in the channel this picks.
+
+**Method:**
+- **Image:** the F-001 build, unchanged: `registry.fly.io/seazn-relay-spike:deployment-01M4ZBW92TN0GPMPC9S0KK5TQ3@sha256:15890e25c22a470bd3e79fb690d9ee1d36844fc0a944d96238fed824adcd73a3` (`spike/t00` @738eb88; `spike/Dockerfile` is identical at the branch head). Its `/opt/gstcefsrc/BUILDINFO`, printed by every run: `gstcefsrc_commit=204b01b02df23d143316b11e51516171ab7fae0a`, `CEF_VERSION "139.0.28+g55ab8a8+chromium-139.0.7258.139"`.
+- **Host:** app `seazn-relay-spike`, region lhr, performance-4x / 8 GB (F-001's guest), `restart: no`. **One fresh Machine per run**, so no preflight cache, profile or process survives between runs. The two harness files reached the Machine with `fly machine run --file-local`; the run went over `fly ssh console -C`; the Machine was destroyed straight after. flyctl used its own stored login: no token on argv or in any log.
+- **Origin:** public HTTPS, as in production. `harness/pages/` was served from the laptop with `python3 -m http.server 8080 --bind 127.0.0.1` and exposed with `cloudflared tunnel --url http://127.0.0.1:8080` (cloudflared 2026.9.3, darwin-amd64: the binary matched the release's published SHA-256, and it is code-signed, team `68WVV388M8`). The page URL was `https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html`, served as HTTP/2 by `server: cloudflare` from 104.16.230.132 / 104.16.231.132 (public addresses).
+- **Inside each Machine (one network namespace):** `Xvfb :99 -screen 0 1920x1080x24`, then `harness/phase-probe-server.py` (bound to 127.0.0.1:7419), then the brief's line, as uid 10001 (`spike`, the non-root user):
+  `GST_DEBUG=cefconsole:4 gst-launch-1.0 cefsrc url=<page> listen-for-js-signals=false max-video-framerate=30/1 [chrome-extra-flags=<flag>] ! video/x-raw,format=BGRA,width=1920,height=1080 ! fakesink`.
+  Stop: 20 s after the server's first stdout line, or 30 s after the gst start if it never logs (it always logged, 3 858–3 866 ms after the gst start).
+- **The page** logs every result on F-001's console channel (`console.info`, read from `cefconsole`): `seazn:probe=ok:<body>` or `seazn:probe=blocked:<name>:<message>`, as the brief writes them, plus `seazn:probe-page=<origin> secure=<isSecureContext>` before the fetch (proof that the channel works) and `seazn:probe-ms=<n>`. Its fetch is the brief's bare `fetch(url)`, with no init.
+- Runs at 2026-10-16 06:58–07:05Z.
+
+### Results
+
+| Run | Server | `chrome-extra-flags` | Preflight seen by the server | Then | `seazn:probe=` (verbatim) | `probe-ms` |
+|---|---|---|---|---|---|---|
+| V1 | `--variant none` | none | `OPTIONS`, `acrpn=true acrm=GET`; answered 204 with **no** CORS header | the GET **still arrived, 1 ms later**, held 2 000 ms, answered 200 | `seazn:probe=blocked:TypeError:Failed to fetch` | 2010 |
+| V2 | `--variant pna` | none | `OPTIONS`, `acrpn=true acrm=GET`; 204 with ACAO, ACAM, ACAPN, `Vary` | GET, held 2 000 ms, 200 | `seazn:probe=ok:{"phase":"live","seq":1}` | 2055 |
+| V3a | `--variant pna` | `disable-features=LocalNetworkAccessChecks` | same as V2 | same as V2 | `seazn:probe=ok:{"phase":"live","seq":1}` | 2058 |
+| V3b | `--variant pna` | `disable-features=PrivateNetworkAccessRespectPreflightResults` | same as V2 | same as V2 | `seazn:probe=ok:{"phase":"live","seq":1}` | 2055 |
+| V4 | `--variant pna --hold-ms 9000` | none (V2 passed) | same as V2 | GET **held 9 000 ms**, 200 | `seazn:probe=ok:{"phase":"live","seq":1}` | 9048 |
+
+1. **V2 passes. That is outcome (a).** The fetch succeeds with C12's headers and no CEF flag. V4 shows that a long-poll held 9 s (inside `RELAY_PHASE_LONG_POLL_MAX_MS` = 10 000) comes back intact through CEF: `held_ms=9000`, the reply body unchanged, `probe-ms=9048`.
+2. **V1 fails on plain CORS, not on Private Network Access.** Its one non-probe console line, at ERROR:
+   `Access to fetch at 'http://127.0.0.1:7419/phase?after=0' from origin 'https://disclosure-raymond-functioning-structured.trycloudflare.com' has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present on the requested resource.`
+3. **CEF 139 sends the PNA preflight but does not enforce its result.** Every fetch was preceded by an `OPTIONS` carrying `Access-Control-Request-Private-Network: true`, even this simple GET with no custom header. In V1 that preflight came back with no `Access-Control-Allow-Origin` and no `Access-Control-Allow-Private-Network`, and Chromium sent the GET anyway, 1 ms later (`at=1792133902797` then `at=1792133902798`). A respected preflight would have stopped the GET there. So what CEF 139 actually checks is the GET's `Access-Control-Allow-Origin`; the PNA header is not checked yet. That also explains V3a and V3b: disabling either feature changed nothing, because nothing was blocking. Whether the `chrome-extra-flags` switch reached Chromium is **not witnessed**: gstcefsrc logs "Adding switch with value" in category `cefsrc` at INFO, which the brief's `GST_DEBUG=cefconsole:4` leaves off.
+4. **No mixed-content, "Private Network" or "Local Network" console line, in any run.** There were 23 `cefconsole` messages across the 6 runs: 4 in V1, 3 each in V2–V4, and 7 in V5. They are the probe's own lines plus V1's CORS line. `http://127.0.0.1` from an HTTPS page is not treated as mixed content: the page reports `secure=true`, and the request went out.
+5. **The `Origin` header, as the server saw it:** `https://disclosure-raymond-functioning-structured.trycloudflare.com`. That is scheme + host, with no port (443 is the default) and no trailing slash, the same form on the preflight and the GET. C12's exact-origin check (`Env.app_origin`) must serialize APP_URL the same way: it omits a default port and keeps a non-default one.
+6. **The request headers** were the same in every run, key by key (only V1's are printed in full in the appendix). The preflight carried `Access-Control-Request-Method: GET`, `Access-Control-Request-Private-Network: true`, `Origin`, `Sec-Fetch-Mode: cors`, `Sec-Fetch-Site: cross-site` and `Sec-Fetch-Dest: empty`, and **no** `Access-Control-Request-Headers`. The GET carried the same `Origin` and `Sec-Fetch-*` values. The User-Agent is `… Chrome/139.0.0.0 …`, and `sec-ch-ua` reads `"Chromium";v="139"`.
+7. **Every long-poll pays its own preflight** (V5 below: 4 GETs, 4 `OPTIONS`). Fetch's preflight cache matches on the URL, and `?after=<seq>` changes on every poll, so an `Access-Control-Max-Age` would not save any of them. On loopback the cost is about 1 ms per poll. C12's `PHASE_HTTP_MAX_CONCURRENT` = 4 counts a preflight as a request like any other. The page's polls are sequential, and each preflight was answered before its GET arrived, so one page holds one request open at a time.
+8. **Noise, for C12's log budget, is not a defect here.** Each run has 19 `dbus` errors (F-001 saw these) and 1–4 `google_apis/gcm` errors, for example `Registration response error message: PHONE_REGISTRATION_ERROR` and `Error code: 401  Error message: Authentication Failed: wrong_secret`. These are replies, so Chromium's GCM client reached Google's servers from inside the Machine. Whether a switch silences it was not measured.
+
+### V5: the probe server's `--script` mode through CEF (the stand-in the compatibility step uses)
+
+`--variant pna --script waiting:5000,reconnecting:5000,final:5000`, with the page at `?follow=1`: after its first answer it keeps long-polling `?after=<seq>` until `live`. Same origin and image, no flags.
+- **The script clock starts at the first GET:** `transition waiting seq=1 at=1792134262972`, in the same millisecond as that GET's own `request` line, about 4.3 s after the server started (the runner starts it 0.5 s before gst-launch, which started at `1792134259213`).
+- **Each later transition comes exactly 5 000 ms after the one before:** reconnecting `…267972`, final `…272972`, live `…277972`.
+- **Each held poll is answered at the change:** `held_ms=4948/4951/4952`.
+- **Each poll was preceded by its own preflight**, and every preflight and GET carried the same headers as V2.
+- **The page logged the whole sequence:**
+
+  ```
+  seazn:probe=ok:{"phase":"waiting","seq":1}
+  seazn:probe-follow={"phase":"reconnecting","seq":2}
+  seazn:probe-follow={"phase":"final","seq":3}
+  seazn:probe-follow={"phase":"live","seq":4}
+  seazn:probe-follow-done=live:4
+  ```
+
+This is **not** the compatibility step (next section). It proves only that the stand-in serves the script the way that step needs, through a real CEF, from a public origin.
+
+### Compatibility step (coordinator decision G1): NOT RUN; both legs owed
+
+The brief's pre-condition is "R2005 is live on stg". It isn't, and the fallback (the template leg alone) can't run either:
+- `seazn.club` main at `c64e0a217` (2026-10-16) has **no** `seazn:ready` and no `use-programme-phase` anywhere under `apps/web/src`. R2005 is unmerged, so the page sends no readiness signal and has no scene layer.
+- `OVERLAY_TEMPLATES` and `?template=` belong to R2007 PR A, which is open and unmerged (`seazn.club` #974).
+- `stg.yml` deploys only on a push to main. So stg can't carry either one yet.
+- The template leg asserts "the template renders and `seazn:ready` arrives". With no `seazn:ready` and no template id to load, it would assert nothing. Running it now would be a vacuous record, so it was not run.
+
+Owed (`docs/_INDEX.md` Owed 21):
+- **The template leg:** C11, after Step 4, once R2005 and #974 are on stg.
+- **The scene leg** (`--script waiting:5000,reconnecting:5000,final:5000`): C11, if R2005 is live on stg by then; otherwise C17.
+
+Outcome (a) does not push the scene leg to C17: with loopback primary, the probe server can drive the scenes.
+
+Not investigated, but it bears on "on stg": `stg.yml`'s last three runs on main (02:19Z, 02:48Z and 06:41Z, 2026-10-16) concluded `failure`.
+
+### Verdict and changes
+
+**Outcome (a). Loopback is primary, with C12's headers and no CEF flags.** So:
+- **R2005:** the phase hook starts in `loopback`, and fallback B (web) stays the fallback: 3 consecutive loopback failures, then sticky (Decision log, 2026-10-15). The `_FINDINGS.md` id to cite at the constant is **F-009**. Outcome (c) did not happen, so nothing in R2005 changes.
+- **C11 Step 3:** no `chrome-extra-flags`. The flag assertion in `ready_signal_arrives_with_its_generation` belonged to outcome (b), so it is not added.
+- **C12 (`phase_http.rs`):** ship the headers as briefed. ACAO on the GET (the exact app origin) is what CEF 139 checks today. The preflight's `Access-Control-Allow-Private-Network: true` is not checked yet (result 3), but it stays, so a CEF that starts enforcing PNA preflight results keeps working. Derive `allowed_origin` in the form result 5 observed.
+- **Re-run Step 0 on every CEF bump** (any `docker/GSTCEF_COMMIT` change, C12/C16). Chromium has said that **Local Network Access** will replace PNA preflights with a permission prompt in later releases. That comes from Chromium's public plans and was not measured here. A windowless CEF has no user to answer a prompt, so a bump could turn this into outcome (b) or (c).
+  - V1 does not tell you when that happens: with no CORS headers, it fails on CORS in any release.
+  - The signal is result 3 instead: whether the GET still arrives after V1's failed preflight, and what V2 answers.
+- **Element fact (C11):** at this gstcefsrc pin, `chrome-extra-flags` is deprecated, and the value is global across every `cefsrc` instance. gstcefsrc.cc:1214–1218 warns: "set GST_CEF_CHROME_EXTRA_FLAGS instead". It splits on `,`, then on `=` (gstcefsrc.cc:676–699). Under outcome (a) the adapter sets no flag. If a later CEF needs one, the warning's env var is the supported route; it is just as global.
+
+**Not measured:**
+- The 404 / edge-5xx / net-error paint question (Owed 17). Step 0 never loaded a failing page.
+- Whether a permission flow would fire. None was visible (no console line, no failure), and gstcefsrc at this pin implements no `CefPermissionHandler`.
+- A non-loopback private address. Only `127.0.0.1` was probed, which is the only address the compositor serves.
+
+### Teardown (C11 Step 0)
+
+- **Machines:** `8654212a734238` (V1), `e829491b1569e8` (V2), `7849207a95d408` (V3a), `e82dd5e0c69478` (V3b), `784eee0da52678` (V4) and `819653c9755e48` (V5). Each was destroyed with `--force` right after its run.
+- **Final check:** `fly machine list -a seazn-relay-spike` reads "No machines are available on this app".
+- **Laptop:** the quick tunnel and the laptop's `http.server` were stopped; the tunnel URL above is dead.
+- **Kept:** the app, its secrets and the image. Nothing else was created.
+
+### F-009 appendix: raw lines
+
+Lines are verbatim from each run's output, in order. The runner's own lines come first (`RUN`, `GST start`, `FIRST_SERVER_LINE`, `STOP`), then the probe server's stdout, then the `cefconsole` messages. The dbus/GCM lines are left out (counted in result 8). In V2–V5 each `request` line's trailing `headers={…}` JSON is elided, because it was compared key by key and is identical to V1's (result 6). The server's `at=` values are epoch ms.
+
+**V1**
+
+```
+RUN V1 url=https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html flag=none server_args=--variant none host=Linux 6.12.105-fly x86_64 start=1792133897581
+GST start=1792133899090 cmd: GST_DEBUG=cefconsole:4 gst-launch-1.0 cefsrc url=https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html listen-for-js-signals=false max-video-framerate=30/1  ! video/x-raw,format=BGRA,width=1920,height=1080 ! fakesink
+FIRST_SERVER_LINE seen=1792133902951 (+3861 ms after gst start)
+STOP reason=20s-after-first-server-line at=1792133923050
+RUN V1 done
+--- server (stdout)
+request method=OPTIONS path=/phase?after=0 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=true acrm=GET at=1792133902797 headers={"Host":"127.0.0.1:7419","Connection":"keep-alive","Access-Control-Request-Method":"GET","Access-Control-Request-Private-Network":"true","Origin":"https://disclosure-raymond-functioning-structured.trycloudflare.com","User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36","Sec-Fetch-Mode":"cors","Sec-Fetch-Site":"cross-site","Sec-Fetch-Dest":"empty","Accept-Encoding":"gzip, deflate, br, zstd","Accept-Language":"en-US,en;q=0.9"}
+reply method=OPTIONS path=/phase?after=0 status=204 write=ok at=1792133902797 body=-
+request method=GET path=/phase?after=0 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=- acrm=- at=1792133902798 headers={"Host":"127.0.0.1:7419","Connection":"keep-alive","sec-ch-ua-platform":"\"Linux\"","User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36","sec-ch-ua":"\"Chromium\";v=\"139\", \"Not;A=Brand\";v=\"99\"","sec-ch-ua-mobile":"?0","Accept":"*/*","Origin":"https://disclosure-raymond-functioning-structured.trycloudflare.com","Accept-Language":"en-US,en;q=0.9","Sec-Fetch-Site":"cross-site","Sec-Fetch-Mode":"cors","Sec-Fetch-Dest":"empty","Accept-Encoding":"gzip, deflate, br, zstd"}
+reply method=GET path=/phase?after=0 status=200 held_ms=2000 write=ok at=1792133904799 body={"phase":"live","seq":1}
+--- console (cefconsole)
+0:00:03.680230790   694 0x55e1f7268be0 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html:27 seazn:probe-page=https://disclosure-raymond-functioning-structured.trycloudflare.com secure=true
+0:00:05.693694010   694 0x55e1f7268be0 ERROR             cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html:0 Access to fetch at 'http://127.0.0.1:7419/phase?after=0' from origin 'https://disclosure-raymond-functioning-structured.trycloudflare.com' has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present on the requested resource.
+0:00:05.695571950   694 0x55e1f7268be0 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html:41 seazn:probe=blocked:TypeError:Failed to fetch
+0:00:05.699308540   694 0x55e1f7268be0 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html:42 seazn:probe-ms=2010
+```
+
+**V2**
+
+```
+RUN V2 url=https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html flag=none server_args=--variant pna host=Linux 6.12.105-fly x86_64 start=1792133984708
+GST start=1792133986220 cmd: GST_DEBUG=cefconsole:4 gst-launch-1.0 cefsrc url=https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html listen-for-js-signals=false max-video-framerate=30/1  ! video/x-raw,format=BGRA,width=1920,height=1080 ! fakesink
+FIRST_SERVER_LINE seen=1792133990085 (+3865 ms after gst start)
+STOP reason=20s-after-first-server-line at=1792134010217
+RUN V2 done
+--- server (stdout)
+request method=OPTIONS path=/phase?after=0 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=true acrm=GET at=1792133989968 headers={…}
+reply method=OPTIONS path=/phase?after=0 status=204 write=ok at=1792133989969 body=-
+request method=GET path=/phase?after=0 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=- acrm=- at=1792133989970 headers={…}
+reply method=GET path=/phase?after=0 status=200 held_ms=2000 write=ok at=1792133991971 body={"phase":"live","seq":1}
+--- console (cefconsole)
+0:00:03.714472548   693 0x55e1c608a290 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html:27 seazn:probe-page=https://disclosure-raymond-functioning-structured.trycloudflare.com secure=true
+0:00:05.771581215   693 0x55e1c608a290 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html:45 seazn:probe=ok:{"phase":"live","seq":1}
+0:00:05.771699175   693 0x55e1c608a290 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html:46 seazn:probe-ms=2055
+```
+
+**V3a**
+
+```
+RUN V3a url=https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html flag=disable-features=LocalNetworkAccessChecks server_args=--variant pna host=Linux 6.12.105-fly x86_64 start=1792134067125
+GST start=1792134068635 cmd: GST_DEBUG=cefconsole:4 gst-launch-1.0 cefsrc url=https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html listen-for-js-signals=false max-video-framerate=30/1 chrome-extra-flags=disable-features=LocalNetworkAccessChecks ! video/x-raw,format=BGRA,width=1920,height=1080 ! fakesink
+FIRST_SERVER_LINE seen=1792134072499 (+3864 ms after gst start)
+STOP reason=20s-after-first-server-line at=1792134092635
+RUN V3a done
+--- server (stdout)
+request method=OPTIONS path=/phase?after=0 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=true acrm=GET at=1792134072382 headers={…}
+reply method=OPTIONS path=/phase?after=0 status=204 write=ok at=1792134072383 body=-
+request method=GET path=/phase?after=0 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=- acrm=- at=1792134072385 headers={…}
+reply method=GET path=/phase?after=0 status=200 held_ms=2000 write=ok at=1792134074385 body={"phase":"live","seq":1}
+--- console (cefconsole)
+0:00:03.707751849   694 0x56434e766120 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html:27 seazn:probe-page=https://disclosure-raymond-functioning-structured.trycloudflare.com secure=true
+0:00:05.767429446   694 0x56434e766120 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html:45 seazn:probe=ok:{"phase":"live","seq":1}
+0:00:05.767548526   694 0x56434e766120 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html:46 seazn:probe-ms=2058
+```
+
+**V3b**
+
+```
+RUN V3b url=https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html flag=disable-features=PrivateNetworkAccessRespectPreflightResults server_args=--variant pna host=Linux 6.12.105-fly x86_64 start=1792134121661
+GST start=1792134123170 cmd: GST_DEBUG=cefconsole:4 gst-launch-1.0 cefsrc url=https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html listen-for-js-signals=false max-video-framerate=30/1 chrome-extra-flags=disable-features=PrivateNetworkAccessRespectPreflightResults ! video/x-raw,format=BGRA,width=1920,height=1080 ! fakesink
+FIRST_SERVER_LINE seen=1792134127028 (+3858 ms after gst start)
+STOP reason=20s-after-first-server-line at=1792134147124
+RUN V3b done
+--- server (stdout)
+request method=OPTIONS path=/phase?after=0 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=true acrm=GET at=1792134126855 headers={…}
+reply method=OPTIONS path=/phase?after=0 status=204 write=ok at=1792134126855 body=-
+request method=GET path=/phase?after=0 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=- acrm=- at=1792134126856 headers={…}
+reply method=GET path=/phase?after=0 status=200 held_ms=2000 write=ok at=1792134128857 body={"phase":"live","seq":1}
+--- console (cefconsole)
+0:00:03.659968320   693 0x55eb395fafe0 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html:27 seazn:probe-page=https://disclosure-raymond-functioning-structured.trycloudflare.com secure=true
+0:00:05.716433750   693 0x55eb395fafe0 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html:45 seazn:probe=ok:{"phase":"live","seq":1}
+0:00:05.716526980   693 0x55eb395fafe0 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html:46 seazn:probe-ms=2055
+```
+
+**V4**
+
+```
+RUN V4 url=https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html flag=none server_args=--variant pna --hold-ms 9000 host=Linux 6.12.105-fly x86_64 start=1792134186449
+GST start=1792134187958 cmd: GST_DEBUG=cefconsole:4 gst-launch-1.0 cefsrc url=https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html listen-for-js-signals=false max-video-framerate=30/1  ! video/x-raw,format=BGRA,width=1920,height=1080 ! fakesink
+FIRST_SERVER_LINE seen=1792134191817 (+3859 ms after gst start)
+STOP reason=20s-after-first-server-line at=1792134211909
+RUN V4 done
+--- server (stdout)
+request method=OPTIONS path=/phase?after=0 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=true acrm=GET at=1792134191639 headers={…}
+reply method=OPTIONS path=/phase?after=0 status=204 write=ok at=1792134191640 body=-
+request method=GET path=/phase?after=0 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=- acrm=- at=1792134191641 headers={…}
+reply method=GET path=/phase?after=0 status=200 held_ms=9000 write=ok at=1792134200641 body={"phase":"live","seq":1}
+--- console (cefconsole)
+0:00:03.657955548   694 0x5597ac7c6a80 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html:27 seazn:probe-page=https://disclosure-raymond-functioning-structured.trycloudflare.com secure=true
+0:00:12.711358542   694 0x5597ac7c6a80 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html:45 seazn:probe=ok:{"phase":"live","seq":1}
+0:00:12.711459052   694 0x5597ac7c6a80 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html:46 seazn:probe-ms=9048
+```
+
+**V5**
+
+```
+RUN V5 url=https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html?follow=1 flag=none server_args=--variant pna --script waiting:5000,reconnecting:5000,final:5000 host=Linux 6.12.105-fly x86_64 start=1792134257700
+GST start=1792134259213 cmd: GST_DEBUG=cefconsole:4 gst-launch-1.0 cefsrc url=https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html?follow=1 listen-for-js-signals=false max-video-framerate=30/1  ! video/x-raw,format=BGRA,width=1920,height=1080 ! fakesink
+FIRST_SERVER_LINE seen=1792134263079 (+3866 ms after gst start)
+STOP reason=20s-after-first-server-line at=1792134283208
+RUN V5 done
+--- server (stdout)
+request method=OPTIONS path=/phase?after=0 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=true acrm=GET at=1792134262970 headers={…}
+reply method=OPTIONS path=/phase?after=0 status=204 write=ok at=1792134262970 body=-
+request method=GET path=/phase?after=0 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=- acrm=- at=1792134262972 headers={…}
+transition waiting seq=1 at=1792134262972
+reply method=GET path=/phase?after=0 status=200 held_ms=0 write=ok at=1792134262973 body={"phase":"waiting","seq":1}
+request method=OPTIONS path=/phase?after=1 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=true acrm=GET at=1792134263023 headers={…}
+reply method=OPTIONS path=/phase?after=1 status=204 write=ok at=1792134263023 body=-
+request method=GET path=/phase?after=1 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=- acrm=- at=1792134263024 headers={…}
+transition reconnecting seq=2 at=1792134267972
+reply method=GET path=/phase?after=1 status=200 held_ms=4948 write=ok at=1792134267973 body={"phase":"reconnecting","seq":2}
+request method=OPTIONS path=/phase?after=2 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=true acrm=GET at=1792134268019 headers={…}
+reply method=OPTIONS path=/phase?after=2 status=204 write=ok at=1792134268020 body=-
+request method=GET path=/phase?after=2 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=- acrm=- at=1792134268021 headers={…}
+transition final seq=3 at=1792134272972
+reply method=GET path=/phase?after=2 status=200 held_ms=4951 write=ok at=1792134272973 body={"phase":"final","seq":3}
+request method=OPTIONS path=/phase?after=3 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=true acrm=GET at=1792134273019 headers={…}
+reply method=OPTIONS path=/phase?after=3 status=204 write=ok at=1792134273019 body=-
+request method=GET path=/phase?after=3 origin=https://disclosure-raymond-functioning-structured.trycloudflare.com acrpn=- acrm=- at=1792134273020 headers={…}
+transition live seq=4 at=1792134277972
+reply method=GET path=/phase?after=3 status=200 held_ms=4952 write=ok at=1792134277972 body={"phase":"live","seq":4}
+--- console (cefconsole)
+0:00:03.722453646   694 0x56186928c010 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html?follow=1:27 seazn:probe-page=https://disclosure-raymond-functioning-structured.trycloudflare.com secure=true
+0:00:03.778286792   694 0x56186928c010 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html?follow=1:45 seazn:probe=ok:{"phase":"waiting","seq":1}
+0:00:03.778368742   694 0x56186928c010 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html?follow=1:46 seazn:probe-ms=54
+0:00:08.776153663   694 0x56186928c010 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html?follow=1:56 seazn:probe-follow={"phase":"reconnecting","seq":2}
+0:00:13.776091105   694 0x56186928c010 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html?follow=1:56 seazn:probe-follow={"phase":"final","seq":3}
+0:00:18.776250036   694 0x56186928c010 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html?follow=1:56 seazn:probe-follow={"phase":"live","seq":4}
+0:00:18.776336366   694 0x56186928c010 INFO              cefconsole gstcefsrc.cc:442:OnConsoleMessage:<cefsrc0> https://disclosure-raymond-functioning-structured.trycloudflare.com/phase-probe.html?follow=1:63 seazn:probe-follow-done=live:4
+```
+
 ## Platform notes (Fly-specific; nothing inside the image depends on them)
 
 - **CPU:** performance-4x reports AMD EPYC with 4 vCPU.
