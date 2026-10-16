@@ -7,7 +7,9 @@ CEF adapter observes). **Amended 2026-10-15:** also **R2007 PR A merged** (templ
 `OVERLAY_SCENES`, `OverlayPreview`, the gallery and its sweeps), **R2007 PR B merged** (`final` and
 `phaseChannel` on the heartbeat; `lib/relay-phase.ts`), and **C11 Step 0's result in `_FINDINGS.md`**
 (whether CEF 139 lets the page reach loopback; it decides which channel is primary). See "Amendment
-2026-10-15 (overlay templates spec)" at the end. **Use the `frontend-design` skill** (house rule for every UI task), even
+2026-10-15 (overlay templates spec)" at the end. **Amended 2026-10-16:** Step 0 recorded **F-009,
+outcome (a)**, so the hook starts in `loopback`. Its review adds changes 8 and 9 (the page's CSP and a
+CORS-simple request); see "Amendment 2026-10-16 (C11 Step 0, F-009)". **Use the `frontend-design` skill** (house rule for every UI task), even
 though the page is transparent: the compositor output is what viewers see.
 
 ## Context
@@ -90,6 +92,9 @@ score bug. That's an inert seam the owner would only see live.
    the z-order rule and the card variants.
 6. **Phase channel: loopback primary, fallback B** (amendment 2026-10-15; spec §4.3). See the amendment.
 7. **Moments during scenes** (amendment 2026-10-15; spec §4.8). See the amendment.
+8. **CSP `connect-src` allows the loopback endpoint on `/overlay` only** (amendment 2026-10-16; F-009,
+   coordinator decision). See the amendment.
+9. **The phase request stays CORS-simple** (amendment 2026-10-16; F-009 review M5). See the amendment.
 
 ## Files
 
@@ -115,6 +120,10 @@ score bug. That's an inert seam the owner would only see live.
   - Test: `components/overlay/__tests__/overlay-scene.test.ts`,
     `components/overlay/__tests__/moment-queue.test.ts` (extend),
     `app/api/v1/public/fixtures/[id]/overlay/__tests__/route.test.ts` (extend), and the e2e above
+- **Amendment 2026-10-16 (F-009):**
+  - Modify: `apps/web/src/proxy.ts` (change 8) and `components/overlay/use-programme-phase.ts`
+    (`phaseRequest`, change 9)
+  - Test: `src/__tests__/proxy-csp.test.ts` (extend, A5), the A6 test, and E8 in the e2e above
 
 ## Steps
 
@@ -125,6 +134,8 @@ score bug. That's an inert seam the owner would only see live.
   - the clamp: an event 2 001 ms past `now + delay` is clamped; 1 999 ms is not
   - the clamp is not applied when the delay is 0 and the event is in the past
   - **(amendment 2026-10-15)** tests A1–A3 from the amendment section
+  - **(amendment 2026-10-16)** tests A5 (the `/overlay`-only `connect-src`, through `proxy()`) and A6
+    (`phaseRequest` stays CORS-simple)
 - [ ] **Step 2: Write the failing page tests.** Extend the existing `app/overlay/__tests__`; re-pin its
   render harness.
   1. A private fixture plus a valid `sid`/`st` for a composed session on it: 200.
@@ -156,10 +167,11 @@ score bug. That's an inert seam the owner would only see live.
     checkerboard background, to prove transparency. ~~once~~ **(amended 2026-10-15)** once per scene
     (live, starting, reconnecting, final), for cricket (bar) and badminton (bug).
   - **(Amendment 2026-10-15)** e2e cases E1–E7 from the amendment section.
+  - **(Amendment 2026-10-16)** E8: E1 once against a prod build started with `CSP_MODE=enforce`.
 - [ ] **Step 4: Run, expect a FAIL** (vitest JSON reporter; the Playwright spec run alone from
   `apps/web` with `BASE=http://localhost:<port>`).
 - [ ] **Step 5: Implement changes 1–4, then changes 5–7** (the amendment: scene layer, phase channel,
-  moments). Run each change's unit tests (A1–A3) before moving to the next, then the page tests (A4,
+  moments), then changes 8–9 (amendment 2026-10-16: the CSP and the CORS-simple request). Run each change's unit tests (A1–A3) before moving to the next, then the page tests (A4,
   5b) and the e2e.
 - [ ] **Step 6: Run, expect a PASS.** Paste the counts.
 - [ ] **Step 7: Mutate once each.**
@@ -168,6 +180,7 @@ score bug. That's an inert seam the owner would only see live.
   3. Emit ready on mount. The e2e "exactly once, after data" assertion must go red. Make it assert
      ready comes **after** the first snapshot's DOM is present.
   4–12. **(Amendment 2026-10-15)** mutants M4–M12 from the amendment section.
+  13–15. **(Amendment 2026-10-16)** mutants M13–M15 from that amendment.
 - [ ] **Step 8: Run the existing overlay e2e specs** (grep by route `/overlay/fixtures`, not by
   filename). All green and unchanged. **Commit and open the PR:**
   `feat(overlay): compositor access by relay page token, readiness and score-stale signals`
@@ -176,10 +189,14 @@ score bug. That's an inert seam the owner would only see live.
 
 - Unit, page and e2e tests pass.
 - Existing overlay e2e is unchanged and green.
-- ~~3 mutants~~ ~~9~~ ~~11~~ 12 mutants went red (amended 2026-10-15; M10 and M11 from the review
-  fixes; M7 rewritten and M12 added for owner ruling D14, 2026-10-16).
+- ~~3 mutants~~ ~~9~~ ~~11~~ ~~12~~ 15 mutants went red (amended 2026-10-15; M10 and M11 from the review
+  fixes; M7 rewritten and M12 added for owner ruling D14, 2026-10-16; M13–M15 added 2026-10-16 for F-009).
 - Cache isolation is proven, for the page read **and** for the overlay route's `programmePhase`
   (amended 2026-10-15).
+- (Amended 2026-10-16, F-009) Under `CSP_MODE=enforce`, the `/overlay` policy's `connect-src` carries
+  `http://127.0.0.1:7419`, and every other route's policy doesn't (A5, with its printed route count).
+  E8 passed, or its absence is recorded with the reason and G1 named as the first witness. The
+  request is CORS-simple (A6). The PR body records the stg `overlayUrl` origin.
 - The false premises (transparent body, timestamps) are recorded.
 - (Amended 2026-10-15) The R2007 gallery shows all four scenes with **no gallery edit**: its sweeps
   enumerate `OVERLAY_SCENES`, so their printed counts grow by ×4 and stay green. Per-screen owner
@@ -279,7 +296,9 @@ Only the backdrop is a new element (`[data-testid="ovl-scene"]`, below the templ
   PR B). An `AbortController` counts any reply later than `RELAY_PHASE_LONG_POLL_MAX_MS + 2_000` as a
   failure. The reply is validated as above before it reaches the reducer. Unless C11 Step 0 recorded
   outcome (c), "blocked", **in which case the hook starts in `web`**
-  and never fetches loopback; the `_FINDINGS.md` F-id is cited at the constant.
+  and never fetches loopback; the `_FINDINGS.md` F-id is cited at the constant. **(2026-10-16) Step 0
+  recorded F-009, outcome (a): the hook starts in `loopback`. Cite F-009. The request stays CORS-simple
+  (change 9), and `connect-src` must allow it on `/overlay` (change 8).**
 - **Channel signal:** `console.info("seazn:phase-channel=loopback" | "seazn:phase-channel=web")` through
   F-001's console mechanism, once on the first settled channel and again on each change. C11 relays it,
   C06 stores it, and C07 puts `phaseChannel` on the beat, so the heartbeat records it (spec §4.3).
@@ -409,6 +428,92 @@ inside the template (AGENTS.md class 2), and the scene card's box doesn't inters
 
 The Machine side of the channel (C08 publishes, C12 serves, C11 relays the signal) and the `final`
 phase itself (C06) are compositor tasks. The organiser's picker is R2006.
+
+## Amendment 2026-10-16 (C11 Step 0, F-009)
+
+Authority: compositor `_FINDINGS.md` F-009 (CEF 139, outcome (a)), the review of compositor PR #20, and the
+coordinator's decision on that review's I1. F-009 proved that loopback works for a page **with no CSP**, sending
+a **CORS-simple GET**. The real overlay page differs in both ways, and that is the reason for this amendment.
+
+### Change 8: the CSP allows the endpoint on `/overlay` only
+
+- **The gap, re-pin it first** (`seazn.club` `c64e0a217`):
+  - `apps/web/src/proxy.ts` `cspHeader` (`:45`) builds one policy for every page request. Its `connect-src`
+    (`:58`) has no `http://127.0.0.1:7419`.
+  - `/overlay` is outside the `CACHEABLE_PUBLIC` carve-out (`:14`), so `CSP_MODE=enforce` would enforce
+    the policy there. API paths get no CSP at all (`:150-151`).
+  - On 2026-10-16, `seazn.club`, `stg.seazn.club` and `seazn-club-stg.fly.dev` all sent it as
+    `Content-Security-Policy-Report-Only`. `design/v1/DEFERRED.md:36-40` still plans the flip to enforce.
+- **Report-only today:** every poll should log a `[Report Only] Refused to connect` console error.
+- **Once enforced:** every loopback fetch would be blocked before it reaches the network. The hook would drop
+  to fallback B after 3 failures, sticky, with no error anywhere (AGENTS.md class 6).
+- **Coordinator decision (2026-10-16): this task owns it.**
+  - Add `http://127.0.0.1:${RELAY_PHASE_PORT}` (`lib/relay-phase.ts`; derived, never a literal) to
+    `connect-src` for the `/overlay` tree only (`/overlay` or `/overlay/…`), never site-wide.
+  - The OBS page carries the source too; it never fetches it, because the hook makes no request without
+    `host=compositor`.
+  - Thread the pathname from the call site (`proxy.ts:155-157`, re-pin) into `cspHeader`.
+  - The other directives are unchanged, and every other route's policy is byte-identical.
+- **Verify `upgrade-insecure-requests` under enforcement** (`:65`; review I1, unverified). An enforced policy
+  might rewrite `http://127.0.0.1:7419` to `https://127.0.0.1:7419`, which would fail.
+  - **E8:** run E1 once against a prod build started with `CSP_MODE=enforce`. The `page.route` handler must
+    be called at least once. That proves the policy allowed the URL and nothing rewrote it, because a
+    CSP-blocked or rewritten request never reaches `http://127.0.0.1:7419/phase**`. The console must also
+    show no `Refused to connect` line.
+  - If the harness can't start a second server, record that, and the G1 compatibility step on stg becomes
+    the first witness (compositor Owed 21).
+
+### Change 9: the phase request stays CORS-simple (review M5)
+
+- **The rule:** the hook's fetch is `fetch(url, { signal })` and nothing else. No `headers`, no `body`, no
+  `method` other than the default GET, no `credentials`, no `mode`.
+- **Why:**
+  - F-009 proved only that shape.
+  - A non-safelisted request header (a `Content-Type`, say) makes the browser send an **enforced** CORS
+    preflight. C12 answers with no `Access-Control-Allow-Headers` (C12 brief, amended 2026-10-16), so the
+    preflight fails, and so does every poll.
+- **The build:** factor the request into a pure `phaseRequest(seq, signal)` that returns `[url, init]`. The hook
+  calls exactly that.
+
+### The page's origin (review M6; nothing to build here)
+
+stg serves `/overlay` on two hosts. The compositor's exact-origin check passes only for the host the composed
+`overlayUrl` names (C12 brief, amended 2026-10-16). Record in the PR body the origin that `sessionFactsForJob`'s
+`overlayUrl` carries on stg, so C12 can pin it.
+
+### Tests
+
+- **A5** (`src/__tests__/proxy-csp.test.ts`, extend). Go through `proxy(new NextRequest(…))`, the real call site,
+  not `cspHeader` alone, so the pathname wiring is what gets proven. Read the `connect-src` directive from
+  whichever CSP header is present.
+  - **These carry `http://127.0.0.1:7419`,** typed from spec §4.3 (port 7419), never read from
+    `RELAY_PHASE_PORT`. Check each in report-only mode and under `CSP_MODE=enforce` (as
+    `Content-Security-Policy`):
+    - `/overlay/fixtures/<uuid>`
+    - `/overlay/fixtures/<uuid>?host=compositor`
+  - **These don't:** `/`, `/dashboard`, `/shared/<x>`, `/embed/<x>`, `/score/<token>`, and the prefix guard
+    `/overlayx/fixtures/<uuid>`.
+  - Print `routes checked: N`. Fail on 0, and on any route class missing.
+  - Every other directive on `/overlay` equals the same directive on `/dashboard` (split on `; `, compared one by
+    one, with each `'nonce-…'` value replaced first, because the nonce is per request).
+- **A6** (`lib/__tests__/overlay-compositor.test.ts` or the hook's own test):
+  - `Object.keys(phaseRequest(7, signal)[1])` is exactly `["signal"]`.
+  - The URL is `http://127.0.0.1:7419/phase?after=7`.
+- **E8** as described above.
+
+**Mutants** (restore each from a `cp` backup):
+
+| # | Mutant | Expected red |
+|---|---|---|
+| M13 | `connect-src` loses the `/overlay` addition | A5's `/overlay` rows (both modes), E8 |
+| M14 | the addition goes site-wide (every path) | A5's other-route rows |
+| M15 | `phaseRequest` adds `headers: { "Content-Type": "application/json" }` | A6 |
+
+### Files (amendment 2026-10-16)
+
+- Modify: `apps/web/src/proxy.ts`
+- Modify: the hook file `components/overlay/use-programme-phase.ts` (`phaseRequest`)
+- Test: `src/__tests__/proxy-csp.test.ts`, the A6 test, and E8 in `overlay-compositor.spec.ts`
 
 ## Do not touch
 

@@ -1,0 +1,70 @@
+<!doctype html>
+<!--
+  C11 Step 0 probe page (harness only, never shipped). Served from a public HTTPS origin, it asks
+  whether this CEF lets that page fetch the compositor's loopback phase endpoint
+  (http://127.0.0.1:7419/phase, web lib/relay-phase.ts). Every result goes out on F-001's console
+  channel (console.info, read from GStreamer's `cefconsole` category), so no second mechanism:
+    seazn:probe-page=<origin> secure=<isSecureContext>   before the fetch (the channel works)
+    seazn:probe=ok:<body>                                 a 2xx answer
+    seazn:probe=status:<code>:<body>                      any other answer (never read as ok)
+    seazn:probe=blocked:<err.name>:<err.message>          a rejection
+    seazn:probe-ms=<n>                                    fetch start to result
+  ?follow=1 (script runs only): after an ok answer, keep long-polling ?after=<seq> and log each
+  answer as seazn:probe-follow=<body>, until a `live` answer, a failure or 8 answers.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<title>phase probe</title>
+<style>html, body { margin: 0; background: transparent; }</style>
+</head>
+<body>
+<script>
+(() => {
+  const ENDPOINT = "http://127.0.0.1:7419/phase";
+  const FOLLOW_MAX = 8;
+  const follow = new URLSearchParams(location.search).get("follow") === "1";
+  console.info("seazn:probe-page=" + location.origin + " secure=" + window.isSecureContext);
+
+  async function poll(after) {
+    // A bare fetch, as the brief writes it: no init, so nothing but PNA/LNA can add a preflight.
+    const res = await fetch(ENDPOINT + "?after=" + after);
+    return { ok: res.ok, status: res.status, body: await res.text() };
+  }
+
+  async function run() {
+    const t0 = performance.now();
+    let first;
+    try {
+      first = await poll(0);
+    } catch (err) {
+      console.info("seazn:probe=blocked:" + err.name + ":" + err.message);
+      console.info("seazn:probe-ms=" + Math.round(performance.now() - t0));
+      return;
+    }
+    console.info(first.ok ? "seazn:probe=ok:" + first.body : "seazn:probe=status:" + first.status + ":" + first.body);
+    console.info("seazn:probe-ms=" + Math.round(performance.now() - t0));
+    if (!follow || !first.ok) return;
+    let reply = JSON.parse(first.body);
+    for (let n = 1; n < FOLLOW_MAX && reply.phase !== "live"; n++) {
+      try {
+        const next = await poll(reply.seq);
+        if (!next.ok) {
+          console.info("seazn:probe-follow=status:" + next.status + ":" + next.body);
+          return;
+        }
+        console.info("seazn:probe-follow=" + next.body);
+        reply = JSON.parse(next.body);
+      } catch (err) {
+        console.info("seazn:probe-follow=blocked:" + err.name + ":" + err.message);
+        return;
+      }
+    }
+    console.info("seazn:probe-follow-done=" + reply.phase + ":" + reply.seq);
+  }
+
+  run();
+})();
+</script>
+</body>
+</html>
