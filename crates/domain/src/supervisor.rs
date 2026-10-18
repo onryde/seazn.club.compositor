@@ -28,7 +28,12 @@
 //! - **Exited** is terminal and ignores every later event.
 //! - **The final beat** (owner ruling 2026-10-15): every path to `Exit` sends a `Stopped` beat that
 //!   carries its reason first. A drain sends it when the drain starts; an immediate exit sends it in
-//!   the same `Decision`, before `Exit`.
+//!   the same `Decision`, before `Exit`. A fatal error's text rides its beat as `ExitInfo.detail`
+//!   (Owed 27, option a), and a fatal error during a drain sends a second `Stopped` beat, its own.
+//! - **A heartbeat 410** (coordinator decision, wave gate 1 review I5) is web's word that the session
+//!   has ended: `Exit(0)` at once from every state but Exited, reason `SessionGone`, with no hold, no
+//!   drain and no beat. It is the one exit with no final beat: web refuses every beat on a terminal
+//!   session with that same 410 (`seazn.club` `stream-sessions.ts` `heartbeat`).
 //! - **Generations.** Every adapter event carries the generation of the pipeline or page that sent
 //!   it, and each sub-machine ignores any other (C04, C05).
 use crate::backoff::delay;
@@ -64,6 +69,15 @@ pub enum Refusal {
     Unauthorized,
     NotFound,
     WrongMode,
+}
+
+/// Why web refused a heartbeat. Only its 410 (the session has ended) has a ruling (coordinator
+/// decision, wave gate 1 review I5), so it is the only variant: a 401 or a 404 on a beat has none,
+/// C07 keeps both transport errors (`HeartbeatFailed`), and a ruling adds a variant here, never a
+/// guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeartbeatRefusal {
+    Gone,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,8 +122,15 @@ pub enum Event {
     ScoreStale(bool),
     HeartbeatReply(Desired),
     HeartbeatFailed,
+    /// Web refused a beat (C07 classifies its 410 into this, distinct from a transport error).
+    HeartbeatRefused(HeartbeatRefusal),
     Signal(SignalKind),
-    Fatal,
+    /// A fatal error. `detail` is its text (C08 maps it from the error), carried opaque and verbatim
+    /// into the final beat's `ExitInfo.detail` (Owed 27, option a). No cap and no redaction here: C07
+    /// redacts it, caps it at 100 chars and omits it when empty, the one authority.
+    Fatal {
+        detail: Option<String>,
+    },
     /// The page's phase channel, as it reports it (overlay templates spec 2026-10-15 §4.3; C11).
     PhaseChannel(PhaseChannel),
 }
@@ -162,6 +183,8 @@ pub struct Supervisor {
     deadline_at: Ms,
     output_ever_connected: bool,
     heartbeat_failures: u32,
+    /// The fatal error's text, set only as a fatal error exits (Owed 27, option a).
+    exit_detail: Option<String>,
 }
 
 impl Supervisor {
@@ -185,6 +208,7 @@ impl Supervisor {
             deadline_at: Ms::MAX,
             output_ever_connected: false,
             heartbeat_failures: 0,
+            exit_detail: None,
         }
     }
 
@@ -237,6 +261,19 @@ impl Supervisor {
         self.lifecycle = Lifecycle::Exited(reason);
         fx.push(Effect::SendHeartbeat(self.health(now)));
         fx.push(Effect::Exit(reason.code()));
+    }
+
+    /// A fatal error: its text rides the final beat, then `Exit(70)`.
+    fn fatal(&mut self, now: Ms, detail: Option<String>, fx: &mut Vec<Effect>) {
+        self.exit_detail = detail;
+        self.exit(now, ExitReason::Fatal, fx);
+    }
+
+    /// A heartbeat 410: web has ended the session. `Exit` alone, at once: no hold, no drain, and no
+    /// beat, which web would refuse with the same 410 (coordinator decision, wave gate 1 review I5).
+    fn gone(&mut self, fx: &mut Vec<Effect>) {
+        self.lifecycle = Lifecycle::Exited(ExitReason::SessionGone);
+        fx.push(Effect::Exit(ExitReason::SessionGone.code()));
     }
 
     /// The drain's end. Its final beat went out when it started, so this is `Exit` alone.
@@ -315,7 +352,9 @@ impl Supervisor {
             }
             // Nothing is on air while booting, so a signal exits at once: nothing to hold or drain.
             Event::Signal(_) => self.exit(now, ExitReason::Signalled, fx),
-            Event::Fatal => self.exit(now, ExitReason::Fatal, fx),
+            Event::Fatal { detail } => self.fatal(now, detail, fx),
+            // No beat is in flight while booting, but web's word that the session ended holds here too.
+            Event::HeartbeatRefused(HeartbeatRefusal::Gone) => self.gone(fx),
             _ => {}
         }
     }
@@ -372,7 +411,8 @@ impl Supervisor {
             Event::HeartbeatFailed => self.heartbeat_failures = self.heartbeat_failures.saturating_add(1),
             Event::Signal(SignalKind::Int) => self.start_hold(now, ExitReason::Signalled),
             Event::Signal(SignalKind::Term) => self.start_drain(now, ExitReason::Signalled, fx),
-            Event::Fatal => self.exit(now, ExitReason::Fatal, fx),
+            Event::Fatal { detail } => self.fatal(now, detail, fx),
+            Event::HeartbeatRefused(HeartbeatRefusal::Gone) => self.gone(fx),
             Event::OutputDrained
             | Event::BootstrapOk { .. }
             | Event::BootstrapFailed
@@ -426,7 +466,9 @@ impl Supervisor {
             Event::HeartbeatReply(Desired::Live) => self.heartbeat_failures = 0,
             Event::HeartbeatFailed => self.heartbeat_failures = self.heartbeat_failures.saturating_add(1),
             Event::Signal(SignalKind::Term) => self.start_drain(now, ExitReason::Signalled, fx),
-            Event::Fatal => self.exit(now, ExitReason::Fatal, fx),
+            Event::Fatal { detail } => self.fatal(now, detail, fx),
+            // Web has ended the session: no Final card is owed to it (the hold is cut short).
+            Event::HeartbeatRefused(HeartbeatRefusal::Gone) => self.gone(fx),
             // A second end request (the reply after the SIGINT, or the reverse) keeps the FIRST hold's
             // clock. An overrun changes nothing: the hold is ≤ final_hold_ms.
             Event::HeartbeatReply(Desired::Ending)
@@ -444,8 +486,11 @@ impl Supervisor {
         match event {
             Event::OutputDrained => self.finish_drain(reason, fx),
             Event::Tick if elapsed(now, since) >= self.t.drain_timeout_ms => self.finish_drain(reason, fx),
-            // The drain's beat named the drain's reason; a fatal error is a different one, so it beats.
-            Event::Fatal => self.exit(now, ExitReason::Fatal, fx),
+            // The drain's beat named the drain's reason; a fatal error is a different one, so it beats
+            // (a second Stopped beat, wave gate 1 review m2).
+            Event::Fatal { detail } => self.fatal(now, detail, fx),
+            // A 410 (the drain's own beat may draw it): the drain is cut short, and no beat follows.
+            Event::HeartbeatRefused(HeartbeatRefusal::Gone) => self.gone(fx),
             _ => {}
         }
     }
@@ -466,9 +511,13 @@ impl Supervisor {
 
     pub fn health(&self, now: Ms) -> HealthReport {
         let (state, exit) = match self.lifecycle {
-            Lifecycle::Draining { reason, .. } | Lifecycle::Exited(reason) => {
-                (BeatState::Stopped, Some(ExitInfo { reason, detail: None }))
-            }
+            Lifecycle::Draining { reason, .. } | Lifecycle::Exited(reason) => (
+                BeatState::Stopped,
+                Some(ExitInfo {
+                    reason,
+                    detail: self.exit_detail.clone(),
+                }),
+            ),
             Lifecycle::Booting { .. } => (BeatState::Starting, None),
             // Owner ruling 2026-10-14 (plan review F5, option A): `playing` = the programme is on air,
             // slate or picture, and the Final scene is on air in the hold. The camera's state travels
@@ -981,7 +1030,7 @@ mod tests {
     fn crash_after_ending_exits_70_and_the_restart_then_sees_410() {
         let s = booted(0).decide(Event::Tick, 0).next;
         let s = s.decide(Event::HeartbeatReply(Desired::Ending), 10).next;
-        assert_eq!(exit_code(&s.decide(Event::Fatal, 20)), Some(70));
+        assert_eq!(exit_code(&s.decide(Event::Fatal { detail: None }, 20)), Some(70));
         // the host-restarted process: a fresh supervisor whose bootstrap is refused as gone
         let r = Supervisor::new(t())
             .decide(Event::Tick, 0)
@@ -997,7 +1046,8 @@ mod tests {
             .next;
         for e in [
             Event::Tick,
-            Event::Fatal,
+            Event::Fatal { detail: None },
+            Event::HeartbeatRefused(HeartbeatRefusal::Gone),
             Event::InputFrame,
             Event::HeartbeatReply(Desired::Ending),
             Event::Signal(SignalKind::Int),
@@ -1248,7 +1298,7 @@ mod tests {
     fn fatal_during_the_hold_exits_70() {
         let s = booted(0).decide(Event::Tick, 0).next;
         let s = s.decide(Event::HeartbeatReply(Desired::Ending), 100).next;
-        let d = s.decide(Event::Fatal, 200);
+        let d = s.decide(Event::Fatal { detail: None }, 200);
         assert_eq!(exit_code(&d), Some(70));
         assert_eq!(d.next.lifecycle(), Lifecycle::Exited(ExitReason::Fatal));
         let at = |want: fn(&Effect) -> bool| d.effects.iter().position(want).expect("effect");
@@ -2007,5 +2057,472 @@ mod tests {
         assert!(now < th.kick_window_ms, "setup: every kick inside one window");
         assert_eq!(kicks as usize, th.kick_alert_count + 1);
         assert!(s.health(now).input_kick_alert, "no alert after {kicks} kicks");
+    }
+
+    // ---- wave gate 1 review (PR #24): thresholds, the beat's legs, the fatal detail, the 410 ----
+
+    /// Every `Ms` threshold distinct from every other (wave gate 1 review I1: the defaults share
+    /// 10 000 between `final_hold_ms`, `cef_hang_after_ms` and three more, and 1 000 between both
+    /// back-off bases, so a timer that read the wrong field kept its instant). Every field is written
+    /// out, so a new one is a compile error here, never a silent default.
+    fn distinct() -> Thresholds {
+        Thresholds {
+            frozen_after_ms: 503,
+            slate_after_ms: 3_011,
+            resume_after_ms: 1_019,
+            input_backoff_base_ms: 1_031,
+            input_backoff_cap_ms: 10_037,
+            input_connect_timeout_ms: 5_041,
+            input_stall_after_ms: 5_051,
+            kick_alert_count: 3,
+            kick_window_ms: 300_061,
+            output_stall_after_ms: 5_071,
+            output_backoff_base_ms: 541,
+            output_backoff_cap_ms: 2_081,
+            output_connect_timeout_ms: 5_087,
+            cef_fail_count: 3,
+            cef_fail_window_ms: 300_097,
+            cef_load_timeout_ms: 10_103,
+            cef_recycle_every_ms: 7_200_109,
+            cef_backoff_base_ms: 1_117,
+            cef_backoff_cap_ms: 10_127,
+            cef_alive_every_ms: 2_131,
+            cef_hang_after_ms: 10_139,
+            ladder_overruns_to_step: 3,
+            ladder_window_ms: 1_151,
+            drain_timeout_ms: 4_157,
+            final_hold_ms: 8_161,
+            heartbeat_interval_ms: 6_173,
+            bootstrap_backoff_base_ms: 1_301,
+            bootstrap_backoff_cap_ms: 2_903,
+        }
+    }
+
+    // Wave gate 1 review I1: each of the supervisor's own timers fires at exactly its threshold and
+    // not 1 ms before, under thresholds that are all distinct, so a timer reading another field moves
+    // (the reviewer's M10, the hold reading `cef_hang_after_ms`, and M11, the bootstrap back-off
+    // reading the CEF back-off, both survived the defaults). The session's beat interval is a value
+    // no threshold has, so the beat reading `Thresholds::heartbeat_interval_ms` moves too.
+    #[test]
+    fn every_supervisor_timer_fires_at_its_own_threshold() {
+        let th = distinct();
+        let ms = [
+            th.frozen_after_ms,
+            th.slate_after_ms,
+            th.resume_after_ms,
+            th.input_backoff_base_ms,
+            th.input_backoff_cap_ms,
+            th.input_connect_timeout_ms,
+            th.input_stall_after_ms,
+            th.kick_window_ms,
+            th.output_stall_after_ms,
+            th.output_backoff_base_ms,
+            th.output_backoff_cap_ms,
+            th.output_connect_timeout_ms,
+            th.cef_fail_window_ms,
+            th.cef_load_timeout_ms,
+            th.cef_recycle_every_ms,
+            th.cef_backoff_base_ms,
+            th.cef_backoff_cap_ms,
+            th.cef_alive_every_ms,
+            th.cef_hang_after_ms,
+            th.ladder_window_ms,
+            th.drain_timeout_ms,
+            th.final_hold_ms,
+            th.heartbeat_interval_ms,
+            th.bootstrap_backoff_base_ms,
+            th.bootstrap_backoff_cap_ms,
+        ];
+        let mut unique = ms.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 25, "setup: every Ms threshold distinct");
+        let base = th.bootstrap_backoff_base_ms;
+        assert!(
+            2 * base < th.bootstrap_backoff_cap_ms && 4 * base > th.bootstrap_backoff_cap_ms,
+            "setup: the second wait doubles and the third is capped"
+        );
+        let session_beat: Ms = 3_701;
+        assert!(
+            !ms.contains(&session_beat),
+            "setup: the session's interval is no threshold"
+        );
+        let mut timers = 0;
+
+        // The bootstrap back-off: base, doubled, then capped, each from its failure's instant.
+        let mut s = Supervisor::new(th.clone());
+        let mut fetch_at: Ms = 0;
+        for wait in [base, 2 * base, th.bootstrap_backoff_cap_ms] {
+            let d = s.decide(Event::Tick, fetch_at);
+            assert_eq!(d.effects, vec![Effect::FetchSession], "a fetch at {fetch_at}");
+            let failed_at = fetch_at + 100;
+            s = d.next.decide(Event::BootstrapFailed, failed_at).next;
+            assert!(
+                s.decide(Event::Tick, failed_at + wait - 1).effects.is_empty(),
+                "a retry before {wait} ms"
+            );
+            fetch_at = failed_at + wait;
+            timers += 1;
+        }
+        let d = s.decide(Event::Tick, fetch_at);
+        assert_eq!(
+            d.effects,
+            vec![Effect::FetchSession],
+            "the third retry at {fetch_at}"
+        );
+
+        // The session's beat interval: the first running tick beats, the next beat is due exactly
+        // one session interval later.
+        let b = fetch_at + 50;
+        let d = d.next.decide(
+            Event::BootstrapOk {
+                heartbeat_interval_ms: session_beat,
+                deadline_at: FAR,
+            },
+            b,
+        );
+        assert_eq!(d.effects, vec![Effect::StartProgramme]);
+        let mut s = d.next.decide(Event::Tick, b).next;
+        assert!(beats(&s.decide(Event::Tick, b + session_beat - 1).effects).is_empty());
+        let d = s.decide(Event::Tick, b + session_beat);
+        assert_eq!(beats(&d.effects).len(), 1, "the beat at the session's interval");
+        s = d.next;
+        timers += 1;
+
+        // The final hold: Holding at final_hold_ms - 1, the drain at final_hold_ms.
+        let h = b + session_beat + 10;
+        s = s.decide(Event::HeartbeatReply(Desired::Ending), h).next;
+        s = s.decide(Event::Tick, h).next;
+        let d = s.decide(Event::Tick, h + th.final_hold_ms - 1);
+        let held = Lifecycle::Holding {
+            since: h,
+            reason: ExitReason::Ended,
+        };
+        assert_eq!(d.next.lifecycle(), held, "still held 1 ms before final_hold_ms");
+        let d = d.next.decide(Event::Tick, h + th.final_hold_ms);
+        let drain_at = h + th.final_hold_ms;
+        assert_eq!(
+            d.next.lifecycle(),
+            Lifecycle::Draining {
+                since: drain_at,
+                reason: ExitReason::Ended
+            }
+        );
+        assert!(d.effects.contains(&Effect::DrainOutput));
+        timers += 1;
+
+        // The drain's timeout: nothing at drain_timeout_ms - 1, Exit alone at drain_timeout_ms.
+        let d = d.next.decide(Event::Tick, drain_at + th.drain_timeout_ms - 1);
+        assert!(d.effects.is_empty(), "{:?}", d.effects);
+        let d = d.next.decide(Event::Tick, drain_at + th.drain_timeout_ms);
+        assert_eq!(d.effects, vec![Effect::Exit(0)]);
+        timers += 1;
+
+        // The deadline tick: Running 1 ms before the deadline, the hold at it.
+        let deadline = 41_011;
+        assert!(!ms.contains(&deadline), "setup: the deadline is no threshold");
+        let s = Supervisor::new(th.clone()).decide(Event::Tick, 0).next;
+        let s = s
+            .decide(
+                Event::BootstrapOk {
+                    heartbeat_interval_ms: session_beat,
+                    deadline_at: deadline,
+                },
+                0,
+            )
+            .next;
+        let s = s.decide(Event::Tick, deadline - 1).next;
+        assert_eq!(s.lifecycle(), Lifecycle::Running);
+        let s = s.decide(Event::Tick, deadline).next;
+        assert_eq!(
+            s.lifecycle(),
+            Lifecycle::Holding {
+                since: deadline,
+                reason: ExitReason::Deadline
+            }
+        );
+        timers += 1;
+        assert_eq!(timers, 7, "timers checked: {timers}");
+    }
+
+    // Wave gate 1 review I2 (the reviewer's M2): only progress that connects the sink makes the output
+    // "ever connected". A zero total (nothing sent yet), the bytes of a sink not current, and a
+    // sink never built leave the beat Starting before the first connect, and still Starting once
+    // the sink then fails; the positive pair, a growing total from the current sink, reads Playing,
+    // then Stalled on its error.
+    #[test]
+    fn progress_that_connects_nothing_leaves_the_beat_starting() {
+        let s = booted(0).decide(Event::Tick, 0).next;
+        assert_eq!(s.output_generation(), 1, "setup: the first sink is built");
+        let mut checked = 0;
+        for (name, ev) in [
+            (
+                "a zero total",
+                Event::OutputProgress {
+                    gen: 1,
+                    total_bytes: 0,
+                },
+            ),
+            (
+                "bytes from before the first sink",
+                Event::OutputProgress {
+                    gen: 0,
+                    total_bytes: 5_000,
+                },
+            ),
+            (
+                "bytes from a sink never built",
+                Event::OutputProgress {
+                    gen: 2,
+                    total_bytes: 5_000,
+                },
+            ),
+        ] {
+            let n = s.decide(ev, 10).next;
+            assert_eq!(n.health(10).state, BeatState::Starting, "{name}");
+            let n = n.decide(Event::OutputError { gen: 1 }, 20).next;
+            assert_eq!(n.health(20).state, BeatState::Starting, "{name}, then an error");
+            checked += 1;
+        }
+        assert_eq!(checked, 3, "progress events checked: {checked}");
+        let n = s.decide(progress(&s, 1), 10).next;
+        assert_eq!(n.health(10).state, BeatState::Playing, "the positive pair");
+        let n = n.decide(Event::OutputError { gen: 1 }, 20).next;
+        assert_eq!(n.health(20).state, BeatState::Stalled);
+    }
+
+    // Wave gate 1 review m1 (the reviewer's M3): the hold's Stalled leg. An output error in the hold,
+    // after the sink had connected, reads Stalled, and the hold's beat says so with the Final phase.
+    #[test]
+    fn an_output_error_in_the_hold_reads_stalled() {
+        let s = booted(0).decide(Event::Tick, 0).next;
+        let s = s.decide(progress(&s, 1_000), 10).next;
+        let s = s.decide(Event::HeartbeatReply(Desired::Ending), 100).next;
+        assert_eq!(
+            s.health(100).state,
+            BeatState::Playing,
+            "setup: on air in the hold"
+        );
+        let s = s.decide(Event::OutputError { gen: 1 }, 200).next;
+        assert!(matches!(s.lifecycle(), Lifecycle::Holding { .. }));
+        assert_eq!(s.health(200).state, BeatState::Stalled);
+        let d = s.decide(Event::Tick, 200);
+        let b = beats(&d.effects);
+        assert_eq!(b.len(), 1, "the hold's first tick beats: {:?}", d.effects);
+        assert_eq!((b[0].state, b[0].programme_phase), (BeatState::Stalled, Final));
+    }
+
+    /// The four states a fatal error can reach (not Exited), each 50 ms before the event.
+    fn every_live_state() -> Vec<(&'static str, Supervisor)> {
+        let on_air = || booted(0).decide(Event::Tick, 0).next;
+        vec![
+            ("Booting", Supervisor::new(t()).decide(Event::Tick, 0).next),
+            ("Running", on_air()),
+            (
+                "Holding",
+                on_air().decide(Event::HeartbeatReply(Desired::Ending), 50).next,
+            ),
+            (
+                "Draining",
+                on_air().decide(Event::Signal(SignalKind::Term), 50).next,
+            ),
+        ]
+    }
+
+    // Owed 27, option (a) (coordinator decision on the wave gate 1 review): a fatal error's text rides
+    // its final beat, opaque and verbatim, from every state it can reach. No cap and no redaction in
+    // the domain (C07's redact and 100-char cap are the one authority), so an empty text, a long one
+    // and one with a stream URL arrive as they were sent, and no text arrives as none.
+    #[test]
+    fn a_fatal_carries_its_detail_verbatim_into_the_final_beat_from_every_state() {
+        let long = format!("rtmps://live.example:443/live2/k3y {}", "é🎉".repeat(150));
+        let details = [
+            None,
+            Some(String::new()),
+            Some("decoder: not-negotiated".to_string()),
+            Some(long),
+        ];
+        let mut checked = 0;
+        for (name, s) in every_live_state() {
+            for detail in &details {
+                let d = s.decide(
+                    Event::Fatal {
+                        detail: detail.clone(),
+                    },
+                    100,
+                );
+                assert_eq!(d.next.lifecycle(), Lifecycle::Exited(ExitReason::Fatal), "{name}");
+                assert_eq!(d.effects.len(), 2, "{name}: {:?}", d.effects);
+                let Effect::SendHeartbeat(h) = &d.effects[0] else {
+                    panic!("{name}: the final beat first, got {:?}", d.effects[0]);
+                };
+                let want = Some(ExitInfo {
+                    reason: ExitReason::Fatal,
+                    detail: detail.clone(),
+                });
+                assert_eq!(h.exit, want, "{name}");
+                assert_eq!(d.effects[1], Effect::Exit(70), "{name}");
+                assert_eq!(
+                    d.next.health(200).exit,
+                    want,
+                    "{name}: the exited report keeps it"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 16, "fatal details checked: {checked}");
+    }
+
+    // Owed 27 (a), the other way (the reviewer's M9): the detail is a fatal error's alone. Every Stopped
+    // beat a fatal error did not send carries none: each refusal, a signal or a past deadline while
+    // booting, and the drain's beat after SIGTERM, SIGINT, an Ending reply or the deadline. A fatal
+    // error during a drain then sends a second Stopped beat (wave gate 1 review m2), and only that
+    // one carries the text.
+    #[test]
+    fn every_stopped_beat_but_a_fatal_ones_has_no_detail() {
+        let th = t();
+        let on_air = || booted(0).decide(Event::Tick, 0).next;
+        let fresh = || Supervisor::new(t()).decide(Event::Tick, 0).next;
+        let to_drain = |mut s: Supervisor, from: Ms| -> (Supervisor, Vec<Effect>) {
+            let mut fx = Vec::new();
+            let mut now = from;
+            while !matches!(s.lifecycle(), Lifecycle::Draining { .. }) {
+                assert!(now <= from + th.final_hold_ms + period(), "no drain by {now}");
+                let d = s.decide(Event::Tick, now);
+                fx.extend(d.effects);
+                s = d.next;
+                now += period();
+            }
+            (s, fx)
+        };
+        let mut paths: Vec<(&str, ExitReason, Supervisor, Vec<Effect>)> = Vec::new();
+        for (r, reason) in [
+            (Refusal::Gone, ExitReason::SessionGone),
+            (Refusal::Unauthorized, ExitReason::Refused),
+            (Refusal::NotFound, ExitReason::Refused),
+            (Refusal::WrongMode, ExitReason::Refused),
+        ] {
+            let d = fresh().decide(Event::BootstrapRefused(r), 5);
+            paths.push(("a refusal", reason, d.next, d.effects));
+        }
+        let d = fresh().decide(Event::Signal(SignalKind::Int), 5);
+        paths.push(("a signal while booting", ExitReason::Signalled, d.next, d.effects));
+        let d = fresh().decide(
+            Event::BootstrapOk {
+                heartbeat_interval_ms: 5_000,
+                deadline_at: 1,
+            },
+            5,
+        );
+        paths.push(("a past deadline", ExitReason::Deadline, d.next, d.effects));
+        let d = on_air().decide(Event::Signal(SignalKind::Term), 100);
+        paths.push(("SIGTERM's drain", ExitReason::Signalled, d.next, d.effects));
+        for (ev, reason) in [
+            (Event::Signal(SignalKind::Int), ExitReason::Signalled),
+            (Event::HeartbeatReply(Desired::Ending), ExitReason::Ended),
+        ] {
+            let s = on_air().decide(ev, 100).next;
+            let (s, fx) = to_drain(s, 100);
+            paths.push(("a hold's drain", reason, s, fx));
+        }
+        let deadline = 30_000;
+        let s = booted_until(0, deadline).decide(Event::Tick, 0).next;
+        let (s, fx) = to_drain(s, deadline);
+        paths.push(("the deadline hold's drain", ExitReason::Deadline, s, fx));
+        let mut checked = 0;
+        for (name, reason, s, fx) in &paths {
+            let stopped: Vec<_> = beats(fx)
+                .into_iter()
+                .filter(|h| h.state == BeatState::Stopped)
+                .collect();
+            assert_eq!(stopped.len(), 1, "{name}: {fx:?}");
+            let want = Some(ExitInfo {
+                reason: *reason,
+                detail: None,
+            });
+            assert_eq!(stopped[0].exit, want, "{name}");
+            assert_eq!(s.health(60_000).exit, want, "{name}: the report after it");
+            checked += 1;
+        }
+        assert_eq!(checked, 10, "Stopped beats checked: {checked}");
+
+        let s = on_air();
+        let d1 = s.decide(Event::Signal(SignalKind::Term), 100);
+        let d2 = d1.next.decide(
+            Event::Fatal {
+                detail: Some("boom".to_string()),
+            },
+            200,
+        );
+        let two: Vec<_> = beats(&d1.effects)
+            .into_iter()
+            .chain(beats(&d2.effects))
+            .filter_map(|h| h.exit.clone())
+            .collect();
+        assert_eq!(
+            two,
+            vec![
+                ExitInfo {
+                    reason: ExitReason::Signalled,
+                    detail: None
+                },
+                ExitInfo {
+                    reason: ExitReason::Fatal,
+                    detail: Some("boom".to_string())
+                },
+            ],
+            "a fatal error during a drain: two Stopped beats, the text on the second alone"
+        );
+    }
+
+    // Wave gate 1 review I5 (coordinator decision): a heartbeat 410 is web's word that the session has
+    // ended (`seazn.club` `stream-sessions.ts` `heartbeat` refuses every beat on a terminal session
+    // with it). From every state but Exited, it is `Exit(0)` at once with reason SessionGone: no Final
+    // hold, no drain and no beat, since web would refuse that beat with the same 410. Nothing follows
+    // it, and after a fatal exit it changes nothing.
+    #[test]
+    fn a_heartbeat_410_exits_at_once_with_no_hold_drain_or_beat() {
+        let gone = || Event::HeartbeatRefused(HeartbeatRefusal::Gone);
+        let mut states = every_live_state();
+        states.insert(0, ("Booting, a fetch due", Supervisor::new(t())));
+        let backing_off = Supervisor::new(t())
+            .decide(Event::Tick, 0)
+            .next
+            .decide(Event::BootstrapFailed, 10)
+            .next;
+        states.insert(1, ("Booting, backing off", backing_off));
+        let mut checked = 0;
+        for (name, s) in states {
+            let d = s.decide(gone(), 100);
+            assert_eq!(d.effects, vec![Effect::Exit(0)], "{name}");
+            assert_eq!(d.frame, None, "{name}");
+            assert_eq!(
+                d.next.lifecycle(),
+                Lifecycle::Exited(ExitReason::SessionGone),
+                "{name}"
+            );
+            for e in [
+                Event::Tick,
+                Event::Fatal {
+                    detail: Some("late".to_string()),
+                },
+                gone(),
+            ] {
+                let after = d.next.decide(e, 200);
+                assert!(after.effects.is_empty() && after.frame.is_none(), "{name}");
+                assert_eq!(after.next, d.next, "{name}: changed after the exit");
+            }
+            checked += 1;
+        }
+        let s = booted(0)
+            .decide(Event::Tick, 0)
+            .next
+            .decide(Event::Fatal { detail: None }, 50)
+            .next;
+        let d = s.decide(gone(), 100);
+        assert!(d.effects.is_empty(), "a 410 after a fatal exit: {:?}", d.effects);
+        assert_eq!(d.next, s);
+        checked += 1;
+        assert_eq!(checked, 7, "states checked: {checked}");
     }
 }

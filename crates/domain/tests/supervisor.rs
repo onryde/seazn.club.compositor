@@ -3,12 +3,14 @@
 //! because the domain's crate root forbids `clippy::print_stderr`, and a sweep must print the count
 //! it checked (AGENTS.md §5).
 use domain::config::{OutputProfile, Thresholds};
-use domain::health::{BeatState, HealthReport, PhaseChannel};
+use domain::health::{BeatState, ExitInfo, HealthReport, PhaseChannel};
 use domain::input_link::LossReason;
 use domain::ladder::Rung;
 use domain::lifecycle::{ExitReason, Lifecycle};
 use domain::programme::{FrameChoice, ProgrammePhase, SlateKind};
-use domain::supervisor::{Decision, Desired, Effect, Event, Refusal, SignalKind, Supervisor};
+use domain::supervisor::{
+    Decision, Desired, Effect, Event, HeartbeatRefusal, Refusal, SignalKind, Supervisor,
+};
 use domain::time::Ms;
 
 const FAR: Ms = 10_000_000;
@@ -44,6 +46,9 @@ fn booted(now: Ms, deadline_at: Ms) -> Supervisor {
     assert_eq!(d.next.lifecycle(), Lifecycle::Running, "setup: booted");
     d.next
 }
+
+/// The fatal error's text every `Kind::Fatal` sample carries (Owed 27, option a).
+const FATAL_DETAIL: &str = "decoder: not-negotiated";
 
 fn stopped_reason(h: &HealthReport) -> Option<ExitReason> {
     (h.state == BeatState::Stopped)
@@ -98,12 +103,14 @@ enum Kind {
     Live,
     Ending,
     HeartbeatFailed,
+    /// A heartbeat 410 (wave gate 1 review I5).
+    HeartbeatGone,
     Term,
     Int,
     Fatal,
 }
 
-const KINDS: [Kind; 23] = [
+const KINDS: [Kind; 24] = [
     Kind::Tick,
     Kind::BootstrapOk,
     Kind::BootstrapFailed,
@@ -124,6 +131,7 @@ const KINDS: [Kind; 23] = [
     Kind::Live,
     Kind::Ending,
     Kind::HeartbeatFailed,
+    Kind::HeartbeatGone,
     Kind::Term,
     Kind::Int,
     Kind::Fatal,
@@ -155,9 +163,10 @@ fn kind_of(e: &Event) -> Kind {
         Event::HeartbeatReply(Desired::Live) => Kind::Live,
         Event::HeartbeatReply(Desired::Ending) => Kind::Ending,
         Event::HeartbeatFailed => Kind::HeartbeatFailed,
+        Event::HeartbeatRefused(HeartbeatRefusal::Gone) => Kind::HeartbeatGone,
         Event::Signal(SignalKind::Term) => Kind::Term,
         Event::Signal(SignalKind::Int) => Kind::Int,
-        Event::Fatal => Kind::Fatal,
+        Event::Fatal { .. } => Kind::Fatal,
     }
 }
 
@@ -203,9 +212,12 @@ fn sample(kind: Kind, s: &Supervisor) -> Event {
         Kind::Live => Event::HeartbeatReply(Desired::Live),
         Kind::Ending => Event::HeartbeatReply(Desired::Ending),
         Kind::HeartbeatFailed => Event::HeartbeatFailed,
+        Kind::HeartbeatGone => Event::HeartbeatRefused(HeartbeatRefusal::Gone),
         Kind::Term => Event::Signal(SignalKind::Term),
         Kind::Int => Event::Signal(SignalKind::Int),
-        Kind::Fatal => Event::Fatal,
+        Kind::Fatal => Event::Fatal {
+            detail: Some(FATAL_DETAIL.to_string()),
+        },
     };
     assert_eq!(kind_of(&e), kind, "sample");
     e
@@ -238,7 +250,7 @@ fn setup(st: Setup, kind: Kind) -> (Supervisor, Ms) {
             100,
         ),
         Setup::Draining => (on_air().decide(Event::Signal(SignalKind::Term), 50).next, 100),
-        Setup::Exited => (on_air().decide(Event::Fatal, 50).next, 100),
+        Setup::Exited => (on_air().decide(Event::Fatal { detail: None }, 50).next, 100),
     };
     let ok = match (st, s.lifecycle()) {
         (Setup::BootingDue, Lifecycle::Booting { retry_at, .. }) => retry_at.is_some_and(|r| r <= now),
@@ -275,7 +287,8 @@ enum Want {
     Drain(ExitReason),
     /// An immediate exit: the final beat with the reason, then `Exit`.
     Exit(ExitReason),
-    /// The drain's end: `Exit` alone (its final beat went out when it started).
+    /// `Exit` alone: the drain's end (its final beat went out when it started), or a heartbeat 410
+    /// (no beat at all: web refuses every beat on a terminal session with that 410).
     ExitAlone(ExitReason),
 }
 
@@ -295,16 +308,20 @@ fn brief(st: Setup, k: Kind) -> Want {
             K::RefusedOther => W::Exit(R::Refused),
             K::Term | K::Int => W::Exit(R::Signalled),
             K::Fatal => W::Exit(R::Fatal),
+            K::HeartbeatGone => W::ExitAlone(R::SessionGone),
             _ => W::Ignored,
         },
-        // Draining: only the drain's end or a fatal error.
+        // Draining: only the drain's end, a fatal error or a heartbeat 410.
         (S::Draining, K::OutputDrained) => W::ExitAlone(R::Signalled),
         (S::Draining, K::Fatal) => W::Exit(R::Fatal),
+        (S::Draining, K::HeartbeatGone) => W::ExitAlone(R::SessionGone),
         (S::Draining, _) => W::Ignored,
         // On air.
         (S::Running | S::Holding, K::Tick) => W::Frame,
         (S::Running | S::Holding, K::Term) => W::Drain(R::Signalled),
         (S::Running | S::Holding, K::Fatal) => W::Exit(R::Fatal),
+        // Web has ended the session: no hold, no drain, no beat (coordinator decision, wave gate 1 I5).
+        (S::Running | S::Holding, K::HeartbeatGone) => W::ExitAlone(R::SessionGone),
         (S::Running, K::Ending) => W::Hold(R::Ended),
         (S::Running, K::Int) => W::Hold(R::Signalled),
         // A second end request keeps the first hold's clock; an overrun changes nothing in the hold.
@@ -320,8 +337,12 @@ fn brief(st: Setup, k: Kind) -> Want {
 fn check(st: Setup, k: Kind, s: &Supervisor, now: Ms, d: &Decision) {
     let at = format!("({st:?}, {k:?})");
     let th = t();
-    let beat_with =
-        |fx: &Effect, r: ExitReason| matches!(fx, Effect::SendHeartbeat(h) if stopped_reason(h) == Some(r));
+    // Owed 27 (a): a Stopped beat carries the fatal error's text iff the event was the fatal error.
+    let detail = (k == Kind::Fatal).then(|| FATAL_DETAIL.to_string());
+    let beat_with = |fx: &Effect, r: ExitReason| {
+        matches!(fx, Effect::SendHeartbeat(h) if stopped_reason(h) == Some(r)
+            && h.exit == Some(ExitInfo { reason: r, detail: detail.clone() }))
+    };
     match brief(st, k) {
         Want::Ignored => {
             assert!(d.effects.is_empty() && d.frame.is_none(), "{at}: {:?}", d.effects);
@@ -419,7 +440,7 @@ fn every_lifecycle_event_pair_follows_the_brief() {
     assert!(moved > 0, "a matrix where nothing moves is vacuous");
 }
 
-// ---- every exit path's final beat (owner ruling 2026-10-15) ----
+// ---- every exit path's final beat (owner ruling 2026-10-15), but a heartbeat 410's ----
 
 /// Applies `events` in order and returns the supervisor and every effect, in order.
 fn run(mut s: Supervisor, events: &[(Ms, Event)]) -> (Supervisor, Vec<Effect>) {
@@ -459,7 +480,7 @@ fn tick_to_the_end(mut s: Supervisor, from: Ms, budget: Ms, drained: bool) -> (S
 }
 
 #[test]
-fn every_exit_is_preceded_by_a_final_beat_with_its_reason() {
+fn every_exit_but_a_heartbeat_410_is_preceded_by_a_final_beat_with_its_reason() {
     let th = t();
     let hold_and_drain = th.final_hold_ms + th.drain_timeout_ms + 2 * period();
     let on_air = || booted(0, FAR).decide(Event::Tick, 0).next;
@@ -497,8 +518,18 @@ fn every_exit_is_preceded_by_a_final_beat_with_its_reason() {
     let (s, fx) = run(fresh(), &[(5, Event::BootstrapRefused(Refusal::Unauthorized))]);
     paths.push(("a 401 at bootstrap", ExitReason::Refused, s, fx));
 
-    let (s, fx) = run(on_air(), &[(100, Event::Fatal)]);
+    let fatal = Event::Fatal {
+        detail: Some(FATAL_DETAIL.to_string()),
+    };
+    let (s, fx) = run(on_air(), &[(100, fatal)]);
     paths.push(("a fatal error while Running", ExitReason::Fatal, s, fx));
+
+    // The one exit with no final beat (coordinator decision, wave gate 1 review I5): web refuses every
+    // beat on a terminal session with this same 410.
+    let no_beat = "a heartbeat 410 while Running";
+    let gone = Event::HeartbeatRefused(HeartbeatRefusal::Gone);
+    let (s, fx) = run(on_air(), &[(100, gone)]);
+    paths.push((no_beat, ExitReason::SessionGone, s, fx));
 
     let mut checked = 0;
     for (name, reason, s, fx) in &paths {
@@ -512,12 +543,18 @@ fn every_exit_is_preceded_by_a_final_beat_with_its_reason() {
         let finals: Vec<usize> = (0..fx.len())
             .filter(|&i| matches!(&fx[i], Effect::SendHeartbeat(h) if h.state == BeatState::Stopped))
             .collect();
-        assert_eq!(finals.len(), 1, "{name}: one final beat");
-        assert!(finals[0] < exit_at, "{name}: the final beat comes before Exit");
-        let Effect::SendHeartbeat(h) = &fx[finals[0]] else {
-            unreachable!()
-        };
-        assert_eq!(stopped_reason(h), Some(*reason), "{name}");
+        if *name == no_beat {
+            assert!(finals.is_empty(), "{name}: no beat for web to refuse: {fx:?}");
+        } else {
+            assert_eq!(finals.len(), 1, "{name}: one final beat");
+            assert!(finals[0] < exit_at, "{name}: the final beat comes before Exit");
+            let Effect::SendHeartbeat(h) = &fx[finals[0]] else {
+                unreachable!()
+            };
+            assert_eq!(stopped_reason(h), Some(*reason), "{name}");
+            let detail = (*reason == ExitReason::Fatal).then(|| FATAL_DETAIL.to_string());
+            assert_eq!(h.exit.as_ref().and_then(|x| x.detail.clone()), detail, "{name}");
+        }
         for e in fx {
             if let Effect::SendHeartbeat(h) = e {
                 assert_eq!(
@@ -532,7 +569,7 @@ fn every_exit_is_preceded_by_a_final_beat_with_its_reason() {
         checked += 1;
     }
     eprintln!("exit paths checked: {checked}");
-    assert_eq!(checked, 7, "every exit path, each reason at least once");
+    assert_eq!(checked, 8, "every exit path, each reason at least once");
     let reasons: Vec<ExitReason> = paths.iter().map(|p| p.1).collect();
     for r in ExitReason::ALL {
         assert!(reasons.contains(&r), "{r:?}: no path reaches it");

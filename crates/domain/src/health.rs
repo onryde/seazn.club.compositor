@@ -39,8 +39,9 @@ pub enum PhaseChannel {
 }
 
 /// Owner ruling 2026-10-15: the final beat carries the exit reason, because the Machine's logs go
-/// with the Machine. `detail` is human text that C07 redacts and caps; the domain has no source for
-/// it, so it is `None` from the domain (`docs/_INDEX.md`, the C06 Owed row on `exitDetail`).
+/// with the Machine. `detail` is a fatal error's text, verbatim from `Event::Fatal { detail }`, and
+/// `None` on every other exit (`docs/_INDEX.md` Owed 27, option a); C07 redacts it, caps it and
+/// omits it when empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExitInfo {
     pub reason: ExitReason,
