@@ -234,16 +234,8 @@ impl Graphics {
     pub fn on_tick(&mut self, now: Ms, t: &Thresholds) -> Option<GraphicsAction> {
         // The bound, checked first: the frame on air comes off on the first tick at or after it, and
         // a restart, a load timeout or a recycle due on the same tick follows on the next one.
-        if let Some((gen, proof, reason)) = self.on_air() {
-            if elapsed(now, proof) >= t.cef_hang_after_ms {
-                if reason == HideReason::Hang {
-                    // The Ready page itself is silent: a hang (Owed 18) is a counted failure, and is
-                    // hidden as a hang whatever `fail` answers, because its last frame may be a stale
-                    // score. Being first, it is never laundered as a recycle due on the same tick.
-                    self.fail(now, t);
-                }
-                return Some(self.hide(reason, gen));
-            }
+        if let Some(hide) = self.on_bound_tick(now, t) {
+            return Some(hide);
         }
         match self.state {
             GraphicsState::Backoff { until, .. } if now >= until => Some(self.restart(now)),
@@ -259,6 +251,26 @@ impl Graphics {
             GraphicsState::Failed { retry_at } if now >= retry_at => Some(self.restart(now)),
             _ => None,
         }
+    }
+
+    /// The bound alone: `on_tick`'s first check, and nothing else. A `Hide` naming its path when the
+    /// frame on air reaches its bound (a hang is still a counted failure); no restart, load timeout,
+    /// recycle or cooldown's end is run. C06's final hold ticks graphics with this, because nothing is
+    /// rebuilt during the hold: a restart the hold dropped after the generation had moved would leave
+    /// the healthy page's beats ignored, and its Final card would come off air at a bound that never
+    /// should have started (coordinator decision on the C05b PR #22 review, carried into C06).
+    pub fn on_bound_tick(&mut self, now: Ms, t: &Thresholds) -> Option<GraphicsAction> {
+        let (gen, proof, reason) = self.on_air()?;
+        if elapsed(now, proof) < t.cef_hang_after_ms {
+            return None;
+        }
+        if reason == HideReason::Hang {
+            // The Ready page itself is silent: a hang (Owed 18) is a counted failure, and is hidden as
+            // a hang whatever `fail` answers, because its last frame may be a stale score. Being
+            // first, it is never laundered as a recycle due on the same tick.
+            self.fail(now, t);
+        }
+        Some(self.hide(reason, gen))
     }
 
     /// The frame on air, as (the generation that produced it, that page's last proof of life, the
@@ -2015,5 +2027,97 @@ mod tests {
             "a window of {FAILURE_HISTORY_CAP} can never count {} failures",
             th.cef_fail_count
         );
+    }
+
+    // ---- the bound alone (C06's final hold; coordinator decision on the C05b PR #22 review) ----
+
+    // In the final hold the graphics tick runs the bound and nothing else: a restart, a load timeout,
+    // a recycle or the cooldown's end due on that tick must not move the machine, or the hold would
+    // drop a `Restart` after the generation has moved and hide a healthy Final card. Each setup has
+    // one timer due (the control: `on_tick` acts on it) and the bound not yet due.
+    #[test]
+    fn the_bound_alone_runs_no_other_timer() {
+        let th = t();
+        let mut checked = 0;
+        // (what, the machine, the instant its timer is due)
+        let mut setups: Vec<(&str, Graphics, Ms)> = Vec::new();
+        setups.push(("a back-off due", Graphics::new(), 0));
+        let mut loading = Graphics::new();
+        assert_eq!(loading.on_tick(0, &th), Some(Restart));
+        setups.push(("a load timeout due", loading.clone(), th.cef_load_timeout_ms));
+        let mut ready = loading.clone();
+        ready.on_ready(0, 1);
+        ready.on_alive(th.cef_recycle_every_ms - 1, 1);
+        setups.push(("a recycle due", ready, th.cef_recycle_every_ms));
+        let fails: Vec<Ms> = (0..th.cef_fail_count as Ms)
+            .map(|k| k * th.cef_backoff_cap_ms)
+            .collect();
+        let (failed, last) = crashes(&fails, &th);
+        assert!(
+            matches!(last, Some(Hide { reason: Failed, .. })),
+            "setup: {last:?}"
+        );
+        let GraphicsState::Failed { retry_at } = failed.state() else {
+            panic!("setup: {:?}", failed.state())
+        };
+        setups.push(("the cooldown's end", failed, retry_at));
+        for (what, g, due) in setups {
+            let mut control = g.clone();
+            let acted = control.on_tick(due, &th);
+            assert!(
+                acted.is_some() || control != g,
+                "{what}: setup, on_tick does nothing at {due}"
+            );
+            let mut bound = g.clone();
+            assert_eq!(bound.on_bound_tick(due, &th), None, "{what} at {due}");
+            assert_eq!(bound, g, "{what}: the bound alone moved the machine");
+            checked += 1;
+        }
+        assert_eq!(checked, 4, "setups checked: {checked}");
+    }
+
+    // When the bound is due, the bound alone is exactly `on_tick`'s first check: the same hide, and
+    // the same machine after it, for the Ready page's own frame (a hang) and a held frame (a crash).
+    #[test]
+    fn the_bound_alone_hides_as_on_tick_does() {
+        let th = t();
+        let mut ready = Graphics::new();
+        assert_eq!(ready.on_tick(0, &th), Some(Restart));
+        ready.on_ready(0, 1);
+        let mut crashed = ready.clone();
+        crashed.on_alive(th.cef_alive_every_ms, 1);
+        assert_eq!(
+            crashed.on_crashed(th.cef_alive_every_ms, 1, &th),
+            None,
+            "setup: below the count"
+        );
+        let cases = [
+            ("a hang", ready, th.cef_hang_after_ms, hide(Hang, 1)),
+            (
+                "a crash's held frame",
+                crashed,
+                th.cef_alive_every_ms + th.cef_hang_after_ms,
+                hide(Crash, 1),
+            ),
+        ];
+        let mut checked = 0;
+        for (what, g, due, want) in cases {
+            let mut early = g.clone();
+            assert_eq!(
+                early.on_bound_tick(due - 1, &th),
+                None,
+                "{what}: 1 ms before the bound"
+            );
+            assert_eq!(early, g, "{what}: an early bound tick moved the machine");
+            let (mut a, mut b) = (g.clone(), g.clone());
+            assert_eq!(a.on_bound_tick(due, &th), want, "{what}");
+            assert_eq!(b.on_tick(due, &th), want, "{what}: on_tick");
+            assert_eq!(
+                a, b,
+                "{what}: the bound alone and on_tick leave different machines"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "cases checked: {checked}");
     }
 }

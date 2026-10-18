@@ -7,9 +7,12 @@
 pub mod backoff;
 pub mod config;
 pub mod graphics;
+pub mod health;
 pub mod input_link;
 pub mod ladder;
+pub mod lifecycle;
 pub mod output_link;
 pub mod programme;
+pub mod supervisor;
 pub mod time;
 pub mod window;

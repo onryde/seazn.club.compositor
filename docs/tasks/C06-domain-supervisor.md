@@ -761,9 +761,14 @@ gets 410 and exits 0. That sequence is tested here.
   the unrouted-`CefAlive` mutant went red.
 - (Amended 2026-10-18, C05b PR #22 review) `Effect::HideOverlay { reason, gen }` carries the domain
   hide's reason and generation unchanged, from the Running tick and crash arms and from the hold.
-  The final hold runs the graphics tick and routes `CefCrashed`, mapping `Hide` and dropping
-  `Restart`. `the_final_hold_still_hides_a_hang_or_a_crash` passes, and both of its mutants went
-  red.
+  ~~The final hold runs the graphics tick and routes `CefCrashed`, mapping `Hide` and dropping
+  `Restart`.~~ (Superseded 2026-10-18: the hold runs `on_bound_tick` alone and routes `CefCrashed`;
+  "Amendment 2026-10-18 (C06 as built)".) `the_final_hold_still_hides_a_hang_or_a_crash` passes, and
+  both of its mutants went red.
+- (Amended 2026-10-18, as built, PR #24) 39 inline supervisor tests, the 3 sweeps in
+  `tests/supervisor.rs` (161 pairs, 7 exit paths, 48 ladder sessions) and the 2 properties at 512
+  cases pass, every count failing at 0. `a_recycle_due_in_the_hold_keeps_the_final_card_shown`
+  passes. 73 mutants: 72 red, 1 argued equivalent (the commit body lists each one).
 
 ## Final heartbeat with the exit reason (owner ruling 2026-10-15)
 
@@ -1160,6 +1165,142 @@ stays `OverlayHalfRate` after it. Print the number of bursts checked, and fail o
     correct, so the check must not run silent past it).
   - Every expected time comes from `Thresholds::default()`, never a literal.
 - **New mutant:** route `CefAlive` to nothing. Expected red: the new test.
+
+## Amendment 2026-10-18 (C06 as built, PR #24; the coordinator's carried decision)
+
+**The hold runs the bound alone.** Authority: the coordinator's decision on the C05b PR #22 review,
+carried into the C06 dispatch (2026-10-18): "during the final hold, the graphics tick runs ONLY the
+stale-frame bound, with no restart arms. Otherwise a recycle due in the hold drops the `Restart`
+after the domain has moved a generation, and the healthy Final card is hidden ~1 s." It supersedes
+the hold's graphics paragraph above (`holding`, "The graphics tick still runs … Its `Hide` is mapped
+and its `Restart` is dropped … That is harmless") and the 2026-10-18 Acceptance bullet "The final
+hold runs the graphics tick … mapping `Hide` and dropping `Restart`". It was not harmless: once a
+recycle moved the generation, the healthy page's beats were the "old generation's events" that get
+ignored, so the held frame's bound took the Final card off air before the hold ended.
+
+- `Graphics::on_bound_tick(now, t)` (C05b's module, new and additive): `on_tick`'s first check and
+  nothing else. `on_tick` now calls it first, so C05b's behaviour is unchanged (its 172 inline tests
+  and 9 sweeps pass unedited). It is a public-API addition to an earlier module, so it is reported as
+  a deviation under "Do not touch".
+- `holding`'s `Tick` maps only `on_bound_tick`'s `Hide`. No restart, load timeout, recycle or
+  cooldown's end runs in the hold, so no `Restart` is ever dropped and the generation never moves
+  under the page on air. The drain (C08: `graphics.stop()`) ends the page.
+- **Test 11** (`the_final_hold_still_hides_a_hang_or_a_crash`) keeps its hang, crash's-held-frame and
+  crash-at-the-count legs. Its recycle leg is rewritten: the recycle is due at `f + 1 000` with the
+  page silent since `f − 1 000`, so the hold runs no recycle and the page's own frame comes off at its
+  bound, `HideOverlay { reason: Hang, gen: 1 }` at the first tick at or after `f + 9 000` (the same
+  instant as the superseded `Recycle` leg). Every leg asserts the Final card on every hold tick and no
+  `RestartGraphics` from `f` to its `DrainOutput`. It is four tests, one per leg
+  (`the_final_hold_still_hides_a_hang_or_a_crash_1_hang`, `_2_crash_held_frame`,
+  `_3_recycle_due_silent_page`, `_4_crash_at_the_count`), so a mutant's red names every leg it breaks
+  (as one test it stopped at its first). An inline domain test cannot print (the crate forbids
+  `clippy::print_stderr`), so there is no `hold legs checked` line.
+- **New test** `a_recycle_due_in_the_hold_keeps_the_final_card_shown`: the page beats every
+  `cef_alive_every_ms`, a quarter beat off its ready's grid, through the hold; the recycle is due at
+  `f + 1 000`. It asserts its precondition (a recycle run in the hold would hide inside it: the last
+  beat before the recycle is at R − 1 500, and R − 1 500 + `cef_hang_after_ms` < `f + final_hold_ms`),
+  then no `HideOverlay` and no `RestartGraphics` from `f` to the drain, generation 1 throughout, and
+  every hold beat reports `graphics: Ready`.
+- **Mutants:** the hold runs the full graphics tick, dropping `Restart` (expected red: the new test
+  and test 11's recycle leg); the hold runs no graphics tick (test 11's first three legs); the hold
+  ignores `CefCrashed` (its fourth leg); and the bound's own mutants (its comparison, `on_tick` without
+  it, the bound tick ending a back-off or recycling, a hang at the bound not counted).
+
+**As built, against the merged code** (each also in `docs/_INDEX.md`'s false-premise rows):
+
+- `Event::OutputProgress { gen, total_bytes }` replaces `OutputConnected`/`OutputAck` (Owed 13):
+  `self.output.on_progress(now, gen, total_bytes)`, then `output_ever_connected` from
+  `is_connected()`. Tests send a growing total.
+- `BootstrapFailed` counts only while a fetch is in flight (`retry_at: None`). One fetch has one
+  outcome, so a second report neither moves the retry nor doubles the next wait
+  (`a_second_failure_report_for_one_fetch_changes_nothing`; mutant B4).
+- The final-beat section's triggers: `SessionGone` is a 410 at bootstrap (`Refusal::Gone`, this
+  brief's own refusal table and C07's), not a 404, which is `Refused` (78). No C06 event carries a
+  heartbeat refusal: C08 maps a heartbeat `Err` to `HeartbeatFailed` (superseded by the wave gate 1
+  amendment below: a heartbeat 410 is `Event::HeartbeatRefused(HeartbeatRefusal::Gone)`).
+  `ProgrammeStartFailed` is not a domain event: C08 maps a start `Err` to `Event::Fatal`, which the
+  test drives.
+- ~~`ExitInfo.detail` is always `None` from the domain: `Event::Fatal` carries no text, so nothing
+  produces C12's "non-empty `exitDetail`" on a fatal exit (`docs/_INDEX.md` Owed 27).~~ Superseded by
+  the wave gate 1 amendment below (Owed 27, option a).
+- The sweeps live in `crates/domain/tests/supervisor.rs` (the pair matrix, the 7 exit paths, the
+  ladder sessions) and `tests/properties.rs`; there is no `supervisor_props.rs`. The crate root
+  forbids `clippy::print_stderr`, and every sweep prints its count.
+- The pair matrix: 7 lifecycle setups × 23 event kinds = 161 pairs, from an exhaustive `match` on
+  `Event`. A routed event must change the supervisor and an ignored one must leave it equal.
+- Properties: P1′, P2–P4 (plus a stale-generation `CefAlive` that must change nothing), P5, P6
+  (every `Exit` follows a `Stopped` beat with its reason and the contract's code; only `Stopped`
+  beats carry one) and P7 (the hold drains on the first tick at or after `final_hold_ms`, with its
+  reason, and never before). Each count prints and fails on 0.
+- The brief's code comments name the host (`Fly`). `scripts/check-portable.sh` refuses that word
+  anywhere under `crates/`, so the built comments say "the host".
+
+## Amendment 2026-10-18 (wave gate 1 review of PR #24; the coordinator's decisions)
+
+The review rated PR #24 NEEDS FIXES: the domain code was correct, the gaps were tests and
+cross-brief items. Its five surviving mutants (M2, M3, M9, M10, M11) are now red. The coordinator's
+decisions, as built:
+
+- **Owed 27, option (a): `Event::Fatal { detail: Option<String> }`.** The fatal error's text rides
+  its final beat as `ExitInfo.detail`, opaque and verbatim, from Booting, Running, Holding and
+  Draining. Every other `Stopped` beat carries `None`. The domain neither caps nor redacts it: C07's
+  redact and 100-char cap are the authority, and web scrubs and caps at 200. C07 omits an empty value
+  ("absent, never ''"). The supervisor keeps the text in `exit_detail`, set only as a fatal error
+  exits (`Supervisor::fatal`), and `health` reads it. Tests:
+  `a_fatal_carries_its_detail_verbatim_into_the_final_beat_from_every_state` (4 states × 4 texts:
+  none, empty, a short one, and a 300-char one with a stream URL and emoji) and
+  `every_stopped_beat_but_a_fatal_ones_has_no_detail` (10 non-fatal exits and the drain's beat, the
+  other way; mutant F1 is the reviewer's M9).
+- **A fatal error during a drain sends a second `Stopped` beat** (review m2): the drain's, with the
+  drain's reason and no detail, then the fatal error's, `fatal` with its text. This is the only path
+  with two. Pinned by the test above; recorded for web (`docs/_INDEX.md` Owed 30).
+- **A heartbeat 410: `Event::HeartbeatRefused(HeartbeatRefusal::Gone)`** (review I5). Web refuses
+  every beat on a terminal session with 410 (`seazn.club` `stream-sessions.ts` `heartbeat`), and
+  without this event the compositor kept streaming (and spending Input B and host minutes) after web
+  had ended the session. From every state but Exited it is `Exit(0)` at once, reason `SessionGone`:
+  no Final hold, no drain, and no beat, because web would refuse that beat with the same 410. It is
+  the one exit with no final beat, an exception the coordinator decided to the owner's 2026-10-15
+  final-beat ruling, on that ground. Booting has no beat in flight, so a 410 there is never a reply,
+  but web's word holds there too and it exits the same way (the implementer's choice, recorded).
+  Exited ignores it, so a 410 after a fatal exit changes nothing. `HeartbeatRefusal` has one variant:
+  a 401 or a 404 on a beat has no ruling, so C07 keeps both transport errors (`HeartbeatFailed`), and
+  a ruling adds a variant rather than a guess. A 410 drawn by the drain's own beat cuts the drain
+  short (exit 0, no EOS wait). Tests: `a_heartbeat_410_exits_at_once_with_no_hold_drain_or_beat`
+  (6 states and a 410 after a fatal exit), the pair matrix's new kind, and an eighth exit path that
+  asserts no `Stopped` beat at all. Mutants G1–G9.
+- **I1, distinct thresholds:** `every_supervisor_timer_fires_at_its_own_threshold` runs under
+  thresholds whose 25 `Ms` fields are all distinct (every field written out, so a new one is a compile
+  error), with a session beat interval no threshold has. The bootstrap back-off (base, doubled,
+  capped), the beat interval, the hold, the drain timeout and the deadline tick each fire at their
+  instant and not 1 ms before. Kills the reviewer's M10 (the hold reading `cef_hang_after_ms`) and M11
+  (the bootstrap back-off reading the CEF one), which the shared 10 000 / 1 000 defaults hid.
+- **I2 and m1, the beat's legs:** `progress_that_connects_nothing_leaves_the_beat_starting` (a zero
+  total, a sink's bytes before the first build, a sink never built; M2) and
+  `an_output_error_in_the_hold_reads_stalled` (M3).
+- **I3, the exit property** (`tests/properties.rs`, now 2 048 cases): the stream drives the page
+  (ready, beats every `cef_alive_every_ms`, silences, crashes, and crash storms that restart the page
+  with two failures counted), overrun bursts, and a growing output total with a tick every second.
+  Gen-carrying events are resolved at delivery, so they name the page or sink current then. In the
+  hold it asserts that the three generations and the rung stay as the hold froze them and nothing is
+  rebuilt or stepped down; on every on-air tick, that a Ready page hides as hung iff its last
+  delivered proof (its ready, then each beat it delivered while Ready) is at least
+  `cef_hang_after_ms` old; at most one `StepDown` per stream; a crash in the hold hides `Failed` or
+  nothing; and P6 with the detail and the 410. Counts, each failing at 0: holds while stepped,
+  crashes in the hold, crashes at the count in the hold, hang hides in the hold, exits on a 410,
+  fatal details checked (a typical run: 324, 574, 89, 38, 181, 411).
+- **Documented, not changed:**
+  - **(m5) An output stall goes undetected in the hold.** The links are not ticked in the hold, so a
+    sink that stops sending bytes still reads `Playing` until the drain. An output error is routed,
+    so it reads `Stalled` (m1). The hold is at most `final_hold_ms`; nothing could be rebuilt in it.
+  - **(m4) After a crash in the hold below the count, the beat reads `graphics: restarting`**
+    (Backoff), though no restart runs before the drain stops the page. Cosmetic.
+  - **(m3) `signalled` covers both signals:** SIGINT (web's own stop, with the hold) and SIGTERM (a
+    host stop, no hold) both exit `signalled`. Web's docs note it (`docs/_INDEX.md` Owed 30).
+- **The pair matrix** is now 7 setups × 24 kinds = 168 pairs, and it checks each `Stopped` beat's
+  detail (the fatal sample's text iff the event is the fatal error). The exit-path test has 8 paths
+  (`every_exit_but_a_heartbeat_410_is_preceded_by_a_final_beat_with_its_reason`).
+- **Mutants:** 101 (the 73 re-run after the edits, stale rows re-pinned, plus 28 new), 100 red, 1
+  argued equivalent (B6, unchanged).
 
 ## Do not touch
 

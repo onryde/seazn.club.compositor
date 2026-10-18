@@ -275,7 +275,9 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
 
 ## Final heartbeat with the exit reason (owner ruling 2026-10-15)
 
-The main loop executes the supervisor's final `SendHeartbeat` before `std::process::exit`. Add to
+The main loop executes the supervisor's final `SendHeartbeat` before `std::process::exit` (amended
+2026-10-18, wave gate 1 review I4: `run()` returns only after C08's bounded flush, so `main` exits
+at most 2 s after `Exit`, never before the beat's one attempt; see that amendment). Add to
 the fake-mode smoke a run where fake-control serves `reply-ending.json`, then assert that the last POST
 fake-control received has `state: "stopped"` and `exitReason: "ended"`. Add a second run with
 `ProgrammeStartFailed` forced via the fake driver: exit 70, and the last POST carries
@@ -493,6 +495,28 @@ existing `eprintln!` form, `ts=<rfc3339> level=info msg=<…>`.
   (a) itself tolerates 5 % missing `cef alive` lines. And three readers each rebuilt it. The hide
   now names its reason, and C14 case 11, C15 (b) and the C17 runbook match the single
   `overlay hidden reason=<r> gen=<g>` line.
+
+## Amendment 2026-10-18 (wave gate 1 review of C06, PR #24; the coordinator's decisions)
+
+**The final beat's flush, reconciled with C07** (review I4; `docs/_INDEX.md` Owed 28). This brief's
+"executes the supervisor's final `SendHeartbeat` before `std::process::exit`" and C07's "best-effort
+… never delays `Exit`" disagreed, and as briefed neither held: C08 dropped a final beat behind a slow
+one, and `main` called `process::exit` as soon as `run()` returned (Step 5). The ruling: C08 puts the
+final beat on a never-dropped slot, and `run()` returns only once it was posted or C07's 2 s timeout
+passed. So `main` needs no wait of its own, the beat always gets its one attempt, and `Exit` is
+delayed by at most 2 s. That fits D15's 20 s grace: the hold (10 s) and the drain (7 s) leave 3 s,
+and a drain's own final beat goes out when the drain starts, so only a fatal error during the drain
+adds a flush there (10 + 7 + 2 = 19 s).
+- The fatal smoke's "non-empty `exitDetail`" now has a producer (Owed 27, option a): C08 maps the
+  start error's text into `Event::Fatal { detail }`, C06 carries it to the final beat, and C07
+  redacts and caps it.
+- **New fake-mode smoke runs:**
+  - The fatal run with fake-control's heartbeat slowed (it answers each POST after 1.5 s), so the
+    periodic slot is full when the start fails: the last POST still carries `exitReason: "fatal"`
+    and a non-empty `exitDetail`, and the process exits 70 (C08's
+    `a_hung_final_beat_delays_exit_at_most_2_s` pins the bound).
+  - A run where fake-control answers a heartbeat with `410 SESSION_ENDED` (review I5): the process
+    exits 0 within 1 s of that reply, and fake-control receives no POST after it.
 
 ## Do not touch
 
