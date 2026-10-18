@@ -555,46 +555,41 @@ fn a_page_that_never_signals_ready_hides_on_the_frame_tick_grid() {
 
 // ---- the ladder ----
 
-const RUNGS: [Rung; 3] = [Rung::Full, Rung::OverlayHalfRate, Rung::FastPreset];
+/// The rungs, top first: the owner ruling of 2026-10-18 (`docs/_INDEX.md` Owed 20) removed the third,
+/// so the ladder is `Full → OverlayHalfRate` and the bottom holds.
+const RUNGS: [Rung; 2] = [Rung::Full, Rung::OverlayHalfRate];
 
 /// Exhaustive, so a new rung is a compile error here and `RUNGS` cannot go stale.
 fn rung_index(r: Rung) -> usize {
     match r {
         Rung::Full => 0,
         Rung::OverlayHalfRate => 1,
-        Rung::FastPreset => 2,
     }
 }
 
 #[derive(Debug, Default)]
 struct LadderCounts {
     below_count: usize,
-    held_by_gap: usize,
     held_at_bottom: usize,
+    held_at_bottom_a_minute_after_the_step: usize,
     steps_to_half_rate: usize,
-    steps_to_fast_preset: usize,
-    first_steps_inside_a_gap_of_zero: usize,
 }
 
 // Each case is a run of overruns at generated spacings (bursts inside the 1 s window, gaps around
-// the 10 s step gap, long silences). The harness keeps its own overrun stamps, last step and rung,
-// and the ladder must step exactly when the brief says: enough overruns in the window, the gap
-// since the last step served, and a rung left below.
+// it, long silences). The harness keeps its own overrun stamps and rung, and the ladder must step
+// exactly when the brief says: enough overruns in the window, and a rung left below. Once on the
+// bottom it never steps again, however long after the step the next full window comes.
 #[test]
 fn ladder_keeps_its_rules_over_generated_schedules() {
     let t = Thresholds::default();
-    let (window, gap, need) = (
-        t.ladder_window_ms,
-        t.ladder_step_min_gap_ms,
-        t.ladder_overruns_to_step,
-    );
+    let (window, need) = (t.ladder_window_ms, t.ladder_overruns_to_step);
     let mut c = LadderCounts::default();
     for case in 0..CASES {
         let mut r = Lcg(case.wrapping_mul(104_729).wrapping_add(7));
         let mut l = Ladder::new();
         let mut now: Ms = 0;
         let mut stamps: Vec<Ms> = Vec::new();
-        let mut last_step: Option<Ms> = None;
+        let mut stepped_at: Option<Ms> = None;
         let mut at = 0usize;
         for calls in 1..=STEPS as u64 {
             now += r.pick(&[
@@ -603,32 +598,29 @@ fn ladder_keeps_its_rules_over_generated_schedules() {
             let got = l.on_overrun(now, &t);
             stamps.push(now);
             let n = within(&stamps, now, window);
-            let gap_served = last_step.is_none_or(|s| now - s >= gap);
             let bottom = at + 1 == RUNGS.len();
-            let want = (n >= need && gap_served && !bottom).then(|| RUNGS[at + 1]);
+            let want = (n >= need && !bottom).then(|| RUNGS[at + 1]);
             assert_eq!(
                 got, want,
                 "case {case}: overrun {calls} at {now}, {n} in the window"
             );
-            match (n >= need, gap_served, bottom) {
-                (false, _, _) => c.below_count += 1,
-                (true, false, _) => c.held_by_gap += 1,
-                (true, true, true) => c.held_at_bottom += 1,
-                (true, true, false) => {
-                    if at == 0 {
-                        c.steps_to_half_rate += 1;
-                        c.first_steps_inside_a_gap_of_zero += usize::from(now < gap);
-                    } else {
-                        c.steps_to_fast_preset += 1;
-                    }
+            match (n >= need, bottom) {
+                (false, _) => c.below_count += 1,
+                (true, true) => {
+                    c.held_at_bottom += 1;
+                    let since = now - stepped_at.expect("on the bottom only after the step");
+                    c.held_at_bottom_a_minute_after_the_step += usize::from(since >= 60 * window);
+                }
+                (true, false) => {
+                    c.steps_to_half_rate += 1;
                     at += 1;
-                    last_step = Some(now);
+                    stepped_at = Some(now);
                 }
             }
             assert_eq!(
                 rung_index(l.rung()),
                 at,
-                "case {case}: the rung only ever steps down, one at a time"
+                "case {case}: the rung only ever steps down, once"
             );
             assert_eq!(
                 l.overruns(),
@@ -640,25 +632,77 @@ fn ladder_keeps_its_rules_over_generated_schedules() {
     eprintln!("ladder schedules: {CASES} cases × {STEPS} overruns: {c:?}");
     let all = [
         ("below the count", c.below_count),
-        ("held by the gap", c.held_by_gap),
         ("held at the bottom", c.held_at_bottom),
-        ("steps to OverlayHalfRate", c.steps_to_half_rate),
-        ("steps to FastPreset", c.steps_to_fast_preset),
         (
-            "first steps before one gap has passed",
-            c.first_steps_inside_a_gap_of_zero,
+            "held at the bottom a minute after the step",
+            c.held_at_bottom_a_minute_after_the_step,
         ),
+        ("steps to OverlayHalfRate", c.steps_to_half_rate),
     ];
     for (name, n) in all {
         assert!(n > 0, "never exercised: {name}");
     }
 }
 
-// An encoder that drops every frame for a minute, on the tick grid of both modes at every phase:
-// the first step at the `ladder_overruns_to_step`-th dropped frame, the second at the first tick a
-// full gap later, then nothing; every frame counted.
+// Owner ruling 2026-10-18: repeated overrun bursts never step below `OverlayHalfRate`, and the bottom
+// holds. Each case is a run of bursts, each with at least `ladder_overruns_to_step` overruns inside
+// one `ladder_window_ms` (so each alone would step from `Full`), separated by generated silences
+// from none to a day. The first burst steps at its `ladder_overruns_to_step`-th overrun; no later
+// overrun steps, the rung stays the bottom, and every overrun is counted.
 #[test]
-fn an_encoder_dropping_every_frame_steps_twice_on_the_frame_tick_grid() {
+fn repeated_overrun_bursts_never_step_below_overlay_half_rate() {
+    let t = Thresholds::default();
+    let (window, need) = (t.ladder_window_ms, t.ladder_overruns_to_step as Ms);
+    let (mut cases, mut bursts_on_bottom, mut overruns_on_bottom) = (0usize, 0usize, 0u64);
+    for case in 0..CASES {
+        let mut r = Lcg(case.wrapping_mul(7_919).wrapping_add(11));
+        let mut l = Ladder::new();
+        let mut now: Ms = r.next(window);
+        let mut calls = 0u64;
+        let mut steps: Vec<(u64, Rung)> = Vec::new();
+        for burst in 0..40 {
+            if burst > 0 {
+                now += r.pick(&[0, 1, window, window + 1, 10 * window, 60 * window, 86_400_000]);
+            }
+            let len = need + r.next(2 * need);
+            // `len` overruns no more than `window` apart end to end, so the window holds them all.
+            let spacing = window / len;
+            for k in 0..len {
+                calls += 1;
+                if let Some(rung) = l.on_overrun(now + k * spacing, &t) {
+                    steps.push((calls, rung));
+                }
+            }
+            now += len * spacing;
+            if burst > 0 {
+                bursts_on_bottom += 1;
+                overruns_on_bottom += len;
+            }
+            assert_eq!(l.rung(), Rung::OverlayHalfRate, "case {case}: burst {burst}");
+        }
+        assert_eq!(
+            steps,
+            vec![(need, Rung::OverlayHalfRate)],
+            "case {case}: one step, at the first burst's step count"
+        );
+        assert_eq!(l.overruns(), calls, "case {case}: every overrun counted");
+        cases += 1;
+    }
+    eprintln!(
+        "repeated-burst runs checked: {cases}, {bursts_on_bottom} bursts and {overruns_on_bottom} \
+         overruns after the step, 0 steps below OverlayHalfRate"
+    );
+    assert!(
+        cases > 0 && bursts_on_bottom > 0 && overruns_on_bottom > 0,
+        "checked 0 bursts on the bottom rung"
+    );
+}
+
+// An encoder that drops every frame for a minute, on the tick grid of both modes at every phase:
+// the one step at the `ladder_overruns_to_step`-th dropped frame, then nothing, the bottom held;
+// every frame counted.
+#[test]
+fn an_encoder_dropping_every_frame_steps_once_on_the_frame_tick_grid() {
     let t = Thresholds::default();
     let need = t.ladder_overruns_to_step;
     let (mut cases, mut frames) = (0usize, 0u64);
@@ -672,17 +716,8 @@ fn an_encoder_dropping_every_frame_steps_twice_on_the_frame_tick_grid() {
                 .filter_map(|&now| l.on_overrun(now, &t).map(|r| (now, r)))
                 .collect();
             let ctx = format!("{mode:?} φ{phase}: {steps:?}");
-            assert_eq!(steps.len(), 2, "{ctx}");
-            assert_eq!(
-                (steps[0].0, steps[0].1),
-                (grid[need - 1], Rung::OverlayHalfRate),
-                "{ctx}"
-            );
-            let next = *grid
-                .iter()
-                .find(|&&at| at >= steps[0].0 + t.ladder_step_min_gap_ms)
-                .unwrap();
-            assert_eq!((steps[1].0, steps[1].1), (next, Rung::FastPreset), "{ctx}");
+            assert_eq!(steps, vec![(grid[need - 1], Rung::OverlayHalfRate)], "{ctx}");
+            assert_eq!(l.rung(), Rung::OverlayHalfRate, "{ctx}");
             assert_eq!(l.overruns(), grid.len() as u64, "{ctx}");
             frames += grid.len() as u64;
             cases += 1;
