@@ -193,11 +193,43 @@ fn contract_code(r: ExitReason) -> i32 {
 
 fn end_stream() -> impl Strategy<Value = (Option<Ms>, Vec<(Ms, u8)>)> {
     // A deadline inside the stream, or none; dt 0..2 000 ms; ticks dominant, Fatal and SIGTERM rare,
-    // so holds run to their end
+    // so holds run to their end. An end event comes about every 4 steps (5 of the 21 kinds), so the
+    // deadline is drawn early enough to come first in a fair share of cases (about 50 of 512). Kind
+    // 20 is a burst of camera frames long enough to read as continuous, so P5 sees frames try to
+    // take the programme out of Final
     (
-        prop::option::of(1u64..60_000),
-        prop::collection::vec((0u64..2_000, 0u8..=19), 1..200),
+        prop::option::of(1u64..20_000),
+        prop::collection::vec((0u64..2_000, 0u8..=20), 1..200),
     )
+}
+
+/// The stream's events at their instants. A burst is a frame and a tick every 100 ms for
+/// `resume_after_ms` + 200 ms: unbroken (100 < `frozen_after_ms`) and long enough to be continuous.
+fn end_events(steps: Vec<(Ms, u8)>, t: &Thresholds) -> Vec<(Ms, Event)> {
+    let (mut now, mut out) = (0, Vec::new());
+    for (dt, k) in steps {
+        now += dt;
+        let ev = match k {
+            0..=11 => Event::Tick,
+            12 | 13 => Event::HeartbeatReply(Desired::Ending),
+            14 => Event::Signal(SignalKind::Int),
+            15 | 16 => Event::OutputDrained,
+            17 => Event::Signal(SignalKind::Term),
+            18 => Event::HeartbeatReply(Desired::Live),
+            19 => Event::Fatal,
+            _ => {
+                let span = t.resume_after_ms + 200;
+                for at in (now..=now + span).step_by(100) {
+                    out.push((at, Event::InputFrame));
+                    out.push((at, Event::Tick));
+                }
+                now += span;
+                continue;
+            }
+        };
+        out.push((now, ev));
+    }
+    out
 }
 
 #[test]
@@ -205,10 +237,12 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
     let t = Thresholds::default();
     let checked = Cell::new(0u32);
     let exits = Cell::new(0u32);
-    let holds = Cell::new(0u64);
+    // Holds entered by reason: Ended, Signalled, Deadline
+    let holds = Cell::new([0u64; 3]);
     let held_out = Cell::new(0u64);
     let final_ticks = Cell::new(0u64);
     let final_beats = Cell::new(0u64);
+    let final_frames = Cell::new(0u64);
     let mut runner = TestRunner::new(Config {
         cases: CASES,
         ..Config::default()
@@ -217,22 +251,14 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
         .run(&end_stream(), |(deadline, steps)| {
             checked.set(checked.get() + 1);
             let mut s = booted(&t, deadline.unwrap_or(Ms::MAX / 2));
-            let mut now = 0;
             let mut seen_exit = false;
             let mut seen_final = false;
             // The reason of the last Stopped beat sent, in effect order
             let mut last_final: Option<ExitReason> = None;
-            for (dt, k) in steps {
-                now += dt;
-                let ev = match k {
-                    0..=11 => Event::Tick,
-                    12 | 13 => Event::HeartbeatReply(Desired::Ending),
-                    14 => Event::Signal(SignalKind::Int),
-                    15 | 16 => Event::OutputDrained,
-                    17 => Event::Signal(SignalKind::Term),
-                    18 => Event::HeartbeatReply(Desired::Live),
-                    _ => Event::Fatal,
-                };
+            for (now, ev) in end_events(steps, &t) {
+                if ev == Event::InputFrame && s.programme_phase() == ProgrammePhase::Final {
+                    final_frames.set(final_frames.get() + 1);
+                }
                 let d = s.decide(ev.clone(), now);
                 let n = d.effects.iter().filter(|e| matches!(e, Effect::Exit(_))).count();
                 if seen_exit {
@@ -285,9 +311,17 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
                 // P7: the hold lasts final_hold_ms. A hold starts at its request's instant; a tick
                 // drains it iff final_hold_ms has passed, with the hold's reason
                 match (s.lifecycle(), d.next.lifecycle()) {
-                    (Lifecycle::Running, Lifecycle::Holding { since, .. }) => {
+                    (Lifecycle::Running, Lifecycle::Holding { since, reason }) => {
                         prop_assert_eq!(since, now);
-                        holds.set(holds.get() + 1);
+                        let i = match reason {
+                            ExitReason::Ended => 0,
+                            ExitReason::Signalled => 1,
+                            ExitReason::Deadline => 2,
+                            r => return Err(TestCaseError::fail(format!("a hold with reason {r:?}"))),
+                        };
+                        let mut h = holds.get();
+                        h[i] += 1;
+                        holds.set(h);
                     }
                     (Lifecycle::Holding { since, reason }, next) if ev == Event::Tick => {
                         if now - since >= t.final_hold_ms {
@@ -310,18 +344,27 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
         })
         .expect("property failed");
     eprintln!(
-        "cases checked: {}, exits observed: {}, holds entered: {}, holds run out: {}, final ticks: {}, final beats: {}",
+        "cases checked: {}, exits observed: {}, holds entered (Ended, Signalled, Deadline): {:?}, holds run out: {}, final ticks: {}, final beats: {}, frames in Final: {}",
         checked.get(),
         exits.get(),
         holds.get(),
         held_out.get(),
         final_ticks.get(),
-        final_beats.get()
+        final_beats.get(),
+        final_frames.get()
     );
     assert_eq!(checked.get(), CASES);
     assert!(exits.get() > 0, "anti-vacuity: no case ever exited");
-    assert!(holds.get() > 0, "anti-vacuity: no hold was entered");
+    assert!(
+        holds.get().iter().all(|&n| n > 0),
+        "anti-vacuity: an end request never held: {:?}",
+        holds.get()
+    );
     assert!(held_out.get() > 0, "anti-vacuity: no hold ran to its end");
     assert!(final_ticks.get() > 0, "anti-vacuity: no Final frame was checked");
     assert!(final_beats.get() > 0, "anti-vacuity: no final beat was checked");
+    assert!(
+        final_frames.get() > 0,
+        "anti-vacuity: no camera frame reached a Final programme"
+    );
 }

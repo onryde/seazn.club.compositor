@@ -1413,12 +1413,12 @@ mod tests {
             .collect()
     }
 
+    // Test 11 (C06 brief, amendment 2026-10-18), one test per leg, so a mutant's red names each leg it
+    // breaks. `cargo test the_final_hold_still_hides_a_hang_or_a_crash` runs all four.
     #[test]
-    fn the_final_hold_still_hides_a_hang_or_a_crash() {
+    fn the_final_hold_still_hides_a_hang_or_a_crash_1_hang() {
         let th = t();
         let (alive, hang, hold) = (th.cef_alive_every_ms, th.cef_hang_after_ms, th.final_hold_ms);
-        let mut legs = 0;
-
         // A hang: the last beat 3 s before the Ending; the bound falls inside the hold.
         let last = 10 * alive;
         let f = last + 3_000;
@@ -1446,8 +1446,12 @@ mod tests {
         let at = first_tick_at_or_after(&log, bound);
         assert_eq!(hidden, vec![(at, HideReason::Hang, 1)], "hang");
         assert_eq!(restarts, 0, "hang: a restart in the hold");
-        legs += 1;
+    }
 
+    #[test]
+    fn the_final_hold_still_hides_a_hang_or_a_crash_2_crash_held_frame() {
+        let th = t();
+        let (alive, hang, hold) = (th.cef_alive_every_ms, th.cef_hang_after_ms, th.final_hold_ms);
         // A crash's held frame: the crash 5 s before the Ending, after the page's last beat; the reload
         // (generation 2) starts in Running and never signals ready.
         let last = 10 * alive;
@@ -1473,8 +1477,12 @@ mod tests {
         let at = first_tick_at_or_after(&log, bound);
         assert_eq!(hidden, vec![(at, HideReason::Crash, 1)], "crash");
         assert_eq!(restarts, 0, "crash: a restart in the hold");
-        legs += 1;
+    }
 
+    #[test]
+    fn the_final_hold_still_hides_a_hang_or_a_crash_3_recycle_due_silent_page() {
+        let th = t();
+        let (alive, hang, hold) = (th.cef_alive_every_ms, th.cef_hang_after_ms, th.final_hold_ms);
         // A recycle due in the hold, the page silent since 1 s before the Ending: the hold runs no
         // recycle, so the page's own frame comes off at its bound, as a hang.
         let recycle_due = th.cef_recycle_every_ms;
@@ -1499,8 +1507,12 @@ mod tests {
             s.graphics_generation() <= 1,
             "recycle due: the generation moved in the hold"
         );
-        legs += 1;
+    }
 
+    #[test]
+    fn the_final_hold_still_hides_a_hang_or_a_crash_4_crash_at_the_count() {
+        let th = t();
+        let hold = th.final_hold_ms;
         // A crash at the count: two crashes in Running, each reload ready, then a crash of the
         // current generation 100 ms into the hold hides as Failed at once.
         let base = th.cef_backoff_base_ms;
@@ -1545,9 +1557,6 @@ mod tests {
         assert_eq!(hidden, vec![(f + 100, HideReason::Failed, 3)], "count: one hide");
         assert_eq!(restarts, 0, "count: a restart in the hold");
         assert_eq!(s.health(f + hold).graphics, GraphicsStatus::Failed);
-        legs += 1;
-
-        assert_eq!(legs, 4, "hold legs checked: {legs}");
     }
 
     // The coordinator's decision on the C05b PR #22 review, carried into C06: the hold runs the bound
