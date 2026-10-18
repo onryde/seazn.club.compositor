@@ -45,6 +45,7 @@ repo.
   #[derive(Debug, Clone, PartialEq, Eq)]
   pub struct SessionConfig {
       pub session_id: String, pub fixture_id: String,
+      // (amended 2026-10-18, C07 as built) `fixture_id: Option<String>`: nullable on the wire (F-006)
       pub input: InputSpec, pub target: TargetSpec, pub output: domain::config::OutputProfile,
       pub heartbeat_interval_ms: u64, pub overlay_url: String, pub overlay_delay_ms: u64,
   }
@@ -57,6 +58,9 @@ repo.
       fn fetch_session(&mut self) -> Result<SessionConfig, FetchError>;
       fn heartbeat(&mut self, report: &domain::health::HealthReport, measured: &Measured) -> Result<domain::supervisor::Desired, String>;
       // (amended 2026-10-18, wave gate 1 I5) the Err tells a 410 apart from a transport error: see that amendment
+      // (as built) `Result<Desired, HeartbeatError>`, `HeartbeatError::{Gone, Transport(String)}`; the three
+      // structs that carry a credential write their own `Debug`; `pub const FINAL_BEAT_TIMEOUT_MS: u64 = 2_000`
+      // (see "Amendment 2026-10-18 (C07 as built)")
   }
   // adapters
   pub fn redact(url: &str) -> String;                                 // redact.rs
@@ -291,6 +295,16 @@ repo.
   count, failing on 0. The frozen-total mutant went red, making 4 mutants red.
 - (Amended 2026-10-18, Owed 24) The vendored `relay-job.v1.json` hashes to `fc99d448…dc50` or a
   later bump, and the `rung` enum is exactly `full|overlay_half_rate`.
+- (Amended 2026-10-18, C07 as built; Owed 4) The beat writes `programmePhase: "final"` and
+  `phaseChannel` (absent until the page reports one), through a `pub fn programme_phase_wire` that
+  C12's endpoint reuses; the contract sweep reaches `Holding`/`Final` with a `PhaseChannel` set and
+  prints the count of beats carrying each, failing on 0.
+- (Amended 2026-10-18, C07 as built; Owed 29) Any heartbeat 410, the final beat's included, is
+  `HeartbeatError::Gone`; every other failure is `Transport`.
+- (Amended 2026-10-18, C07 as built) The 200 is read through the house envelope (F-006), and no
+  credential (the job token, the stream key, the SRT stream id and passphrase, the page token)
+  reaches an error, a `Debug` string or a URL on any error path; each path is tested with a planted
+  secret.
 
 ## Final heartbeat with the exit reason (owner ruling 2026-10-15)
 
@@ -299,8 +313,12 @@ repo.
 `exitDetail` = `redact(detail)`, truncated to **100 Unicode scalar values** (Rust `chars().take(100)`). R2002's published contract caps it at `maxLength: 100` code points, so it always fits web's zod limit of 200 UTF-16 units (F-006; #966 review M1). Also: the exit fields are valid only on a `state: "stopped"` beat (the contract's if/then).
 The final beat is **best-effort**: one attempt, 2 s timeout, never retried. Its failure is logged
 (redacted) and never delays `Exit` (amended 2026-10-18, wave gate 1 review I4: by more than this 2 s
-timeout; C08 flushes the final beat before `run()` returns, bounded by it). A 404 reply to it is not
-an error, and neither is a 410 (web refuses every beat on a terminal session with 410).
+timeout; C08 flushes the final beat before `run()` returns, bounded by it). ~~A 404 reply to it is not
+an error, and neither is a 410 (web refuses every beat on a terminal session with 410).~~ Its reply
+is classified like any other beat's (amended 2026-10-18, C07 as built; `docs/_INDEX.md` Owed 29):
+a 410 is `Gone`, which C08 maps to `HeartbeatRefused(Gone)` (a drain is cut short, exit 0; Exited
+ignores it), and a 404 is a transport error, which C08 maps to `HeartbeatFailed` (Draining and
+Exited ignore it).
 
 Tests:
 - The contract test's sweep includes the 6 exit beats, and every one validates against the vendored
@@ -351,6 +369,98 @@ and it is **absent** when `detail` is `None` **or empty** ("absent, never ''").
   domain's own beat, not a hand-built report.
 - New test `an_empty_detail_is_absent`: a fatal beat with `detail: Some("")` has no `exitDetail`
   key.
+
+## Amendment 2026-10-18 (C07 as built)
+
+**Vendored.** `scripts/vendor-contracts.sh /…/seazn.club eb6538a79` (web main's tip, #980's merge):
+"vendored 21 files" = 20 fixtures + the contract, each compared byte for byte with
+`git show eb6538a79:<path>`. `relay-job.v1.json` hashes to `fc99d448…dc50`, the value web's
+`relay-contract.test.ts` pins (`SHA256`). The script records the full commit sha (`rev-parse
+--verify <rev>^{commit}`) and sorts the pins with `LC_ALL=C`. Web PR #981 (R2004, open) does not
+touch `docs/contracts/`: the file hashes the same at its head 668c0f13f. R2007 PR B (`final`,
+`phaseChannel`, the phase `$defs`) merged as web #970, so the vendored contract carries both
+(`docs/_INDEX.md` Owed 1 closed).
+
+**The final beat's reply** (this amendment resolves the wave gate 1 carried minor: the old text
+here called a 410 to the final beat "not an error", and C08 never said whether a final beat's result
+became an event, so `Draining`'s `HeartbeatRefused(Gone)` arm had no producer). **Any heartbeat 410,
+the final beat's included, is `HeartbeatError::Gone`.** C08 maps it to
+`HeartbeatRefused(HeartbeatRefusal::Gone)`: in `Draining` that cuts the drain short with exit 0 (the
+domain's arm, C06), and `Exited` ignores it, so it is harmless after `Exit`. A 404 to the final beat is
+a transport error like any other beat's. The final beat differs from a periodic one only in its bound:
+one attempt, its request capped at `min(timeout_ms, FINAL_BEAT_TIMEOUT_MS)`. C07 retries nothing.
+Owed 29's text now agrees.
+
+**Interfaces as built** (`crates/app/src/ports.rs`):
+- `SessionConfig.fixture_id: Option<String>`. The contract's `fixtureId` is nullable, because the
+  session outlives its fixture (F-006). A null decodes as `None`; any other non-string is `WrongMode`.
+- `ControlPlane::heartbeat` returns `Result<Desired, HeartbeatError>`, where
+  `HeartbeatError::{Gone, Transport(String)}`.
+- `pub const FINAL_BEAT_TIMEOUT_MS: u64 = 2_000` lives in the port, beside the trait, because two
+  crates read it: the HTTP plane caps the final beat's request with it, and C08's `run()` bounds its
+  flush with it. `Thresholds` would be its home, but this brief does not touch the domain. Moving it
+  there is a later decision, not owed here.
+- `InputSpec`, `TargetSpec` and `SessionConfig` write their own `Debug`. A derived `Debug` would print
+  all four credentials, and C08's `Inbound::Session(SessionConfig)` derives `Debug`. Every credential
+  prints as `****`, and every URL as its scheme and authority alone (`ports::redacted_origin`, which
+  also drops userinfo). `HttpControlPlane`'s `Debug` prints the token as `****`.
+- Also produced: `adapters::control_http::programme_phase_wire` (Owed 4, for C12's endpoint), and
+  `adapters::redact` re-exported at the crate root.
+
+**The classification as built** (`crates/adapters/src/control_http.rs`). The brief's status table
+stands. These rows were settled here, and each one has a test:
+
+| Reply | `fetch_session` | `heartbeat` |
+|---|---|---|
+| 200, the house envelope `{ ok: true, data }` (F-006; the fixtures are its `data`) | `parse_session(data)` | `data.desiredState`, or `Transport` |
+| 200, JSON but not that envelope (no `ok: true`, no `data`, or a bare fixture) | `Refused(WrongMode)`: web's answer, not ours | `Transport` |
+| 200 whose body never arrived as JSON (empty, cut mid-document, cut mid-transfer, an HTML page, past the 64 KiB read cap) | `Transient`: not web's answer | `Transport` |
+| 401 / 404 / 410 | `Refused(Unauthorized / NotFound / Gone)` | `Transport` / `Transport` / **`Gone`** |
+| any other status (5xx, 400, 403, 429), a 3xx (redirects are never followed: `redirects(0)`), a network error, a timeout | `Transient` | `Transport` |
+
+`parse_session` refuses the brief's cases, plus several the contract states:
+- `delay=` repeated (the contract: "appears exactly once"), or not written exactly as `overlayDelayMs`;
+- a 0 `heartbeatIntervalMs` (`exclusiveMinimum: 0`);
+- an `input.protocol` other than `srt`;
+- an `input.url` off the contract's pattern `^srt://[^\s/?#@]+:\d+$`, which is
+  `session-invalid-input-url-query.json`. A query on that URL would carry the credentials, and C10
+  would build a broken URI from it;
+- an absent `sessionId` or `target`, and a body that is not an object.
+
+Every `session-*` fixture gets the verdict its name declares (the fixtures README): plain ones decode,
+and the `refused-`, `invalid-` and passthrough ones are refused.
+
+**The wire as built.**
+- An f64 measurement that is NaN, infinite or negative is omitted. It is not a value we know, serde
+  writes NaN as `null`, and `minimum: 0` makes a negative a 400.
+- Every integer is clamped to the contract's `maximum` (2^53 − 1).
+- The exit keys ride only a `state: "stopped"` beat, whatever `exit` holds (the contract's if/then).
+
+**Redaction as built** (`crates/adapters/src/redact.rs`).
+- Rules 1 and 2 cut at the EARLIEST of `/live/`, `/live2/` and `?`, and drop everything after it.
+  The POC searched `/live2/` before `/live/` and stopped at the first match, so in a text holding a
+  `/live/` key before a `/live2/` one, the first key survived.
+- Rule 3, as Step 6 words it ("in `srt://` URLs"), would be an equivalent guard: an SRT URL's
+  `streamid=` and `passphrase=` sit in its query, which rule 2 already cuts. It is built to mask both
+  keys anywhere, in any case and quoted, because an SRT element's error or property dump names them
+  with no `?` before them.
+
+**Deviations.**
+- The HTTP tests' fake is a raw `TcpListener`, not `tiny_http`. The error paths need a body cut
+  mid-transfer, a close with no reply and a server that never answers, and `tiny_http` answers a
+  dropped request with a 500. `tiny_http` is not a dependency.
+- `serde` is not a dependency: the parser reads `serde_json::Value`.
+- Step 9.3 said to restore the fixture "with `git checkout`". The runner restored every mutant from
+  its in-memory original, with a sha check (AGENTS.md §5).
+- "Asserts no `SwapSink`" (Acceptance and the owed-checks amendment) is false as written: the first
+  tick builds sink generation 1 as a `SwapSink { gen: 1 }`. The sweep asserts that no swap past
+  generation 1 happens, and the frozen-total mutant reds it on the generation-2 swap.
+- The sweep's total grows by a second of 720p bytes (`video_kbps * 1000 / 8`) every second of
+  script time, not by a frame's worth. The domain reads only that the total grew.
+- Each sweep session's end is pinned (`SESSION_ENDS`: its last beat's `exitReason` and the exit
+  code, from the contract's `exitReason` text), so every session the sweep runs is load-bearing.
+
+**Results.** Tests: 47 new (redact 6, contract 21, control_http 18, app ports 2); the workspace runs 306 passed, 0 failed, 0 ignored, the five CI guards pass, and clippy `-D warnings`, fmt and check-portable are clean; against stubs, 32 failed. Mutation: 73 hand mutants (control_http, redact, ports, the fixtures, the sweep), 73/73 red; the first pass left A3 (the sweep's fatal-while-live session dropped) alive, and `SESSION_ENDS` (each session's `exitReason` and exit code, from the contract's own text) kills it.
 
 ## Do not touch
 
