@@ -465,6 +465,16 @@ existing `eprintln!` form, `ts=<rfc3339> level=info msg=<…>`.
 - New test, `graphics_log_lines_exist_in_both_driver_modes`. In each mode, it drives ready → alive
   → crash → restart → hide through the fakes, and asserts each line once in order. It prints the
   lines matched, and fails on 0.
+- (Amended 2026-10-18, C05b) **No line names a hang, by design.** C05b's hang returns the shared
+  `GraphicsAction::Hide` (its brief: no new action), so C06 emits the same `HideOverlay`, and
+  `LoggedProgramme` logs the same `overlay hidden`. A reader identifies a hang from the lines above
+  alone: an `overlay hidden` whose current generation `g` (the last `graphics restart gen=g`) logged
+  `cef ready gen=g` and no `cef crashed gen=g` before the hide, `cef_hang_after_ms` after its last
+  `cef alive gen=g` (or its ready, if it never beat), within one tick (C05b's
+  `a_page_that_stops_beating_hides_on_the_frame_tick_grid`). A load timeout at the count also hides
+  with no crash line, but its generation never logged `cef ready`. C14 case 11, C15 check (b) and
+  the C17 runbook read this chain (`docs/_INDEX.md` false-premise row "C15's soak check (b) has a
+  hang line to match").
 
 ## Do not touch
 

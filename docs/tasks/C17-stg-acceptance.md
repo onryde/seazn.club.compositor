@@ -86,7 +86,10 @@ entries are written in full, in the runbook's four-line form:
     Then the overlay is back. After 3 failures in 5 min, it stays hidden for the cooldown
     (`graphics: failed`).
   - **Check:** the compositor log shows `overlay hidden` with no `cef crashed` before it, then
-    `graphics restart gen=<n+1>`, then `cef ready gen=<n+1>` (C12 amendment). The beats show
+    `graphics restart gen=<n+1>`, then `cef ready gen=<n+1>` (C12 amendment). (Amended 2026-10-18,
+    C05b.) Precisely: generation `n` logged `cef ready gen=<n>` and no `cef crashed gen=<n>` before
+    the hide, which lands about `cef_hang_after_ms` after its last `cef alive gen=<n>`. A hide whose
+    generation never logged `cef ready` is a page that never loaded (load timeouts), not a hang. The beats show
     `restarting`/`starting` → `ready`.
   - **Do:** a single hang needs nothing. Repeated hangs mean the page itself is broken: look at the
     overlay page's recent deploy (R2005/R2007), not at the Machine.

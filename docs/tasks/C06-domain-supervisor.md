@@ -1109,7 +1109,10 @@ stays `OverlayHalfRate` after it. Print the number of bursts checked, and fail o
     `HideOverlay`, and `health().graphics` reads `restarting`.
   - `RestartGraphics{gen: 2}` lands at `last_alive + cef_hang_after_ms + cef_backoff_base_ms`, and
     not 1 ms before. The back-off is `graphics.rs`'s `fail` → `delay(0)` (PR #21 review, I2).
-  - Then `CefReady{2}` gives `health().graphics` = `ready`, and no further `HideOverlay`.
+  - Then `CefReady{2}` gives `health().graphics` = `ready`, and no further `HideOverlay`
+    (amended 2026-10-18, C05b: while generation 2 beats, `CefAlive{2}` every `cef_alive_every_ms`;
+    a Ready page that never beats hangs `cef_hang_after_ms` after its ready, and that hide is
+    correct, so the check must not run silent past it).
   - Every expected time comes from `Thresholds::default()`, never a literal.
 - **New mutant:** route `CefAlive` to nothing. Expected red: the new test.
 

@@ -435,7 +435,9 @@ frees the page's CPU for the cooldown.
   - **The positive pair.** At the first tick at or after `retry_at`, `GraphicsRestart{gen: n+1}`
     appears. `CefReady{n+1}` makes `health().graphics` read `ready`. No `HideOverlay` follows, and
     no extra call is needed to lift the hide: there is no `show_overlay` port, so nothing in the
-    driver holds a hide flag.
+    driver holds a hide flag. (Amended 2026-10-18, C05b: "no `HideOverlay` follows" holds while
+    generation n+1 beats, `FakeGraphics::alive(n+1)` every `cef_alive_every_ms`, or within
+    `cef_hang_after_ms` of its ready. A Ready page that never beats hangs, and that hide is correct.)
   - Print the calls checked, and fail on 0.
 - **New mutant:** drop `graphics.stop()` from the `HideOverlay` mapping. Expected red: the
   negative half.
