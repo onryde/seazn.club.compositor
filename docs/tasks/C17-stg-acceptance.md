@@ -85,14 +85,30 @@ entries are written in full, in the runbook's four-line form:
     **no overlay** for about 4 s (the 1 s back-off plus the reload), so no stale score is shown.
     Then the overlay is back. After 3 failures in 5 min, it stays hidden for the cooldown
     (`graphics: failed`).
-  - **Check:** the compositor log shows `overlay hidden` with no `cef crashed` before it, then
-    `graphics restart gen=<n+1>`, then `cef ready gen=<n+1>` (C12 amendment). (Amended 2026-10-18,
-    C05b.) Precisely: generation `n` logged `cef ready gen=<n>` and no `cef crashed gen=<n>` before
-    the hide, which lands about `cef_hang_after_ms` after its last `cef alive gen=<n>`. A hide whose
-    generation never logged `cef ready` is a page that never loaded (load timeouts), not a hang. The beats show
-    `restarting`/`starting` → `ready`.
+  - **Check** (amended again 2026-10-18, C05b PR #22 review I2; the hide names its reason):
+    - The compositor log shows `overlay hidden reason=hang gen=<n>`, then `graphics restart
+      gen=<n+1>`, then `cef ready gen=<n+1>` (C12 amendment).
+    - The beats show `restarting`/`starting` → `ready`.
+    - `reason=failed` is the count-th failure (`graphics: failed`).
+    - The superseded reading: ~~`overlay hidden` with no `cef crashed` before it, then
+      `graphics restart gen=<n+1>`, then `cef ready gen=<n+1>`. Precisely: generation `n` logged
+      `cef ready gen=<n>` and no `cef crashed gen=<n>` before the hide, which lands about
+      `cef_hang_after_ms` after its last `cef alive gen=<n>`. A hide whose generation never logged
+      `cef ready` is a page that never loaded (load timeouts), not a hang.~~
   - **Do:** a single hang needs nothing. Repeated hangs mean the page itself is broken: look at the
     overlay page's recent deploy (R2005/R2007), not at the Machine.
+- **A crashed overlay page that does not come back** (amended 2026-10-18, C05b PR #22 review G1;
+  coordinator decision, relayed).
+  - **Meaning:** the CEF renderer crashed (or went over `cef_rss_cap_mb`), and its reloads have not
+    signalled ready.
+  - **Viewer sees:** the last frame held through the reload, for at most 10 s
+    (`cef_hang_after_ms`) after the crash. Then **no overlay** until a reload is ready. A reload
+    that is ready inside the 10 s shows no gap.
+  - **Check:** `cef crashed gen=<n>`, then `overlay hidden reason=crash gen=<n>` about 10 s later
+    (it names the crashed generation, not the reload). Then `cef ready gen=<m>` for the first reload
+    that loads. If none loads, `overlay hidden reason=failed` follows, with `graphics: failed`.
+  - **Do:** as for a hang. Repeated crashes point at the page or at the Machine's memory
+    (`cef_rss_cap_mb`).
 - **A CEF bump** (C16 amendment 2026-10-18, Owed 22). The steps, in order:
   1. Bump `docker/GSTCEF_COMMIT`.
   2. Build the image.

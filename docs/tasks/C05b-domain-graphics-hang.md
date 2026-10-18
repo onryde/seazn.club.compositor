@@ -35,13 +35,21 @@ building.
     be a stale score, so it does not stay on air through the back-off and reload.
   - Below the count, the hang backs off like a crash and then restarts. At the count it enters
     Failed, as before.
-  - No new action is needed. The hang tick returns `Hide`.
+  - No new action is needed. The hang tick returns ~~`Hide`~~ `Hide { reason: Hang, gen }`
+    (amended 2026-10-18, PR #22 review I2: every hide names its reason and generation; see the
+    amendment below).
   - C08 maps `HideOverlay` to `programme.hide_overlay()` plus `graphics.stop()` (Owed 17). C11
     writes the slot only from a generation that has signalled its own ready.
   - So the hide lifts by itself when the next generation is Ready. No `show_overlay` exists, and
     none is needed.
-- **A crash is unchanged.** Below the count, a crash still holds the last frame through the
-  back-off. Only a hang hides at once, because only a hang can leave a frozen, stale picture behind.
+- ~~**A crash is unchanged.** Below the count, a crash still holds the last frame through the
+  back-off. Only a hang hides at once, because only a hang can leave a frozen, stale picture behind.~~
+  **A crash's hold is bounded** (amended 2026-10-18; coordinator decision, PR #22 review G1). Below
+  the count a crash still holds the last frame through the back-off and reload, but at most
+  `cef_hang_after_ms` after the crash; then `Hide { reason: Crash, gen }` until the next generation
+  is Ready. Only a hang hides at once, because only a hang leaves the frozen page itself on air; a
+  crash's frame goes just as stale once its reloads fail to come ready (the review's probe held it
+  about 23 s).
 - **Why 10 s and not shorter.** CEF children run at `nice 10`, so beats slip when the Machine is
   short of CPU. A shorter threshold would turn the ladder's CPU starvation into restarts, and their
   load spikes would feed the ladder. Ten seconds equals the page's own stale threshold.
@@ -91,15 +99,15 @@ impl Graphics {
 
 | From | Event | Result |
 |---|---|---|
-| Ready (gen g) | `on_alive(now, g)` | `last_alive = now`, `since` unchanged, no action |
+| Ready (gen g) | `on_alive(now, g)` | `last_alive = ~~now~~ max(now, last_alive)` (amended 2026-10-18, review M3), `since` unchanged, no action |
 | Ready | `on_alive(_, other gen)` | nothing |
 | Starting / Backoff / Failed | `on_alive(_, _)` | nothing. The page beats only after ready, and a beat never makes a page Ready |
-| Ready | tick at `now ≥ last_alive + cef_hang_after_ms`, below the count | `fail(now)` → Backoff `attempt n−1`, and **returns `Some(Hide)`** |
-| Ready | the same tick, at the count | `fail(now)` → Failed + `Some(Hide)`, as in C05 |
+| Ready | tick at `now ≥ last_alive + cef_hang_after_ms`, below the count | `fail(now)` → Backoff `attempt n−1`, and **returns `Some(Hide)`** (amended 2026-10-18: `Hide { reason: Hang, gen: g }`) |
+| Ready | the same tick, at the count | `fail(now)` → Failed + `Some(Hide)`, as in C05 (amended 2026-10-18: still `reason: Hang`; the reason names the cause, not the state left) |
 | Ready | tick at `now = last_alive + cef_hang_after_ms − 1` | nothing |
 | Ready | tick with **both** the hang and the recycle due | **the hang wins**: a counted failure, plus `Hide`. A hang near the 2 h mark is never laundered as a planned restart. Otherwise 3 hangs at recycles would never reach Failed |
 | Ready | tick with only the recycle due | the planned restart, as in C05: no failure and no hide |
-| Starting / Ready | crash below the count | as in C05: Backoff, **no** `Hide`, and the frame is held |
+| Starting / Ready | crash below the count | as in C05: Backoff, **no** `Hide`, and the frame is held (amended 2026-10-18: for at most `cef_hang_after_ms`; see the amendment below) |
 
 **The invariant, replacing "hidden iff Failed".** The overlay is hidden from a `Hide` until the next
 generation's Ready. A `Hide` comes from Failed, or from a hang.
@@ -202,6 +210,66 @@ generation's Ready. A `Hide` comes from Failed, or from a hang.
 - 7 mutants went red, and the tree is clean after each restore.
 - `cargo test --workspace` is green with 0 ignored. Clippy, fmt and check-portable are clean.
 - `docs/_INDEX.md` gets a session-handoff line, and Owed 18's build is marked done.
+
+## Amendment 2026-10-18 (PR #22 review; coordinator decisions, relayed)
+
+The review returned NEEDS FIXES. The coordinator adopted I2, ruled on G1, and routed I1, G2 and G3
+to the briefs named below. Built in PR #22 on top of the C05b commits.
+
+**1. Every hide names its reason and generation (I2).** `GraphicsAction::Hide` is now
+`Hide { reason: HideReason, gen }`, and `HideReason` is `Hang | Failed | Crash`:
+- `Hang` is every hang, the count-th included. The reason names what took the frame off air, not
+  the state the machine is left in.
+- `Failed` is a crash or a load timeout that enters Failed.
+- `Crash` is a crash's hold running out (point 2).
+- `gen` is the generation whose failure hid the overlay. For `Crash`, that is the crashed generation,
+  not the reload that is loading.
+
+C06 emits `HideOverlay { reason, gen }`, and the driver logs the one line
+`overlay hidden reason=<hang|crash|failed> gen=<g>` (C12). C14 case 11, C15 (b) and the C17 runbook
+read that line, not the three-line chain. Tests pin the reason and the generation on every hide
+path, and the reason-swap mutants went red.
+
+**2. A crash holds the last frame at most `cef_hang_after_ms` (G1).** This is a coordinator decision
+derived from the owner-approved 10 s rule (`docs/_INDEX.md`).
+- After a crash below the count, the first tick at or after the crash plus `cef_hang_after_ms` returns
+  `Hide { reason: Crash, gen }` if no newer generation is Ready by then. The hide holds until the next
+  generation is Ready.
+- **A reload that is Ready inside the window** means no hide, then or later.
+- **The clock.** A second crash keeps the first crash's clock and generation.
+- **What can be held.** A crash holds only a frame that is on air:
+  - none before the first Ready
+  - none from any hide until the next Ready
+  - a recycle's or a load timeout's last frame does stay on air, so a crash of that reload holds it
+- **Tick order.** The hold's tick is checked first, so the frame comes off air on the tick its hold
+  ends. A restart or load timeout due on the same tick follows on the next tick.
+- **What follows a Crash hide.** It leaves the reload loading, so the next action is a Restart, or
+  that reload's `Failed` hide. That is the one pair of hides with neither a restart nor a Ready
+  between them.
+- `Graphics` tracks this with a private `OnAir` (`Nothing | Frame | Held { since, gen }`). Its public
+  API is unchanged except for the hide.
+
+**3. `on_alive` keeps the later beat (M3).** `last_alive = max(now, last_alive)`, so an
+earlier-stamped beat never pulls the deadline in. It is unreachable today: C08 stamps on receipt from
+a monotonic clock.
+
+**4. Sweep checks that could not fail (M1)** are replaced by air probes on a clone after every
+step, which can fail:
+- **Held:** the hold's tick hides as `Crash`.
+- **Frame:** a crash then holds and hides.
+- **Nothing:** a crash hides nothing.
+
+The matrix gains frame-on-air and held setups.
+
+**Routed to other briefs** (each amended 2026-10-18):
+- **C11 (I1):** `stop()` takes the `restart()` reaper path. It never blocks, and it closes the
+  stopped generation's slot gate at once; a reported crash closes that generation's gate too.
+- **C08:** `stop()` gets semantics. A `Crash` hide maps to `hide_overlay()` alone, so the reload
+  survives; `Hang` and `Failed` map to `hide_overlay()` and `stop()`.
+- **C06 (G2):** the final hold runs the graphics tick and routes `CefCrashed`. It maps `Hide` and
+  drops `Restart`.
+- **C12, C14, C15 and C17 (I2):** the single reason line.
+- **R2005 (G3):** E9 checks the beat across live → reconnecting → final.
 
 ## Do not touch
 

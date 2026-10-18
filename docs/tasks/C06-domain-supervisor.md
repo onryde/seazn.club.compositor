@@ -101,7 +101,7 @@ gets 410 and exits 0. That sequence is tested here.
       RebuildInput { gen: u64 },
       SwapSink { gen: u64 },
       RestartGraphics { gen: u64 },
-      HideOverlay,
+      HideOverlay { reason: HideReason, gen: u64 }, // amended 2026-10-18 (C05b, PR #22 review I2): the driver logs both
       StepDown(Rung),
       SendHeartbeat(HealthReport),
       DrainOutput,
@@ -490,7 +490,7 @@ gets 410 and exits 0. That sequence is tested here.
                   if self.output.on_tick(now, &t) { fx.push(Effect::SwapSink { gen: self.output.generation() }); }
                   match self.graphics.on_tick(now, &t) {
                       Some(GraphicsAction::Restart) => fx.push(Effect::RestartGraphics { gen: self.graphics.generation() }),
-                      Some(GraphicsAction::Hide) => fx.push(Effect::HideOverlay),
+                      Some(GraphicsAction::Hide { reason, gen }) => fx.push(Effect::HideOverlay { reason, gen }), // amended 2026-10-18
                       None => {}
                   }
                   let choice = self.programme.on_tick(now, &t);
@@ -514,7 +514,8 @@ gets 410 and exits 0. That sequence is tested here.
               }
               Event::CefReady { gen } => self.graphics.on_ready(now, gen),
               Event::CefCrashed { gen } => {
-                  if self.graphics.on_crashed(now, gen, &t) == Some(GraphicsAction::Hide) { fx.push(Effect::HideOverlay); }
+                  // amended 2026-10-18 (C05b, PR #22 review I2): the hide carries its reason and generation
+                  if let Some(GraphicsAction::Hide { reason, gen }) = self.graphics.on_crashed(now, gen, &t) { fx.push(Effect::HideOverlay { reason, gen }); }
               }
               Event::ScoreStale(b) => self.score_stale = Some(b),
               Event::HeartbeatReply(Desired::Live) => self.heartbeat_failures = 0,
@@ -758,6 +759,11 @@ gets 410 and exits 0. That sequence is tested here.
 - (Amended 2026-10-18, Owed 18) `CefAlive{gen}` is routed in Running and Holding. The sweep counts
   its `CefAlive` deliveries, and 0 fails. `a_ready_page_that_stops_beating_restarts` passes, and
   the unrouted-`CefAlive` mutant went red.
+- (Amended 2026-10-18, C05b PR #22 review) `Effect::HideOverlay { reason, gen }` carries the domain
+  hide's reason and generation unchanged, from the Running tick and crash arms and from the hold.
+  The final hold runs the graphics tick and routes `CefCrashed`, mapping `Hide` and dropping
+  `Restart`. `the_final_hold_still_hides_a_hang_or_a_crash` passes, and both of its mutants went
+  red.
 
 ## Final heartbeat with the exit reason (owner ruling 2026-10-15)
 
@@ -957,7 +963,15 @@ fn holding(&mut self, event: Event, now: Ms, since: Ms, reason: ExitReason, fx: 
                 self.start_drain(now, reason, fx);
                 return None;
             }
-            // No link or graphics on_tick here: nothing is rebuilt during the hold (no rebuild could finish inside it).
+            // No link on_tick here: nothing is rebuilt during the hold (no rebuild could finish inside it).
+            // (Amended 2026-10-18, C05b PR #22 review G2.) The graphics tick still runs, so a page that hangs, or a
+            // crash whose hold runs out, near Final still comes off air. Its `Hide` is mapped and its `Restart` is
+            // dropped: nothing is rebuilt. A dropped restart leaves the domain one generation ahead of the adapter
+            // for the rest of the hold. That is harmless: the old generation's events are then ignored, and the hold
+            // ends in DrainOutput → graphics.stop().
+            if let Some(GraphicsAction::Hide { reason, gen }) = self.graphics.on_tick(now, &t) {
+                fx.push(Effect::HideOverlay { reason, gen });
+            }
             let choice = self.programme.on_tick(now, &t); // Final ⇒ Slate(SlateKind::Final)
             if now >= self.next_beat_at {
                 fx.push(Effect::SendHeartbeat(self.health(now)));
@@ -975,6 +989,13 @@ fn holding(&mut self, event: Event, now: Ms, since: Ms, reason: ExitReason, fx: 
         Event::OutputAck { gen } => self.output.on_ack(now, gen),
         Event::OutputError { gen } => self.output.on_error(now, gen, &t),
         Event::CefReady { gen } => self.graphics.on_ready(now, gen),
+        // (Amended 2026-10-18, C05b PR #22 review G2.) A crash in the hold is counted, so one at the count hides at
+        // once, and one below it starts the crash hold that the graphics tick above ends.
+        Event::CefCrashed { gen } => {
+            if let Some(GraphicsAction::Hide { reason, gen }) = self.graphics.on_crashed(now, gen, &t) {
+                fx.push(Effect::HideOverlay { reason, gen });
+            }
+        }
         Event::ScoreStale(b) => self.score_stale = Some(b),
         Event::PhaseChannel(c) => self.phase_channel = Some(c),
         Event::HeartbeatReply(Desired::Live) => self.heartbeat_failures = 0,
@@ -982,9 +1003,10 @@ fn holding(&mut self, event: Event, now: Ms, since: Ms, reason: ExitReason, fx: 
         Event::Signal(SignalKind::Term) => self.start_drain(now, ExitReason::Signalled, fx),
         Event::Fatal => self.exit(ExitReason::Fatal, fx),
         // A second end request (the reply after the SIGINT, or the reverse) keeps the FIRST hold's clock. An
-        // overrun or a CEF crash changes nothing: the hold is ≤ final_hold_ms and the held overlay frame stays (C11).
+        // overrun changes nothing: the hold is ≤ final_hold_ms. ~~or a CEF crash~~ (amended 2026-10-18: a crash is
+        // routed above).
         Event::HeartbeatReply(Desired::Ending) | Event::Signal(SignalKind::Int) | Event::EncoderOverrun
-        | Event::CefCrashed { .. } | Event::OutputDrained | Event::BootstrapOk { .. } | Event::BootstrapFailed
+        | Event::OutputDrained | Event::BootstrapOk { .. } | Event::BootstrapFailed
         | Event::BootstrapRefused(_) => {}
     }
     None
@@ -1045,6 +1067,23 @@ frames and ticks into each camera phase exactly as `final_is_terminal_against_ev
     Without the reset, that beat waits until `B + heartbeat_interval_ms`. The expected beat time comes
     from `Thresholds::default()` and the tick period, never from `decide`. Print
     `end paths checked: 3`; fail on 0.
+11. **(Amended 2026-10-18, C05b PR #22 review G2)** `the_final_hold_still_hides_a_hang_or_a_crash`.
+    Every instant comes from `Thresholds::default()`. From `booted(0)` with the output connected,
+    `CefReady{1}`, and `CefAlive{1}` every `cef_alive_every_ms`, take three legs. Each sends `Ending`
+    at `f`.
+    - **A hang.** The last beat is at `f − 3 000`. The first tick at or after
+      `last_alive + cef_hang_after_ms`, which falls inside the hold, emits
+      `HideOverlay { reason: Hang, gen: 1 }`, and not 1 ms before.
+    - **A crash's hold.** `CefCrashed{1}` at `f − 5 000`. The restart to generation 2 falls in
+      Running, and generation 2 never signals ready. The tick at the crash plus `cef_hang_after_ms`
+      emits `HideOverlay { reason: Crash, gen: 1 }`.
+    - **A crash at the count.** Two earlier crashes in the window, then `CefCrashed` of the current
+      generation at `f + 100` emits `HideOverlay { reason: Failed, gen }` at once.
+
+    Each leg emits no `RestartGraphics` from `f` to its `DrainOutput`. Print `hold legs checked: 3`,
+    and fail on 0. **Mutants:**
+    - the hold runs no graphics tick (expected red: the first two legs)
+    - the hold ignores `CefCrashed` (expected red: the third leg)
 
 **Properties** (`properties.rs`):
 - P1 becomes P1′: a tick yields a frame iff the lifecycle before **and** after is `Running` or
@@ -1106,7 +1145,8 @@ stays `OverlayHalfRate` after it. Print the number of bursts checked, and fail o
   - Boot, `CefReady{1}`, then `CefAlive{1}` every `cef_alive_every_ms` for 30 s: no
     `RestartGraphics`.
   - Then silence. At exactly `last_alive + cef_hang_after_ms`, and not 1 ms before, the tick emits
-    `HideOverlay`, and `health().graphics` reads `restarting`.
+    `HideOverlay` (amended 2026-10-18: `HideOverlay { reason: Hang, gen: 1 }`), and
+    `health().graphics` reads `restarting`.
   - `RestartGraphics{gen: 2}` lands at `last_alive + cef_hang_after_ms + cef_backoff_base_ms`, and
     not 1 ms before. The back-off is `graphics.rs`'s `fail` → `delay(0)` (PR #21 review, I2).
   - Then `CefReady{2}` gives `health().graphics` = `ready`, and no further `HideOverlay`
