@@ -44,12 +44,16 @@ building.
     none is needed.
 - ~~**A crash is unchanged.** Below the count, a crash still holds the last frame through the
   back-off. Only a hang hides at once, because only a hang can leave a frozen, stale picture behind.~~
-  **A crash's hold is bounded** (amended 2026-10-18; coordinator decision, PR #22 review G1). Below
+  ~~**A crash's hold is bounded** (amended 2026-10-18; coordinator decision, PR #22 review G1). Below
   the count a crash still holds the last frame through the back-off and reload, but at most
   `cef_hang_after_ms` after the crash; then `Hide { reason: Crash, gen }` until the next generation
-  is Ready. Only a hang hides at once, because only a hang leaves the frozen page itself on air; a
-  crash's frame goes just as stale once its reloads fail to come ready (the review's probe held it
-  about 23 s).
+  is Ready.~~ **One bound on a frame's age** (amended again 2026-10-18; coordinator decision, the
+  review's second round): the frame on air stays on air at most `cef_hang_after_ms` after the last
+  ready or beat of the page that drew it, whether that page hung, crashed or was recycled, then
+  `Hide { reason: Hang | Crash | Recycle, gen }` until the next generation is Ready. Only a hang
+  hides at once, because only a hang leaves the frozen page itself on air; a crashed or recycled
+  page's frame goes just as stale once its reloads fail to come ready (the review's probe held a
+  crash's about 23 s, and a recycle's about 33 s).
 - **Why 10 s and not shorter.** CEF children run at `nice 10`, so beats slip when the Machine is
   short of CPU. A shorter threshold would turn the ladder's CPU starvation into restarts, and their
   load spikes would feed the ladder. Ten seconds equals the page's own stale threshold.
@@ -217,7 +221,8 @@ The review returned NEEDS FIXES. The coordinator adopted I2, ruled on G1, and ro
 to the briefs named below. Built in PR #22 on top of the C05b commits.
 
 **1. Every hide names its reason and generation (I2).** `GraphicsAction::Hide` is now
-`Hide { reason: HideReason, gen }`, and `HideReason` is `Hang | Failed | Crash`:
+`Hide { reason: HideReason, gen }`, and `HideReason` is `Hang | Failed | Crash` (round 2 adds
+`Recycle`, and changes what `Crash` and `gen` mean below; see its section):
 - `Hang` is every hang, the count-th included. The reason names what took the frame off air, not
   the state the machine is left in.
 - `Failed` is a crash or a load timeout that enters Failed.
@@ -231,7 +236,9 @@ read that line, not the three-line chain. Tests pin the reason and the generatio
 path, and the reason-swap mutants went red.
 
 **2. A crash holds the last frame at most `cef_hang_after_ms` (G1).** This is a coordinator decision
-derived from the owner-approved 10 s rule (`docs/_INDEX.md`).
+derived from the owner-approved 10 s rule (`docs/_INDEX.md`). **Superseded by round 2** (below): the
+bound now runs from the crashed page's last beat, not the crash, it covers a recycle too, and the
+private `OnAir` is gone.
 - After a crash below the count, the first tick at or after the crash plus `cef_hang_after_ms` returns
   `Hide { reason: Crash, gen }` if no newer generation is Ready by then. The hide holds until the next
   generation is Ready.
@@ -270,6 +277,67 @@ The matrix gains frame-on-air and held setups.
   drops `Restart`.
 - **C12, C14, C15 and C17 (I2):** the single reason line.
 - **R2005 (G3):** E9 checks the beat across live → reconnecting → final.
+
+## Amendment 2026-10-18, round 2: one bound on a frame's age (coordinator decision, relayed)
+
+The coordinator confirmed round 1's derived points (a `Crash` hide maps to `hide_overlay()` alone;
+C11 closes a generation's slot at its reported crash). It ruled on the open one, G1's ~33 s hold
+after a recycle or a load timeout whose reloads never come ready: generalise the rule rather than
+put it to the owner, since it is the principle the owner approved at 10 s. This supersedes round 1's
+point 2.
+
+**The invariant.** The frame on air may stay on air at most `cef_hang_after_ms` after the last proof
+of life (its ready, or a beat) of the page that produced it. The first tick at or after that instant
+hides it.
+- **One check, first in `on_tick`.** It reads `on_air()`: the Ready page's own frame, whose proof is
+  its `last_alive`, or a held frame. A hang is that check firing on the Ready page's own frame, so the
+  separate hang arm is gone; the hang is still a counted failure, and still wins over a recycle due on
+  the same tick. A restart or a load timeout due on the bound's tick follows on the next one.
+- **What holds a frame.** A crash of a Ready page below the count, or a recycle, ends its life and
+  records `Held { gen, proof: last_alive, ended }`. Nothing else does: a page that never got Ready
+  showed no frame of its own, so its crash or load timeout leaves a held frame's page, bound and cause
+  as they were. A Ready replaces the frame, and a hide clears it.
+- **The clock moved.** Round 1 timed a crash's hold from the crash. It now runs from the crashed
+  page's last beat, so the frame comes off up to one beat (2 s) sooner: the invariant read literally.
+- **A crash reported past the bound** but before its tick is one failure, and hides as `Crash`, not as
+  a hang too.
+
+**The reasons: `Hang | Crash | Recycle | Failed`, the minimal set.** A bound hide names the path that
+started it.
+- `Recycle` is the one new reason. A recycle is planned and records no failure, so `Crash` would send
+  an operator after a crash that never happened, and `Hang` would count a failure.
+- No `LoadTimeout`. A load timeout never starts a hold: a page that timed out never signalled ready,
+  so it showed no frame of its own (C11 writes the slot only after a page's own ready). Its reloads'
+  load timeouts neither end nor move the bound of the frame on air.
+- No `Stale`. One reason for every bound would throw away the cause I2 asked for.
+- `gen` names the page whose frame came off (`Hang`, `Crash`, `Recycle`), or the generation whose
+  failure entered Failed (`Failed`). A recycle whose reload crashes still hides as `Recycle, gen 1`.
+- A `Recycle` hide leaves the reload loading, like a `Crash` hide, so C08 maps both to
+  `hide_overlay()` alone. The only pairs of hides with neither a restart nor a Ready between are
+  (`Crash` or `Recycle`, then that reload's `Failed`).
+
+**G1's cases, under the defaults** (bound 10 s, load timeout 10 s, beat 2 s):
+- a recycle whose reloads never come ready: off at its last beat + 10 s, so at most 10 s after the
+  recycle (it was about 33 s)
+- a crash whose reloads never come ready: off at its last beat + 10 s (it was the crash + 10 s)
+- reloads that time out inside the bound (a load timeout under 10 s): no change to the bound
+
+**Tests.**
+- Inline:
+  - the recycle-never-ready and the reloads-time-out-inside-the-bound cases hide at exactly the
+    bound and stay shown at −1, for both paths
+  - a reload Ready at its restart, at −1, or on the bound's own instant before the tick keeps the
+    frame shown
+  - the bound reads `cef_hang_after_ms` from the proof, under thresholds where the crash, the restart
+    and the load timeout all differ
+  - a crash reported past the bound, and the bound winning a tick a restart is also due on
+- The matrix gains recycled-frame setups (hides by reason: Hang 4, Failed 5, Crash 2, Recycle 2).
+- The sweep runs under the defaults and under a 3 s load timeout, so reloads time out beside a held
+  frame. From the machine's outputs alone (a page's frames reach air at its Ready and leave at a
+  `Hide` or the next Ready), it asserts after every tick that no frame is on air
+  `cef_hang_after_ms` after its page's proof. It prints the count and fails on 0.
+- The grid test covers both paths at every phase of both modes, and pins its case count.
+- 54 of 54 mutants red, none equivalent: 10 on the reason and generation each hide names, 16 on the bound (its comparison, its field, its anchor, its precedence over a restart, a load timeout and a recycle), 7 on how a life ends, 7 on the beat (C05b's, re-pinned), and 14 anti-vacuity mutants on the harness. With the matrix assert and the air probes switched off, the sweep's bound invariant alone still goes red on a held frame that never hides and on a bound 1 ms late.
 
 ## Do not touch
 

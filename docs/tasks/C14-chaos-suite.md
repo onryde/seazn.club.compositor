@@ -102,7 +102,7 @@ cases to 12, and the Step 7 commit title says twelve:
   - then `graphics restart gen=g+1`
   - then `cef ready gen=g+1`
 
-  There is no `overlay hidden` with `reason=crash` or `reason=failed` in the run. The timing is the
+  There is no `overlay hidden` with `reason=crash`, `reason=recycle` or `reason=failed` in the run. The timing is the
   strip's, frame-exact (above), never a log timestamp: `ts=` is wall-clock time of unstated precision,
   and the domain's clock is monotonic.
 

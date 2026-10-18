@@ -356,10 +356,13 @@ So:
   - on `stop()`
   - for generation `g`, when the adapter reports `CefCrashed{g}`
 
-  The last of these is what makes C05b's crash hold a hold: a crashed page whose renderer is still
-  alive (`cef_rss_cap_mb`) stops writing at its report. A sample from a closed generation is dropped
-  and counted. So nothing of a hidden or crashed generation reaches the slot again, and the hide
-  holds until a later generation signals ready.
+  The last of these is what makes C05b's held frame a hold: a crashed page whose renderer is still
+  alive (`cef_rss_cap_mb`) stops writing at its report. The first does the same for a recycled page
+  at its restart (C05b's one bound, amended 2026-10-18 in the review's second round: a crashed or
+  recycled page's last frame stays in the slot at most `cef_hang_after_ms` after that page's last
+  beat, then `hide_overlay` clears it). A sample from a closed generation is dropped and counted. So
+  nothing of a hidden, crashed or recycled generation reaches the slot again, and the hide holds
+  until a later generation signals ready.
 - **The harness page revives on request.** `?crash=1` gains `&revive_after_ms=N`: the busy loop ends
   after N ms, and the page beats and paints again. A page that never revives cannot witness the gate.
 

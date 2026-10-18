@@ -990,7 +990,8 @@ fn holding(&mut self, event: Event, now: Ms, since: Ms, reason: ExitReason, fx: 
         Event::OutputError { gen } => self.output.on_error(now, gen, &t),
         Event::CefReady { gen } => self.graphics.on_ready(now, gen),
         // (Amended 2026-10-18, C05b PR #22 review G2.) A crash in the hold is counted, so one at the count hides at
-        // once, and one below it starts the crash hold that the graphics tick above ends.
+        // once, and one below it leaves the crashed page's frame on air to its bound, which the graphics tick above
+        // ends (C05b's one bound, the review's second round).
         Event::CefCrashed { gen } => {
             if let Some(GraphicsAction::Hide { reason, gen }) = self.graphics.on_crashed(now, gen, &t) {
                 fx.push(Effect::HideOverlay { reason, gen });
@@ -1074,16 +1075,20 @@ frames and ticks into each camera phase exactly as `final_is_terminal_against_ev
     - **A hang.** The last beat is at `f − 3 000`. The first tick at or after
       `last_alive + cef_hang_after_ms`, which falls inside the hold, emits
       `HideOverlay { reason: Hang, gen: 1 }`, and not 1 ms before.
-    - **A crash's hold.** `CefCrashed{1}` at `f − 5 000`. The restart to generation 2 falls in
-      Running, and generation 2 never signals ready. The tick at the crash plus `cef_hang_after_ms`
-      emits `HideOverlay { reason: Crash, gen: 1 }`.
+    - **A crash's held frame.** `CefCrashed{1}` at `f − 5 000`, after its last beat. The restart to
+      generation 2 falls in Running, and generation 2 never signals ready. The first tick at or after
+      the last beat plus `cef_hang_after_ms` (amended in the review's second round: the bound runs
+      from the page's last beat, not the crash) emits `HideOverlay { reason: Crash, gen: 1 }`.
+    - **A recycle's held frame** (the review's second round). The recycle falls due at `f + 1 000`,
+      inside the hold, with the last beat at `f − 1 000`. The hold drops the recycle's `Restart`, and
+      the first tick at or after `f + 9 000` emits `HideOverlay { reason: Recycle, gen: 1 }`.
     - **A crash at the count.** Two earlier crashes in the window, then `CefCrashed` of the current
       generation at `f + 100` emits `HideOverlay { reason: Failed, gen }` at once.
 
-    Each leg emits no `RestartGraphics` from `f` to its `DrainOutput`. Print `hold legs checked: 3`,
+    Each leg emits no `RestartGraphics` from `f` to its `DrainOutput`. Print `hold legs checked: 4`,
     and fail on 0. **Mutants:**
-    - the hold runs no graphics tick (expected red: the first two legs)
-    - the hold ignores `CefCrashed` (expected red: the third leg)
+    - the hold runs no graphics tick (expected red: the first, second and third legs)
+    - the hold ignores `CefCrashed` (expected red: the fourth leg)
 
 **Properties** (`properties.rs`):
 - P1 becomes P1′: a tick yields a frame iff the lifecycle before **and** after is `Running` or

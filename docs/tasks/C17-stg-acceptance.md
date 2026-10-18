@@ -101,14 +101,27 @@ entries are written in full, in the runbook's four-line form:
   coordinator decision, relayed).
   - **Meaning:** the CEF renderer crashed (or went over `cef_rss_cap_mb`), and its reloads have not
     signalled ready.
-  - **Viewer sees:** the last frame held through the reload, for at most 10 s
-    (`cef_hang_after_ms`) after the crash. Then **no overlay** until a reload is ready. A reload
-    that is ready inside the 10 s shows no gap.
-  - **Check:** `cef crashed gen=<n>`, then `overlay hidden reason=crash gen=<n>` about 10 s later
-    (it names the crashed generation, not the reload). Then `cef ready gen=<m>` for the first reload
-    that loads. If none loads, `overlay hidden reason=failed` follows, with `graphics: failed`.
+  - **Viewer sees:** the last frame held through the reload, until 10 s (`cef_hang_after_ms`) after
+    the crashed page's last beat (amended 2026-10-18, the review's second round: the one bound runs
+    from the page's last proof of life, not the crash), so 8–10 s after the crash. Then **no
+    overlay** until a reload is ready. A reload that is ready inside the window shows no gap.
+  - **Check:** `cef crashed gen=<n>`, then `overlay hidden reason=crash gen=<n>` within 10 s (it
+    names the crashed generation, not the reload). Then `cef ready gen=<m>` for the first reload that
+    loads. If none loads, `overlay hidden reason=failed` follows, with `graphics: failed`.
   - **Do:** as for a hang. Repeated crashes point at the page or at the Machine's memory
     (`cef_rss_cap_mb`).
+- **A recycled overlay page that does not come back** (amended 2026-10-18, C05b PR #22 review, second
+  round; coordinator decision, relayed).
+  - **Meaning:** the planned 2 h recycle restarted the browser, and the reload has not signalled
+    ready. A recycle is not a failure; its reload's load timeouts are.
+  - **Viewer sees:** the last frame held through the reload, until 10 s after the recycled page's
+    last beat (at most 10 s after the recycle). Then **no overlay** until a reload is ready. It was
+    about 33 s before this amendment: the hold ran through every load timeout to Failed.
+  - **Check:** `graphics restart gen=<n+1>` at the recycle, then `overlay hidden reason=recycle
+    gen=<n>` within 10 s (it names the recycled page). Then `cef ready gen=<m>` for the first reload
+    that loads, or the load timeouts and `overlay hidden reason=failed` with `graphics: failed`.
+  - **Do:** a single one needs nothing. Repeated ones mean the page loads slowly: look at the
+    overlay page's load (R2005/R2007) and the Machine's network.
 - **A CEF bump** (C16 amendment 2026-10-18, Owed 22). The steps, in order:
   1. Bump `docker/GSTCEF_COMMIT`.
   2. Build the image.

@@ -177,7 +177,10 @@ index drop to 0" is replaced by four checks:
 - (a) The compositor log has `cef alive` lines for at least 95 % of `3 h / cef_alive_every_ms`.
 - (b) (Amended again 2026-10-18, C05b PR #22 review I2.)
   - `graphics` never reads `failed`.
-  - Every `overlay hidden` line names its reason: `reason=hang` or `reason=crash`.
+  - Every `overlay hidden` line names its reason: `reason=hang`, `reason=crash` or `reason=recycle`
+    (`recycle` amended 2026-10-18 in the review's second round: a 3 h soak crosses one 2 h recycle,
+    and a reload not ready within `cef_hang_after_ms` of the recycled page's last beat hides as
+    `recycle`; it is printed, not failed, like a crash).
     - A `reason=failed` line fails, as the first clause already does.
     - So does a bare `overlay hidden` with no reason. That line comes from a build older than this
       amendment.
@@ -193,8 +196,9 @@ index drop to 0" is replaced by four checks:
     `cef alive gen=g` (or its ready, if it never beat), within one tick. "Or crash" was vacuous: below
     the count a crash never hides, and at the count `graphics` reads `failed`, which the first clause
     already fails. Print the hides matched, and fail on a hide that matches nothing.~~
-  - "Below the count a crash never hides" has also stopped being true: a crash's hold now ends in
-    `reason=crash`.
+  - "Below the count a crash never hides" has also stopped being true: a crashed page's held frame
+    now ends in `reason=crash`, and a recycled page's in `reason=recycle`, `cef_hang_after_ms` after
+    that page's last beat (C05b's one bound).
 - (c) The score driver has recorded ≥ 1 delivery a minute.
 - (d) Once a minute, a sample of the programme recording's overlay region differs from the
   camera-only reference, so the overlay is on air.

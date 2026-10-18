@@ -455,11 +455,14 @@ window (Owed 19; PR #21 review I3). So these lines must exist in both driver mod
 existing `eprintln!` form, `ts=<rfc3339> level=info msg=<…>`.
 
 - ~~`LoggedProgramme` (`logged.rs`) also logs `overlay hidden` on `hide_overlay()`.~~ (Amended
-  2026-10-18, C05b PR #22 review I2.) The driver logs `overlay hidden reason=<hang|crash|failed>
-  gen=<g>` when it applies `HideOverlay { reason, gen }` (C06, C08). `reason` and `gen` are the
-  domain hide's own: `hang` for every hang, `crash` for a crash's hold that ran out, and `failed` for
-  a crash or load timeout entering Failed. `gen` is the generation whose failure hid the overlay.
-  `LoggedProgramme` logs nothing on `hide_overlay()`, so there is exactly one line per hide.
+  2026-10-18, C05b PR #22 review I2; `recycle` added in its second round.) The driver logs
+  `overlay hidden reason=<hang|crash|recycle|failed> gen=<g>` when it applies
+  `HideOverlay { reason, gen }` (C06, C08). `reason` and `gen` are the domain hide's own. The first
+  three are a frame reaching its bound, `cef_hang_after_ms` after its page's last beat (C05b's one
+  bound): `hang` for the Ready page's own, `crash` for a crashed page's held frame, and `recycle` for
+  a recycled page's. `failed` is a crash or load timeout entering Failed. `gen` is the page whose
+  frame came off (`failed`: the generation that failed). `LoggedProgramme` logs nothing on
+  `hide_overlay()`, so there is exactly one line per hide.
 - A new `LoggedGraphics<G: GraphicsRenderer>` decorator, beside it, logs:
   - `graphics restart gen=<n>` on `restart`
   - `graphics stop` on `stop`
@@ -469,10 +472,12 @@ existing `eprintln!` form, `ts=<rfc3339> level=info msg=<…>`.
   - `cef alive gen=<n>`, one every 2 s, so a 60 s case has about 30
 - New test, `graphics_log_lines_exist_in_both_driver_modes`. In each mode, it drives ready → alive
   → crash → restart → hide through the fakes, and asserts each line once in order. It prints the
-  lines matched, and fails on 0. (Amended 2026-10-18, C05b PR #22 review I2.) It drives one hide of
-  each reason: a hang, a crash whose reload never readies, and the count-th failure. It asserts
-  `overlay hidden reason=hang gen=1`, `reason=crash gen=<the crashed generation>` and
-  `reason=failed gen=<the count-th>`, each exactly once, and no bare `overlay hidden`.
+  lines matched, and fails on 0. (Amended 2026-10-18, C05b PR #22 review I2 and its second round.)
+  It drives one hide of each reason: a hang, a crash whose reload never readies, a recycle whose
+  reload never readies (with a short `cef_recycle_every_ms`), and the count-th failure. It asserts
+  `overlay hidden reason=hang gen=1`, `reason=crash gen=<the crashed generation>`,
+  `reason=recycle gen=<the recycled generation>` and `reason=failed gen=<the count-th>`, each
+  exactly once, and no bare `overlay hidden`.
 - ~~(Amended 2026-10-18, C05b) **No line names a hang, by design.** C05b's hang returns the shared
   `GraphicsAction::Hide` (its brief: no new action), so C06 emits the same `HideOverlay`, and
   `LoggedProgramme` logs the same `overlay hidden`. A reader identifies a hang from the lines above
