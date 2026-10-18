@@ -32,6 +32,8 @@ of them:
     force-key-unit event on swap. It rebases PTS to 0 per connection.
   - Bus `Error` → `Event::OutputError{gen}`. The first acked bytes → `OutputConnected{gen}`. Acked
     bytes increasing (1 s poll) → `OutputAck{gen}`. EOS after `drain()` → `OutputDrained`.
+    **(Amended 2026-10-18, Owed 13: replaced by one `OutputProgress{gen, total_bytes}` from
+    `out-bytes-total`; see "Amendment 2026-10-18".)**
 
 `FrameStore` is shared state between pipelines, written by input (C10) and graphics (C11). It lives
 in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
@@ -234,9 +236,20 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
 - `builds() == 1` holds across swaps.
 - The output starts on a keyframe, with PTS rebased.
 - The stream key is never in errors.
-- ~~5 mutants~~ 7 mutants went red (amended 2026-10-15).
+- ~~5 mutants~~ ~~7 mutants~~ 9 mutants went red (amended 2026-10-15; 2026-10-18 adds `clear_overlay` and the sticky flag).
 - `check.yml` is green with GStreamer installed.
-
+- (Amended 2026-10-18, owner "no lite mode") `the_bottom_rung_keeps_the_overlay_on_air` passes. No
+  rung clears the overlay, and the `clear_overlay` mutant went red.
+- (Amended 2026-10-18, Owed 13) Progress is `OutputProgress` from `out-bytes-total` (the file size
+  for `file://`), with `bitrate_kbps` and `egress_bytes` from the bytes-sent total. The grow/freeze
+  test prints a non-zero count, and the live CF leg is recorded.
+- (Amended 2026-10-18, Owed 15) The poll choice is recorded, and
+  `stall_is_detected_within_budget_of_the_last_byte` holds the chosen bound with the measured gap
+  printed.
+- (Amended 2026-10-18, Owed 16) Both live legs, command bytes and trickle, are recorded with
+  verdicts. A failing leg reopens C04, and the reopening is named in the PR.
+- (Amended 2026-10-18, Owed 17) `hide_then_set_overlay_composites_again` passes, and the
+  sticky-flag mutant went red.
 
 ## Audio (C00 audio A/B, 2026-10-15; F-004 verdict, overrides anything above)
 
@@ -335,6 +348,57 @@ raise the CPU size". The score is never removed.
   blue, and `overlay_pushes() == 30`.
 - **New mutant:** `step_down(OverlayHalfRate)` also calls `clear_overlay`. Expected red: the new
   test.
+
+### Owed checks as acceptance criteria (Owner, 2026-10-18, in chat, relayed by the coordinator: "apply rec 4-9")
+
+**Owed 13: progress comes from `out-bytes-total`, never acked bytes.** The acked bytes stay 0 on CF
+(F-005).
+- The output poll reads rtmp2sink `out-bytes-total`: the sink's own count, from 0 per sink. For
+  `file://` targets it reads the file's size. Each poll sends `OutputProgress { gen, total_bytes }`.
+- `OutputConnected` and `OutputAck` are not sent. C04 replaced them.
+- `Stats.bitrate_kbps` and `Stats.egress_bytes` are defined from the bytes-sent total, not from
+  acked bytes. Rename `stats_egress_and_bitrate_follow_acked_bytes` to
+  `stats_egress_and_bitrate_follow_bytes_sent`.
+- New test `progress_total_grows_while_pushing_and_freezes_when_the_sink_stops`, on a `file://`
+  target:
+  - The totals sent while pushing strictly increase.
+  - After a `drain()`, no total exceeds the last one.
+  - Print the progress events read, and fail on 0.
+- **Live leg (Step 1's real Input B, CF):** the same assertion against a real `rtmps://` sink.
+  Record in `_FINDINGS.md` that `out-bytes-total` grows on a healthy push and stops growing when
+  `netem out loss 100%` cuts it.
+
+**Owed 15: the stall fires within its budget of the last real byte.** `last_progress` is the poll
+that SAW growth, so a 1 s poll adds up to 1 s.
+- Either poll `out-bytes-total` at `OUTPUT_PROGRESS_POLL_MS` ≤ 250 ms, keeping the PDF's 5 s, or
+  keep 1 s and change the claim to ≤ `output_stall_after_ms + poll` (6 s). Then C14 case 5's bound
+  and the PDF claim in spec §6 move with it.
+- Choose one, record which in `_FINDINGS.md`, and cite it at the const.
+- New test `stall_is_detected_within_budget_of_the_last_byte`:
+  - Cut a `file://` sink by blocking its writes.
+  - Measure from the last growing total to the `SwapSink` that the domain-in-the-loop harness
+    returns.
+  - Assert ≤ the chosen bound, and print the measured gap.
+
+**Owed 16: what counts as progress is proved on a real sink.** Two live legs, recorded in
+`_FINDINGS.md`:
+- **(a) Command bytes.** Point the sink at an RTMP endpoint that accepts `connect` and `createStream`
+  but refuses `publish` (mediamtx with a publish-denied path). Record whether `out-bytes-total` goes
+  above 0.
+  - If it does, the first nonzero total is not media. C04's Connected rule then needs a byte
+    floor, so reopen C04 and do not merge C09's progress feed alone.
+- **(b) Trickle.** Push through `netem out rate 8kbit`. Record the totals over 10 s.
+  - If they keep growing, a trickling sink would stay Connected forever. C14 case 12 is then the
+    red witness, and C04 reopens for a rate floor.
+- Each leg prints its samples. Acceptance needs both recorded, with the verdict and the C04 routing.
+
+**Owed 17: the hide is not sticky.** New test `hide_then_set_overlay_composites_again`:
+- `set_overlay` (opaque blue), `hide_overlay()`, push: not blue.
+- Then `set_overlay` (opaque blue) again, push: **blue**.
+- `hide_overlay` clears the slot. It sets no flag that a later `set_overlay` would have to lift: no
+  `show_overlay` port exists, so a sticky flag would keep C05's recoverable Failed off air forever.
+- **Mutant:** make `hide_overlay` set a `hidden` flag that `set_overlay` does not clear. Expected
+  red: the new test.
 
 ## Do not touch
 

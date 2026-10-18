@@ -201,6 +201,15 @@ score bug. That's an inert seam the owner would only see live.
 - (Amended 2026-10-15) The R2007 gallery shows all four scenes with **no gallery edit**: its sweeps
   enumerate `OVERLAY_SCENES`, so their printed counts grow by ×4 and stay green. Per-screen owner
   verdicts for every scene × template.
+- (Amended 2026-10-18, compositor Owed 18) Change 10: `seazn:alive` beats every 2 s with
+  `host=compositor`, only after ready. Without `host` there are 0 beats. Units, E9, and M16–M18
+  went red.
+- (Amended 2026-10-18, owner "fix the product gaps") Change 11: the warming card shows carrom's
+  toss result. The toss-sport sweep is derived from the engine registry, prints its count (≥ 2),
+  and fails on 0. The new key is in all 4 locales, and M19–M20 went red.
+- (Amended 2026-10-18, owner "fix the product gaps") Change 12: the cricket bug's striker-only
+  line passes check 8 and 8b at 1920, 844 and 390, with a non-zero bug-cell figure count. M21–M23
+  went red, and the owner's per-screen visual verdicts are recorded.
 
 ## Amendment 2026-10-15 (overlay templates spec)
 
@@ -560,6 +569,108 @@ the page is ready: cefsrc emits a buffer only when the page paints, so frame sil
 
 - Modify: the compositor-host hook beside change 3's ready signal (re-pin it; R2005 has not landed).
 - Test: its unit file, and E9 in `overlay-compositor.spec.ts`.
+
+## Amendment 2026-10-18, product gaps (owner: "fix the product gaps along with tasks")
+
+Owner, 2026-10-18, in chat, relayed by the coordinator: "fix the product gaps along with tasks". Two gaps that R2007 PR A (#974, merged `99c477755`) recorded and left are fixed in this
+task. Pins are at `99c477755`; re-pin them before building.
+
+### Change 11: the warming card reads carrom's toss
+
+- **The gap.** After a recorded carrom toss, the warming card still says "Toss pending" until play
+  starts.
+  - `declaresToss` answers yes for carrom (`EVENT_KEY` holds `carrom.toss`), but the loader reads
+    only cricket's toss: `server/overlay/load.ts:251` passes `cricketToss: cricket.toss`, and
+    `warmingLine` (`lib/overlay-openers.ts:58`) takes no other. The brief's name
+    `warmingTossLine` is `warmingLine` in the tree.
+  - #974 left a KNOWN GAP comment, `overlay-openers.ts:47–50`, which this change deletes.
+- **Read it from the engine's declarations, the way cricket's is.** Cricket's toss comes off the
+  engine's folded scorecard (`tossFromScorecard`, `lib/overlay-cricket.ts:136`), not off a hand
+  parse of the event.
+  - Carrom's toss event is `carrom.toss`, validated by `CarromToss = z.strictObject({ firstBreak:
+    EntrantId })` (`packages/engine/src/sports/carrom/carrom.ts:96`). The fold records it as
+    `tossTaken: true` and `firstBreak: Side` (`:379`).
+  - Project it from the folded carrom state into the loader's data, next to `cricketToss`, as
+    `carromToss: { firstBreakSide: 0 | 1 } | null`. Null means no toss taken.
+- **A false premise: the copy is not cricket's.** Carrom's toss records who **breaks first**. It has
+  no "won" and no "elected bat/bowl", so `overlay.toss.wonAndElected` cannot say it.
+  - Add `overlay.toss.breaksFirst`: "{team} breaks first", or the matching phrasing beside the
+    existing `timeline.carrom.toss` ("Toss — {side} breaks"). Add it in all four locales
+    (`dictionaries/{en,es,fr,nl}/public.json`), then regenerate `i18n-keys.ts`.
+  - `warmingLine` takes the toss as a per-sport union. It never casts carrom into cricket's
+    `OverlayCricketToss`.
+- **Tests.**
+  - **Unit sweep over every sport that declares a toss.** The set comes from the engine registry:
+    the sports whose module's `eventSchemas` has a `<sport>.toss` key. It never comes from
+    `EVENT_KEY` or a hand list. Today that set is cricket and carrom.
+  - For each sport in the set, fold a real recorded toss through the engine and build the warming
+    line through the real loader projection:
+    - it names the team and that sport's own choice copy
+    - it never says "Toss pending"
+    - with no toss, it says "Toss pending"
+  - Print `toss sports checked: N`. Assert N equals the registry's count and is ≥ 2. Zero is a
+    failure.
+  - The existing sweep, that a non-toss sport shows the start alone, stays.
+- **Mutants:**
+
+  | # | Mutant | Expected red |
+  |---|---|---|
+  | M19 | the loader passes `carromToss: null` | the sweep's carrom row |
+  | M20 | `warmingLine` ignores the carrom arm | the sweep's carrom row |
+
+### Change 12: the cricket corner bug carries a striker-only line
+
+- **The gap.** #974 dropped the crease from the bug (`components/overlay/overlay-bug.tsx:23–27`,
+  review a). At the 30 px floor, the 512 px footer could not hold a pair's figures beside the chase:
+  "Haruto Fuj… · J…", every figure gone. So the bug shows no batter at all.
+- **The fix: the striker only, as one line:** `▸ <name> <runs> (<balls>)`.
+  - The mark is the existing `overlay.cricket.strikerMark` key (`▸` in all four locales). It
+    **leads** the name, in the name's box at its start edge (check 8's third half).
+  - The name ellipses, with `min-width: 0` on the whole ancestor chain. The figures are
+    `flex: none`.
+  - It uses the existing crease classes (`.ovl-detail-entry`, `.ovl-detail-name`,
+    `.ovl-detail-figures`, `.ovl-detail-mark`), so check 8 reads it with no new selector.
+  - House theme only: the bug's stadium-night tile tokens, and no new colour.
+- **The data.** The person on the crease line (`OverlayDetailLine.people`) who carries `mark`. The
+  model already puts the striker first (`overlay-cricket.ts:52`). No line is drawn when no person
+  has the mark (between innings, before the first ball).
+- **The footer cap stays two** (§4 rule 1, `bug-footer-cap.test.tsx`): the striker line, then the
+  most recent non-crease line, such as the chase or result. Where that drops a line that showed
+  before, it is part of the owner sign-off below.
+- **Tests.**
+  - **Units:**
+    - the bug draws the striker line on cricket, and only the striker (the non-striker's name is
+      absent)
+    - the mark comes before the name
+    - with no striker, there is no line
+  - **Unit sweep over the registry:** no other sport's bug gains a crease line. Count the sports,
+    and fail on 0.
+  - **Gallery check 8** (`e2e/overlay-gallery.spec.ts:406`) at 1920, 844 and 390: no figure is
+    cut. It gains a bug-specific anti-vacuity count: the figures read **inside `.ovl-bug` cells**
+    must be more than 0 at each frame. Otherwise the aggregate count hides a bug that drew nothing.
+  - **Check 8b** (the hostile 43-character name squeeze): the bug's name ellipses, and its figures
+    stay whole.
+- **Mutants:**
+
+  | # | Mutant | Expected red |
+  |---|---|---|
+  | M21 | the figures lose `flex: none` | check 8 at 390 |
+  | M22 | the line keeps both batters | the striker-only unit |
+  | M23 | the mark follows the name | check 8's third half |
+- **Owner visual sign-off at R2005 (required).** The bug at 1920, 844 and 390 with a
+  43-character striker name, plus a short one. Each screen gets the owner's verdict verbatim. Crops
+  go in the PR thread or the scratchpad, never the repo. Update the `overlay-bug.tsx` comment to
+  say why one batter fits where two did not.
+
+### Files (amendment 2026-10-18, product gaps)
+
+- Modify: `server/overlay/load.ts`, `server/overlay/project.ts`,
+  `components/public-site/live-score-data.ts` (the loader data), `lib/overlay-openers.ts`,
+  `components/overlay/overlay-slate.tsx`, `components/overlay/overlay-stage.tsx`,
+  `components/overlay/overlay-bug.tsx`, plus the four `public.json` files and `lib/i18n-keys.ts`
+  (generated).
+- Test: `lib/__tests__/overlay-openers-end-of-over.test.ts` (or its sibling), the bug unit files,
+  and `e2e/overlay-gallery.spec.ts` (check 8's bug count).
 
 ## Do not touch
 

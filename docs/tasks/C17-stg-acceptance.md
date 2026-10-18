@@ -81,6 +81,54 @@ entries are written in full, in the runbook's four-line form:
     logged, and the compositor log shows the hang line.
   - **Do:** a single hang needs nothing. Repeated hangs mean the page itself is broken: look at the
     overlay page's recent deploy (R2005/R2007), not at the Machine.
+- **A CEF bump** (C16 amendment 2026-10-18, Owed 22). The steps, in order:
+  1. Bump `docker/GSTCEF_COMMIT`.
+  2. Build the image.
+  3. Re-run C11 Step 0 on it, read by V2, any request reached, and `probe-ms`.
+  4. Record F-0xx.
+  5. Update `docker/CEF_STEP0_PASS`.
+  6. Only then merge, deploy and promote. `check-cef-bump.sh` refuses otherwise.
+
+**Amendment 2026-10-18, owed checks become acceptance criteria** (Owner, 2026-10-18, in chat, relayed by the coordinator: "apply rec 4-9").
+
+**Row 12, live: the crash cap reads Fly's exit after the restart (R2003b; Owed 11).**
+- *Why.* No live run yet shows that Fly's Machine GET still carries the crash's `exit` event once
+  Fly reports `started` again. R2003b's `CrashTally` counts a slow loop "one exit at a time,
+  including on a `running` read after Fly already restarted it" (web `server/relay/config.ts`,
+  `RUNNER_CRASH_CAP`). That holds only if `events[]` keeps the exit.
+- *The run.* On a composed stg session, crash the compositor three times with
+  `fly machine exec <id> 'pkill -KILL -x compositor'` (tini exits non-zero, and `on-failure`
+  restarts it in place).
+  - Space the crashes past the ~330 s refill (F-007), so each one is a restarting exit with
+    `restart_count` back to 1.
+  - Observe each crash **only after its restart has completed**: wait until the Machines API GET
+    shows `state: started`, with a `start` event newer than the exit.
+- *Record.* For each crash:
+  - the GET body's `events[]` entries for that exit (type, timestamp, `request.exit_event`,
+    `request.restart_count`; ids only, no secrets)
+  - the session's crash tally as web stored it
+- *Expected.*
+  - After crashes 1 and 2, the session stays live and the tally reads 1, then 2.
+  - At crash 3, the session **fails `machine_crash`**, and no `r2` attempt row is created (the cap
+    spends no retry).
+  - The exit event is present in `events[]` on every `started` read. Its absence is a finding
+    against R2003b, never a pass.
+- The owner books about 20 minutes more for this row (Step 2).
+
+**G1, both compatibility records on stg (Owed 21).** This is an acceptance criterion, gated on R2005
+and R2007 PR A (#974) both being on stg. #974 merged at `99c477755` and is deployed. R2005 is not
+yet merged.
+- Preflight records the stg web commit and confirms both.
+- Then C11's compatibility step runs against stg's real page:
+  - **The template leg:** the real overlay page, with each `TemplateId` (`bar`, `bug`), through
+    `cefsrc`. `seazn:ready` arrives, and the template renders.
+  - **The scene leg:** the probe server's `--script waiting:5000,reconnecting:5000,final:5000`
+    through CEF, with the probe server logging at least 3 `GET /phase` lines.
+- The page is loaded from the host the composed `overlayUrl` names (C12's `allowed_origin`), with
+  its CSP in force (Owed 23). That is the first CEF run of the CSP, whose `connect-src` criterion
+  R2005's acceptance carries (A5, E8).
+- If R2005 is not on stg when C17 runs, C17 is **not accepted**. The gate is recorded, never
+  skipped.
 
 ## Steps
 
@@ -126,6 +174,16 @@ entries are written in full, in the runbook's four-line form:
   and R2007 step 14b's OBS browser-source check. Link both from the acceptance doc. A missing record
   fails acceptance; if C11 recorded the scene leg as owed, this run's rows 1, 3 and 7 discharge it,
   and the acceptance doc says so.
+- (Amended 2026-10-18, Owed 20) The runbook has the sizing-alarm entry. If any row shows
+  `rung != full`, it is a finding routed to C15's size rule (Owed 25), never a pass.
+- (Amended 2026-10-18, Owed 18) The runbook has the hung-page entry. Row 8's health query shows no
+  `graphics` restart without a crash, unless a row caused one.
+- (Amended 2026-10-18, Owed 22) The runbook has the "CEF bump" entry.
+- (Amended 2026-10-18, Owed 11) Row 12 passes: three crashes, each read after its restart from a
+  real GET whose `events[]` still carries the exit, and the session fails `machine_crash` at the
+  third. The GET bodies are recorded (redacted).
+- (Amended 2026-10-18, Owed 21) Both G1 legs pass on stg, with R2005 and #974 confirmed on the stg
+  web commit and the CSP in force. Without R2005 on stg, C17 is not accepted.
 
 ## Amendment 2026-10-15 (overlay templates spec)
 

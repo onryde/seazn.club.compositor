@@ -93,6 +93,47 @@ config is the app itself. `fly/stg.toml` and `fly/prod.toml` record app name, or
 - The workflow check is green, and 2 mutants went red.
 - An stg image is pushed, and promoted once with the owner's go-ahead.
 - Prod is untouched.
+- (Amended 2026-10-18, Owed 22) `docker/CEF_STEP0_PASS` is seeded. `check-cef-bump.sh` runs in
+  `check.yml` and first in all three deploy workflows. The C17 runbook has the "CEF bump" entry,
+  and mutants 3 and 4 went red, so 4 mutants are red in all.
+
+## Amendment 2026-10-18 (a CEF bump is gated on C11 Step 0)
+
+Owner, 2026-10-18, in chat, relayed by the coordinator: "fix the product gaps along with tasks". Owed 22: a CEF bump past Chrome 142 is expected to break loopback, because Local Network
+Access is a permission no header satisfies, so C11 Step 0 must be re-run on every bump. This makes
+that a **required, enforced step**, not a note.
+
+- **The record.** Create `docker/CEF_STEP0_PASS`, with two lines: the `docker/GSTCEF_COMMIT` value
+  C11 Step 0 last passed on, and that run's `_FINDINGS.md` F-id. Seed it with the pinned commit and
+  `F-009`.
+  - "Passed" means loopback reached: outcome (a), or outcome (a) with a recorded grant (Owed 22's
+    candidates).
+  - Read a re-run by V2's `seazn:probe=` line, by whether any request reached the server, and by
+    `probe-ms`. Never read it by V1 (false-premise row "V1 is the control").
+- **The gate.** `scripts/check-cef-bump.sh` fails when:
+  - `docker/GSTCEF_COMMIT` differs from line 1 of the record, or
+  - line 2 is not a `## F-0xx` heading in `_FINDINGS.md`.
+
+  It prints `cef bump gate: GSTCEF_COMMIT=<sha> step0=<sha> <F-id>`. `check.yml` runs it, so a PR
+  that bumps CEF stays red until Step 0 is re-run and recorded.
+- **Deploys refuse too.** `deploy-stg.yml`, `deploy-prod.yml` and `promote.yml` each run
+  `scripts/check-cef-bump.sh` as their first step after checkout. On a failure they stop with
+  `::error::CEF bump without a passing C11 Step 0 re-run (compositor docs/_INDEX.md Owed 22)`.
+  `check-workflows.sh` gains a fourth static grep: every workflow that pushes or promotes runs the
+  gate.
+- **The checklist.** The runbook (C17) gets a "CEF bump" entry:
+  1. Bump `docker/GSTCEF_COMMIT`.
+  2. Build the image.
+  3. Re-run C11 Step 0 on it.
+  4. Record F-0xx.
+  5. Update `docker/CEF_STEP0_PASS`.
+  6. Only then merge, deploy and promote.
+
+  An outcome (b) or (c) means picking a grant from Owed 22's candidates and re-running Step 0.
+  Never update the record over a failing run.
+- **New mutants:**
+  3. Change `docker/GSTCEF_COMMIT` without touching the record. Expected: `check-cef-bump.sh` red.
+  4. Delete the gate step from `promote.yml`. Expected: `check-workflows.sh` red.
 
 ## Do not touch
 

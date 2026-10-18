@@ -753,7 +753,11 @@ gets 410 and exits 0. That sequence is tested here.
 - Purity and deps guards are still green.
 - (Amended 2026-10-15) C03's sweeps pass with `Final` added: `unlisted pairs checked` is
   `5 × 4 − PROGRAMME_TABLE.len()`, and `final ticks checked` is > 0 from all four camera phases.
-
+- (Amended 2026-10-18, owner "no lite mode") One `StepDown(OverlayHalfRate)` per session of
+  bursts, with `health().rung` held at `OverlayHalfRate`. The burst count is printed, and 0 fails.
+- (Amended 2026-10-18, Owed 18) `CefAlive{gen}` is routed in Running and Holding. The sweep counts
+  its `CefAlive` deliveries, and 0 fails. `a_ready_page_that_stops_beating_restarts` passes, and
+  the unrouted-`CefAlive` mutant went red.
 
 ## Final heartbeat with the exit reason (owner ruling 2026-10-15)
 

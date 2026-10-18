@@ -285,7 +285,11 @@ repo.
 - The passthrough session is refused.
 - The token never appears in errors.
 - 3 mutants went red.
-
+- (Amended 2026-10-18, Owed 13) The contract test's script feeds a growing `OutputProgress`
+  total, never `OutputConnected`/`OutputAck`. It asserts no `SwapSink` and prints its progress
+  count, failing on 0. The frozen-total mutant went red, making 4 mutants red.
+- (Amended 2026-10-18, Owed 24) The vendored `relay-job.v1.json` hashes to `fc99d448…dc50` or a
+  later bump, and the `rung` enum is exactly `full|overlay_half_rate`.
 
 ## Final heartbeat with the exit reason (owner ruling 2026-10-15)
 
@@ -302,6 +306,22 @@ Tests:
   chars, half of them emoji. The wire carries no key, and its length is ≤ 100 chars.
 - `non_final_beats_have_no_exit_keys`: assert absence, not null.
 - **Mutant:** skip `redact` on `exitDetail`. Expected red: the redaction test.
+
+## Amendment 2026-10-18 (owed checks become acceptance criteria)
+
+Owner, 2026-10-18, in chat, relayed by the coordinator: "apply rec 4-9". Every owed check is an acceptance criterion in its owning brief.
+
+**Owed 13: the contract test feeds byte progress, not acks.** C04 replaced `OutputConnected` and
+`OutputAck` with one event, `OutputProgress { gen, total_bytes }` (C06 routes it to
+`output.on_progress`). The acked bytes stay 0 on CF (F-005).
+- Step 5's `script` (the line with `Event::OutputConnected { gen: 1 }`) sends `OutputProgress {
+  gen: 1, total_bytes }` with a total that **grows** on every send, by a frame's worth of bytes
+  every 1 s of script time.
+- A frozen total stall-swaps the output to generation 2, and the script's generation-1 events go
+  stale behind a green pin test.
+- The test asserts that no `SwapSink` effect appears in the run, and it prints the number of
+  progress events sent. Zero sent is a failure.
+- **New mutant:** freeze the total at its first value. Expected red: the script sees a `SwapSink`.
 
 ## Do not touch
 

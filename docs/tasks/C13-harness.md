@@ -193,6 +193,10 @@ Field meanings:
 - The smoke case is green locally and in CI.
 - The report has every field populated (`late_frames_max`/`future_dated` may be 0; they're report-only).
 - 2 mutants went red.
+- (Amended 2026-10-18, Owed 18) `overlay-test.html` beats `seazn:alive`.
+  `graphics.restarts_without_crash` reads 0 on a green run.
+- (Amended 2026-10-18, Owed 20) The checker fails a run whose beats carry a `rung` other than
+  `full`/`overlay_half_rate`. `--pattern snow` exists, and the checker still reads its strip.
 
 ## Amendment 2026-10-18 (two owner rulings)
 

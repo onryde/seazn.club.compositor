@@ -49,7 +49,7 @@ The PDF's kill-switch case is replaced by "CEF killed".
 | 5 | `dest-stall` | at 20 s `netem out rate 1kbit` (accepts, but no acks); at 50 s `clear` | a `sinkSwaps` increase appears in a beat ≤ `output_ack_stall_ms + heartbeat_interval_ms` after 20 s; output recovers after clear as in case 4 |
 | 6 | `cpu-starved` | start a `stress-ng --cpu 4` sidecar in the compositor netns/cgroup at 20 s, for 40 s | `fps_mean` over the window stays ≥ 29.5 (the clock holds); `pts_gaps == []`; heartbeats show `droppedFrames` increase **or** `rung != "full"`, and at least one of them changes; after stress ends, `encoderSpeed ≥ $t.encoder_speed_realtime_min` within `BUDGET_LADDER_REALTIME_MS` |
 | 7 | `score-down` | `POST fake-control /control/score-down?ms=60000` at 20 s | heartbeats show `scoreStale: true` within 10 s (spec §6, page side) + one beat interval; the overlay index never changes during the outage and never regresses; `scoreStale: false` after the first poll following recovery |
-| 8 | `cef-killed` | at 20 s `docker exec compositor pkill -KILL -f cef` | the overlay strip shows the **same** index (held frame) with no transparent gap; camera strip frames continue (no freeze > 2 frames); heartbeats go `graphics: restarting` → `ready`; `output_outages == []` |
+| 8 | `cef-killed` | at 20 s `docker exec compositor pkill -KILL -f cef` | the overlay strip shows the **same** index (held frame) with no transparent gap; camera strip frames continue (no freeze > 2 frames); ~~heartbeats go `graphics: restarting` → `ready`~~ (amended 2026-10-18, Owed 19: restart evidence, see "Amendment 2026-10-18"); `output_outages == []` |
 | 9 | `process-killed` | at 20 s `docker exec compositor pkill -KILL -x compositor` (tini exits non-zero, compose's `on-failure:2` restarts it) | output resumes ≤ `BUDGET_PROCESS_RESTART_OUTPUT_MS` after the kill; heartbeats resume; fake-control sees the **same** `SESSION_ID`; `counter_regressions == 0` |
 | 10 | `input-impaired` | at 20 s `netem.sh in delay 400ms 100ms loss 2%`; at 80 s `clear`; run 100 s | the programme clock holds through a bad camera leg: `pts_gaps == []`, `fps_mean ≥ 29.5`, `counter_regressions == 0`, `output_outages == []`; anti-vacuity is witnessed **where the fault is injected**, because SRT's fixed 1 000 ms TSBPD latency absorbs a 400 ± 100 ms delay and keeps glass-to-glass flat: (a) `tc -s` on `netem-in` shows the filter's hit count > 0 and the netem child's `dropped` grew during 20–80 s; (b) MediaMTX's reader stats for the compositor's SRT connection show retransmitted packets > 0 in the window (field name pinned with the MediaMTX tag in C13's F-entry). `latency_windows_ms` is reported, never gated |
 
@@ -102,7 +102,59 @@ cases to 11, and the Step 7 commit title says eleven):
   on its `graphics` clause. As with mutant 1, the verdict reads the committed
   `harness/thresholds.json`.
 - **Files:** `harness/cases/cef-hung.{sh,jq}`.
-- **Acceptance:** 11 cases, each with an anti-vacuity clause, and 4 mutants red.
+
+### Owed checks as acceptance criteria (Owner, 2026-10-18, in chat, relayed by the coordinator: "apply rec 4-9"; and owner, 2026-10-18, in chat, relayed by the coordinator: "fix the product gaps along with tasks")
+
+**Case 8 (`cef-killed`), reworded (Owed 19).**
+- *Why.* "Heartbeats go `graphics: restarting` → `ready`" asks a 5 s beat to land inside a ~1 s
+  state. After a kill, the domain reads `restarting` only for the first back-off,
+  `cef_backoff_base_ms` = 1 s. It reads `starting` for the ~2.8 s load (F-001). Before C11's 1 s
+  pid poll notices the kill, it still reads `ready`. About one beat in five sees `restarting`,
+  which is the same point case 2 makes.
+- *What it asserts instead* is the restart evidence, never a beat in the window:
+  - The compositor log has `CefCrashed{gen: g}` within 2 s of the kill (the 1 s pid poll plus
+    slack).
+  - Then `RestartGraphics{gen: g+1}` and `CefReady{gen: g+1}`, in that order.
+  - Every beat from the kill to `CefReady{g+1}` reads `ready`, `restarting` or `starting`, and
+    none reads `failed`.
+  - The first beat after `CefReady{g+1}` reads `ready`.
+  - **Anti-vacuity:** `g+1` is exactly one generation past the last ready before the kill.
+- *A false premise in the coordinator's wording.* The request was to assert on "the exit/restart
+  evidence the web reads (exit events and restart_count)". Case 8 has no process exit: CEF's
+  children die, the compositor process lives and restarts the page itself, so Fly writes no exit
+  event and no `restart_count` moves. That evidence belongs to case 9, below. F-007's ~1.3 s
+  window is the Machine restart, also case 9.
+
+**Case 9 (`process-killed`) gains the exit evidence.**
+- It reads the harness's equivalent of what web reads off Fly's Machine GET in production
+  (`events[]`: the newest `exit` with `request.exit_event` and `request.restart_count`; R2003b).
+- Since compose's `on-failure:2` restarts the container, `docker inspect compositor
+  --format '{{.RestartCount}}'` rises by exactly 1 across the kill.
+- The `die` event of `docker events --filter container=compositor --filter event=die` carries a
+  non-zero `exitCode`.
+- These are read after the restart completes, never from a beat inside the ~1.3 s gap. The live
+  Fly version of this read is C17 row 12.
+
+**Case 5 (`dest-stall`): the bound reads progress, not acks (Owed 13/15).**
+- `output_ack_stall_ms` becomes `output_stall_after_ms` (C04's rename).
+- The bound is `output_stall_after_ms + OUTPUT_PROGRESS_POLL_MS + heartbeat_interval_ms`, with the
+  poll term taken from C09's recorded choice in `thresholds.json`, never a literal.
+
+**Case 12, `dest-trickle` (Owed 16(b)).**
+
+| # | File | Script | Verdict (`.jq`) |
+|---|---|---|---|
+| 12 | `dest-trickle` | At 20 s, `netem out rate 8kbit`: the link stays open and bytes still trickle. At 50 s, `clear`. Run 80 s | A `sinkSwaps` increase appears in a beat ≤ case 5's bound after 20 s, so a trickle is a stall, not progress. Output recovers after `clear`, as in case 4. **Anti-vacuity:** the compositor log's `OutputProgress` totals between 20 s and the swap take at least 2 distinct values, which proves the bytes really trickled, and the case is not case 5 again |
+
+- A red case 12 is the witness Owed 16 asks for. It reopens C04 for a rate floor, and the `.jq` is
+  never loosened.
+
+**Mutants (Step 5):**
+- 4, as above: delete C05b's Ready hang arm. Expected red: case 11.
+- 5. Comment out case 12's `netem` line. The `.jq` must fail **on its anti-vacuity clause**, as with
+  mutant 3.
+
+**Acceptance (this amendment):** 12 cases, each with an anti-vacuity clause, and 5 mutants red.
 
 ## Files
 
@@ -147,10 +199,17 @@ cases to 11, and the Step 7 commit title says eleven):
 
 ## Acceptance
 
-- 10 cases, each with an anti-vacuity clause.
+- ~~10~~ 12 cases, each with an anti-vacuity clause (amended 2026-10-18: case 11 `cef-hung`, Owed 18; case 12 `dest-trickle`, Owed 16).
 - Every number comes from `thresholds.json`.
 - 3 consecutive local green runs, plus 1 green CI dispatch.
-- 3 mutants went red.
+- ~~3~~ 5 mutants went red (amended 2026-10-18: mutants 4 and 5).
+- (Amended 2026-10-18, Owed 19) Case 8 asserts restart evidence (generations in the compositor
+  log) and accepts `ready`/`restarting`/`starting` before the new ready. Case 9 reads
+  `RestartCount` + 1 and a non-zero `die` exit code.
+- (Amended 2026-10-18, Owed 13/15) Case 5's bound is `output_stall_after_ms + poll + beat`, read
+  from `thresholds.json`.
+- (Amended 2026-10-18, Owed 20) Case 6 asserts the score stays on air through the stress and
+  after it, and every beat's `rung` is `full`/`overlay_half_rate`, never back to `full` after a step.
 
 ## Do not touch
 

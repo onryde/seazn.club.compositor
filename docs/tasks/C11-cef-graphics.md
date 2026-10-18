@@ -106,6 +106,14 @@ source of truth.
   and the raw console and server lines.
 - (Amended 2026-10-15, G1) The first `cefsrc` compatibility record (the "Compatibility" section) is in
   `_FINDINGS.md`, with the scene leg either run or recorded as owed to C17.
+- (Amended 2026-10-18, Owed 18) `seazn:alive` is relayed as `CefAlive{gen}`, the harness page
+  beats, and the reaper kill fallback is proven: three tests, and mutants 4 and 5 went red.
+- (Amended 2026-10-18, Owed 17) Ready-gated slot writes:
+  `frames_before_ready_never_reach_the_slot` and
+  `the_hidden_page_stays_off_air_and_the_retry_reaches_air` pass with non-zero counts on both
+  sides, and mutant 6 went red.
+- (Amended 2026-10-18, Owed 17) F-0xx `cef error pages` is in `_FINDINGS.md`, with all three
+  legs' alpha samples.
 
 ## Amendment 2026-10-15 (overlay templates spec)
 
@@ -290,6 +298,35 @@ tear down.
 - **New mutants** (Step 5):
   4. Map `seazn:alive` to nothing. Expected red: `alive_beats_are_relayed_with_their_generation`.
   5. Delete the reaper's kill. Expected red: `reaper_kills_a_renderer_that_will_not_tear_down`.
+
+### Owed 17: no frame of a generation reaches air before that generation's own ready (Owner, 2026-10-18, in chat, relayed by the coordinator: "apply rec 4-9")
+
+This is the coordinator's decision of 2026-10-16.
+- The adapter **never** writes `FrameStore::set_overlay` from generation `g` until `g`'s own
+  `seazn:ready` line. Until then, the previous generation's last frame stays held, or nothing on
+  the first. The Events table's "Each appsink sample → `FrameStore::set_overlay(sample)`" row is
+  gated on that.
+
+New image tests (Step 1's table):
+
+| Test | What it asserts |
+|---|---|
+| `frames_before_ready_never_reach_the_slot` | `?noready=1`: the appsink delivers frames (count them, fail on 0), and the slot still holds the previous generation's frame, compared by bytes, or is empty on the first |
+| `the_hidden_page_stays_off_air_and_the_retry_reaches_air` | The positive pair, through C09's real `ProgrammePipeline` to a `file://` target. `cef_fail_count` × `?noready=1` restarts, then `hide_overlay()` + `stop()` (C08's mapping): no decoded programme frame carries the test square's blue from the hide until the retry. Then `restart(n+1, …overlay-test.html)`: after its `CefReady`, the blue **is** present. Print the frames checked on each side, and fail on 0 |
+
+**New mutant 6:** set the slot on every sample, regardless of ready. Expected red:
+`frames_before_ready_never_reach_the_slot`.
+
+### Owed 17: does CEF 139 paint an error page opaque? (a measurement)
+
+Record F-0xx `cef error pages`. Load three URLs through `cefsrc` in the image:
+1. a 404 from the probe server
+2. a 502 from the probe server (`--status 502`)
+3. a host that does not resolve (a Chromium net-error page)
+
+For each, record whether frames arrive, the alpha at five sample pixels (the corners and the
+centre), and whether any `seazn:` line appears. The gate above makes none of them reach air before a
+ready, so this measures how much the gate protects. It is not a pass/fail. Paste the raw numbers.
 
 ## Do not touch
 
