@@ -87,6 +87,14 @@ repo.
   Run it with the R2002 merge sha. Confirm the printed count equals the number of files under
   `docs/contracts/fixtures/relay-job.v1/` plus 1.
 
+  **(Amended 2026-10-18, `docs/_INDEX.md` Owed 24)** Run it with a `seazn.club` commit at or after
+  #980's merge, never the R2002 merge sha. #980 removed `fast_preset` from the heartbeat's `rung`,
+  and `docs/contracts/relay-job.v1.json` hashes to
+  `fc99d44899ee543cfe36c48902573501f815d68b4ec7c2e4bbb50d096608dc50` there (it was
+  `7091c0c4…6037` at R2002). The pin test's expected sha for that file is that value, or a later
+  bump's. A contract test asserts that the vendored schema's `rung` enum is exactly
+  `["full","overlay_half_rate"]`, and that every `Rung` variant serialises into it.
+
 - [ ] **Step 2: Dependencies.**
   - `crates/app`: `serde = { version = "1", features = ["derive"] }` is **not** needed yet, because
     ports are plain structs.
@@ -244,7 +252,8 @@ repo.
     - `graphics`: `starting|ready|restarting|failed`
     - `inputKicks`, `inputKickAlert`, `pipelineRebuilds`, `sinkSwaps`
     - `droppedFrames`: from `dropped_frames`. The domain measures it, so it's always present.
-    - `rung`: `full|overlay_half_rate|fast_preset`
+    - `rung`: `full|overlay_half_rate`. (Amended 2026-10-18, Owed 20: `fast_preset` is gone from
+      both C05's `Rung` and the contract; web answers a `fast_preset` beat with a 400)
     - `scoreStale`: only if `Some`
     - each `Measured` field: only if `Some`
 
@@ -276,7 +285,11 @@ repo.
 - The passthrough session is refused.
 - The token never appears in errors.
 - 3 mutants went red.
-
+- (Amended 2026-10-18, Owed 13) The contract test's script feeds a growing `OutputProgress`
+  total, never `OutputConnected`/`OutputAck`. It asserts no `SwapSink` and prints its progress
+  count, failing on 0. The frozen-total mutant went red, making 4 mutants red.
+- (Amended 2026-10-18, Owed 24) The vendored `relay-job.v1.json` hashes to `fc99d448…dc50` or a
+  later bump, and the `rung` enum is exactly `full|overlay_half_rate`.
 
 ## Final heartbeat with the exit reason (owner ruling 2026-10-15)
 
@@ -293,6 +306,22 @@ Tests:
   chars, half of them emoji. The wire carries no key, and its length is ≤ 100 chars.
 - `non_final_beats_have_no_exit_keys`: assert absence, not null.
 - **Mutant:** skip `redact` on `exitDetail`. Expected red: the redaction test.
+
+## Amendment 2026-10-18 (owed checks become acceptance criteria)
+
+Owner, 2026-10-18, in chat, relayed by the coordinator: "apply rec 4-9". Every owed check is an acceptance criterion in its owning brief.
+
+**Owed 13: the contract test feeds byte progress, not acks.** C04 replaced `OutputConnected` and
+`OutputAck` with one event, `OutputProgress { gen, total_bytes }` (C06 routes it to
+`output.on_progress`). The acked bytes stay 0 on CF (F-005).
+- Step 5's `script` (the line with `Event::OutputConnected { gen: 1 }`) sends `OutputProgress {
+  gen: 1, total_bytes }` with a total that **grows** on every send, by a frame's worth of bytes
+  every 1 s of script time.
+- A frozen total stall-swaps the output to generation 2, and the script's generation-1 events go
+  stale behind a green pin test.
+- The test asserts that no `SwapSink` effect appears in the run, and it prints the number of
+  progress events sent. Zero sent is a failure.
+- **New mutant:** freeze the total at its first value. Expected red: the script sees a `SwapSink`.
 
 ## Do not touch
 

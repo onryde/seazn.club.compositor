@@ -91,7 +91,7 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
   | `RebuildInput{gen}` | `input.rebuild(gen, &cfg.input)` |
   | `SwapSink{gen}` | `programme.swap_sink(gen, &cfg.target)` |
   | `RestartGraphics{gen}` | `graphics.restart(gen, &cfg.overlay_url)` |
-  | `HideOverlay` | `programme.hide_overlay()` |
+  | `HideOverlay` | `programme.hide_overlay()`, then **`graphics.stop()`** (amended 2026-10-18; coordinator decision 2026-10-16, Owed 17) |
   | `StepDown(r)` | `programme.step_down(r)` |
   | `SendHeartbeat(h)` | `control.request(Heartbeat(h, metrics.sample()))` |
   | `DrainOutput` | `programme.drain()`, then `input.stop()` and `graphics.stop()` |
@@ -335,6 +335,12 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
 - Boundary guard is green.
 - ~~3 mutants~~ 5 mutants went red (amended 2026-10-15).
 - `cargo clippy --workspace --all-targets -- -D warnings` is clean.
+- (Amended 2026-10-18, Owed 17) `HideOverlay` maps to `hide_overlay()` then `graphics.stop()`.
+  `hide_stops_the_hidden_page_and_the_retry_reaches_air` passes both halves, and the
+  dropped-stop mutant went red.
+- (Amended 2026-10-18, Owed 18) `hung_page_is_restarted_through_the_port` passes. Every hang gives
+  `HideOverlay` + `GraphicsStop` at once (owner-approved design (2026-10-18); "at once" is the coordinator's reading of it), then one restart after
+  `cef_backoff_base_ms`, and the `cef_fail_count`-th hang enters Failed.
 
 ## Amendment 2026-10-15 (overlay templates spec)
 
@@ -392,6 +398,47 @@ impl PhasePublisher for FakePhase { fn publish(&mut self, p: ProgrammePhase, seq
 - `holding_ticks_still_push_frames_at_the_profile_rate`: over the hold, the pushed indices are
   consecutive (the hold never pauses the programme clock: a frozen output would trip YouTube's gap
   timer, F-004).
+
+## Amendment 2026-10-18 (the hang beat; the ladder's rungs)
+
+Owner, 2026-10-18, in chat, relayed by the coordinator: "2 Ok", approving hang detection (`docs/_INDEX.md` Owed 18). Also owner, 2026-10-18, in chat, relayed by the coordinator: "no lite mode; if CPU impacts, measure and raise the CPU size" (`docs/_INDEX.md` Owed 20).
+
+- **Mapping.** `Inbound::Event(Event::CefAlive{gen})` is handed straight to `decide`, like every
+  other event. No driver rule changes: a hang becomes the domain's `RestartGraphics{gen}`, which the
+  driver applies as `graphics.restart(gen, &cfg.overlay_url)`.
+- **`FakeGraphics` gains `alive(gen)`.** It is a testkit helper that returns
+  `Inbound::Event(Event::CefAlive{gen})`, so scenario tests can send the beat by name.
+- **New scenario test:** `hung_page_is_restarted_through_the_port`.
+  - Ready gen 1, then beats every `cef_alive_every_ms` to t = 30 s, then silence.
+  - The log shows `Call::HideOverlay`, then `Call::GraphicsStop`, at the first tick at or after
+    `last_alive + cef_hang_after_ms`. That is the hide at once (owner-approved design (2026-10-18); "at once" is the coordinator's reading of it).
+  - Then exactly one `Call::GraphicsRestart{gen: 2}`, at the first tick at or after
+    `+ cef_backoff_base_ms`.
+  - Repeat the hang `cef_fail_count` times within `cef_fail_window_ms`. Every hang logs
+    `HideOverlay`. The last one enters Failed, and no `GraphicsRestart` follows until `retry_at`.
+  - Times come from `Thresholds::default()`.
+- **`StepDown(r)` → `programme.step_down(r)`:** `r` is only ever `OverlayHalfRate` (C05). The
+  existing overrun scenario asserts exactly one `step_down` call for a session of sustained overruns.
+
+### Owed 17: the hide stops the hidden page and lifts for the retried one (Owner, 2026-10-18, in chat, relayed by the coordinator: "apply rec 4-9")
+
+The coordinator closed Owed 17 on 2026-10-16. C08 maps `HideOverlay` to `programme.hide_overlay()`
+**and** `graphics.stop()`. Stopping the hidden page means no late ready can re-open it, and it
+frees the page's CPU for the cooldown.
+
+- **New scenario test** `hide_stops_the_hidden_page_and_the_retry_reaches_air`, with
+  `Thresholds::default()`. Run `cef_fail_count` load timeouts: Ready never arrives, so this is
+  `?noready=1` as the domain sees it. Then:
+  - **The negative half.** The log has `HideOverlay` and then `GraphicsStop`, in that order, and
+    no `GraphicsRestart` before `retry_at`. A `CefReady` from the stopped generation, sent after
+    the hide, changes nothing: `health().graphics` stays `failed`.
+  - **The positive pair.** At the first tick at or after `retry_at`, `GraphicsRestart{gen: n+1}`
+    appears. `CefReady{n+1}` makes `health().graphics` read `ready`. No `HideOverlay` follows, and
+    no extra call is needed to lift the hide: there is no `show_overlay` port, so nothing in the
+    driver holds a hide flag.
+  - Print the calls checked, and fail on 0.
+- **New mutant:** drop `graphics.stop()` from the `HideOverlay` mapping. Expected red: the
+  negative half.
 
 ## Do not touch
 

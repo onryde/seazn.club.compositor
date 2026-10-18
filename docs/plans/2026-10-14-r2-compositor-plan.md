@@ -202,7 +202,8 @@ fly/stg.toml, fly/prod.toml        (C16)
 | C02 | Domain foundations: time, config, backoff, window | compositor | C01 | `tasks/C02-domain-foundations.md` |
 | C03 | Domain: Programme | compositor | C02 | `tasks/C03-domain-programme.md` |
 | C04 | Domain: InputLink + OutputLink | compositor | C02 | `tasks/C04-domain-links.md` |
-| C05 | Domain: Graphics + DegradeLadder | compositor | C02 | `tasks/C05-domain-graphics-ladder.md` |
+| C05 | Domain: Graphics + DegradeLadder. **Amended 2026-10-18 (owner, Owed 20):** no `FastPreset`; `Full → OverlayHalfRate`, and the bottom holds (built) | compositor | C02 | `tasks/C05-domain-graphics-ladder.md` |
+| C05b | **New 2026-10-18 (owner, Owed 18 "2 Ok").** Domain: hang detection, with `Graphics::on_alive` and a Ready-arm hang as a counted failure | compositor | C05. Run it before C06's `CefAlive` routing | `tasks/C05b-domain-graphics-hang.md` |
 | C06 | Domain: Lifecycle, HealthReport, Supervisor, properties. **Amended 2026-10-15:** the final hold, `ProgrammePhase::Final`, `PhaseChannel` | compositor | C03, C04, C05 | `tasks/C06-domain-supervisor.md` |
 | R2002 | relay-job.v1 contract + schema extension | seazn.club | R2001 | `tasks/R2002-relay-job-contract.md` |
 | C07 | Vendor contract, ControlPlane port + HTTP adapter. **Amended 2026-10-15:** see "Amendments 2026-10-15" below; the brief is not yet edited | compositor | C06, R2002 merged, **R2007 PR B merged** | `tasks/C07-control-plane.md` |

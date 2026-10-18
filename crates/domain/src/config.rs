@@ -58,8 +58,6 @@ pub struct Thresholds {
     pub cef_backoff_base_ms: Ms,
     /// C02 brief default: the cap of the CEF back-off (1 s → 10 s, mirroring the input).
     pub cef_backoff_cap_ms: Ms,
-    /// PDF failure table "real time restored within 10 s": at most one ladder rung per this gap.
-    pub ladder_step_min_gap_ms: Ms,
     /// C02 brief default (no PDF number): overruns within `ladder_window_ms` needed to step down a rung.
     pub ladder_overruns_to_step: usize,
     /// C02 brief default (no PDF number): the window `ladder_overruns_to_step` is counted in.
@@ -112,7 +110,6 @@ impl Default for Thresholds {
             cef_recycle_every_ms: 7_200_000,
             cef_backoff_base_ms: 1_000,
             cef_backoff_cap_ms: 10_000,
-            ladder_step_min_gap_ms: 10_000,
             ladder_overruns_to_step: 3,
             ladder_window_ms: 1_000,
             drain_timeout_ms: 7_000,

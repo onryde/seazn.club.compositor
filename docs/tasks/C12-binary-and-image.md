@@ -264,6 +264,7 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
 
 ## Acceptance
 
+- (Amended 2026-10-18) `graphics_log_lines_exist_in_both_driver_modes` passes in both modes.
 - Env, metrics and fake-run tests pass.
 - `image.yml` is green on the PR: plugin present, ~~7~~ 8 cef tests, smoke exits 0, size under the cap.
 - ~~3~~ 8 mutants went red (amended 2026-10-15).
@@ -446,6 +447,24 @@ spawned binaries never race for port 7419):
 | 6 | drop `Access-Control-Allow-Private-Network` | 2 |
 | 7 | answer at once, never wait | 3 |
 | 8 | a bind failure returns `Err` from `main` (exit 70) | `phase_port_taken_still_runs_to_exit_zero` |
+
+## Amendment 2026-10-18 (the log lines C14 cases 8 and 11 read)
+
+C14 cases 8 and 11 assert on the compositor's own log, not on a 5 s beat landing in a ~1–4 s
+window (Owed 19; PR #21 review I3). So these lines must exist in both driver modes. They use the
+existing `eprintln!` form, `ts=<rfc3339> level=info msg=<…>`.
+
+- `LoggedProgramme` (`logged.rs`) also logs `overlay hidden` on `hide_overlay()`.
+- A new `LoggedGraphics<G: GraphicsRenderer>` decorator, beside it, logs:
+  - `graphics restart gen=<n>` on `restart`
+  - `graphics stop` on `stop`
+- The driver logs each graphics event it hands to `decide`:
+  - `cef ready gen=<n>`
+  - `cef crashed gen=<n>`
+  - `cef alive gen=<n>`, one every 2 s, so a 60 s case has about 30
+- New test, `graphics_log_lines_exist_in_both_driver_modes`. In each mode, it drives ready → alive
+  → crash → restart → hide through the fakes, and asserts each line once in order. It prints the
+  lines matched, and fails on 0.
 
 ## Do not touch
 

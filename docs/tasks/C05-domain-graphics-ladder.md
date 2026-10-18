@@ -17,7 +17,8 @@
 - **DegradeLadder** handles an encoder that can't keep up. Frames are dropped before the encoder (the
   adapter counts them), and once `ladder_overruns_to_step` overruns land within `ladder_window_ms`,
   the ladder steps down one rung: `Full → OverlayHalfRate → FastPreset`. It steps at most once per
-  `ladder_step_min_gap_ms`. **There is no step back up in R2.** The match finishes on the degraded
+  `ladder_step_min_gap_ms`. **(Amended 2026-10-18: `Full → OverlayHalfRate` only, no gap; see
+  "Amendment 2026-10-18".)** **There is no step back up in R2.** The match finishes on the degraded
   rung, and it is reported. This is YAGNI until the soak shows a need.
 
 ## Files
@@ -329,6 +330,23 @@
 - 9 new tests pass.
 - All 4 mutants went red.
 - Clippy is clean.
+
+## Amendment 2026-10-18 (owner rulings; the ladder is built on `fix/ladder-no-overlay-off`)
+
+- **The ladder** (owner, 2026-10-18, in chat, relayed by the coordinator: "no lite mode; if CPU
+  impacts, measure and raise the CPU size"; `docs/_INDEX.md` Owed 20). The score is never removed.
+  - `Rung` is `Full | OverlayHalfRate`. `FastPreset` is deleted: F-001 found x264's preset cannot
+    change live, and C09's fallback for it was to drop the overlay.
+  - The ladder steps once, `Full → OverlayHalfRate`, and the bottom holds.
+  - `ladder_step_min_gap_ms` is removed (C02 amendment), so Context's "at most once per gap" and
+    Step 6 mutant 4 are void. The Step 5 test that asserted two steps is replaced by
+    `sustained_overruns_step_once_to_overlay_half_rate_then_stop` and
+    `every_burst_after_the_step_holds_on_overlay_half_rate`.
+  - `tests/graphics.rs` gains `repeated_overrun_bursts_never_step_below_overlay_half_rate`, which
+    counts its bursts and fails on 0.
+  - Any step down in production is a sizing alarm (C17 runbook).
+- **Hang detection** (owner, 2026-10-18, "2 Ok"; Owed 18). This is a follow-up task,
+  `tasks/C05b-domain-graphics-hang.md`, and not this brief.
 
 ## Do not touch
 

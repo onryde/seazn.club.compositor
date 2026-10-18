@@ -106,6 +106,14 @@ source of truth.
   and the raw console and server lines.
 - (Amended 2026-10-15, G1) The first `cefsrc` compatibility record (the "Compatibility" section) is in
   `_FINDINGS.md`, with the scene leg either run or recorded as owed to C17.
+- (Amended 2026-10-18, Owed 18) `seazn:alive` is relayed as `CefAlive{gen}`, the harness page
+  beats, and the reaper kill fallback is proven: three tests, and mutants 4 and 5 went red.
+- (Amended 2026-10-18, Owed 17) Ready-gated slot writes:
+  `frames_before_ready_never_reach_the_slot` and
+  `the_hidden_page_stays_off_air_and_the_retry_reaches_air` pass with non-zero counts on both
+  sides, and mutant 6 went red.
+- (Amended 2026-10-18, Owed 17) F-0xx `cef error pages` is in `_FINDINGS.md`, with all three
+  legs' alpha samples.
 
 ## Amendment 2026-10-15 (overlay templates spec)
 
@@ -257,6 +265,68 @@ New test, added to Step 1's table:
 | Test | What it asserts |
 |---|---|
 | `phase_channel_signal_is_relayed` | `?channel=web` → `PhaseChannel(Web)`; `?channel=loopback` → `PhaseChannel(Loopback)`; `?channel=bogus` → **no** `PhaseChannel` event within 3 s after `CefReady` (the guard). Print `channel values checked: 3`. |
+
+## Amendment 2026-10-18 (hang detection, owner ruling)
+
+Owner, 2026-10-18, in chat, relayed by the coordinator: "2 Ok", approving hang detection (`docs/_INDEX.md` Owed 18). The domain half is C05b. This task relays the beat and kills a renderer that will not
+tear down.
+
+- **Parse the beat.** R2005's page logs `seazn:alive` every `cef_alive_every_ms` (2 s) after ready,
+  with `host=compositor` only, on F-001's console channel (`cefconsole`), the same stream as
+  `seazn:ready`. It never uses `gstSendMsg`: that accepts only `ready`/`eos`, and F-001 found that
+  the js-signal mode hangs `start()` and `set_state(NULL)`. The adapter sends
+  `Inbound::Event(Event::CefAlive{gen})`, tagged with the generation of the pipeline that logged it.
+  The line is matched exactly. Any other `seazn:alive…` text is logged at WARN and mapped to nothing.
+- **The harness page beats too.** `overlay-test.html` logs `seazn:alive` every 2 s after its ready
+  (false-premise row "The hang design needs only the real page to beat"). `?crash=1`
+  (`while(true){}` after ready) stops the beat with the rest of the page, and that is the point.
+  `?crash=1` gains an optional `&crash_after_ms=N` (default 500) so C14 can time the hang.
+- **Reaper kill fallback.** `restart(gen, url)` tears down on the reaper thread. When the old
+  pipeline's `set_state(NULL)` has not returned within `REAPER_KILL_AFTER_MS` (3 000, a const in
+  `cef_graphics.rs` that cites F-001: it did not return within 10 s in the js-signal hang), the
+  reaper sends `SIGKILL` to the old generation's CEF renderer pids (the pids F-001 identified and
+  the crash poll already watches). It logs the pids at WARN and moves on. The new generation is
+  built **without** waiting for the reaper. The held overlay frame stays in `FrameStore` throughout.
+- **New tests** (Step 1's table):
+
+  | Test | What it asserts |
+  |---|---|
+  | `alive_beats_are_relayed_with_their_generation` | `restart(1, …overlay-test.html)`: within 7 s, at least 2 `CefAlive{gen:1}` after `CefReady{gen:1}`, and none before it |
+  | `hung_page_stops_beating` | `?crash=1`: `CefAlive{gen:1}` arrives before the hang, and **none** in the 3 s after it, while the renderer pid is still alive (it is a hang, not a crash: no `CefCrashed`) |
+  | `reaper_kills_a_renderer_that_will_not_tear_down` | **Drive the kill path deterministically.** Gen 1 loads F-001's js-signal hang page, where `set_state(NULL)` is known not to return within 10 s. Then `restart(2, …overlay-test.html)`. Within `REAPER_KILL_AFTER_MS` + 2 s, every gen-1 renderer pid is gone, and `CefReady{gen:2}` arrives. The reaper reports which path ran, and the test **requires the kill path**: print the pids killed, and fail on 0. If the js-signal hang ever tears down by itself, the test fails and names it, never passing on the other path (PR #21 review m1) |
+
+- **New mutants** (Step 5):
+  4. Map `seazn:alive` to nothing. Expected red: `alive_beats_are_relayed_with_their_generation`.
+  5. Delete the reaper's kill. Expected red: `reaper_kills_a_renderer_that_will_not_tear_down`.
+
+### Owed 17: no frame of a generation reaches air before that generation's own ready (Owner, 2026-10-18, in chat, relayed by the coordinator: "apply rec 4-9")
+
+This is the coordinator's decision of 2026-10-16.
+- The adapter **never** writes `FrameStore::set_overlay` from generation `g` until `g`'s own
+  `seazn:ready` line. Until then, the previous generation's last frame stays held, or nothing on
+  the first. The Events table's "Each appsink sample → `FrameStore::set_overlay(sample)`" row is
+  gated on that.
+
+New image tests (Step 1's table):
+
+| Test | What it asserts |
+|---|---|
+| `frames_before_ready_never_reach_the_slot` | `?noready=1`: the appsink delivers frames (count them, fail on 0), and the slot still holds the previous generation's frame, compared by bytes, or is empty on the first |
+| `the_hidden_page_stays_off_air_and_the_retry_reaches_air` | The positive pair, through C09's real `ProgrammePipeline` to a `file://` target. `cef_fail_count` × `?noready=1` restarts, then `hide_overlay()` + `stop()` (C08's mapping): no decoded programme frame carries the test square's blue from the hide until the retry. Then `restart(n+1, …overlay-test.html)`: after its `CefReady`, the blue **is** present. Print the frames checked on each side, and fail on 0 |
+
+**New mutant 6:** set the slot on every sample, regardless of ready. Expected red:
+`frames_before_ready_never_reach_the_slot`.
+
+### Owed 17: does CEF 139 paint an error page opaque? (a measurement)
+
+Record F-0xx `cef error pages`. Load three URLs through `cefsrc` in the image:
+1. a 404 from the probe server
+2. a 502 from the probe server (`--status 502`)
+3. a host that does not resolve (a Chromium net-error page)
+
+For each, record whether frames arrive, the alpha at five sample pixels (the corners and the
+centre), and whether any `seazn:` line appears. The gate above makes none of them reach air before a
+ready, so this measures how much the gate protects. It is not a pass/fail. Paste the raw numbers.
 
 ## Do not touch
 

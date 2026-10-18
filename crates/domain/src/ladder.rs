@@ -2,38 +2,36 @@
 //! step down the DegradeLadder"). It never stalls the clock: frames are dropped before the encoder,
 //! and the adapter reports each drop as one overrun (C09, the pre-encoder queue's `overrun` signal).
 //!
-//! - **Step.** `ladder_overruns_to_step` overruns within `ladder_window_ms` (an overrun exactly the
-//!   window old still counts, as in `Window`) step down one rung, `Full → OverlayHalfRate →
-//!   FastPreset`, and the bottom rung holds.
-//! - **Gap.** At most one step per `ladder_step_min_gap_ms` (PDF failure table: real time restored
-//!   within 10 s): the next step may come once that long has passed since the last. The first step
-//!   waits for nothing.
+//! - **Two rungs, and the bottom holds** (owner ruling 2026-10-18, `docs/_INDEX.md` Owed 20: "no lite
+//!   mode; if CPU impacts, measure and raise the CPU size"). `ladder_overruns_to_step` overruns within
+//!   `ladder_window_ms` (an overrun exactly the window old still counts, as in `Window`) step down
+//!   once, `Full → OverlayHalfRate`, with no wait. Every later burst holds on `OverlayHalfRate`.
+//! - **The score is never removed.** The spec's second rung (x264 `veryfast` → `superfast`) cannot
+//!   exist: F-001 found x264enc's `speed-preset` cannot change in PLAYING, and the programme pipeline
+//!   is never rebuilt. C09's fallback for it, "drop the overlay entirely", is what the ruling refused.
+//!   So `FastPreset` is gone, and so is the step gap that only a second step needed.
 //! - **No way back up in R2** (C05 brief): the match finishes on the degraded rung, and the heartbeat
-//!   reports it (C06 `HealthReport.rung`). YAGNI until the soak shows a need. With C09's `FastPreset`
-//!   that costs the score bug for the rest of the match; the owner decides (`docs/_INDEX.md` Owed 20).
-//! - **What `FastPreset` does is C09's.** The spec names an x264 preset step (`veryfast` →
-//!   `superfast`), but F-001 found x264enc's `speed-preset` cannot change in PLAYING, and the
-//!   programme pipeline is never rebuilt. C09's decision rule then makes this rung "drop the overlay
-//!   entirely" (`docs/_INDEX.md`, the C05 false-premise rows). The name stays, because the heartbeat
-//!   contract carries it (`fast_preset`, R2002).
+//!   reports it (C06 `HealthReport.rung`, `overlay_half_rate` on the wire). In production any step
+//!   down is a sizing alarm: web raises it from the heartbeat, and ops raise the Machine size (C17
+//!   runbook). C15's soak measures the real overlay cost against the size rule.
 use crate::config::Thresholds;
-use crate::time::{elapsed, Ms};
+use crate::time::Ms;
 use crate::window::Window;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Rung {
     Full,
+    /// The bottom: the overlay is refreshed on every other tick (C09), and the score stays on air.
     OverlayHalfRate,
-    FastPreset,
 }
 
 impl Rung {
-    /// The rung below this one; the bottom has none.
+    /// The rung below this one. `OverlayHalfRate` is the bottom and has none (owner ruling
+    /// 2026-10-18: no rung takes the score off air), so the ladder holds there.
     fn next(self) -> Option<Rung> {
         match self {
             Rung::Full => Some(Rung::OverlayHalfRate),
-            Rung::OverlayHalfRate => Some(Rung::FastPreset),
-            Rung::FastPreset => None,
+            Rung::OverlayHalfRate => None,
         }
     }
 }
@@ -46,7 +44,6 @@ pub const OVERRUN_HISTORY_CAP: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ladder {
     rung: Rung,
-    last_step_at: Option<Ms>,
     recent: Window,
     total: u64,
 }
@@ -61,7 +58,6 @@ impl Ladder {
     pub fn new() -> Self {
         Self {
             rung: Rung::Full,
-            last_step_at: None,
             recent: Window::new(OVERRUN_HISTORY_CAP),
             total: 0,
         }
@@ -76,22 +72,16 @@ impl Ladder {
         self.total
     }
 
-    /// One frame dropped before the encoder at `now`. `Some(rung)` ⇒ effect `StepDown(rung)`.
+    /// One frame dropped before the encoder at `now`. `Some(rung)` ⇒ effect `StepDown(rung)`; on the
+    /// bottom rung it is always `None`.
     pub fn on_overrun(&mut self, now: Ms, t: &Thresholds) -> Option<Rung> {
         self.total += 1;
         let n = self.recent.record(now, t.ladder_window_ms);
         if n < t.ladder_overruns_to_step {
             return None;
         }
-        if self
-            .last_step_at
-            .is_some_and(|last| elapsed(now, last) < t.ladder_step_min_gap_ms)
-        {
-            return None;
-        }
         let next = self.rung.next()?;
         self.rung = next;
-        self.last_step_at = Some(now);
         Some(next)
     }
 }
@@ -118,7 +108,12 @@ mod tests {
         at.iter().fold(None, |_, &now| l.on_overrun(now, th))
     }
 
-    // ---- the brief's 3 (C05 Step 5) ----
+    /// Feeds every instant of `at`; returns every step it produced, in order.
+    fn steps_of(l: &mut Ladder, at: &[Ms], th: &Thresholds) -> Vec<Rung> {
+        at.iter().filter_map(|&now| l.on_overrun(now, th)).collect()
+    }
+
+    // ---- the brief's 3 (C05 Step 5), as the owner ruling of 2026-10-18 amends them ----
 
     #[test]
     fn isolated_overruns_never_step() {
@@ -135,32 +130,32 @@ mod tests {
         );
     }
 
+    // Owner ruling 2026-10-18: the score is never removed, so the one step is to the overlay at
+    // half rate, at the `ladder_overruns_to_step`-th overrun, and ~66 s more of constant overrun
+    // never steps again.
     #[test]
-    fn sustained_overruns_step_overlay_first_then_preset_then_stop() {
+    fn sustained_overruns_step_once_to_overlay_half_rate_then_stop() {
         let th = t();
         let mut l = Ladder::new();
         let mut steps = Vec::new();
         for i in 0..2_000u64 {
-            // ~66 s of constant overrun
             if let Some(r) = l.on_overrun(i * 33, &th) {
-                steps.push((i * 33, r));
+                steps.push((i, r));
             }
         }
-        assert_eq!(
-            steps.iter().map(|s| s.1).collect::<Vec<_>>(),
-            vec![Rung::OverlayHalfRate, Rung::FastPreset]
-        );
-        assert!(steps[1].0 - steps[0].0 >= th.ladder_step_min_gap_ms);
+        let first = th.ladder_overruns_to_step as u64 - 1;
+        assert_eq!(steps, vec![(first, Rung::OverlayHalfRate)]);
+        assert_eq!(l.rung(), Rung::OverlayHalfRate);
+        assert_eq!(l.overruns(), 2_000);
     }
 
     #[test]
     fn bottom_rung_holds() {
         let th = t();
         let mut l = Ladder::new();
-        for i in 0..10_000u64 {
-            l.on_overrun(i * 10, &th);
-        }
-        assert_eq!(l.rung(), Rung::FastPreset);
+        let at: Vec<Ms> = (0..10_000u64).map(|i| i * 10).collect();
+        assert_eq!(steps_of(&mut l, &at, &th), vec![Rung::OverlayHalfRate]);
+        assert_eq!(l.rung(), Rung::OverlayHalfRate);
     }
 
     // ---- boundaries ----
@@ -195,35 +190,49 @@ mod tests {
         assert_eq!(l.overruns(), (count - 1) as u64);
     }
 
-    // The first step needs no gap (at 2 ms, long before `ladder_step_min_gap_ms`). The next waits for
-    // exactly the gap: a full burst ending 1 ms short of it does not step, and the overrun at exactly
-    // the gap does.
+    // The one step waits for nothing: the burst's last overrun steps in the same millisecond as
+    // its first.
     #[test]
-    fn the_next_step_waits_exactly_the_min_gap() {
+    fn the_step_needs_no_wait() {
         let th = t();
-        let count = th.ladder_overruns_to_step as Ms;
-        let gap = th.ladder_step_min_gap_ms;
         let mut l = Ladder::new();
-        let first: Vec<Ms> = (0..count).collect();
-        assert_eq!(feed(&mut l, &first, &th), Some(Rung::OverlayHalfRate));
-        let stepped = count - 1;
-        let burst: Vec<Ms> = (0..count).map(|k| stepped + gap - count + k).collect();
-        assert_eq!(*burst.last().unwrap(), stepped + gap - 1);
-        for &now in &burst {
-            assert_eq!(
-                l.on_overrun(now, &th),
-                None,
-                "at {now}, {} ms after the step",
-                now - stepped
-            );
-        }
-        assert_eq!(l.on_overrun(stepped + gap, &th), Some(Rung::FastPreset));
+        let burst = vec![0; th.ladder_overruns_to_step];
+        assert_eq!(feed(&mut l, &burst, &th), Some(Rung::OverlayHalfRate));
     }
 
     // ---- sequences ----
 
+    // The bottom holds against every later burst, whatever the silence before it: right after the
+    // step, one window later, ten windows, a minute's worth, a day. Each burst has the step count
+    // and more, so each one alone would have stepped from `Full`.
+    #[test]
+    fn every_burst_after_the_step_holds_on_overlay_half_rate() {
+        let th = t();
+        let (need, window) = (th.ladder_overruns_to_step as Ms, th.ladder_window_ms);
+        let mut l = Ladder::new();
+        let first: Vec<Ms> = (0..need).collect();
+        assert_eq!(steps_of(&mut l, &first, &th), vec![Rung::OverlayHalfRate]);
+        let mut now = need - 1;
+        let mut bursts = 0;
+        for silence in [0, 1, window + 1, 10 * window, 60 * window, 86_400_000] {
+            for len in [need, need + 1, 2 * need] {
+                now += silence;
+                let burst: Vec<Ms> = (0..len).map(|k| now + k).collect();
+                now += len;
+                assert_eq!(
+                    steps_of(&mut l, &burst, &th),
+                    Vec::<Rung>::new(),
+                    "a burst of {len} after {silence} ms"
+                );
+                assert_eq!(l.rung(), Rung::OverlayHalfRate);
+                bursts += 1;
+            }
+        }
+        assert_eq!(bursts, 18, "every silence × burst length");
+    }
+
     // R2 has no way back up (C05 brief): a day of silence, then isolated overruns, leave the degraded
-    // rung where it is; a fresh sustained burst only steps further down.
+    // rung where it is; a fresh sustained burst steps nowhere, and nothing wraps to `Full`.
     #[test]
     fn the_ladder_never_steps_back_up() {
         let th = t();
@@ -243,16 +252,15 @@ mod tests {
             );
         }
         let burst: Vec<Ms> = (0..count).map(|k| 2 * day + k).collect();
-        assert_eq!(feed(&mut l, &burst, &th), Some(Rung::FastPreset));
-        assert_eq!(feed(&mut l, &[3 * day, 3 * day, 3 * day, 3 * day + 1], &th), None);
+        assert_eq!(feed(&mut l, &burst, &th), None);
         assert_eq!(
             l.rung(),
-            Rung::FastPreset,
+            Rung::OverlayHalfRate,
             "the bottom holds; nothing wraps to Full"
         );
     }
 
-    // Every overrun is a dropped frame, whether it steps, is held back by the gap, or lands on the
+    // Every overrun is a dropped frame, whether it steps, is below the count, or lands on the
     // bottom rung.
     #[test]
     fn every_overrun_counts_as_a_dropped_frame() {
@@ -265,23 +273,23 @@ mod tests {
             calls += 1;
         }
         assert_eq!(l.overruns(), calls);
-        assert_eq!(steps, 1, "5 s of overruns: one step, then the gap holds the next");
+        assert_eq!(steps, 1, "5 s of overruns: one step, then the bottom holds");
         for i in 0..1_000u64 {
-            l.on_overrun(20_000 + i * 5, &th);
+            steps += usize::from(l.on_overrun(20_000 + i * 5, &th).is_some());
             calls += 1;
         }
-        assert_eq!(l.rung(), Rung::FastPreset);
+        assert_eq!(steps, 1, "a second 5 s of overruns steps nowhere");
+        assert_eq!(l.rung(), Rung::OverlayHalfRate);
         assert_eq!(l.overruns(), calls, "counted on the bottom rung too");
     }
 
-    // Every field the ladder reads set apart from the defaults (5 overruns, a 250 ms window, a 3 s
-    // gap), so a field mix-up cannot hide behind equal defaults; each expectation comes from its field.
+    // Every field the ladder reads set apart from the defaults (5 overruns, a 250 ms window), so a
+    // field mix-up cannot hide behind equal defaults; each expectation comes from its field.
     #[test]
     fn the_ladder_reads_its_own_thresholds() {
         let th = Thresholds {
             ladder_overruns_to_step: 5,
             ladder_window_ms: 250,
-            ladder_step_min_gap_ms: 3_000,
             ..t()
         };
         let mut l = Ladder::new();
@@ -298,15 +306,11 @@ mod tests {
             "the first is 251 ms old"
         );
         assert_eq!(
-            feed(&mut l, &[3_000, 3_060, 3_120, 3_180, 3_249], &th),
+            feed(&mut l, &[3_000, 3_060, 3_120, 3_180, 3_250], &th),
             None,
-            "2_999 ms after the step"
+            "a second full burst, on the bottom"
         );
-        assert_eq!(
-            l.on_overrun(3_250, &th),
-            Some(Rung::FastPreset),
-            "3_000 ms after the step"
-        );
+        assert_eq!(l.rung(), Rung::OverlayHalfRate);
     }
 
     #[test]
@@ -316,19 +320,6 @@ mod tests {
             OVERRUN_HISTORY_CAP >= th.ladder_overruns_to_step,
             "a window of {OVERRUN_HISTORY_CAP} can never count {} overruns",
             th.ladder_overruns_to_step
-        );
-    }
-
-    // The next step's evidence comes after the last step: the window is shorter than the gap, so an
-    // overrun from before a step has left the window by the time the next step is allowed.
-    #[test]
-    fn overruns_before_a_step_never_count_toward_the_next() {
-        let th = t();
-        assert!(
-            th.ladder_window_ms < th.ladder_step_min_gap_ms,
-            "window {} ms vs gap {} ms",
-            th.ladder_window_ms,
-            th.ladder_step_min_gap_ms
         );
     }
 }
