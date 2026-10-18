@@ -72,11 +72,16 @@ pub struct Thresholds {
     pub ladder_overruns_to_step: usize,
     /// C02 brief default (no PDF number): the window `ladder_overruns_to_step` is counted in.
     pub ladder_window_ms: Ms,
-    /// R1 sends SIGINT and SIGKILLs after RUNNER_STOP_GRACE_SECONDS = 10 (seazn.club
-    /// `apps/web/src/server/relay/config.ts`). The drain must finish with headroom for EOS to reach the
-    /// sink and the process to exit: grace − 3 s. C12's `drain_timeout_fits_inside_r1_stop_grace` pins
-    /// it below the grace.
+    /// R1 sends SIGINT and SIGKILLs after RUNNER_STOP_GRACE_SECONDS (seazn.club
+    /// `apps/web/src/server/relay/config.ts`): 20 s since the owner's D15 ruling (2026-10-16), which
+    /// fits the final hold, this drain and the headroom. The drain must finish with headroom for EOS to
+    /// reach the sink and the process to exit: 3 s. C12's `final_hold_and_drain_fit_inside_r1_stop_grace`
+    /// pins `final_hold_ms + drain_timeout_ms + 3 s` inside R1's grace.
     pub drain_timeout_ms: Ms,
+    /// Overlay templates spec 2026-10-15 §4.2 (D4): FINAL_HOLD_MS, how long the Final scene holds before
+    /// EOS. C12's `final_hold_and_drain_fit_inside_r1_stop_grace` pins final_hold + drain + 3 s inside
+    /// R1's grace.
+    pub final_hold_ms: Ms,
     /// Spec §5.3 default (`heartbeatIntervalMs`: 5000); the bootstrap's `heartbeatIntervalMs` overrides it.
     pub heartbeat_interval_ms: Ms,
     /// C02 brief default (no PDF number): bootstrap GET retry back-off while web is unreachable at boot.
@@ -125,6 +130,7 @@ impl Default for Thresholds {
             ladder_overruns_to_step: 3,
             ladder_window_ms: 1_000,
             drain_timeout_ms: 7_000,
+            final_hold_ms: 10_000,
             heartbeat_interval_ms: 5_000,
             bootstrap_backoff_base_ms: 1_000,
             bootstrap_backoff_cap_ms: 10_000,

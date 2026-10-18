@@ -25,12 +25,22 @@ pub enum ProgrammePhase {
     Live,
     Frozen,
     Reconnecting,
+    /// Overlay templates spec 2026-10-15 §4.2 (D4): the final hold before EOS. Terminal:
+    /// `PROGRAMME_TABLE` has no row from it, so no feed leaves it, and only `Programme::finish` enters
+    /// it. It wins over every camera state.
+    Final,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SlateKind {
     Waiting,
     Reconnecting,
+    Final,
+}
+
+impl SlateKind {
+    /// Every kind once. C09 renders the one textless slate for each, and its test enumerates this.
+    pub const ALL: [SlateKind; 3] = [SlateKind::Waiting, SlateKind::Reconnecting, SlateKind::Final];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -80,6 +90,9 @@ pub fn choice_for(phase: ProgrammePhase) -> FrameChoice {
         Live => Emit,
         Frozen => Repeat,
         Reconnecting => Slate(SlateKind::Reconnecting),
+        // Spec §4.2's Final backdrop is opaque, so the camera is not shown. With graphics up the
+        // page's Final scene covers the slate; with graphics failed, C09's textless slate shows.
+        Final => Slate(SlateKind::Final),
     }
 }
 
@@ -154,6 +167,12 @@ impl Programme {
     pub fn on_tick(&mut self, now: Ms, t: &Thresholds) -> FrameChoice {
         self.phase = next_phase(self.phase, self.feed(now, t));
         choice_for(self.phase)
+    }
+
+    /// Enter the final hold (C06). Idempotent. Later frames and ticks keep it Final: no table row
+    /// leaves it.
+    pub fn finish(&mut self) {
+        self.phase = Final;
     }
 }
 
@@ -235,6 +254,7 @@ mod tests {
         assert_eq!(choice_for(Live), Emit);
         assert_eq!(choice_for(Frozen), Repeat);
         assert_eq!(choice_for(Reconnecting), Slate(SlateKind::Reconnecting));
+        assert_eq!(choice_for(Final), Slate(SlateKind::Final));
     }
 
     // ---- behaviour against the PDF timing budgets ----

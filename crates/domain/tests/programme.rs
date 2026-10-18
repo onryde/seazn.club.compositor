@@ -7,9 +7,11 @@ use domain::programme::{
     choice_for, next_phase, Feed, FrameChoice, Programme, ProgrammePhase, SlateKind, PROGRAMME_TABLE,
 };
 use domain::time::Ms;
-use ProgrammePhase::{Frozen, Live, Reconnecting, Waiting};
+use ProgrammePhase::{Final, Frozen, Live, Reconnecting, Waiting};
 
-const PHASES: [ProgrammePhase; 4] = [Waiting, Live, Frozen, Reconnecting];
+const PHASES: [ProgrammePhase; 5] = [Waiting, Live, Frozen, Reconnecting, Final];
+/// The phases a camera feed can reach (C03); `Final` is entered only by `Programme::finish` (C06).
+const FEED_PHASES: [ProgrammePhase; 4] = [Waiting, Live, Frozen, Reconnecting];
 const FEEDS: [Feed; 4] = [Feed::Continuous, Feed::Fresh, Feed::Gap, Feed::LongGap];
 
 /// Exhaustive `match`es, so a new variant is a compile error here and `PHASES` / `FEEDS` cannot go
@@ -20,6 +22,7 @@ fn phase_index(p: ProgrammePhase) -> usize {
         Live => 1,
         Frozen => 2,
         Reconnecting => 3,
+        Final => 4,
     }
 }
 
@@ -39,12 +42,15 @@ fn feed_index(f: Feed) -> usize {
 /// - Live: 0.5 s with no frame freezes it; 3 s with no frame slates it (a stalled tick skips Frozen).
 /// - Frozen: frames resuming take it live at once, however short the run; 3 s with no frame slates.
 /// - Reconnecting: only 1 s of continuous frames takes it live.
-const PDF: [[ProgrammePhase; 4]; 4] = [
+/// - Final: overlay templates spec 2026-10-15 §6, C06 row: Final is terminal and wins over every
+///   camera state.
+const PDF: [[ProgrammePhase; 4]; 5] = [
     // Continuous, Fresh, Gap, LongGap
     [Live, Waiting, Waiting, Waiting],                // Waiting
     [Live, Live, Frozen, Reconnecting],               // Live
     [Live, Live, Frozen, Reconnecting],               // Frozen
     [Live, Reconnecting, Reconnecting, Reconnecting], // Reconnecting
+    [Final, Final, Final, Final],                     // Final
 ];
 
 fn pdf_next(p: ProgrammePhase, f: Feed) -> ProgrammePhase {
@@ -58,6 +64,8 @@ fn spec_choice(p: ProgrammePhase) -> FrameChoice {
         Live => FrameChoice::Emit,
         Frozen => FrameChoice::Repeat,
         Reconnecting => FrameChoice::Slate(SlateKind::Reconnecting),
+        // Spec §4.2: the Final scene's backdrop is opaque, so the camera is not shown.
+        Final => FrameChoice::Slate(SlateKind::Final),
     }
 }
 
@@ -133,7 +141,7 @@ fn unlisted_pairs_hold_their_phase() {
     }
     eprintln!("unlisted pairs checked: {checked}");
     assert!(checked > 0, "checked 0 unlisted pairs");
-    assert_eq!(checked, 16 - PROGRAMME_TABLE.len());
+    assert_eq!(checked, PHASES.len() * FEEDS.len() - PROGRAMME_TABLE.len());
 }
 
 #[test]
@@ -151,7 +159,8 @@ fn every_phase_is_reachable_from_waiting() {
         }
     }
     eprintln!("reachable from Waiting: {seen:?}");
-    assert_eq!(seen.len(), PHASES.len(), "reachable: {seen:?}");
+    assert_eq!(seen.len(), FEED_PHASES.len(), "reachable: {seen:?}");
+    assert!(!seen.contains(&Final), "no feed reaches Final");
 }
 
 #[test]
@@ -254,7 +263,7 @@ struct Seen {
     ticks: usize,
     frames: usize,
     row_hits: Vec<usize>,
-    phase_ticks: [usize; 4],
+    phase_ticks: [usize; 5],
     late_accepted: usize,
     early_ticks: usize,
     late_ignored: usize,
@@ -335,6 +344,8 @@ impl Sim<'_> {
             FrameChoice::Slate(SlateKind::Reconnecting) => {
                 assert!(self.m.ever_live, "reconnecting slate before any live")
             }
+            // No feed reaches Final (`final_is_terminal_against_every_feed`): reaching it is a failure.
+            FrameChoice::Slate(SlateKind::Final) => panic!("Final slate from a camera feed at {now}"),
         }
         if age >= t.slate_after_ms {
             assert!(
@@ -449,7 +460,7 @@ fn programme_matches_the_reference_model_over_generated_schedules() {
     }
     eprintln!(
         "reference-model sweep: {CASES} cases, {} ticks ({} before the latest frame), {} frames \
-         ({} late accepted, {} late ignored); ticks per phase {:?} (Waiting, Live, Frozen, Reconnecting); hits per table row \
+         ({} late accepted, {} late ignored); ticks per phase {:?} (Waiting, Live, Frozen, Reconnecting, Final); hits per table row \
          {:?}; boundary ticks: age 500 = {}, 501 = {}, 2 999 = {}, 3 000 = {}; span 999 = {}, \
          1 000 = {}",
         seen.ticks,
@@ -470,9 +481,16 @@ fn programme_matches_the_reference_model_over_generated_schedules() {
     for (i, &hits) in seen.row_hits.iter().enumerate() {
         assert!(hits > 0, "table row {:?} never fired", PROGRAMME_TABLE[i]);
     }
-    for (i, &n) in seen.phase_ticks.iter().enumerate() {
-        assert!(n > 0, "the sweep never ticked in {:?}", PHASES[i]);
+    for p in FEED_PHASES {
+        let n = seen.phase_ticks[phase_index(p)];
+        assert!(n > 0, "the sweep never ticked in {p:?}");
     }
+    // A positive statement, not a count: a table row into Final would turn it red.
+    assert_eq!(
+        seen.phase_ticks[phase_index(Final)],
+        0,
+        "a camera feed reached Final"
+    );
     assert!(seen.late_accepted > 0, "no late frame was accepted");
     assert!(
         seen.early_ticks > 0,
@@ -768,4 +786,82 @@ fn the_pdf_budgets_hold_in_both_modes_at_every_grid_phase() {
             );
         }
     }
+}
+
+// ---- the final hold (C06, overlay templates spec 2026-10-15 §4.2 / §6) ----
+
+/// From `Programme::default()`, frames every frame period and a tick after each, into `phase` (C06
+/// brief: Live after `resume_after_ms` + 100 of frames; Frozen after `frozen_after_ms` + 100 with no
+/// frame; Reconnecting after `slate_after_ms` + 100 with no frame). Returns the machine and the time
+/// of its last tick.
+fn reach(phase: ProgrammePhase, t: &Thresholds) -> (Programme, Ms) {
+    let step = OutputProfile::P720.frame_period_ms().round() as Ms;
+    let mut p = Programme::default();
+    let mut now = 0;
+    if phase == Waiting {
+        p.on_tick(now, t);
+        return (p, now);
+    }
+    while now <= t.resume_after_ms + 100 {
+        p.on_frame(now, t);
+        p.on_tick(now, t);
+        now += step;
+    }
+    let last = now - step;
+    let silence = match phase {
+        Live => 0,
+        Frozen => t.frozen_after_ms + 100,
+        _ => t.slate_after_ms + 100,
+    };
+    while now <= last + silence {
+        p.on_tick(now, t);
+        now += step;
+    }
+    (p, now - step)
+}
+
+#[test]
+fn final_is_terminal_against_every_feed() {
+    let t = Thresholds::default();
+    let step = OutputProfile::P720.frame_period_ms().round() as Ms;
+    let (mut ticks, mut starts) = (0usize, 0usize);
+    let mut feeds = [0usize; 4];
+    for start in FEED_PHASES {
+        let (mut p, mut now) = reach(start, &t);
+        assert_eq!(p.phase(), start, "setup: reach {start:?}");
+        p.finish();
+        assert_eq!(p.phase(), Final, "finish from {start:?}");
+        p.finish();
+        assert_eq!(p.phase(), Final, "a second finish from {start:?}");
+        starts += 1;
+        let mut check = |p: &mut Programme, now: Ms| {
+            feeds[feed_index(p.feed(now, &t))] += 1;
+            assert_eq!(
+                p.on_tick(now, &t),
+                FrameChoice::Slate(SlateKind::Final),
+                "{start:?} at {now}"
+            );
+            assert_eq!(p.phase(), Final, "{start:?} at {now}");
+            ticks += 1;
+        };
+        // Frames for 1.2 s (Fresh, then Continuous), then silence past the freeze (Gap) and past the
+        // slate (LongGap).
+        let frames_until = now + t.resume_after_ms + 200;
+        while now < frames_until {
+            now += step;
+            p.on_frame(now, &t);
+            check(&mut p, now);
+        }
+        let last = now;
+        while now < last + t.slate_after_ms + 100 {
+            now += step;
+            check(&mut p, now);
+        }
+    }
+    eprintln!(
+        "final ticks checked: {ticks}, starts: {starts}, feeds seen: {feeds:?} (Continuous, Fresh, Gap, LongGap)"
+    );
+    assert!(ticks > 0, "checked 0 final ticks");
+    assert_eq!(starts, FEED_PHASES.len(), "every camera phase");
+    assert!(feeds.iter().all(|&n| n > 0), "a feed was never seen: {feeds:?}");
 }
