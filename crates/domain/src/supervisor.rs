@@ -926,6 +926,43 @@ mod tests {
         );
     }
 
+    // The stall rule reads the programme's frames: a connected input that keeps delivering them is
+    // never rebuilt, however long it runs; once they stop, it is rebuilt after the stall window.
+    #[test]
+    fn frames_keep_a_connected_input_from_the_stall_rule() {
+        let th = t();
+        let step = period();
+        let s = booted(0).decide(Event::Tick, 0).next;
+        let mut s = s.decide(Event::InputConnected { gen: 1 }, 10).next;
+        let mut now = step;
+        let run_for = 3 * th.input_stall_after_ms;
+        while now <= run_for {
+            s = s.decide(Event::InputFrame, now).next;
+            let d = s.decide(Event::Tick, now);
+            assert!(
+                !d.effects.contains(&Effect::RebuildInput { gen: 2 }),
+                "rebuilt at {now} with frames flowing"
+            );
+            s = d.next;
+            now += step;
+        }
+        let last = now - step;
+        let mut rebuilt = None;
+        while now <= last + th.input_stall_after_ms + th.input_backoff_base_ms + 2 * step {
+            let d = s.decide(Event::Tick, now);
+            if d.effects.contains(&Effect::RebuildInput { gen: 2 }) {
+                rebuilt.get_or_insert(now);
+            }
+            s = d.next;
+            now += step;
+        }
+        let at = rebuilt.expect("a silent input was never rebuilt");
+        assert!(
+            at >= last + th.input_stall_after_ms,
+            "rebuilt at {at}, last frame {last}"
+        );
+    }
+
     #[test]
     fn signal_while_booting_exits_immediately() {
         for k in [SignalKind::Term, SignalKind::Int] {
@@ -1813,5 +1850,153 @@ mod tests {
             "{:?}",
             d.effects
         );
+    }
+
+    // ---- the report and the bootstrap's numbers ----
+
+    // The session's own beat interval (C07's bootstrap), not the default: a value the default is not.
+    #[test]
+    fn the_bootstrap_sets_the_beat_interval() {
+        let interval = 2 * t().heartbeat_interval_ms + 1_000;
+        let s = Supervisor::new(t()).decide(Event::Tick, 0).next;
+        let s = s
+            .decide(
+                Event::BootstrapOk {
+                    heartbeat_interval_ms: interval,
+                    deadline_at: FAR,
+                },
+                0,
+            )
+            .next;
+        let d = s.decide(Event::Tick, 0);
+        assert_eq!(beats(&d.effects).len(), 1, "the first tick beats");
+        let d = d.next.decide(Event::Tick, interval - 1);
+        assert!(
+            beats(&d.effects).is_empty(),
+            "beat 1 ms before the session's interval"
+        );
+        let d = d.next.decide(Event::Tick, interval);
+        assert_eq!(beats(&d.effects).len(), 1, "no beat at the session's interval");
+        let d = d.next.decide(Event::Tick, 2 * interval - 1);
+        assert!(beats(&d.effects).is_empty());
+        assert_eq!(beats(&d.next.decide(Event::Tick, 2 * interval).effects).len(), 1);
+    }
+
+    // Every sub-machine state reaches the report as the brief maps it, with the counters beside it.
+    #[test]
+    fn health_maps_every_sub_machine_state() {
+        let th = t();
+        let mut s = booted(0).decide(Event::Tick, 0).next;
+        let h = s.health(0);
+        assert_eq!(
+            (h.input, h.output, h.graphics),
+            (
+                LinkStatus::Connecting,
+                LinkStatus::Connecting,
+                GraphicsStatus::Starting
+            )
+        );
+        assert_eq!((h.pipeline_rebuilds, h.sink_swaps, h.dropped_frames), (0, 0, 0));
+        assert_eq!((h.input_kicks, h.input_kick_alert), (0, false));
+        assert_eq!(
+            (h.rung, h.score_stale, h.heartbeat_failures),
+            (Rung::Full, None, 0)
+        );
+        assert_eq!((h.phase_channel, h.exit), (None, None));
+        s = s.decide(Event::InputConnected { gen: 1 }, 10).next;
+        s = s.decide(progress(&s, 1_000), 10).next;
+        s = s.decide(Event::CefReady { gen: 1 }, 10).next;
+        s = s.decide(Event::ScoreStale(true), 10).next;
+        s = s.decide(Event::HeartbeatFailed, 10).next;
+        s = s.decide(Event::HeartbeatFailed, 10).next;
+        let h = s.health(10);
+        assert_eq!(
+            (h.input, h.output, h.graphics),
+            (
+                LinkStatus::Connected,
+                LinkStatus::Connected,
+                GraphicsStatus::Ready
+            )
+        );
+        assert_eq!((h.score_stale, h.heartbeat_failures), (Some(true), 2));
+        s = s.decide(Event::HeartbeatReply(Desired::Live), 10).next;
+        assert_eq!(
+            s.health(10).heartbeat_failures,
+            0,
+            "a Live reply resets the failures"
+        );
+        s = s
+            .decide(
+                Event::InputLost {
+                    gen: 1,
+                    reason: LossReason::Error,
+                },
+                20,
+            )
+            .next;
+        s = s.decide(Event::OutputError { gen: 1 }, 20).next;
+        s = s.decide(Event::CefCrashed { gen: 1 }, 20).next;
+        let h = s.health(20);
+        assert_eq!(
+            (h.input, h.output, h.graphics),
+            (
+                LinkStatus::Backoff,
+                LinkStatus::Backoff,
+                GraphicsStatus::Restarting
+            )
+        );
+        assert_eq!(h.input_kicks, 0, "an error is not a kick");
+        // One rebuild and one swap after their back-offs: each counts builds after the first.
+        let after = 20 + th.input_backoff_base_ms.max(th.output_backoff_base_ms);
+        let d = s.decide(Event::Tick, after);
+        assert!(
+            d.effects.contains(&Effect::RebuildInput { gen: 2 }),
+            "{:?}",
+            d.effects
+        );
+        assert!(
+            d.effects.contains(&Effect::SwapSink { gen: 2 }),
+            "{:?}",
+            d.effects
+        );
+        let h = d.next.health(after);
+        assert_eq!((h.pipeline_rebuilds, h.sink_swaps), (1, 1));
+    }
+
+    // PDF failure table: "alert if it repeats > 3 times in 5 min". The kick_alert_count-th kick does
+    // not raise it; the next one, inside the window, does.
+    #[test]
+    fn health_raises_the_kick_alert_past_the_count() {
+        let th = t();
+        let mut s = booted(0).decide(Event::Tick, 0).next;
+        let mut now = 0;
+        let mut kicks = 0;
+        for _ in 0..=th.kick_alert_count {
+            let gen = s.input_generation();
+            assert!(!s.health(now).input_kick_alert, "alert after {kicks} kicks");
+            s = s.decide(Event::InputConnected { gen }, now).next;
+            s = s
+                .decide(
+                    Event::InputLost {
+                        gen,
+                        reason: LossReason::Eos,
+                    },
+                    now + 10,
+                )
+                .next;
+            kicks += 1;
+            assert_eq!(s.health(now + 10).input_kicks, kicks);
+            now += 10 + th.input_backoff_base_ms;
+            let d = s.decide(Event::Tick, now);
+            assert!(
+                d.effects.contains(&Effect::RebuildInput { gen: gen + 1 }),
+                "{:?}",
+                d.effects
+            );
+            s = d.next;
+        }
+        assert!(now < th.kick_window_ms, "setup: every kick inside one window");
+        assert_eq!(kicks as usize, th.kick_alert_count + 1);
+        assert!(s.health(now).input_kick_alert, "no alert after {kicks} kicks");
     }
 }
