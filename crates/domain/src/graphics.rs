@@ -1,16 +1,17 @@
 //! CEF overlay lifecycle. It never blocks video: a failed page restarts on a back-off while the adapter
-//! holds the last overlay frame (C11); a hung page and repeated failures hide the overlay, so a stale
-//! score never stays on air, and retry after a cooldown; the planned recycle is a restart, never a
-//! failure.
+//! holds the last overlay frame (C11), a crash's hold for at most `cef_hang_after_ms`; a hung page, a
+//! hold that runs out and repeated failures hide the overlay, so a stale score never stays on air, and
+//! retry after a cooldown; the planned recycle is a restart, never a failure.
 //!
 //! ```text
 //! Backoff --due tick: restart, next generation--> Starting --ready signal--> Ready
 //!    ^                                               |                         |
 //!    +---------- failure: load timeout or crash -----+--------- crash ---------+
-//!                (the cef_fail_count-th in the window enters Failed + Hide)    |
+//!         (the cef_fail_count-th in the window enters Failed + Hide(Failed))   |
 //!                                                                              |
-//! Ready --silent cef_hang_after_ms: failure + Hide--> Backoff | Failed         |
+//! Ready --silent cef_hang_after_ms: failure + Hide(Hang)--> Backoff | Failed   |
 //! Ready --beat--> Ready (the hang deadline moves; the recycle does not)        |
+//! Backoff | Starting --a crash's hold ends (cef_hang_after_ms): Hide(Crash)    |
 //! Ready --recycle due--> Starting (Restart; not a failure)                     |
 //! Failed --retry_at--> Starting (Restart)                                      v
 //! ```
@@ -23,7 +24,8 @@
 //! - **Beat.** While Ready, the page logs `seazn:alive` every `cef_alive_every_ms` (R2005; C11 relays
 //!   it, C06 routes it). The ready signal counts as the first beat. A beat from any other generation,
 //!   or in any other state, changes nothing: the page beats only after ready, and a beat never makes a
-//!   page Ready. A beat moves only the hang deadline, never the recycle.
+//!   page Ready. A beat moves only the hang deadline, never the recycle, and never earlier: a beat
+//!   stamped before the last one changes nothing (PR #22 review M3).
 //! - **Failure.** A crash of the current generation while Starting or Ready (C11: a bus error, the
 //!   renderer exiting, a CEF child gone, RSS over its cap), a load with no ready signal
 //!   `cef_load_timeout_ms` after its restart, or a hang: a Ready page with no beat for
@@ -34,21 +36,35 @@
 //! - **Back-off.** The n-th failure within `cef_fail_window_ms` waits `delay(n - 1)` on the CEF
 //!   back-off (1 s → 10 s), so a page that keeps failing waits longer.
 //! - **Failed.** The `cef_fail_count`-th failure within `cef_fail_window_ms` (spec §4.2: 3 in 5 min; a
-//!   failure exactly the window old still counts, as in `Window`) enters Failed and returns `Hide`,
-//!   once. Failed is not terminal (C05 brief): a flaky deploy of the page early in a match must not
+//!   failure exactly the window old still counts, as in `Window`) enters Failed and returns
+//!   `Hide { reason: Failed }`, once. Failed is not terminal (C05 brief): a flaky deploy of the page early in a match must not
 //!   lose the score bug for the whole match, so `cef_fail_window_ms` after it the page restarts. By then
 //!   every failure that led to Failed is at least the window old, so the retried page gets its full
 //!   `cef_fail_count` attempts again.
-//! - **Hide.** A `Hide` comes from entering Failed, or from a hang, at once and below the count too:
-//!   a hung page's last frame may be a stale score, so it does not stay on air through the back-off
-//!   and reload (owner-approved design, 2026-10-18; "at once" is the coordinator's reading of it). A
-//!   crash below the count still holds the frame. The overlay stays hidden from a `Hide` until the
-//!   next generation's Ready; nothing else lifts it. After a `Hide` the next action is always a
-//!   `Restart`: at `retry_at` from Failed, at the back-off's end from a hang. Nothing of the hidden
-//!   generation may reach the programme before it; under F-001's console readiness a page that never
-//!   signals ready keeps painting, so the adapters must hold the hide against its frames, and lift it
-//!   once a later generation signals ready (C08 maps `HideOverlay` to `hide_overlay()` and
-//!   `graphics.stop()`; C11 writes the slot only from a generation that signalled its own ready;
+//! - **Hide.** Every `Hide` names its reason and the generation whose failure took the frame off air
+//!   (PR #22 review I2; C12 logs `overlay hidden reason=<r> gen=<g>`):
+//!   - `Hang`: a hang hides at once, below the count and at it (the reason names the cause, not the
+//!     state left): a hung page's last frame may be a stale score, so it does not stay on air through
+//!     the back-off and reload (owner-approved design, 2026-10-18; "at once" is the coordinator's
+//!     reading of it).
+//!   - `Failed`: a crash or a load timeout that enters Failed.
+//!   - `Crash`: a crash below the count holds the last frame through the reload, but at most
+//!     `cef_hang_after_ms` after the crash (coordinator decision 2026-10-18, from the owner-approved
+//!     10 s rule): if no newer generation is Ready by then, the first tick at or after it hides,
+//!     naming the crashed generation. The hold keeps the first crash's clock through a second crash,
+//!     and a crash holds only a frame that is on air: none before the first Ready, none from a `Hide`
+//!     until the next Ready, while a recycle's or a load timeout's last frame stays on air. The hide
+//!     wins a tick on which a restart or a load timeout also falls due; that follows on the next tick.
+//!
+//!   The overlay stays hidden from a `Hide` until the next generation's Ready; nothing else lifts it.
+//!   After a `Hang` or `Failed` hide the next action is a `Restart` (at `retry_at` from Failed, at the
+//!   back-off's end from a hang); a `Crash` hide leaves the reload loading, so the next is a `Restart`
+//!   or that reload's `Failed`. Nothing of the hidden generation may reach the programme before it;
+//!   under F-001's console readiness a page that never signals ready keeps painting, so the adapters
+//!   must hold the hide against its frames, and lift it once a later generation signals ready (C08
+//!   maps a `Hang` or `Failed` hide to `hide_overlay()` and `graphics.stop()`, and a `Crash` hide to
+//!   `hide_overlay()` alone, so the reload survives; C11 writes the slot only from a generation that
+//!   signalled its own ready, and closes a generation's slot at its stop or its reported crash;
 //!   `docs/_INDEX.md` Owed 17).
 //! - **Recycle.** `cef_recycle_every_ms` after the ready signal the browser is restarted (spec §6, every
 //!   2 h). It is planned, so it records no failure.
@@ -92,6 +108,23 @@ pub enum HideReason {
     Hang,
     /// A crash or a load timeout entered Failed (the `cef_fail_count`-th failure in the window).
     Failed,
+    /// A crash held the last frame for `cef_hang_after_ms`, and no newer generation is Ready.
+    Crash,
+}
+
+/// What of this machine's pages the programme may be showing. C11 writes the overlay slot only from a
+/// generation after its own ready, and `hide_overlay` clears it, so the machine tracks it without
+/// seeing a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnAir {
+    /// Nothing: before the first Ready, and from every `Hide` until the next Ready.
+    Nothing,
+    /// A Ready page's frames, or that page's last frame, held through a recycle, a reload or a load
+    /// timeout.
+    Frame,
+    /// A crash of generation `gen` at `since` is holding the last frame: off air `cef_hang_after_ms`
+    /// later, unless a newer generation is Ready first.
+    Held { since: Ms, gen: u64 },
 }
 
 /// Failure history bound: the window never holds more than this many stamps (AGENTS.md §4, nothing
@@ -104,6 +137,7 @@ pub struct Graphics {
     state: GraphicsState,
     generation: u64,
     failures: Window,
+    on_air: OnAir,
 }
 
 impl Default for Graphics {
@@ -119,6 +153,7 @@ impl Graphics {
             state: GraphicsState::Backoff { attempt: 0, until: 0 },
             generation: 0,
             failures: Window::new(FAILURE_HISTORY_CAP),
+            on_air: OnAir::Nothing,
         }
     }
 
@@ -132,13 +167,14 @@ impl Graphics {
     }
 
     /// The page of generation `gen` signalled ready (F-001's console line, relayed by C11). It counts
-    /// only while that page is loading.
+    /// only while that page is loading. Its frames now reach air: a hide lifts, and a hold ends.
     pub fn on_ready(&mut self, now: Ms, gen: u64) {
         if gen == self.generation && matches!(self.state, GraphicsState::Starting { .. }) {
             self.state = GraphicsState::Ready {
                 since: now,
                 last_alive: now,
             };
+            self.on_air = OnAir::Frame;
         }
     }
 
@@ -148,10 +184,10 @@ impl Graphics {
         if gen != self.generation {
             return;
         }
-        if let GraphicsState::Ready { since, .. } = self.state {
+        if let GraphicsState::Ready { since, last_alive } = self.state {
             self.state = GraphicsState::Ready {
                 since,
-                last_alive: now,
+                last_alive: now.max(last_alive),
             };
         }
     }
@@ -163,16 +199,34 @@ impl Graphics {
             return None;
         }
         match self.state {
-            GraphicsState::Starting { .. } | GraphicsState::Ready { .. } => self.fail(now, t),
+            GraphicsState::Starting { .. } | GraphicsState::Ready { .. } => {
+                let action = self.fail(now, t);
+                // Below the count the last frame is held, for at most `cef_hang_after_ms` (the hold's
+                // tick in `on_tick`). An earlier crash's hold keeps its clock, and with nothing on
+                // air there is nothing to hold; at the count `fail` has already hidden it.
+                if self.on_air == OnAir::Frame {
+                    self.on_air = OnAir::Held { since: now, gen };
+                }
+                action
+            }
             // Already failed: the same page reporting again changes nothing.
             GraphicsState::Backoff { .. } | GraphicsState::Failed { .. } => None,
         }
     }
 
     /// `Some(Restart)` when a restart is due (the back-off is over, the recycle is due, or the
-    /// cooldown is over); `Hide { reason: Failed, .. }` when a load timeout enters Failed, and
-    /// `Hide { reason: Hang, .. }` on every hang.
+    /// cooldown is over); `Hide { reason: Failed, .. }` when a load timeout enters Failed,
+    /// `Hide { reason: Hang, .. }` on every hang, and `Hide { reason: Crash, .. }` when a crash's
+    /// hold runs out.
     pub fn on_tick(&mut self, now: Ms, t: &Thresholds) -> Option<GraphicsAction> {
+        // Checked first, so the held frame comes off air on the tick its hold ends; a restart or a
+        // load timeout due on the same tick follows on the next one. A hold never runs beside Ready
+        // (a Ready ends it) or Failed (entering Failed hides).
+        if let OnAir::Held { since, gen } = self.on_air {
+            if elapsed(now, since) >= t.cef_hang_after_ms {
+                return Some(self.hide(HideReason::Crash, gen));
+            }
+        }
         match self.state {
             GraphicsState::Backoff { until, .. } if now >= until => Some(self.restart(now)),
             GraphicsState::Starting { since } if elapsed(now, since) >= t.cef_load_timeout_ms => {
@@ -183,10 +237,7 @@ impl Graphics {
             // falls due with it is never laundered as a planned restart.
             GraphicsState::Ready { last_alive, .. } if elapsed(now, last_alive) >= t.cef_hang_after_ms => {
                 self.fail(now, t);
-                Some(GraphicsAction::Hide {
-                    reason: HideReason::Hang,
-                    gen: self.generation,
-                })
+                Some(self.hide(HideReason::Hang, self.generation))
             }
             // The planned recycle: a restart, and no failure is recorded.
             GraphicsState::Ready { since, .. } if elapsed(now, since) >= t.cef_recycle_every_ms => {
@@ -195,6 +246,12 @@ impl Graphics {
             GraphicsState::Failed { retry_at } if now >= retry_at => Some(self.restart(now)),
             _ => None,
         }
+    }
+
+    /// Takes the overlay off air: nothing of this machine's pages is shown until the next Ready.
+    fn hide(&mut self, reason: HideReason, gen: u64) -> GraphicsAction {
+        self.on_air = OnAir::Nothing;
+        GraphicsAction::Hide { reason, gen }
     }
 
     fn restart(&mut self, now: Ms) -> GraphicsAction {
@@ -211,10 +268,7 @@ impl Graphics {
             self.state = GraphicsState::Failed {
                 retry_at: now.saturating_add(t.cef_fail_window_ms),
             };
-            return Some(GraphicsAction::Hide {
-                reason: HideReason::Failed,
-                gen: self.generation,
-            });
+            return Some(self.hide(HideReason::Failed, self.generation));
         }
         // n ≤ FAILURE_HISTORY_CAP (32), so the cast is exact; n ≥ 1, as this failure is recorded.
         let attempt = (n as u32).saturating_sub(1);
@@ -231,7 +285,7 @@ impl Graphics {
 mod tests {
     use super::*;
     use GraphicsAction::{Hide, Restart};
-    use HideReason::{Failed, Hang};
+    use HideReason::{Crash, Failed, Hang};
 
     fn t() -> Thresholds {
         Thresholds::default()
@@ -1334,6 +1388,359 @@ mod tests {
                 until: hang + th.cef_backoff_base_ms
             }
         );
+    }
+
+    // ---- the crash hold: a crash holds the last frame at most `cef_hang_after_ms` (coordinator
+    // decision 2026-10-18, PR #22 review G1, derived from the owner-approved 10 s rule) ----
+
+    /// Generation 1 Ready at `r` (its frame on air), crashed 1 ms later: a first failure, so it backs
+    /// off and the frame is held. Returns the machine and the crash's instant.
+    fn crashed_ready(th: &Thresholds) -> (Graphics, Ms) {
+        let (mut g, r) = ready_at(th);
+        let c = r + 1;
+        assert_eq!(
+            g.on_crashed(c, 1, th),
+            None,
+            "a first crash backs off and holds the frame"
+        );
+        assert_eq!(
+            g.state(),
+            GraphicsState::Backoff {
+                attempt: 0,
+                until: c + wait(th, 0)
+            }
+        );
+        (g, c)
+    }
+
+    // The crashed page's frame stays on air through the reload for exactly `cef_hang_after_ms` after
+    // the crash, and no longer: 1 ms before, nothing; at it, a `Crash` hide naming the crashed
+    // generation, while the reload (generation 2) goes on loading; then nothing more.
+    #[test]
+    fn a_crash_holds_the_frame_until_exactly_the_hang_threshold() {
+        let th = t();
+        let (mut g, c) = crashed_ready(&th);
+        let restart = c + wait(&th, 0);
+        assert_eq!(g.on_tick(restart, &th), Some(Restart), "the reload");
+        let off = c + th.cef_hang_after_ms;
+        assert!(
+            off < restart + th.cef_load_timeout_ms,
+            "the hold ends before the reload's own load timeout"
+        );
+        assert_eq!(g.on_tick(off - 1, &th), None, "1 ms before the hold ends");
+        assert_eq!(
+            g.on_tick(off, &th),
+            hide(Crash, 1),
+            "the held frame comes off air"
+        );
+        assert_eq!(
+            (g.state(), g.generation()),
+            (GraphicsState::Starting { since: restart }, 2),
+            "a crash hide does not touch the reload"
+        );
+        assert_eq!(g.on_tick(off + 1, &th), None, "one hide, not one per tick");
+    }
+
+    // A first tick past the hold's end still hides, 1 ms past it and when the reload's own load
+    // timeout falls due on the same tick. The hide wins that tick, and the load timeout is recorded on
+    // the next one.
+    #[test]
+    fn a_first_tick_past_the_hold_still_hides() {
+        let th = t();
+        let restart_after = wait(&th, 0);
+        let both = restart_after + th.cef_load_timeout_ms - th.cef_hang_after_ms;
+        let mut checked = 0;
+        for late in [1, both] {
+            let (mut g, c) = crashed_ready(&th);
+            let restart = c + restart_after;
+            assert_eq!(g.on_tick(restart, &th), Some(Restart));
+            let at = c + th.cef_hang_after_ms + late;
+            assert_eq!(g.on_tick(at, &th), hide(Crash, 1), "{late} ms past the hold");
+            assert_eq!(g.state(), GraphicsState::Starting { since: restart });
+            if at >= restart + th.cef_load_timeout_ms {
+                assert_eq!(g.on_tick(at, &th), None, "the load timeout, on the next tick");
+                assert_eq!(
+                    g.state(),
+                    GraphicsState::Backoff {
+                        attempt: 1,
+                        until: at + wait(&th, 1)
+                    }
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 2);
+    }
+
+    // The reload goes Ready inside the hold, on the tick of its restart or 1 ms before the hold
+    // ends: no hide, then or later, while it beats. A Ready 1 ms too late (after the hold's tick) is
+    // after the hide, and lifts it: that page's own crash then holds and hides again, naming it.
+    #[test]
+    fn a_reload_ready_inside_the_hold_never_hides() {
+        let th = t();
+        let restart_after = wait(&th, 0);
+        let mut checked = 0;
+        for ready_after in [restart_after, th.cef_hang_after_ms - 1] {
+            let (mut g, c) = crashed_ready(&th);
+            assert_eq!(g.on_tick(c + restart_after, &th), Some(Restart));
+            let ready = c + ready_after;
+            g.on_ready(ready, 2);
+            assert!(matches!(g.state(), GraphicsState::Ready { .. }), "{ready_after}");
+            let off = c + th.cef_hang_after_ms;
+            assert_eq!(
+                g.on_tick(off, &th),
+                None,
+                "Ready {ready_after} ms after the crash"
+            );
+            let mut now = ready;
+            while now < off + 60_000 {
+                now += th.cef_alive_every_ms;
+                g.on_alive(now, 2);
+                assert_eq!(g.on_tick(now, &th), None, "a beating reload at {now}");
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 2);
+
+        let (mut g, c) = crashed_ready(&th);
+        assert_eq!(g.on_tick(c + restart_after, &th), Some(Restart));
+        let off = c + th.cef_hang_after_ms;
+        assert_eq!(g.on_tick(off, &th), hide(Crash, 1));
+        g.on_ready(off, 2);
+        assert!(
+            matches!(g.state(), GraphicsState::Ready { .. }),
+            "late, but Ready"
+        );
+        let again = off + 1;
+        assert_eq!(g.on_crashed(again, 2, &th), None, "the second failure backs off");
+        assert_eq!(g.on_tick(again + wait(&th, 1), &th), Some(Restart));
+        assert_eq!(
+            g.on_tick(again + th.cef_hang_after_ms, &th),
+            hide(Crash, 2),
+            "the late Ready lifted the hide: its page's frame was on air, and held"
+        );
+    }
+
+    // Two crashes in one hold (the page, then its reload while loading) keep the FIRST crash's clock
+    // and generation: the frame on air is the first page's, and it has been held since then.
+    #[test]
+    fn a_second_crash_keeps_the_first_crashs_clock() {
+        let th = t();
+        let (mut g, c) = crashed_ready(&th);
+        let first = c + wait(&th, 0);
+        assert_eq!(g.on_tick(first, &th), Some(Restart));
+        let second_crash = first + 1;
+        assert_eq!(g.on_crashed(second_crash, 2, &th), None, "the second failure");
+        let second = second_crash + wait(&th, 1);
+        assert_eq!(g.on_tick(second, &th), Some(Restart));
+        let off = c + th.cef_hang_after_ms;
+        assert!(off < second_crash + th.cef_hang_after_ms);
+        assert_eq!(g.on_tick(off - 1, &th), None);
+        assert_eq!(
+            g.on_tick(off, &th),
+            hide(Crash, 1),
+            "the first crash's clock and page"
+        );
+        assert_eq!(g.generation(), 3);
+    }
+
+    // A crash holds only a frame that is on air. Nothing is on air before the first Ready, and none
+    // from a hide until the next Ready, so those crashes hide nothing: one hide per frame. A recycle
+    // keeps its page's last frame on air, so a crash of the reload holds that frame and hides it.
+    // A crash from another generation, or reported again while backing off, arms nothing.
+    #[test]
+    fn a_crash_holds_only_a_frame_on_air() {
+        let th = t();
+        // Generation 1 never signalled ready: nothing on air.
+        let mut g = Graphics::new();
+        g.on_tick(0, &th);
+        assert_eq!(g.on_crashed(10, 1, &th), None);
+        assert_eq!(g.on_tick(10 + wait(&th, 0), &th), Some(Restart));
+        assert_eq!(
+            g.on_tick(10 + th.cef_hang_after_ms, &th),
+            None,
+            "nothing was on air"
+        );
+
+        // A hang hid generation 1; its reload crashes while loading: already off air.
+        let (mut g, r) = ready_at(&th);
+        let hang = r + th.cef_hang_after_ms;
+        assert_eq!(g.on_tick(hang, &th), hide(Hang, 1));
+        let first = hang + wait(&th, 0);
+        assert_eq!(g.on_tick(first, &th), Some(Restart));
+        assert_eq!(g.on_crashed(first + 1, 2, &th), None);
+        assert_eq!(g.on_tick(first + 1 + wait(&th, 1), &th), Some(Restart));
+        assert_eq!(
+            g.on_tick(first + 1 + th.cef_hang_after_ms, &th),
+            None,
+            "the hang's hide still covers it"
+        );
+
+        // A recycle: generation 1's last frame is on air while generation 2 loads.
+        let (mut g, r) = ready_at(&th);
+        let recycle = r + th.cef_recycle_every_ms;
+        g.on_alive(recycle - 1, 1);
+        assert_eq!(g.on_tick(recycle, &th), Some(Restart));
+        let before = g.clone();
+        assert_eq!(g.on_crashed(recycle + 1, 1, &th), None);
+        assert_eq!(g, before, "the recycled generation's crash arms nothing");
+        let c = recycle + 2;
+        assert_eq!(g.on_crashed(c, 2, &th), None);
+        let backing_off = g.clone();
+        assert_eq!(g.on_crashed(c + 1, 2, &th), None);
+        assert_eq!(
+            g, backing_off,
+            "reported again while backing off: the same failure"
+        );
+        assert_eq!(g.on_tick(c + wait(&th, 0), &th), Some(Restart));
+        assert_eq!(g.on_tick(c + th.cef_hang_after_ms - 1, &th), None);
+        assert_eq!(
+            g.on_tick(c + th.cef_hang_after_ms, &th),
+            hide(Crash, 2),
+            "the recycled frame, held by the reload's crash"
+        );
+    }
+
+    // A crash that is the count-th failure hides at once as `Failed`, and no crash hide follows,
+    // whether a hold was running or not: entering Failed takes the frame off air.
+    #[test]
+    fn a_crash_at_the_count_hides_once_as_failed() {
+        let th = t();
+        let (mut g, c) = crashed_ready(&th);
+        let mut now = c;
+        for gen in 2..=th.cef_fail_count as u64 {
+            now += wait(&th, gen as usize - 2);
+            assert_eq!(g.on_tick(now, &th), Some(Restart));
+            now += 1;
+            let a = g.on_crashed(now, gen, &th);
+            let at_count = gen == th.cef_fail_count as u64;
+            assert_eq!(
+                a,
+                hide(Failed, gen).filter(|_| at_count),
+                "crash of generation {gen}"
+            );
+        }
+        assert!(
+            now < c + th.cef_hang_after_ms,
+            "Failed inside the first crash's hold"
+        );
+        let GraphicsState::Failed { retry_at } = g.state() else {
+            panic!("expected Failed, got {:?}", g.state())
+        };
+        for at in [c + th.cef_hang_after_ms, now + th.cef_hang_after_ms, retry_at - 1] {
+            assert_eq!(g.on_tick(at, &th), None, "no crash hide after Failed, at {at}");
+        }
+
+        // Every crash from a Ready page, the last one the count-th.
+        let span = th.cef_fail_window_ms;
+        let (mut g, last) = crashes(&spread(th.cef_fail_count, span), &th);
+        assert_eq!(last, hide(Failed, th.cef_fail_count as u64));
+        assert_eq!(g.on_tick(span + th.cef_hang_after_ms, &th), None);
+    }
+
+    // A crash hide does not stop the reload (C08 maps it to `hide_overlay()` alone), so that reload
+    // can still fail: its load timeout at the count enters Failed and hides again, as `Failed`, with
+    // no restart between the two hides. That is the only pair of hides with none between.
+    #[test]
+    fn a_crash_hide_then_the_reload_fails_at_the_count() {
+        let th = t();
+        let (mut g, c) = crashed_ready(&th);
+        let first = c + wait(&th, 0);
+        assert_eq!(g.on_tick(first, &th), Some(Restart));
+        assert_eq!(g.on_crashed(first + 1, 2, &th), None, "the second failure");
+        let second = first + 1 + wait(&th, 1);
+        let off = c + th.cef_hang_after_ms;
+        let timeout = second + th.cef_load_timeout_ms;
+        assert!(
+            second < off && off < timeout,
+            "restart, hide, then the load timeout"
+        );
+        let mut acts = Vec::new();
+        let mut now = first + 1;
+        while acts.len() < 3 {
+            now += 1;
+            assert!(now <= timeout, "no third action by {timeout}");
+            if let Some(a) = g.on_tick(now, &th) {
+                acts.push((now, a));
+            }
+        }
+        let want = vec![
+            (second, Restart),
+            (off, hide(Crash, 1).unwrap()),
+            (timeout, hide(Failed, 3).unwrap()),
+        ];
+        assert_eq!(acts, want);
+        assert_eq!(th.cef_fail_count, 3, "the third failure is the count-th here");
+    }
+
+    // Under `Thresholds::default()` the hold equals the load timeout (both 10 s), so reading the wrong
+    // field, or timing the hold from the reload's restart, is invisible there. Here they differ.
+    #[test]
+    fn the_hold_reads_cef_hang_after_ms_from_the_crash() {
+        let th = Thresholds {
+            cef_hang_after_ms: 7_777,
+            cef_load_timeout_ms: 20_000,
+            cef_alive_every_ms: 1_111,
+            cef_backoff_base_ms: 250,
+            cef_backoff_cap_ms: 400,
+            ..t()
+        };
+        assert!(th.cef_hang_after_ms + th.cef_backoff_base_ms < th.cef_load_timeout_ms);
+        let (mut g, c) = crashed_ready(&th);
+        let restart = c + th.cef_backoff_base_ms;
+        assert_eq!(g.on_tick(restart, &th), Some(Restart));
+        let off = c + th.cef_hang_after_ms;
+        assert_eq!(g.on_tick(off - 1, &th), None);
+        assert_eq!(g.on_tick(off, &th), hide(Crash, 1), "the hold, from the crash");
+        assert_eq!(g.state(), GraphicsState::Starting { since: restart });
+    }
+
+    // A back-off as long as the hold (a base at `cef_hang_after_ms`): the hold's end and the restart
+    // fall due on one tick. The hide wins it, and the restart follows on the next tick.
+    #[test]
+    fn the_hold_wins_over_a_restart_due_on_the_same_tick() {
+        let base = t().cef_hang_after_ms;
+        let th = Thresholds {
+            cef_backoff_base_ms: base,
+            cef_backoff_cap_ms: base,
+            ..t()
+        };
+        let (mut g, c) = crashed_ready(&th);
+        let off = c + th.cef_hang_after_ms;
+        assert_eq!(g.on_tick(off - 1, &th), None);
+        assert_eq!(g.on_tick(off, &th), hide(Crash, 1), "the hide first");
+        assert_eq!(
+            (g.state(), g.generation()),
+            (
+                GraphicsState::Backoff {
+                    attempt: 0,
+                    until: off
+                },
+                1
+            )
+        );
+        assert_eq!(g.on_tick(off, &th), Some(Restart), "then the restart");
+        assert_eq!(g.generation(), 2);
+    }
+
+    // PR #22 review M3: a beat stamped earlier than the last one (C08 stamps on receipt from a
+    // monotonic clock, so this is unreachable today) never pulls the hang deadline in.
+    #[test]
+    fn an_earlier_stamped_beat_never_pulls_the_deadline_in() {
+        let th = t();
+        let (mut g, r) = ready_at(&th);
+        let (late, early) = (r + 2 * th.cef_alive_every_ms, r + th.cef_alive_every_ms);
+        g.on_alive(late, 1);
+        g.on_alive(early, 1);
+        assert_eq!(
+            g.state(),
+            GraphicsState::Ready {
+                since: r,
+                last_alive: late
+            }
+        );
+        assert_eq!(g.on_tick(early + th.cef_hang_after_ms, &th), None);
+        assert_eq!(g.on_tick(late + th.cef_hang_after_ms, &th), hide(Hang, 1));
     }
 
     #[test]
