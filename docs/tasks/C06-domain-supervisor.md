@@ -761,9 +761,14 @@ gets 410 and exits 0. That sequence is tested here.
   the unrouted-`CefAlive` mutant went red.
 - (Amended 2026-10-18, C05b PR #22 review) `Effect::HideOverlay { reason, gen }` carries the domain
   hide's reason and generation unchanged, from the Running tick and crash arms and from the hold.
-  The final hold runs the graphics tick and routes `CefCrashed`, mapping `Hide` and dropping
-  `Restart`. `the_final_hold_still_hides_a_hang_or_a_crash` passes, and both of its mutants went
-  red.
+  ~~The final hold runs the graphics tick and routes `CefCrashed`, mapping `Hide` and dropping
+  `Restart`.~~ (Superseded 2026-10-18: the hold runs `on_bound_tick` alone and routes `CefCrashed`;
+  "Amendment 2026-10-18 (C06 as built)".) `the_final_hold_still_hides_a_hang_or_a_crash` passes, and
+  both of its mutants went red.
+- (Amended 2026-10-18, as built, PR #24) 39 inline supervisor tests, the 3 sweeps in
+  `tests/supervisor.rs` (161 pairs, 7 exit paths, 48 ladder sessions) and the 2 properties at 512
+  cases pass, every count failing at 0. `a_recycle_due_in_the_hold_keeps_the_final_card_shown`
+  passes. 73 mutants: 72 red, 1 argued equivalent (the commit body lists each one).
 
 ## Final heartbeat with the exit reason (owner ruling 2026-10-15)
 
@@ -1160,6 +1165,72 @@ stays `OverlayHalfRate` after it. Print the number of bursts checked, and fail o
     correct, so the check must not run silent past it).
   - Every expected time comes from `Thresholds::default()`, never a literal.
 - **New mutant:** route `CefAlive` to nothing. Expected red: the new test.
+
+## Amendment 2026-10-18 (C06 as built, PR #24; the coordinator's carried decision)
+
+**The hold runs the bound alone.** Authority: the coordinator's decision on the C05b PR #22 review,
+carried into the C06 dispatch (2026-10-18): "during the final hold, the graphics tick runs ONLY the
+stale-frame bound, with no restart arms. Otherwise a recycle due in the hold drops the `Restart`
+after the domain has moved a generation, and the healthy Final card is hidden ~1 s." It supersedes
+the hold's graphics paragraph above (`holding`, "The graphics tick still runs … Its `Hide` is mapped
+and its `Restart` is dropped … That is harmless") and the 2026-10-18 Acceptance bullet "The final
+hold runs the graphics tick … mapping `Hide` and dropping `Restart`". It was not harmless: once a
+recycle moved the generation, the healthy page's beats were the "old generation's events" that get
+ignored, so the held frame's bound took the Final card off air before the hold ended.
+
+- `Graphics::on_bound_tick(now, t)` (C05b's module, new and additive): `on_tick`'s first check and
+  nothing else. `on_tick` now calls it first, so C05b's behaviour is unchanged (its 172 inline tests
+  and 9 sweeps pass unedited). It is a public-API addition to an earlier module, so it is reported as
+  a deviation under "Do not touch".
+- `holding`'s `Tick` maps only `on_bound_tick`'s `Hide`. No restart, load timeout, recycle or
+  cooldown's end runs in the hold, so no `Restart` is ever dropped and the generation never moves
+  under the page on air. The drain (C08: `graphics.stop()`) ends the page.
+- **Test 11** (`the_final_hold_still_hides_a_hang_or_a_crash`) keeps its hang, crash's-held-frame and
+  crash-at-the-count legs. Its recycle leg is rewritten: the recycle is due at `f + 1 000` with the
+  page silent since `f − 1 000`, so the hold runs no recycle and the page's own frame comes off at its
+  bound, `HideOverlay { reason: Hang, gen: 1 }` at the first tick at or after `f + 9 000` (the same
+  instant as the superseded `Recycle` leg). Every leg asserts the Final card on every hold tick and no
+  `RestartGraphics` from `f` to its `DrainOutput`. It is four tests, one per leg
+  (`the_final_hold_still_hides_a_hang_or_a_crash_1_hang`, `_2_crash_held_frame`,
+  `_3_recycle_due_silent_page`, `_4_crash_at_the_count`), so a mutant's red names every leg it breaks
+  (as one test it stopped at its first). An inline domain test cannot print (the crate forbids
+  `clippy::print_stderr`), so there is no `hold legs checked` line.
+- **New test** `a_recycle_due_in_the_hold_keeps_the_final_card_shown`: the page beats every
+  `cef_alive_every_ms`, a quarter beat off its ready's grid, through the hold; the recycle is due at
+  `f + 1 000`. It asserts its precondition (a recycle run in the hold would hide inside it: the last
+  beat before the recycle is at R − 1 500, and R − 1 500 + `cef_hang_after_ms` < `f + final_hold_ms`),
+  then no `HideOverlay` and no `RestartGraphics` from `f` to the drain, generation 1 throughout, and
+  every hold beat reports `graphics: Ready`.
+- **Mutants:** the hold runs the full graphics tick, dropping `Restart` (expected red: the new test
+  and test 11's recycle leg); the hold runs no graphics tick (test 11's first three legs); the hold
+  ignores `CefCrashed` (its fourth leg); and the bound's own mutants (its comparison, `on_tick` without
+  it, the bound tick ending a back-off or recycling, a hang at the bound not counted).
+
+**As built, against the merged code** (each also in `docs/_INDEX.md`'s false-premise rows):
+
+- `Event::OutputProgress { gen, total_bytes }` replaces `OutputConnected`/`OutputAck` (Owed 13):
+  `self.output.on_progress(now, gen, total_bytes)`, then `output_ever_connected` from
+  `is_connected()`. Tests send a growing total.
+- `BootstrapFailed` counts only while a fetch is in flight (`retry_at: None`). One fetch has one
+  outcome, so a second report neither moves the retry nor doubles the next wait
+  (`a_second_failure_report_for_one_fetch_changes_nothing`; mutant B4).
+- The final-beat section's triggers: `SessionGone` is a 410 at bootstrap (`Refusal::Gone`, this
+  brief's own refusal table and C07's), not a 404, which is `Refused` (78). No C06 event carries a
+  heartbeat refusal: C08 maps a heartbeat `Err` to `HeartbeatFailed`. `ProgrammeStartFailed` is not a
+  domain event: C08 maps a start `Err` to `Event::Fatal`, which the test drives.
+- `ExitInfo.detail` is always `None` from the domain: `Event::Fatal` carries no text, so nothing
+  produces C12's "non-empty `exitDetail`" on a fatal exit (`docs/_INDEX.md` Owed 27).
+- The sweeps live in `crates/domain/tests/supervisor.rs` (the pair matrix, the 7 exit paths, the
+  ladder sessions) and `tests/properties.rs`; there is no `supervisor_props.rs`. The crate root
+  forbids `clippy::print_stderr`, and every sweep prints its count.
+- The pair matrix: 7 lifecycle setups × 23 event kinds = 161 pairs, from an exhaustive `match` on
+  `Event`. A routed event must change the supervisor and an ignored one must leave it equal.
+- Properties: P1′, P2–P4 (plus a stale-generation `CefAlive` that must change nothing), P5, P6
+  (every `Exit` follows a `Stopped` beat with its reason and the contract's code; only `Stopped`
+  beats carry one) and P7 (the hold drains on the first tick at or after `final_hold_ms`, with its
+  reason, and never before). Each count prints and fails on 0.
+- The brief's code comments name the host (`Fly`). `scripts/check-portable.sh` refuses that word
+  anywhere under `crates/`, so the built comments say "the host".
 
 ## Do not touch
 
