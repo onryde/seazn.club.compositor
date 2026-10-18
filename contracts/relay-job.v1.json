@@ -1,0 +1,602 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seazn.club/contracts/relay-job.v1.json",
+  "title": "Seazn relay job, v1: the Machine's session facts and heartbeat",
+  "description": "The web↔Machine contract for a relay session (compositor spec 2026-10-14 §5.3, §5.4). The root is bare: validate against #/$defs/session (the GET's data), #/$defs/heartbeat (the POST body) and #/$defs/heartbeatReply (the POST's data). On the wire a 200 is the house envelope `{ \"ok\": true, \"data\": … }` and this shape is its `data`; every refusal is `{ \"ok\": false, … }` with its status. Inside the Machine, the overlay page reads the compositor's loopback phase endpoint: #/$defs/phaseReply is its reply and #/$defs/phaseEndpoint where it listens (overlay templates spec 2026-10-15 §4.3). Vendored into the compositor repo (C07); its sha256, parity with its zod twins and its fixtures are pinned by apps/web/src/server/api-v1/__tests__/relay-contract.test.ts.",
+  "$defs": {
+    "session": {
+      "description": "GET /api/internal/relay/sessions/{sid} with `Authorization: Bearer <job token>`: the facts a Machine boots from (compositor spec 2026-10-14 §5.3; web `sessionFactsForJob`). On the wire a 200 is the house envelope `{ \"ok\": true, \"data\": … }` and this shape is its `data`; every refusal is `{ \"ok\": false, … }` with its status. Strict: no other key. A refused token is 401 (one body for every cause), an unknown session 404, a terminal one 410 with code SESSION_ENDED. The four composed-only keys (input, output, heartbeatIntervalMs, overlayUrl) are absent on a passthrough session; a compositor refuses any session that is not composed or lacks one of them.",
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "description": "The broadcast session: the Machine's SESSION_ID.",
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "fixtureId": {
+          "description": "The fixture the session broadcasts. null once that fixture has been deleted mid-session: the session outlives it and ends through the normal commands (V410 `on delete set null`).",
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mode": {
+          "description": "\"passthrough\" (no Machine composes) or \"composed\".",
+          "type": "string",
+          "enum": [
+            "passthrough",
+            "composed"
+          ]
+        },
+        "themeId": {
+          "description": "The overlay theme picked at Go live, or null for the default theme.",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "overlayDelayMs": {
+          "description": "How far the score overlay runs behind real time, in milliseconds, fixed for the session when it is created: the fixture's override, or else the measured camera-to-compositor delay (ADR 0006; web config.ts RELAY_OVERLAY_DELAY_DEFAULT_MS). 0 is a real value, never \"unset\". On a composed session it must agree with the `delay=` in overlayUrl.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "maxDurationMinutes": {
+          "description": "The session's own duration cap. A Machine's deadline authority is RELAY_DEADLINE_AT (env), not this.",
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "target": {
+          "description": "Where the Machine pushes. Passthrough: the organiser's destination. Composed: Cloudflare Input B's RTMPS ingest, never the destination itself (§5.3, R2004).",
+          "type": "object",
+          "properties": {
+            "url": {
+              "description": "The RTMP(S) ingest URL, without the key.",
+              "type": "string"
+            },
+            "streamKey": {
+              "description": "The stream key. A credential: never logged, never in argv, never formatted into an error.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "url",
+            "streamKey"
+          ],
+          "additionalProperties": false
+        },
+        "pageToken": {
+          "description": "A relay-page token for this session: the overlay page's credential. Never logged.",
+          "type": "string"
+        },
+        "input": {
+          "description": "Composed only: Cloudflare Input A slot 0's SRT playback, the camera the compositor reads (§5.3, R2004).",
+          "type": "object",
+          "properties": {
+            "protocol": {
+              "description": "Always \"srt\".",
+              "type": "string",
+              "const": "srt"
+            },
+            "url": {
+              "description": "srt://host:port and nothing else: no path, no query, no userinfo. The stream id and the passphrase travel as their own fields.",
+              "type": "string",
+              "pattern": "^srt:\\/\\/[^\\s/?#@]+:\\d+$"
+            },
+            "streamId": {
+              "description": "The SRT stream id. A credential.",
+              "type": "string"
+            },
+            "passphrase": {
+              "description": "The SRT passphrase. A credential.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "protocol",
+            "url",
+            "streamId",
+            "passphrase"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "description": "Composed only: the programme encode. 720p30 (1280×720, 30 fps, 4000 kbps) by default, 1080p30 (1920×1080, 30 fps, 6000 kbps) when flagged (compositor ADR 0005). A compositor refuses any other profile.",
+          "type": "object",
+          "properties": {
+            "width": {
+              "description": "Pixels.",
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "height": {
+              "description": "Pixels.",
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "fps": {
+              "description": "Frames per second.",
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "videoKbps": {
+              "description": "The video bitrate, kbit/s.",
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "width",
+            "height",
+            "fps",
+            "videoKbps"
+          ],
+          "additionalProperties": false
+        },
+        "heartbeatIntervalMs": {
+          "description": "Composed only: how often the Machine POSTs its heartbeat, in milliseconds (§5.3; web config.ts RELAY_HEARTBEAT_INTERVAL_MS).",
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "overlayUrl": {
+          "description": "Composed only: the score overlay page the compositor renders, {APP_URL}/overlay/fixtures/{fixtureId}?sid={sessionId}&st={pageToken}&host=compositor&delay={overlayDelayMs} (R2004). It carries the page token, so it is logged only with its query removed. Its `delay=` appears exactly once and equals overlayDelayMs: the server never serves, and a compositor refuses, a session whose overlayUrl has no `delay=`, has it twice, or has a different value. Neither number is defaulted from the other.",
+          "type": "string",
+          "format": "uri"
+        }
+      },
+      "required": [
+        "sessionId",
+        "fixtureId",
+        "mode",
+        "themeId",
+        "overlayDelayMs",
+        "maxDurationMinutes",
+        "target",
+        "pageToken"
+      ],
+      "additionalProperties": false
+    },
+    "heartbeat": {
+      "description": "POST /api/internal/relay/sessions/{sid}/heartbeat with `Authorization: Bearer <job token>`, every heartbeatIntervalMs (compositor spec 2026-10-14 §5.3): the Machine's report, and the control channel. The body is bare (no envelope). Strict: an unknown key is a 400, never dropped. Every field but `state` is optional. Omitted when not measured, never sent as 0: a present 0 is a measured zero. null is admitted and stored as sent, but a compositor omits a field rather than sending null. The server keeps the whole latest body and every beat as a sample. The 200 is `{ \"ok\": true, \"data\": <heartbeatReply> }`; 400 a body this schema refuses; 401 a refused token; 404 an unknown session; 410 SESSION_ENDED.",
+      "type": "object",
+      "properties": {
+        "state": {
+          "description": "starting | playing | stalled | stopped. `playing` means the output is connected, whether it carries a slate or the camera (owner ruling 2026-10-14); the camera's own state is in programmePhase and input.",
+          "type": "string",
+          "enum": [
+            "starting",
+            "playing",
+            "stalled",
+            "stopped"
+          ]
+        },
+        "videoState": {
+          "description": "R1's video state word, verbatim, at most 40 characters. The compositor does not send it.",
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 40
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fps": {
+          "description": "Programme frames per second. Omitted when not measured, never sent as 0: a present 0 is a measured zero.",
+          "anyOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bitrateKbps": {
+          "description": "Output bitrate, kbit/s. Omitted when not measured, never sent as 0: a present 0 is a measured zero.",
+          "anyOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "egressBytes": {
+          "description": "Bytes the output has sent since the Machine started, a whole number. Omitted when not measured: an omitted value leaves the stored count unchanged, and only a reported 0 stores 0.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "measuredLatencyMs": {
+          "description": "Measured latency, whole milliseconds. Omitted when not measured, never sent as 0: a present 0 is a measured zero.",
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "droppedFrames": {
+          "description": "Frames dropped (the compositor: encoder overruns that stepped the ladder), a whole number. A present 0 is a measured zero.",
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "encoderSpeed": {
+          "description": "Encoder speed, 1.0 is real time. Omitted when not measured, never sent as 0: a present 0 is a measured zero.",
+          "anyOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cpuPct": {
+          "description": "Machine CPU, percent. Omitted when not measured, never sent as 0: a present 0 is a measured zero.",
+          "anyOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "memMb": {
+          "description": "Machine memory, MB. Omitted when not measured, never sent as 0: a present 0 is a measured zero.",
+          "anyOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "programmePhase": {
+          "description": "The programme (compositor C03, C06): `waiting` before the first camera frame, `live`, `frozen` after 0.5 s with no frame, `reconnecting` (the slate) after 3 s. Back to `live` after 1 s of continuous frames. `final` is the final hold (compositor C06 `Holding`, its 2026-10-15 amendment; overlay templates spec 2026-10-15 §4.2): the compositor enters it on the FIRST end request (an `ending` heartbeat reply, a SIGINT, which is web's organiser and deadline stop, or its own deadline, RELAY_DEADLINE_AT) and shows the Final scene for FINAL_HOLD_MS before it drains and sends EOS. A later end request keeps the first one's clock. It is terminal and wins over every camera state, and the exit beat after a hold carries it too. A SIGTERM that arrives before any hold (the platform's controlled stop) drains at once with no hold, so that exit beat does not carry `final`.",
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "waiting",
+                "live",
+                "frozen",
+                "reconnecting",
+                "final"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "input": {
+          "description": "The camera link, the SRT read of Input A (compositor C04): connecting, connected, or backoff between retries.",
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "connecting",
+                "connected",
+                "backoff"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "output": {
+          "description": "The programme push to Input B (compositor C04): connecting, connected, or backoff between retries.",
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "connecting",
+                "connected",
+                "backoff"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "graphics": {
+          "description": "The score overlay renderer (compositor C05): starting, ready, restarting, or failed (the camera goes out without the overlay).",
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "starting",
+                "ready",
+                "restarting",
+                "failed"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "inputKicks": {
+          "description": "How many times the camera's playback was closed under the compositor within the kick window (5 minutes). A present 0 is a measured zero.",
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "inputKickAlert": {
+          "description": "true once inputKicks exceeds the alert count (more than 3 in 5 minutes): a second reader or Cloudflare maintenance.",
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "pipelineRebuilds": {
+          "description": "Camera pipeline builds after the first, since the process started. A present 0 is a measured zero.",
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sinkSwaps": {
+          "description": "Output pipeline builds after the first, since the process started. A present 0 is a measured zero.",
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rung": {
+          "description": "The degrade ladder's rung (compositor C05): full, or overlay_half_rate, the bottom, where the overlay is refreshed at half rate. The score is never removed (owner ruling 2026-10-18), so the ladder has no lower rung, and the bottom holds: the compositor never steps back up (a restarted process starts on full). Anything but full means the encoder overran and the ladder stepped down: the Machine is short of CPU, and the server raises a sizing alarm.",
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "full",
+                "overlay_half_rate"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scoreStale": {
+          "description": "true while the overlay page cannot reach the score feed (it keeps the last score). Omitted until the page has reported either way.",
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "phaseChannel": {
+          "description": "Which channel the overlay page reads the programme phase from (overlay templates spec 2026-10-15 §4.3): `loopback`, the compositor's own endpoint (#/$defs/phaseEndpoint, the primary), or `web`, the fallback that reads programmePhase from the session's latest beat through the page's data poll (the page switches after 3 failed loopback attempts). Omitted until the page has reported.",
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "loopback",
+                "web"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "exitReason": {
+          "description": "Sent only with `state: \"stopped\"`, on the final beat: why the Machine is exiting (compositor C06 `ExitReason`). ended, deadline, signalled and session_gone exit 0; refused exits 78; fatal exits 70. A beat in any other state that carries exitReason or exitDetail is refused (400); this schema states it as its if/then. The server records the reason with the beat; the runner's observed exit stays the authority for how the session ends.",
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "ended",
+                "deadline",
+                "signalled",
+                "session_gone",
+                "refused",
+                "fatal"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "exitDetail": {
+          "description": "Sent only with `state: \"stopped\"`, on the final beat: what went wrong, in words. The server's bound is 200 UTF-16 code units. This schema's maxLength counts characters (code points), and a character is at most two UTF-16 code units, so it publishes 100 characters: a text within that is never refused. Redacted by the compositor before it is sent (no key, token or query). The server scrubs it again before storing it (anything JWT-shaped, the session's own job token, everything from the first `?`), and both stores keep the same text. Human text, never parsed.",
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 100
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "additionalProperties": false,
+      "if": {
+        "type": "object",
+        "anyOf": [
+          {
+            "type": "object",
+            "required": [
+              "exitReason"
+            ],
+            "properties": {
+              "exitReason": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "exitDetail"
+            ],
+            "properties": {
+              "exitDetail": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "const": "stopped"
+          }
+        }
+      }
+    },
+    "heartbeatReply": {
+      "description": "The `data` of a heartbeat's 200 (compositor spec 2026-10-14 §5.3): what the Machine must do. A Machine takes no inbound traffic, so this reply is the only way a stop reaches it.",
+      "type": "object",
+      "properties": {
+        "desiredState": {
+          "description": "\"live\": keep going. \"ending\": flush, send EOS and exit 0.",
+          "type": "string",
+          "enum": [
+            "live",
+            "ending"
+          ]
+        }
+      },
+      "required": [
+        "desiredState"
+      ],
+      "additionalProperties": false
+    },
+    "phaseReply": {
+      "description": "GET http://127.0.0.1:{port}{path}?after=<seq> (#/$defs/phaseEndpoint) inside the Machine: the compositor's loopback reply, which the overlay page reads when its URL carries host=compositor (overlay templates spec 2026-10-15 §4.3). Served by the compositor, not web, so it is bare JSON with no envelope. `?after=<seq>` long-polls: the request is held at most longPollMaxMs. Strict: no other key.",
+      "type": "object",
+      "properties": {
+        "phase": {
+          "description": "The programme phase, in heartbeat.programmePhase's words.",
+          "type": "string",
+          "enum": [
+            "waiting",
+            "live",
+            "frozen",
+            "reconnecting",
+            "final"
+          ]
+        },
+        "seq": {
+          "description": "The phase's sequence number, a whole number, never negative. A reader passes the last one it saw as `after`.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "phase",
+        "seq"
+      ],
+      "additionalProperties": false
+    },
+    "phaseEndpoint": {
+      "description": "Where the compositor's phase endpoint listens (overlay templates spec 2026-10-15 §4.3). Not a message: three constants, each published as a const. Web declares them in lib/relay-phase.ts, and a vendoring repo drift-tests its own copies against this file (C12). Loopback only (127.0.0.1) inside the Machine: never exposed outside it, and not part of the outbound-only host contract (compositor ADR 0007). The page is https and the endpoint is loopback, so the compositor answers the preflight with `Access-Control-Allow-Private-Network: true` and a CORS origin locked to the app's exact origin.",
+      "type": "object",
+      "properties": {
+        "port": {
+          "description": "The TCP port on 127.0.0.1. Unprivileged (above 1023) and below Linux's default ephemeral range (32768–60999), so no outbound socket is handed it first.",
+          "type": "number",
+          "const": 7419
+        },
+        "path": {
+          "description": "The path: GET {path}?after=<seq>.",
+          "type": "string",
+          "const": "/phase"
+        },
+        "longPollMaxMs": {
+          "description": "The longest a long-poll is held, in milliseconds.",
+          "type": "number",
+          "const": 10000
+        }
+      },
+      "required": [
+        "port",
+        "path",
+        "longPollMaxMs"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

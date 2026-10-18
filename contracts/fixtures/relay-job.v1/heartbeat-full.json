@@ -1,0 +1,23 @@
+{
+  "state": "playing",
+  "videoState": "running",
+  "fps": 29.97,
+  "bitrateKbps": 4012,
+  "egressBytes": 187654321,
+  "measuredLatencyMs": 3104,
+  "droppedFrames": 3,
+  "encoderSpeed": 0.998,
+  "cpuPct": 63.5,
+  "memMb": 912,
+  "programmePhase": "frozen",
+  "input": "backoff",
+  "output": "connected",
+  "graphics": "restarting",
+  "inputKicks": 4,
+  "inputKickAlert": true,
+  "pipelineRebuilds": 2,
+  "sinkSwaps": 1,
+  "rung": "overlay_half_rate",
+  "scoreStale": true,
+  "phaseChannel": "web"
+}
