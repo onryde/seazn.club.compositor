@@ -93,10 +93,18 @@ cases to 12, and the Step 7 commit title says twelve:
 | # | File | Script | Verdict (`.jq`) |
 |---|---|---|---|
 | 11 | `cef-hung` | At 20 s, the harness page hangs: C11's `?crash=1` (`while(true){}` after ready), armed with `crash_after_ms` to fire at 20 s. Run 60 s | Hide at once (owner-approved design (2026-10-18); "at once" is the coordinator's reading of it). **The strip, frame-exact:** the overlay strip holds the **same** index from the hang until the hang is detected, at most `$t.cef_hang_after_ms` + one frame period after the page's last `seazn:alive`. From there it shows **no overlay** (transparent, so no stale score) until generation `g+1`'s first frame after its `CefReady`, and then the overlay again (the positive pair). Camera strip frames continue (no freeze > 2 frames). `output_outages == []`. **The evidence, from the compositor's structured log (C12 amendment), never a beat in a window** (PR #21 review I3: the ~3.8 s non-ready span catches a 5 s beat only ~3 runs in 4):
-- the last `cef alive gen=g`
-- then `overlay hidden` at the last beat + `$t.cef_hang_after_ms` (± one tick), with no `cef crashed gen=g` before it
-- then `graphics restart gen=g+1` at + `$t.cef_backoff_base_ms`
-- then `cef ready gen=g+1`
+- ~~the last `cef alive gen=g`~~
+- ~~then `overlay hidden` at the last beat + `$t.cef_hang_after_ms` (± one tick), with no `cef crashed gen=g` before it~~
+- ~~then `graphics restart gen=g+1` at + `$t.cef_backoff_base_ms`~~
+- ~~then `cef ready gen=g+1`~~
+- (Amended 2026-10-18, C05b PR #22 review I2; the hide names its reason.) In order:
+  - exactly one `overlay hidden reason=hang gen=g`
+  - then `graphics restart gen=g+1`
+  - then `cef ready gen=g+1`
+
+  There is no `overlay hidden` with `reason=crash`, `reason=recycle` or `reason=failed` in the run. The timing is the
+  strip's, frame-exact (above), never a log timestamp: `ts=` is wall-clock time of unstated precision,
+  and the domain's clock is monotonic.
 
 Every beat in that span reads `ready`, `restarting` or `starting`, and never `failed`. **Anti-vacuity:** the log has at least 2 `cef alive gen=g` lines before the hang and none after it, the hang time comes from the page's own log line (never the script's timer), and the strip's transparent span is ≥ 1 frame |
 

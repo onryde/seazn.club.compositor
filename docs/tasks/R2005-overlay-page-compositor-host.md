@@ -556,6 +556,18 @@ the page is ready: cefsrc emits a buffer only when the page paints, so frame sil
   - Unmount, then remount: still one line per interval.
 - **E9** in `overlay-compositor.spec.ts`: with `host=compositor`, the console shows ≥ 2
   `seazn:alive` lines within 5 s after `seazn:ready`. Without `host`, it shows 0 in the same window.
+  - (Amended 2026-10-18, compositor C05b PR #22 review G3; coordinator decision, relayed) **The beat
+    survives a scene change.**
+    - With `host=compositor`, serve `live`, then `reconnecting`, then `final` through the route
+      (E2's mechanism), holding each for at least 6 s.
+    - The gap between consecutive `seazn:alive` lines never exceeds `2 × OVERLAY_ALIVE_EVERY_MS`
+      (4 s, well inside the compositor's 10 s), across each switch.
+    - Every scene logs at least one beat. Print the beats per scene, and fail on 0 in any of them.
+  - **Why.** A beat hook mounted under a scene subtree would unmount at the scene change. The
+    compositor would then read every scene change as a hang and hide the score.
+  - **Mutant M19:** mount the beat inside the live scene's subtree. Expected red: E9's scene legs.
+  - **One deploy.** Change 2 (ready) and change 10 (beat) ship in one deploy. A build with the ready
+    but no beat hangs every page, and reaches `graphics: failed` in about 35 s.
 
 ### Mutants
 
@@ -564,6 +576,7 @@ the page is ready: cefsrc emits a buffer only when the page paints, so frame sil
 | M16 | the beat starts on mount, not after ready | the unit "no `seazn:alive` before ready" |
 | M17 | the `host=compositor` gate is dropped | the unit "without `host`", E9's second half |
 | M18 | `clearInterval` on unmount is dropped | the remount unit |
+| M19 | (amended 2026-10-18, compositor C05b PR #22 review G3) the beat mounts inside the live scene's subtree | E9's scene legs |
 
 ### Files (amendment 2026-10-18)
 

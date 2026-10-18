@@ -18,6 +18,9 @@ cefsrc url=<overlayUrl> <readiness property from F-001> → video/x-raw,format=B
   The adapter never starts Xvfb itself.
 - `restart(gen, url)`: tear down the old graphics pipeline on the reaper thread. The **last overlay
   frame stays** in `FrameStore` (it's held), and a new pipeline is built for `gen`.
+- (Amended 2026-10-18, C05b PR #22 review I1) `stop()`: the same reaper teardown and kill fallback as
+  `restart()`, with no new pipeline. It returns without waiting, and before it returns it closes the
+  stopped generation's slot gate. See "stop() and the slot gate" below.
 
 **Events:**
 
@@ -108,6 +111,9 @@ source of truth.
   `_FINDINGS.md`, with the scene leg either run or recorded as owed to C17.
 - (Amended 2026-10-18, Owed 18) `seazn:alive` is relayed as `CefAlive{gen}`, the harness page
   beats, and the reaper kill fallback is proven: three tests, and mutants 4 and 5 went red.
+- (Amended 2026-10-18, C05b PR #22 review I1) `stop()` takes the reaper path and returns at
+  once, and the slot gate closes at `restart`, `stop` and a reported crash. Both new tests pass with
+  non-zero dropped-sample counts, and mutants 7–9 went red.
 - (Amended 2026-10-18, Owed 17) Ready-gated slot writes:
   `frames_before_ready_never_reach_the_slot` and
   `the_hidden_page_stays_off_air_and_the_retry_reaches_air` pass with non-zero counts on both
@@ -327,6 +333,50 @@ Record F-0xx `cef error pages`. Load three URLs through `cefsrc` in the image:
 For each, record whether frames arrive, the alpha at five sample pixels (the corners and the
 centre), and whether any `seazn:` line appears. The gate above makes none of them reach air before a
 ready, so this measures how much the gate protects. It is not a pass/fail. Paste the raw numbers.
+
+### `stop()` and the slot gate (amended 2026-10-18, C05b PR #22 review I1; coordinator decision, relayed)
+
+C05b made `HideOverlay → stop()` target a **hung** renderer for the first time. That is F-001's case,
+where `set_state(NULL)` did not return for 10 s. Before this amendment `stop()` had no stated
+semantics, and both readings broke the hide:
+- If it tears down synchronously on C08's loop thread, the loop that drives the programme ticks
+  blocks for 3–10 s, and a graphics hang stalls video.
+- If it is asynchronous with the gate left open, a page that revives can write the slot between the
+  hide and the teardown. CPU starvation at nice 10, the brief's own reason for 10 s, is exactly how a
+  hung page revives. The slot would then hold that frame through the next generation's Starting.
+
+So:
+- **`stop()` is the reaper path.** It tears the current pipeline down on the reaper thread, with
+  `restart()`'s `REAPER_KILL_AFTER_MS` kill fallback, and returns without waiting. It never blocks
+  C08's loop.
+- **The slot gate** is one adapter field: the generation whose samples may reach
+  `FrameStore::set_overlay`, opened only by that generation's own `seazn:ready` (Owed 17 above).
+  It closes synchronously, before the call returns or the event is sent:
+  - for the old generation, on `restart(g)`
+  - on `stop()`
+  - for generation `g`, when the adapter reports `CefCrashed{g}`
+
+  The last of these is what makes C05b's held frame a hold: a crashed page whose renderer is still
+  alive (`cef_rss_cap_mb`) stops writing at its report. The first does the same for a recycled page
+  at its restart (C05b's one bound, amended 2026-10-18 in the review's second round: a crashed or
+  recycled page's last frame stays in the slot at most `cef_hang_after_ms` after that page's last
+  beat, then `hide_overlay` clears it). A sample from a closed generation is dropped and counted. So
+  nothing of a hidden, crashed or recycled generation reaches the slot again, and the hide holds
+  until a later generation signals ready.
+- **The harness page revives on request.** `?crash=1` gains `&revive_after_ms=N`: the busy loop ends
+  after N ms, and the page beats and paints again. A page that never revives cannot witness the gate.
+
+New image tests (Step 1's table):
+
+| Test | What it asserts |
+|---|---|
+| `stop_never_blocks_and_closes_the_slot_on_a_page_hung_after_ready` | `restart(1, …overlay-test.html?crash=1&crash_after_ms=500&revive_after_ms=1500)`. `CefReady{1}` arrives, then at least one gen-1 sample in the slot (count them, fail on 0). During the hang, call `hide_overlay()` and then `stop()`, as C08 maps a `Hang` hide. `stop()` returns in under 200 ms (print it): it does not wait out `set_state(NULL)`. From its return on, no gen-1 sample reaches the slot. The slot stays empty, compared by bytes, while the revived page's appsink still delivers gen-1 samples that the gate drops. Count them, and fail on 0, naming it: a run in which the page never painted after `stop()` proves nothing. Every gen-1 renderer pid is gone within `REAPER_KILL_AFTER_MS` + 2 s |
+| `a_reported_crash_closes_its_generations_gate` | `cef_rss_cap_mb` is overridden low, so the adapter reports `CefCrashed{1}` while the page is alive and painting. From the report on, no gen-1 sample reaches the slot. The slot keeps its last frame (the hold), compared by bytes, and the gate counts the samples it dropped, failing on 0 |
+
+**New mutants** (Step 5):
+7. `stop()` leaves the gate open. Expected red: `stop_never_blocks_and_closes_the_slot_on_a_page_hung_after_ready`.
+8. `stop()` joins the teardown on the caller's thread. Expected red: the same test's 200 ms bound.
+9. The crash report leaves the gate open. Expected red: `a_reported_crash_closes_its_generations_gate`.
 
 ## Do not touch
 

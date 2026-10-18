@@ -43,6 +43,10 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
       fn drain(&mut self);
   }
   pub trait GraphicsRenderer: Send { fn restart(&mut self, gen: u64, url: &str); fn stop(&mut self); }
+  // (Amended 2026-10-18, C05b PR #22 review I1) `stop()` returns without waiting: it takes `restart()`'s
+  // reaper teardown and kill fallback (C11). Before it returns, it closes the stopped generation's slot
+  // gate, so no sample of that generation reaches the overlay slot after it, even from a page that revives.
+  // It never blocks the loop: F-001 measured `set_state(NULL)` not returning for 10 s on a hung renderer.
   pub trait Metrics: Send { fn sample(&mut self) -> Measured; }
   #[derive(Debug, Clone, PartialEq)] pub enum ControlRequest { FetchSession, Heartbeat(domain::health::HealthReport, Measured) }
   pub trait ControlQueue: Send { fn request(&mut self, req: ControlRequest); }
@@ -91,7 +95,9 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
   | `RebuildInput{gen}` | `input.rebuild(gen, &cfg.input)` |
   | `SwapSink{gen}` | `programme.swap_sink(gen, &cfg.target)` |
   | `RestartGraphics{gen}` | `graphics.restart(gen, &cfg.overlay_url)` |
-  | `HideOverlay` | `programme.hide_overlay()`, then **`graphics.stop()`** (amended 2026-10-18; coordinator decision 2026-10-16, Owed 17) |
+  | ~~`HideOverlay`~~ | ~~`programme.hide_overlay()`, then **`graphics.stop()`** (amended 2026-10-18; coordinator decision 2026-10-16, Owed 17)~~ |
+  | `HideOverlay { reason: Hang \| Failed, gen }` | log `overlay hidden reason=<r> gen=<g>` (C12), `programme.hide_overlay()`, then **`graphics.stop()`** (amended 2026-10-18; coordinator decision 2026-10-16, Owed 17; the reason from the C05b PR #22 review) |
+  | `HideOverlay { reason: Crash \| Recycle, gen }` | log `overlay hidden reason=<crash\|recycle> gen=<g>`, then `programme.hide_overlay()` **alone** (amended 2026-10-18, C05b PR #22 review; `Recycle` added in its second round, the one bound on a frame's age). A crashed generation's gate closed at its reported crash, and a recycled one's at its restart (C11). The reload now loading must survive: stopping it would turn the bound's hide into one more load timeout |
   | `StepDown(r)` | `programme.step_down(r)` |
   | `SendHeartbeat(h)` | `control.request(Heartbeat(h, metrics.sample()))` |
   | `DrainOutput` | `programme.drain()`, then `input.stop()` and `graphics.stop()` |
@@ -337,7 +343,10 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
 - `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 - (Amended 2026-10-18, Owed 17) `HideOverlay` maps to `hide_overlay()` then `graphics.stop()`.
   `hide_stops_the_hidden_page_and_the_retry_reaches_air` passes both halves, and the
-  dropped-stop mutant went red.
+  dropped-stop mutant went red. (Amended 2026-10-18, C05b PR #22 review) That holds for a `Hang` or
+  `Failed` hide. A `Crash` or `Recycle` hide maps to `hide_overlay()` alone.
+  `a_crash_hide_leaves_the_reload_loading` passes both its legs, and the stop-on-every-hide mutant
+  went red.
 - (Amended 2026-10-18, Owed 18) `hung_page_is_restarted_through_the_port` passes. Every hang gives
   `HideOverlay` + `GraphicsStop` at once (owner-approved design (2026-10-18); "at once" is the coordinator's reading of it), then one restart after
   `cef_backoff_base_ms`, and the `cef_fail_count`-th hang enters Failed.
@@ -423,7 +432,8 @@ Owner, 2026-10-18, in chat, relayed by the coordinator: "2 Ok", approving hang d
 ### Owed 17: the hide stops the hidden page and lifts for the retried one (Owner, 2026-10-18, in chat, relayed by the coordinator: "apply rec 4-9")
 
 The coordinator closed Owed 17 on 2026-10-16. C08 maps `HideOverlay` to `programme.hide_overlay()`
-**and** `graphics.stop()`. Stopping the hidden page means no late ready can re-open it, and it
+**and** `graphics.stop()` (amended 2026-10-18, C05b PR #22 review: for a `Hang` or `Failed` hide;
+see the scenario below for `Crash`). Stopping the hidden page means no late ready can re-open it, and it
 frees the page's CPU for the cooldown.
 
 - **New scenario test** `hide_stops_the_hidden_page_and_the_retry_reaches_air`, with
@@ -435,10 +445,39 @@ frees the page's CPU for the cooldown.
   - **The positive pair.** At the first tick at or after `retry_at`, `GraphicsRestart{gen: n+1}`
     appears. `CefReady{n+1}` makes `health().graphics` read `ready`. No `HideOverlay` follows, and
     no extra call is needed to lift the hide: there is no `show_overlay` port, so nothing in the
-    driver holds a hide flag.
+    driver holds a hide flag. (Amended 2026-10-18, C05b: "no `HideOverlay` follows" holds while
+    generation n+1 beats, `FakeGraphics::alive(n+1)` every `cef_alive_every_ms`, or within
+    `cef_hang_after_ms` of its ready. A Ready page that never beats hangs, and that hide is correct.)
   - Print the calls checked, and fail on 0.
 - **New mutant:** drop `graphics.stop()` from the `HideOverlay` mapping. Expected red: the
   negative half.
+
+### The crash and recycle hides leave the reload loading (amended 2026-10-18, C05b PR #22 review; coordinator decisions, relayed)
+
+The frame on air stays on air at most `cef_hang_after_ms` after its page's last beat (C05b's one
+bound, round 2 of the review). After a crash or a recycle, the domain then returns
+`Hide { reason: Crash | Recycle, gen }`, naming the page whose frame came off, usually while the
+reload is loading (the 1 s back-off has run, or the recycle itself restarted). So the mapping must
+not stop that reload.
+
+- **New scenario test** `a_crash_hide_leaves_the_reload_loading`, with `Thresholds::default()`.
+  `CefReady{1}`, then `CefAlive{1}` every `cef_alive_every_ms`, the last at `b`, then
+  `CefCrashed{1}` at `c`, before the next beat would come.
+  - `GraphicsRestart{gen: 2}` lands at the first tick at or after `c + cef_backoff_base_ms`.
+    Generation 2 sends nothing.
+  - At the first tick at or after `b + cef_hang_after_ms` (the last beat, not the crash), the log
+    has `Call::HideOverlay`, and **no** `Call::GraphicsStop`, then or before generation 2's ready.
+  - `CefReady{2}` comes 1 ms later, inside generation 2's load timeout. `health().graphics` reads
+    `ready`, and no further `HideOverlay` follows while generation 2 beats.
+  - The positive pair: a hang of generation 2 still logs `HideOverlay` then `GraphicsStop`.
+  - **The recycle leg**, with `cef_recycle_every_ms: 60_000` (the length is not under test).
+    Generation 1 beats until its recycle, the last beat at `b`; `GraphicsRestart{gen: 2}` lands on
+    the recycle's tick, and generation 2 sends nothing. At the first tick at or after
+    `b + cef_hang_after_ms`, the log has `Call::HideOverlay` with the log line
+    `overlay hidden reason=recycle gen=1`, and no `Call::GraphicsStop`.
+  - Print the calls checked, and fail on 0.
+- **New mutant:** map every `HideOverlay` to `hide_overlay()` + `graphics.stop()`. Expected red:
+  the scenario's "no `GraphicsStop`", in both legs.
 
 ## Do not touch
 
