@@ -66,6 +66,44 @@ configured, never forked. It runs only in our CI and on our own Machines, never 
 instance: stream keys and footage stay on infrastructure we control. Real Cloudflare behaviour is
 measured in C00 (F-002), copied into the MediaMTX config and case scripts, and proven live in C17.
 
+## Amendment 2026-10-18 (owner rulings on the ladder and on hang detection)
+
+Owner, 2026-10-18, in chat, relayed by the coordinator: "no lite mode; if CPU impacts, measure and
+raise the CPU size" (`docs/_INDEX.md` Owed 20), and "2 Ok" (Owed 18). The CPU-cost **measurement**
+and the size rule are C15's (the soak runs on the production guest; this suite runs on the harness
+host). This suite gains the following.
+
+**Case 6 (`cpu-starved`), the verdict gains three clauses** (Owed 20: "whichever is chosen, C14
+case 6 asserts what the overlay strip shows after the stress ends"):
+- The score is never removed. The overlay strip keeps following the timeline through the stress and
+  after it. Every overlay index change that `score.json` schedules in the window appears in the
+  strip, and no strip frame in the window has a transparent overlay.
+- Every beat's `rung` is `full` or `overlay_half_rate`, and no other value. A beat that reads
+  `overlay_half_rate` is followed by no `full` beat in the same process (the bottom holds, C05).
+- The verdict prints the rung of the last beat. A stepped rung is not a red here, because the
+  stress is meant to starve the encoder. In production it is the sizing alarm (C17 runbook).
+
+**The budget consistency test:** C05 deleted `ladder_step_min_gap_ms` (it gated only a second
+step). `BUDGET_LADDER_REALTIME_MS` is checked against `ladder_window_ms` instead: the ladder's one
+step lands within one window of its overruns, so `ladder_window_ms ≤ BUDGET_LADDER_REALTIME_MS`.
+
+**Case 11, `cef-hung`** (Owed 18, approved 2026-10-18; this grows the suite from 10
+cases to 11, and the Step 7 commit title says eleven):
+
+| # | File | Script | Verdict (`.jq`) |
+|---|---|---|---|
+| 11 | `cef-hung` | At 20 s, the harness page hangs: C11's `?crash=1` (`while(true){}` after ready), armed to fire at 20 s. Run 60 s | The overlay strip holds the **same** index (the held frame) from the hang until the restarted page's first frame, with no transparent gap. Camera strip frames continue (no freeze > 2 frames). A beat shows `graphics` leaving `ready` within `$t.cef_hang_after_ms + $t.heartbeat_interval_ms` of the hang. Per Owed 19, `restarting` **or** `starting` counts. A later beat is `ready` again. `output_outages == []`. **Anti-vacuity:** the compositor log has a `CefAlive` before the hang and none from the hung generation after it, and the hang time comes from the page's own log line, never from the script's timer |
+
+- **Every case's page beats.** The harness page logs `seazn:alive` like the real one (C11
+  amendment; false-premise row "The hang design needs only the real page to beat"). Without the
+  beat, C05b restarts the page every `cef_hang_after_ms` in every case, and cases 1–10 measure
+  restarts.
+- **Step 5 gains mutant 4.** Delete C05b's Ready hang arm in a scratch build. Expected red: case 11,
+  on its `graphics` clause. As with mutant 1, the verdict reads the committed
+  `harness/thresholds.json`.
+- **Files:** `harness/cases/cef-hung.{sh,jq}`.
+- **Acceptance:** 11 cases, each with an anti-vacuity clause, and 4 mutants red.
+
 ## Files
 
 - Create: `harness/cases/{camera-stop,camera-flap,reader-kicked,dest-disconnect,dest-stall,cpu-starved,score-down,cef-killed,process-killed,input-impaired}.{sh,jq}`

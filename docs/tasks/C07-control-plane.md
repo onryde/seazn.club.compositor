@@ -87,6 +87,14 @@ repo.
   Run it with the R2002 merge sha. Confirm the printed count equals the number of files under
   `docs/contracts/fixtures/relay-job.v1/` plus 1.
 
+  **(Amended 2026-10-18, `docs/_INDEX.md` Owed 24)** Run it with a `seazn.club` commit at or after
+  #980's merge, never the R2002 merge sha. #980 removed `fast_preset` from the heartbeat's `rung`,
+  and `docs/contracts/relay-job.v1.json` hashes to
+  `fc99d44899ee543cfe36c48902573501f815d68b4ec7c2e4bbb50d096608dc50` there (it was
+  `7091c0c4…6037` at R2002). The pin test's expected sha for that file is that value, or a later
+  bump's. A contract test asserts that the vendored schema's `rung` enum is exactly
+  `["full","overlay_half_rate"]`, and that every `Rung` variant serialises into it.
+
 - [ ] **Step 2: Dependencies.**
   - `crates/app`: `serde = { version = "1", features = ["derive"] }` is **not** needed yet, because
     ports are plain structs.
@@ -244,7 +252,8 @@ repo.
     - `graphics`: `starting|ready|restarting|failed`
     - `inputKicks`, `inputKickAlert`, `pipelineRebuilds`, `sinkSwaps`
     - `droppedFrames`: from `dropped_frames`. The domain measures it, so it's always present.
-    - `rung`: `full|overlay_half_rate|fast_preset`
+    - `rung`: `full|overlay_half_rate`. (Amended 2026-10-18, Owed 20: `fast_preset` is gone from
+      both C05's `Rung` and the contract; web answers a `fast_preset` beat with a 400)
     - `scoreStale`: only if `Some`
     - each `Measured` field: only if `Some`
 

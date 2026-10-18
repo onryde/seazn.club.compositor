@@ -393,6 +393,25 @@ impl PhasePublisher for FakePhase { fn publish(&mut self, p: ProgrammePhase, seq
   consecutive (the hold never pauses the programme clock: a frozen output would trip YouTube's gap
   timer, F-004).
 
+## Amendment 2026-10-18 (the hang beat; the ladder's rungs)
+
+Owner, 2026-10-18, in chat, relayed by the coordinator: "2 Ok", approving hang detection (`docs/_INDEX.md` Owed 18). Also owner, 2026-10-18, in chat, relayed by the coordinator: "no lite mode; if CPU impacts, measure and raise the CPU size" (`docs/_INDEX.md` Owed 20).
+
+- **Mapping.** `Inbound::Event(Event::CefAlive{gen})` is handed straight to `decide`, like every
+  other event. No driver rule changes: a hang becomes the domain's `RestartGraphics{gen}`, which the
+  driver applies as `graphics.restart(gen, &cfg.overlay_url)`.
+- **`FakeGraphics` gains `alive(gen)`.** It is a testkit helper that returns
+  `Inbound::Event(Event::CefAlive{gen})`, so scenario tests can send the beat by name.
+- **New scenario test:** `hung_page_is_restarted_through_the_port`.
+  - Ready gen 1, then beats every `cef_alive_every_ms` to t = 30 s, then silence.
+  - The log shows exactly one `Call::GraphicsRestart{gen: 2}`, at the first tick at or after
+    `last_alive + cef_hang_after_ms`. No `HideOverlay` follows the first hang.
+  - Repeat the hang `cef_fail_count` times within `cef_fail_window_ms`: the last one logs
+    `Call::HideOverlay`.
+  - Times come from `Thresholds::default()`.
+- **`StepDown(r)` → `programme.step_down(r)`:** `r` is only ever `OverlayHalfRate` (C05). The
+  existing overrun scenario asserts exactly one `step_down` call for a session of sustained overruns.
+
 ## Do not touch
 
 The domain crate's API, and the adapters (except to keep them compiling). (Amended 2026-10-15) The

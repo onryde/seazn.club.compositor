@@ -258,6 +258,39 @@ New test, added to Step 1's table:
 |---|---|
 | `phase_channel_signal_is_relayed` | `?channel=web` → `PhaseChannel(Web)`; `?channel=loopback` → `PhaseChannel(Loopback)`; `?channel=bogus` → **no** `PhaseChannel` event within 3 s after `CefReady` (the guard). Print `channel values checked: 3`. |
 
+## Amendment 2026-10-18 (hang detection, owner ruling)
+
+Owner, 2026-10-18, in chat, relayed by the coordinator: "2 Ok", approving hang detection (`docs/_INDEX.md` Owed 18). The domain half is C05b. This task relays the beat and kills a renderer that will not
+tear down.
+
+- **Parse the beat.** R2005's page logs `seazn:alive` every `cef_alive_every_ms` (2 s) after ready,
+  with `host=compositor` only, on F-001's console channel (`cefconsole`), the same stream as
+  `seazn:ready`. It never uses `gstSendMsg`: that accepts only `ready`/`eos`, and F-001 found that
+  the js-signal mode hangs `start()` and `set_state(NULL)`. The adapter sends
+  `Inbound::Event(Event::CefAlive{gen})`, tagged with the generation of the pipeline that logged it.
+  The line is matched exactly. Any other `seazn:alive…` text is logged at WARN and mapped to nothing.
+- **The harness page beats too.** `overlay-test.html` logs `seazn:alive` every 2 s after its ready
+  (false-premise row "The hang design needs only the real page to beat"). `?crash=1`
+  (`while(true){}` after ready) stops the beat with the rest of the page, and that is the point.
+  `?crash=1` gains an optional `&crash_after_ms=N` (default 500) so C14 can time the hang.
+- **Reaper kill fallback.** `restart(gen, url)` tears down on the reaper thread. When the old
+  pipeline's `set_state(NULL)` has not returned within `REAPER_KILL_AFTER_MS` (3 000, a const in
+  `cef_graphics.rs` that cites F-001: it did not return within 10 s in the js-signal hang), the
+  reaper sends `SIGKILL` to the old generation's CEF renderer pids (the pids F-001 identified and
+  the crash poll already watches). It logs the pids at WARN and moves on. The new generation is
+  built **without** waiting for the reaper. The held overlay frame stays in `FrameStore` throughout.
+- **New tests** (Step 1's table):
+
+  | Test | What it asserts |
+  |---|---|
+  | `alive_beats_are_relayed_with_their_generation` | `restart(1, …overlay-test.html)`: within 7 s, at least 2 `CefAlive{gen:1}` after `CefReady{gen:1}`, and none before it |
+  | `hung_page_stops_beating` | `?crash=1`: `CefAlive{gen:1}` arrives before the hang, and **none** in the 3 s after it, while the renderer pid is still alive (it is a hang, not a crash: no `CefCrashed`) |
+  | `reaper_kills_a_renderer_that_will_not_tear_down` | `?crash=1`, then `restart(2, …)`: within `REAPER_KILL_AFTER_MS` + 2 s every gen-1 renderer pid is gone, and `CefReady{gen:2}` arrives. Print the number of pids killed, and fail on 0 if teardown did not return by itself (log which path ran) |
+
+- **New mutants** (Step 5):
+  4. Map `seazn:alive` to nothing. Expected red: `alive_beats_are_relayed_with_their_generation`.
+  5. Delete the reaper's kill. Expected red: `reaper_kills_a_renderer_that_will_not_tear_down`.
+
 ## Do not touch
 
 The programme and input adapters, and the page in `seazn.club` (that's R2005). (Amended 2026-10-15)

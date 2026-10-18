@@ -194,6 +194,19 @@ Field meanings:
 - The report has every field populated (`late_frames_max`/`future_dated` may be 0; they're report-only).
 - 2 mutants went red.
 
+## Amendment 2026-10-18 (two owner rulings)
+
+- **The harness page beats** (Owed 18, "2 Ok"; C11 amendment). `overlay-test.html`, as extended
+  here, keeps C11's `seazn:alive` beat every 2 s after ready. Without it, once C05b is live, every
+  run restarts the page every 10 s. The checker gains `graphics.restarts_without_crash`: the count
+  of beats that move `graphics` out of `ready` with no `CefCrashed` in the compositor log. A green
+  run on cases other than C14's `cef-hung` must read 0.
+- **The rung on the beats** (Owed 20). `report.json`'s heartbeat summary gains `rungs`, the sorted
+  set of `rung` values seen. It may only contain `full` and `overlay_half_rate`. The checker fails
+  the run on any other value, which guards against a stale contract.
+- **Snow** (for C15's cost legs). `fake-camera` gains `--pattern snow`: `videotestsrc pattern=snow`
+  under the strip, which stays readable for the checker.
+
 ## Do not touch
 
 The compositor crates, except reading `adapters::redact`.

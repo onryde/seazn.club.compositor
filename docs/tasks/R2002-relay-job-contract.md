@@ -86,7 +86,7 @@ inputKicks: z.number().int().min(0).nullish(),
 inputKickAlert: z.boolean().nullish(),
 pipelineRebuilds: z.number().int().min(0).nullish(),
 sinkSwaps: z.number().int().min(0).nullish(),
-rung: z.enum(["full", "overlay_half_rate", "fast_preset"]).nullish(),
+rung: z.enum(["full", "overlay_half_rate", "fast_preset"]).nullish(), // amended 2026-10-18: z.enum(LADDER_RUNGS), no fast_preset
 scoreStale: z.boolean().nullish(),
 ```
 
@@ -210,6 +210,22 @@ exitDetail: z.string().max(200).nullish(),   // compositor-redacted; human text,
 They go everywhere the other new fields go: the schema `$defs`, OpenAPI, `ALLOWED_KEYS`, and both
 stores. Add a `heartbeat-final-fatal.json` fixture and an invalid `exitReason: "crashed"` fixture.
 The health-review SQL selects `exit_reason`. How web **reacts** to a stopped beat stays R2003's job.
+
+## Amendment 2026-10-18 (owner ruling on the ladder; done in `seazn.club` #980)
+
+Owner, 2026-10-18, in chat, relayed by the coordinator: "no lite mode; if CPU impacts, measure and
+raise the CPU size" (`docs/_INDEX.md` Owed 20). The score is never removed, so the compositor's
+ladder is `full → overlay_half_rate`, and the bottom holds.
+
+- **The schema.** `rung` is `z.enum(LADDER_RUNGS)`, where `LADDER_RUNGS = ["full",
+  "overlay_half_rate"]`. That is declared once, in the import-free `server/relay/domain/ladder.ts`,
+  because `schemas.ts` is loaded with no module resolver. A `fast_preset` beat is a 400.
+- **The contract.** `docs/contracts/relay-job.v1.json` is regenerated. Its sha256 moves from
+  `7091c0c4e10ad627e2aea34e85af085f31c391cbb7d2d8a8003b21c2a9ed6037` to
+  `fc99d44899ee543cfe36c48902573501f815d68b4ec7c2e4bbb50d096608dc50`. C07 vendors the new one (Owed 24).
+- **The sizing alarm.** Web's heartbeat use-case logs a WARN (`alarm: "sizing"`) and reports to
+  Sentry (`relay.sizing_alarm`) once per entry to a rung below `full`, on composed sessions only
+  (C17 runbook).
 
 ## Do not touch
 

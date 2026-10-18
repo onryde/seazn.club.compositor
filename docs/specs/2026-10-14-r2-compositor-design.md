@@ -173,7 +173,9 @@ can be enumerated in tests.
   - `FrameChoice`
   - `Backoff`
   - `DegradeLadder`: overlay fps 30→15 first, then x264 preset `veryfast`→`superfast`; never stall
-    the clock
+    the clock. **Amended 2026-10-18** (owner ruling, `docs/_INDEX.md` Owed 20): there is no preset
+    rung. F-001 found it cannot change live, and its fallback was to drop the overlay, so the ladder is
+    overlay fps 30→15 only, and the bottom holds. A step down is a sizing alarm (C17 runbook)
   - `ExitReason` → exit code
   - `Thresholds`
   - `HealthReport`: every optional field is an `Option`, so an absent value is never sent as zero,
@@ -248,8 +250,8 @@ adjustments below.
 | Camera loss | Frozen after 0.5 s, slate after 3 s, reconnect forever. iOS backgrounding makes this **normal operation**: it gets soaked, not just edge-tested. | Live 1.2 s after frames return |
 | CF closes SRT playback (second reader, maintenance) | Treated as camera loss. The peer's close reason is logged. More than 3 in 5 min raises an alert flag. | as above |
 | Output disconnect / stall | Sink swapped behind a 2 s leaky queue. Input and graphics untouched. | ≤5 s, ≤2 s of programme lost |
-| Encoder overrun | Drop frames before the encoder (`droppedFrames`), then step down the `DegradeLadder`. | Real time within 10 s |
-| CEF crash / hang | Hold the last overlay frame, restart with backoff. After 3 in 5 min, `graphics: failed`, and the camera goes out without the overlay. | n/a |
+| Encoder overrun | Drop frames before the encoder (`droppedFrames`), then step down the `DegradeLadder` (one rung, overlay at half rate; amended 2026-10-18, Owed 20). The score is never removed. In production a step down is a sizing alarm: raise the Machine size. | Real time within 10 s |
+| CEF crash / hang | Hold the last overlay frame, restart with backoff. After 3 in 5 min, `graphics: failed`, and the camera goes out without the overlay. A hang is detected by the page's 2 s `seazn:alive` beat stopping for 10 s (amended 2026-10-18, Owed 18; C05b). | n/a |
 | Score feed stale | The page keeps the last state and signals `scoreStale` after 10 s. The compositor relays it in the heartbeat. | First good poll |
 | Process crash | Fly `on-failure` restarts it (≤2). | Output back ≤15 s |
 | Machine loss | 3 missed beats (15 s), web marks `lost`, cold-start of `r<n+1>`. There is **no warm pool in R2**. | **~60 s** (the PDF's 30 s needs R4's warm pool) |

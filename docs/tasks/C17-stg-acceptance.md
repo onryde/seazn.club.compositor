@@ -40,7 +40,7 @@ the viewer sees**, **what to check**, and **what to do**.
 | `input: backoff` for > 60 s | camera gone: phone backgrounded, or capture stopped |
 | `graphics: failed` | CEF failed 3× in 5 min; the camera goes out without the overlay |
 | `scoreStale: true` | the page can't reach the score feed |
-| `rung != full` | encoder overrun; the ladder stepped down |
+| `rung != full` | **sizing alarm** (amended 2026-10-18, Owed 20/25; see below): encoder overrun, the ladder stepped to `overlay_half_rate` |
 | `output: backoff` | can't reach CF Input B |
 | session `lost` (web side, 3 missed beats) | Machine gone; `r<n+1>` cold-starts (~60 s) |
 | Machine exit 78 | refused: token, 404, or wrong mode |
@@ -56,6 +56,31 @@ Also include:
 - the **rollback**: `promote.yml` with the previous ref (C16)
 - **manual stop**: end the session in the organiser UI. **Never** `flyctl machine destroy` a live
   session's Machine, because the sweep would book an `r<n+1>`.
+
+**Amendment 2026-10-18 (owner rulings on the ladder and on hang detection).** These two runbook
+entries are written in full, in the runbook's four-line form:
+
+- **`rung != full`: the sizing alarm.** Owner, 2026-10-18, in chat, relayed by the coordinator: "no
+  lite mode; if CPU impacts, measure and raise the CPU size".
+  - **Meaning:** the Machine is short of CPU. The encoder overran, frames were dropped before it, and
+    the ladder stepped to `overlay_half_rate`. The bottom holds for the rest of that process.
+  - **Viewer sees:** the score stays on air, with the overlay refreshed at half rate (15 fps). The
+    match is not affected.
+  - **Check:** web logs `relay sizing alarm` at WARN (`alarm: "sizing"`, with `sid`, `orgId`, `rung`,
+    `previousRung`, `attempt` and `machineId`) and reports it to Sentry under route
+    `relay.sizing_alarm`, once per step (`seazn.club` #980). In the health review, the step shows in
+    `rung_stepped_beats`.
+  - **Do:** nothing during the match. Afterwards, raise the Machine size: a `seazn.club` PR moves R1's
+    `RUNNER_DEFAULT_GUEST` to the next performance size, after C15's cost legs pass on it (Owed 25).
+- **A hung overlay page** (Owed 18, "2 Ok", 2026-10-18).
+  - **Meaning:** the page stopped its 2 s `seazn:alive` beat for `cef_hang_after_ms` (10 s) after
+    ready. C05b counts that as a failure, the same as a crash.
+  - **Viewer sees:** the held last frame, possibly a stale score, for up to about 10 s plus the
+    back-off and reload. After 3 failures in 5 min, the overlay is hidden (`graphics: failed`).
+  - **Check:** the beats show `graphics` going `restarting`/`starting` → `ready` with no crash
+    logged, and the compositor log shows the hang line.
+  - **Do:** a single hang needs nothing. Repeated hangs mean the page itself is broken: look at the
+    overlay page's recent deploy (R2005/R2007), not at the Machine.
 
 ## Steps
 

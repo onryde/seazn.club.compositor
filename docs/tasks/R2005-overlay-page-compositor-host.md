@@ -515,6 +515,52 @@ stg serves `/overlay` on two hosts. The compositor's exact-origin check passes o
 - Modify: the hook file `components/overlay/use-programme-phase.ts` (`phaseRequest`)
 - Test: `src/__tests__/proxy-csp.test.ts`, the A6 test, and E8 in `overlay-compositor.spec.ts`
 
+## Amendment 2026-10-18 (hang detection; owner ruling, compositor `docs/_INDEX.md` Owed 18)
+
+Owner, 2026-10-18, in chat, relayed by the coordinator: "2 Ok", approving hang detection (compositor Owed 18, closed). The compositor cannot see a JS hang once
+the page is ready: cefsrc emits a buffer only when the page paints, so frame silence is not a signal
+(F-001). So the page beats.
+
+### Change 10: the alive beat
+
+- **With `host=compositor` only**, after the ready signal (change 3's `console.info("seazn:ready")`),
+  the page runs `setInterval(() => console.info("seazn:alive"), 2_000)` on F-001's console channel.
+- It **never** uses `gstSendMsg`, which accepts only `ready`/`eos`, and whose js-signal mode hangs
+  the compositor's `start()` and `set_state(NULL)` (F-001).
+- The interval is `OVERLAY_ALIVE_EVERY_MS = 2_000`, and its comment cites the compositor's
+  `cef_alive_every_ms`. The compositor counts `cef_hang_after_ms` (10 000, five beats, equal to
+  `SCORE_STALE_AFTER_MS`) of silence as a hang, then restarts the page.
+- The beat runs on the main thread on purpose: a hung main thread must stop it. It is never a worker
+  or a `requestAnimationFrame` loop that could keep beating while the score logic hangs.
+- The line is the bare `seazn:alive`. The design's optional `stale=0|1` suffix is **not** built: the
+  `ScoreStale` signal stays change 4's own edge-triggered line.
+- Without `host=compositor`, nothing is logged (OBS and the public page are unchanged).
+- Started once, after ready. The interval is cleared on unmount, so a remount never doubles the beat.
+
+### Tests
+
+- **Unit (fake timers):**
+  - with `host=compositor`, there is no `seazn:alive` before ready.
+  - After ready, there are exactly `k` lines at `k × OVERLAY_ALIVE_EVERY_MS` and `k − 1` at 1 ms
+    before. Check `k` = 1..5, and print the count.
+  - Without `host`, there are 0 lines after 10 beats' worth of time.
+  - Unmount, then remount: still one line per interval.
+- **E9** in `overlay-compositor.spec.ts`: with `host=compositor`, the console shows ≥ 2
+  `seazn:alive` lines within 5 s after `seazn:ready`. Without `host`, it shows 0 in the same window.
+
+### Mutants
+
+| # | Mutant | Expected red |
+|---|---|---|
+| M16 | the beat starts on mount, not after ready | the unit "no `seazn:alive` before ready" |
+| M17 | the `host=compositor` gate is dropped | the unit "without `host`", E9's second half |
+| M18 | `clearInterval` on unmount is dropped | the remount unit |
+
+### Files (amendment 2026-10-18)
+
+- Modify: the compositor-host hook beside change 3's ready signal (re-pin it; R2005 has not landed).
+- Test: its unit file, and E9 in `overlay-compositor.spec.ts`.
+
 ## Do not touch
 
 The organiser UI (R2006), and the relay usecases (R2004). (Amended 2026-10-15) The template registry's

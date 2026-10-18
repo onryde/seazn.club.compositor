@@ -151,6 +151,7 @@ impl Window {
       pub cef_backoff_base_ms: Ms,
       pub cef_backoff_cap_ms: Ms,
       /// PDF failure table "real time restored within 10 s": at most one ladder rung per this gap.
+      /// (REMOVED 2026-10-18 with FastPreset; see "Amendment 2026-10-18".)
       pub ladder_step_min_gap_ms: Ms,
       /// Overruns within `ladder_window_ms` needed to step down one rung.
       pub ladder_overruns_to_step: usize,
@@ -341,6 +342,26 @@ impl Window {
 
 `cargo test -p domain` reports 17 passed: 15 unit tests (the 14 from step 7 plus the boundary test
 from step 8) and the 2 guards. Clippy is clean. The mutation is recorded.
+
+## Amendment 2026-10-18 (two owner rulings; `config.rs` is this brief's file)
+
+1. **`ladder_step_min_gap_ms` is removed** (field, doc and default). Owner, 2026-10-18, in chat, relayed by the coordinator: "no lite mode; if CPU impacts, measure and raise the CPU size" (`docs/_INDEX.md` Owed 20). The ladder is
+   `Full → OverlayHalfRate`, and the bottom holds. The gap gated only a second step, and no second
+   step exists. A mutant on it would be equivalent, and its doc ("at most one ladder rung per this
+   gap") would describe a rule that is gone. This is done, on `fix/ladder-no-overlay-off` with C05's
+   code. `ladder_overruns_to_step` (3) and `ladder_window_ms` (1 000) are unchanged.
+2. **Two fields are added by C05b, not by this task** (Owner, 2026-10-18, in chat, relayed by the coordinator: "2 Ok", approving hang detection (`docs/_INDEX.md` Owed 18)):
+   ```rust
+   /// R2005: the overlay page logs `seazn:alive` this often after ready (Owed 18).
+   pub cef_alive_every_ms: Ms,          // default 2_000
+   /// C05b: a Ready page silent this long is hung, a counted failure. Five beats, equal to the page's
+   /// SCORE_STALE_AFTER_MS (spec §6); shorter turns CPU starvation (CEF children run at nice 10, so
+   /// beats slip under load) into restarts whose load spikes feed the ladder.
+   pub cef_hang_after_ms: Ms,           // default 10_000
+   ```
+   C05b's test pins `cef_hang_after_ms == 5 * cef_alive_every_ms` against the declared defaults.
+   The domain reads only `cef_hang_after_ms`. `cef_alive_every_ms` is the page's contract, kept here
+   so the ratio is pinned in one place.
 
 ## Do not touch
 

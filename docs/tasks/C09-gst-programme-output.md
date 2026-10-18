@@ -101,10 +101,11 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
   gst-inspect-1.0 x264enc | grep -A3 speed-preset             # is it "changeable in PLAYING state"?
   gst-inspect-1.0 compositor | grep -E "latency|ignore-inactive|start-time-selection"
   ```
-  **Decision rule for `speed-preset`.** If it is *not* changeable while PLAYING, the `FastPreset` rung
+  ~~**Decision rule for `speed-preset`.** If it is *not* changeable while PLAYING, the `FastPreset` rung
   becomes "drop the overlay entirely" (`clear_overlay` and stop overlay pushes). Record that as a
   deviation **in the commit body and in `_FINDINGS.md`**. The programme pipeline is still never
-  rebuilt.
+  rebuilt.~~ **SUPERSEDED 2026-10-18:** no `FastPreset` rung exists, and there is no decision rule.
+  See "Amendment 2026-10-18" below.
 
 - [ ] **Step 2: Slate buffers.** ~~`slate.rs` renders one I420 frame per `SlateKind` at `start()`:~~
   - ~~pipeline: `videotestsrc pattern=solid-color foreground-color=0xff111827 num-buffers=1 ! video/x-raw,width=W,height=H ! textoverlay text="…" valignment=center halignment=center font-desc="Sans 36" ! videoconvert ! video/x-raw,format=I420 ! appsink`~~
@@ -313,6 +314,27 @@ the composition order does. The tests below pin both halves.
 6. Restore a `textoverlay` for `SlateKind::Reconnecting`. Expected red: test 1 (the factory-name check,
    and the buffers stop being pointer-equal).
 7. Backdrop back to `0xff111827`. Expected red: test 1's corner pixels.
+
+## Amendment 2026-10-18 (owner ruling on the ladder, `docs/_INDEX.md` Owed 20)
+
+Owner, 2026-10-18, in chat, relayed by the coordinator: "no lite mode; if CPU impacts, measure and
+raise the CPU size". The score is never removed.
+
+- **The `speed-preset` decision rule is void.** C05's `Rung` is `Full | OverlayHalfRate`, and
+  `FastPreset` is deleted. F-001 already pinned that x264enc's `speed-preset` cannot change in
+  PLAYING. Step 1 still records the `gst-inspect` line with the other element facts, but nothing
+  branches on it, and no deviation is owed.
+- **`step_down(r)` matches `Rung` exhaustively.** `OverlayHalfRate` is the half-rate overlay update
+  above (`half_rate_rung_halves_overlay_pushes`). `Full` restores every-tick overlay updates: the
+  domain never emits it, but the match is total, and a test pins it. **No rung ever calls
+  `clear_overlay`, or stops overlay pushes:** only `hide_overlay()` (graphics Failed, C05) clears the
+  slot.
+- **New test:** `the_bottom_rung_keeps_the_overlay_on_air`. Call `set_overlay` (opaque blue
+  top-left, as in `overlay_is_composited_on_top_and_hide_clears_it`), then
+  `step_down(OverlayHalfRate)`, then push 0..60. The decoded frames at even and odd indices are all
+  blue, and `overlay_pushes() == 30`.
+- **New mutant:** `step_down(OverlayHalfRate)` also calls `clear_overlay`. Expected red: the new
+  test.
 
 ## Do not touch
 

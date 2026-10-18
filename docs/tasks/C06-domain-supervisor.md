@@ -1070,6 +1070,41 @@ frames and ticks into each camera phase exactly as `final_is_terminal_against_ev
   plan and `_INDEX.md`.
 - **C08**: the driver publishes phase changes to the loopback endpoint (amended).
 
+## Amendment 2026-10-18 (the ladder's rungs; the hang beat)
+
+**The rung values** (Owner, 2026-10-18, in chat, relayed by the coordinator: "no lite mode; if CPU impacts, measure and raise the CPU size" (`docs/_INDEX.md` Owed 20)). `HealthReport.rung: Rung` is unchanged in shape, but C05's
+`Rung` is now `Full | OverlayHalfRate`: `FastPreset` is deleted, and the bottom holds. So
+`HealthReport.rung` is only ever `Rung::Full` or `Rung::OverlayHalfRate`, and the wire words are
+`full` and `overlay_half_rate` (C07). `Effect::StepDown(Rung)` is emitted at most once per process,
+and always with `OverlayHalfRate`. One test is added: a stream of `EncoderOverrun` bursts across
+the whole session yields exactly one `StepDown`, `StepDown(OverlayHalfRate)`, and `health().rung`
+stays `OverlayHalfRate` after it. Print the number of bursts checked, and fail on 0.
+
+**The hang beat** (Owner, 2026-10-18, in chat, relayed by the coordinator: "2 Ok", approving hang detection (`docs/_INDEX.md` Owed 18), after C05b).
+- `Event` gains `CefAlive { gen: u64 }`, after `CefCrashed`.
+- `decide` routes it like `CefReady`:
+  ```rust
+  Event::CefAlive { gen } => self.graphics.on_alive(now, gen),
+  ```
+  It is routed in Running **and** in Holding. In Holding, the final scene is on air, and its page must
+  stay watched. Each lifecycle arm that lists `CefCrashed { .. }` as ignored lists `CefAlive { .. }`
+  the same way, so the match stays exhaustive.
+- The hang itself needs no new effect. C05b's Ready arm returns `Restart` or `Hide` from
+  `on_tick`, and the existing graphics mapping already turns those into `RestartGraphics{gen}` and
+  `HideOverlay`.
+- **The property sweep** (`event_for`): kind 11 becomes `CefAlive { gen: s.graphics_generation() }`,
+  and `HeartbeatReply(Desired::Live)` moves to 12. Widen `steps()` to `0u8..=12`. The existing
+  generation property extends to it: no `CefAlive` from a stale generation changes `graphics`.
+  The anti-vacuity count covers it: the sweep counts the `CefAlive` events it delivered while Ready,
+  prints the count, and fails on 0.
+- **New test:** `a_ready_page_that_stops_beating_restarts`.
+  - Boot, `CefReady{1}`, then `CefAlive{1}` every `cef_alive_every_ms` for 30 s: no
+    `RestartGraphics`.
+  - Then silence. `RestartGraphics{gen: 2}` lands at exactly `last_alive + cef_hang_after_ms`, and
+    not 1 ms before.
+  - Every expected time comes from `Thresholds::default()`.
+- **New mutant:** route `CefAlive` to nothing. Expected red: the new test.
+
 ## Do not touch
 
 Earlier modules' public APIs. A change needed there is a deviation: report it, don't make it silently.

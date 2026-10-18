@@ -99,6 +99,62 @@ The job's `timeout-minutes` is `minutes + 40`, well under GitHub's 360.
 - Both Machines are destroyed afterwards. Run `flyctl machine list -a seazn-relay-soak` and show it's
   empty.
 
+## Amendment 2026-10-18 (owner ruling on the ladder, `docs/_INDEX.md` Owed 20)
+
+Owner, 2026-10-18, in chat, relayed by the coordinator: "no lite mode; if CPU impacts, measure and
+raise the CPU size". The owner approved measuring the **real** overlay cost here, with a size rule.
+F-005 measured only a test page: 0.83 of 4 cores at 720p, and 1.27 average (p95 1.37) on its 720p
+snow diagnostic. This closes that gap. A ladder step-down in production is a sizing alarm (C17
+runbook), so the size must leave headroom for the real page.
+
+### Cost legs (run before the 3 h soak, on the same split: compositor Machine on the production guest, harness Machine beside it)
+
+| Leg | Output | Overlay | Camera |
+|---|---|---|---|
+| A | 720p30 | template `bar` on a **cricket** fixture, moments back to back | snow |
+| B | 720p30 | template `bug` (the corner bug), the same fixture and driver | snow |
+| C | 1080p30 | as A | snow |
+| D | 1080p30 | as B | snow |
+
+- **The page is the production overlay page.** `…/overlay/fixtures/<id>?template=bar|bug&host=compositor&…`,
+  from a `seazn.club` build containing R2007 PR A (`#974`, the registry: `TemplateId = "bar" | "bug"`)
+  and R2005. Never `overlay-test.html`. Where it is served from is this task's choice: stg, or a
+  standalone build on the harness Machine. Record which, with the web commit.
+- **Frequent moments.** A score driver records cricket deliveries on the fixture so that a moment
+  fires as soon as the previous moment's slab has cleared. That is the worst case the page allows.
+  Record the moment rate achieved, and fail the leg if fewer than one moment a minute was seen.
+- **Snow.** The camera is `videotestsrc pattern=snow`, F-005's worst-case all-real-bits encode, at
+  the session's bitrate (720p 4 000 kbps, 1080p 6 000 kbps: `OutputProfile::P720`/`P1080` in `crates/domain/src/config.rs`; F-005 ran its snow diagnostic at only 2 500 kbps). The fake-camera gains a
+  `--pattern snow` mode for this. It keeps the strip if the checker reads it.
+- **Each leg runs at least 10 minutes** (brief default; F-005 ran 290 s), sampled every 1 s from
+  +15 s, by F-005's method. The sample covers the whole Machine (`/proc/stat`) and the process tree,
+  plus the heartbeats' `encoderSpeed`, `droppedFrames` and `rung`.
+- **Size rule (acceptance).** In every leg, the p95 of Machine CPU must be at most 50 % of the
+  guest's cores, which is 2.0 cores on performance-4x.
+  - If any leg is over, move to the next performance size (performance-8x after 4x) and re-run all
+    four legs there. Repeat until all four pass. The 3 h soak then runs on the passing size.
+  - The move is a `seazn.club` PR that sets R1's `RUNNER_DEFAULT_GUEST` (Owed 25), because web picks
+    the guest. This task records the finding and opens or requests that PR. It never edits web's
+    config itself.
+- **Record `F-0xx: real overlay cost`** in `_FINDINGS.md`: F-005's table shape per leg (Machine
+  cores avg / p95 / max, tree, encoder speed, drops, rung), the URLs, the moment rate and the size
+  verdict. Screenshots of each leg's programme are looked at, and never committed.
+
+### Soak verdict, criterion 6 (added)
+
+| # | Criterion | How it's measured |
+|---|---|---|
+| 6 | No step down | Every heartbeat's `rung` is `full`. A stepped beat fails with the reason "sizing alarm: the guest is short of CPU" (C17 runbook). In production the same beat raises web's sizing alarm. |
+
+`test-verdict.sh` gains a fifth red fixture, a beat with `rung: "overlay_half_rate"`, which fails
+on criterion 6. That makes the suite 1 green / 5 red. Step 6 gains a second mutant: drop criterion 6 from `verdict.jq`. Expected red: the new fixture
+reads green.
+
+### Acceptance (added)
+
+- The four cost legs, with the size rule met on the size the soak then uses, and the F-entry pasted.
+- `test-verdict.sh` is 1 green / 5 red, with reasons.
+
 ## Do not touch
 
 The compositor crates. A soak red is fixed in the owning task's code, with the fix referencing this
