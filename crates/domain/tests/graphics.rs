@@ -6,11 +6,16 @@
 //! because the domain's crate root forbids `clippy::print_stderr`, and a sweep must print the count
 //! it checked (AGENTS.md §5).
 use domain::config::{OutputProfile, Thresholds};
-use domain::graphics::{Graphics, GraphicsAction, GraphicsState};
+use domain::graphics::{Graphics, GraphicsAction, GraphicsState, HideReason};
 use domain::ladder::{Ladder, Rung};
 use domain::time::Ms;
 
 use GraphicsAction::{Hide, Restart};
+
+/// The hide C06 maps to `HideOverlay { reason, gen }` (C12: `overlay hidden reason=<r> gen=<g>`).
+fn hide(reason: HideReason, gen: u64) -> GraphicsAction {
+    Hide { reason, gen }
+}
 
 const BOTH_MODES: [OutputProfile; 2] = [OutputProfile::P720, OutputProfile::P1080];
 
@@ -176,8 +181,10 @@ fn graphics_in(kind_want: Kind, prior: usize, beat: Beat, t: &Thresholds) -> (Gr
             );
         }
         Kind::Backoff | Kind::Failed => {
-            let a = g.on_crashed(entered, g.generation(), t);
-            assert_eq!(a == Some(Hide), kind_want == Kind::Failed, "setup {kind_want:?}");
+            let gen = g.generation();
+            let a = g.on_crashed(entered, gen, t);
+            let want = (kind_want == Kind::Failed).then(|| hide(HideReason::Failed, gen));
+            assert_eq!(a, want, "setup {kind_want:?}");
             stamps.push(entered);
         }
     }
@@ -214,12 +221,16 @@ fn apply(g: &mut Graphics, e: GEvent, now: Ms, gen: u64, t: &Thresholds) -> Opti
     }
 }
 
-/// The state a failure at `at` must leave, given `n` failures in the window, this one included: the
-/// count-th or later enters Failed for one window; any other waits the back-off.
-fn after_failure(n: usize, at: Ms, t: &Thresholds) -> (GraphicsState, Option<GraphicsAction>) {
+/// The state a failure of generation `gen` at `at` must leave, given `n` failures in the window, this
+/// one included: the count-th or later enters Failed for one window and hides, naming `gen`; any
+/// other waits the back-off.
+fn after_failure(n: usize, at: Ms, gen: u64, t: &Thresholds) -> (GraphicsState, Option<GraphicsAction>) {
     if n >= t.cef_fail_count {
         let retry_at = at + t.cef_fail_window_ms;
-        (GraphicsState::Failed { retry_at }, Some(Hide))
+        (
+            GraphicsState::Failed { retry_at },
+            Some(hide(HideReason::Failed, gen)),
+        )
     } else {
         let until = at + wait(t, n - 1);
         let attempt = (n - 1) as u32;
@@ -228,14 +239,17 @@ fn after_failure(n: usize, at: Ms, t: &Thresholds) -> (GraphicsState, Option<Gra
 }
 
 /// The briefs' transitions (C05 Context and Step 3; C05b Rules), written from their prose: the state
-/// and action after `e` at `at`, from `from`, where `n` is the failures in the window if `e` is a
-/// failure. One row is NOT the C05 brief: `(Failed, Tick)` encodes C05's deliberate deviation
+/// and action after `e` at `at`, from `from` at generation `gen`, where `n` is the failures in the
+/// window if `e` is a failure. A hide names its reason (PR #22 review I2: a hang is `Hang` at the
+/// count too; a crash or load timeout entering Failed is `Failed`) and the generation that failed.
+/// One row is NOT the C05 brief: `(Failed, Tick)` encodes C05's deliberate deviation
 /// (docs/_INDEX.md, the C05 decision row), so this matrix is no independent witness of the brief there.
 fn brief(
     from: GraphicsState,
     e: GEvent,
     at: Ms,
     n: usize,
+    gen: u64,
     t: &Thresholds,
 ) -> (GraphicsState, Option<GraphicsAction>) {
     use GEvent as E;
@@ -245,13 +259,15 @@ fn brief(
         (K::Backoff, E::Tick) => restart, // the back-off is over
         // C05b: a hang is a counted failure and hides at once, below the count too; it wins over a
         // recycle that is due on the same tick.
-        (K::Ready, E::Tick) if hang_due(from, at, t) => (after_failure(n, at, t).0, Some(Hide)),
+        (K::Ready, E::Tick) if hang_due(from, at, t) => {
+            (after_failure(n, at, gen, t).0, Some(hide(HideReason::Hang, gen)))
+        }
         (K::Ready, E::Tick) => restart, // the planned recycle
         // C05 DEVIATION, not Step 3: the brief went Failed → `Backoff { 0, now }` with no action and
         // restarted on the next tick; C05 restarts on the tick the cooldown ends (docs/_INDEX.md).
         (K::Failed, E::Tick) => restart,
-        (K::Starting, E::Tick) => after_failure(n, at, t), // the load timed out
-        (K::Starting | K::Ready, E::Crashed) => after_failure(n, at, t),
+        (K::Starting, E::Tick) => after_failure(n, at, gen, t), // the load timed out
+        (K::Starting | K::Ready, E::Crashed) => after_failure(n, at, gen, t),
         (K::Starting, E::Ready) => (
             GraphicsState::Ready {
                 since: at,
@@ -307,15 +323,15 @@ fn every_graphics_pair_follows_the_brief() {
             }
             let n = within(&stamps, at, t.cef_fail_window_ms);
             let a = apply(&mut g, e, at, gen, &t);
-            let want = brief(from, e, at, n, &t);
+            let want = brief(from, e, at, n, gen, &t);
             let ctx = format!("({k:?} prior {prior} {beat:?}, {e:?}) at {at}");
             assert_eq!((g.state(), a), want, "{ctx}");
             let restarted = want.1 == Some(Restart);
             assert_eq!(g.generation(), gen + u64::from(restarted), "{ctx}");
             checked += 1;
             moved += usize::from(kind(want.0) != k || want.0 != from);
-            hides += usize::from(want.1 == Some(Hide));
-            hang_hides += usize::from(e == GEvent::Tick && hang_due(from, at, &t) && a == Some(Hide));
+            hides += usize::from(matches!(want.1, Some(Hide { .. })));
+            hang_hides += usize::from(a == Some(hide(HideReason::Hang, gen)));
         }
     }
     eprintln!(
@@ -553,7 +569,7 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
             let n = within(&stamps, now, span);
             let want = match (k, e) {
                 (_, GEvent::Tick) if !due_now => (before, None),
-                _ => brief(before, e, now, n, &t),
+                _ => brief(before, e, now, n, gen, &t),
             };
             assert_eq!(
                 (g.state(), a),
@@ -607,7 +623,8 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
                 }
             }
             if failure {
-                c.crashes_to_failed += usize::from(e == GEvent::Crashed && a == Some(Hide));
+                c.crashes_to_failed +=
+                    usize::from(e == GEvent::Crashed && a == Some(hide(HideReason::Failed, gen)));
                 c.waits_doubled += usize::from(a.is_none() && n >= 2);
                 c.failures_within_a_window_of_a_recycle +=
                     usize::from(recycled_at.is_some_and(|at| now - at <= span));
@@ -628,7 +645,7 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
                 page = None;
             }
             match a {
-                Some(Hide) => {
+                Some(Hide { .. }) => {
                     assert!(
                         !hid_since_restart,
                         "case {case}: a second hide with no restart between"
@@ -738,7 +755,12 @@ fn a_page_that_never_signals_ready_hides_on_the_frame_tick_grid() {
                 );
                 match g.on_tick(now, &t) {
                     Some(Restart) => restarts.push(now),
-                    Some(Hide) => hides.push(now),
+                    Some(h) => {
+                        // The count-th load timeout of each set of attempts: Failed, naming it.
+                        let gen = (hides.len() as u64 + 1) * count as u64;
+                        assert_eq!(h, hide(HideReason::Failed, gen), "{mode:?} φ{phase} at {now}");
+                        hides.push(now);
+                    }
                     None => {}
                 }
                 let gen = g.generation();
@@ -846,7 +868,7 @@ fn a_page_that_stops_beating_hides_on_the_frame_tick_grid() {
             let ctx = format!("{mode:?} φ{phase}: {acts:?}");
             assert_eq!(next, beats.len(), "{ctx}: every beat delivered");
             let kinds: Vec<GraphicsAction> = acts.iter().map(|&(_, a)| a).collect();
-            assert_eq!(kinds, vec![Restart, Hide, Restart], "{ctx}");
+            assert_eq!(kinds, vec![Restart, hide(HideReason::Hang, 1), Restart], "{ctx}");
             assert_eq!(acts[0].0, phase, "{ctx}: the first tick restarts");
             let hidden = acts[1].0;
             assert!(

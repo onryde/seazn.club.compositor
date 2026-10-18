@@ -79,8 +79,19 @@ pub enum GraphicsAction {
     /// Build the page of `generation()` (C06 `RestartGraphics { gen }`). The adapter holds the last
     /// overlay frame while it loads (C11).
     Restart,
-    /// Take the overlay off air (C06 `HideOverlay`) until the next `Restart`.
-    Hide,
+    /// Take the overlay off air (C06 `HideOverlay { reason, gen }`) until the next generation's Ready.
+    /// `gen` is the generation whose failure took it off. C12 logs the one line
+    /// `overlay hidden reason=<r> gen=<g>` for it (PR #22 review I2).
+    Hide { reason: HideReason, gen: u64 },
+}
+
+/// What took the overlay off air. It names the cause, not the state the machine is left in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HideReason {
+    /// A Ready page stopped beating for `cef_hang_after_ms` (Owed 18): below the count, and at it.
+    Hang,
+    /// A crash or a load timeout entered Failed (the `cef_fail_count`-th failure in the window).
+    Failed,
 }
 
 /// Failure history bound: the window never holds more than this many stamps (AGENTS.md §4, nothing
@@ -145,7 +156,8 @@ impl Graphics {
         }
     }
 
-    /// The page of generation `gen` crashed. `Some(Hide)` when this failure enters Failed.
+    /// The page of generation `gen` crashed. `Hide { reason: Failed, .. }` when this failure enters
+    /// Failed.
     pub fn on_crashed(&mut self, now: Ms, gen: u64, t: &Thresholds) -> Option<GraphicsAction> {
         if gen != self.generation {
             return None;
@@ -158,7 +170,8 @@ impl Graphics {
     }
 
     /// `Some(Restart)` when a restart is due (the back-off is over, the recycle is due, or the
-    /// cooldown is over); `Some(Hide)` when a load timeout enters Failed, and on every hang.
+    /// cooldown is over); `Hide { reason: Failed, .. }` when a load timeout enters Failed, and
+    /// `Hide { reason: Hang, .. }` on every hang.
     pub fn on_tick(&mut self, now: Ms, t: &Thresholds) -> Option<GraphicsAction> {
         match self.state {
             GraphicsState::Backoff { until, .. } if now >= until => Some(self.restart(now)),
@@ -170,7 +183,10 @@ impl Graphics {
             // falls due with it is never laundered as a planned restart.
             GraphicsState::Ready { last_alive, .. } if elapsed(now, last_alive) >= t.cef_hang_after_ms => {
                 self.fail(now, t);
-                Some(GraphicsAction::Hide)
+                Some(GraphicsAction::Hide {
+                    reason: HideReason::Hang,
+                    gen: self.generation,
+                })
             }
             // The planned recycle: a restart, and no failure is recorded.
             GraphicsState::Ready { since, .. } if elapsed(now, since) >= t.cef_recycle_every_ms => {
@@ -195,7 +211,10 @@ impl Graphics {
             self.state = GraphicsState::Failed {
                 retry_at: now.saturating_add(t.cef_fail_window_ms),
             };
-            return Some(GraphicsAction::Hide);
+            return Some(GraphicsAction::Hide {
+                reason: HideReason::Failed,
+                gen: self.generation,
+            });
         }
         // n ≤ FAILURE_HISTORY_CAP (32), so the cast is exact; n ≥ 1, as this failure is recorded.
         let attempt = (n as u32).saturating_sub(1);
@@ -212,9 +231,16 @@ impl Graphics {
 mod tests {
     use super::*;
     use GraphicsAction::{Hide, Restart};
+    use HideReason::{Failed, Hang};
 
     fn t() -> Thresholds {
         Thresholds::default()
+    }
+
+    /// The hide C06 maps to `HideOverlay { reason, gen }`, and C12 logs as
+    /// `overlay hidden reason=<r> gen=<g>`.
+    fn hide(reason: HideReason, gen: u64) -> Option<GraphicsAction> {
+        Some(Hide { reason, gen })
     }
 
     /// The CEF back-off, written independently of `backoff::delay`: the base, doubled once per
@@ -316,16 +342,21 @@ mod tests {
         let th = t();
         let (g, acts) = run(th.cef_fail_window_ms - 1, None);
         let restarts = acts.iter().filter(|(_, a)| *a == Restart).count();
-        let hides: Vec<Ms> = acts
+        let hides: Vec<GraphicsAction> = acts
             .iter()
-            .filter(|(_, a)| *a == Hide)
-            .map(|(at, _)| *at)
+            .filter(|(_, a)| matches!(a, Hide { .. }))
+            .map(|&(_, a)| a)
             .collect();
         assert_eq!(
             restarts, th.cef_fail_count,
             "one restart per attempt before Failed"
         );
-        assert_eq!(hides.len(), 1, "hide exactly once on entering Failed");
+        let count = th.cef_fail_count as u64;
+        assert_eq!(
+            hides,
+            vec![hide(Failed, count).unwrap()],
+            "hide exactly once on entering Failed, naming the count-th generation"
+        );
         assert!(matches!(g.state(), GraphicsState::Failed { .. }));
     }
 
@@ -519,7 +550,11 @@ mod tests {
         let th = t();
         let (count, span) = (th.cef_fail_count, th.cef_fail_window_ms);
         let (g, last) = crashes(&spread(count, span), &th);
-        assert_eq!(last, Some(Hide), "{count} failures exactly {span} ms apart");
+        assert_eq!(
+            last,
+            hide(Failed, count as u64),
+            "{count} failures exactly {span} ms apart"
+        );
         assert_eq!(
             g.state(),
             GraphicsState::Failed {
@@ -565,9 +600,9 @@ mod tests {
         let th = t();
         let span = th.cef_fail_window_ms;
         let (mut g, last) = crashes(&spread(th.cef_fail_count, span), &th);
-        assert_eq!(last, Some(Hide));
-        let retry_at = span + span;
         let hidden = g.generation();
+        assert_eq!(last, hide(Failed, hidden));
+        let retry_at = span + span;
         for now in [span, span + 1, span + 33, retry_at - 1_000, retry_at - 1] {
             assert_eq!(g.on_tick(now, &th), None, "tick at {now}");
             assert_eq!(g.on_crashed(now, hidden, &th), None, "crash at {now}");
@@ -591,7 +626,7 @@ mod tests {
         let th = t();
         let span = th.cef_fail_window_ms;
         let (mut g, last) = crashes(&spread(th.cef_fail_count, span), &th);
-        assert_eq!(last, Some(Hide), "first Failed");
+        assert_eq!(last, hide(Failed, th.cef_fail_count as u64), "first Failed");
         let retry_at = span + span;
         assert_eq!(g.on_tick(retry_at, &th), Some(Restart));
         g.on_ready(retry_at + 2_804, g.generation());
@@ -612,7 +647,7 @@ mod tests {
                 g.on_ready(now, g.generation());
                 now += 1;
             } else {
-                assert_eq!(a, Some(Hide), "the second Failed hides again");
+                assert_eq!(a, hide(Failed, g.generation()), "the second Failed hides again");
                 assert_eq!(g.state(), GraphicsState::Failed { retry_at: now + span });
             }
         }
@@ -629,13 +664,15 @@ mod tests {
         let to_hide = count as Ms * th.cef_load_timeout_ms + (0..count - 1).map(|k| wait(&th, k)).sum::<Ms>();
         let second = to_hide + th.cef_fail_window_ms + to_hide;
         let (_, acts) = run(second, None);
-        let hides: Vec<Ms> = acts
+        let hides: Vec<(Ms, GraphicsAction)> = acts
             .iter()
-            .filter(|(_, a)| *a == Hide)
-            .map(|(at, _)| *at)
+            .filter(|(_, a)| matches!(a, Hide { .. }))
+            .copied()
             .collect();
         let restarts = acts.iter().filter(|(_, a)| *a == Restart).count();
-        assert_eq!(hides, vec![to_hide, second], "{acts:?}");
+        let n = count as u64;
+        let want = [(to_hide, n), (second, 2 * n)].map(|(at, gen)| (at, hide(Failed, gen).unwrap()));
+        assert_eq!(hides, want, "{acts:?}");
         assert_eq!(restarts, 2 * count, "{acts:?}");
     }
 
@@ -746,11 +783,8 @@ mod tests {
         for gen in 2..=th.cef_fail_count as u64 {
             assert_eq!(g.on_tick(top, &th), Some(Restart));
             let a = g.on_crashed(top, gen, &th);
-            assert_eq!(
-                a == Some(Hide),
-                gen == th.cef_fail_count as u64,
-                "generation {gen}"
-            );
+            let at_count = gen == th.cef_fail_count as u64;
+            assert_eq!(a, hide(Failed, gen).filter(|_| at_count), "generation {gen}");
         }
         assert_eq!(g.state(), GraphicsState::Failed { retry_at: top });
         assert_eq!(g.on_tick(top, &th), Some(Restart));
@@ -794,7 +828,7 @@ mod tests {
                 GraphicsState::Failed { retry_at } => {
                     assert_eq!(
                         (a, gen, retry_at),
-                        (Some(Hide), 4, now + 77_000),
+                        (hide(Failed, 4), 4, now + 77_000),
                         "the 4th failure"
                     );
                     now = retry_at;
@@ -914,7 +948,7 @@ mod tests {
                 last_alive: r
             }
         );
-        assert_eq!(g.on_tick(hang, &th), Some(Hide), "hidden at once");
+        assert_eq!(g.on_tick(hang, &th), hide(Hang, 1), "hidden at once");
         let until = hang + wait(&th, 0);
         assert_eq!(
             (g.state(), g.generation()),
@@ -937,7 +971,7 @@ mod tests {
         for late in [1, 60_000] {
             let (mut g, r) = ready_at(&th);
             let at = r + th.cef_hang_after_ms + late;
-            assert_eq!(g.on_tick(at, &th), Some(Hide), "{late} ms past the threshold");
+            assert_eq!(g.on_tick(at, &th), hide(Hang, 1), "{late} ms past the threshold");
             assert_eq!(
                 g.state(),
                 GraphicsState::Backoff {
@@ -977,7 +1011,7 @@ mod tests {
             None,
             "1 ms before the last beat's deadline"
         );
-        assert_eq!(g.on_tick(hang, &th), Some(Hide), "the last beat's deadline");
+        assert_eq!(g.on_tick(hang, &th), hide(Hang, 1), "the last beat's deadline");
     }
 
     // Spec §4.2 "3 in 5 min", through hangs alone: every hang hides at once, below the count as well
@@ -991,7 +1025,9 @@ mod tests {
         for k in 0..count {
             let hang = ready + th.cef_hang_after_ms;
             assert_eq!(g.on_tick(hang - 1, &th), None, "hang {}: 1 ms early", k + 1);
-            assert_eq!(g.on_tick(hang, &th), Some(Hide), "hang {} hides", k + 1);
+            // The reason names what took the frame off air: a hang, at the count too.
+            let gen = k as u64 + 1;
+            assert_eq!(g.on_tick(hang, &th), hide(Hang, gen), "hang {} hides", k + 1);
             hangs.push(hang);
             if k + 1 < count {
                 let until = hang + wait(&th, k);
@@ -1031,7 +1067,12 @@ mod tests {
                     (ready + 1, g.on_crashed(ready + 1, g.generation(), &th))
                 };
                 let last = k + 1 == count;
-                let want = if k == hang_at || last { Some(Hide) } else { None };
+                let gen = k as u64 + 1;
+                let want = match (k == hang_at, last) {
+                    (true, _) => hide(Hang, gen),
+                    (false, true) => hide(Failed, gen),
+                    (false, false) => None,
+                };
                 assert_eq!(a, want, "hang at {hang_at}: failure {}", k + 1);
                 if last {
                     let retry_at = at + th.cef_fail_window_ms;
@@ -1060,7 +1101,11 @@ mod tests {
         let recycle = r + th.cef_recycle_every_ms;
         g.on_alive(recycle - th.cef_hang_after_ms, 1);
         assert_eq!(g.on_tick(recycle - 1, &th), None, "neither is due 1 ms early");
-        assert_eq!(g.on_tick(recycle, &th), Some(Hide), "the hang, not the recycle");
+        assert_eq!(
+            g.on_tick(recycle, &th),
+            hide(Hang, 1),
+            "the hang, not the recycle"
+        );
         let until = recycle + wait(&th, 0);
         assert_eq!(
             (g.state(), g.generation()),
@@ -1074,7 +1119,11 @@ mod tests {
                 assert_eq!(a, None, "failure {}", k + 1);
                 now += wait(&th, k);
             } else {
-                assert_eq!(a, Some(Hide), "the hang counted: this crash is the count-th");
+                assert_eq!(
+                    a,
+                    hide(Failed, g.generation()),
+                    "the hang counted: this crash is the count-th"
+                );
                 assert!(matches!(g.state(), GraphicsState::Failed { .. }));
             }
         }
@@ -1177,7 +1226,7 @@ mod tests {
         assert_eq!(
             acts,
             vec![
-                (hang, Some(Hide)),
+                (hang, hide(Hang, 1)),
                 (first, Some(Restart)),
                 (timeout, None),
                 (second, Some(Restart))
@@ -1212,7 +1261,7 @@ mod tests {
         let th = t();
         let (mut g, r) = ready_at(&th);
         let hang = r + th.cef_hang_after_ms;
-        assert_eq!(g.on_tick(hang, &th), Some(Hide));
+        assert_eq!(g.on_tick(hang, &th), hide(Hang, 1));
         let backing_off = g.state();
         let until = hang + wait(&th, 0);
         for at in [hang, hang + 1, until - 1] {
@@ -1231,7 +1280,7 @@ mod tests {
         g.on_ready(ready, 2);
         for k in 1..th.cef_fail_count {
             let hang = ready + th.cef_hang_after_ms;
-            assert_eq!(g.on_tick(hang, &th), Some(Hide), "hang {}", k + 1);
+            assert_eq!(g.on_tick(hang, &th), hide(Hang, g.generation()), "hang {}", k + 1);
             if k + 1 < th.cef_fail_count {
                 let until = hang + wait(&th, k);
                 assert_eq!(g.on_tick(until, &th), Some(Restart));
@@ -1263,15 +1312,26 @@ mod tests {
             cef_backoff_cap_ms: 400,
             ..t()
         };
+        // Every expected instant reads the field it tests, so editing an override keeps it honest;
+        // the guard keeps the load timeout a distinct, earlier instant the hang must not fire at.
+        assert!(
+            th.cef_load_timeout_ms < th.cef_hang_after_ms,
+            "the overrides must differ"
+        );
         let (mut g, r) = ready_at(&th);
-        assert_eq!(g.on_tick(r + 4_321, &th), None, "not the load timeout");
-        assert_eq!(g.on_tick(r + 7_776, &th), None);
-        assert_eq!(g.on_tick(r + 7_777, &th), Some(Hide), "the hang threshold");
+        let hang = r + th.cef_hang_after_ms;
+        assert_eq!(
+            g.on_tick(r + th.cef_load_timeout_ms, &th),
+            None,
+            "not the load timeout"
+        );
+        assert_eq!(g.on_tick(hang - 1, &th), None);
+        assert_eq!(g.on_tick(hang, &th), hide(Hang, 1), "the hang threshold");
         assert_eq!(
             g.state(),
             GraphicsState::Backoff {
                 attempt: 0,
-                until: r + 7_777 + 250
+                until: hang + th.cef_backoff_base_ms
             }
         );
     }
