@@ -1093,9 +1093,10 @@ stays `OverlayHalfRate` after it. Print the number of bursts checked, and fail o
   It is routed in Running **and** in Holding. In Holding, the final scene is on air, and its page must
   stay watched. Each lifecycle arm that lists `CefCrashed { .. }` as ignored lists `CefAlive { .. }`
   the same way, so the match stays exhaustive.
-- The hang itself needs no new effect. C05b's Ready arm returns `Restart` or `Hide` from
-  `on_tick`, and the existing graphics mapping already turns those into `RestartGraphics{gen}` and
-  `HideOverlay`.
+- The hang itself needs no new effect. C05b's Ready hang arm returns `Hide` from `on_tick` at
+  once, below the count too (owner-approved design (2026-10-18); "at once" is the coordinator's reading of it). The restart follows from the Backoff arm one
+  `delay(0)` later, which is `cef_backoff_base_ms`. The existing graphics mapping turns those into
+  `HideOverlay` and `RestartGraphics{gen}`.
 - **The property sweep** (`event_for`): kind 11 becomes `CefAlive { gen: s.graphics_generation() }`,
   and `HeartbeatReply(Desired::Live)` moves to 12. Widen `steps()` to `0u8..=12`. The existing
   generation property extends to it: no `CefAlive` from a stale generation changes `graphics`.
@@ -1104,9 +1105,12 @@ stays `OverlayHalfRate` after it. Print the number of bursts checked, and fail o
 - **New test:** `a_ready_page_that_stops_beating_restarts`.
   - Boot, `CefReady{1}`, then `CefAlive{1}` every `cef_alive_every_ms` for 30 s: no
     `RestartGraphics`.
-  - Then silence. `RestartGraphics{gen: 2}` lands at exactly `last_alive + cef_hang_after_ms`, and
-    not 1 ms before.
-  - Every expected time comes from `Thresholds::default()`.
+  - Then silence. At exactly `last_alive + cef_hang_after_ms`, and not 1 ms before, the tick emits
+    `HideOverlay`, and `health().graphics` reads `restarting`.
+  - `RestartGraphics{gen: 2}` lands at `last_alive + cef_hang_after_ms + cef_backoff_base_ms`, and
+    not 1 ms before. The back-off is `graphics.rs`'s `fail` → `delay(0)` (PR #21 review, I2).
+  - Then `CefReady{2}` gives `health().graphics` = `ready`, and no further `HideOverlay`.
+  - Every expected time comes from `Thresholds::default()`, never a literal.
 - **New mutant:** route `CefAlive` to nothing. Expected red: the new test.
 
 ## Do not touch

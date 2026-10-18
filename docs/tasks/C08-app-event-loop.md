@@ -338,8 +338,9 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
 - (Amended 2026-10-18, Owed 17) `HideOverlay` maps to `hide_overlay()` then `graphics.stop()`.
   `hide_stops_the_hidden_page_and_the_retry_reaches_air` passes both halves, and the
   dropped-stop mutant went red.
-- (Amended 2026-10-18, Owed 18) `hung_page_is_restarted_through_the_port` passes: one restart per
-  hang, and `HideOverlay` at the `cef_fail_count`-th.
+- (Amended 2026-10-18, Owed 18) `hung_page_is_restarted_through_the_port` passes. Every hang gives
+  `HideOverlay` + `GraphicsStop` at once (owner-approved design (2026-10-18); "at once" is the coordinator's reading of it), then one restart after
+  `cef_backoff_base_ms`, and the `cef_fail_count`-th hang enters Failed.
 
 ## Amendment 2026-10-15 (overlay templates spec)
 
@@ -409,10 +410,12 @@ Owner, 2026-10-18, in chat, relayed by the coordinator: "2 Ok", approving hang d
   `Inbound::Event(Event::CefAlive{gen})`, so scenario tests can send the beat by name.
 - **New scenario test:** `hung_page_is_restarted_through_the_port`.
   - Ready gen 1, then beats every `cef_alive_every_ms` to t = 30 s, then silence.
-  - The log shows exactly one `Call::GraphicsRestart{gen: 2}`, at the first tick at or after
-    `last_alive + cef_hang_after_ms`. No `HideOverlay` follows the first hang.
-  - Repeat the hang `cef_fail_count` times within `cef_fail_window_ms`: the last one logs
-    `Call::HideOverlay`.
+  - The log shows `Call::HideOverlay`, then `Call::GraphicsStop`, at the first tick at or after
+    `last_alive + cef_hang_after_ms`. That is the hide at once (owner-approved design (2026-10-18); "at once" is the coordinator's reading of it).
+  - Then exactly one `Call::GraphicsRestart{gen: 2}`, at the first tick at or after
+    `+ cef_backoff_base_ms`.
+  - Repeat the hang `cef_fail_count` times within `cef_fail_window_ms`. Every hang logs
+    `HideOverlay`. The last one enters Failed, and no `GraphicsRestart` follows until `retry_at`.
   - Times come from `Thresholds::default()`.
 - **`StepDown(r)` → `programme.step_down(r)`:** `r` is only ever `OverlayHalfRate` (C05). The
   existing overrun scenario asserts exactly one `step_down` call for a session of sustained overruns.

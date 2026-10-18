@@ -293,7 +293,7 @@ tear down.
   |---|---|
   | `alive_beats_are_relayed_with_their_generation` | `restart(1, …overlay-test.html)`: within 7 s, at least 2 `CefAlive{gen:1}` after `CefReady{gen:1}`, and none before it |
   | `hung_page_stops_beating` | `?crash=1`: `CefAlive{gen:1}` arrives before the hang, and **none** in the 3 s after it, while the renderer pid is still alive (it is a hang, not a crash: no `CefCrashed`) |
-  | `reaper_kills_a_renderer_that_will_not_tear_down` | `?crash=1`, then `restart(2, …)`: within `REAPER_KILL_AFTER_MS` + 2 s every gen-1 renderer pid is gone, and `CefReady{gen:2}` arrives. Print the number of pids killed, and fail on 0 if teardown did not return by itself (log which path ran) |
+  | `reaper_kills_a_renderer_that_will_not_tear_down` | **Drive the kill path deterministically.** Gen 1 loads F-001's js-signal hang page, where `set_state(NULL)` is known not to return within 10 s. Then `restart(2, …overlay-test.html)`. Within `REAPER_KILL_AFTER_MS` + 2 s, every gen-1 renderer pid is gone, and `CefReady{gen:2}` arrives. The reaper reports which path ran, and the test **requires the kill path**: print the pids killed, and fail on 0. If the js-signal hang ever tears down by itself, the test fails and names it, never passing on the other path (PR #21 review m1) |
 
 - **New mutants** (Step 5):
   4. Map `seazn:alive` to nothing. Expected red: `alive_beats_are_relayed_with_their_generation`.

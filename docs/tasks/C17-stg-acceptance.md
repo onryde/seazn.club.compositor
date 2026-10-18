@@ -68,17 +68,26 @@ entries are written in full, in the runbook's four-line form:
     match is not affected.
   - **Check:** web logs `relay sizing alarm` at WARN (`alarm: "sizing"`, with `sid`, `orgId`, `rung`,
     `previousRung`, `attempt` and `machineId`) and reports it to Sentry under route
-    `relay.sizing_alarm`, once per step (`seazn.club` #980). In the health review, the step shows in
-    `rung_stepped_beats`.
+    `relay.sizing_alarm`, once per step and per attempt (`seazn.club` #980). In the health review,
+    the step shows in `rung_stepped_beats`.
+  - **Alert rule (the simplest that cannot go quiet):** a Sentry issue alert **on every event**
+    whose tag `route` is `relay.sizing_alarm`, sent to the ops channel. The message is fixed, so
+    every alarm groups into ONE issue. An alert on "a new issue" would fire once, ever, and then
+    stay silent while the issue stays open. So the rule is per event, not per issue. Resolving the
+    issue after a resize is housekeeping, and the alert does not depend on it.
   - **Do:** nothing during the match. Afterwards, raise the Machine size: a `seazn.club` PR moves R1's
     `RUNNER_DEFAULT_GUEST` to the next performance size, after C15's cost legs pass on it (Owed 25).
 - **A hung overlay page** (Owed 18, "2 Ok", 2026-10-18).
   - **Meaning:** the page stopped its 2 s `seazn:alive` beat for `cef_hang_after_ms` (10 s) after
-    ready. C05b counts that as a failure, the same as a crash.
-  - **Viewer sees:** the held last frame, possibly a stale score, for up to about 10 s plus the
-    back-off and reload. After 3 failures in 5 min, the overlay is hidden (`graphics: failed`).
-  - **Check:** the beats show `graphics` going `restarting`/`starting` → `ready` with no crash
-    logged, and the compositor log shows the hang line.
+    ready. C05b counts that as a failure, the same as a crash, and **hides the overlay at once**
+    (owner-approved design (2026-10-18); "at once" is the coordinator's reading of it).
+  - **Viewer sees:** the frozen last frame for up to 10 s, while the hang is being detected. Then
+    **no overlay** for about 4 s (the 1 s back-off plus the reload), so no stale score is shown.
+    Then the overlay is back. After 3 failures in 5 min, it stays hidden for the cooldown
+    (`graphics: failed`).
+  - **Check:** the compositor log shows `overlay hidden` with no `cef crashed` before it, then
+    `graphics restart gen=<n+1>`, then `cef ready gen=<n+1>` (C12 amendment). The beats show
+    `restarting`/`starting` → `ready`.
   - **Do:** a single hang needs nothing. Repeated hangs mean the page itself is broken: look at the
     overlay page's recent deploy (R2005/R2007), not at the Machine.
 - **A CEF bump** (C16 amendment 2026-10-18, Owed 22). The steps, in order:

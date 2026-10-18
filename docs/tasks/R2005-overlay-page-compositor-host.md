@@ -608,6 +608,8 @@ task. Pins are at `99c477755`; re-pin them before building.
     - it names the team and that sport's own choice copy
     - it never says "Toss pending"
     - with no toss, it says "Toss pending"
+    - **after a void:** a toss recorded and then undone or voided (the ledger's void path) says
+      "Toss pending" again (PR #21 review gap hunt; the house rule's "after a void")
   - Print `toss sports checked: N`. Assert N equals the registry's count and is ≥ 2. Zero is a
     failure.
   - The existing sweep, that a non-toss sport shows the start alone, stays.

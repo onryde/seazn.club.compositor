@@ -112,9 +112,20 @@ runbook), so the size must leave headroom for the real page.
 | Leg | Output | Overlay | Camera |
 |---|---|---|---|
 | A | 720p30 | template `bar` on a **cricket** fixture, moments back to back | snow |
-| B | 720p30 | template `bug` (the corner bug), the same fixture and driver | snow |
+| B | 720p30 | template `bug` (the corner bug) on a **badminton** fixture, rallies back to back (the score driver records a rally every 3 s) | snow |
 | C | 1080p30 | as A | snow |
 | D | 1080p30 | as B | snow |
+
+**Why these two sports** (amended 2026-10-18, PR #21 review; the house rule "one sample is not a
+sweep").
+- **Cricket's bar is the expected heaviest page.** It carries the most live elements at once: the
+  crease band with two batters, the bowler's analysis and this over's ball glyphs. A delivery
+  repaints it and can fire a moment on nearly every ball.
+- **Badminton's corner bug is the most common production pairing.** So its cost is the one most
+  Machines actually pay.
+- "Heaviest" is a hypothesis, not a measurement. If leg B or D measures above A or C, that is a
+  finding. Then add a leg for a clocked sport, football, whose running clock repaints every second,
+  before choosing a size.
 
 - **The page is the production overlay page.** `…/overlay/fixtures/<id>?template=bar|bug&host=compositor&…`,
   from a `seazn.club` build containing R2007 PR A (`#974`, the registry: `TemplateId = "bar" | "bug"`)
@@ -129,16 +140,48 @@ runbook), so the size must leave headroom for the real page.
 - **Each leg runs at least 10 minutes** (brief default; F-005 ran 290 s), sampled every 1 s from
   +15 s, by F-005's method. The sample covers the whole Machine (`/proc/stat`) and the process tree,
   plus the heartbeats' `encoderSpeed`, `droppedFrames` and `rung`.
-- **Size rule (acceptance).** In every leg, the p95 of Machine CPU must be at most 50 % of the
-  guest's cores, which is 2.0 cores on performance-4x.
-  - If any leg is over, move to the next performance size (performance-8x after 4x) and re-run all
-    four legs there. Repeat until all four pass. The 3 h soak then runs on the passing size.
+- **One page reload per leg** (amended 2026-10-18).
+  - At the leg's midpoint, kill the CEF renderer once: `pkill -KILL -f cef`, C14 case 8's
+    mechanism. The page reloads under load, which is the same work as the 2 h recycle and as a
+    hang's restart.
+  - A reload under load is the likeliest false sizing alarm: 3 drops in 1 s step the ladder down
+    for the rest of the match. So it is measured, not assumed.
+- **Size rule (acceptance).** A leg passes only if all three hold over its whole run, the reload
+  included:
+  1. The p95 of Machine CPU is at most 50 % of the guest's cores, which is 2.0 cores on
+     performance-4x.
+  2. **No step down:** every beat's `rung` is `full`.
+  3. **No pre-encoder drops:** the final `droppedFrames` is 0.
+
+  CPU alone can pass a leg that steps. A single-thread bottleneck, such as the blend or CEF's
+  renderer at `nice 10`, can drop frames at 45 % p95 (PR #21 review, I4).
+  - If any leg fails any of the three, move to the next performance size (performance-8x after 4x),
+    and re-run all four legs there. Repeat until all four pass. The 3 h soak then runs on the
+    passing size.
   - The move is a `seazn.club` PR that sets R1's `RUNNER_DEFAULT_GUEST` (Owed 25), because web picks
     the guest. This task records the finding and opens or requests that PR. It never edits web's
     config itself.
 - **Record `F-0xx: real overlay cost`** in `_FINDINGS.md`: F-005's table shape per leg (Machine
   cores avg / p95 / max, tree, encoder speed, drops, rung), the URLs, the moment rate and the size
   verdict. Screenshots of each leg's programme are looked at, and never committed.
+
+### The 3 h soak runs the real templates (amended 2026-10-18)
+
+The soak's overlay is the production page, never `overlay-test.html`. Run the soak on the heaviest
+pairing: `bar` on the cricket fixture, with the same score driver. The `overlayUrl` that
+fake-control hands out points at the real page (served as for the cost legs) for a **public**
+fixture, so it needs no `sid`/`st`. That is R2005's public path, with `host=compositor`.
+
+The real page has no machine-readable strip. So criterion 5's "9 match restarts seen as an overlay
+index drop to 0" is replaced by four checks:
+- (a) The compositor log has `cef alive` lines for at least 95 % of `3 h / cef_alive_every_ms`.
+- (b) `graphics` never reads `failed`, and no `overlay hidden` appears without a matching hang or
+  crash line.
+- (c) The score driver has recorded ≥ 1 delivery a minute.
+- (d) Once a minute, a sample of the programme recording's overlay region differs from the
+  camera-only reference, so the overlay is on air.
+
+The strip-based overlay checks stay in C13/C14, on the test page.
 
 ### Soak verdict, criterion 6 (added)
 
@@ -152,7 +195,11 @@ reads green.
 
 ### Acceptance (added)
 
-- The four cost legs, with the size rule met on the size the soak then uses, and the F-entry pasted.
+- The four cost legs, each with its one reload, meet all three parts of the size rule (CPU p95
+  ≤ 50 %, 0 step-downs, 0 dropped frames) on the size the soak then uses. The F-entry is pasted,
+  with the sport reason, or the football leg if the hypothesis failed.
+- The 3 h soak ran on the real `bar`/cricket page, and criterion 5's replacement checks (a)–(d)
+  all passed.
 - `test-verdict.sh` is 1 green / 5 red, with reasons.
 
 ## Do not touch

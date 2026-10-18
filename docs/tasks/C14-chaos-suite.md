@@ -1,4 +1,4 @@
-# C14: Chaos suite (10 cases, automated pass/fail)
+# C14: Chaos suite (~~10~~ 12 cases, automated pass/fail; amended 2026-10-18)
 
 **Repo:** `seazn.club.compositor`. **Depends on:** C13. Read spec §6 (the robustness table and
 budgets) and §9.4 (the cases).
@@ -36,7 +36,7 @@ Add a unit test that each budget is consistent with its threshold. For example,
 `slate_after_ms + one frame period ≤ BUDGET_SLATE_AFTER_LOSS_MS`. A spike-driven threshold change
 that breaks a budget then reds at `cargo test`, not in a 2-minute chaos run.
 
-### The 10 cases
+### The 10 cases (12 with the 2026-10-18 amendment's cases 11 and 12)
 
 The PDF's kill-switch case is replaced by "CEF killed".
 
@@ -87,12 +87,18 @@ case 6 asserts what the overlay strip shows after the stress ends"):
 step). `BUDGET_LADDER_REALTIME_MS` is checked against `ladder_window_ms` instead: the ladder's one
 step lands within one window of its overruns, so `ladder_window_ms ≤ BUDGET_LADDER_REALTIME_MS`.
 
-**Case 11, `cef-hung`** (Owed 18, approved 2026-10-18; this grows the suite from 10
-cases to 11, and the Step 7 commit title says eleven):
+**Case 11, `cef-hung`** (Owed 18, approved 2026-10-18). With case 12 below, the suite grows from 10
+cases to 12, and the Step 7 commit title says twelve:
 
 | # | File | Script | Verdict (`.jq`) |
 |---|---|---|---|
-| 11 | `cef-hung` | At 20 s, the harness page hangs: C11's `?crash=1` (`while(true){}` after ready), armed to fire at 20 s. Run 60 s | The overlay strip holds the **same** index (the held frame) from the hang until the restarted page's first frame, with no transparent gap. Camera strip frames continue (no freeze > 2 frames). A beat shows `graphics` leaving `ready` within `$t.cef_hang_after_ms + $t.heartbeat_interval_ms` of the hang. Per Owed 19, `restarting` **or** `starting` counts. A later beat is `ready` again. `output_outages == []`. **Anti-vacuity:** the compositor log has a `CefAlive` before the hang and none from the hung generation after it, and the hang time comes from the page's own log line, never from the script's timer |
+| 11 | `cef-hung` | At 20 s, the harness page hangs: C11's `?crash=1` (`while(true){}` after ready), armed with `crash_after_ms` to fire at 20 s. Run 60 s | Hide at once (owner-approved design (2026-10-18); "at once" is the coordinator's reading of it). **The strip, frame-exact:** the overlay strip holds the **same** index from the hang until the hang is detected, at most `$t.cef_hang_after_ms` + one frame period after the page's last `seazn:alive`. From there it shows **no overlay** (transparent, so no stale score) until generation `g+1`'s first frame after its `CefReady`, and then the overlay again (the positive pair). Camera strip frames continue (no freeze > 2 frames). `output_outages == []`. **The evidence, from the compositor's structured log (C12 amendment), never a beat in a window** (PR #21 review I3: the ~3.8 s non-ready span catches a 5 s beat only ~3 runs in 4):
+- the last `cef alive gen=g`
+- then `overlay hidden` at the last beat + `$t.cef_hang_after_ms` (± one tick), with no `cef crashed gen=g` before it
+- then `graphics restart gen=g+1` at + `$t.cef_backoff_base_ms`
+- then `cef ready gen=g+1`
+
+Every beat in that span reads `ready`, `restarting` or `starting`, and never `failed`. **Anti-vacuity:** the log has at least 2 `cef alive gen=g` lines before the hang and none after it, the hang time comes from the page's own log line (never the script's timer), and the strip's transparent span is ≥ 1 frame |
 
 - **Every case's page beats.** The harness page logs `seazn:alive` like the real one (C11
   amendment; false-premise row "The hang design needs only the real page to beat"). Without the
@@ -194,7 +200,7 @@ cases to 11, and the Step 7 commit title says eleven):
      does not count.
 - [ ] **Step 6: Run `run-chaos.sh` three times in a row**, all green (spec §9.7 item 1). Paste the
   three tables.
-- [ ] **Step 7: Commit and open the PR.** `test(chaos): ten automated failure cases (C14)`. Then
+- [ ] **Step 7: Commit and open the PR.** `test(chaos): twelve automated failure cases (C14)` (amended 2026-10-18; was "ten"). Then
   trigger `chaos.yml` once by dispatch, and paste the run URL.
 
 ## Acceptance

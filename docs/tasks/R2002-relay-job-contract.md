@@ -86,7 +86,7 @@ inputKicks: z.number().int().min(0).nullish(),
 inputKickAlert: z.boolean().nullish(),
 pipelineRebuilds: z.number().int().min(0).nullish(),
 sinkSwaps: z.number().int().min(0).nullish(),
-rung: z.enum(["full", "overlay_half_rate", "fast_preset"]).nullish(), // amended 2026-10-18: z.enum(LADDER_RUNGS), no fast_preset
+rung: z.enum(["full", "overlay_half_rate"]).nullish(), // amended 2026-10-18: z.enum(LADDER_RUNGS); "fast_preset" removed (Owed 20)
 scoreStale: z.boolean().nullish(),
 ```
 
