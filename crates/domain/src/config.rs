@@ -58,6 +58,16 @@ pub struct Thresholds {
     pub cef_backoff_base_ms: Ms,
     /// C02 brief default: the cap of the CEF back-off (1 s → 10 s, mirroring the input).
     pub cef_backoff_cap_ms: Ms,
+    /// R2005: the overlay page logs `seazn:alive` this often after ready, on F-001's console channel
+    /// (`docs/_INDEX.md` Owed 18, owner 2026-10-18). The domain does not read it: it is the page's
+    /// contract, kept here so its ratio to `cef_hang_after_ms` is pinned in one place.
+    pub cef_alive_every_ms: Ms,
+    /// C05b (Owed 18): a Ready page silent this long is hung, a counted failure that hides the overlay
+    /// at once. A hung page paints nothing new and cefsrc emits only on paint (F-001), so frame silence
+    /// is no signal; the beat is. Five beats, equal to the page's SCORE_STALE_AFTER_MS (spec §6);
+    /// shorter turns CPU starvation (CEF children run at nice 10, so beats slip under load) into
+    /// restarts whose load spikes feed the ladder.
+    pub cef_hang_after_ms: Ms,
     /// C02 brief default (no PDF number): overruns within `ladder_window_ms` needed to step down a rung.
     pub ladder_overruns_to_step: usize,
     /// C02 brief default (no PDF number): the window `ladder_overruns_to_step` is counted in.
@@ -110,6 +120,8 @@ impl Default for Thresholds {
             cef_recycle_every_ms: 7_200_000,
             cef_backoff_base_ms: 1_000,
             cef_backoff_cap_ms: 10_000,
+            cef_alive_every_ms: 2_000,
+            cef_hang_after_ms: 10_000,
             ladder_overruns_to_step: 3,
             ladder_window_ms: 1_000,
             drain_timeout_ms: 7_000,
@@ -252,6 +264,21 @@ mod tests {
         let t = Thresholds::default();
         assert_eq!(t.cef_load_timeout_ms, 5 * 2_000);
         assert!(t.cef_load_timeout_ms > 2_804);
+    }
+
+    // Owed 18 (owner, 2026-10-18, "2 Ok"): the page beats every 2 s (R2005), and five missed beats
+    // are a hang, the page's own SCORE_STALE_AFTER_MS (spec §6). Against the sources, not each other
+    // alone: 5 × 2 000 = 10 000. A hang deadline at or past the recycle could never fire before it.
+    #[test]
+    fn the_hang_threshold_is_five_beats() {
+        let t = Thresholds::default();
+        assert_eq!(t.cef_alive_every_ms, 2_000, "R2005's beat");
+        assert_eq!(t.cef_hang_after_ms, 5 * t.cef_alive_every_ms, "five beats");
+        assert_eq!(t.cef_hang_after_ms, 10_000, "the page's SCORE_STALE_AFTER_MS");
+        assert!(
+            t.cef_hang_after_ms < t.cef_recycle_every_ms,
+            "a hang is detected before the planned recycle"
+        );
     }
 
     // F-002 and F-004 rerun 1: the slowest healthy connect on CF SRT playback was a first decoded
