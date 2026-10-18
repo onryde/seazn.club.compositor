@@ -1,7 +1,8 @@
-//! Sweeps over C05's graphics sub-machine and degrade ladder: every (state, event) pair against a
-//! matrix written from the brief, both machines over generated schedules against facts the harness
-//! tracks for itself, and, on the frame tick grid of both modes, the plan's review focus 2 (a page
-//! that never signals ready) and an encoder that drops every frame. They live here, not inline,
+//! Sweeps over C05's graphics sub-machine (with C05b's hang detection) and degrade ladder: every
+//! (state, event) pair against a matrix written from the briefs, both machines over generated
+//! schedules against facts the harness tracks for itself, and, on the frame tick grid of both modes,
+//! the plan's review focus 2 (a page that never signals ready), a page that stops beating, and an
+//! encoder that drops every frame. They live here, not inline,
 //! because the domain's crate root forbids `clippy::print_stderr`, and a sweep must print the count
 //! it checked (AGENTS.md §5).
 use domain::config::{OutputProfile, Thresholds};
@@ -78,37 +79,62 @@ fn kind(s: GraphicsState) -> Kind {
     }
 }
 
-/// The instant a state's own timer is due: the load timeout, the recycle, the back-off's end, the
-/// cooldown's end.
+/// The instant a state's own timer is due: the load timeout, the recycle or the hang (C05b: whichever
+/// comes first), the back-off's end, the cooldown's end.
 fn due(s: GraphicsState, t: &Thresholds) -> Ms {
     match s {
         GraphicsState::Starting { since } => since + t.cef_load_timeout_ms,
-        GraphicsState::Ready { since } => since + t.cef_recycle_every_ms,
+        GraphicsState::Ready { since, last_alive } => {
+            (since + t.cef_recycle_every_ms).min(last_alive + t.cef_hang_after_ms)
+        }
         GraphicsState::Backoff { until, .. } => until,
         GraphicsState::Failed { retry_at } => retry_at,
     }
 }
 
-/// Every reachable (state, failures already in the window) setup. Starting and Ready can hold up to
-/// `cef_fail_count - 1` earlier failures; Backoff holds one fewer, since its own failure is in the
-/// window too; Failed exists only at the count.
-fn setups(t: &Thresholds) -> Vec<(Kind, usize)> {
+/// Whether a Ready page has been silent for `cef_hang_after_ms` at `at` (C05b: a hang).
+fn hang_due(s: GraphicsState, at: Ms, t: &Thresholds) -> bool {
+    matches!(s, GraphicsState::Ready { last_alive, .. } if at >= last_alive + t.cef_hang_after_ms)
+}
+
+/// How a Ready setup's page beat: which of its timers falls due first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Beat {
+    /// No beat after the ready: the hang is due first (for a non-Ready setup, nothing beats).
+    Silent,
+    /// Beating up to 1 ms past `recycle − hang`, so the recycle is due 1 ms before the hang.
+    Kept,
+    /// The last beat exactly `cef_hang_after_ms` before the recycle: both are due on one tick.
+    Both,
+}
+
+/// Every reachable (state, failures already in the window, beat) setup. Starting and Ready can hold
+/// up to `cef_fail_count - 1` earlier failures; Backoff holds one fewer, since its own failure is in
+/// the window too; Failed exists only at the count. A Ready setup comes in each `Beat`, so a hang lands
+/// both below the count and at it, and both with and without the recycle due beside it.
+fn setups(t: &Thresholds) -> Vec<(Kind, usize, Beat)> {
     let count = t.cef_fail_count;
     assert!(count >= 2, "the setups need a back-off below the count");
-    vec![
-        (Kind::Starting, 0),
-        (Kind::Starting, count - 1),
-        (Kind::Ready, 0),
-        (Kind::Ready, count - 1),
-        (Kind::Backoff, 0),
-        (Kind::Backoff, count - 2),
-        (Kind::Failed, count - 1),
-    ]
+    let mut s = vec![
+        (Kind::Starting, 0, Beat::Silent),
+        (Kind::Starting, count - 1, Beat::Silent),
+    ];
+    for beat in [Beat::Kept, Beat::Silent, Beat::Both] {
+        s.push((Kind::Ready, 0, beat));
+        s.push((Kind::Ready, count - 1, beat));
+    }
+    s.extend([
+        (Kind::Backoff, 0, Beat::Silent),
+        (Kind::Backoff, count - 2, Beat::Silent),
+        (Kind::Failed, count - 1, Beat::Silent),
+    ]);
+    s
 }
 
 /// A machine in `kind` with `prior` failures in its window, built by crashing each page 10 ms after
-/// its restart. Returns it with the harness's own failure stamps and the instant it entered `kind`.
-fn graphics_in(kind_want: Kind, prior: usize, t: &Thresholds) -> (Graphics, Vec<Ms>, Ms) {
+/// its restart, and beating as `beat` says if Ready. Returns it with the harness's own failure stamps
+/// and the instant of its last setup event (the entry, or the Ready page's last beat).
+fn graphics_in(kind_want: Kind, prior: usize, beat: Beat, t: &Thresholds) -> (Graphics, Vec<Ms>, Ms) {
     let mut g = Graphics::new();
     let mut stamps = Vec::new();
     let mut now = 0;
@@ -125,9 +151,30 @@ fn graphics_in(kind_want: Kind, prior: usize, t: &Thresholds) -> (Graphics, Vec<
         assert_eq!(g.on_tick(now, t), Some(Restart));
     }
     let entered = now + 50;
+    let mut last = entered;
     match kind_want {
         Kind::Starting => {}
-        Kind::Ready => g.on_ready(entered, g.generation()),
+        Kind::Ready => {
+            g.on_ready(entered, g.generation());
+            let (recycle, hang) = (t.cef_recycle_every_ms, t.cef_hang_after_ms);
+            last = match beat {
+                Beat::Silent => entered,
+                Beat::Kept => entered + recycle - hang + 1,
+                Beat::Both => entered + recycle - hang,
+            };
+            if last > entered {
+                g.on_alive(last, g.generation());
+            }
+            let want = GraphicsState::Ready {
+                since: entered,
+                last_alive: last,
+            };
+            assert_eq!(
+                g.state(),
+                want,
+                "setup Ready, {beat:?}: the harness's own instants"
+            );
+        }
         Kind::Backoff | Kind::Failed => {
             let a = g.on_crashed(entered, g.generation(), t);
             assert_eq!(a == Some(Hide), kind_want == Kind::Failed, "setup {kind_want:?}");
@@ -139,7 +186,7 @@ fn graphics_in(kind_want: Kind, prior: usize, t: &Thresholds) -> (Graphics, Vec<
         (kind_want, prior as u64 + 1),
         "setup"
     );
-    (g, stamps, entered)
+    (g, stamps, last)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,9 +194,10 @@ enum GEvent {
     Tick,
     Ready,
     Crashed,
+    Alive,
 }
 
-const G_EVENTS: [GEvent; 3] = [GEvent::Tick, GEvent::Ready, GEvent::Crashed];
+const G_EVENTS: [GEvent; 4] = [GEvent::Tick, GEvent::Ready, GEvent::Crashed, GEvent::Alive];
 
 fn apply(g: &mut Graphics, e: GEvent, now: Ms, gen: u64, t: &Thresholds) -> Option<GraphicsAction> {
     match e {
@@ -159,6 +207,10 @@ fn apply(g: &mut Graphics, e: GEvent, now: Ms, gen: u64, t: &Thresholds) -> Opti
             None
         }
         GEvent::Crashed => g.on_crashed(now, gen, t),
+        GEvent::Alive => {
+            g.on_alive(now, gen);
+            None
+        }
     }
 }
 
@@ -175,10 +227,10 @@ fn after_failure(n: usize, at: Ms, t: &Thresholds) -> (GraphicsState, Option<Gra
     }
 }
 
-/// The brief's transitions (C05 Context and Step 3), written from its prose: the state and action
-/// after `e` at `at`, from `from`, where `n` is the failures in the window if `e` is a failure.
-/// One row is NOT the brief: `(Failed, Tick)` encodes C05's deliberate deviation (docs/_INDEX.md, the
-/// C05 decision row), so this matrix is no independent witness of the brief on that row.
+/// The briefs' transitions (C05 Context and Step 3; C05b Rules), written from their prose: the state
+/// and action after `e` at `at`, from `from`, where `n` is the failures in the window if `e` is a
+/// failure. One row is NOT the C05 brief: `(Failed, Tick)` encodes C05's deliberate deviation
+/// (docs/_INDEX.md, the C05 decision row), so this matrix is no independent witness of the brief there.
 fn brief(
     from: GraphicsState,
     e: GEvent,
@@ -191,91 +243,120 @@ fn brief(
     let restart = (GraphicsState::Starting { since: at }, Some(Restart));
     match (kind(from), e) {
         (K::Backoff, E::Tick) => restart, // the back-off is over
-        (K::Ready, E::Tick) => restart,   // the planned recycle
+        // C05b: a hang is a counted failure and hides at once, below the count too; it wins over a
+        // recycle that is due on the same tick.
+        (K::Ready, E::Tick) if hang_due(from, at, t) => (after_failure(n, at, t).0, Some(Hide)),
+        (K::Ready, E::Tick) => restart, // the planned recycle
         // C05 DEVIATION, not Step 3: the brief went Failed → `Backoff { 0, now }` with no action and
         // restarted on the next tick; C05 restarts on the tick the cooldown ends (docs/_INDEX.md).
         (K::Failed, E::Tick) => restart,
         (K::Starting, E::Tick) => after_failure(n, at, t), // the load timed out
         (K::Starting | K::Ready, E::Crashed) => after_failure(n, at, t),
-        (K::Starting, E::Ready) => (GraphicsState::Ready { since: at }, None),
+        (K::Starting, E::Ready) => (
+            GraphicsState::Ready {
+                since: at,
+                last_alive: at,
+            },
+            None,
+        ),
+        // C05b: a beat moves the hang deadline, never the recycle clock.
+        (K::Ready, E::Alive) => match from {
+            GraphicsState::Ready { since, .. } => (
+                GraphicsState::Ready {
+                    since,
+                    last_alive: at,
+                },
+                None,
+            ),
+            _ => unreachable!("kind() said Ready"),
+        },
         _ => (from, None), // everything else changes nothing
     }
 }
 
-/// Whether `e` from `from` is a failure the window must record.
-fn is_failure(from: Kind, e: GEvent) -> bool {
-    matches!(
-        (from, e),
-        (Kind::Starting, GEvent::Tick) | (Kind::Starting | Kind::Ready, GEvent::Crashed)
-    )
+/// Whether `e` at `at` from `from` is a failure the window must record (the tick only when its timer
+/// is due: a load timeout, or a hang).
+fn is_failure(from: GraphicsState, e: GEvent, at: Ms, t: &Thresholds) -> bool {
+    match (kind(from), e) {
+        (Kind::Starting, GEvent::Tick) => at >= due(from, t),
+        (Kind::Ready, GEvent::Tick) => hang_due(from, at, t),
+        (Kind::Starting | Kind::Ready, GEvent::Crashed) => true,
+        _ => false,
+    }
 }
 
-// Ticks land at the state's due instant; ready and crash 1 ms after the state was entered, inside
-// every window. Each setup holds its own failure history, so a failure lands both below the count
-// and at it.
+// Ticks land at the state's due instant; ready, crash and beat 1 ms after the setup's last event,
+// inside every window. Each setup holds its own failure history, so a failure lands both below the
+// count and at it; each Ready setup beats its own way, so the tick is a recycle, a hang, or both due.
 #[test]
 fn every_graphics_pair_follows_the_brief() {
     let t = Thresholds::default();
-    let (mut checked, mut moved, mut hides) = (0usize, 0usize, 0usize);
-    for (k, prior) in setups(&t) {
+    let (mut checked, mut moved, mut hides, mut hang_hides) = (0usize, 0usize, 0usize, 0usize);
+    for (k, prior, beat) in setups(&t) {
         for e in G_EVENTS {
-            let (mut g, mut stamps, entered) = graphics_in(k, prior, &t);
+            let (mut g, mut stamps, last) = graphics_in(k, prior, beat, &t);
             let from = g.state();
             let gen = g.generation();
             let at = if e == GEvent::Tick {
                 due(from, &t)
             } else {
-                entered + 1
+                last + 1
             };
-            if is_failure(k, e) {
+            if is_failure(from, e, at, &t) {
                 stamps.push(at);
             }
             let n = within(&stamps, at, t.cef_fail_window_ms);
             let a = apply(&mut g, e, at, gen, &t);
             let want = brief(from, e, at, n, &t);
-            assert_eq!((g.state(), a), want, "({k:?} prior {prior}, {e:?}) at {at}");
+            let ctx = format!("({k:?} prior {prior} {beat:?}, {e:?}) at {at}");
+            assert_eq!((g.state(), a), want, "{ctx}");
             let restarted = want.1 == Some(Restart);
-            assert_eq!(g.generation(), gen + u64::from(restarted), "({k:?}, {e:?})");
+            assert_eq!(g.generation(), gen + u64::from(restarted), "{ctx}");
             checked += 1;
-            moved += usize::from(kind(want.0) != k);
+            moved += usize::from(kind(want.0) != k || want.0 != from);
             hides += usize::from(want.1 == Some(Hide));
+            hang_hides += usize::from(e == GEvent::Tick && hang_due(from, at, &t) && a == Some(Hide));
         }
     }
-    eprintln!("graphics pairs checked: {checked} ({moved} move the state, {hides} hide)");
+    eprintln!(
+        "graphics pairs checked: {checked} ({moved} move the state, {hides} hide, {hang_hides} of them a hang)"
+    );
     assert_eq!(checked, setups(&t).len() * G_EVENTS.len(), "every pair, once");
     assert!(
         moved > 0 && hides > 0,
         "a matrix where nothing moves or hides is vacuous"
     );
+    assert!(hang_hides > 0, "no hang hid: the C05b rows are vacuous");
 }
 
-// A tick 1 ms before each timer is due, and every ready or crash from the previous generation and
-// from one never built, change nothing in any state: not the state, the generation or the window.
+// A tick 1 ms before each timer is due, and every ready, crash or beat from the previous generation
+// and from one never built, change nothing in any state: not the state, the generation or the window.
 #[test]
 fn graphics_early_ticks_and_other_generations_change_nothing() {
     let t = Thresholds::default();
+    let other = [GEvent::Ready, GEvent::Crashed, GEvent::Alive];
     let mut checked = 0usize;
-    for (k, prior) in setups(&t) {
-        let (mut g, _, entered) = graphics_in(k, prior, &t);
+    for (k, prior, beat) in setups(&t) {
+        let (mut g, _, last) = graphics_in(k, prior, beat, &t);
         let before = g.clone();
         assert_eq!(
             g.on_tick(due(g.state(), &t) - 1, &t),
             None,
-            "{k:?}: acted 1 ms early"
+            "{k:?} {beat:?}: acted 1 ms early"
         );
-        assert_eq!(g, before, "{k:?}: early tick");
+        assert_eq!(g, before, "{k:?} {beat:?}: early tick");
         checked += 1;
-        for e in [GEvent::Ready, GEvent::Crashed] {
+        for e in other {
             for gen in [before.generation() - 1, before.generation() + 1] {
-                let (mut g, _, _) = graphics_in(k, prior, &t);
-                assert_eq!(apply(&mut g, e, entered + 1, gen, &t), None);
-                assert_eq!(g, before, "({k:?}, {e:?}) from generation {gen}");
+                let (mut g, _, _) = graphics_in(k, prior, beat, &t);
+                assert_eq!(apply(&mut g, e, last + 1, gen, &t), None);
+                assert_eq!(g, before, "({k:?} {beat:?}, {e:?}) from generation {gen}");
                 checked += 1;
             }
         }
     }
     eprintln!("graphics no-ops checked: {checked}");
-    assert_eq!(checked, setups(&t).len() * (1 + 2 * 2));
+    assert_eq!(checked, setups(&t).len() * (1 + other.len() * 2));
 }
 
 // ---- graphics: generated schedules, against facts the harness tracks itself ----
@@ -289,6 +370,66 @@ fn advance(r: &mut Lcg, now: Ms, due: Ms) -> Ms {
     match r.next(4) {
         0 if due > now => due - 1 + r.next(3), // due - 1, due or due + 1
         _ => now + r.pick(&[0, 1, 33, 34, 120, 999, 2_000, 10_000, 60_000, 150_000]),
+    }
+}
+
+/// The harness's model of a Ready page (C05b). It beats every `cef_alive_every_ms` plus a slip (CEF
+/// children run at nice 10, so beats come late under load; the longest slip leaves a beat 1 ms
+/// inside the threshold), and, unless `stop` is None, its last beat is exactly at `stop` and it is
+/// silent after: a hang `cef_hang_after_ms` later. A stop at the ready itself never beats at all.
+#[derive(Debug)]
+struct Page {
+    ready_at: Ms,
+    last_beat: Ms,
+    next_beat: Ms,
+    stop: Option<Ms>,
+}
+
+impl Page {
+    fn new(r: &mut Lcg, ready_at: Ms, t: &Thresholds) -> Self {
+        let (recycle, hang) = (t.cef_recycle_every_ms, t.cef_hang_after_ms);
+        let stop = match r.next(8) {
+            0..=2 => None,                              // beats until it leaves Ready
+            3 => Some(ready_at),                        // never beats: the ready is its last
+            4 | 5 => Some(ready_at + r.next(4 * hang)), // stops soon after the ready
+            _ => Some(ready_at + recycle - hang - r.pick(&[0, 0, 1, 999, 30_000])), // near the recycle
+        };
+        Self {
+            ready_at,
+            last_beat: ready_at,
+            next_beat: ready_at + Self::spacing(r, t),
+            stop,
+        }
+    }
+
+    fn spacing(r: &mut Lcg, t: &Thresholds) -> Ms {
+        let (every, hang) = (t.cef_alive_every_ms, t.cef_hang_after_ms);
+        every + r.pick(&[0, 0, 0, 1, 33, every / 4, every / 2, hang - every - 1])
+    }
+
+    /// The next beat at or before `now`, if the page has one: its schedule, ending exactly at `stop`.
+    fn beat_by(&mut self, r: &mut Lcg, now: Ms, t: &Thresholds) -> Option<Ms> {
+        let b = match self.stop {
+            Some(s) if self.last_beat >= s => return None, // silent since its last beat
+            Some(s) => self.next_beat.min(s),
+            None => self.next_beat,
+        };
+        if b > now {
+            return None;
+        }
+        self.last_beat = b;
+        self.next_beat = b + Self::spacing(r, t);
+        Some(b)
+    }
+
+    /// The instant this page's Ready ends on its own if nothing else happens: the recycle, or the hang
+    /// after its last beat. The generator aims at it, so recycles and hangs both come up.
+    fn deadline(&self, t: &Thresholds) -> Ms {
+        let recycle = self.ready_at + t.cef_recycle_every_ms;
+        match self.stop {
+            None => recycle,
+            Some(s) => recycle.min(s.max(self.last_beat) + t.cef_hang_after_ms),
+        }
     }
 }
 
@@ -310,6 +451,21 @@ struct GraphicsCounts {
     stale: usize,
     waits_doubled: usize,
     failures_within_a_window_of_a_recycle: usize,
+    beats: usize,
+    beats_ignored_not_ready: usize,
+    beats_after_a_hang: usize,
+    hangs: usize,
+    hangs_to_failed: usize,
+    hang_hides_lifted_by_ready: usize,
+    beaten_ready_ticks: usize,
+    hang_at_recycle: usize,
+}
+
+/// What the harness knows about a hide it has seen: the generation hidden, and whether a hang hid it.
+#[derive(Debug, Clone, Copy)]
+struct Hidden {
+    gen: u64,
+    by_hang: bool,
 }
 
 #[test]
@@ -322,35 +478,60 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
         let mut g = Graphics::new();
         let mut now: Ms = 0;
         // Facts kept by the harness: its own failure stamps, the restarts it saw, the last recycle,
-        // and whether the overlay is hidden.
+        // the Ready page it is driving, whether the overlay is hidden (C05b: a `Hide` sets it, the
+        // Ready of a generation newer than the one hidden clears it, nothing else touches it), and
+        // whether the page now backing off or Failed left Ready by a hang.
         let mut stamps: Vec<Ms> = Vec::new();
         let mut restarts: u64 = 0;
         let mut recycled_at: Option<Ms> = None;
-        let mut hidden = false;
+        let mut page: Option<Page> = None;
+        let mut hidden: Option<Hidden> = None;
+        let mut hid_since_restart = false;
+        let mut left_by_hang = false;
         for _ in 0..STEPS {
-            let before = g.state();
-            now = advance(&mut r, now, due(before, &t));
+            let aim = match &page {
+                Some(p) => p.deadline(&t),
+                None => due(g.state(), &t),
+            };
+            now = advance(&mut r, now, aim);
             let gen = g.generation();
             assert_eq!(gen, restarts, "case {case}: one generation per restart");
+            // The Ready page's beats up to `now`, in order, before this step's event.
+            if let Some(p) = page.as_mut() {
+                while let Some(b) = p.beat_by(&mut r, now, &t) {
+                    g.on_alive(b, gen);
+                    let want = GraphicsState::Ready {
+                        since: p.ready_at,
+                        last_alive: b,
+                    };
+                    assert_eq!(g.state(), want, "case {case}: the beat at {b}");
+                    c.beats += 1;
+                }
+            }
+            let before = g.state();
             let k = kind(before);
-            let (e, ev_gen) = match r.next(10) {
+            match (&page, before) {
+                (Some(p), GraphicsState::Ready { since, last_alive }) => assert_eq!(
+                    (since, last_alive),
+                    (p.ready_at, p.last_beat),
+                    "case {case}: the machine's Ready is the harness's own"
+                ),
+                (None, GraphicsState::Ready { .. }) => panic!("case {case}: Ready with no page"),
+                (Some(_), other) => panic!("case {case}: a page, but {other:?}"),
+                (None, _) => {}
+            }
+            let (e, ev_gen) = match r.next(12) {
                 0..=4 => (GEvent::Tick, gen),
                 5..=6 => (GEvent::Ready, gen),
                 7..=8 => (GEvent::Crashed, gen),
+                9 => (GEvent::Alive, gen),
                 _ => {
                     let other = if gen > 0 && r.next(2) == 0 {
                         gen - 1
                     } else {
                         gen + 1
                     };
-                    (
-                        if r.next(2) == 0 {
-                            GEvent::Ready
-                        } else {
-                            GEvent::Crashed
-                        },
-                        other,
-                    )
+                    (r.pick(&[GEvent::Ready, GEvent::Crashed, GEvent::Alive]), other)
                 }
             };
             let a = apply(&mut g, e, now, ev_gen, &t);
@@ -364,11 +545,8 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
                 continue;
             }
             let due_now = now >= due(before, &t);
-            let failure = match (k, e) {
-                (Kind::Starting, GEvent::Tick) => due_now,
-                (Kind::Starting | Kind::Ready, GEvent::Crashed) => true,
-                _ => false,
-            };
+            let hang = e == GEvent::Tick && hang_due(before, now, &t);
+            let failure = is_failure(before, e, now, &t);
             if failure {
                 stamps.push(now);
             }
@@ -383,8 +561,26 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
                 "case {case}: ({k:?}, {e:?}) at {now}, {n} in the window"
             );
             match (k, e, a) {
-                (_, GEvent::Tick, None) if !due_now => c.quiet_ticks += 1,
+                (_, GEvent::Tick, None) if !due_now => {
+                    c.quiet_ticks += 1;
+                    // A quiet Ready tick the ready alone would have hung: a beat kept the page.
+                    if let (Kind::Ready, Some(p)) = (k, &page) {
+                        let kept = now >= p.ready_at + t.cef_hang_after_ms;
+                        assert!(
+                            !kept || p.last_beat > p.ready_at,
+                            "case {case}: kept with no beat"
+                        );
+                        c.beaten_ready_ticks += usize::from(kept);
+                    }
+                }
                 (Kind::Backoff, GEvent::Tick, _) => c.restarts_after_backoff += 1,
+                (Kind::Ready, GEvent::Tick, _) if hang => {
+                    c.hangs += 1;
+                    c.hangs_to_failed += usize::from(kind(g.state()) == Kind::Failed);
+                    let recycle_due = matches!(before, GraphicsState::Ready { since, .. }
+                        if now >= since + t.cef_recycle_every_ms);
+                    c.hang_at_recycle += usize::from(recycle_due);
+                }
                 (Kind::Ready, GEvent::Tick, _) => {
                     c.recycles += 1;
                     recycled_at = Some(now);
@@ -398,6 +594,17 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
                 (_, GEvent::Ready, _) => c.readies_ignored += 1,
                 (Kind::Backoff, GEvent::Crashed, _) => c.crashes_ignored_backing_off += 1,
                 (Kind::Failed, GEvent::Crashed, _) => c.crashes_ignored_failed += 1,
+                (Kind::Ready, GEvent::Alive, _) => {
+                    // A beat off the page's schedule (a late one): the page is silent again after it
+                    // if it had stopped.
+                    let p = page.as_mut().expect("Ready has a page");
+                    p.last_beat = now;
+                    c.beats += 1;
+                }
+                (_, GEvent::Alive, _) => {
+                    c.beats_ignored_not_ready += 1;
+                    c.beats_after_a_hang += usize::from(left_by_hang);
+                }
             }
             if failure {
                 c.crashes_to_failed += usize::from(e == GEvent::Crashed && a == Some(Hide));
@@ -405,21 +612,53 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
                 c.failures_within_a_window_of_a_recycle +=
                     usize::from(recycled_at.is_some_and(|at| now - at <= span));
             }
+            // The page the harness drives: made at the machine's Ready, gone when it leaves Ready.
+            let after = kind(g.state());
+            if k == Kind::Starting && after == Kind::Ready {
+                page = Some(Page::new(&mut r, now, &t));
+                if let Some(h) = hidden.take() {
+                    assert!(
+                        g.generation() > h.gen,
+                        "case {case}: the hidden generation {} went Ready",
+                        h.gen
+                    );
+                    c.hang_hides_lifted_by_ready += usize::from(h.by_hang);
+                }
+            } else if after != Kind::Ready {
+                page = None;
+            }
             match a {
                 Some(Hide) => {
-                    assert!(!hidden, "case {case}: a second hide with no restart between");
-                    hidden = true;
+                    assert!(
+                        !hid_since_restart,
+                        "case {case}: a second hide with no restart between"
+                    );
+                    hid_since_restart = true;
+                    assert!(
+                        matches!(after, Kind::Backoff | Kind::Failed),
+                        "case {case}: hidden, but {:?}",
+                        g.state()
+                    );
+                    let by_hang = hidden.is_some_and(|h| h.by_hang) || hang;
+                    hidden = Some(Hidden { gen, by_hang });
                 }
                 Some(Restart) => {
                     restarts += 1;
-                    hidden = false;
+                    hid_since_restart = false;
+                    left_by_hang = false;
                 }
                 None => {}
             }
-            assert_eq!(
-                hidden,
-                kind(g.state()) == Kind::Failed,
-                "case {case}: hidden iff Failed"
+            left_by_hang |= hang;
+            // C05b's invariant, replacing "hidden iff Failed": Failed is always hidden, and a hidden
+            // overlay is never on a Ready page (only a newer generation's Ready lifts it, above).
+            assert!(
+                after != Kind::Failed || hidden.is_some(),
+                "case {case}: Failed but not hidden"
+            );
+            assert!(
+                after != Kind::Ready || hidden.is_none(),
+                "case {case}: hidden on a Ready page"
             );
         }
     }
@@ -444,6 +683,17 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
             "failures within a window of a recycle",
             c.failures_within_a_window_of_a_recycle,
         ),
+        ("beats", c.beats),
+        ("beats ignored while not Ready", c.beats_ignored_not_ready),
+        ("beats after a hang was declared", c.beats_after_a_hang),
+        ("hangs", c.hangs),
+        ("hangs that fail", c.hangs_to_failed),
+        (
+            "hang hides lifted by the next Ready",
+            c.hang_hides_lifted_by_ready,
+        ),
+        ("Ready ticks a beat kept from hanging", c.beaten_ready_ticks),
+        ("hangs with the recycle due beside them", c.hang_at_recycle),
     ];
     for (name, n) in all {
         assert!(n > 0, "never exercised: {name}");
@@ -551,6 +801,74 @@ fn a_page_that_never_signals_ready_hides_on_the_frame_tick_grid() {
         ready_transitions, 0,
         "a never-ready page went Ready on an ignorable signal"
     );
+}
+
+// C05b on the frame tick grid of both modes, at every phase: a page that is ready off the grid, beats
+// every `cef_alive_every_ms` for 30 s on its own clock (between ticks), then stops, is hidden on the
+// first tick at or after `cef_hang_after_ms` past its last beat (late by under one tick spacing: C14
+// case 11's "± one tick"), and restarted on the first tick at or after the hide plus
+// `cef_backoff_base_ms` (C06 and C08's hang timing). Nothing acts between its first restart and the
+// hide, and each run counts the beats it delivered, so "never hung while beating" can fail.
+#[test]
+fn a_page_that_stops_beating_hides_on_the_frame_tick_grid() {
+    let t = Thresholds::default();
+    let (every, hang, base) = (t.cef_alive_every_ms, t.cef_hang_after_ms, t.cef_backoff_base_ms);
+    let (mut cases, mut beats_delivered) = (0usize, 0usize);
+    for mode in BOTH_MODES {
+        let spacing = widest(mode);
+        for phase in 0..spacing {
+            let mut g = Graphics::new();
+            let ready = phase + t.cef_load_timeout_ms / 2 + 7; // off the grid
+            let beats: Vec<Ms> = (1..=30_000 / every).map(|k| ready + k * every).collect();
+            let last = *beats.last().unwrap();
+            let mut next = 0usize;
+            let mut is_ready = false;
+            let mut acts = Vec::new();
+            let horizon = last + hang + base + 2 * spacing;
+            for now in ticks(mode, phase) {
+                assert!(now <= horizon, "{mode:?} φ{phase}: no restart by {horizon} ms");
+                if !is_ready && now >= ready {
+                    g.on_ready(ready, 1);
+                    is_ready = true;
+                }
+                while next < beats.len() && beats[next] <= now {
+                    g.on_alive(beats[next], 1);
+                    next += 1;
+                    beats_delivered += 1;
+                }
+                if let Some(a) = g.on_tick(now, &t) {
+                    acts.push((now, a));
+                }
+                if acts.len() == 3 {
+                    break;
+                }
+            }
+            let ctx = format!("{mode:?} φ{phase}: {acts:?}");
+            assert_eq!(next, beats.len(), "{ctx}: every beat delivered");
+            let kinds: Vec<GraphicsAction> = acts.iter().map(|&(_, a)| a).collect();
+            assert_eq!(kinds, vec![Restart, Hide, Restart], "{ctx}");
+            assert_eq!(acts[0].0, phase, "{ctx}: the first tick restarts");
+            let hidden = acts[1].0;
+            assert!(
+                (last + hang..last + hang + spacing).contains(&hidden),
+                "{ctx}: hidden {} ms after the last beat",
+                hidden - last
+            );
+            let restarted = acts[2].0;
+            assert!(
+                (hidden + base..hidden + base + spacing).contains(&restarted),
+                "{ctx}: restarted {} ms after the hide",
+                restarted - hidden
+            );
+            assert_eq!(g.generation(), 2, "{ctx}");
+            cases += 1;
+        }
+    }
+    eprintln!(
+        "stopped-beat runs checked: {cases} (mode × phase), {beats_delivered} beats delivered; hide within one \
+         tick of the last beat + {hang} ms, restart within one tick of the hide + {base} ms"
+    );
+    assert!(cases > 0 && beats_delivered > 0, "checked 0 runs or 0 beats");
 }
 
 // ---- the ladder ----
