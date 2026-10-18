@@ -3,7 +3,9 @@
 use adapters::control_http::{heartbeat_wire, parse_session, programme_phase_wire};
 use app::ports::{FetchError, Measured};
 use domain::config::{OutputProfile, Thresholds};
-use domain::health::{BeatState, ExitInfo, GraphicsStatus, HealthReport, LinkStatus, PhaseChannel};
+use domain::health::{
+    BeatState, ExitDetail, ExitInfo, GraphicsStatus, HealthReport, LinkStatus, PhaseChannel,
+};
 use domain::ladder::Rung;
 use domain::lifecycle::ExitReason;
 use domain::programme::ProgrammePhase;
@@ -147,7 +149,7 @@ fn stopped(reason: ExitReason, detail: Option<&str>) -> HealthReport {
         state: BeatState::Stopped,
         exit: Some(ExitInfo {
             reason,
-            detail: detail.map(str::to_owned),
+            detail: detail.map(ExitDetail::new),
         }),
         ..report()
     }
@@ -578,7 +580,7 @@ fn an_empty_detail_is_absent() {
     let s = booted(0, u64::MAX / 2);
     let d = s.decide(
         Event::Fatal {
-            detail: Some(String::new()),
+            detail: Some(ExitDetail::new("")),
         },
         10,
     );
@@ -620,14 +622,20 @@ fn exit_detail_is_redacted_and_capped() {
         let s = booted(0, u64::MAX / 2);
         let d = s.decide(
             Event::Fatal {
-                detail: Some(detail.clone()),
+                detail: Some(ExitDetail::new(detail.clone())),
             },
             10,
         );
         let beats = beats_of(&d.effects);
         assert_eq!(beats.len(), 1);
         assert_eq!(
-            beats[0].exit.as_ref().unwrap().detail.as_deref(),
+            beats[0]
+                .exit
+                .as_ref()
+                .unwrap()
+                .detail
+                .as_ref()
+                .map(ExitDetail::as_str),
             Some(detail.as_str()),
             "domain: verbatim"
         );
@@ -1128,7 +1136,7 @@ fn sessions() -> Vec<(&'static str, World)> {
     w.boot(1_000, far);
     w.run_until(2_000);
     w.decide(Event::Fatal {
-        detail: Some(fatal_detail()),
+        detail: Some(ExitDetail::new(fatal_detail())),
     });
     out.push(("fatal", w));
     let mut w = World::new();
@@ -1137,7 +1145,7 @@ fn sessions() -> Vec<(&'static str, World)> {
     w.decide(Event::Signal(SignalKind::Term));
     w.pending.clear(); // the drain does not finish: the fatal error lands inside it
     w.decide(Event::Fatal {
-        detail: Some(fatal_detail()),
+        detail: Some(ExitDetail::new(fatal_detail())),
     });
     out.push(("fatal-in-drain", w));
     out

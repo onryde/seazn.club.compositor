@@ -23,7 +23,7 @@ use app::ports::{
     FINAL_BEAT_TIMEOUT_MS,
 };
 use domain::config::OutputProfile;
-use domain::health::{BeatState, GraphicsStatus, HealthReport, LinkStatus, PhaseChannel};
+use domain::health::{BeatState, ExitDetail, GraphicsStatus, HealthReport, LinkStatus, PhaseChannel};
 use domain::ladder::Rung;
 use domain::lifecycle::ExitReason;
 use domain::programme::ProgrammePhase;
@@ -173,7 +173,7 @@ pub fn heartbeat_wire(report: &HealthReport, measured: &Measured) -> Value {
     // The exit keys ride only a `stopped` beat (the contract's if/then; web answers 400 otherwise).
     if let (BeatState::Stopped, Some(exit)) = (report.state, &report.exit) {
         put("exitReason", exit_reason_wire(exit.reason).into());
-        let detail: String = redact(exit.detail.as_deref().unwrap_or(""))
+        let detail: String = redact(exit.detail.as_ref().map_or("", ExitDetail::as_str))
             .chars()
             .take(EXIT_DETAIL_MAX_CHARS)
             .collect();

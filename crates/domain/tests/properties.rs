@@ -4,7 +4,7 @@
 //! prints it, and fails on 0 (AGENTS.md §5).
 use domain::config::Thresholds;
 use domain::graphics::HideReason;
-use domain::health::{BeatState, GraphicsStatus};
+use domain::health::{BeatState, ExitDetail, GraphicsStatus};
 use domain::input_link::LossReason;
 use domain::ladder::Rung;
 use domain::lifecycle::{ExitReason, Lifecycle};
@@ -292,8 +292,8 @@ fn end_events(beating: bool, steps: Vec<(Ms, u8)>, t: &Thresholds) -> Vec<(Ms, E
             21 if dt < 1_000 => Event::Fatal {
                 detail: match dt % 3 {
                     0 => None,
-                    1 => Some(String::new()),
-                    _ => Some(format!("fatal at {now}")),
+                    1 => Some(ExitDetail::new("")),
+                    _ => Some(ExitDetail::new(format!("fatal at {now}"))),
                 },
             },
             21 => Event::Tick,
