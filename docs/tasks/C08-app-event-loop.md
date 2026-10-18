@@ -91,7 +91,7 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
   | Effect | Port call |
   |---|---|
   | `FetchSession` | `control.request(FetchSession)` |
-  | `StartProgramme` | `programme.start(&cfg.output)`. On `Err`, decide `Event::Fatal`. |
+  | `StartProgramme` | `programme.start(&cfg.output)`. On `Err(e)`, decide `Event::Fatal { detail: Some(e.to_string()) }` (amended 2026-10-18, Owed 27 (a): the error's text, unredacted; C07 redacts and caps it). |
   | `RebuildInput{gen}` | `input.rebuild(gen, &cfg.input)` |
   | `SwapSink{gen}` | `programme.swap_sink(gen, &cfg.target)` |
   | `RestartGraphics{gen}` | `graphics.restart(gen, &cfg.overlay_url)` |
@@ -99,7 +99,7 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
   | `HideOverlay { reason: Hang \| Failed, gen }` | log `overlay hidden reason=<r> gen=<g>` (C12), `programme.hide_overlay()`, then **`graphics.stop()`** (amended 2026-10-18; coordinator decision 2026-10-16, Owed 17; the reason from the C05b PR #22 review) |
   | `HideOverlay { reason: Crash \| Recycle, gen }` | log `overlay hidden reason=<crash\|recycle> gen=<g>`, then `programme.hide_overlay()` **alone** (amended 2026-10-18, C05b PR #22 review; `Recycle` added in its second round, the one bound on a frame's age). A crashed generation's gate closed at its reported crash, and a recycled one's at its restart (C11). The reload now loading must survive: stopping it would turn the bound's hide into one more load timeout |
   | `StepDown(r)` | `programme.step_down(r)` |
-  | `SendHeartbeat(h)` | `control.request(Heartbeat(h, metrics.sample()))` |
+  | `SendHeartbeat(h)` | `control.request(Heartbeat(h, metrics.sample()))`; when `h.exit` is `Some`, the never-dropped final-beat slot instead (amended 2026-10-18, wave gate 1 I4; see that amendment) |
   | `DrainOutput` | `programme.drain()`, then `input.stop()` and `graphics.stop()` |
   | `Exit(c)` | `input.stop()`, `graphics.stop()`, and return `Some(c)`. Nothing is applied after it. |
 
@@ -313,7 +313,8 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
     - `Err(Refused(r))` → `Event(BootstrapRefused(r))`
     - `Err(Transient(_))` → `Event(BootstrapFailed)`
     - heartbeat `Ok(d)` → `Event(HeartbeatReply(d))`
-    - heartbeat `Err` → `Event(HeartbeatFailed)`
+    - heartbeat `Err` → `Event(HeartbeatFailed)`, except C07's 410 (`Gone`) →
+      `Event(HeartbeatRefused(HeartbeatRefusal::Gone))` (amended 2026-10-18, wave gate 1 I5)
 
   `run()` loops on `rx.recv_timeout(next_tick_at − now)`. On a message it calls `step`, and on a
   timeout it calls `tick_due`. It returns the code on `Some(code)`.
@@ -478,6 +479,42 @@ not stop that reload.
   - Print the calls checked, and fail on 0.
 - **New mutant:** map every `HideOverlay` to `hide_overlay()` + `graphics.stop()`. Expected red:
   the scenario's "no `GraphicsStop`", in both legs.
+
+## Amendment 2026-10-18 (wave gate 1 review of C06, PR #24; the coordinator's decisions)
+
+**The final beat is never dropped, and it is flushed before exit** (review I4; `docs/_INDEX.md`
+Owed 28). As briefed, the final beat could be lost two ways: `ControlHandle::request` sends every
+beat by `try_send` on a `bounded(1)` slot and drops it on `Full` (Step 5), so a final beat behind a
+slow periodic one was dropped and counted; and `Exit(c)` returns at once, so `main`'s
+`process::exit` (C12) could kill the worker before it posted. The coordinator's ruling:
+- A `SendHeartbeat(h)` whose `h.exit` is `Some` goes on its **own slot, never dropped**, like
+  `FetchSession`'s channel: capacity 2, because a run sends at most two (the drain's, then a fatal
+  error's during the drain, C06 review m2), so its `send` never blocks the frame clock. The worker
+  `select!`s it with priority over the periodic slot. Periodic beats keep `try_send` and the dropped
+  counter.
+- `run()` returns the exit code only once the final beat's request has completed or C07's 2 s
+  timeout has passed (for example, the worker acks each final beat on a channel that `run()` waits on
+  with `recv_timeout`, bounded by 2 s from `Exit`). The flush is bounded, so `Exit` is never delayed
+  past 2 s (C07's final-beat section, reconciled with C12's). An exit with no final beat (a heartbeat
+  410) has nothing to flush and returns at once.
+- Tests (`control_worker.rs`, `driver.rs`):
+  - `the_final_beat_is_posted_under_a_full_heartbeat_channel`: a `ControlPlane` whose `heartbeat`
+    sleeps 300 ms; fill the periodic slot (one in flight, one pending), then decide
+    `Event::Fatal { detail: Some("x") }`. The plane receives the `Stopped` beat (exit `fatal`, detail
+    `x`) before `run()` returns 70.
+  - `the_final_beat_is_posted_on_a_fatal_start`: `programme.start` returns `Err("boom")`. The plane
+    receives a `Stopped` beat whose `exit.detail` is `Some("boom")`, then `run()` returns 70.
+  - `a_hung_final_beat_delays_exit_at_most_2_s`: the plane's `heartbeat` sleeps 10 s. `run()`
+    returns within 2 s + one tick of `Exit`.
+  - `a_heartbeat_410_exits_0_with_no_beat`: the plane answers a periodic beat with C07's `Gone`.
+    `run()` returns 0, and the plane receives no beat after the refused one.
+- **Mutants:** send the final beat through the periodic `try_send` slot (expected red: the full
+  channel test); return from `run()` without waiting for the flush (expected red: the fatal-start
+  test); map C07's `Gone` to `HeartbeatFailed` (expected red: the 410 test).
+
+**Fatal errors carry their text** (Owed 27, option a). Every `Event::Fatal` the driver decides
+(today, a start `Err`) carries the error's own text, `Some(e.to_string())`, unredacted: C07 is the
+one redactor, and an empty text reaches the wire as no `exitDetail`.
 
 ## Do not touch
 

@@ -1216,10 +1216,13 @@ ignored, so the held frame's bound took the Final card off air before the hold e
   (`a_second_failure_report_for_one_fetch_changes_nothing`; mutant B4).
 - The final-beat section's triggers: `SessionGone` is a 410 at bootstrap (`Refusal::Gone`, this
   brief's own refusal table and C07's), not a 404, which is `Refused` (78). No C06 event carries a
-  heartbeat refusal: C08 maps a heartbeat `Err` to `HeartbeatFailed`. `ProgrammeStartFailed` is not a
-  domain event: C08 maps a start `Err` to `Event::Fatal`, which the test drives.
-- `ExitInfo.detail` is always `None` from the domain: `Event::Fatal` carries no text, so nothing
-  produces C12's "non-empty `exitDetail`" on a fatal exit (`docs/_INDEX.md` Owed 27).
+  heartbeat refusal: C08 maps a heartbeat `Err` to `HeartbeatFailed` (superseded by the wave gate 1
+  amendment below: a heartbeat 410 is `Event::HeartbeatRefused(HeartbeatRefusal::Gone)`).
+  `ProgrammeStartFailed` is not a domain event: C08 maps a start `Err` to `Event::Fatal`, which the
+  test drives.
+- ~~`ExitInfo.detail` is always `None` from the domain: `Event::Fatal` carries no text, so nothing
+  produces C12's "non-empty `exitDetail`" on a fatal exit (`docs/_INDEX.md` Owed 27).~~ Superseded by
+  the wave gate 1 amendment below (Owed 27, option a).
 - The sweeps live in `crates/domain/tests/supervisor.rs` (the pair matrix, the 7 exit paths, the
   ladder sessions) and `tests/properties.rs`; there is no `supervisor_props.rs`. The crate root
   forbids `clippy::print_stderr`, and every sweep prints its count.
@@ -1231,6 +1234,73 @@ ignored, so the held frame's bound took the Final card off air before the hold e
   reason, and never before). Each count prints and fails on 0.
 - The brief's code comments name the host (`Fly`). `scripts/check-portable.sh` refuses that word
   anywhere under `crates/`, so the built comments say "the host".
+
+## Amendment 2026-10-18 (wave gate 1 review of PR #24; the coordinator's decisions)
+
+The review rated PR #24 NEEDS FIXES: the domain code was correct, the gaps were tests and
+cross-brief items. Its five surviving mutants (M2, M3, M9, M10, M11) are now red. The coordinator's
+decisions, as built:
+
+- **Owed 27, option (a): `Event::Fatal { detail: Option<String> }`.** The fatal error's text rides
+  its final beat as `ExitInfo.detail`, opaque and verbatim, from Booting, Running, Holding and
+  Draining. Every other `Stopped` beat carries `None`. The domain neither caps nor redacts it: C07's
+  redact and 100-char cap are the authority, and web scrubs and caps at 200. C07 omits an empty value
+  ("absent, never ''"). The supervisor keeps the text in `exit_detail`, set only as a fatal error
+  exits (`Supervisor::fatal`), and `health` reads it. Tests:
+  `a_fatal_carries_its_detail_verbatim_into_the_final_beat_from_every_state` (4 states × 4 texts:
+  none, empty, a short one, and a 300-char one with a stream URL and emoji) and
+  `every_stopped_beat_but_a_fatal_ones_has_no_detail` (10 non-fatal exits and the drain's beat, the
+  other way; mutant F1 is the reviewer's M9).
+- **A fatal error during a drain sends a second `Stopped` beat** (review m2): the drain's, with the
+  drain's reason and no detail, then the fatal error's, `fatal` with its text. This is the only path
+  with two. Pinned by the test above; recorded for web (`docs/_INDEX.md` Owed 30).
+- **A heartbeat 410: `Event::HeartbeatRefused(HeartbeatRefusal::Gone)`** (review I5). Web refuses
+  every beat on a terminal session with 410 (`seazn.club` `stream-sessions.ts` `heartbeat`), and
+  without this event the compositor kept streaming (and spending Input B and host minutes) after web
+  had ended the session. From every state but Exited it is `Exit(0)` at once, reason `SessionGone`:
+  no Final hold, no drain, and no beat, because web would refuse that beat with the same 410. It is
+  the one exit with no final beat, an exception the coordinator decided to the owner's 2026-10-15
+  final-beat ruling, on that ground. Booting has no beat in flight, so a 410 there is never a reply,
+  but web's word holds there too and it exits the same way (the implementer's choice, recorded).
+  Exited ignores it, so a 410 after a fatal exit changes nothing. `HeartbeatRefusal` has one variant:
+  a 401 or a 404 on a beat has no ruling, so C07 keeps both transport errors (`HeartbeatFailed`), and
+  a ruling adds a variant rather than a guess. A 410 drawn by the drain's own beat cuts the drain
+  short (exit 0, no EOS wait). Tests: `a_heartbeat_410_exits_at_once_with_no_hold_drain_or_beat`
+  (6 states and a 410 after a fatal exit), the pair matrix's new kind, and an eighth exit path that
+  asserts no `Stopped` beat at all. Mutants G1–G9.
+- **I1, distinct thresholds:** `every_supervisor_timer_fires_at_its_own_threshold` runs under
+  thresholds whose 25 `Ms` fields are all distinct (every field written out, so a new one is a compile
+  error), with a session beat interval no threshold has. The bootstrap back-off (base, doubled,
+  capped), the beat interval, the hold, the drain timeout and the deadline tick each fire at their
+  instant and not 1 ms before. Kills the reviewer's M10 (the hold reading `cef_hang_after_ms`) and M11
+  (the bootstrap back-off reading the CEF one), which the shared 10 000 / 1 000 defaults hid.
+- **I2 and m1, the beat's legs:** `progress_that_connects_nothing_leaves_the_beat_starting` (a zero
+  total, a sink's bytes before the first build, a sink never built; M2) and
+  `an_output_error_in_the_hold_reads_stalled` (M3).
+- **I3, the exit property** (`tests/properties.rs`, now 2 048 cases): the stream drives the page
+  (ready, beats every `cef_alive_every_ms`, silences, crashes, and crash storms that restart the page
+  with two failures counted), overrun bursts, and a growing output total with a tick every second.
+  Gen-carrying events are resolved at delivery, so they name the page or sink current then. In the
+  hold it asserts that the three generations and the rung stay as the hold froze them and nothing is
+  rebuilt or stepped down; on every on-air tick, that a Ready page hides as hung iff its last
+  delivered proof (its ready, then each beat it delivered while Ready) is at least
+  `cef_hang_after_ms` old; at most one `StepDown` per stream; a crash in the hold hides `Failed` or
+  nothing; and P6 with the detail and the 410. Counts, each failing at 0: holds while stepped,
+  crashes in the hold, crashes at the count in the hold, hang hides in the hold, exits on a 410,
+  fatal details checked (a typical run: 324, 574, 89, 38, 181, 411).
+- **Documented, not changed:**
+  - **(m5) An output stall goes undetected in the hold.** The links are not ticked in the hold, so a
+    sink that stops sending bytes still reads `Playing` until the drain. An output error is routed,
+    so it reads `Stalled` (m1). The hold is at most `final_hold_ms`; nothing could be rebuilt in it.
+  - **(m4) After a crash in the hold below the count, the beat reads `graphics: restarting`**
+    (Backoff), though no restart runs before the drain stops the page. Cosmetic.
+  - **(m3) `signalled` covers both signals:** SIGINT (web's own stop, with the hold) and SIGTERM (a
+    host stop, no hold) both exit `signalled`. Web's docs note it (`docs/_INDEX.md` Owed 30).
+- **The pair matrix** is now 7 setups × 24 kinds = 168 pairs, and it checks each `Stopped` beat's
+  detail (the fatal sample's text iff the event is the fatal error). The exit-path test has 8 paths
+  (`every_exit_but_a_heartbeat_410_is_preceded_by_a_final_beat_with_its_reason`).
+- **Mutants:** 101 (the 73 re-run after the edits, stale rows re-pinned, plus 28 new), 100 red, 1
+  argued equivalent (B6, unchanged).
 
 ## Do not touch
 

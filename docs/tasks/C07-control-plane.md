@@ -56,6 +56,7 @@ repo.
   pub trait ControlPlane: Send {
       fn fetch_session(&mut self) -> Result<SessionConfig, FetchError>;
       fn heartbeat(&mut self, report: &domain::health::HealthReport, measured: &Measured) -> Result<domain::supervisor::Desired, String>;
+      // (amended 2026-10-18, wave gate 1 I5) the Err tells a 410 apart from a transport error: see that amendment
   }
   // adapters
   pub fn redact(url: &str) -> String;                                 // redact.rs
@@ -297,7 +298,9 @@ repo.
 `report.exit` is `Some`. Otherwise both keys are **absent**, never null and never "".
 `exitDetail` = `redact(detail)`, truncated to **100 Unicode scalar values** (Rust `chars().take(100)`). R2002's published contract caps it at `maxLength: 100` code points, so it always fits web's zod limit of 200 UTF-16 units (F-006; #966 review M1). Also: the exit fields are valid only on a `state: "stopped"` beat (the contract's if/then).
 The final beat is **best-effort**: one attempt, 2 s timeout, never retried. Its failure is logged
-(redacted) and never delays `Exit`. A 404 reply to it is not an error.
+(redacted) and never delays `Exit` (amended 2026-10-18, wave gate 1 review I4: by more than this 2 s
+timeout; C08 flushes the final beat before `run()` returns, bounded by it). A 404 reply to it is not
+an error, and neither is a 410 (web refuses every beat on a terminal session with 410).
 
 Tests:
 - The contract test's sweep includes the 6 exit beats, and every one validates against the vendored
@@ -322,6 +325,32 @@ Owner, 2026-10-18, in chat, relayed by the coordinator: "apply rec 4-9". Every o
 - The test asserts that no `SwapSink` effect appears in the run, and it prints the number of
   progress events sent. Zero sent is a failure.
 - **New mutant:** freeze the total at its first value. Expected red: the script sees a `SwapSink`.
+
+## Amendment 2026-10-18 (wave gate 1 review of C06, PR #24; the coordinator's decisions)
+
+**A heartbeat 410 is its own result, not a transport error** (review I5). Web answers every beat on
+a terminal session with `410 SESSION_ENDED` (`seazn.club` `stream-sessions.ts` `heartbeat`). C06
+now has `Event::HeartbeatRefused(HeartbeatRefusal::Gone)`, which exits 0 at once with no hold, no
+drain and no beat. Without it the compositor kept streaming, and spending Input B and host minutes,
+after web had ended the session.
+- `ControlPlane::heartbeat` (Interfaces) returns a result that tells a 410 apart, e.g.
+  `Result<Desired, HeartbeatError>` with `HeartbeatError::{Gone, Transport(String)}`; the variant
+  names are yours. **Only 410 is `Gone`.** A 401, a 404, a 5xx and a network error stay transport
+  errors (C08 maps them to `HeartbeatFailed`): a 401 or a 404 on a beat has no ruling, and the
+  domain's `HeartbeatRefusal` has no variant for them.
+- Test (`control_http.rs`): `heartbeat_410_is_gone_and_other_refusals_are_transport`, a table over
+  410 (Gone) and 401, 404, 503 (transport), each asserting the error text carries no token.
+- **Mutant:** classify a heartbeat 410 as a transport error. Expected red: that test.
+
+**`exitDetail` now has a producer** (Owed 27, option a). The domain's `ExitInfo.detail` is a fatal
+error's text, verbatim from `Event::Fatal { detail }` (C08 maps it from the error), and `None` on
+every other exit. This section's rule stands: `exitDetail` = `redact(detail)` capped at 100 chars,
+and it is **absent** when `detail` is `None` **or empty** ("absent, never ''").
+- The contract test's sweep drives a real `Event::Fatal { detail: Some(<a URL with a key and 500
+  chars>) }` through a real `Supervisor`, so `exit_detail_is_redacted_and_capped` is fed by the
+  domain's own beat, not a hand-built report.
+- New test `an_empty_detail_is_absent`: a fatal beat with `detail: Some("")` has no `exitDetail`
+  key.
 
 ## Do not touch
 
