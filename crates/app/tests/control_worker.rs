@@ -386,3 +386,23 @@ fn flush_reports_a_final_beat_the_worker_could_not_take() {
     );
     assert!(log.beats().is_empty());
 }
+
+/// The worker's own priority (Owed 28: the final slot outranks the periodic one), apart from the
+/// retire: a periodic beat requested AFTER a final one, both pending behind a beat in flight, still
+/// goes after it. The domain sends no periodic beat after a final one; this pins the worker alone.
+#[test]
+fn a_final_beat_outranks_a_periodic_beat_requested_after_it() {
+    let (tx, _rx) = unbounded();
+    let (plane, log) = slow_periodic();
+    let mut h = spawn(Box::new(plane), tx);
+    in_flight(&mut h, &log, 1);
+    h.request(beat(final_beat(9, ExitReason::Signalled)));
+    h.request(beat(periodic(2)));
+    assert!(h.flush(WAIT));
+    assert!(log.wait_for(WAIT, |c| c
+        .iter()
+        .filter(|c| matches!(c, PlaneCall::Beat(..)))
+        .count()
+        >= 3));
+    assert_eq!(marks(&log), vec![(1, false), (9, true), (2, false)]);
+}
