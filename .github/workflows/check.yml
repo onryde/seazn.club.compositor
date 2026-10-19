@@ -15,6 +15,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Portability guard (ADR 0007)
         run: scripts/check-portable.sh
+      # The programme and output pipelines (C09) build against GStreamer and test against its
+      # plugins: x264enc (ugly), flvmux/rtmp2sink/pngdec (good/bad), avdec_* (libav, decode-back only).
+      - name: GStreamer
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
       - uses: dtolnay/rust-toolchain@master
         with: { toolchain: "1.91.0", components: "rustfmt, clippy" }
       - uses: Swatinem/rust-cache@v2

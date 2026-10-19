@@ -15,8 +15,21 @@ app = { path = "../app" }
 # it, so no async runtime is needed. `tls` is rustls with webpki roots (no system OpenSSL in the image).
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 serde_json = "1"
+# C09: the programme and output pipelines. GStreamer 1.24 is Ubuntu 24.04's (F-010); `v1_24` exposes
+# its API, appsrc `leaky-type` among it.
+gstreamer = { version = "0.24", features = ["v1_24"] }
+gstreamer-app = { version = "0.24", features = ["v1_24"] }
+gstreamer-video = { version = "0.24", features = ["v1_24"] }
+crossbeam-channel = "0.5"
+
+[features]
+# C09: `Stats::force_snapshot` and the pipeline stand-ins the C09 tests drive (a held sink write, a
+# teardown that hangs). Only dev-dependencies enable it, so a release build never carries it.
+test-hooks = []
 
 [dev-dependencies]
+# This crate's own integration tests (C09) and C12's join test use the test hooks.
+adapters = { path = ".", features = ["test-hooks"] }
 # The vendored contract is the arbiter: our heartbeat must validate against its JSON Schema (C07).
 jsonschema = { version = "0.26", default-features = false }
 sha2 = "0.10"
