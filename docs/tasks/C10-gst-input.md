@@ -97,6 +97,7 @@ edits `domain/src/config.rs`, and is allowed **only** for this field.
 - 6 tests pass.
 - 2 mutants went red.
 - The new `config.rs` field cites its source.
+- (Amended 2026-10-19, as built) `tests/input.rs` passes 25 tests: the six above (test 3 asserting `Error`), the dispatch's sequences (loss and recovery, two reconnects, a source that never answers, a caps and frame-rate change mid-stream and across rebuilds, EOS against error, a full channel) and the bounded `Drop`. Every guard's mutant is red or argued equivalent (`_INDEX.md`, the session handoff for PR #30).
 
 ## Amendment 2026-10-19 (C08 PR #27 review round 1: a bounded `Drop`)
 
@@ -106,6 +107,15 @@ return within a bound: it never waits on a pipeline, a renderer or a thread that
 `set_state(NULL)` did not return for 10 s on a hung renderer); teardown that may block goes to a
 reaper thread, as `stop` does, or is bounded by a timeout. **Acceptance:** a test drops the adapter
 while what it owns is hung (or stands in for hung) and the drop returns within 500 ms.
+
+## Amendment 2026-10-19 (as built, PR #30; F-012)
+
+- **Test 3 asserts `Error`, and is named for it** (`listener_closing_reports_an_error_loss_with_the_right_generation`). `srtsrc` posts an ERROR when its peer closes, never an EOS, and F-002 recorded no close from CF at all (a silent socket; the C10 leg saw the same). The Events table's `Eos` row stays mapped, from the video appsink, but nothing produces it (Owed 46).
+- **The listener** is `… ! mpegtsmux alignment=7 ! srtsink …`. At the default alignment no keyframe reaches the caller, and nothing decodes. It sets `srtsink` `authentication=true` too, so that `caller-connecting` reports the stream id the adapter presented.
+- **Test 4's witness** holds generation 2's start, so only the retired pipeline is delivering. It then reads the camera slot's PTS and the audio ring. `generation_of_last_frame() == 2` alone stayed green with the video gate removed.
+- **Test 5** checks log lines and `Debug`; events carry no text. The values are planted raw, percent-encoded and inside the URI, each as its own error, because `redact` masks everything after a `?`.
+- **Step 3 additions:** `srtsrc` `auto-reconnect=false`; the camera caps also pin `colorimetry=bt709`; both appsinks set `async=false`.
+- **Step 5, mutant 2** is the raw URI written past the scrubber. Through the adapter's log path the scrubber masks it, and it stays green.
 
 ## Do not touch
 
