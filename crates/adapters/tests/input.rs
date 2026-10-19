@@ -85,6 +85,7 @@ struct Cfg {
     passphrase: Option<String>,
     /// Pixel aspect ratio of the camera's pixels; `None` is square.
     par: Option<(i32, i32)>,
+    fps: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -109,6 +110,7 @@ fn cfg(w: u32, h: u32) -> Cfg {
         audio: Some(TONE_440),
         passphrase: None,
         par: None,
+        fps: SOURCE_FPS,
     }
 }
 
@@ -140,7 +142,7 @@ impl Listener {
             .unwrap_or_default();
         let desc = format!(
             "videotestsrc is-live=true pattern={pattern} ! capsfilter name=vcf \
-             caps=video/x-raw,format=I420,width={w},height={h},framerate={SOURCE_FPS}/1,colorimetry={col}{par} \
+             caps=video/x-raw,format=I420,width={w},height={h},framerate={fps}/1,colorimetry={col}{par} \
              ! x264enc tune=zerolatency speed-preset=ultrafast key-int-max=30 \
              ! h264parse config-interval=-1 ! mpegtsmux name=m alignment=7 \
              ! srtsink name=out uri=srt://127.0.0.1:{port}?mode=listener wait-for-connection=false{audio}",
@@ -148,6 +150,7 @@ impl Listener {
             w = c.w,
             h = c.h,
             col = c.colorimetry,
+            fps = c.fps,
             par = c
                 .par
                 .map(|(n, d)| format!(",pixel-aspect-ratio={n}/{d}"))
@@ -373,6 +376,19 @@ fn luma(frames: &FrameStore, x: u32, y: u32) -> u8 {
     frame.plane_data(0).expect("luma plane")[y as usize * stride + x as usize]
 }
 
+/// Drops `input` and waits for its teardowns (a test hook may hold one for seconds), so no pipeline
+/// is still being torn down when the test process exits: one that was aborted the process (SIGABRT)
+/// after a filtered run's last test.
+fn finish(input: GstInput) {
+    let teardowns = input.teardown_counter();
+    drop(input);
+    let end = Instant::now() + Duration::from_secs(10);
+    while teardowns.load(Ordering::SeqCst) > 0 && Instant::now() < end {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(teardowns.load(Ordering::SeqCst), 0, "every teardown returned");
+}
+
 /// The camera slot's buffer PTS, to tell one frame from the next.
 fn camera_pts(frames: &FrameStore) -> Option<gst::ClockTime> {
     frames.camera()?.buffer()?.pts()
@@ -406,19 +422,27 @@ fn connects_and_delivers_frames_with_its_generation() {
     assert_eq!(checked, 2);
 }
 
-/// Brief test 2 (Review Focus 1): 640×360, then the listener restarts at 1920×1080 and the input is
-/// rebuilt; every camera frame is the programme's 1280×720 in both phases.
+/// Brief test 2 (Review Focus 1: "a different resolution or frame rate after reconnecting"):
+/// 640×360 at 30 fps, then the listener restarts at 1920×1080 at 25 fps, then portrait 720×1280 at
+/// 60 fps, the input rebuilt each time; every camera frame is the programme's 1280×720 in each phase.
 #[test]
 fn input_caps_change_does_not_reach_programme() {
     let _s = serial();
     let port = free_port();
     let (mut input, rx, frames, _lines) = input(&P720);
     let mut checked = 0;
-    for (gen, (w, h)) in [(1u64, (640, 360)), (2, (1920, 1080))] {
-        let l = Listener::start(port, &cfg(w, h));
+    let phases = [
+        (1u64, (640, 360, 30)),
+        (2, (1920, 1080, 25)),
+        (3, (720, 1280, 60)),
+    ];
+    for (gen, (w, h, fps)) in phases {
+        let mut c = cfg(w, h);
+        c.fps = fps;
+        let l = Listener::start(port, &c);
         connect(&mut input, &rx, gen, &spec(port));
         for _ in 0..10 {
-            assert_programme_shape(&frames, &P720, &format!("{w}x{h}"));
+            assert_programme_shape(&frames, &P720, &format!("{w}x{h}@{fps}"));
             checked += 1;
             thread::sleep(Duration::from_millis(50));
         }
@@ -426,7 +450,7 @@ fn input_caps_change_does_not_reach_programme() {
         events_until(&rx, LOSS_BUDGET, |e| matches!(e, Event::InputLost { .. }));
     }
     eprintln!("camera frames checked: {checked}");
-    assert_eq!(checked, 20);
+    assert_eq!(checked, 30);
 }
 
 /// Brief test 3, as measured (F-012): `srtsrc` 1.24 with `auto-reconnect` off posts an ERROR, never
@@ -453,42 +477,46 @@ fn listener_closing_reports_an_error_loss_with_the_right_generation() {
     assert!(losses(&after).is_empty(), "one loss a generation: {after:?}");
 }
 
-/// Brief test 4: after `rebuild(2)` returns, nothing of generation 1 reaches the camera slot, even
-/// while the retired pipeline is still running (its teardown is held 1.5 s) and still delivering.
+/// Brief test 4: after `rebuild(2)` returns, nothing of generation 1 reaches the camera slot or the
+/// audio ring, though the retired pipeline is still running and delivering (its teardown is held 3 s).
+/// Generation 2's start is held 2 s, so in that window the only pipeline delivering is the retired
+/// one: any change to the slot or the ring is generation 1's. Then generation 2 takes over.
 #[test]
 fn rebuild_tears_down_the_old_pipeline() {
     let _s = serial();
     let l = Listener::new(&cfg(640, 360));
-    let (mut input, rx, _frames, _lines) = input(&P720);
+    let (mut input, rx, frames, _lines) = input(&P720);
     connect(&mut input, &rx, 1, &spec(l.port));
     assert_eq!(input.generation_of_last_frame(), Some(1));
-    input.delay_teardowns(Duration::from_millis(1_500));
+    input.delay_teardowns(Duration::from_secs(3));
+    input.delay_starts(Duration::from_secs(2));
     let dropped_before = input.gate_dropped();
     input.rebuild(2, &spec(l.port));
-    let end = Instant::now() + Duration::from_millis(2_500);
-    let (mut reads, mut seen_two) = (0, false);
+    let pts = camera_pts(&frames);
+    frames.take_audio(frames.audio_level());
+    let end = Instant::now() + Duration::from_millis(1_800);
+    let mut reads = 0;
     while Instant::now() < end {
-        let g = input.generation_of_last_frame();
-        if g == Some(2) {
-            seen_two = true;
-        }
-        assert!(
-            !(seen_two && g != Some(2)),
-            "generation {g:?} reached the slot after generation 2 did"
-        );
-        assert_ne!(g, Some(0));
+        assert_eq!(camera_pts(&frames), pts, "a generation-1 frame reached the slot");
+        assert_eq!(frames.audio_level(), 0, "generation-1 audio reached the ring");
+        assert_eq!(input.generation_of_last_frame(), Some(1));
         reads += 1;
         thread::sleep(Duration::from_millis(5));
     }
     let gate = input.gate_dropped() - dropped_before;
-    eprintln!("slot reads: {reads}; generation-1 samples dropped at the gate: {gate}");
-    assert!(seen_two, "generation 2 delivered");
+    events_until(&rx, connect_budget() + Duration::from_secs(2), |e| {
+        *e == Event::InputConnected { gen: 2 }
+    });
+    eprintln!("slot and ring reads: {reads}; generation-1 samples dropped at the gate: {gate}");
+    assert!(reads > 100, "{reads} reads");
     assert!(
         gate > 0,
         "the retired pipeline delivered while held, and the gate dropped it"
     );
     assert_eq!(input.generation_of_last_frame(), Some(2));
+    assert_ne!(camera_pts(&frames), pts);
     assert_eq!(input.builds(), 2);
+    finish(input);
 }
 
 /// Brief test 5: the URI's credentials are percent-encoded, empty ones are left out, and no form of
@@ -529,13 +557,19 @@ fn srt_uri_encodes_and_never_appears_in_logs() {
     });
     assert_eq!(losses(&seen), vec![(1, LossReason::Error)]);
     assert!(connects(&seen).is_empty());
-    // An element error whose text echoes the URI and both values (raw and encoded) is scrubbed too.
+    // Element errors that echo the values raw, percent-encoded, and inside the URI are scrubbed too.
+    // One error each: `redact` masks everything after a `?`, so a text that led with the URI would
+    // hide the values that follow it from the scrubber's by-value rule, and test only the pattern.
     let uri = GstInput::srt_uri(&secret, 1_000);
     input.rebuild(2, &secret);
-    assert!(input.plant_error(&format!(
-        "could not open {uri}: stream {} pass {} ({} {})",
-        secret.stream_id, secret.passphrase, "playSECRETSTREAM%26id%3D1", "SECRETPASS%26word%3D2345"
-    )));
+    let planted = [
+        format!("stream {} pass {}", secret.stream_id, secret.passphrase),
+        "stream playSECRETSTREAM%26id%3D1 pass SECRETPASS%26word%3D2345".to_owned(),
+        format!("could not open {uri}"),
+    ];
+    for text in &planted {
+        assert!(input.plant_error(text));
+    }
     events_until(&rx, Duration::from_secs(8), |e| {
         *e == Event::InputLost {
             gen: 2,
@@ -547,7 +581,10 @@ fn srt_uri_encodes_and_never_appears_in_logs() {
     let lines = lines.lock().unwrap().clone();
     let errors = lines.iter().filter(|l| l.contains("error")).count();
     eprintln!("log lines checked: {}, error lines: {errors}", lines.len());
-    assert!(errors >= 2, "both errors were logged: {lines:?}");
+    assert!(
+        errors > planted.len(),
+        "the failed connect and every planted error were logged: {lines:?}"
+    );
     // Each build names its source, so the URL reached the log path and only its origin was written.
     assert!(
         lines.iter().any(|l| l == "gen=1: srt://127.0.0.1:9 latency=1000"),
@@ -847,6 +884,7 @@ fn a_lost_generation_writes_nothing_more() {
     );
     assert_eq!(ring, 0, "no audio after the loss");
     assert!(gate > 0, "the pipeline kept delivering, so the gate was tested");
+    finish(input);
 }
 
 /// A camera with no audio track (the demuxer offers no AAC pad, so the audio branch stays unlinked)
@@ -892,6 +930,7 @@ fn a_hung_video_decoder_never_stalls_the_audio() {
     );
     assert!(still, "the hang held the video, so the test is the one it says");
     assert!(ring > 0, "audio arrived while the video decoder hung");
+    finish(input);
 }
 
 /// The pipeline is built with the bounds the plan and the brief state (written out here from their
@@ -1080,6 +1119,7 @@ fn rebuild_never_waits_on_the_start() {
     events_until(&rx, connect_budget() + Duration::from_secs(2), |e| {
         *e == Event::InputConnected { gen: 1 }
     });
+    finish(input);
 }
 
 /// C08 amendment 2026-10-19: the adapter drops within 500 ms while the pipeline it owns is hung, and
@@ -1154,6 +1194,7 @@ fn stop_closes_the_gate_and_refuses_later_rebuilds() {
     assert_eq!(camera_pts(&frames), pts);
     assert_eq!(input.refused_rebuilds(), 1);
     assert_eq!(input.builds(), 1);
+    finish(input);
 }
 
 /// An input URL that is not `srt://host:port` (here, one carrying its own query) is lost at once as
@@ -1217,19 +1258,30 @@ fn an_encrypted_listener_is_reached_through_the_encoded_uri() {
 }
 
 /// The seam end to end: the input's camera, read by the real programme pipeline from the shared frame
-/// store, is what goes on air. The listener sends solid blue; the programme's file shows blue.
+/// store, is what goes on air. The listener sends solid blue; the programme's file shows blue. At the
+/// programme's own 30 fps and at a camera's 25.
 #[test]
 fn the_programme_puts_the_input_on_air() {
     let _s = serial();
+    let mut checked = 0;
+    for fps in [30, 25] {
+        on_air(fps);
+        checked += 1;
+    }
+    assert_eq!(checked, 2);
+}
+
+fn on_air(fps: u32) {
     let mut c = cfg(640, 480);
     c.pattern = "blue";
+    c.fps = fps;
     let l = Listener::new(&c);
     let (mut input, rx, frames, _lines) = input(&P720);
     connect(&mut input, &rx, 1, &spec(l.port));
     let (ptx, prx) = crossbeam_channel::bounded(8_192);
     let mut p = GstProgramme::new(frames.clone(), ptx);
     p.start(&P720).expect("programme");
-    let dir = std::env::temp_dir().join(format!("c10-on-air-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("c10-on-air-{}-{fps}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("p.flv");
     p.swap_sink(
@@ -1265,7 +1317,8 @@ fn the_programme_puts_the_input_on_air() {
         .filter(|c| c[2] > 180 && c[0] < 60 && c[1] < 60)
         .count();
     eprintln!(
-        "programme frames decoded: {}; blue at the centre: {blue}; camera missing: {missing}",
+        "camera {fps} fps: programme frames decoded: {}; blue at the centre: {blue}; camera missing: \
+         {missing}",
         centres.len()
     );
     assert!(centres.len() >= 50, "{} frames", centres.len());
