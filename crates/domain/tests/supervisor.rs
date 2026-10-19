@@ -3,7 +3,7 @@
 //! because the domain's crate root forbids `clippy::print_stderr`, and a sweep must print the count
 //! it checked (AGENTS.md §5).
 use domain::config::{OutputProfile, Thresholds};
-use domain::health::{BeatState, ExitInfo, HealthReport, PhaseChannel};
+use domain::health::{BeatState, ExitDetail, ExitInfo, HealthReport, PhaseChannel};
 use domain::input_link::LossReason;
 use domain::ladder::Rung;
 use domain::lifecycle::{ExitReason, Lifecycle};
@@ -216,7 +216,7 @@ fn sample(kind: Kind, s: &Supervisor) -> Event {
         Kind::Term => Event::Signal(SignalKind::Term),
         Kind::Int => Event::Signal(SignalKind::Int),
         Kind::Fatal => Event::Fatal {
-            detail: Some(FATAL_DETAIL.to_string()),
+            detail: Some(ExitDetail::new(FATAL_DETAIL)),
         },
     };
     assert_eq!(kind_of(&e), kind, "sample");
@@ -338,7 +338,7 @@ fn check(st: Setup, k: Kind, s: &Supervisor, now: Ms, d: &Decision) {
     let at = format!("({st:?}, {k:?})");
     let th = t();
     // Owed 27 (a): a Stopped beat carries the fatal error's text iff the event was the fatal error.
-    let detail = (k == Kind::Fatal).then(|| FATAL_DETAIL.to_string());
+    let detail = (k == Kind::Fatal).then(|| ExitDetail::new(FATAL_DETAIL));
     let beat_with = |fx: &Effect, r: ExitReason| {
         matches!(fx, Effect::SendHeartbeat(h) if stopped_reason(h) == Some(r)
             && h.exit == Some(ExitInfo { reason: r, detail: detail.clone() }))
@@ -519,7 +519,7 @@ fn every_exit_but_a_heartbeat_410_is_preceded_by_a_final_beat_with_its_reason() 
     paths.push(("a 401 at bootstrap", ExitReason::Refused, s, fx));
 
     let fatal = Event::Fatal {
-        detail: Some(FATAL_DETAIL.to_string()),
+        detail: Some(ExitDetail::new(FATAL_DETAIL)),
     };
     let (s, fx) = run(on_air(), &[(100, fatal)]);
     paths.push(("a fatal error while Running", ExitReason::Fatal, s, fx));
@@ -552,7 +552,7 @@ fn every_exit_but_a_heartbeat_410_is_preceded_by_a_final_beat_with_its_reason() 
                 unreachable!()
             };
             assert_eq!(stopped_reason(h), Some(*reason), "{name}");
-            let detail = (*reason == ExitReason::Fatal).then(|| FATAL_DETAIL.to_string());
+            let detail = (*reason == ExitReason::Fatal).then(|| ExitDetail::new(FATAL_DETAIL));
             assert_eq!(h.exit.as_ref().and_then(|x| x.detail.clone()), detail, "{name}");
         }
         for e in fx {
@@ -636,4 +636,69 @@ fn bursts_of_overruns_step_down_once_per_session() {
         "anti-vacuity: some session must burst more than once"
     );
     assert!(sessions > 0 && bursts > 0);
+}
+
+// ---- Owed 31: a fatal error's text never reaches a `Debug` string ----
+
+/// A planted key in a fatal error's text, the way an element's error names its location. The C08 and
+/// C12 holders (`ControlRequest`, `Inbound`, `Driver`) derive `Debug`, so every domain value they hold
+/// must print without it. The text still rides the final beat verbatim (its one reader is `as_str`).
+#[test]
+fn no_debug_string_shows_a_fatal_detail() {
+    const KEY: &str = "PLANTED-OWED31-KEY";
+    let text = format!("rtmp2sink0: could not connect to rtmps://live.cloudflare.com:443/live/{KEY}");
+    let on_air = || booted(0, FAR).decide(Event::Tick, 0).next;
+    let draining = || {
+        let d = on_air().decide(Event::Signal(SignalKind::Term), 10);
+        assert!(
+            matches!(d.next.lifecycle(), Lifecycle::Draining { .. }),
+            "setup: a drain"
+        );
+        d.next
+    };
+    let mut checked = 0;
+    for (name, s) in [("live", on_air()), ("draining", draining())] {
+        let ev = Event::Fatal {
+            detail: Some(ExitDetail::new(text.clone())),
+        };
+        let d = s.decide(ev.clone(), 20);
+        let report = d.next.health(30);
+        let carried = report.exit.as_ref().and_then(|x| x.detail.as_ref());
+        assert_eq!(
+            carried.map(ExitDetail::as_str),
+            Some(text.as_str()),
+            "{name}: carried verbatim"
+        );
+        let mut shown: Vec<(&str, String)> = vec![
+            ("Event", format!("{ev:?}")),
+            ("Event alt", format!("{ev:#?}")),
+            ("Decision", format!("{d:?}")),
+            ("Decision alt", format!("{d:#?}")),
+            ("Supervisor", format!("{:?}", d.next)),
+            ("Supervisor alt", format!("{:#?}", d.next)),
+            ("HealthReport", format!("{report:?}")),
+            ("HealthReport alt", format!("{report:#?}")),
+            ("ExitInfo", format!("{:?}", report.exit)),
+        ];
+        for e in &d.effects {
+            shown.push(("Effect", format!("{e:?}")));
+            shown.push(("Effect alt", format!("{e:#?}")));
+        }
+        assert!(
+            d.effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendHeartbeat(h) if h.exit.is_some())),
+            "{name}: the final beat is among the effects"
+        );
+        for (what, s) in &shown {
+            assert!(!s.contains(KEY), "{name}: {what} shows the fatal text: {s}");
+            assert!(
+                !s.contains("rtmp2sink0"),
+                "{name}: {what} shows the fatal text: {s}"
+            );
+            checked += 1;
+        }
+    }
+    eprintln!("Debug strings checked for a fatal detail: {checked}");
+    assert!(checked >= 2 * 11, "anti-vacuity: {checked}");
 }

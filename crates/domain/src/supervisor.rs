@@ -39,7 +39,9 @@
 use crate::backoff::delay;
 use crate::config::Thresholds;
 use crate::graphics::{Graphics, GraphicsAction, GraphicsState, HideReason};
-use crate::health::{BeatState, ExitInfo, GraphicsStatus, HealthReport, LinkStatus, PhaseChannel};
+use crate::health::{
+    BeatState, ExitDetail, ExitInfo, GraphicsStatus, HealthReport, LinkStatus, PhaseChannel,
+};
 use crate::input_link::{InputLink, InputState, LossReason};
 use crate::ladder::{Ladder, Rung};
 use crate::lifecycle::{ExitReason, Lifecycle};
@@ -129,7 +131,7 @@ pub enum Event {
     /// into the final beat's `ExitInfo.detail` (Owed 27, option a). No cap and no redaction here: C07
     /// redacts it, caps it at 100 chars and omits it when empty, the one authority.
     Fatal {
-        detail: Option<String>,
+        detail: Option<ExitDetail>,
     },
     /// The page's phase channel, as it reports it (overlay templates spec 2026-10-15 §4.3; C11).
     PhaseChannel(PhaseChannel),
@@ -184,7 +186,7 @@ pub struct Supervisor {
     output_ever_connected: bool,
     heartbeat_failures: u32,
     /// The fatal error's text, set only as a fatal error exits (Owed 27, option a).
-    exit_detail: Option<String>,
+    exit_detail: Option<ExitDetail>,
 }
 
 impl Supervisor {
@@ -264,7 +266,7 @@ impl Supervisor {
     }
 
     /// A fatal error: its text rides the final beat, then `Exit(70)`.
-    fn fatal(&mut self, now: Ms, detail: Option<String>, fx: &mut Vec<Effect>) {
+    fn fatal(&mut self, now: Ms, detail: Option<ExitDetail>, fx: &mut Vec<Effect>) {
         self.exit_detail = detail;
         self.exit(now, ExitReason::Fatal, fx);
     }
@@ -2338,9 +2340,9 @@ mod tests {
         let long = format!("rtmps://live.example:443/live2/k3y {}", "é🎉".repeat(150));
         let details = [
             None,
-            Some(String::new()),
-            Some("decoder: not-negotiated".to_string()),
-            Some(long),
+            Some(ExitDetail::new("")),
+            Some(ExitDetail::new("decoder: not-negotiated")),
+            Some(ExitDetail::new(long)),
         ];
         let mut checked = 0;
         for (name, s) in every_live_state() {
@@ -2450,7 +2452,7 @@ mod tests {
         let d1 = s.decide(Event::Signal(SignalKind::Term), 100);
         let d2 = d1.next.decide(
             Event::Fatal {
-                detail: Some("boom".to_string()),
+                detail: Some(ExitDetail::new("boom")),
             },
             200,
         );
@@ -2468,7 +2470,7 @@ mod tests {
                 },
                 ExitInfo {
                     reason: ExitReason::Fatal,
-                    detail: Some("boom".to_string())
+                    detail: Some(ExitDetail::new("boom"))
                 },
             ],
             "a fatal error during a drain: two Stopped beats, the text on the second alone"
@@ -2504,7 +2506,7 @@ mod tests {
             for e in [
                 Event::Tick,
                 Event::Fatal {
-                    detail: Some("late".to_string()),
+                    detail: Some(ExitDetail::new("late")),
                 },
                 gone(),
             ] {

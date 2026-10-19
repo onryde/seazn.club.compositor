@@ -176,6 +176,7 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
   /// so a re-vendor that changes the fixture reds there instead of drifting silently.
   pub fn session_720p() -> SessionConfig {
       SessionConfig {
+          // (amended 2026-10-18, C07 as built) fixture_id is `Option<String>` (F-006): Some("<fixture fixtureId>".into())
           session_id: "<fixture sessionId>".into(), fixture_id: "<fixture fixtureId>".into(),
           input: InputSpec { url: "<fixture input.url>".into(), stream_id: "<fixture input.streamId>".into(), passphrase: "<fixture input.passphrase>".into() },
           target: TargetSpec { url: "<fixture target.url>".into(), stream_key: "<fixture target.streamKey>".into() },
@@ -315,6 +316,12 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
     - heartbeat `Ok(d)` → `Event(HeartbeatReply(d))`
     - heartbeat `Err` → `Event(HeartbeatFailed)`, except C07's 410 (`Gone`) →
       `Event(HeartbeatRefused(HeartbeatRefusal::Gone))` (amended 2026-10-18, wave gate 1 I5)
+    - (amended 2026-10-18, C07 as built; Owed 29) **the final beat's result maps the same way.**
+      C07 returns `HeartbeatError::Gone` for every heartbeat 410, the final beat's included, and
+      `HeartbeatError::Transport` for everything else (a 404 too). The worker posts each result as
+      its event: `Draining` turns `HeartbeatRefused(Gone)` into `Exit(0)` (the drain's own beat may
+      draw it) and ignores `HeartbeatFailed`, and `Exited` ignores both, so a result that lands after
+      `Exit` changes nothing.
 
   `run()` loops on `rx.recv_timeout(next_tick_at − now)`. On a message it calls `step`, and on a
   timeout it calls `tick_due`. It returns the code on `Some(code)`.
@@ -494,7 +501,8 @@ slow periodic one was dropped and counted; and `Exit(c)` returns at once, so `ma
   counter.
 - `run()` returns the exit code only once the final beat's request has completed or C07's 2 s
   timeout has passed (for example, the worker acks each final beat on a channel that `run()` waits on
-  with `recv_timeout`, bounded by 2 s from `Exit`). The flush is bounded, so `Exit` is never delayed
+  with `recv_timeout`, bounded by 2 s from `Exit`; amended 2026-10-18, C07 as built: the bound is
+  `app::ports::FINAL_BEAT_TIMEOUT_MS`, the one value C07's final-beat request is capped at too). The flush is bounded, so `Exit` is never delayed
   past 2 s (C07's final-beat section, reconciled with C12's). An exit with no final beat (a heartbeat
   410) has nothing to flush and returns at once.
 - Tests (`control_worker.rs`, `driver.rs`):
@@ -515,6 +523,24 @@ slow periodic one was dropped and counted; and `Exit(c)` returns at once, so `ma
 **Fatal errors carry their text** (Owed 27, option a). Every `Event::Fatal` the driver decides
 (today, a start `Err`) carries the error's own text, `Some(e.to_string())`, unredacted: C07 is the
 one redactor, and an empty text reaches the wire as no `exitDetail`.
+
+## Amendment 2026-10-19 (C07 PR #25 review: `ExitDetail`; the fallible plane)
+
+- The fatal text is now `domain::health::ExitDetail` (Owed 31, closed in C07's PR #25). Every
+  `Event::Fatal { detail: Some(e.to_string()) }` above reads
+  `Event::Fatal { detail: Some(ExitDetail::new(e.to_string())) }`. Every test sketch's
+  `Some("x")`/`Some("boom")` reads `Some(ExitDetail::new("x"))`. Its `Debug` prints the length
+  alone, so the derived `Debug` on `ControlRequest`, `Inbound` and `Driver` is safe. Never log the
+  text through `as_str` raw.
+- (Amended 2026-10-19, the coordinator, C07 PR #25 confirm pass) A fatal text logged to stderr goes
+  through a `Scrubber` built from the `SessionConfig` (its credentials, by value) AND `redact` (the
+  patterns), never `redact` alone: a stream key in a GStreamer error follows no marker. The app
+  crate never names the adapters crate (the layering guard), so the driver never logs a fatal text
+  itself. It hands the text to the control port, whose wire scrubs it, and C12's binary logs it
+  through that `Scrubber` (C12's amendment of this date). Before the session is fetched, only
+  `redact` plus the job token's scrub apply.
+- C07's final beat can still hang in DNS: ureq 2 never bounds a lookup (C07's amendment I1). The
+  flush's own `recv_timeout` bound, and its mutant, stay as written (Owed 28).
 
 ## Do not touch
 

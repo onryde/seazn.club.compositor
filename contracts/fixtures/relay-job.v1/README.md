@@ -1,0 +1,65 @@
+# relay-job.v1 fixtures
+
+Hand-written vectors for `docs/contracts/relay-job.v1.json` (R2002). They are never generated from the
+code they test. `apps/web/src/server/api-v1/__tests__/relay-contract.test.ts` sweeps every `*.json` here
+against the zod twins and against the published file under ajv, and pins the count. The compositor
+vendors this directory with the contract (C07).
+
+## Names
+
+The prefix names the shape:
+
+| Prefix | Shape |
+|---|---|
+| `session-` | `#/$defs/session`: the `data` of `GET /api/internal/relay/sessions/{sid}` |
+| `heartbeat-` | `#/$defs/heartbeat`: the body of `POST …/heartbeat` |
+| `reply-` | `#/$defs/heartbeatReply`: the `data` of that POST's 200 |
+| `phase-reply-` | `#/$defs/phaseReply`: the compositor's loopback `GET /phase` reply, which the overlay page reads (R2007 PR B) |
+
+What follows the prefix says how a reader must treat the vector:
+
+- **A plain name** (`session-composed-720p`) is valid: the schema admits it, and so does a consumer.
+- **`invalid-`** (`heartbeat-invalid-unknown-field`) is refused by the JSON Schema itself.
+  `heartbeat-invalid-exit-while-playing` is a one-field edit of `heartbeat-final-fatal`, refused by
+  the schema's `if`/`then`: `exitReason` and `exitDetail` are sent only with `state: "stopped"`.
+- **`refused-`** (`session-refused-delay-mismatch`, `session-refused-delay-absent`) is admitted by the
+  JSON Schema and refused by a rule that JSON Schema cannot state, which the contract states in the
+  field's prose: a composed session's `overlayUrl` carries `delay=` exactly once, equal to
+  `overlayDelayMs`. A consumer must refuse these. Each is a one-field edit of `session-composed-720p`.
+
+## The envelope
+
+On the wire a 200 is `{ "ok": true, "data": … }`. The `session-` and `reply-` vectors are the `data`.
+The heartbeat body is sent bare. The `phase-reply-` vectors are bare too: the compositor serves that
+reply, not web, so it has no envelope.
+
+## Absent is not zero
+
+A Machine omits a field it has not measured. It is never sent as 0, because
+a present 0 is a measured zero.
+`heartbeat-zero-is-a-measurement` carries `fps: 0`: it is valid, and it means the programme was
+measured at 0 frames per second, never "not measured". `heartbeat-minimal` carries `state` alone: every
+other field is unmeasured. The server stores what was sent, so an omitted field is an absent key in the
+stored beat, never a `null` and never a `0`.
+
+## Values
+
+- `session-composed-720p` carries 3100 ms, the delay compositor `_FINDINGS.md` F-002 measured and the
+  provisional default when this contract was cut (web `config.ts` `RELAY_OVERLAY_DELAY_DEFAULT_MS` is
+  the authority, not this file). `session-composed-1080p` carries 2500 ms, an organiser's override, so
+  no one constant satisfies both.
+- The output profiles are the compositor's Global Constraints: 1280×720 at 30 fps and 4000 kbps, and
+  1920×1080 at 30 fps and 6000 kbps.
+- `heartbeat-full` carries every heartbeat field except the final beat's two. `heartbeat-final-fatal`
+  is a Machine's last beat: `state` `stopped`, the reason it is exiting (`exitReason`, the
+  compositor's `ExitReason`) and what went wrong in words (`exitDetail`, redacted by the compositor).
+  The server's bound on `exitDetail` is 200 UTF-16 code units. The schema publishes 100 characters,
+  the bound under which any text fits. `heartbeat-invalid-exit-reason` names a reason outside the
+  vocabulary. The server records both fields with the beat, scrubbed again, and does nothing else with
+  them.
+- `heartbeat-full` carries `phaseChannel: "web"`, the fallback. `heartbeat-final-hold` is a beat
+  during the final hold (compositor C06): `programmePhase: "final"` on the primary channel,
+  `phaseChannel: "loopback"`. `heartbeat-invalid-phase-channel` is a one-field edit of it, refused on
+  `phaseChannel` alone. `phase-reply-final` is the loopback reply in `final`;
+  `phase-reply-invalid-unknown-field` adds a key the strict reply does not declare.
+- Every id, key, passphrase and token here is a placeholder, never a real credential.

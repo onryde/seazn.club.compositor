@@ -1,6 +1,8 @@
 //! The heartbeat's report (spec §5.3; R2002's `heartbeat` def). Plain data: `Supervisor::health`
 //! maps the sub-machines into it, and C07's `heartbeat_wire` writes it. Every optional field is
 //! `None` until it is known, never defaulted (plan: "omitted when not measured, never sent as 0").
+use std::fmt;
+
 use crate::ladder::Rung;
 use crate::lifecycle::ExitReason;
 use crate::programme::ProgrammePhase;
@@ -38,6 +40,43 @@ pub enum PhaseChannel {
     Web,
 }
 
+/// A fatal error's text, carried opaque and verbatim from `Event::Fatal` into the final beat (Owed 27,
+/// option a). It can hold a credential (an element's error names its location, stream key included),
+/// and only C07 redacts it, so its `Debug` prints its length and nothing of the text: no `{:?}` of an
+/// `Event`, a `Supervisor`, a `Decision`, an `Effect` or a `HealthReport` shows it (Owed 31). There is
+/// deliberately no `Display`: the one reader is `as_str`, which C07's wire redacts.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExitDetail(String);
+
+impl fmt::Debug for ExitDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ExitDetail({} chars)", self.0.chars().count())
+    }
+}
+
+impl ExitDetail {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    /// The text, verbatim. Never log it as it is: redact it first.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for ExitDetail {
+    fn from(text: String) -> Self {
+        Self(text)
+    }
+}
+
+impl From<&str> for ExitDetail {
+    fn from(text: &str) -> Self {
+        Self(text.to_owned())
+    }
+}
+
 /// Owner ruling 2026-10-15: the final beat carries the exit reason, because the Machine's logs go
 /// with the Machine. `detail` is a fatal error's text, verbatim from `Event::Fatal { detail }`, and
 /// `None` on every other exit (`docs/_INDEX.md` Owed 27, option a); C07 redacts it, caps it and
@@ -45,7 +84,7 @@ pub enum PhaseChannel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExitInfo {
     pub reason: ExitReason,
-    pub detail: Option<String>,
+    pub detail: Option<ExitDetail>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

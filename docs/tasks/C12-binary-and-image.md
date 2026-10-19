@@ -518,6 +518,38 @@ adds a flush there (10 + 7 + 2 = 19 s).
   - A run where fake-control answers a heartbeat with `410 SESSION_ENDED` (review I5): the process
     exits 0 within 1 s of that reply, and fake-control receives no POST after it.
 
+## Amendment 2026-10-19 (C07 PR #25 review: the job token and the fallible plane)
+
+- **`JOB_TOKEN` is read from env, never argv** (C07 review gap hunt; `docs/_INDEX.md` Owed 32). No
+  production code reads it yet.
+- `HttpControlPlane::new(app_url, session_id, job_token, timeout_ms)` returns
+  `Result<Self, PlaneConfigError>`. It refuses an empty token, a token with a byte outside visible
+  ASCII (a CRLF `.env` line, a pasted secret) and a 0 ms timeout, and no variant carries the token.
+  The `live` mode handles the refusal before the event loop starts. It is a misconfigured Machine,
+  never a transient. It exits **78** (`EX_CONFIG`, coordinator 2026-10-19), sending no beat (as at
+  :285); web's runner sees the exit-78 refusal and tears the Machine down (runner.ts:254-258). Test:
+  a `JOB_TOKEN` ending in CR exits 78, and stderr carries no token byte; mutant: exit 70 goes red.
+  An empty `JOB_TOKEN` takes the same path (`PlaneConfigError::EmptyToken`).
+- The fatal text is a `domain::health::ExitDetail`. Its `Debug` prints the length alone. Never log
+  `ExitDetail::as_str` raw. (Amended 2026-10-19, the coordinator, C07 PR #25 confirm pass) A fatal
+  text logged to stderr goes through a `Scrubber` built from the `SessionConfig` (its credentials,
+  by value) AND `redact` (the patterns), never `redact` alone: a stream key in a GStreamer error
+  follows no marker, and `redact` cannot see it.
+  - Build it as the plane does: `adapters::redact::Scrubber::default()`, `add` the job token, and
+    once the session is fetched, `add` `input.stream_id`, `input.passphrase`, `target.stream_key`
+    and the overlay URL's `st=` (the contract's `pageToken`; it is not a `SessionConfig` field).
+    C07's `HttpControlPlane::learn` holds the same list. Rather than copy it, C12 may lift it into a
+    `pub` `Scrubber` method that the plane calls too, so the two lists cannot drift.
+  - `Scrubber::add` ignores a value shorter than 8 characters (the coordinator's minimum); every
+    credential is longer, and `redact`'s patterns still apply.
+  - **Before the session is fetched**, only `redact` plus the token scrub apply: no session
+    credential exists yet to scrub.
+  - The fatal smoke run plants a **marker-less** stream key (no `/live/`, no `?`, at least 8
+    characters) in fake-control's session, forces a `ProgrammeStartFailed` whose text names that key
+    bare, and asserts the key is absent from stderr and from the final beat's `exitDetail`. It also
+    asserts that the forced text did name the key, so the check cannot pass on a text without it
+    (Owed 32).
+
 ## Do not touch
 
 Domain and app crates (except to read them), and fly configs (C16). (Amended 2026-10-15) No Fly

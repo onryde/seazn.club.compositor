@@ -45,6 +45,7 @@ repo.
   #[derive(Debug, Clone, PartialEq, Eq)]
   pub struct SessionConfig {
       pub session_id: String, pub fixture_id: String,
+      // (amended 2026-10-18, C07 as built) `fixture_id: Option<String>`: nullable on the wire (F-006)
       pub input: InputSpec, pub target: TargetSpec, pub output: domain::config::OutputProfile,
       pub heartbeat_interval_ms: u64, pub overlay_url: String, pub overlay_delay_ms: u64,
   }
@@ -57,11 +58,15 @@ repo.
       fn fetch_session(&mut self) -> Result<SessionConfig, FetchError>;
       fn heartbeat(&mut self, report: &domain::health::HealthReport, measured: &Measured) -> Result<domain::supervisor::Desired, String>;
       // (amended 2026-10-18, wave gate 1 I5) the Err tells a 410 apart from a transport error: see that amendment
+      // (as built) `Result<Desired, HeartbeatError>`, `HeartbeatError::{Gone, Transport(String)}`; the three
+      // structs that carry a credential write their own `Debug`; `pub const FINAL_BEAT_TIMEOUT_MS: u64 = 2_000`
+      // (see "Amendment 2026-10-18 (C07 as built)")
   }
   // adapters
   pub fn redact(url: &str) -> String;                                 // redact.rs
   pub struct HttpControlPlane { /* ureq agent, base, sid, token */ }  // control_http.rs
   impl HttpControlPlane { pub fn new(app_url: &str, session_id: &str, job_token: String, timeout_ms: u64) -> Self; }
+  // (amended 2026-10-19, PR #25 review I2/M2) `-> Result<Self, PlaneConfigError>`: see that amendment
   impl app::ports::ControlPlane for HttpControlPlane { … }
   pub fn heartbeat_wire(report: &HealthReport, measured: &Measured) -> serde_json::Value; // pub for the contract test
   ```
@@ -239,7 +244,9 @@ repo.
   - a URL with no secret is unchanged
 
 - [ ] **Step 7: Implement `control_http.rs`.**
-  - `HttpControlPlane` holds a `ureq::Agent` with a `timeout_ms` overall timeout.
+  - `HttpControlPlane` holds a `ureq::Agent` with a `timeout_ms` overall timeout. (Amended 2026-10-19,
+    PR #25 review I1/M4: and a connect timeout of `min(timeout_ms, FINAL_BEAT_TIMEOUT_MS)`, and no
+    connection pool.)
   - `parse_session(&Value) -> Result<SessionConfig, FetchError>` is pub. It reads the camelCase keys.
     It returns `WrongMode` if `mode != "composed"`, if any of `input`, `output`, `overlayUrl` or
     `heartbeatIntervalMs` is absent, or if `output` is not exactly `OutputProfile::P720` or `P1080`
@@ -291,6 +298,16 @@ repo.
   count, failing on 0. The frozen-total mutant went red, making 4 mutants red.
 - (Amended 2026-10-18, Owed 24) The vendored `relay-job.v1.json` hashes to `fc99d448…dc50` or a
   later bump, and the `rung` enum is exactly `full|overlay_half_rate`.
+- (Amended 2026-10-18, C07 as built; Owed 4) The beat writes `programmePhase: "final"` and
+  `phaseChannel` (absent until the page reports one), through a `pub fn programme_phase_wire` that
+  C12's endpoint reuses; the contract sweep reaches `Holding`/`Final` with a `PhaseChannel` set and
+  prints the count of beats carrying each, failing on 0.
+- (Amended 2026-10-18, C07 as built; Owed 29) Any heartbeat 410, the final beat's included, is
+  `HeartbeatError::Gone`; every other failure is `Transport`.
+- (Amended 2026-10-18, C07 as built) The 200 is read through the house envelope (F-006), and no
+  credential (the job token, the stream key, the SRT stream id and passphrase, the page token)
+  reaches an error, a `Debug` string or a URL on any error path; each path is tested with a planted
+  secret.
 
 ## Final heartbeat with the exit reason (owner ruling 2026-10-15)
 
@@ -299,8 +316,12 @@ repo.
 `exitDetail` = `redact(detail)`, truncated to **100 Unicode scalar values** (Rust `chars().take(100)`). R2002's published contract caps it at `maxLength: 100` code points, so it always fits web's zod limit of 200 UTF-16 units (F-006; #966 review M1). Also: the exit fields are valid only on a `state: "stopped"` beat (the contract's if/then).
 The final beat is **best-effort**: one attempt, 2 s timeout, never retried. Its failure is logged
 (redacted) and never delays `Exit` (amended 2026-10-18, wave gate 1 review I4: by more than this 2 s
-timeout; C08 flushes the final beat before `run()` returns, bounded by it). A 404 reply to it is not
-an error, and neither is a 410 (web refuses every beat on a terminal session with 410).
+timeout; C08 flushes the final beat before `run()` returns, bounded by it). ~~A 404 reply to it is not
+an error, and neither is a 410 (web refuses every beat on a terminal session with 410).~~ Its reply
+is classified like any other beat's (amended 2026-10-18, C07 as built; `docs/_INDEX.md` Owed 29):
+a 410 is `Gone`, which C08 maps to `HeartbeatRefused(Gone)` (a drain is cut short, exit 0; Exited
+ignores it), and a 404 is a transport error, which C08 maps to `HeartbeatFailed` (Draining and
+Exited ignore it).
 
 Tests:
 - The contract test's sweep includes the 6 exit beats, and every one validates against the vendored
@@ -351,6 +372,185 @@ and it is **absent** when `detail` is `None` **or empty** ("absent, never ''").
   domain's own beat, not a hand-built report.
 - New test `an_empty_detail_is_absent`: a fatal beat with `detail: Some("")` has no `exitDetail`
   key.
+
+## Amendment 2026-10-18 (C07 as built)
+
+**Vendored.** `scripts/vendor-contracts.sh /…/seazn.club eb6538a79` (web main's tip, #980's merge):
+"vendored 21 files" = 20 fixtures + the contract, each compared byte for byte with
+`git show eb6538a79:<path>`. `relay-job.v1.json` hashes to `fc99d448…dc50`, the value web's
+`relay-contract.test.ts` pins (`SHA256`). The script records the full commit sha (`rev-parse
+--verify <rev>^{commit}`) and sorts the pins with `LC_ALL=C`. Web PR #981 (R2004, open) does not
+touch `docs/contracts/`: the file hashes the same at its head 668c0f13f. R2007 PR B (`final`,
+`phaseChannel`, the phase `$defs`) merged as web #970, so the vendored contract carries both
+(`docs/_INDEX.md` Owed 1 closed).
+
+**The final beat's reply** (this amendment resolves the wave gate 1 carried minor: the old text
+here called a 410 to the final beat "not an error", and C08 never said whether a final beat's result
+became an event, so `Draining`'s `HeartbeatRefused(Gone)` arm had no producer). **Any heartbeat 410,
+the final beat's included, is `HeartbeatError::Gone`.** C08 maps it to
+`HeartbeatRefused(HeartbeatRefusal::Gone)`: in `Draining` that cuts the drain short with exit 0 (the
+domain's arm, C06), and `Exited` ignores it, so it is harmless after `Exit`. A 404 to the final beat is
+a transport error like any other beat's. The final beat differs from a periodic one only in its bound:
+one attempt, its request capped at `min(timeout_ms, FINAL_BEAT_TIMEOUT_MS)`. C07 retries nothing.
+Owed 29's text now agrees.
+
+**Interfaces as built** (`crates/app/src/ports.rs`):
+- `SessionConfig.fixture_id: Option<String>`. The contract's `fixtureId` is nullable, because the
+  session outlives its fixture (F-006). A null decodes as `None`; any other non-string is `WrongMode`.
+- `ControlPlane::heartbeat` returns `Result<Desired, HeartbeatError>`, where
+  `HeartbeatError::{Gone, Transport(String)}`.
+- `pub const FINAL_BEAT_TIMEOUT_MS: u64 = 2_000` lives in the port, beside the trait, because two
+  crates read it: the HTTP plane caps the final beat's request with it, and C08's `run()` bounds its
+  flush with it. `Thresholds` would be its home, but this brief does not touch the domain. Moving it
+  there is a later decision, not owed here.
+- `InputSpec`, `TargetSpec` and `SessionConfig` write their own `Debug`. A derived `Debug` would print
+  all four credentials, and C08's `Inbound::Session(SessionConfig)` derives `Debug`. Every credential
+  prints as `****`, and every URL as its scheme and authority alone (`ports::redacted_origin`, which
+  also drops userinfo). `HttpControlPlane`'s `Debug` prints the token as `****`.
+- Also produced: `adapters::control_http::programme_phase_wire` (Owed 4, for C12's endpoint), and
+  `adapters::redact` re-exported at the crate root.
+
+**The classification as built** (`crates/adapters/src/control_http.rs`). The brief's status table
+stands. These rows were settled here, and each one has a test:
+
+| Reply | `fetch_session` | `heartbeat` |
+|---|---|---|
+| 200, the house envelope `{ ok: true, data }` (F-006; the fixtures are its `data`) | `parse_session(data)` | `data.desiredState`, or `Transport` |
+| 200, JSON but not that envelope (no `ok: true`, no `data`, or a bare fixture) | `Refused(WrongMode)`: web's answer, not ours | `Transport` |
+| 200 whose body never arrived as JSON (empty, cut mid-document, cut mid-transfer, an HTML page, past the 64 KiB read cap) | `Transient`: not web's answer | `Transport` |
+| 401 / 404 / 410 | `Refused(Unauthorized / NotFound / Gone)` | `Transport` / `Transport` / **`Gone`** |
+| any other status (5xx, 400, 403, 429), a 3xx (redirects are never followed: `redirects(0)`), a network error, a timeout | `Transient` | `Transport` |
+
+`parse_session` refuses the brief's cases, plus several the contract states:
+- `delay=` repeated (the contract: "appears exactly once"), or not written exactly as `overlayDelayMs`;
+- a 0 `heartbeatIntervalMs` (`exclusiveMinimum: 0`);
+- an `input.protocol` other than `srt`;
+- an `input.url` off the contract's pattern `^srt://[^\s/?#@]+:\d+$`, which is
+  `session-invalid-input-url-query.json`. A query on that URL would carry the credentials, and C10
+  would build a broken URI from it;
+- an absent `sessionId` or `target`, and a body that is not an object.
+
+Every `session-*` fixture gets the verdict its name declares (the fixtures README): plain ones decode,
+and the `refused-`, `invalid-` and passthrough ones are refused.
+
+**The wire as built.**
+- An f64 measurement that is NaN, infinite or negative is omitted. It is not a value we know, serde
+  writes NaN as `null`, and `minimum: 0` makes a negative a 400.
+- Every integer is clamped to the contract's `maximum` (2^53 − 1).
+- The exit keys ride only a `state: "stopped"` beat, whatever `exit` holds (the contract's if/then).
+
+**Redaction as built** (`crates/adapters/src/redact.rs`).
+- Rules 1 and 2 cut at the EARLIEST of `/live/`, `/live2/` and `?`, and drop everything after it.
+  The POC searched `/live2/` before `/live/` and stopped at the first match, so in a text holding a
+  `/live/` key before a `/live2/` one, the first key survived.
+- Rule 3, as Step 6 words it ("in `srt://` URLs"), would be an equivalent guard: an SRT URL's
+  `streamid=` and `passphrase=` sit in its query, which rule 2 already cuts. It is built to mask both
+  keys anywhere, in any case and quoted, because an SRT element's error or property dump names them
+  with no `?` before them.
+
+**Deviations.**
+- The HTTP tests' fake is a raw `TcpListener`, not `tiny_http`. The error paths need a body cut
+  mid-transfer, a close with no reply and a server that never answers, and `tiny_http` answers a
+  dropped request with a 500. `tiny_http` is not a dependency.
+- `serde` is not a dependency: the parser reads `serde_json::Value`.
+- Step 9.3 said to restore the fixture "with `git checkout`". The runner restored every mutant from
+  its in-memory original, with a sha check (AGENTS.md §5).
+- "Asserts no `SwapSink`" (Acceptance and the owed-checks amendment) is false as written: the first
+  tick builds sink generation 1 as a `SwapSink { gen: 1 }`. The sweep asserts that no swap past
+  generation 1 happens, and the frozen-total mutant reds it on the generation-2 swap.
+- The sweep's total grows by a second of 720p bytes (`video_kbps * 1000 / 8`) every second of
+  script time, not by a frame's worth. The domain reads only that the total grew.
+- Each sweep session's end is pinned (`SESSION_ENDS`: its last beat's `exitReason` and the exit
+  code, from the contract's `exitReason` text), so every session the sweep runs is load-bearing.
+
+**Results.** Tests: 47 new (redact 6, contract 21, control_http 18, app ports 2); the workspace runs 306 passed, 0 failed, 0 ignored, the five CI guards pass, and clippy `-D warnings`, fmt and check-portable are clean; against stubs, 32 failed. Mutation: 73 hand mutants (control_http, redact, ports, the fixtures, the sweep), 73/73 red; the first pass left A3 (the sweep's fatal-while-live session dropped) alive, and `SESSION_ENDS` (each session's `exitReason` and exit code, from the contract's own text) kills it.
+
+## Amendment 2026-10-19 (PR #25 review; the coordinator's decisions)
+
+The review rated PR #25 NEEDS FIXES: three Important findings, each measured, and five Minor ones.
+The coordinator decided each, under the owner's standing medium delegation. Built in the same PR.
+
+**I1, the connect phase.** ureq 2.12's own `timeout_connect` (30 s by default) takes precedence over
+`.timeout()`, and a connect never reads the overall deadline (ureq `stream.rs:352-357`). A final
+beat to an unreachable address took 30.0 s. The agent now sets
+`.timeout_connect(min(timeout_ms, FINAL_BEAT_TIMEOUT_MS))`. A hermetic inline test pins it through
+ureq's `Agent` `Debug`: `the_agent_bounds_connect_and_pools_nothing`. The test named
+`the_plane_timeout_bounds_every_call` claimed more than it tested (M5). It is now
+`the_plane_timeout_bounds_a_hung_reply_on_every_call`. **DNS is never bounded** in ureq 2
+(`stream.rs:364`, a TODO), so C08's own-clock flush and its mutant stay (`docs/_INDEX.md` Owed 28).
+
+**I2, the token in ureq's header error.** For a token holding a CR, LF, DEL or non-ASCII byte,
+ureq's `Header::validate` prints the whole `Authorization` line in its error. That reached
+`FetchError` and `HeartbeatError` in plain text. Two independent guards fix it:
+- `HttpControlPlane::new` is now fallible: `-> Result<Self, PlaneConfigError>`. It refuses a token
+  with any byte outside visible ASCII (0x21..=0x7E, `PlaneConfigError::TokenNotVisibleAscii`). No
+  variant carries a value.
+- The plane's `Scrubber` holds the token and masks it by value from every error text.
+
+Each guard has its own test. The constructor is swept over all 94 visible bytes and 7 refused ones.
+An inline test builds a plane past the constructor and still sees the token masked.
+
+**I3, rule 3's coverage.** The coordinator chose both fixes:
+- **(a) By value.** After a successful `fetch_session`, the plane learns the session's credentials
+  (`adapters::redact::Scrubber::add`): the stream key, the SRT stream id and passphrase, the
+  `pageToken` and the overlay URL's `st=`. It masks each one, raw and percent-encoded (upper- and
+  lowercase hex), from `exitDetail` and from every error text. The order is scrub, then `redact`,
+  then the 100-character cap, so the cap never leaves part of a value behind.
+- **(b) By rule.** Rule 3 is widened to a key followed by `\s*[=:]\s*`, an optional GStreamer type
+  (`(string)`), and then the value. A quoted value runs to its closing quote (JSON, multi-word, and
+  backslash escapes). Rule 1's markers match in any ASCII case and percent-encoded (`%2Flive%2F`).
+
+Every row of the reviewer's table is a test, plus a 50 000-case deterministic fuzz for totality and
+idempotence. One consequence: whitespace after `=` is skipped, so `streamid= passphrase=` masks the
+second word. That is over-masking, the safe direction.
+
+**Minor.**
+- **M1.** `redacted_origin` prints `****` for a scheme that is not purely alphanumeric, or empty. A
+  userinfo ends at the last `@` before the first `/`.
+  - *As built, beyond the decision:* a host that is not one (empty, a name outside
+    `[A-Za-z0-9.-]`, or a port that is not digits) prints as `****`. Without this, the reviewer's
+    own example `srt://user:pa/ss@h:1` still printed `user:pa`.
+  - The plane's `Debug` now prints APP_URL through `redacted_origin`: userinfo, path and query never
+    print.
+- **M2.** A 0 ms timeout is refused (`PlaneConfigError::ZeroTimeout`).
+- **M3.** A session whose `sessionId` is not the plane's own is `Refused(WrongMode)`. The comparison
+  ignores ASCII case, as a UUID does.
+- **M4.** `max_idle_connections(0)`: every call opens a fresh connection. ureq never retries a POST
+  on a stale pooled connection, so a pooled connection that the server had closed would lose that
+  beat, the final one included. A keep-alive fake witnesses one connection per call.
+
+**Owed 31, in this PR as its own commit** (the coordinator's decision; the domain API touch falls
+under the owner's medium delegation). `domain::health::ExitDetail(String)`:
+- It carries the fatal text in `Event::Fatal`, `Supervisor.exit_detail` and `ExitInfo.detail`.
+- Its manual `Debug` prints only the length. It has no `Display`; the one reader is `as_str`.
+- `heartbeat_wire` reads it as `exit.detail.as_ref().map_or("", ExitDetail::as_str)`.
+- `no_debug_string_shows_a_fatal_detail` plants a key and checks 26 `{:?}`/`{:#?}` strings of
+  `Event`, `Decision`, `Supervisor`, every `Effect`, `HealthReport` and `ExitInfo`.
+
+**Results.** Tests: 13 new in the round (domain 1, redact 3, control_http 2 inline and 6 integration, app ports 1); the workspace runs 319 passed, 0 failed, 0 ignored, the five CI guards pass, and clippy `-D warnings`, fmt and check-portable are clean; each new test was red against a stub (or under the derived `Debug`) first. Mutation: 54 mutants of the new and moved guards (20 on the plane, 6 earlier ones re-pinned to the moved code, 18 on `redact` and `Scrubber`, 9 on `redacted_origin`, 1 on `ExitDetail`'s `Debug`), 54/54 red; the 61 earlier mutants whose pins still hold re-ran 61/61 red.
+
+### The confirm pass (2026-10-19): APPROVED c3447ca, and one last round
+
+The coordinator's decisions (medium), built in PR #25:
+- **The empty token.** `HttpControlPlane::new` refuses an empty `JOB_TOKEN`
+  (`PlaneConfigError::EmptyToken`, "the job token is empty"), the same path as a bad token, so C12
+  exits 78 on it (Owed 32).
+- **The `Scrubber`'s minimum.** `Scrubber::add` ignores a value shorter than 8 characters
+  (`MIN_SECRET_LENGTH`, counted in characters, not bytes). A shorter one would mask ordinary words.
+  An SRT passphrase is 10 to 79 characters, and keys and tokens are long. `redact`'s patterns still
+  apply to a short value. *As found:* web's `MIN_SECRET_LENGTH` is `"[redacted]".length`, 10. It
+  exists so web's 10-character replacement never lengthens the text, which `****` cannot do at 8.
+  The coordinator's 8 masks strictly more. A token shorter than 8 is still accepted, but it is not
+  scrubbed by value; web mints a JWT.
+- **C08 and C12** log a fatal text through a `Scrubber` built from the `SessionConfig` and then
+  `redact`, never `redact` alone (their amendments of this date; Owed 32 carries the exit code, 78).
+
+**Results.** Tests: 2 new (`an_empty_token_is_refused_at_construction`,
+`a_value_shorter_than_eight_characters_is_not_scrubbed_by_value`, 6 rows). The scrubber test's
+values grew to 8 characters or more. Mutation: 7 new mutants (the empty-token guard off, and the
+wrong variant; the minimum at 1 and at 9, `<=`, counted in bytes, and off), 7/7 red. The 43
+earlier mutants on the plane and on `redact` re-ran 43/43 red. R17 (the empty value learned) is
+superseded by the minimum's mutants.
 
 ## Do not touch
 

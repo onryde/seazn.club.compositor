@@ -1,0 +1,19 @@
+{
+  "sessionId": "7c9e1a2b-3d4f-4a5b-8c6d-7e8f9a0b1c2d",
+  "fixtureId": "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e",
+  "mode": "composed",
+  "themeId": "bug",
+  "overlayDelayMs": 2500,
+  "maxDurationMinutes": 120,
+  "target": { "url": "rtmps://live.cloudflare.com:443/live/", "streamKey": "fixture-input-b-stream-key-1080p" },
+  "pageToken": "fixture-page-token-1080p",
+  "input": {
+    "protocol": "srt",
+    "url": "srt://live.cloudflare.com:778",
+    "streamId": "fixture-input-a-playback-stream-id-1080p",
+    "passphrase": "fixture-input-a-playback-passphrase-1080p"
+  },
+  "output": { "width": 1920, "height": 1080, "fps": 30, "videoKbps": 6000 },
+  "heartbeatIntervalMs": 5000,
+  "overlayUrl": "https://seazn.club/overlay/fixtures/b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e?sid=7c9e1a2b-3d4f-4a5b-8c6d-7e8f9a0b1c2d&st=fixture-page-token-1080p&host=compositor&delay=2500"
+}
