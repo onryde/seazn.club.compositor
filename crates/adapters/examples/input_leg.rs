@@ -41,6 +41,22 @@ fn decode(v: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// RFC 3986 percent-encoding of every byte outside the unreserved set (the leak check's own copy,
+/// so it does not lean on the adapter's).
+fn encode(v: &str, lower: bool) -> String {
+    v.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                char::from(b).to_string()
+            } else if lower {
+                format!("%{b:02x}")
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
 /// `srt://host:port?passphrase=…&streamid=…` into the contract's three fields.
 fn parse(full: &str) -> InputSpec {
     let (url, query) = full.split_once('?').unwrap_or((full, ""));
@@ -74,11 +90,12 @@ fn main() {
         _ => OutputProfile::P720,
     };
     let spec = parse(&full);
-    let forms: Vec<String> = [&spec.stream_id, &spec.passphrase, &GstInput::srt_uri(&spec, 0)]
-        .iter()
-        .filter(|v| v.len() >= 8)
-        .map(|v| v.to_string())
-        .collect();
+    // Every form a credential can take in a line: raw, percent-encoded in either case, and the URI.
+    let mut forms = vec![GstInput::srt_uri(&spec, 0)];
+    for v in [&spec.stream_id, &spec.passphrase] {
+        forms.extend([v.clone(), encode(v, false), encode(v, true)]);
+    }
+    forms.retain(|v| v.len() >= 8);
     let t = Thresholds::default();
     eprintln!(
         "input_leg: {} streamid {} chars, passphrase {} chars, latency {} ms, {}x{}, {seconds} s",
