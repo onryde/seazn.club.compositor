@@ -387,7 +387,7 @@ return within a bound: it never waits on a pipeline, a renderer or a thread that
 reaper thread, as `stop` does, or is bounded by a timeout. **Acceptance:** a test drops the adapter
 while what it owns is hung (or stands in for hung) and the drop returns within 500 ms.
 
-## Amendment 2026-10-19 (as built, PR #__C11PR__; F-013, F-014, F-015)
+## Amendment 2026-10-19 (as built, PR #32; F-013, F-014, F-015)
 
 - **The gate is `required-features`, not `#[ignore]`.** `tests/graphics.rs` is a `[[test]]` with `required-features = ["cef"]`, and `adapters` has a feature `cef = []`. check.yml fails a run with any ignored test, and CI has no cefsrc. The C12 image runs `cargo test -p adapters --features cef --test graphics -- --test-threads=1` under `Xvfb :99`.
 - **The Events table, as built:**
