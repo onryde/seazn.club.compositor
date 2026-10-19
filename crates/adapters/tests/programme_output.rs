@@ -2039,6 +2039,40 @@ fn a_sink_that_fails_during_the_drain_ends_it() {
     assert_eq!(drained, 1, "{after:?}");
 }
 
+/// The ring's gap rule, deterministically (the reviewer's M4 survived a quiet machine: whether the
+/// stall test's natural overflow leaves a delta frame at the ring's front is timing). While the sink
+/// hangs and the feeder holds off, the ring loses its oldest entries up to a delta frame; when the
+/// sink resumes, the output's next picture after the gap is a keyframe, never that delta.
+#[test]
+fn after_the_ring_drops_entries_the_output_resumes_at_a_keyframe() {
+    let _s = serial();
+    let dir = Tmp::new("ring-gap");
+    let (mut p, rx, _f, _l) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    pace(&mut p, 0..30, FrameChoice::Slate(SlateKind::Waiting));
+    assert!(p.hang_sink(Duration::from_secs(4)), "the hook found the sink");
+    // The output's queue fills (`OUTPUT_QUEUE_BYTES`, about 1.4 s) and the feeder holds off; the
+    // ring then holds about a second.
+    pace(&mut p, 30..105, FrameChoice::Slate(SlateKind::Waiting));
+    let held = p.ring_entries();
+    let dropped = p.drop_ring_to_delta();
+    pace(&mut p, 105..240, FrameChoice::Slate(SlateKind::Waiting));
+    drain_and_wait(&mut p, &rx);
+    let d = decode(&dir.file("a.flv"));
+    let step = (1_000.0 / f64::from(P720.fps)).round() as u64;
+    let gaps: Vec<(u64, u64, bool)> = d
+        .parsed
+        .windows(2)
+        .filter(|w| w[1].0 > w[0].0 + step + 1)
+        .map(|w| (w[0].0, w[1].0, w[1].1))
+        .collect();
+    eprintln!("ring held {held}, dropped {dropped} up to a delta; gaps (before ms, after ms, key) {gaps:?}; frames parsed {}", d.parsed.len());
+    assert!(dropped >= 1 && held > dropped, "held {held}, dropped {dropped}");
+    assert!(!gaps.is_empty(), "no gap reached the file");
+    assert!(gaps.iter().all(|g| g.2), "{gaps:?}");
+    assert!(d.first_is_key());
+}
+
 /// Review item 4 (ruling: keep the rebase, witnessed on the appsrc side): flvmux starts its own
 /// timestamps at 0, so the file cannot tell a rebased output from one that is not. What the feeder
 /// sends into the output's appsrcs can: a second sink, built 2 s into the programme, starts its video
@@ -2165,7 +2199,15 @@ fn progress_dropped_on_a_full_channel_is_counted_and_logged() {
     let first = events_until(&rx, Duration::from_secs(2), |e| {
         matches!(e, Event::OutputProgress { .. })
     });
-    let lines_now = lines.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    // The count is logged just after that event is delivered, on the watch's thread: wait for it.
+    let end = Instant::now() + Duration::from_secs(1);
+    let lines_now = loop {
+        let now = lines.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if now.iter().any(|l| l.contains("progress events were dropped")) || Instant::now() > end {
+            break now;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
     let full = lines_now
         .iter()
         .filter(|l| l.contains("inbound channel is full"))

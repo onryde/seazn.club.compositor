@@ -231,6 +231,13 @@ impl GstProgramme {
         hang_pad(&pad, hold)
     }
 
+    /// Test hook: drops the ring's oldest entries up to a video frame that is not a keyframe, as the
+    /// ring does when a stalled sink outlasts it; returns how many.
+    #[cfg(feature = "test-hooks")]
+    pub fn drop_ring_to_delta(&self) -> usize {
+        self.shared.ring.drop_to_delta()
+    }
+
     /// Test hook: the encoded ring's entries now.
     #[cfg(feature = "test-hooks")]
     pub fn ring_entries(&self) -> usize {

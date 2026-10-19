@@ -132,6 +132,23 @@ impl EncodedRing {
         locked(&self.state).entries.len()
     }
 
+    /// Drops the oldest entries as an overflowing ring does, up to the first video entry that is
+    /// not a keyframe (at least one is dropped), so the next entry a feeder takes follows a gap and
+    /// cannot start a picture (the test hooks plant it). Returns how many were dropped.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn drop_to_delta(&self) -> usize {
+        let mut r = locked(&self.state);
+        let mut dropped = 0;
+        while let Some(front) = r.entries.front() {
+            if dropped > 0 && front.video && !front.key {
+                break;
+            }
+            r.entries.pop_front();
+            dropped += 1;
+        }
+        dropped
+    }
+
     pub(crate) fn end_of_stream(&self, video: bool) {
         let mut r = locked(&self.state);
         if video {
