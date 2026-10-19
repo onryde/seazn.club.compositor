@@ -273,7 +273,9 @@ fn files_holding(root: &Path, needle: &[u8]) -> (Vec<PathBuf>, usize) {
             } else if ft.is_file() {
                 *files += 1;
                 // An empty needle lists every file.
-                if needle.is_empty() || std::fs::read(&p).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle)) {
+                if needle.is_empty()
+                    || std::fs::read(&p).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle))
+                {
                     hits.push(p);
                 }
             }
@@ -461,6 +463,57 @@ fn rss_over_cap_reports_crash() {
     // CEF's children exist once it starts (a load's work), and the cap is read every child poll.
     let bound = load_timeout() + Duration::from_millis(2 * CHILD_POLL_MS);
     events_until(&r.rx, bound, crashed(1));
+    r.g.stop();
+}
+
+// PR #32 review G2: a retiring build's renderer is not the new build's memory. Gen 1's teardown is
+// held (and the reaper's kill put off), so its renderer lives on beside gen 2's. A cap between gen
+// 2's share and the whole sum crashes nothing; a cap below gen 2's share crashes gen 2.
+#[test]
+fn a_retiring_builds_renderer_does_not_count_against_the_new_builds_cap() {
+    let _s = serial();
+    let mut r = rig();
+    r.g.hold_teardowns(true);
+    r.g.set_reaper_kill_after(Duration::from_secs(60));
+    r.g.restart(1, &page(""));
+    events_until(&r.rx, load_timeout(), ready(1));
+    r.g.restart(2, &page(""));
+    events_until(&r.rx, load_timeout(), ready(2));
+    assert!(two_polls(&r.g), "the child poll stopped");
+    let gen1 = r.g.renderer_pids(1);
+    assert!(
+        !gen1.is_empty() && gen1.iter().all(|p| alive(*p)),
+        "gen 1's renderer ended: this run proves nothing ({gen1:?})"
+    );
+    let g = r.g.last_guard();
+    let other = g.pss_mb - g.pss_counted_mb;
+    eprintln!(
+        "PSS {} MB in all, {} MB counted for gen 2, {other} MB not; gen 1 {gen1:?}, gen 2 {:?}",
+        g.pss_mb,
+        g.pss_counted_mb,
+        r.g.renderer_pids(2)
+    );
+    // A renderer is tens of MB (F-013; the review's P6: 22-38 MB for a respawned one).
+    assert!(other >= 10, "gen 1's renderer counted for gen 2: {g:?}");
+    let mid = g.pss_counted_mb + other / 2;
+    r.g.set_rss_cap_mb(mid);
+    assert!(two_polls(&r.g), "the child poll stopped");
+    let seen = drain(&r.rx);
+    let after = r.g.last_guard();
+    eprintln!("cap {mid} MB; later {after:?}; events {seen:?}");
+    assert!(
+        after.pss_mb > mid,
+        "the whole sum fell under the cap: this run proves nothing ({after:?})"
+    );
+    assert!(
+        !seen.iter().any(crashed(2)),
+        "gen 2 crashed for gen 1's renderer: {seen:?}"
+    );
+    // The positive pair: under gen 2's own share.
+    r.g.set_rss_cap_mb(after.pss_counted_mb / 2);
+    events_until(&r.rx, hang_bound(), crashed(2));
+    r.g.hold_teardowns(false);
+    r.g.set_reaper_kill_after(Duration::from_millis(REAPER_KILL_AFTER_MS));
     r.g.stop();
 }
 
@@ -1034,7 +1087,10 @@ fn a_hide_before_the_stop_can_leave_a_stale_frame_and_after_it_cannot() {
     );
     let later = r.g.samples(2);
     r.g.hold_teardowns(false);
-    eprintln!("stop then hide: dropped after both {}", later.dropped - at_stop.dropped);
+    eprintln!(
+        "stop then hide: dropped after both {}",
+        later.dropped - at_stop.dropped
+    );
     assert!(
         r.frames.overlay().is_none(),
         "stop, then hide: a frame reached the slot"
@@ -1193,23 +1249,31 @@ fn cef_children_run_at_nice_10_with_the_renderer_first_in_the_oom_order() {
 }
 
 // Owed 56, owner ruling 2026-10-19 "B": a dead renderer zygote ends CEF for the process, so the
-// adapter reports it (C11b restarts in place). It kills CEF, so it runs in a child process.
+// adapter reports it (C11b restarts in place). Killing a zygote can end CEF, so each case runs in a
+// child process of its own: the GPU process's zygote alone (recovered, no verdict), then the
+// renderers' zygote alone with the GPU one alive (the verdict from its lost renderers, not from
+// "no zygote left").
 #[test]
 fn a_dead_renderer_zygote_is_reported_and_the_gpu_zygotes_is_not() {
     let _s = serial();
-    if std::env::var_os("C11_CHILD").is_none() {
-        let out = rerun_in_child(
-            "a_dead_renderer_zygote_is_reported_and_the_gpu_zygotes_is_not",
-            &[],
-        );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let checked: Vec<&str> = stderr
-            .lines()
-            .filter(|l| l.starts_with("zygote child:"))
-            .collect();
-        eprintln!("child: {}; {checked:?}", out.status);
-        assert!(out.status.success(), "the child failed:\n{stderr}");
-        assert_eq!(checked.len(), 1, "{stderr}");
+    let name = "a_dead_renderer_zygote_is_reported_and_the_gpu_zygotes_is_not";
+    let which = std::env::var("C11_ZYGOTE").unwrap_or_default();
+    if std::env::var_os("C11_CHILD").is_none() || which.is_empty() {
+        let mut checked = Vec::new();
+        for which in ["gpu", "renderer"] {
+            let out = rerun_in_child(name, &[("C11_ZYGOTE", which)]);
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            let mine: Vec<String> = stderr
+                .lines()
+                .filter(|l| l.starts_with("zygote child:"))
+                .map(str::to_owned)
+                .collect();
+            assert!(out.status.success(), "the {which} child failed:\n{stderr}");
+            assert_eq!(mine.len(), 1, "{stderr}");
+            checked.extend(mine);
+        }
+        eprintln!("children checked: {}; {checked:?}", checked.len());
+        assert_eq!(checked.len(), 2);
         return;
     }
     let mut r = rig();
@@ -1231,43 +1295,56 @@ fn a_dead_renderer_zygote_is_reported_and_the_gpu_zygotes_is_not() {
         zygotes.contains(&renderer.ppid),
         "the renderer's parent is no zygote: {kids:?}"
     );
-    let other: Vec<i32> = zygotes.iter().copied().filter(|z| *z != renderer.ppid).collect();
+    let gpu: Vec<i32> = zygotes.iter().copied().filter(|z| *z != renderer.ppid).collect();
+    assert!(!gpu.is_empty(), "one zygote only: {kids:?}");
     assert!(two_polls(&r.g), "the child poll stopped");
     assert_eq!(r.g.health().unrecoverable, None);
-    // The other zygote (the GPU process's): CEF recovers, and the next build reaches ready.
-    for z in &other {
-        let _ = Command::new("kill").args(["-KILL", &z.to_string()]).status();
+    if which == "gpu" {
+        // The GPU process's zygote: CEF recovers, and the next build reaches ready.
+        for z in &gpu {
+            let _ = Command::new("kill").args(["-KILL", &z.to_string()]).status();
+        }
+        assert!(gpu.iter().all(|z| wait_for(hang_bound(), || !alive(*z))));
+        assert!(two_polls(&r.g), "the child poll stopped");
+        r.g.restart(2, &page(""));
+        events_until(&r.rx, load_timeout(), ready(2));
+        assert!(two_polls(&r.g), "the child poll stopped");
+        assert_eq!(
+            r.g.health().unrecoverable,
+            None,
+            "the GPU zygote's death was reported"
+        );
+        eprintln!(
+            "zygote child: GPU zygotes {gpu:?} killed, gen 2 ready, {:?}",
+            r.g.health()
+        );
+    } else {
+        // The renderers' zygote alone: reported with the newest generation, within two polls.
+        let _ = Command::new("kill")
+            .args(["-KILL", &renderer.ppid.to_string()])
+            .status();
+        assert!(
+            wait_for(hang_bound(), || r.g.health().unrecoverable.is_some()),
+            "the renderer zygote's death was not reported: {:?}",
+            r.g.health()
+        );
+        assert_eq!(r.g.health().unrecoverable, Some(1));
+        assert!(
+            gpu.iter().all(|z| alive(*z)),
+            "the GPU zygote died too: this run proves only \"no zygote left\""
+        );
+        assert!(lines(&r)
+            .iter()
+            .any(|l| l.contains("ERROR gen=1") && l.contains("zygote")));
+        // And the next build fails at once (F-013).
+        r.g.restart(2, &page(""));
+        events_until(&r.rx, load_timeout(), crashed(2));
+        eprintln!(
+            "zygote child: renderer zygote {} killed (GPU zygotes {gpu:?} alive), {:?}",
+            renderer.ppid,
+            r.g.health()
+        );
     }
-    assert!(other.iter().all(|z| wait_for(hang_bound(), || !alive(*z))));
-    assert!(two_polls(&r.g), "the child poll stopped");
-    assert_eq!(
-        r.g.health().unrecoverable,
-        None,
-        "the GPU zygote's death was reported"
-    );
-    r.g.restart(2, &page(""));
-    events_until(&r.rx, load_timeout(), ready(2));
-    // The renderers' zygote: reported with the newest generation, within two polls.
-    let _ = Command::new("kill")
-        .args(["-KILL", &renderer.ppid.to_string()])
-        .status();
-    assert!(
-        wait_for(hang_bound(), || r.g.health().unrecoverable.is_some()),
-        "the renderer zygote's death was not reported: {:?}",
-        r.g.health()
-    );
-    assert_eq!(r.g.health().unrecoverable, Some(2));
-    assert!(lines(&r)
-        .iter()
-        .any(|l| l.contains("ERROR gen=2") && l.contains("zygote")));
-    // And the next build fails at once (F-013).
-    r.g.restart(3, &page(""));
-    events_until(&r.rx, load_timeout(), crashed(3));
-    eprintln!(
-        "zygote child: other zygotes {other:?} killed and recovered; renderer zygote {} killed, {:?}",
-        renderer.ppid,
-        r.g.health()
-    );
     r.g.stop();
 }
 
@@ -1380,7 +1457,10 @@ fn a_page_token_rests_on_disk_only_in_the_private_profile_until_the_drop() {
         held.iter().any(|p| p.file_name().is_some_and(|n| n == "History"))
     });
     eprintln!("profile {profile:?}; token on disk in {held:?}");
-    assert!(reached, "the token never reached History: this run proves nothing");
+    assert!(
+        reached,
+        "the token never reached History: this run proves nothing"
+    );
     let in_home: Vec<&PathBuf> = held.iter().filter(|p| p.starts_with(&home)).collect();
     assert!(
         in_home.is_empty(),

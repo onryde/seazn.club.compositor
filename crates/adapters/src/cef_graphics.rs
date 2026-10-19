@@ -2318,6 +2318,11 @@ mod tests {
         assert!(zygote_check(&mut w, &tree(false, false), |_| false));
         assert!(!zygote_check(&mut w, &tree(false, false), |_| false));
         checked += 2;
+        // The renderers' zygote alone, the GPU one alive: decided (its lost renderers, not "none left").
+        let mut w = ZygoteWatch::default();
+        assert!(!zygote_check(&mut w, &tree(true, true), |_| false));
+        assert!(zygote_check(&mut w, &tree(true, false), |_| false));
+        checked += 2;
         // A zygote missing from one list while its process lives (a failed cmdline read): no verdict.
         let mut w = ZygoteWatch::default();
         assert!(!zygote_check(&mut w, &tree(true, true), |_| false));
