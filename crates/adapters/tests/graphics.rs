@@ -802,6 +802,13 @@ fn reaper_kills_a_renderer_that_will_not_tear_down() {
     eprintln!("leaked counted by {leaked_seen:?}; {:?}", r.g.health());
     assert!(leaked_seen >= leak_at, "counted leaked at {leaked_seen:?}");
     assert_eq!(r.g.health().leaked_teardowns, 1);
+    // No zygote dies in this process (only the child tests kill one): a killed renderer, or any
+    // other child's exit, is no verdict.
+    assert_eq!(
+        r.g.health().unrecoverable,
+        None,
+        "a renderer's death read as a zygote's"
+    );
     assert_eq!(r.g.teardowns_in_flight(), 1);
     // The count is published before its line is logged: wait for the line, bounded.
     assert!(
@@ -1356,9 +1363,10 @@ fn zygote_case(which: &str) {
         .find(|k| k.kind == "renderer")
         .expect("renderer")
         .clone();
+    // The zygotes are this process's own children (a zygote's fresh fork can read `--type=zygote`).
     let zygotes: Vec<i32> = kids
         .iter()
-        .filter(|k| k.kind == "zygote")
+        .filter(|k| k.kind == "zygote" && k.ppid == std::process::id() as i32)
         .map(|k| k.pid)
         .collect();
     assert!(

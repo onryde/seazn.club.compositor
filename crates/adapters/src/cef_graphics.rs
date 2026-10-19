@@ -468,7 +468,7 @@ fn guard(kids: &[CefChild], counts: impl Fn(&CefChild) -> bool) -> Guarded {
 /// What the child polls have seen of CEF's zygotes (process-wide: CEF is one per process).
 #[derive(Debug, Default)]
 pub(crate) struct ZygoteWatch {
-    /// Every zygote pid seen.
+    /// Every zygote pid seen (a child of this process).
     seen: BTreeSet<i32>,
     /// Decided: CEF can start no renderer again in this process.
     dead: bool,
@@ -482,14 +482,22 @@ pub(crate) struct ZygoteWatch {
 /// pass's N1, 3/3). Either way C11b's in-place restart must come first, on its own terms.
 ///
 /// A zygote missing from one poll's list counts only once `alive` says its process is gone: a
-/// command line read that failed once must not end CEF for the process.
-pub(crate) fn zygote_check(w: &mut ZygoteWatch, kids: &[CefChild], alive: impl Fn(i32) -> bool) -> bool {
+/// command line read that failed once must not end CEF for the process. A zygote is a child of
+/// `root`, this process. A zygote's fresh fork reads `--type=zygote` until it is renamed a renderer
+/// or a utility, and its later exit is no verdict: the likely cause of the one false verdict in the
+/// confirm pass's 16 runs (no probe caught a fork in that state).
+pub(crate) fn zygote_check(
+    w: &mut ZygoteWatch,
+    kids: &[CefChild],
+    root: i32,
+    alive: impl Fn(i32) -> bool,
+) -> bool {
     if w.dead {
         return false;
     }
     let now: BTreeSet<i32> = kids
         .iter()
-        .filter(|k| k.kind == "zygote")
+        .filter(|k| k.kind == "zygote" && k.ppid == root)
         .map(|k| k.pid)
         .collect();
     w.seen.extend(now.iter().copied());
@@ -1926,7 +1934,7 @@ fn poll_children(shared: &Shared) {
         *locked(&shared.last_guard) = g;
         {
             let mut watch = unrecoverable();
-            if zygote_check(&mut watch.0, &kids, pid_alive) {
+            if zygote_check(&mut watch.0, &kids, std::process::id() as i32, pid_alive) {
                 let newest = locked(&shared.builds).last_key_value().map(|(_, (gen, _))| *gen);
                 watch.1 = Some(newest.unwrap_or(0));
                 drop(watch);
@@ -2334,35 +2342,47 @@ mod tests {
         let mut checked = 0;
         // Healthy, then the GPU zygote gone: decided, once, never again.
         let mut w = ZygoteWatch::default();
-        assert!(!zygote_check(&mut w, &tree(true, true), |_| false));
-        assert!(zygote_check(&mut w, &tree(false, true), |_| false));
-        assert!(!zygote_check(&mut w, &tree(false, true), |_| false));
-        assert!(!zygote_check(&mut w, &tree(false, false), |_| false));
+        assert!(!zygote_check(&mut w, &tree(true, true), 1544, |_| false));
+        assert!(zygote_check(&mut w, &tree(false, true), 1544, |_| false));
+        assert!(!zygote_check(&mut w, &tree(false, true), 1544, |_| false));
+        assert!(!zygote_check(&mut w, &tree(false, false), 1544, |_| false));
         checked += 4;
         // The renderers' zygote alone, the GPU one alive: decided.
         let mut w = ZygoteWatch::default();
-        assert!(!zygote_check(&mut w, &tree(true, true), |_| false));
-        assert!(zygote_check(&mut w, &tree(true, false), |_| false));
+        assert!(!zygote_check(&mut w, &tree(true, true), 1544, |_| false));
+        assert!(zygote_check(&mut w, &tree(true, false), 1544, |_| false));
         checked += 2;
         // A zygote missing from one list while its process lives (a failed cmdline read): no verdict,
         // for either zygote.
         for gone in [1556, 1557] {
             let mut w = ZygoteWatch::default();
-            assert!(!zygote_check(&mut w, &tree(true, true), |_| false));
+            assert!(!zygote_check(&mut w, &tree(true, true), 1544, |_| false));
             let partial = tree(gone != 1556, gone != 1557);
-            assert!(!zygote_check(&mut w, &partial, |p| p == gone), "zygote {gone}");
+            assert!(
+                !zygote_check(&mut w, &partial, 1544, |p| p == gone),
+                "zygote {gone}"
+            );
             checked += 2;
         }
         // Every zygote gone before any renderer was seen.
         let mut w = ZygoteWatch::default();
         let early = vec![kid(1556, 1544, "zygote", None), kid(1557, 1544, "zygote", None)];
-        assert!(!zygote_check(&mut w, &early, |_| false));
-        assert!(zygote_check(&mut w, &[], |_| false));
+        assert!(!zygote_check(&mut w, &early, 1544, |_| false));
+        assert!(zygote_check(&mut w, &[], 1544, |_| false));
         checked += 2;
         // Nothing seen yet (CEF not started): nothing decided.
         let mut w = ZygoteWatch::default();
-        assert!(!zygote_check(&mut w, &[], |_| false));
+        assert!(!zygote_check(&mut w, &[], 1544, |_| false));
         checked += 1;
+        // A zygote's fresh fork reads `--type=zygote` (its parent a zygote, not this process):
+        // seen once, then gone as the renderer or utility it became exits. No verdict (the likely
+        // cause of 1 false verdict in 16 runs of the parent test process, the confirm pass).
+        let mut w = ZygoteWatch::default();
+        let mut forking = tree(true, true);
+        forking.push(kid(1640, 1557, "zygote", None));
+        assert!(!zygote_check(&mut w, &forking, 1544, |_| false));
+        assert!(!zygote_check(&mut w, &tree(true, true), 1544, |_| false));
+        checked += 2;
         eprintln!("polls checked: {checked}");
     }
 
