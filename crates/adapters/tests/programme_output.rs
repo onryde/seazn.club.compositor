@@ -1170,6 +1170,10 @@ fn stall_is_detected_within_budget_of_the_last_byte() {
     let mut held = false;
     let mut connected_at: Option<Instant> = None;
     let mut swapped_at: Option<Instant> = None;
+    // The last growth as it stood when the swap was decided. The retired sink's teardown flushes
+    // what `filesink` still buffered (bytes it took before the cut), so growth seen after the swap
+    // is not a write the stall rule could have waited for.
+    let mut at_swap: Option<(u64, Instant)> = None;
     let mut i = 0u64;
     // Until the cut, the sink has its connect bound and 4 s more to earn Connected; then the
     // stall bound and 4 s more to be swapped.
@@ -1191,7 +1195,11 @@ fn stall_is_detected_within_budget_of_the_last_byte() {
             let gen = link.generation();
             if gen >= 2 {
                 swapped_at = Some(now);
+                at_swap = Some(*last_growth.lock().unwrap());
                 p.swap_sink(gen, &file_target(&path(gen)));
+                // Watch on past the swap, so the teardown's flush lands while the watcher runs
+                // and the snapshot above, not the watcher's final reading, is what is judged.
+                thread::sleep(Duration::from_millis(500));
                 break;
             }
             p.swap_sink(gen, &file_target(&path(gen)));
@@ -1214,11 +1222,13 @@ fn stall_is_detected_within_budget_of_the_last_byte() {
     let connected_at = connected_at.expect("the sink earned Connected within its bound and 4 s");
     assert!(held, "the writes were cut");
     let swapped_at = swapped_at.expect("the stall swapped the sink within its bound and 4 s of the cut");
-    let (bytes, last) = *last_growth.lock().unwrap();
+    let (bytes, last) = at_swap.expect("the snapshot is taken with the swap");
+    let flushed = last_growth.lock().unwrap().0 - bytes;
     let gap = swapped_at.duration_since(last).as_millis() as u64;
     let bound = t.output_stall_after_ms + OWED_15_POLL_MAX_MS + period(&P720).as_millis() as u64 + 1;
     eprintln!(
-        "connected {} ms after t0; last byte (total {bytes}) to SwapSink: {gap} ms; bound {bound} ms",
+        "connected {} ms after t0; last byte (total {bytes}) to SwapSink: {gap} ms; bound {bound} ms; \
+         flushed by the teardown: {flushed} bytes",
         ms(connected_at)
     );
     assert!(bytes > 0);
