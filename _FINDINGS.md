@@ -1170,7 +1170,7 @@ echo "RUN $RUN done"
 **`srtsrc`, the adapter's caller:**
 - **`auto-reconnect` defaults to TRUE.** With it on, a peer that goes away is retried inside the element: warnings forever and never an error, a retry policy the domain cannot see. Built: `false`.
 - With it off, the connect runs on the streaming thread and `set_state` returns at once. With nothing listening, an ERROR "Error on SRT socket: Connection timeout (16)" arrives after 3.0 s (3.01–3.03 s across the tests).
-- **A peer that closes gives an ERROR, never an EOS.** A graceful close (the listening `gst-launch-1.0` stopped by SIGINT) gave the ERROR about 47 ms later; a killed listener gave "Error on SRT socket: Unknown or erroneous (0)" about 5.2 s later. No run produced an EOS.
+- **A peer that closes gives an ERROR, and then an EOS.** A graceful close (the listening `gst-launch-1.0` stopped by SIGINT) gave the ERROR about 47 ms later; a killed listener gave "Error on SRT socket: Unknown or erroneous (0)" about 5.2 s later. *Corrected by the PR #30 review (probe P2):* `basesrc` then pushes an EOS, which reaches the video appsink 1.4–7 ms after the error was posted. The C10 build first reported whichever reached it first, so a slow log line gave `Eos` (3 of 3 with a 300 ms log). Since round 1 a bus sync handler decides the loss when the error is posted, before that EOS exists: a peer close is `Error`, always (`a_peer_close_is_an_error_even_when_the_log_is_slow`).
 - A passphrase under 10 characters fails inside `set_state` (READY to PAUSED), and the element posts it on the bus about 20 ms in: "Could not open resource for reading … failed to set passphrase (reason: Operation not supported: Bad parameters)". The text holds no secret.
 - **A hanging resolver** (a container with `--dns 192.0.2.1`) held `set_state(PAUSED)` for 10 s inside `srtsrc`'s start, then "Failed to resolve host". So the adapter starts each pipeline on a starter thread.
 - GStreamer percent-decodes the URI's query. `streamid=play%3DMADEUP%26X` reached libsrt as `play=MADEUP&X`: the listener's `caller-connecting` and `srtobject`'s debug line both showed the decoded stream id, byte for byte. A `latency=` in the URI sets the property (read back as 1 000).
@@ -1217,7 +1217,7 @@ echo "RUN $RUN done"
   - 0 log lines held any form of either credential (raw, percent-encoded in either case, or the URI). 0 samples were dropped at the gate, and 0 frame events.
 - **Verdict:**
   - On CF, the input is lost only by the domain's stall rule and connect timeout; the adapter never reports `InputLost` for a source that stops. This matches F-002's silent socket.
-  - `LossReason::Eos` never occurred, here or locally (Owed 46).
+  - `LossReason::Eos` never occurred on CF. Locally it could, through the race above; since round 1 it needs a bare EOS with no error before it, and nothing measured produces one (Owed 46).
   - Connects took 2.9 s from the build, inside F-002's 2.22–4.19 s.
 
 **Teardown (C10):**

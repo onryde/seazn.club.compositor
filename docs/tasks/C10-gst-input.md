@@ -110,12 +110,21 @@ while what it owns is hung (or stands in for hung) and the drop returns within 5
 
 ## Amendment 2026-10-19 (as built, PR #30; F-012)
 
-- **Test 3 asserts `Error`, and is named for it** (`listener_closing_reports_an_error_loss_with_the_right_generation`). `srtsrc` posts an ERROR when its peer closes, never an EOS, and F-002 recorded no close from CF at all (a silent socket; the C10 leg saw the same). The Events table's `Eos` row stays mapped, from the video appsink, but nothing produces it (Owed 46).
+- **Test 3 asserts `Error`, and is named for it** (`listener_closing_reports_an_error_loss_with_the_right_generation`). `srtsrc` posts an ERROR when its peer closes, and F-002 recorded no close from CF at all (a silent socket; the C10 leg saw the same). *Amended by the PR #30 review:* `basesrc` pushes an EOS 1.4–7 ms after the error, so the loss is decided when the error is posted (a bus sync handler), and a peer close is `Error` however slow the log is. The Events table's `Eos` row stays mapped, from the video appsink, for a bare EOS with no error before it, which nothing measured produces (Owed 46).
 - **The listener** is `… ! mpegtsmux alignment=7 ! srtsink …`. At the default alignment no keyframe reaches the caller, and nothing decodes. It sets `srtsink` `authentication=true` too, so that `caller-connecting` reports the stream id the adapter presented.
 - **Test 4's witness** holds generation 2's start, so only the retired pipeline is delivering. It then reads the camera slot's PTS and the audio ring. `generation_of_last_frame() == 2` alone stayed green with the video gate removed.
 - **Test 5** checks log lines and `Debug`; events carry no text. The values are planted raw, percent-encoded and inside the URI, each as its own error, because `redact` masks everything after a `?`.
 - **Step 3 additions:** `srtsrc` `auto-reconnect=false`; the camera caps also pin `colorimetry=bt709`; both appsinks set `async=false`.
 - **Step 5, mutant 2** is the raw URI written past the scrubber. Through the adapter's log path the scrubber masks it, and it stays green.
+
+## Amendment 2026-10-19 (PR #30 review round 1; the coordinator's rulings)
+
+- **Error or EOS is decided when the error is posted (I1).** A bus sync handler closes the gate for the build on the posting thread, before `basesrc`'s EOS (1.4–7 ms behind) exists; the build's thread logs and reports. Test: `a_peer_close_is_an_error_even_when_the_log_is_slow` (3 closes, a 300 ms log line on each error).
+- **A domain-decided loss closes the gate (G1).** `GstInput::new` takes `&Thresholds`; each video sample is held against the connect timeout and the stall rule, `DOMAIN_LAG_ALLOWANCE_MS` (250) sooner, and the first one past either closes the gate for good, with no event. Tests: `frames_after_the_stall_rule_never_reach_the_programme`, `a_late_connect_is_dropped_and_a_fresh_generation_connects`. The exact form (a port call on the domain's decision) needs the domain and app crates: for the coordinator.
+- **One thread per build (M1, M2):** start, bus, teardown, in that order; a build retired mid-start never goes PLAYING. Tests: `stop_during_a_held_start_leaves_nothing_playing`, `every_generations_threads_end_with_it`.
+- **A loss waits for room (M3):** `a_loss_waits_for_room_in_a_full_channel`.
+- **Plugins load in `new` (M4):** `INPUT_FACTORIES`; `tests/input_preload.rs` (its own binary, so nothing is loaded before it).
+- **The start hold** (`hold_starts`) replaces `delay_starts`: it holds inside READY→PAUSED, where a hanging resolver holds a real start. `rebuild_never_waits_on_the_start` proves the order with no clock bound.
 
 ## Do not touch
 
