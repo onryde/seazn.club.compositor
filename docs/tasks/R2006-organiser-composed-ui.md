@@ -277,7 +277,8 @@ neither A nor B. Built on `onryde/seazn.club` branch `feat/r2006-organiser-compo
   shown `themeId`.
 - **Camera only** is a small link under the card ("Camera only (no score)"); it stores
   `streamMode: "passthrough"` and swaps the card for a one-line camera-only note with *Add the score
-  back*, which clears it.
+  back*, which stores `streamMode: "composed"` (corrected 2026-10-19, PR #989 review m5: it does not
+  clear the field; a stored `composed` and a null both read as the score whenever it can stream).
 - **Composed unavailable** (no compositor image, or the relay not entitled): a one-line reason and a
   camera-only Go live. Never blocked, never a disabled option.
 - **The OBS tab:** the style grid replaces the style tabs and the big preview.
@@ -288,8 +289,11 @@ neither A nor B. Built on `onryde/seazn.club` branch `feat/r2006-organiser-compo
 
 ### The stored mode, read by all three starts
 
-- `fixture_stream_settings.stream_mode` (`'composed' | 'passthrough' | null`), migration **V464**.
-  W2c holds V463, so this merges after W2c (the coordinator sequences it).
+- `fixture_stream_settings.stream_mode` (`'composed' | 'passthrough' | null`), migration **V465**
+  (renumbered from V464 on 2026-10-19, PR #989 review C1). W2c (`feat/format-matrix-w2c`) holds V463
+  and `seazn.club` PR #991 (`feat/claim-email-signin`) holds V464, both unmerged. Flyway runs without
+  `outOfOrder`, so the required merge order is **V463 (W2c) → V464 (#991) → V465 (#989)**, with no prod
+  tag cut between them (the coordinator sequences it).
 - `effectiveStreamMode(stored, available)` in `lib/stream-settings.ts` is the one rule: a stored
   `passthrough` is Camera only; anything else is the score when it can stream, else the camera.
 - The organiser's Go live, the phone's own start and the automatic start all read it
@@ -308,6 +312,8 @@ neither A nor B. Built on `onryde/seazn.club` branch `feat/r2006-organiser-compo
 - The camera phone's own timing control (capture app).
 - Adjusting the delay while live.
 - The composed camera chip (`programmePhase`) — Step 2.4 and mutant 3 above are deferred, not built.
+  It is owed to a web follow-up before C17 (`_INDEX.md` Owed 52), and C17 Step 3 row 3 no longer
+  expects it.
 
 ### Added during the build
 
@@ -316,6 +322,24 @@ neither A nor B. Built on `onryde/seazn.club` branch `feat/r2006-organiser-compo
   codes it airs (Lee Chong Wei v Viktor Axelsen: WEI/AXE, not LEE/VIK).
 - **CI e2e:** e2e-parallel sets a dummy `RELAY_IMAGE`, so the score is every start's default there; a
   walkthrough that follows the camera's lifecycle stores Camera only on its fixture first.
+- **The owner's per-screen sign-off** (2026-10-19, relayed by the coordinator: "approve"): all 6 screens,
+  as built.
+- **PR #989 review fixes (2026-10-19), as built:**
+  - Step 3's width e2e is built: `e2e/overlay-compositor.spec.ts`, one test per width (320, 360, 375,
+    390, 430, 768, 834 and 1280), on the e2e-parallel leg, which has the image. `mobile.spec.ts` runs
+    without the image, so the score card never renders there. Each test checks two things: reachability
+    (`elementFromPoint`, 44 px below 768 and 36 px from 768), and no clipping (`overflowingIn`). It then
+    runs the sequence: Camera only and back, a style and 2.5 s that survive a reload, Reset, and Go live,
+    with the mode read back through the API.
+  - Go live sends `overlayDelayMs`, the timing the card showed, in `CreateStreamSession`. Without it the
+    request raced the timing's own save, which fires on blur. If the field is absent, the stored timing
+    applies; if it is null, the server's default applies. That covers the phone's start and the
+    automatic start, which send none.
+  - While a composed session is open, the OBS tab's grid says "Applies to the next stream". It is still
+    editable, and a running session never moves.
+  - The stored preferences re-seed from a newer page read for every field with no save in flight.
+  - Both radiogroups use arrow keys with a roving tabindex.
+  - A number the browser rejects shows the invalid line.
 
 ## Do not touch
 
