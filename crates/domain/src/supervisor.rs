@@ -2425,6 +2425,74 @@ mod tests {
         assert_eq!((b[0].state, b[0].programme_phase), (BeatState::Stalled, Final));
     }
 
+    // PR #29 review I1: after a swap, the new sink reads Stalled until it earns Connected. The beat
+    // must not read Playing on the new sink's first bytes (476 B is also a refused publish's first
+    // total, F-011), nor 1 ms short of the bound; it reads Playing at the bound. Both ways a
+    // Connected sink is swapped: by the stall rule, and by an error then the back-off.
+    #[test]
+    fn a_swapped_sink_reads_stalled_until_it_earns_connected() {
+        let th = t();
+        let (n, stall, base) = (
+            th.output_connected_after_ms,
+            th.output_stall_after_ms,
+            th.output_backoff_base_ms,
+        );
+        let mut checked = 0;
+        for how in ["a stall", "an error"] {
+            let (s, c, _) = on_air(booted(0).decide(Event::Tick, 0).next, 10);
+            assert_eq!(s.health(c).state, BeatState::Playing, "{how}: setup, on air");
+            let (s, swap_at) = match how {
+                "a stall" => (s, c + stall),
+                _ => (
+                    s.decide(Event::OutputError { gen: 1 }, c + 100).next,
+                    c + 100 + base,
+                ),
+            };
+            let d = s.decide(Event::Tick, swap_at);
+            assert!(
+                d.effects.contains(&Effect::SwapSink { gen: 2 }),
+                "{how}: swapped at {swap_at}: {:?}",
+                d.effects
+            );
+            let s = d.next;
+            assert_eq!(s.health(swap_at).state, BeatState::Stalled, "{how}: swapped");
+            // F-011: the first nonzero total is the 476 B `connect` command, 31 ms (median) after
+            // the build; then C09's 250 ms poll, plus a growth 1 ms short of the bound and one at it.
+            let first = swap_at + 31;
+            let mut growth: Vec<Ms> = (0..)
+                .map(|k| first + 250 * k)
+                .take_while(|&g| g < first + n)
+                .collect();
+            growth.extend([first + n - 1, first + n]);
+            growth.dedup();
+            let mut s = s;
+            for (k, &g) in growth.iter().enumerate() {
+                s = s.decide(progress(&s, 476 + 100_000 * k as u64), g).next;
+                let h = s.health(g);
+                let want = if g - first >= n {
+                    (BeatState::Playing, LinkStatus::Connected)
+                } else {
+                    (BeatState::Stalled, LinkStatus::Connecting)
+                };
+                assert_eq!(
+                    (h.state, h.output),
+                    want,
+                    "{how}: {} ms after the first bytes",
+                    g - first
+                );
+                assert_eq!(h.sink_swaps, 1, "{how}");
+            }
+            assert_eq!(growth[0], first, "setup: the first bytes are checked");
+            assert_eq!(
+                growth[growth.len() - 2..],
+                [first + n - 1, first + n],
+                "setup: the edge"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "swap paths checked: {checked}");
+    }
+
     /// The four states a fatal error can reach (not Exited), each 50 ms before the event.
     fn every_live_state() -> Vec<(&'static str, Supervisor)> {
         let on_air = || booted(0).decide(Event::Tick, 0).next;
