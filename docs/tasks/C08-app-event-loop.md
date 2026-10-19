@@ -358,6 +358,16 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
 - (Amended 2026-10-18, Owed 18) `hung_page_is_restarted_through_the_port` passes. Every hang gives
   `HideOverlay` + `GraphicsStop` at once (owner-approved design (2026-10-18); "at once" is the coordinator's reading of it), then one restart after
   `cef_backoff_base_ms`, and the `cef_fail_count`-th hang enters Failed.
+- (Amended 2026-10-19, C08 as built) `scenarios.rs`, `control_worker.rs`, `run.rs` and `secrets.rs`
+  pass, and every sweep prints its count and fails on 0. The scenario sequences the dispatch named
+  pass: a crash then a reload, a hang in Reconnecting, Final with the ladder stepped, SIGTERM in the
+  hold, a 410 mid-drain, a fatal error during the drain, and the final beat under a full channel.
+- (Amended 2026-10-19, Owed 28) The final beat is posted under a full periodic slot, on a fatal start,
+  and both of a drain's final beats behind a full slot; a hung final beat delays `run()` by at least
+  and at most `FINAL_BEAT_TIMEOUT_MS` (plus one tick). The three briefed mutants went red, and so did
+  the drop-oldest form of "the final beat through the periodic slot".
+- (Amended 2026-10-19, Owed 35) The driver's lines go through `Ports.log`, and no `Debug` of a C08 type,
+  no port call and no log line carries a planted credential or fatal text (`secrets.rs`).
 
 ## Amendment 2026-10-15 (overlay templates spec)
 
@@ -541,6 +551,73 @@ one redactor, and an empty text reaches the wire as no `exitDetail`.
   `redact` plus the job token's scrub apply.
 - C07's final beat can still hang in DNS: ureq 2 never bounds a lookup (C07's amendment I1). The
   flush's own `recv_timeout` bound, and its mutant, stay as written (Owed 28).
+
+## Amendment 2026-10-19 (C08 as built)
+
+The implementer's choices, inside the brief. None is an owner ruling; each medium one is recorded in
+`docs/_INDEX.md` (decision row "C08, as built") for the coordinator.
+
+- **A log port.** C12's amendment of 2026-10-18 has the driver log `overlay hidden reason=<r> gen=<g>`
+  and `cef ready|crashed|alive gen=<n>`, but this brief gave it no port, and the app crate reads no
+  clock and never names the adapters crate. So `ports.rs` adds
+  `pub trait LogSink: Send { fn info(&mut self, line: &str); }` and `Ports.log`. The driver writes the
+  message alone; C12's adapter adds `ts=<rfc3339> level=info msg=` (C12's amendment of this date).
+  The driver logs each hide's line before `hide_overlay()`, and each graphics event's line before it
+  hands the event to `decide`, a stale one included. No line carries a credential or a fatal text.
+- **`ControlQueue` gained `flush(timeout) -> bool`** (the 2026-10-18 amendment's ack): it waits on a
+  `Condvar` for every final beat requested so far to post, bounded by its own clock. `run()` calls
+  it once, after `Exit`, with `FINAL_BEAT_TIMEOUT_MS`.
+- **The slots.** The final beat's slot has capacity 2 and a blocking `send` (a third final still
+  posts; its `request` waits for room). The fetch's slot has capacity 1 and a blocking `send`. The
+  periodic slot drops the OLDEST beat, not the newest: AGENTS.md §4 ("every queue and channel has a
+  cap and drops the oldest"); the brief's `try_send`-and-count would drop the newest. The handle
+  holds a clone of the slot's receiver to retire the pending beat, and counts it in `dropped`. A final
+  beat also retires a pending periodic beat, so no `playing` beat reaches web after a `stopped` one;
+  with that, the worker's final-over-periodic priority is equivalent (mutant W12, argued below).
+- **The worker** takes a final beat, then the fetch, then a periodic beat (`try_recv` in that order,
+  then `Select::ready` over the open slots). It acknowledges a final beat before posting its result,
+  so a full inbound channel cannot hold up `flush`. It ends when the handle drops. If its thread
+  cannot start, it posts `Event::Fatal` (the loop would otherwise wait for ever on a fetch). No
+  result's text is kept or logged.
+- **The tick grid is exact:** tick `i` is due at `origin + ⌈i·1000 / fps⌉` ms, not at a period rounded
+  to the nanosecond. The rounded period drifts off the millisecond grid: at 60 fps tick 3 is due at
+  exactly 50 ms, and `16 666 667 ns × 3` puts it at 51 ms. The catch-up cap is one second of ticks at
+  the current rate (`fps` after the session, 10 before it), oldest first, and every tick in one call
+  is decided at that call's `now`.
+- **Refusals, each with a test:** a second `Session` changes nothing (the session is taken only
+  while Booting). An inbound `Event::Tick` is refused (the driver owns the tick). An inbound
+  `BootstrapOk` leaves the domain Running with no session; its `StartProgramme` (and any other wiring
+  effect) then exits as a fatal error, "a session effect arrived before a session" (70), never a
+  panic. A session whose `output.fps` is 0 cannot be paced and is refused as `WrongMode` (78);
+  `parse_session` accepts only P720 and P1080, so it is a guard on the public type. The loop's
+  inbound channel closing (every sender gone) exits as a fatal error, "inbound channel closed" (70),
+  with its final beat.
+- **`FakeProgramme.fail_start` is `Option<String>`, not `bool`:** the error's text is the fatal
+  detail the test pins (`"boom"`).
+- **The flush outcome is logged:** when `flush` returns false (a final beat hung, as in DNS, or its
+  worker died), `run()` logs `final beat not confirmed within 2000 ms` through `Ports.log` before it
+  returns. A final beat whose call returned an error is not logged here: the worker keeps no text
+  (Owed 35 routes it to C12).
+- **Tests as built:** `scenarios.rs` (32), `control_worker.rs` (15), `run.rs` (7) and `secrets.rs` (1).
+  The scenario sequences the dispatch named: a crash then a reload (`a_crash_hide_leaves_the_reload_loading_1_crash`,
+  `_2_a_hang_after_it_still_stops`, `_3_recycle`), a hang in Reconnecting, Final with the ladder
+  stepped, SIGTERM in the hold, a 410 mid-drain (in the driver and through the worker), a fatal error
+  during the drain (in the driver, and behind a full slot through `run()`), and the final beat under
+  a full channel. `secrets.rs` plants made-up credentials and a fatal text, and checks `{:?}` and
+  `{:#?}` of every C08 type and every port call, and every log line, with the positive pair (the
+  values reached the ports and the beat).
+- **Mutation:** 72 hand mutants of `driver.rs`, `control_worker.rs` and `run.rs` (plus one of C07's
+  `InputSpec` `Debug`, to prove `secrets.rs` is not vacuous), each run against the whole `app` suite
+  with its collected total pinned at the baseline: 70 red, 2 argued equivalent. The brief's five
+  went red (the "apply effects after `Exit`" mutant in two forms, B2a and B2b), and so did the three
+  of the 2026-10-18 amendment, the stop-on-every-hide and dropped-stop ones, and the drop-oldest form
+  of "the final beat through the periodic slot" (killed only by the fatal-during-the-drain test and
+  the flush). **Equivalent, argued:** B2c (`tick_due` ignores the exit latch): an `Exited`
+  supervisor decides nothing on a tick (no effect, no frame, no phase change), so nothing reaches a
+  port either way. W16 (the worker's `return None` when no slot is open, removed):
+  `Select::ready()` then panics on an empty set (crossbeam: "no operations have been added"), which
+  ends the thread and closes its sender just as the return does; the explicit return is the
+  intended path, and the only difference is a panic line at shutdown.
 
 ## Do not touch
 
