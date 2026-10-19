@@ -290,12 +290,15 @@ impl Driver {
             Effect::HideOverlay { reason, gen } => {
                 p.log
                     .info(&format!("overlay hidden reason={} gen={gen}", hide_name(reason)));
-                p.programme.hide_overlay();
-                // A hung or failed page is stopped (Owed 17). A crashed or recycled generation is
-                // already gone, and the reload now loading must survive (C05b PR #22 review).
+                // A hung or failed page is stopped (Owed 17), BEFORE the slot is cleared: the stop
+                // closes the page's gate and waits out a sample being written, which would otherwise
+                // land after the clear and stay on air (PR #32 review I2, Owed 57). A crashed or
+                // recycled generation is already gone, and the reload now loading must survive (C05b
+                // PR #22 review).
                 if matches!(reason, HideReason::Hang | HideReason::Failed) {
                     p.graphics.stop();
                 }
+                p.programme.hide_overlay();
             }
             Effect::StepDown(r) => p.programme.step_down(r),
             Effect::SendHeartbeat(h) => {

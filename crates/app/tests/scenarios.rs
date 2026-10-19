@@ -689,8 +689,10 @@ fn last_beat(events: &[(u64, Inbound)]) -> u64 {
         .expect("the page beat")
 }
 
-/// A hang hide: the line, then `HideOverlay`, then `GraphicsStop`, in one tick's call, at the first
-/// tick at or after the page's last beat + `cef_hang_after_ms`. Returns that tick.
+/// A hang hide: the line, then `GraphicsStop`, then `HideOverlay`, in one tick's call, at the first
+/// tick at or after the page's last beat + `cef_hang_after_ms`. Returns that tick. The stop comes
+/// first (PR #32 review I2, Owed 57): a sample being written as the slot is cleared lands after the
+/// clear unless the stop, which waits that write out, came before it.
 fn assert_hang_hide(sim: &Sim, gen: u64, last_alive: u64) -> u64 {
     let t = th();
     let want = sim.first_tick_at_or_after(last_alive + t.cef_hang_after_ms);
@@ -702,13 +704,13 @@ fn assert_hang_hide(sim: &Sim, gen: u64, last_alive: u64) -> u64 {
         .unwrap_or_else(|| panic!("no line {text:?}"));
     assert_eq!(
         calls[l + 1],
-        Call::HideOverlay,
-        "the line, then the hide (gen {gen})"
+        Call::GraphicsStop,
+        "the line, then the stop (gen {gen})"
     );
     assert_eq!(
         calls[l + 2],
-        Call::GraphicsStop,
-        "the hide, then the stop (gen {gen})"
+        Call::HideOverlay,
+        "the stop, then the hide (gen {gen})"
     );
     assert!(
         !(0..l).any(|i| sim.at(i) == want && matches!(calls[i], Call::Push(..))),
@@ -817,7 +819,7 @@ fn hide_stops_the_hidden_page_and_the_retry_reaches_air() {
     let failed_at = load_timeouts_to_failed(&mut sim);
     let n = t.cef_fail_count as u64;
     let mut checked = 0;
-    // The negative half: the line, HideOverlay, then GraphicsStop, in that order, in that tick.
+    // The negative half: the line, GraphicsStop, then HideOverlay, in that order, in that tick.
     assert_eq!(sim.times_of(|c| *c == Call::HideOverlay), vec![failed_at]);
     assert_eq!(sim.times_of(|c| *c == Call::GraphicsStop), vec![failed_at]);
     let calls = sim.calls();
@@ -825,7 +827,7 @@ fn hide_stops_the_hidden_page_and_the_retry_reaches_air() {
         .iter()
         .position(|c| *c == Call::Log(format!("overlay hidden reason=failed gen={n}")))
         .expect("the failed hide's line");
-    assert_eq!(calls[l + 1..l + 3], [Call::HideOverlay, Call::GraphicsStop]);
+    assert_eq!(calls[l + 1..l + 3], [Call::GraphicsStop, Call::HideOverlay]);
     assert_eq!(sim.at(l), failed_at);
     checked += 3;
     // A ready from the stopped generation, after the hide, changes nothing.
@@ -914,8 +916,8 @@ fn a_crash_hide_leaves_the_reload_loading_1_crash() {
 }
 
 /// Review round 1, item 3: at the count, the crash itself hides, inside the `decide` it is handed to.
-/// Its line comes first: `cef crashed gen=<n>`, then the hide's line, `HideOverlay` and the stop (a
-/// failed page is stopped), in that order and at the crash's instant. Each generation crashes as it
+/// Its line comes first: `cef crashed gen=<n>`, then the hide's line, the stop (a failed page is
+/// stopped) and `HideOverlay`, in that order and at the crash's instant. Each generation crashes as it
 /// loads, 1 ms after the tick that started it; the next starts on its back-off's tick.
 #[test]
 fn a_crash_at_the_count_logs_the_crash_before_its_hide() {
@@ -945,8 +947,8 @@ fn a_crash_at_the_count_logs_the_crash_before_its_hide() {
         [
             crash,
             Call::Log(format!("overlay hidden reason=failed gen={count}")),
-            Call::HideOverlay,
             Call::GraphicsStop,
+            Call::HideOverlay,
         ],
         "the crash's line, then its hide"
     );
