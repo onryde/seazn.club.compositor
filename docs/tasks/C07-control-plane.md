@@ -66,6 +66,7 @@ repo.
   pub fn redact(url: &str) -> String;                                 // redact.rs
   pub struct HttpControlPlane { /* ureq agent, base, sid, token */ }  // control_http.rs
   impl HttpControlPlane { pub fn new(app_url: &str, session_id: &str, job_token: String, timeout_ms: u64) -> Self; }
+  // (amended 2026-10-19, PR #25 review I2/M2) `-> Result<Self, PlaneConfigError>`: see that amendment
   impl app::ports::ControlPlane for HttpControlPlane { … }
   pub fn heartbeat_wire(report: &HealthReport, measured: &Measured) -> serde_json::Value; // pub for the contract test
   ```
@@ -243,7 +244,9 @@ repo.
   - a URL with no secret is unchanged
 
 - [ ] **Step 7: Implement `control_http.rs`.**
-  - `HttpControlPlane` holds a `ureq::Agent` with a `timeout_ms` overall timeout.
+  - `HttpControlPlane` holds a `ureq::Agent` with a `timeout_ms` overall timeout. (Amended 2026-10-19,
+    PR #25 review I1/M4: and a connect timeout of `min(timeout_ms, FINAL_BEAT_TIMEOUT_MS)`, and no
+    connection pool.)
   - `parse_session(&Value) -> Result<SessionConfig, FetchError>` is pub. It reads the camelCase keys.
     It returns `WrongMode` if `mode != "composed"`, if any of `input`, `output`, `overlayUrl` or
     `heartbeatIntervalMs` is absent, or if `output` is not exactly `OutputProfile::P720` or `P1080`
@@ -461,6 +464,70 @@ and the `refused-`, `invalid-` and passthrough ones are refused.
   code, from the contract's `exitReason` text), so every session the sweep runs is load-bearing.
 
 **Results.** Tests: 47 new (redact 6, contract 21, control_http 18, app ports 2); the workspace runs 306 passed, 0 failed, 0 ignored, the five CI guards pass, and clippy `-D warnings`, fmt and check-portable are clean; against stubs, 32 failed. Mutation: 73 hand mutants (control_http, redact, ports, the fixtures, the sweep), 73/73 red; the first pass left A3 (the sweep's fatal-while-live session dropped) alive, and `SESSION_ENDS` (each session's `exitReason` and exit code, from the contract's own text) kills it.
+
+## Amendment 2026-10-19 (PR #25 review; the coordinator's decisions)
+
+The review rated PR #25 NEEDS FIXES: three Important findings, each measured, and five Minor ones.
+The coordinator decided each, under the owner's standing medium delegation. Built in the same PR.
+
+**I1, the connect phase.** ureq 2.12's own `timeout_connect` (30 s by default) takes precedence over
+`.timeout()`, and a connect never reads the overall deadline (ureq `stream.rs:352-357`). A final
+beat to an unreachable address took 30.0 s. The agent now sets
+`.timeout_connect(min(timeout_ms, FINAL_BEAT_TIMEOUT_MS))`. A hermetic inline test pins it through
+ureq's `Agent` `Debug`: `the_agent_bounds_connect_and_pools_nothing`. The test named
+`the_plane_timeout_bounds_every_call` claimed more than it tested (M5). It is now
+`the_plane_timeout_bounds_a_hung_reply_on_every_call`. **DNS is never bounded** in ureq 2
+(`stream.rs:364`, a TODO), so C08's own-clock flush and its mutant stay (`docs/_INDEX.md` Owed 28).
+
+**I2, the token in ureq's header error.** For a token holding a CR, LF, DEL or non-ASCII byte,
+ureq's `Header::validate` prints the whole `Authorization` line in its error. That reached
+`FetchError` and `HeartbeatError` in plain text. Two independent guards fix it:
+- `HttpControlPlane::new` is now fallible: `-> Result<Self, PlaneConfigError>`. It refuses a token
+  with any byte outside visible ASCII (0x21..=0x7E, `PlaneConfigError::TokenNotVisibleAscii`). No
+  variant carries a value.
+- The plane's `Scrubber` holds the token and masks it by value from every error text.
+
+Each guard has its own test. The constructor is swept over all 94 visible bytes and 7 refused ones.
+An inline test builds a plane past the constructor and still sees the token masked.
+
+**I3, rule 3's coverage.** The coordinator chose both fixes:
+- **(a) By value.** After a successful `fetch_session`, the plane learns the session's credentials
+  (`adapters::redact::Scrubber::add`): the stream key, the SRT stream id and passphrase, the
+  `pageToken` and the overlay URL's `st=`. It masks each one, raw and percent-encoded (upper- and
+  lowercase hex), from `exitDetail` and from every error text. The order is scrub, then `redact`,
+  then the 100-character cap, so the cap never leaves part of a value behind.
+- **(b) By rule.** Rule 3 is widened to a key followed by `\s*[=:]\s*`, an optional GStreamer type
+  (`(string)`), and then the value. A quoted value runs to its closing quote (JSON, multi-word, and
+  backslash escapes). Rule 1's markers match in any ASCII case and percent-encoded (`%2Flive%2F`).
+
+Every row of the reviewer's table is a test, plus a 50 000-case deterministic fuzz for totality and
+idempotence. One consequence: whitespace after `=` is skipped, so `streamid= passphrase=` masks the
+second word. That is over-masking, the safe direction.
+
+**Minor.**
+- **M1.** `redacted_origin` prints `****` for a scheme that is not purely alphanumeric, or empty. A
+  userinfo ends at the last `@` before the first `/`.
+  - *As built, beyond the decision:* a host that is not one (empty, a name outside
+    `[A-Za-z0-9.-]`, or a port that is not digits) prints as `****`. Without this, the reviewer's
+    own example `srt://user:pa/ss@h:1` still printed `user:pa`.
+  - The plane's `Debug` now prints APP_URL through `redacted_origin`: userinfo, path and query never
+    print.
+- **M2.** A 0 ms timeout is refused (`PlaneConfigError::ZeroTimeout`).
+- **M3.** A session whose `sessionId` is not the plane's own is `Refused(WrongMode)`. The comparison
+  ignores ASCII case, as a UUID does.
+- **M4.** `max_idle_connections(0)`: every call opens a fresh connection. ureq never retries a POST
+  on a stale pooled connection, so a pooled connection that the server had closed would lose that
+  beat, the final one included. A keep-alive fake witnesses one connection per call.
+
+**Owed 31, in this PR as its own commit** (the coordinator's decision; the domain API touch falls
+under the owner's medium delegation). `domain::health::ExitDetail(String)`:
+- It carries the fatal text in `Event::Fatal`, `Supervisor.exit_detail` and `ExitInfo.detail`.
+- Its manual `Debug` prints only the length. It has no `Display`; the one reader is `as_str`.
+- `heartbeat_wire` reads it as `exit.detail.as_ref().map_or("", ExitDetail::as_str)`.
+- `no_debug_string_shows_a_fatal_detail` plants a key and checks 26 `{:?}`/`{:#?}` strings of
+  `Event`, `Decision`, `Supervisor`, every `Effect`, `HealthReport` and `ExitInfo`.
+
+**Results.** Tests: 13 new in the round (domain 1, redact 3, control_http 2 inline and 6 integration, app ports 1); the workspace runs 319 passed, 0 failed, 0 ignored, the five CI guards pass, and clippy `-D warnings`, fmt and check-portable are clean; each new test was red against a stub (or under the derived `Debug`) first. Mutation: 54 mutants of the new and moved guards (20 on the plane, 6 earlier ones re-pinned to the moved code, 18 on `redact` and `Scrubber`, 9 on `redacted_origin`, 1 on `ExitDetail`'s `Debug`), 54/54 red; the 61 earlier mutants whose pins still hold re-ran 61/61 red.
 
 ## Do not touch
 

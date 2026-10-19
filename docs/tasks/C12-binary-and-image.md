@@ -518,6 +518,19 @@ adds a flush there (10 + 7 + 2 = 19 s).
   - A run where fake-control answers a heartbeat with `410 SESSION_ENDED` (review I5): the process
     exits 0 within 1 s of that reply, and fake-control receives no POST after it.
 
+## Amendment 2026-10-19 (C07 PR #25 review: the job token and the fallible plane)
+
+- **`JOB_TOKEN` is read from env, never argv** (C07 review gap hunt; `docs/_INDEX.md` Owed 32). No
+  production code reads it yet.
+- `HttpControlPlane::new(app_url, session_id, job_token, timeout_ms)` returns
+  `Result<Self, PlaneConfigError>`. It refuses a token with a byte outside visible ASCII (a CRLF
+  `.env` line, a pasted secret) and a 0 ms timeout, and no variant carries the token. The `live`
+  mode handles the refusal before the event loop starts. It is a misconfigured Machine, never a
+  transient. Its exit code is owed (Owed 32, coordinator).
+- The fatal text is a `domain::health::ExitDetail`. Its `Debug` prints the length alone. Log a fatal
+  error only through `adapters::redact` (or the plane's wire), never `ExitDetail::as_str` raw. The
+  fatal smoke run asserts that stderr never shows a planted key (Owed 32).
+
 ## Do not touch
 
 Domain and app crates (except to read them), and fly configs (C16). (Amended 2026-10-15) No Fly

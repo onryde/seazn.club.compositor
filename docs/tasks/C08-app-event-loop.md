@@ -524,6 +524,17 @@ slow periodic one was dropped and counted; and `Exit(c)` returns at once, so `ma
 (today, a start `Err`) carries the error's own text, `Some(e.to_string())`, unredacted: C07 is the
 one redactor, and an empty text reaches the wire as no `exitDetail`.
 
+## Amendment 2026-10-19 (C07 PR #25 review: `ExitDetail`; the fallible plane)
+
+- The fatal text is now `domain::health::ExitDetail` (Owed 31, closed in C07's PR #25). Every
+  `Event::Fatal { detail: Some(e.to_string()) }` above reads
+  `Event::Fatal { detail: Some(ExitDetail::new(e.to_string())) }`. Every test sketch's
+  `Some("x")`/`Some("boom")` reads `Some(ExitDetail::new("x"))`. Its `Debug` prints the length
+  alone, so the derived `Debug` on `ControlRequest`, `Inbound` and `Driver` is safe. Log the text
+  only through C07's wire or `adapters::redact`, never `as_str` raw.
+- C07's final beat can still hang in DNS: ureq 2 never bounds a lookup (C07's amendment I1). The
+  flush's own `recv_timeout` bound, and its mutant, stay as written (Owed 28).
+
 ## Do not touch
 
 The domain crate's API, and the adapters (except to keep them compiling). (Amended 2026-10-15) The
