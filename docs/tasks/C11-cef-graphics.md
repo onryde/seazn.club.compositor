@@ -378,6 +378,15 @@ New image tests (Step 1's table):
 8. `stop()` joins the teardown on the caller's thread. Expected red: the same test's 200 ms bound.
 9. The crash report leaves the gate open. Expected red: `a_reported_crash_closes_its_generations_gate`.
 
+## Amendment 2026-10-19 (C08 PR #27 review round 1: a bounded `Drop`)
+
+C08's `run()` returns after its final-beat flush, and the driver drops with every port as it returns,
+so `CefGraphics`'s `Drop` runs on the exit path, after the final beat and before the process ends. It must
+return within a bound: it never waits on a pipeline, a renderer or a thread that may hang (F-001:
+`set_state(NULL)` did not return for 10 s on a hung renderer); teardown that may block goes to a
+reaper thread, as `stop` does, or is bounded by a timeout. **Acceptance:** a test drops the adapter
+while what it owns is hung (or stands in for hung) and the drop returns within 500 ms.
+
 ## Do not touch
 
 The programme and input adapters, and the page in `seazn.club` (that's R2005). (Amended 2026-10-15)

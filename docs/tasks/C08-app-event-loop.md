@@ -368,6 +368,13 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
   the drop-oldest form of "the final beat through the periodic slot".
 - (Amended 2026-10-19, Owed 35) The driver's lines go through `Ports.log`, and no `Debug` of a C08 type,
   no port call and no log line carries a planted credential or fatal text (`secrets.rs`).
+- (Amended 2026-10-19, PR #27 review round 1) Final beats have their own lane (the coordinator's
+  ruling): through `run()` with the real worker, the final beat posts past a periodic POST stalled
+  5 s, and with a bounded(4) inbound channel kept full (the reviewer's probe), and `run()` logs no lost
+  beat; at the worker, a second final beat posts while the first's result waits on a full channel,
+  and the lane's plane is scrubbed of credentials learned after it was made (C07's suite). A crash at
+  the count logs its line before its hide (the reviewer's mutant M13 went red). The skipped ticks and
+  the dropped beats reach the log, at most a line a minute each, and the rest at the exit.
 
 ## Amendment 2026-10-15 (overlay templates spec)
 
@@ -566,19 +573,43 @@ The implementer's choices, inside the brief. None is an owner ruling; each mediu
   hands the event to `decide`, a stale one included. No line carries a credential or a fatal text.
 - **`ControlQueue` gained `flush(timeout) -> bool`** (the 2026-10-18 amendment's ack): it waits on a
   `Condvar` for every final beat requested so far to post, bounded by its own clock. `run()` calls
-  it once, after `Exit`, with `FINAL_BEAT_TIMEOUT_MS`.
+  it once, after `Exit`, with `FINAL_BEAT_TIMEOUT_MS`. It returns false at once when a final beat
+  found its lane gone (review round 1). It also gained `dropped() -> u64` (round 1, item 4).
 - **The slots.** The final beat's slot has capacity 2 and a blocking `send` (a third final still
   posts; its `request` waits for room). The fetch's slot has capacity 1 and a blocking `send`. The
   periodic slot drops the OLDEST beat, not the newest: AGENTS.md §4 ("every queue and channel has a
   cap and drops the oldest"); the brief's `try_send`-and-count would drop the newest. The handle
   holds a clone of the slot's receiver to retire the pending beat, and counts it in `dropped`. A final
-  beat also retires a pending periodic beat, so no `playing` beat reaches web after a `stopped` one;
-  with that, the worker's final-over-periodic priority is equivalent (mutant W12, argued below).
-- **The worker** takes a final beat, then the fetch, then a periodic beat (`try_recv` in that order,
-  then `Select::ready` over the open slots). It acknowledges a final beat before posting its result,
-  so a full inbound channel cannot hold up `flush`. It ends when the handle drops. If its thread
-  cannot start, it posts `Event::Fatal` (the loop would otherwise wait for ever on a fetch). No
+  beat also retires a pending periodic beat, so no periodic beat STARTS after a final one. (Corrected
+  by review round 1: this said no `playing` beat reaches web after a `stopped` one, and that it made
+  the final-over-periodic priority equivalent, mutant W12. W12 was killed by
+  `a_final_beat_outranks_a_periodic_beat_requested_after_it` before round 1; since round 1 the lanes
+  share no priority, and a periodic beat already IN FLIGHT runs on, so it may land after the final
+  beat.)
+- **The worker** (as corrected by review round 1, the coordinator's ruling, medium): two threads.
+  `control` takes the fetch, then a periodic beat (`try_recv` in that order, then `Select::ready`
+  over the open slots), and posts each result with a blocking `send`, so a full inbound channel holds
+  it alone. `control-final` serves the final beats over a second plane instance,
+  `ControlPlane::final_lane()`: its own connection, sharing every credential the first instance knows
+  or later learns (`HttpControlPlane` shares its `Scrubber` behind a mutex held only while a text is
+  scrubbed), so a final beat's text is scrubbed as before. The final lane acknowledges each beat for
+  `flush` as its call returns, and selects between taking the next final beat and posting a result
+  still waiting for room, so neither a periodic beat in flight, however long, nor a full inbound
+  channel holds a final beat or `flush` up. (Before round 1 one thread served all three slots, and
+  this said that acknowledging a final beat before posting its result meant a full inbound channel
+  could not hold up `flush`. That was false: a final beat queued behind a periodic beat in flight, so
+  a periodic POST stalled past 2 s lost it, and a periodic result blocked on a full channel held it
+  for good, the reviewer's probes P1 and P2.) Both threads end when the handle drops; the final lane
+  serves on if the loop has gone first. If either thread cannot start, it posts `Event::Fatal`. No
   result's text is kept or logged.
+- **The counters reach the log** (review round 1, item 4, medium): `skipped_ticks` and the queue's
+  `dropped()` were read only by tests. The driver logs `ticks skipped total=<n>` after a catch-up
+  jump and `heartbeats dropped total=<n>` after a beat it requests, each when its count rose, at most
+  one line a minute per counter (`TALLY_EVERY_MS`), and whatever rose since the last line at the
+  exit, before it.
+- **`run()` drops the ports as it returns** (review round 1, item 5): the driver, and with it every
+  adapter, drops after the flush, so an adapter's `Drop` runs on the exit path. C09, C10 and C11 are
+  amended: an adapter's `Drop` returns within a bound and never waits on a hung pipeline or renderer.
 - **The tick grid is exact:** tick `i` is due at `origin + ⌈i·1000 / fps⌉` ms, not at a period rounded
   to the nanosecond. The rounded period drifts off the millisecond grid: at 60 fps tick 3 is due at
   exactly 50 ms, and `16 666 667 ns × 3` puts it at 51 ms. The catch-up cap is one second of ticks at
@@ -617,7 +648,19 @@ The implementer's choices, inside the brief. None is an owner ruling; each mediu
   port either way. W16 (the worker's `return None` when no slot is open, removed):
   `Select::ready()` then panics on an empty set (crossbeam: "no operations have been added"), which
   ends the thread and closes its sender just as the return does; the explicit return is the
-  intended path, and the only difference is a panic line at shutdown.
+  intended path, and the only difference is a panic line at shutdown. That holds only while a panic
+  unwinds: it breaks if the workspace ever sets `panic = "abort"` or installs a panic hook that exits.
+- **Review round 1 (tests and mutation):** 10 new tests (`scenarios.rs` 4: the crash at the count and
+  the counters' three; `control_worker.rs` 3; `run.rs` 2; C07's `control_http.rs` 1, the lane's
+  scrub), each red first but three (the crash at the count, the lane serving on after the loop has
+  gone, and the counters' empty case), which mutants cover. The list was re-pinned to the lane and
+  re-run whole against the app suite, its total pinned at 69 (and C07's suite at 59 for the scrub):
+  91 hand mutants, 90 red, 1 argued equivalent (W16). M13 (the graphics line after `decide`) and
+  every Owed-28 mutant (the final beat through the periodic slot in both forms, no flush, the
+  flush's bounds, the ack after the post, before the call and dropped, the lost beat ignored and
+  never recorded, and five new on the lane: a blocking post, no take while a result waits, the lane
+  ending when the loop has gone, a result dropped, results newest first) went red. B2c is now red: a
+  late tick past an unlatched exit logs a skip. W12 is gone (the lanes share no priority).
 
 ## Do not touch
 

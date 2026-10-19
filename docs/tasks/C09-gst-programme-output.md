@@ -400,6 +400,15 @@ that SAW growth, so a 1 s poll adds up to 1 s.
 - **Mutant:** make `hide_overlay` set a `hidden` flag that `set_overlay` does not clear. Expected
   red: the new test.
 
+## Amendment 2026-10-19 (C08 PR #27 review round 1: a bounded `Drop`)
+
+C08's `run()` returns after its final-beat flush, and the driver drops with every port as it returns,
+so `GstProgramme`'s `Drop` runs on the exit path, after the final beat and before the process ends. It must
+return within a bound: it never waits on a pipeline, a renderer or a thread that may hang (F-001:
+`set_state(NULL)` did not return for 10 s on a hung renderer); teardown that may block goes to a
+reaper thread, as `stop` does, or is bounded by a timeout. **Acceptance:** a test drops the adapter
+while what it owns is hung (or stands in for hung) and the drop returns within 500 ms.
+
 ## Do not touch
 
 Domain and app crates. If you find a port signature problem, report it as a deviation and don't
