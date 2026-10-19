@@ -46,14 +46,17 @@ impl Lcg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Connecting,
+    /// The output only (Owed 38): bytes flow, but the sink has not yet earned Connected.
+    Proving,
     Up,
     Backoff,
 }
 
-const KINDS: [Kind; 3] = [Kind::Connecting, Kind::Up, Kind::Backoff];
+const INPUT_KINDS: [Kind; 3] = [Kind::Connecting, Kind::Up, Kind::Backoff];
+const OUTPUT_KINDS: [Kind; 4] = [Kind::Connecting, Kind::Proving, Kind::Up, Kind::Backoff];
 
-/// Exhaustive `match`es, so a new state variant is a compile error here and `KINDS` cannot go stale
-/// behind a sweep that still reports its old count.
+/// Exhaustive `match`es, so a new state variant is a compile error here and the kind lists cannot go
+/// stale behind a sweep that still reports its old count.
 fn input_kind(s: InputState) -> Kind {
     match s {
         InputState::Connecting { .. } => Kind::Connecting,
@@ -65,8 +68,19 @@ fn input_kind(s: InputState) -> Kind {
 fn output_kind(s: OutputState) -> Kind {
     match s {
         OutputState::Connecting { .. } => Kind::Connecting,
+        OutputState::Proving { .. } => Kind::Proving,
         OutputState::Connected { .. } => Kind::Up,
         OutputState::Backoff { .. } => Kind::Backoff,
+    }
+}
+
+/// The consecutive failures a state carries; Connected carries none (it reset them).
+fn output_attempt(s: OutputState) -> Option<u32> {
+    match s {
+        OutputState::Connecting { attempt, .. }
+        | OutputState::Proving { attempt, .. }
+        | OutputState::Backoff { attempt, .. } => Some(attempt),
+        OutputState::Connected { .. } => None,
     }
 }
 
@@ -88,6 +102,7 @@ fn input_in(kind: Kind, t: &Thresholds) -> (InputLink, Ms) {
             l.on_connected(up, 2);
             l.on_lost(up + 50, 2, LossReason::Error, t);
         }
+        Kind::Proving => panic!("an input link has no Proving state"),
     }
     assert_eq!((input_kind(l.state()), l.generation()), (kind, 2), "setup");
     let due = match l.state() {
@@ -153,7 +168,7 @@ fn brief_input(from: Kind, e: InputEvent) -> (Kind, bool, usize) {
 fn every_input_pair_follows_the_brief() {
     let t = Thresholds::default();
     let (mut checked, mut moved) = (0usize, 0usize);
-    for kind in KINDS {
+    for kind in INPUT_KINDS {
         for e in INPUT_EVENTS {
             let (mut l, due) = input_in(kind, &t);
             let built = apply_input(&mut l, e, due, 2, &t);
@@ -166,7 +181,11 @@ fn every_input_pair_follows_the_brief() {
         }
     }
     eprintln!("input pairs checked: {checked} ({moved} move the state)");
-    assert_eq!(checked, KINDS.len() * INPUT_EVENTS.len(), "every pair, once");
+    assert_eq!(
+        checked,
+        INPUT_KINDS.len() * INPUT_EVENTS.len(),
+        "every pair, once"
+    );
     assert!(moved > 0, "a matrix where nothing moves is vacuous");
 }
 
@@ -176,7 +195,7 @@ fn every_input_pair_follows_the_brief() {
 fn input_early_ticks_and_other_generations_change_nothing() {
     let t = Thresholds::default();
     let mut checked = 0usize;
-    for kind in KINDS {
+    for kind in INPUT_KINDS {
         let (mut l, due) = input_in(kind, &t);
         let before = l.clone();
         assert!(!l.on_tick(due - 1, &t), "{kind:?}: built 1 ms early");
@@ -196,31 +215,42 @@ fn input_early_ticks_and_other_generations_change_nothing() {
         }
     }
     eprintln!("input no-ops checked: {checked}");
-    assert_eq!(checked, KINDS.len() * (1 + 2 * 4));
+    assert_eq!(checked, INPUT_KINDS.len() * (1 + 2 * 4));
 }
 
-/// An output link in `kind` at sink generation 2 (1 torn down, 3 never built), with 1 000 bytes sent
-/// when Connected. Returns the link and the instant its timer is due.
+/// An output link in `kind` at sink generation 2 (1 torn down, 3 never built), one failure behind it
+/// (gen 1's). Proving holds 1 000 bytes, grown 1 ms short of the bound; Connected holds 1 000 bytes;
+/// Backoff is gen 2 refused while proving. Returns the link and the instant its timer is due.
 fn output_in(kind: Kind, t: &Thresholds) -> (OutputLink, Ms) {
     let mut o = OutputLink::new();
     assert!(o.on_tick(0, t));
-    o.on_progress(0, 1, 1_000);
+    o.on_progress(0, 1, 1_000, t);
     o.on_error(100, 1, t);
     let built = 100 + t.output_backoff_base_ms;
     assert!(o.on_tick(built, t));
     let up = built + 50;
+    let n = t.output_connected_after_ms;
     match kind {
         Kind::Connecting => {}
-        Kind::Up => o.on_progress(up, 2, 1_000),
+        Kind::Proving => {
+            o.on_progress(up, 2, 500, t);
+            o.on_progress(up + n - 1, 2, 1_000, t);
+        }
+        Kind::Up => {
+            o.on_progress(up, 2, 500, t);
+            o.on_progress(up + n, 2, 1_000, t);
+        }
         Kind::Backoff => {
-            o.on_progress(up, 2, 1_000);
+            o.on_progress(up, 2, 500, t);
             o.on_error(up + 50, 2, t);
         }
     }
     assert_eq!((output_kind(o.state()), o.generation()), (kind, 2), "setup");
     let due = match o.state() {
         OutputState::Connecting { since, .. } => since + t.output_connect_timeout_ms,
-        OutputState::Connected { last_progress, .. } => last_progress + t.output_stall_after_ms,
+        OutputState::Proving { last_progress, .. } | OutputState::Connected { last_progress, .. } => {
+            last_progress + t.output_stall_after_ms
+        }
         OutputState::Backoff { until, .. } => until,
     };
     (o, due)
@@ -245,29 +275,44 @@ const OUTPUT_EVENTS: [OutputEvent; 4] = [
 
 fn apply_output(o: &mut OutputLink, e: OutputEvent, now: Ms, gen: u64, t: &Thresholds) -> bool {
     let high = match o.state() {
-        OutputState::Connected { sent, .. } => sent,
+        OutputState::Proving { sent, .. } | OutputState::Connected { sent, .. } => sent,
         _ => 0,
     };
     match e {
         OutputEvent::Tick => return o.on_tick(now, t),
-        OutputEvent::Progress => o.on_progress(now, gen, 1_001),
-        OutputEvent::NoProgress => o.on_progress(now, gen, high),
+        OutputEvent::Progress => o.on_progress(now, gen, 1_001, t),
+        OutputEvent::NoProgress => o.on_progress(now, gen, high, t),
         OutputEvent::Error => o.on_error(now, gen, t),
     }
     false
 }
 
-/// The brief's transitions (Step 6) with the C04 corrections (bytes sent, F-005): (kind after, built).
-fn brief_output(from: Kind, e: OutputEvent) -> (Kind, bool) {
+/// The failures `output_in`'s state carries: gen 1's one failure, plus gen 2's refusal in Backoff.
+fn setup_attempt(kind: Kind) -> Option<u32> {
+    match kind {
+        Kind::Connecting | Kind::Proving => Some(1),
+        Kind::Up => None,
+        Kind::Backoff => Some(2),
+    }
+}
+
+/// The brief's transitions (Step 6) with the C04 corrections (bytes sent, F-005) and Owed 38's
+/// (Connected is earned; every end before it is a failure; only Connected resets the count):
+/// (kind after, built, failures carried after).
+fn brief_output(from: Kind, e: OutputEvent) -> (Kind, bool, Option<u32>) {
     use Kind as K;
     use OutputEvent as E;
+    let failed = setup_attempt(from).map(|a| a + 1);
     match (from, e) {
-        (K::Backoff, E::Tick) => (K::Connecting, true),
-        (K::Connecting, E::Tick) => (K::Backoff, false), // the connect timed out
-        (K::Up, E::Tick) => (K::Connecting, true),       // stalled for 5 s: swap at once
-        (K::Connecting, E::Progress) => (K::Up, false),  // the first bytes connect it
-        (K::Connecting | K::Up, E::Error) => (K::Backoff, false),
-        (k, _) => (k, false),
+        (K::Backoff, E::Tick) => (K::Connecting, true, setup_attempt(from)),
+        (K::Connecting, E::Tick) => (K::Backoff, false, failed), // the connect timed out
+        (K::Proving, E::Tick) => (K::Backoff, false, failed),    // stalled before the bound
+        (K::Up, E::Tick) => (K::Connecting, true, Some(0)),      // stalled: swap at once, count reset
+        (K::Connecting, E::Progress) => (K::Proving, false, setup_attempt(from)), // the first bytes
+        (K::Proving, E::Progress) => (K::Up, false, None),       // growth at or past the bound
+        (K::Connecting | K::Proving, E::Error) => (K::Backoff, false, failed),
+        (K::Up, E::Error) => (K::Backoff, false, Some(1)), // failure 1 again: Connected reset it
+        (k, _) => (k, false, setup_attempt(k)),
     }
 }
 
@@ -275,19 +320,24 @@ fn brief_output(from: Kind, e: OutputEvent) -> (Kind, bool) {
 fn every_output_pair_follows_the_brief() {
     let t = Thresholds::default();
     let (mut checked, mut moved) = (0usize, 0usize);
-    for kind in KINDS {
+    for kind in OUTPUT_KINDS {
         for e in OUTPUT_EVENTS {
             let (mut o, due) = output_in(kind, &t);
             let built = apply_output(&mut o, e, due, 2, &t);
             let want = brief_output(kind, e);
-            assert_eq!((output_kind(o.state()), built), want, "({kind:?}, {e:?})");
+            let got = (output_kind(o.state()), built, output_attempt(o.state()));
+            assert_eq!(got, want, "({kind:?}, {e:?})");
             assert_eq!(o.generation(), 2 + u64::from(want.1), "({kind:?}, {e:?})");
             checked += 1;
             moved += usize::from(want.0 != kind);
         }
     }
     eprintln!("output pairs checked: {checked} ({moved} move the state)");
-    assert_eq!(checked, KINDS.len() * OUTPUT_EVENTS.len(), "every pair, once");
+    assert_eq!(
+        checked,
+        OUTPUT_KINDS.len() * OUTPUT_EVENTS.len(),
+        "every pair, once"
+    );
     assert!(moved > 0, "a matrix where nothing moves is vacuous");
 }
 
@@ -295,7 +345,7 @@ fn every_output_pair_follows_the_brief() {
 fn output_early_ticks_and_other_generations_change_nothing() {
     let t = Thresholds::default();
     let mut checked = 0usize;
-    for kind in KINDS {
+    for kind in OUTPUT_KINDS {
         let (mut o, due) = output_in(kind, &t);
         let before = o.clone();
         assert!(!o.on_tick(due - 1, &t), "{kind:?}: built 1 ms early");
@@ -312,7 +362,7 @@ fn output_early_ticks_and_other_generations_change_nothing() {
         }
     }
     eprintln!("output no-ops checked: {checked}");
-    assert_eq!(checked, KINDS.len() * (1 + 2 * 2));
+    assert_eq!(checked, OUTPUT_KINDS.len() * (1 + 2 * 2));
 }
 
 // ---- generated schedules, against facts the harness tracks itself ----
@@ -333,16 +383,24 @@ struct OutputCounts {
     builds_from_backoff: usize,
     stall_swaps: usize,
     connect_timeouts: usize,
+    proving_stalls: usize,
     early_or_quiet_ticks: usize,
+    first_bytes: usize,
+    proving_growth: usize,
+    growth_1_ms_short: usize,
     connects: usize,
+    connects_at_the_bound: usize,
     refreshes: usize,
     repeats_connecting: usize,
+    repeats_proving: usize,
     repeats_connected: usize,
     backwards: usize,
     errors_connecting: usize,
+    errors_proving: usize,
     errors_connected: usize,
     ignored_while_backing_off: usize,
     stale_connecting: usize,
+    stale_proving: usize,
     stale_connected: usize,
     stale_backoff: usize,
     waits_at_cap: usize,
@@ -352,18 +410,24 @@ struct OutputCounts {
 fn output_link_keeps_its_rules_over_generated_schedules() {
     let t = Thresholds::default();
     let (stall, timeout) = (t.output_stall_after_ms, t.output_connect_timeout_ms);
+    let n = t.output_connected_after_ms;
     let mut c = OutputCounts::default();
     for case in 0..CASES {
         let mut g = Lcg(case.wrapping_mul(7_919).wrapping_add(17));
         let mut o = OutputLink::new();
         let mut now: Ms = 0;
-        // Facts kept by the harness: the highest total delivered to the current sink, and the
-        // consecutive failures since the last first progress.
+        // Facts kept by the harness: the highest total delivered to the current sink, its first and
+        // latest growth, and the consecutive failures since the last time a sink earned Connected
+        // (Owed 38: growth for `output_connected_after_ms` since the first, by the harness's clock).
         let mut high: u64 = 0;
         let mut failures: u32 = 0;
+        let (mut first, mut last): (Option<Ms>, Ms) = (None, 0);
         for _ in 0..STEPS {
             let due = match o.state() {
                 OutputState::Connecting { since, .. } => Some(since + timeout),
+                // Two instants matter while proving: the bound (on a growth) and the stall (on a tick).
+                OutputState::Proving { .. } if g.next(2) == 0 => first.map(|f| f + n),
+                OutputState::Proving { .. } => Some(last + stall),
                 OutputState::Connected { last_progress, .. } => Some(last_progress + stall),
                 OutputState::Backoff { until, .. } => Some(until),
             };
@@ -405,6 +469,20 @@ fn output_link_keeps_its_rules_over_generated_schedules() {
                             c.connect_timeouts += 1;
                             c.waits_at_cap += usize::from(w == t.output_backoff_cap_ms);
                         }
+                        // Owed 38: the bytes stopped before the sink earned Connected: a failure.
+                        OutputState::Proving { attempt, .. } if now - last >= stall => {
+                            assert!(!built, "case {case}: a proving stall waits; it is not a swap");
+                            assert_eq!(attempt, failures, "case {case}");
+                            let w = out_wait(&t, failures);
+                            failures += 1;
+                            let want = OutputState::Backoff {
+                                attempt: failures,
+                                until: now + w,
+                            };
+                            assert_eq!(o.state(), want, "case {case}: a proving stall");
+                            c.proving_stalls += 1;
+                            c.waits_at_cap += usize::from(w == t.output_backoff_cap_ms);
+                        }
                         _ => {
                             assert!(!built, "case {case}: built from {before:?} at {now}");
                             assert_eq!(o.state(), before, "case {case}: a quiet tick changed {before:?}");
@@ -414,34 +492,79 @@ fn output_link_keeps_its_rules_over_generated_schedules() {
                     if built {
                         assert_eq!(o.generation(), gen + 1, "case {case}: one build, one generation");
                         high = 0; // a new sink counts from 0
+                        first = None;
                     }
                 }
                 5..=7 => {
                     let total = g.pick(&[high, high.saturating_sub(1), high + 1, high + 64_000, 0]);
-                    o.on_progress(now, gen, total);
+                    o.on_progress(now, gen, total, &t);
                     if kind == Kind::Backoff {
                         assert_eq!(o.state(), before, "case {case}: bytes from a failed sink");
                         c.ignored_while_backing_off += 1;
                     } else if total > high {
-                        let want = OutputState::Connected {
-                            last_progress: now,
-                            sent: total,
-                        };
-                        assert_eq!(o.state(), want, "case {case}: progress {total} over {high}");
-                        if kind == Kind::Connecting {
-                            failures = 0;
-                            c.connects += 1;
-                        } else {
-                            c.refreshes += 1;
+                        match kind {
+                            Kind::Connecting => {
+                                let want = OutputState::Proving {
+                                    attempt: failures,
+                                    first_progress: now,
+                                    last_progress: now,
+                                    sent: total,
+                                };
+                                assert_eq!(o.state(), want, "case {case}: the first bytes start the proof");
+                                first = Some(now);
+                                c.first_bytes += 1;
+                            }
+                            Kind::Proving => {
+                                let f = first.expect("a proving sink grew once");
+                                if now - f >= n {
+                                    let want = OutputState::Connected {
+                                        last_progress: now,
+                                        sent: total,
+                                    };
+                                    assert_eq!(
+                                        o.state(),
+                                        want,
+                                        "case {case}: grew {} ms after the first",
+                                        now - f
+                                    );
+                                    failures = 0;
+                                    c.connects += 1;
+                                    c.connects_at_the_bound += usize::from(now - f == n);
+                                } else {
+                                    let want = OutputState::Proving {
+                                        attempt: failures,
+                                        first_progress: f,
+                                        last_progress: now,
+                                        sent: total,
+                                    };
+                                    assert_eq!(
+                                        o.state(),
+                                        want,
+                                        "case {case}: grew {} ms after the first",
+                                        now - f
+                                    );
+                                    c.proving_growth += 1;
+                                    c.growth_1_ms_short += usize::from(now - f == n - 1);
+                                }
+                            }
+                            _ => {
+                                let want = OutputState::Connected {
+                                    last_progress: now,
+                                    sent: total,
+                                };
+                                assert_eq!(o.state(), want, "case {case}: progress {total} over {high}");
+                                c.refreshes += 1;
+                            }
                         }
                         high = total;
+                        last = now;
                     } else {
                         assert_eq!(o.state(), before, "case {case}: {total} ≤ {high} is no progress");
                         c.backwards += usize::from(total < high);
-                        if kind == Kind::Connecting {
-                            c.repeats_connecting += 1;
-                        } else {
-                            c.repeats_connected += 1;
+                        match kind {
+                            Kind::Connecting => c.repeats_connecting += 1,
+                            Kind::Proving => c.repeats_proving += 1,
+                            _ => c.repeats_connected += 1,
                         }
                     }
                 }
@@ -458,10 +581,10 @@ fn output_link_keeps_its_rules_over_generated_schedules() {
                             until: now + w,
                         };
                         assert_eq!(o.state(), want, "case {case}: error from {before:?}");
-                        if kind == Kind::Connecting {
-                            c.errors_connecting += 1;
-                        } else {
-                            c.errors_connected += 1;
+                        match kind {
+                            Kind::Connecting => c.errors_connecting += 1,
+                            Kind::Proving => c.errors_proving += 1,
+                            _ => c.errors_connected += 1,
                         }
                         c.waits_at_cap += usize::from(w == t.output_backoff_cap_ms);
                     }
@@ -473,7 +596,7 @@ fn output_link_keeps_its_rules_over_generated_schedules() {
                         gen + 1
                     };
                     if g.next(2) == 0 {
-                        o.on_progress(now, other, high + 64_000);
+                        o.on_progress(now, other, high + 64_000, &t);
                     } else {
                         o.on_error(now, other, &t);
                     }
@@ -484,6 +607,7 @@ fn output_link_keeps_its_rules_over_generated_schedules() {
                     );
                     match kind {
                         Kind::Connecting => c.stale_connecting += 1,
+                        Kind::Proving => c.stale_proving += 1,
                         Kind::Up => c.stale_connected += 1,
                         Kind::Backoff => c.stale_backoff += 1,
                     }
@@ -500,22 +624,30 @@ fn output_link_keeps_its_rules_over_generated_schedules() {
         ("builds from back-off", c.builds_from_backoff),
         ("stall swaps", c.stall_swaps),
         ("connect timeouts", c.connect_timeouts),
+        ("stalls while proving", c.proving_stalls),
         ("quiet ticks", c.early_or_quiet_ticks),
+        ("first bytes", c.first_bytes),
+        ("growth while proving", c.proving_growth),
+        ("growth 1 ms short of the bound", c.growth_1_ms_short),
         ("connects", c.connects),
+        ("connects exactly at the bound", c.connects_at_the_bound),
         ("refreshes", c.refreshes),
         ("repeats while connecting", c.repeats_connecting),
+        ("repeats while proving", c.repeats_proving),
         ("repeats while connected", c.repeats_connected),
         ("backwards totals", c.backwards),
         ("errors while connecting", c.errors_connecting),
+        ("errors while proving", c.errors_proving),
         ("errors while connected", c.errors_connected),
         ("events ignored while backing off", c.ignored_while_backing_off),
         ("stale while connecting", c.stale_connecting),
+        ("stale while proving", c.stale_proving),
         ("stale while connected", c.stale_connected),
         ("stale while backing off", c.stale_backoff),
         ("waits at the cap", c.waits_at_cap),
     ];
-    for (name, n) in all {
-        assert!(n > 0, "never exercised: {name}");
+    for (name, k) in all {
+        assert!(k > 0, "never exercised: {name}");
     }
 }
 
@@ -781,9 +913,11 @@ struct Recovery {
 
 /// One output recovery through the real `OutputLink`, millisecond by millisecond. `ticks[ms]` says
 /// whether a tick lands on that millisecond. The sink pushes, its total growing on every poll, the
-/// last one at `last_progress`; then the fault. The first `failed` sinks built after the fault hang
-/// (no bytes and no error, so the domain's connect timeout ends each one). The next one sends its
-/// first bytes `connect_ms` after it was built, and the recovery ends there.
+/// last one at `last_progress`; it earns Connected `output_connected_after_ms` after its first poll
+/// (Owed 38), well before the fault. The first `failed` sinks built after the fault hang (no bytes
+/// and no error, so the domain's connect timeout ends each one). The next one sends its first bytes
+/// `connect_ms` after it was built, and the recovery ends there: the output's bytes flow again, and
+/// the gap the broadcast sees is over, though that sink earns Connected only later.
 fn recover(
     t: &Thresholds,
     ticks: &[bool],
@@ -797,14 +931,21 @@ fn recover(
     let mut fault_at = None;
     let mut builds_after_fault = 0u32;
     let mut first_bytes: Option<(u64, Ms)> = None;
+    let mut first_poll = None;
     for now in 0..ticks.len() as Ms {
         if now >= 1 && now <= last_progress && (last_progress - now).is_multiple_of(POLL_MS) {
             total += 64_000;
-            o.on_progress(now, 1, total);
-            assert!(
-                o.is_connected() && o.generation() == 1,
-                "the healthy push at {now}"
+            o.on_progress(now, 1, total, t);
+            let first = *first_poll.get_or_insert(now);
+            assert_eq!(o.generation(), 1, "the healthy push at {now}");
+            assert_eq!(
+                o.is_connected(),
+                now - first >= t.output_connected_after_ms,
+                "the healthy push at {now}, first bytes at {first}"
             );
+            if now == last_progress {
+                assert!(o.is_connected(), "setup: the push is Connected before its fault");
+            }
         }
         if let Fault::Error { after } = fault {
             if now == last_progress + after {
@@ -814,8 +955,12 @@ fn recover(
         }
         if let Some((gen, at)) = first_bytes {
             if now == at {
-                o.on_progress(now, gen, 4_096);
-                assert!(o.is_connected(), "the recovering sink's first bytes connect it");
+                o.on_progress(now, gen, 4_096, t);
+                assert!(
+                    matches!(o.state(), OutputState::Proving { .. }),
+                    "the recovering sink's first bytes start its proof: {:?}",
+                    o.state()
+                );
                 return Recovery {
                     last_progress,
                     fault_at: fault_at.expect("a fault happened"),

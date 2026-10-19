@@ -498,7 +498,7 @@ impl Supervisor {
     }
 
     fn on_output_progress(&mut self, now: Ms, gen: u64, total_bytes: u64) {
-        self.output.on_progress(now, gen, total_bytes);
+        self.output.on_progress(now, gen, total_bytes, &self.t);
         if self.output.is_connected() {
             self.output_ever_connected = true;
         }
@@ -542,7 +542,8 @@ impl Supervisor {
             },
             output: match self.output.state() {
                 OutputState::Connected { .. } => LinkStatus::Connected,
-                OutputState::Connecting { .. } => LinkStatus::Connecting,
+                // Bytes flow but the sink has not earned Connected (Owed 38): still connecting.
+                OutputState::Connecting { .. } | OutputState::Proving { .. } => LinkStatus::Connecting,
                 OutputState::Backoff { .. } => LinkStatus::Backoff,
             },
             graphics: match self.graphics.state() {
@@ -644,6 +645,34 @@ mod tests {
             gen: s.output_generation(),
             total_bytes,
         }
+    }
+
+    /// Owed 38: the current sink's first bytes at `from`, then a total growing every 250 ms (C09's
+    /// poll) until the output earns Connected, `output_connected_after_ms` after the first growth. No
+    /// tick is sent, so no other timer moves. Returns the supervisor, the instant it connected and
+    /// the last total sent.
+    fn on_air(mut s: Supervisor, from: Ms) -> (Supervisor, Ms, u64) {
+        let c = from + s.thresholds().output_connected_after_ms;
+        let (mut at, mut total) = (from, 0);
+        loop {
+            total += 1_000;
+            s = s.decide(progress(&s, total), at).next;
+            if at == c {
+                break;
+            }
+            assert_eq!(
+                s.health(at).output,
+                LinkStatus::Connecting,
+                "setup: proving at {at}"
+            );
+            at = (at + 250).min(c);
+        }
+        assert_eq!(
+            s.health(c).output,
+            LinkStatus::Connected,
+            "setup: Connected at {c}"
+        );
+        (s, c, total)
     }
 
     /// One decided event: its instant, the event, and what came out (not `next`: long runs log many).
@@ -861,17 +890,23 @@ mod tests {
         let th = t();
         let mut s = booted(0).decide(Event::Tick, 0).next;
         assert_eq!(s.health(0).state, BeatState::Starting);
-        let mut sent = 1_000;
-        s = s.decide(progress(&s, sent), 10).next;
-        // F5 option A: the slate is on air, so the session is playing; the camera shows as Waiting
+        s = s.decide(progress(&s, 476), 10).next;
         assert_eq!(
             s.health(10).state,
+            BeatState::Starting,
+            "Owed 38: the first bytes have not earned Connected"
+        );
+        let (n, c, mut sent) = on_air(s, 10);
+        s = n;
+        // F5 option A: the slate is on air, so the session is playing; the camera shows as Waiting
+        assert_eq!(
+            s.health(c).state,
             BeatState::Playing,
             "slate on air counts as playing"
         );
-        assert_eq!(s.health(10).programme_phase, ProgrammePhase::Waiting);
-        let mut now = 10;
-        while now < 10 + th.resume_after_ms + 100 {
+        assert_eq!(s.health(c).programme_phase, ProgrammePhase::Waiting);
+        let mut now = c;
+        while now < c + th.resume_after_ms + 100 {
             sent += 1_000;
             s = s.decide(Event::InputFrame, now).next;
             s = s.decide(progress(&s, sent), now).next;
@@ -1087,10 +1122,9 @@ mod tests {
     #[test]
     fn ending_reply_holds_the_final_card_then_drains() {
         let th = t();
-        let mut s = booted(0).decide(Event::Tick, 0).next;
-        s = s.decide(progress(&s, 1_000), 10).next;
+        let (mut s, c, _) = on_air(booted(0).decide(Event::Tick, 0).next, 10);
         assert_eq!(
-            s.health(10).output,
+            s.health(c).output,
             LinkStatus::Connected,
             "setup: output gen 1 connected"
         );
@@ -1101,15 +1135,16 @@ mod tests {
                     gen: 1,
                     reason: LossReason::Error,
                 },
-                20,
+                c + 10,
             )
             .next;
-        let d = s.decide(Event::HeartbeatReply(Desired::Ending), 100);
+        let hold = c + 90;
+        let d = s.decide(Event::HeartbeatReply(Desired::Ending), hold);
         assert!(!d.effects.contains(&Effect::DrainOutput));
         assert_eq!(d.next.programme_phase(), Final);
         let mut s = d.next;
-        let end = 100 + th.final_hold_ms;
-        let (mut now, mut ticks) = (100, 0);
+        let end = hold + th.final_hold_ms;
+        let (mut now, mut ticks) = (hold, 0);
         while now < end {
             let d = s.decide(Event::Tick, now);
             assert_eq!(d.frame, Some(FrameChoice::Slate(SlateKind::Final)), "at {now}");
@@ -1316,12 +1351,11 @@ mod tests {
     #[test]
     fn health_during_the_hold_reports_final_and_stays_on_air() {
         let th = t();
-        let mut s = booted(0).decide(Event::Tick, 0).next;
-        let mut sent = 1_000;
-        s = s.decide(progress(&s, sent), 10).next;
-        s = s.decide(Event::HeartbeatReply(Desired::Ending), 100).next;
-        let (mut now, mut hold_beats, mut ticks) = (100, Vec::new(), 0);
-        while now < 100 + th.final_hold_ms {
+        let (mut s, c, mut sent) = on_air(booted(0).decide(Event::Tick, 0).next, 10);
+        let hold = c + 90;
+        s = s.decide(Event::HeartbeatReply(Desired::Ending), hold).next;
+        let (mut now, mut hold_beats, mut ticks) = (hold, Vec::new(), 0);
+        while now < hold + th.final_hold_ms {
             sent += 1_000;
             s = s.decide(progress(&s, sent), now).next;
             let d = s.decide(Event::Tick, now);
@@ -1735,11 +1769,9 @@ mod tests {
     fn input_loss_during_starting_soon_rebuilds_and_keeps_the_waiting_slate() {
         let th = t();
         let step = period();
-        let mut s = booted(0).decide(Event::Tick, 0).next;
-        let mut sent = 1_000;
-        s = s.decide(progress(&s, sent), 0).next;
-        s = s.decide(Event::InputConnected { gen: 1 }, 10).next;
-        let lost = 20;
+        let (mut s, c, mut sent) = on_air(booted(0).decide(Event::Tick, 0).next, 0);
+        s = s.decide(Event::InputConnected { gen: 1 }, c + 10).next;
+        let lost = c + 20;
         s = s
             .decide(
                 Event::InputLost {
@@ -1750,7 +1782,7 @@ mod tests {
             )
             .next;
         assert_eq!(s.health(lost).input, LinkStatus::Backoff);
-        let (mut now, mut rebuilt) = (step, None);
+        let (mut now, mut rebuilt) = (c + step, None);
         while now < lost + th.input_backoff_base_ms + 2 * step {
             sent += 1_000;
             s = s.decide(progress(&s, sent), now).next;
@@ -1965,12 +1997,18 @@ mod tests {
         );
         assert_eq!((h.phase_channel, h.exit), (None, None));
         s = s.decide(Event::InputConnected { gen: 1 }, 10).next;
-        s = s.decide(progress(&s, 1_000), 10).next;
-        s = s.decide(Event::CefReady { gen: 1 }, 10).next;
-        s = s.decide(Event::ScoreStale(true), 10).next;
-        s = s.decide(Event::HeartbeatFailed, 10).next;
-        s = s.decide(Event::HeartbeatFailed, 10).next;
-        let h = s.health(10);
+        s = s.decide(progress(&s, 476), 10).next;
+        assert_eq!(
+            s.health(10).output,
+            LinkStatus::Connecting,
+            "Owed 38: a sink proving itself still reads connecting"
+        );
+        let (n, c, _) = on_air(s, 10);
+        s = n.decide(Event::CefReady { gen: 1 }, c).next;
+        s = s.decide(Event::ScoreStale(true), c).next;
+        s = s.decide(Event::HeartbeatFailed, c).next;
+        s = s.decide(Event::HeartbeatFailed, c).next;
+        let h = s.health(c);
         assert_eq!(
             (h.input, h.output, h.graphics),
             (
@@ -1980,24 +2018,25 @@ mod tests {
             )
         );
         assert_eq!((h.score_stale, h.heartbeat_failures), (Some(true), 2));
-        s = s.decide(Event::HeartbeatReply(Desired::Live), 10).next;
+        s = s.decide(Event::HeartbeatReply(Desired::Live), c).next;
         assert_eq!(
-            s.health(10).heartbeat_failures,
+            s.health(c).heartbeat_failures,
             0,
             "a Live reply resets the failures"
         );
+        let e = c + 10;
         s = s
             .decide(
                 Event::InputLost {
                     gen: 1,
                     reason: LossReason::Error,
                 },
-                20,
+                e,
             )
             .next;
-        s = s.decide(Event::OutputError { gen: 1 }, 20).next;
-        s = s.decide(Event::CefCrashed { gen: 1 }, 20).next;
-        let h = s.health(20);
+        s = s.decide(Event::OutputError { gen: 1 }, e).next;
+        s = s.decide(Event::CefCrashed { gen: 1 }, e).next;
+        let h = s.health(e);
         assert_eq!(
             (h.input, h.output, h.graphics),
             (
@@ -2008,7 +2047,7 @@ mod tests {
         );
         assert_eq!(h.input_kicks, 0, "an error is not a kick");
         // One rebuild and one swap after their back-offs: each counts builds after the first.
-        let after = 20 + th.input_backoff_base_ms.max(th.output_backoff_base_ms);
+        let after = e + th.input_backoff_base_ms.max(th.output_backoff_base_ms);
         let d = s.decide(Event::Tick, after);
         assert!(
             d.effects.contains(&Effect::RebuildInput { gen: 2 }),
@@ -2061,6 +2100,70 @@ mod tests {
         assert!(s.health(now).input_kick_alert, "no alert after {kicks} kicks");
     }
 
+    // Owed 38 (F-011) through the supervisor: the stream key is refused at every connect, in
+    // mediamtx's measured shape (the 476 B `connect` command, 9 growing totals up to 1 008 779 B over
+    // 2 s, the error at 2 033 ms). No beat reads playing, the output never reads connected, and the
+    // swaps slow to the capped back-off (0.5, 1, 2, 2 s after each refusal) instead of retrying at
+    // the base all session.
+    #[test]
+    fn a_refused_stream_key_never_reads_playing_and_its_retries_slow_down() {
+        let th = t();
+        let refused_at: Ms = 2_033;
+        let mut totals: Vec<(Ms, u64)> = vec![(31, 476)];
+        totals.extend((1..=8u64).map(|k| (250 * k, 476 + (1_008_779 - 476) * k / 8)));
+        let mut s = booted(0);
+        let (mut built, mut builds, mut beats_seen) = (None::<(Ms, u64)>, Vec::new(), 0);
+        for now in 0..40_000 {
+            if let Some((b, gen)) = built {
+                if let Some(&(_, total)) = totals.iter().find(|(at, _)| b + at == now) {
+                    let ev = Event::OutputProgress {
+                        gen,
+                        total_bytes: total,
+                    };
+                    s = s.decide(ev, now).next;
+                }
+                if b + refused_at == now {
+                    s = s.decide(Event::OutputError { gen }, now).next;
+                }
+            }
+            if now % period() == 0 {
+                let d = s.decide(Event::Tick, now);
+                for e in &d.effects {
+                    if let Effect::SwapSink { gen } = e {
+                        built = Some((now, *gen));
+                        builds.push(now);
+                    }
+                }
+                for b in beats(&d.effects) {
+                    assert_eq!(b.state, BeatState::Starting, "a beat at {now}");
+                    beats_seen += 1;
+                }
+                s = d.next;
+            }
+            let h = s.health(now);
+            assert_ne!(h.output, LinkStatus::Connected, "at {now}");
+            assert_ne!(h.state, BeatState::Playing, "at {now}");
+        }
+        assert!(beats_seen > 0, "no beat was checked");
+        let gaps: Vec<Ms> = builds.windows(2).map(|w| w[1] - w[0] - refused_at).collect();
+        assert!(gaps.len() >= 5, "builds {builds:?}");
+        let wants: Vec<Ms> = (0..gaps.len())
+            .map(|i| (th.output_backoff_base_ms << i.min(16)).min(th.output_backoff_cap_ms))
+            .collect();
+        assert_eq!(
+            wants[..4],
+            [500, 1_000, 2_000, 2_000],
+            "the brief's 0.5, 1, 2, 2 s"
+        );
+        for (i, (&gap, &want)) in gaps.iter().zip(&wants).enumerate() {
+            assert!(
+                (want..want + period()).contains(&gap),
+                "refusal {}: waited {gap} ms, the back-off is {want} ms (builds {builds:?})",
+                i + 1
+            );
+        }
+    }
+
     // ---- wave gate 1 review (PR #24): thresholds, the beat's legs, the fatal detail, the 410 ----
 
     /// Every `Ms` threshold distinct from every other (wave gate 1 review I1: the defaults share
@@ -2082,6 +2185,7 @@ mod tests {
             output_backoff_base_ms: 541,
             output_backoff_cap_ms: 2_081,
             output_connect_timeout_ms: 5_087,
+            output_connected_after_ms: 5_099,
             cef_fail_count: 3,
             cef_fail_window_ms: 300_097,
             cef_load_timeout_ms: 10_103,
@@ -2121,6 +2225,7 @@ mod tests {
             th.output_backoff_base_ms,
             th.output_backoff_cap_ms,
             th.output_connect_timeout_ms,
+            th.output_connected_after_ms,
             th.cef_fail_window_ms,
             th.cef_load_timeout_ms,
             th.cef_recycle_every_ms,
@@ -2138,7 +2243,7 @@ mod tests {
         let mut unique = ms.to_vec();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(unique.len(), 25, "setup: every Ms threshold distinct");
+        assert_eq!(unique.len(), 26, "setup: every Ms threshold distinct");
         let base = th.bootstrap_backoff_base_ms;
         assert!(
             2 * base < th.bootstrap_backoff_cap_ms && 4 * base > th.bootstrap_backoff_cap_ms,
@@ -2279,6 +2384,13 @@ mod tests {
                     total_bytes: 5_000,
                 },
             ),
+            (
+                "the first bytes alone, a refused publish (Owed 38, F-011)",
+                Event::OutputProgress {
+                    gen: 1,
+                    total_bytes: 476,
+                },
+            ),
         ] {
             let n = s.decide(ev, 10).next;
             assert_eq!(n.health(10).state, BeatState::Starting, "{name}");
@@ -2286,29 +2398,28 @@ mod tests {
             assert_eq!(n.health(20).state, BeatState::Starting, "{name}, then an error");
             checked += 1;
         }
-        assert_eq!(checked, 3, "progress events checked: {checked}");
-        let n = s.decide(progress(&s, 1), 10).next;
-        assert_eq!(n.health(10).state, BeatState::Playing, "the positive pair");
-        let n = n.decide(Event::OutputError { gen: 1 }, 20).next;
-        assert_eq!(n.health(20).state, BeatState::Stalled);
+        assert_eq!(checked, 4, "progress events checked: {checked}");
+        let (n, c, _) = on_air(s, 10);
+        assert_eq!(n.health(c).state, BeatState::Playing, "the positive pair");
+        let n = n.decide(Event::OutputError { gen: 1 }, c + 10).next;
+        assert_eq!(n.health(c + 10).state, BeatState::Stalled);
     }
 
     // Wave gate 1 review m1 (the reviewer's M3): the hold's Stalled leg. An output error in the hold,
     // after the sink had connected, reads Stalled, and the hold's beat says so with the Final phase.
     #[test]
     fn an_output_error_in_the_hold_reads_stalled() {
-        let s = booted(0).decide(Event::Tick, 0).next;
-        let s = s.decide(progress(&s, 1_000), 10).next;
-        let s = s.decide(Event::HeartbeatReply(Desired::Ending), 100).next;
+        let (s, c, _) = on_air(booted(0).decide(Event::Tick, 0).next, 10);
+        let s = s.decide(Event::HeartbeatReply(Desired::Ending), c + 90).next;
         assert_eq!(
-            s.health(100).state,
+            s.health(c + 90).state,
             BeatState::Playing,
             "setup: on air in the hold"
         );
-        let s = s.decide(Event::OutputError { gen: 1 }, 200).next;
+        let s = s.decide(Event::OutputError { gen: 1 }, c + 190).next;
         assert!(matches!(s.lifecycle(), Lifecycle::Holding { .. }));
-        assert_eq!(s.health(200).state, BeatState::Stalled);
-        let d = s.decide(Event::Tick, 200);
+        assert_eq!(s.health(c + 190).state, BeatState::Stalled);
+        let d = s.decide(Event::Tick, c + 190);
         let b = beats(&d.effects);
         assert_eq!(b.len(), 1, "the hold's first tick beats: {:?}", d.effects);
         assert_eq!((b[0].state, b[0].programme_phase), (BeatState::Stalled, Final));

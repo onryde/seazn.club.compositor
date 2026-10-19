@@ -44,6 +44,14 @@ pub struct Thresholds {
     /// Spec §4.2: "a reconnect is expected to complete within 5 s". F-004 addendum: stall detection,
     /// one capped back-off and one whole connect must stay under YouTube's 15 s broadcast split.
     pub output_connect_timeout_ms: Ms,
+    /// F-011 (Owed 38; the coordinator's ruling): a sink is Connected only once its bytes-sent total
+    /// has kept growing for this long since its first growth, with no error and no stall between. The
+    /// first nonzero `out-bytes-total` is the 476 B RTMP `connect` command (22–69 ms after the build,
+    /// n = 10 on CF), and a REFUSED publish keeps counting until its refusal arrives: 262 334 B by
+    /// 538 ms on CF (a made-up key) and 1 008 779 B over 2 033 ms on mediamtx (a denied path). No byte
+    /// floor tells those apart; time does. 5 s is about 2.5× the slowest refusal measured. It is not
+    /// longer because the first `playing` beat and the back-off's reset both wait on Connected.
+    pub output_connected_after_ms: Ms,
     /// Spec §4.2: 3 CEF failures in 5 min → graphics Failed.
     pub cef_fail_count: usize,
     /// Spec §4.2: the "5 min" of "3 CEF failures in 5 min".
@@ -119,6 +127,7 @@ impl Default for Thresholds {
             output_backoff_base_ms: 500,
             output_backoff_cap_ms: 2_000,
             output_connect_timeout_ms: 5_000,
+            output_connected_after_ms: 5_000,
             cef_fail_count: 3,
             cef_fail_window_ms: 300_000,
             cef_load_timeout_ms: 10_000,
@@ -308,6 +317,25 @@ mod tests {
         let t = Thresholds::default();
         let gap = t.output_stall_after_ms + t.output_backoff_cap_ms + t.output_connect_timeout_ms;
         assert!(gap < OUTPUT_GAP_BUDGET_MS, "output recovery gap {gap} ms");
+    }
+
+    // F-011 (Owed 38): a refused publish counted bytes until its refusal arrived, the last total at
+    // 538 ms on CF (a made-up key) and the error at 2 033 ms on mediamtx (a denied path). Connected
+    // must wait past both with at least twice their length to spare; the ruling set 5 s.
+    #[test]
+    fn output_connected_bound_clears_every_measured_refusal_twice_over() {
+        let t = Thresholds::default();
+        assert_eq!(
+            t.output_connected_after_ms, 5_000,
+            "the coordinator's ruling, from F-011"
+        );
+        for (leg, refused_by) in [("CF, a made-up key", 538), ("mediamtx, a denied path", 2_033)] {
+            assert!(
+                t.output_connected_after_ms >= 2 * refused_by,
+                "{leg}: refused by {refused_by} ms, bound {} ms",
+                t.output_connected_after_ms
+            );
+        }
     }
 
     // F-004: the same broadcast survived a 15 s gap, and a 30 s gap split it.
