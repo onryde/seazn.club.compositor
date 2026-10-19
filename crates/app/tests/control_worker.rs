@@ -1,6 +1,7 @@
-//! The control worker (C08): one thread that owns the `ControlPlane`, its three request slots, and the
-//! mapping of every result into an `Inbound` message. Every wait is bounded and FAILS on its own
-//! message rather than hang.
+//! The control worker (C08): its two lanes (the fetch and periodic beats on one plane instance, final
+//! beats on another, each on its own thread; review round 1), its three request slots, and the mapping
+//! of every result into an `Inbound` message. Every wait is bounded and FAILS on its own message rather
+//! than hang.
 use std::time::{Duration, Instant};
 
 use app::control_worker::{spawn, ControlHandle};
@@ -15,6 +16,8 @@ use testkit::fakes::{session_720p, PlaneCall, PlaneLog, ScriptedPlane};
 
 const WAIT: Duration = Duration::from_secs(3);
 const SLOW: Duration = Duration::from_millis(300);
+/// A periodic POST stalled past `WAIT` and past the final beat's 2 s bound (review round 1, item 1).
+const STALL: Duration = Duration::from_secs(5);
 
 /// A periodic beat, told apart from the others by `heartbeat_failures`.
 fn periodic(mark: u32) -> HealthReport {
@@ -238,8 +241,8 @@ fn fetch_is_never_dropped_behind_a_slow_heartbeat() {
     assert_eq!(order, vec!["beat", "fetch", "beat"]);
 }
 
-/// Owed 28: a final beat is never dropped, and it outranks a pending periodic beat, which it retires:
-/// no `playing` beat reaches web after a `stopped` one.
+/// Owed 28: a final beat is never dropped. It posts on its own lane while the periodic beat in flight
+/// runs on, and it retires the pending periodic beat, so no periodic beat starts after it.
 #[test]
 fn a_final_beat_outranks_and_retires_a_pending_periodic_beat() {
     let (tx, _rx) = unbounded();
@@ -249,12 +252,14 @@ fn a_final_beat_outranks_and_retires_a_pending_periodic_beat() {
     h.request(beat(periodic(2)));
     h.request(beat(final_beat(9, ExitReason::Fatal)));
     assert!(h.flush(WAIT), "the final beat was posted");
+    assert_eq!(marks(&log), vec![(9, true)], "beat 1 is still in flight");
     std::thread::sleep(SLOW + SLOW / 2);
     assert_eq!(
         marks(&log),
-        vec![(1, false), (9, true)],
+        vec![(9, true), (1, false)],
         "the pending periodic beat never posts"
     );
+    assert_eq!(started(&log), 2, "no periodic beat started after the final one");
     assert_eq!(h.dropped(), 1, "the retired beat is counted");
 }
 
@@ -270,7 +275,14 @@ fn every_final_beat_is_posted_a_third_included() {
         h.request(beat(final_beat(m, ExitReason::Signalled)));
     }
     assert!(h.flush(WAIT));
-    assert_eq!(marks(&log), vec![(1, false), (7, true), (8, true), (9, true)]);
+    assert_eq!(
+        marks(&log),
+        vec![(7, true), (8, true), (9, true)],
+        "in order, beat 1 still in flight"
+    );
+    assert!(log.wait_for(WAIT, |c| c
+        .iter()
+        .any(|c| matches!(c, PlaneCall::Beat(h, _) if h.heartbeat_failures == 1))));
     assert_eq!(h.dropped(), 0);
 }
 
@@ -360,24 +372,26 @@ fn the_final_beat_reaches_the_plane_with_its_detail() {
     assert_eq!(log.beats(), vec![report]);
 }
 
-/// A worker that died (its plane panicked) can post nothing: `flush` says so at once rather than
-/// report a final beat posted that never was.
+/// A lane that died (its plane panicked) can post nothing: `flush` says so at once rather than report
+/// a final beat posted that never was, or wait out its timeout for one that cannot come. The plane
+/// panics on every beat: a periodic one ends the `control` thread, a first final beat the final lane;
+/// with both gone the inbound channel closes, and the next final beat finds its lane gone.
 #[test]
 fn flush_reports_a_final_beat_the_worker_could_not_take() {
     let (tx, rx) = unbounded();
     let (plane, log) = ScriptedPlane::new(session_720p());
-    let plane = plane.reply(|h| {
-        assert!(h.exit.is_some(), "planted: the plane fails on a periodic beat");
-        (Duration::ZERO, Ok(Desired::Live))
-    });
+    let plane = plane.reply(|h| panic!("planted: the plane fails on beat {}", h.heartbeat_failures));
     let mut h = spawn(Box::new(plane), tx);
-    h.request(beat(periodic(1)));
+    // Taken before the final beat comes, which would retire it.
+    in_flight(&mut h, &log, 1);
+    h.request(beat(final_beat(2, ExitReason::Fatal)));
     assert_eq!(
         rx.recv_timeout(WAIT),
         Err(RecvTimeoutError::Disconnected),
-        "the worker died"
+        "both lanes died"
     );
-    h.request(beat(final_beat(2, ExitReason::Fatal)));
+    assert_eq!(started(&log), 2, "each lane took its beat");
+    h.request(beat(final_beat(3, ExitReason::Fatal)));
     let t0 = Instant::now();
     assert!(!h.flush(WAIT), "a final beat nobody took is not posted");
     assert!(
@@ -387,9 +401,9 @@ fn flush_reports_a_final_beat_the_worker_could_not_take() {
     assert!(log.beats().is_empty());
 }
 
-/// The worker's own priority (Owed 28: the final slot outranks the periodic one), apart from the
-/// retire: a periodic beat requested AFTER a final one, both pending behind a beat in flight, still
-/// goes after it. The domain sends no periodic beat after a final one; this pins the worker alone.
+/// The worker's own order (Owed 28), apart from the retire: a periodic beat requested AFTER a final
+/// one waits behind the beat in flight on its lane, while the final one has already posted on its own.
+/// The domain sends no periodic beat after a final one; this pins the worker alone.
 #[test]
 fn a_final_beat_outranks_a_periodic_beat_requested_after_it() {
     let (tx, _rx) = unbounded();
@@ -404,5 +418,65 @@ fn a_final_beat_outranks_a_periodic_beat_requested_after_it() {
         .filter(|c| matches!(c, PlaneCall::Beat(..)))
         .count()
         >= 3));
-    assert_eq!(marks(&log), vec![(1, false), (9, true), (2, false)]);
+    assert_eq!(marks(&log), vec![(9, true), (1, false), (2, false)]);
+}
+
+/// Review round 1, item 1 (the coordinator's ruling): final beats have their own lane, a second plane
+/// instance on its own thread, so a periodic beat in flight, stalled past the bound, never holds one up.
+#[test]
+fn a_final_beat_is_posted_while_a_periodic_beat_is_stalled_in_flight() {
+    let (tx, _rx) = unbounded();
+    let (plane, log) = ScriptedPlane::new(session_720p());
+    let plane = plane.reply(|h| {
+        let d = if h.exit.is_some() { Duration::ZERO } else { STALL };
+        (d, Ok(Desired::Live))
+    });
+    let mut h = spawn(Box::new(plane), tx);
+    in_flight(&mut h, &log, 1);
+    let t0 = Instant::now();
+    h.request(beat(final_beat(9, ExitReason::Fatal)));
+    assert!(h.flush(WAIT), "the final beat was posted");
+    let took = t0.elapsed();
+    assert!(
+        took < Duration::from_secs(1),
+        "at once, not behind the stalled beat: {took:?}"
+    );
+    assert_eq!(
+        marks(&log),
+        vec![(9, true)],
+        "the periodic beat is still in flight"
+    );
+}
+
+/// Review round 1, item 2: the loop stops reading once it exits, so a full inbound channel must not hold
+/// a final beat behind the result of the one before it. The results are not lost: they post, in order,
+/// once the channel has room.
+#[test]
+fn a_second_final_beat_is_posted_while_the_first_result_waits_on_a_full_channel() {
+    let (tx, rx) = bounded(1);
+    tx.send(Inbound::Event(Event::InputFrame)).expect("fill");
+    let (plane, log) = ScriptedPlane::new(session_720p());
+    let plane = plane.reply(|h| {
+        let d = if h.heartbeat_failures == 1 {
+            Desired::Ending
+        } else {
+            Desired::Live
+        };
+        (Duration::ZERO, Ok(d))
+    });
+    let mut h = spawn(Box::new(plane), tx);
+    h.request(beat(final_beat(1, ExitReason::Signalled)));
+    h.request(beat(final_beat(2, ExitReason::Fatal)));
+    assert!(h.flush(WAIT), "both final beats posted, the channel still full");
+    assert_eq!(marks(&log), vec![(1, true), (2, true)]);
+    let got: Vec<Inbound> = (0..3).map(|_| recv(&rx)).collect();
+    assert_eq!(
+        got,
+        vec![
+            Inbound::Event(Event::InputFrame),
+            Inbound::Event(Event::HeartbeatReply(Desired::Ending)),
+            Inbound::Event(Event::HeartbeatReply(Desired::Live)),
+        ],
+        "each result posted once there was room, the first beat's first"
+    );
 }

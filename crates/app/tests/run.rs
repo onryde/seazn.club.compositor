@@ -1,6 +1,7 @@
 //! `run()` (C08) on a wall clock: the real driver, the real control worker and a scripted plane. The
 //! final beat is posted before `run()` returns, on a full channel and on a fatal error, and the flush
 //! is bounded by `FINAL_BEAT_TIMEOUT_MS` (Owed 28). Every wait is bounded and FAILS rather than hang.
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -42,9 +43,22 @@ fn unconfirmed() -> String {
 
 /// Wires a driver to a real control worker over `plane`, and runs `run()` on its own thread.
 fn launch(plane: ScriptedPlane, plane_log: PlaneLog, programme_fails: Option<&str>) -> Rig {
+    launch_with(plane, plane_log, programme_fails, None)
+}
+
+/// `launch`, over an inbound channel of capacity `cap` (`None`: unbounded).
+fn launch_with(
+    plane: ScriptedPlane,
+    plane_log: PlaneLog,
+    programme_fails: Option<&str>,
+    cap: Option<usize>,
+) -> Rig {
     let started = Instant::now();
     let clock = move || started.elapsed().as_millis() as u64;
-    let (tx, rx) = unbounded();
+    let (tx, rx) = match cap {
+        Some(c) => bounded(c),
+        None => unbounded(),
+    };
     let log = Log::default();
     let mut p = ports(&log, Measured::default());
     p.control = Box::new(spawn(Box::new(plane), tx.clone()));
@@ -103,6 +117,14 @@ fn send(rig: &Rig, e: Event) {
 /// A session that beats every 50 ms, against a plane whose periodic beats take `SLOW`: the periodic
 /// slot fills within a few beats.
 fn fast_beating(final_reply: Result<Desired, HeartbeatError>) -> (ScriptedPlane, PlaneLog) {
+    beating_every_50_ms(final_reply, SLOW)
+}
+
+/// A session that beats every 50 ms; its periodic beats take `periodic`, its final beats nothing.
+fn beating_every_50_ms(
+    final_reply: Result<Desired, HeartbeatError>,
+    periodic: Duration,
+) -> (ScriptedPlane, PlaneLog) {
     let session = SessionConfig {
         heartbeat_interval_ms: 50,
         ..session_720p()
@@ -112,7 +134,7 @@ fn fast_beating(final_reply: Result<Desired, HeartbeatError>) -> (ScriptedPlane,
         if h.exit.is_some() {
             (Duration::ZERO, final_reply.clone())
         } else {
-            (SLOW, Ok(Desired::Live))
+            (periodic, Ok(Desired::Live))
         }
     });
     (plane, log)
@@ -324,4 +346,83 @@ fn a_closed_inbound_channel_is_fatal_70() {
         .collect();
     assert_eq!(fin, vec![Some("inbound channel closed".to_owned())]);
     assert_eq!(log.count(|c| *c == Call::Flush), 1, "run() flushes once");
+}
+
+fn periodic_in_flight(rig: &Rig) {
+    assert!(
+        rig.plane.wait_for(Duration::from_secs(5), |c| c
+            .iter()
+            .any(|c| matches!(c, PlaneCall::BeatStarted(h) if h.exit.is_none()))),
+        "no periodic beat in flight"
+    );
+}
+
+fn fatal(rig: &Rig) {
+    send(
+        rig,
+        Event::Fatal {
+            detail: Some(ExitDetail::new("x")),
+        },
+    );
+}
+
+/// Review round 1, item 1 (the coordinator's ruling): a periodic POST stalled 5 s, past the 2 s bound,
+/// is in flight when a fatal error comes. The final beat has its own lane, so it posts, and `run()`
+/// returns 70 without waiting out the bound or logging a lost beat.
+#[test]
+fn the_final_beat_is_posted_past_a_periodic_beat_stalled_5_s() {
+    let (plane, log) = beating_every_50_ms(Ok(Desired::Live), Duration::from_secs(5));
+    let rig = launch(plane, log, None);
+    periodic_in_flight(&rig);
+    let t0 = Instant::now();
+    fatal(&rig);
+    let ran = finished(&rig, Duration::from_secs(8));
+    assert_eq!(ran.code, ExitReason::Fatal.code());
+    assert_eq!(
+        finals(&ran.plane),
+        vec![(ExitReason::Fatal, Some("x".to_owned()))],
+        "posted before run() returned"
+    );
+    let took = ran.at.duration_since(t0);
+    assert!(
+        took < Duration::from_millis(FINAL_BEAT_TIMEOUT_MS / 2),
+        "the flush did not wait out the bound: {took:?}"
+    );
+    assert!(!rig.log.lines().contains(&unconfirmed()), "{:?}", rig.log.lines());
+}
+
+/// Review round 1, item 2 (the reviewer's probe): an adapter keeps a bounded(4) inbound channel full
+/// while a periodic beat is in flight. `run()` stops reading at its exit, so the periodic beat's
+/// result can never be posted; the final beat still posts, and nothing is logged as lost.
+#[test]
+fn the_final_beat_is_posted_with_the_inbound_channel_kept_full() {
+    let (plane, log) = fast_beating(Ok(Desired::Live));
+    let rig = launch_with(plane, log, None, Some(4));
+    periodic_in_flight(&rig);
+    let flood = rig.tx.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let flooding = Arc::clone(&stop);
+    let h = thread::spawn(move || {
+        let mut flooded = 0u64;
+        while !flooding.load(Ordering::Relaxed) {
+            if flood.try_send(Inbound::Event(Event::InputFrame)).is_ok() {
+                flooded += 1;
+            }
+        }
+        flooded
+    });
+    thread::sleep(Duration::from_millis(30));
+    fatal(&rig);
+    let ran = finished(&rig, Duration::from_secs(8));
+    stop.store(true, Ordering::Relaxed);
+    let flooded = h.join().expect("the flood thread");
+    eprintln!("frames flooded in: {flooded}");
+    assert!(flooded > 0, "the channel was kept full");
+    assert_eq!(ran.code, ExitReason::Fatal.code());
+    assert_eq!(
+        finals(&ran.plane),
+        vec![(ExitReason::Fatal, Some("x".to_owned()))],
+        "posted before run() returned"
+    );
+    assert!(!rig.log.lines().contains(&unconfirmed()), "{:?}", rig.log.lines());
 }

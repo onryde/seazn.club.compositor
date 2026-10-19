@@ -894,6 +894,68 @@ fn the_sessions_credentials_are_scrubbed_by_value_from_the_final_beat_and_errors
     assert_eq!(checked, 7);
 }
 
+/// C08 review round 1 (the final-beat lane): the control worker posts final beats through
+/// `final_lane()`, made when the worker starts, before any session is fetched. The fetch on the first
+/// instance still teaches the lane every credential, so the lane's final beat is scrubbed of each one;
+/// and the lane calls the same session's route with the same token.
+#[test]
+fn the_final_lane_scrubs_what_the_plane_learns_after_it_was_made() {
+    const KEY: &str = "PLANTED-SK-LANE-5";
+    const PASS: &str = "PLANTED-PASS-LANE-4";
+    const STREAM_ID: &str = "PLANTED-SID-LANE-3";
+    const PAGE: &str = "PLANTED-PT-LANE-2";
+    const ST: &str = "PLANTED-ST-LANE-1";
+    let mut session = fixture("session-composed-720p.json");
+    session["target"]["streamKey"] = json!(KEY);
+    session["input"]["passphrase"] = json!(PASS);
+    session["input"]["streamId"] = json!(STREAM_ID);
+    session["pageToken"] = json!(PAGE);
+    let overlay = session["overlayUrl"]
+        .as_str()
+        .unwrap()
+        .replace("fixture-page-token-720p", ST);
+    session["overlayUrl"] = json!(overlay);
+    let values = [KEY, PASS, STREAM_ID, PAGE, ST];
+    let mut replies = vec![Reply::Status(200, ok(session))];
+    replies.extend(
+        values
+            .iter()
+            .map(|_| Reply::Status(200, ok(fixture("reply-live.json")))),
+    );
+    let fake = serve(replies);
+    let mut p = plane(&fake.url);
+    let mut lane = p.final_lane();
+    assert!(p.fetch_session().is_ok());
+    fake.next();
+    let mut checked = 0;
+    for value in values {
+        let beat = HealthReport {
+            state: BeatState::Stopped,
+            exit: Some(ExitInfo {
+                reason: ExitReason::Fatal,
+                detail: Some(ExitDetail::new(format!("stream '{value}' publish failed"))),
+            }),
+            ..periodic()
+        };
+        assert_eq!(
+            lane.heartbeat(&beat, &Measured::default()),
+            Ok(Desired::Live),
+            "{value}"
+        );
+        let seen = fake.next();
+        assert_eq!(seen.path, format!("/api/internal/relay/sessions/{SID}/heartbeat"));
+        assert_eq!(
+            seen.header("authorization"),
+            Some(format!("Bearer {TOKEN}").as_str())
+        );
+        let posted: Value = serde_json::from_str(&seen.body).unwrap();
+        assert_eq!(posted["exitDetail"], "stream '****' publish failed", "{value}");
+        checked += 1;
+    }
+    eprintln!("credentials scrubbed from the final lane's beat: {checked}");
+    assert_eq!(checked, 5);
+}
+
 // ---- pooling (C07 review M4) ----
 
 /// A fake that keeps each connection open (no `Connection: close`) and answers every request on it

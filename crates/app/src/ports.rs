@@ -192,6 +192,12 @@ pub trait ControlPlane: Send {
     /// A report whose `exit` is `Some` is the final beat: one attempt, bounded by
     /// `FINAL_BEAT_TIMEOUT_MS`. Its result is classified exactly like any other beat's.
     fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Desired, HeartbeatError>;
+    /// A second instance for the final-beat lane (C08 review round 1, the coordinator's ruling), which
+    /// the control worker runs on its own thread: its own connection, so a call in flight on this
+    /// instance never holds a final beat up; and every credential this instance knows or LATER learns
+    /// (a fetched session's), so the final beat's text is scrubbed of them as this one's would be.
+    /// It only heartbeats.
+    fn final_lane(&self) -> Box<dyn ControlPlane>;
 }
 
 /// Input A's SRT pipeline (C10). `rebuild` tears down the current generation and builds `gen`;
@@ -237,7 +243,9 @@ pub trait PhasePublisher: Send {
 }
 
 /// The driver's own log lines (C12's amendment 2026-10-18; C14 cases 8 and 11 and C15 read them):
-/// `overlay hidden reason=<r> gen=<g>`, `cef ready|crashed|alive gen=<n>`, and `run()`'s
+/// `overlay hidden reason=<r> gen=<g>`, `cef ready|crashed|alive gen=<n>`,
+/// `ticks skipped total=<n>` and `heartbeats dropped total=<n>` (at most one of each a minute, and
+/// the rest at the exit; review round 1, item 4), and `run()`'s
 /// `final beat not confirmed within 2000 ms` (Owed 35). The adapter (C12)
 /// writes each as `ts=<rfc3339> level=info msg=<line>` on stderr: the timestamp is the adapter's,
 /// because this crate reads no clock. No line carries a credential or a fatal error's text: the
@@ -259,6 +267,9 @@ pub enum ControlRequest {
 /// blocks the frame clock.
 pub trait ControlQueue: Send {
     fn request(&mut self, req: ControlRequest);
+    /// Periodic beats replaced or retired before they were sent, so far (the driver logs it; review
+    /// round 1, item 4).
+    fn dropped(&self) -> u64;
     /// Blocks until every final beat requested so far has been posted (its call returned, whatever
     /// its result), or until `timeout` has passed on the queue's own clock, never the HTTP layer's
     /// (DNS is unbounded inside ureq 2: C07 review I1, Owed 28). True if every one was posted. Only

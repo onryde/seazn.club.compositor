@@ -16,6 +16,7 @@
 //! are never followed, so the token and the call never go anywhere but `APP_URL`.
 use std::fmt;
 use std::io::Read;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use app::ports::{
@@ -350,7 +351,9 @@ fn exchange(result: Result<ureq::Response, ureq::Error>) -> Result<(u16, String)
 
 /// The HTTP control plane: one agent, `APP_URL`, the session id and the job token (C12 reads both
 /// from env, never argv; AGENTS.md §7), and the `Scrubber` that masks every credential it knows from
-/// every error text and from `exitDetail`.
+/// every error text and from `exitDetail`. Its `final_lane` (C08 review round 1) has an agent of its
+/// own and SHARES the scrubber, so what this plane learns from a fetch is masked on the lane too; the
+/// lock is held only while a text is scrubbed or a credential learned, never across a call.
 pub struct HttpControlPlane {
     agent: ureq::Agent,
     session_url: String,
@@ -358,7 +361,29 @@ pub struct HttpControlPlane {
     session_id: String,
     token: String,
     timeout_ms: u64,
-    scrubber: Scrubber,
+    scrubber: Arc<Mutex<Scrubber>>,
+}
+
+/// The scrubber, its lock recovered if a scrub ever panicked: a poisoned lock must not stop a beat.
+fn locked(m: &Mutex<Scrubber>) -> MutexGuard<'_, Scrubber> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// An agent bounded as C07 ruled. Each plane instance has its own (C08 review round 1).
+fn agent(timeout_ms: u64) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(Duration::from_millis(timeout_ms))
+        // ureq's own connect timeout (30 s) takes precedence over `.timeout()`, and a connect never
+        // reads the overall deadline (C07 review I1): bound it here. DNS stays unbounded in ureq 2
+        // (Owed 28), so C08's flush keeps its own clock.
+        .timeout_connect(Duration::from_millis(timeout_ms.min(FINAL_BEAT_TIMEOUT_MS)))
+        // ureq never retries a POST on a stale pooled connection, so a reused one the server had
+        // closed would lose that beat, the final one included (C07 review M4): pool nothing.
+        .max_idle_connections(0)
+        // Web never redirects (R8). A followed redirect would take the call somewhere APP_URL does
+        // not name, so a 3xx is a status like any other.
+        .redirects(0)
+        .build()
 }
 
 impl fmt::Debug for HttpControlPlane {
@@ -368,7 +393,7 @@ impl fmt::Debug for HttpControlPlane {
             .field("session_id", &self.session_id)
             .field("token", &"****")
             .field("timeout_ms", &self.timeout_ms)
-            .field("scrubber", &self.scrubber)
+            .field("scrubber", &*locked(&self.scrubber))
             .finish_non_exhaustive()
     }
 }
@@ -430,53 +455,41 @@ impl HttpControlPlane {
 
     /// The plane, unchecked (`new` checks first; the inline tests build past it).
     fn build(app_url: &str, session_id: &str, job_token: String, timeout_ms: u64) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_millis(timeout_ms))
-            // ureq's own connect timeout (30 s) takes precedence over `.timeout()`, and a connect never
-            // reads the overall deadline (C07 review I1): bound it here. DNS stays unbounded in ureq 2
-            // (Owed 28), so C08's flush keeps its own clock.
-            .timeout_connect(Duration::from_millis(timeout_ms.min(FINAL_BEAT_TIMEOUT_MS)))
-            // ureq never retries a POST on a stale pooled connection, so a reused one the server had
-            // closed would lose that beat, the final one included (C07 review M4): pool nothing.
-            .max_idle_connections(0)
-            // Web never redirects (R8). A followed redirect would take the call somewhere APP_URL does
-            // not name, so a 3xx is a status like any other.
-            .redirects(0)
-            .build();
         let base = app_url.trim_end_matches('/');
         let session_url = format!("{base}/api/internal/relay/sessions/{session_id}");
         let mut scrubber = Scrubber::default();
         scrubber.add(&job_token);
         Self {
-            agent,
+            agent: agent(timeout_ms),
             heartbeat_url: format!("{session_url}/heartbeat"),
             session_url,
             session_id: session_id.to_owned(),
             token: job_token,
             timeout_ms,
-            scrubber,
+            scrubber: Arc::new(Mutex::new(scrubber)),
         }
     }
 
     /// Learns a fetched session's four credentials, so every later text is scrubbed of them.
     fn learn(&mut self, session: &SessionConfig, data: &Value) {
-        self.scrubber.add(&session.input.stream_id);
-        self.scrubber.add(&session.input.passphrase);
-        self.scrubber.add(&session.target.stream_key);
+        let mut scrubber = locked(&self.scrubber);
+        scrubber.add(&session.input.stream_id);
+        scrubber.add(&session.input.passphrase);
+        scrubber.add(&session.target.stream_key);
         if let Some(t) = data.get("pageToken").and_then(Value::as_str) {
-            self.scrubber.add(t);
+            scrubber.add(t);
         }
         if let Some(t) = page_token_in(&session.overlay_url) {
-            self.scrubber.add(t);
+            scrubber.add(t);
         }
     }
 
     fn transient(&self, text: &str) -> FetchError {
-        FetchError::Transient(self.scrubber.scrub(text))
+        FetchError::Transient(locked(&self.scrubber).scrub(text))
     }
 
     fn transport(&self, text: &str) -> HeartbeatError {
-        HeartbeatError::Transport(self.scrubber.scrub(text))
+        HeartbeatError::Transport(locked(&self.scrubber).scrub(text))
     }
 
     fn bearer(&self) -> String {
@@ -485,6 +498,18 @@ impl HttpControlPlane {
 }
 
 impl ControlPlane for HttpControlPlane {
+    fn final_lane(&self) -> Box<dyn ControlPlane> {
+        Box::new(Self {
+            agent: agent(self.timeout_ms),
+            session_url: self.session_url.clone(),
+            heartbeat_url: self.heartbeat_url.clone(),
+            session_id: self.session_id.clone(),
+            token: self.token.clone(),
+            timeout_ms: self.timeout_ms,
+            scrubber: Arc::clone(&self.scrubber),
+        })
+    }
+
     fn fetch_session(&mut self) -> Result<SessionConfig, FetchError> {
         let sent = self
             .agent
@@ -522,7 +547,8 @@ impl ControlPlane for HttpControlPlane {
             // The final beat: one attempt, never delaying `Exit` past its bound (Owed 28).
             req = req.timeout(Duration::from_millis(self.timeout_ms.min(FINAL_BEAT_TIMEOUT_MS)));
         }
-        let sent = req.send_json(wire(report, measured, &self.scrubber));
+        let body = wire(report, measured, &locked(&self.scrubber));
+        let sent = req.send_json(body);
         let (code, body) =
             exchange(sent).map_err(|e| self.transport(&format!("heartbeat transport: {e}")))?;
         match code {

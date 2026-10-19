@@ -3,6 +3,7 @@
 //! `Ports`, and sees the order across ports.
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -196,16 +197,24 @@ impl Metrics for FakeMetrics {
 }
 
 /// Records each request. `flush` has nothing to wait for and reports every final beat posted.
+/// `dropped` reads `dropped`, a count the test sets (no beat is ever dropped here).
 #[derive(Debug)]
-pub struct FakeControl(pub Log);
+pub struct FakeControl {
+    pub log: Log,
+    pub dropped: Arc<AtomicU64>,
+}
 
 impl ControlQueue for FakeControl {
     fn request(&mut self, r: ControlRequest) {
-        self.0.push(Call::Control(r));
+        self.log.push(Call::Control(r));
+    }
+
+    fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::SeqCst)
     }
 
     fn flush(&mut self, _timeout: Duration) -> bool {
-        self.0.push(Call::Flush);
+        self.log.push(Call::Flush);
         true
     }
 }
@@ -238,7 +247,10 @@ pub fn ports(log: &Log, metrics: Measured) -> Ports {
         }),
         graphics: Box::new(FakeGraphics(log.clone())),
         metrics: Box::new(FakeMetrics(metrics)),
-        control: Box::new(FakeControl(log.clone())),
+        control: Box::new(FakeControl {
+            log: log.clone(),
+            dropped: Arc::default(),
+        }),
         phase: Box::new(FakePhase(log.clone())),
         log: Box::new(FakeLog(log.clone())),
     }
@@ -319,23 +331,30 @@ impl PlaneLog {
 
 type Reply = Box<dyn FnMut(&HealthReport) -> (Duration, Result<Desired, HeartbeatError>) + Send>;
 
-/// A `ControlPlane` for the control worker's tests and the binary's fake mode (C12: "a scripted
-/// control plane that serves `session_720p()` and replies `live`"). Fetches answer from `fetches` in
-/// order, then `Ok(session)` for ever. Each heartbeat calls `reply`, which says how long the call
-/// takes and what it returns; the default answers `Live` at once.
-pub struct ScriptedPlane {
+/// A scripted plane's script, shared with its final-lane instance.
+struct Script {
     session: SessionConfig,
     fetches: VecDeque<Result<SessionConfig, FetchError>>,
     fetch_delay: Duration,
     reply: Reply,
+}
+
+/// A `ControlPlane` for the control worker's tests and the binary's fake mode (C12: "a scripted
+/// control plane that serves `session_720p()` and replies `live`"). Fetches answer from `fetches` in
+/// order, then `Ok(session)` for ever. Each heartbeat calls `reply`, which says how long the call
+/// takes and what it returns; the default answers `Live` at once. Its `final_lane` shares the script
+/// and the record, and runs its calls apart: no lock is held while a call takes its time.
+pub struct ScriptedPlane {
+    script: Arc<Mutex<Script>>,
     log: PlaneLog,
 }
 
 impl fmt::Debug for ScriptedPlane {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = locked(&self.script);
         f.debug_struct("ScriptedPlane")
-            .field("session", &self.session)
-            .field("fetches", &self.fetches.len())
+            .field("session", &s.session)
+            .field("fetches", &s.fetches.len())
             .finish_non_exhaustive()
     }
 }
@@ -343,32 +362,35 @@ impl fmt::Debug for ScriptedPlane {
 impl ScriptedPlane {
     pub fn new(session: SessionConfig) -> (Self, PlaneLog) {
         let log = PlaneLog::default();
-        let plane = Self {
+        let script = Script {
             session,
             fetches: VecDeque::new(),
             fetch_delay: Duration::ZERO,
             reply: Box::new(|_| (Duration::ZERO, Ok(Desired::Live))),
+        };
+        let plane = Self {
+            script: Arc::new(Mutex::new(script)),
             log: log.clone(),
         };
         (plane, log)
     }
 
     /// The first fetches' results, in order.
-    pub fn fetches(mut self, results: Vec<Result<SessionConfig, FetchError>>) -> Self {
-        self.fetches = results.into();
+    pub fn fetches(self, results: Vec<Result<SessionConfig, FetchError>>) -> Self {
+        locked(&self.script).fetches = results.into();
         self
     }
 
-    pub fn fetch_delay(mut self, d: Duration) -> Self {
-        self.fetch_delay = d;
+    pub fn fetch_delay(self, d: Duration) -> Self {
+        locked(&self.script).fetch_delay = d;
         self
     }
 
     pub fn reply(
-        mut self,
+        self,
         f: impl FnMut(&HealthReport) -> (Duration, Result<Desired, HeartbeatError>) + Send + 'static,
     ) -> Self {
-        self.reply = Box::new(f);
+        locked(&self.script).reply = Box::new(f);
         self
     }
 }
@@ -376,20 +398,29 @@ impl ScriptedPlane {
 impl ControlPlane for ScriptedPlane {
     fn fetch_session(&mut self) -> Result<SessionConfig, FetchError> {
         self.log.push(PlaneCall::FetchStarted);
-        thread::sleep(self.fetch_delay);
-        let r = self
-            .fetches
-            .pop_front()
-            .unwrap_or_else(|| Ok(self.session.clone()));
+        let delay = locked(&self.script).fetch_delay;
+        thread::sleep(delay);
+        let r = {
+            let mut s = locked(&self.script);
+            let session = s.session.clone();
+            s.fetches.pop_front().unwrap_or(Ok(session))
+        };
         self.log.push(PlaneCall::Fetched);
         r
     }
 
     fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Desired, HeartbeatError> {
         self.log.push(PlaneCall::BeatStarted(report.clone()));
-        let (delay, result) = (self.reply)(report);
+        let (delay, result) = (locked(&self.script).reply)(report);
         thread::sleep(delay);
         self.log.push(PlaneCall::Beat(report.clone(), measured.clone()));
         result
+    }
+
+    fn final_lane(&self) -> Box<dyn ControlPlane> {
+        Box::new(Self {
+            script: Arc::clone(&self.script),
+            log: self.log.clone(),
+        })
     }
 }
