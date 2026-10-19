@@ -215,6 +215,16 @@ impl GstProgramme {
         Some(self.running.as_ref()?.output.as_ref()?.queued())
     }
 
+    /// Test hook: posts an error on the current output's bus, as a failing sink would. False if
+    /// there is no output.
+    #[cfg(feature = "test-hooks")]
+    pub fn plant_output_error(&self) -> bool {
+        self.running
+            .as_ref()
+            .and_then(|r| r.output.as_ref())
+            .is_some_and(|o| o.plant_error())
+    }
+
     /// Test hook: posts an error on the programme's bus, as a failing element would, with `debug`
     /// as its debug text. False before `start()`.
     #[cfg(feature = "test-hooks")]

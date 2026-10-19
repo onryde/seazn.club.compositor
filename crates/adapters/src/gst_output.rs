@@ -266,6 +266,15 @@ impl OutputGen {
         &self.sink
     }
 
+    /// Posts an error on this output's bus, as a failing sink would (the test hooks plant it).
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn plant_error(&self) -> bool {
+        let msg = gst::message::Error::builder(gst::ResourceError::Write, "planted output error")
+            .src(&self.sink)
+            .build();
+        self.pipeline.post_message(msg).is_ok()
+    }
+
     /// The bytes queued in the video and audio appsrcs (the test hooks read them).
     #[cfg(feature = "test-hooks")]
     pub(crate) fn queued(&self) -> (u64, u64) {

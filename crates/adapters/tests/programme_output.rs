@@ -34,6 +34,9 @@ use gstreamer_video::prelude::*;
 use sha2::{Digest, Sha256};
 
 const P720: OutputProfile = OutputProfile::P720;
+/// The house backdrop, from the rulebook rather than the adapter: seazn.club's `--mk-night`,
+/// `#150b36` (`apps/web/src/app/globals.css:535`; the overlay templates spec §4.2).
+const HOUSE_NIGHT: [u8; 3] = [0x15, 0x0b, 0x36];
 /// The brief's pin of the vendored logo (C09 amendment 2026-10-15).
 const LOGO_SHA256: &str = "bee2648f76fa2590ac81d2c1e14050fe4c62687b8630437b0d6e6b080c2f90e8";
 /// Owed 15, option (a): poll the bytes-sent total at most every 250 ms, keeping the PDF's 5 s.
@@ -320,7 +323,7 @@ impl Pic {
         let mut off = 0usize;
         for y in y0..y0 + lh {
             for x in x0..x0 + lw {
-                if !close(self.at(x, y), SLATE_BACKDROP_RGB, 40) {
+                if !close(self.at(x, y), HOUSE_NIGHT, 40) {
                     off += 1;
                 }
             }
@@ -606,7 +609,7 @@ fn overlay_is_composited_on_top_and_hide_clears_it() {
     assert!(is_blue(d.frames[14].spot), "{:?}", d.frames[14].spot);
     assert!(!is_blue(d.frames[29].spot), "{:?}", d.frames[29].spot);
     assert!(
-        close(d.frames[29].spot, SLATE_BACKDROP_RGB, 8),
+        close(d.frames[29].spot, HOUSE_NIGHT, 8),
         "{:?}",
         d.frames[29].spot
     );
@@ -875,10 +878,7 @@ fn slate_is_textless_house_backdrop_and_logo_for_every_kind() {
             assert_eq!((pic.w, pic.h), (w, h));
             for (x, y) in [(10, 10), (w - 10, h - 10)] {
                 let px = pic.at(x, y);
-                assert!(
-                    close(px, SLATE_BACKDROP_RGB, 4),
-                    "{kind:?} {w}x{h} ({x},{y}) = {px:?}"
-                );
+                assert!(close(px, HOUSE_NIGHT, 4), "{kind:?} {w}x{h} ({x},{y}) = {px:?}");
             }
             let share = pic.logo_share();
             assert!(
@@ -894,6 +894,10 @@ fn slate_is_textless_house_backdrop_and_logo_for_every_kind() {
         );
         assert!(slate.factories().contains(&"pngdec"), "{:?}", slate.factories());
         eprintln!("slate kinds checked: {kinds} ({w}x{h})");
+        assert_eq!(
+            SLATE_BACKDROP_RGB, HOUSE_NIGHT,
+            "the adapter's backdrop is the house colour"
+        );
         assert_eq!(kinds, SlateKind::ALL.len());
         assert!(kinds > 0);
         modes += 1;
@@ -933,8 +937,8 @@ fn an_opaque_overlay_covers_the_slate_and_hiding_it_reveals_the_slate() {
         "the overlay covers the logo: {covered:?}"
     );
     let revealed = &d.frames[29];
-    assert!(close(revealed.corner_tl, SLATE_BACKDROP_RGB, 8), "{revealed:?}");
-    assert!(close(revealed.corner_br, SLATE_BACKDROP_RGB, 8), "{revealed:?}");
+    assert!(close(revealed.corner_tl, HOUSE_NIGHT, 8), "{revealed:?}");
+    assert!(close(revealed.corner_br, HOUSE_NIGHT, 8), "{revealed:?}");
     assert!(revealed.logo_share >= 0.10, "the logo is back: {revealed:?}");
 }
 
@@ -1367,10 +1371,7 @@ fn a_slate_then_back_to_camera_and_back_again() {
         if (20..40).contains(&i) {
             assert!(is_red(f.corner_tl) && is_red(f.centre), "frame {i}: camera {f:?}");
         } else {
-            assert!(
-                close(f.corner_tl, SLATE_BACKDROP_RGB, 8),
-                "frame {i}: slate {f:?}"
-            );
+            assert!(close(f.corner_tl, HOUSE_NIGHT, 8), "frame {i}: slate {f:?}");
         }
         checked += 1;
     }
@@ -1389,7 +1390,7 @@ fn emit_with_no_camera_frame_pushes_the_slate_and_counts_it() {
     assert_eq!(p.camera_missing(), 10);
     let d = decode(&dir.file("a.flv"));
     assert_eq!(d.frames.len(), 10);
-    assert!(close(d.frames[9].corner_tl, SLATE_BACKDROP_RGB, 8));
+    assert!(close(d.frames[9].corner_tl, HOUSE_NIGHT, 8));
 }
 
 #[test]
@@ -1471,7 +1472,7 @@ fn an_index_that_does_not_advance_is_refused() {
 #[test]
 fn a_target_with_an_unknown_scheme_or_no_key_is_an_output_error() {
     let _s = serial();
-    let (mut p, rx, _f, _l) = programme();
+    let (mut p, rx, _f, lines) = programme();
     p.swap_sink(
         1,
         &TargetSpec {
@@ -1494,6 +1495,21 @@ fn a_target_with_an_unknown_scheme_or_no_key_is_an_output_error() {
     assert_eq!(
         errors,
         vec![&Event::OutputError { gen: 1 }, &Event::OutputError { gen: 2 }]
+    );
+    // Both are refused before any sink is built, each with its own reason.
+    let lines = lines.lock().unwrap().clone();
+    for (gen, reason) in [
+        (1, "output target scheme is not rtmp, rtmps or file"),
+        (2, "output target has no stream key"),
+    ] {
+        let found = lines
+            .iter()
+            .any(|l| l.starts_with(&format!("swap_sink gen={gen}: {reason}")));
+        assert!(found, "gen {gen}: {reason:?} not in {lines:?}");
+    }
+    assert!(
+        !lines.iter().any(|l| l.contains(": sink ")),
+        "a sink was built: {lines:?}"
     );
 }
 
@@ -1523,7 +1539,7 @@ fn the_1080p_programme_keeps_its_own_caps() {
     assert_eq!(d.frames.len(), 30);
     assert!(d.frames.iter().all(|f| (f.w, f.h) == (1_920, 1_080)));
     assert!(
-        close(d.frames[14].corner_br, SLATE_BACKDROP_RGB, 8),
+        close(d.frames[14].corner_br, HOUSE_NIGHT, 8),
         "{:?}",
         d.frames[14]
     );
@@ -1671,4 +1687,62 @@ fn a_sink_that_stalls_past_the_ring_resumes_at_a_keyframe() {
     eprintln!("gaps checked: {gaps}; frames parsed: {}", d.parsed.len());
     assert!(gaps >= 1, "the stall never outlasted the ring");
     assert!(d.first_is_key());
+}
+
+#[test]
+fn a_camera_frame_that_cannot_be_fitted_shows_the_slate_and_is_logged_once() {
+    let _s = serial();
+    let dir = Tmp::new("unfit");
+    let (mut p, rx, frames, lines) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    // Caps that promise a 640 × 360 I420 frame, and a buffer far too small to be one.
+    let caps = gst_video::VideoInfo::builder(gst_video::VideoFormat::I420, 640, 360)
+        .build()
+        .expect("info")
+        .to_caps()
+        .expect("caps");
+    let short = gst::Sample::builder()
+        .buffer(&gst::Buffer::from_mut_slice(vec![0u8; 16]))
+        .caps(&caps)
+        .build();
+    frames.set_camera(short);
+    pace(&mut p, 0..10, FrameChoice::Emit);
+    // A good frame afterwards is fitted as usual.
+    frames.set_camera(solid(gst_video::VideoFormat::I420, 640, 360, [255, 0, 0, 255]));
+    pace(&mut p, 10..20, FrameChoice::Emit);
+    drain_and_wait(&mut p, &rx);
+    assert_eq!(p.camera_missing(), 10);
+    let lines = lines.lock().unwrap().clone();
+    let logged = lines.iter().filter(|l| l.contains("cannot be fitted")).count();
+    eprintln!("unfit camera ticks: 10, lines logged: {logged}");
+    assert_eq!(logged, 1, "{lines:?}");
+    let d = decode(&dir.file("a.flv"));
+    assert_eq!(d.frames.len(), 20);
+    assert!(close(d.frames[9].corner_tl, HOUSE_NIGHT, 8), "{:?}", d.frames[9]);
+    assert!(is_red(d.frames[19].centre), "{:?}", d.frames[19]);
+}
+
+#[test]
+fn an_output_error_is_reported_once_and_its_progress_stops() {
+    let _s = serial();
+    let dir = Tmp::new("output-error");
+    let (mut p, rx, _f, _l) = programme();
+    p.swap_sink(5, &file_target(&dir.file("a.flv")));
+    pace(&mut p, 0..15, FrameChoice::Slate(SlateKind::Waiting));
+    for _ in 0..2 {
+        assert!(p.plant_output_error(), "the hook found the output");
+    }
+    let seen = events_until(&rx, Duration::from_secs(2), |e| {
+        matches!(e, Event::OutputError { .. })
+    });
+    assert_eq!(seen.last(), Some(&Event::OutputError { gen: 5 }));
+    pace(&mut p, 15..45, FrameChoice::Slate(SlateKind::Waiting));
+    let after = events_for(&rx, Duration::from_millis(500));
+    let errors = after
+        .iter()
+        .filter(|e| matches!(e, Event::OutputError { .. }))
+        .count();
+    let progress = progress_of(&after, 5).len();
+    eprintln!("after the error: {errors} more errors, {progress} progress events");
+    assert_eq!((errors, progress), (0, 0), "{after:?}");
 }
