@@ -2179,6 +2179,7 @@ mod tests {
             input_backoff_cap_ms: 10_037,
             input_connect_timeout_ms: 5_041,
             input_stall_after_ms: 5_051,
+            input_srt_latency_ms: 1_181,
             kick_alert_count: 3,
             kick_window_ms: 300_061,
             output_stall_after_ms: 5_071,
