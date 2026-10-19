@@ -328,12 +328,26 @@ neither A nor B. Built on `onryde/seazn.club` branch `feat/r2006-organiser-compo
 - **The owner's per-screen sign-off** (2026-10-19, relayed by the coordinator: "approve"): all 6 screens,
   as built.
 - **PR #989 review fixes (2026-10-19), as built:**
-  - Step 3's width e2e is built: `e2e/overlay-compositor.spec.ts`, one test per width (320, 360, 375,
-    390, 430, 768, 834 and 1280), on the e2e-parallel leg, which has the image. `mobile.spec.ts` runs
-    without the image, so the score card never renders there. Each test checks two things: reachability
-    (`elementFromPoint`, 44 px below 768 and 36 px from 768), and no clipping (`overflowingIn`). It then
-    runs the sequence: Camera only and back, a style and 2.5 s that survive a reload, Reset, and Go live,
-    with the mode read back through the API.
+  - Step 3's width e2e is built: `e2e/overlay-compositor.spec.ts`, ~~one test per width (320, 360, 375,
+    390, 430, 768, 834 and 1280)~~ ONE test on ONE rig that walks all eight widths (amended 2026-10-19,
+    PR #989 confirm N4; see the next two bullets), on the e2e-parallel leg, which has the image.
+    `mobile.spec.ts` runs without the image, so the score card never renders there. ~~Each test checks
+    two things: reachability (`elementFromPoint`, 44 px below 768 and 36 px from 768), and no clipping
+    (`overflowingIn`). It then runs the sequence: Camera only and back, a style and 2.5 s that survive a
+    reload, Reset, and Go live, with the mode read back through the API.~~
+  - **(Amended 2026-10-19, PR #989 confirm N4)** One rig, because each Go live takes the whole
+    stream-slot pool: eight separately seeded tests serialised on it and pushed the slowest
+    e2e-parallel shard past its 20-minute timeout (run 39305103748). The budget is per width
+    (`PER_WIDTH_MS`), so adding a width moves it. At each of 320, 360, 375, 390, 430, 768, 834 and 1280
+    the card is reloaded at that width, then checked for reachability (`elementFromPoint`, 44 px below
+    768 and 36 px from 768) of every style option, every scene, the Score timing summary, Go live,
+    Camera only, the timing input and Reset; for no clipping (`overflowingIn`) at the card's default,
+    with Score timing open, and at Camera only; and for no horizontal page scroll. Camera only and back
+    runs at every width. The clip scan first waits out finite animations: the timing chevron's turn is
+    a transient wider box, and CI's 320 red was a scan taken mid-turn.
+  - **(Amended 2026-10-19, PR #989 confirm N4)** The test asserts that every width was walked. The
+    sequence, which does not vary by width, then runs once, at 320: a style and 2.5 s that survive a
+    reload, Reset, and Go live, with the mode read back through the API.
   - Go live sends `overlayDelayMs`, the timing the card showed, in `CreateStreamSession`. Without it the
     request raced the timing's own save, which fires on blur. If the field is absent, the stored timing
     applies; if it is null, the server's default applies. That covers the phone's start and the
