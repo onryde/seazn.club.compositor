@@ -1225,6 +1225,84 @@ echo "RUN $RUN done"
 - **Cloudflare:** no input or Output was created or changed. Pushes went only to Input A; its recording setting was not re-read.
 - **flyctl** used its stored login; no token went on argv.
 
+## F-013: CEF element facts for the overlay renderer (C11, 2026-10-19)
+
+**Where:** the C11 test image, which is F-001's spike image (`registry.fly.io/seazn-relay-spike`, image id `15890e25c22a`: CEF 139.0.28, gstcefsrc `204b01b`, GStreamer 1.24.2) plus the build tools and Rust 1.91.0. It ran in a colima VM on the dev host, under `Xvfb :99`, as uid 10001 with `HOME=/home/spike`. No Fly Machine was used. Every token below is made up.
+
+**The spare renderer:**
+- Without a flag, Chromium keeps a spare renderer beside the active one, and the next browser takes it. Across builds the renderer client ids went 5, 6, 7, 8, with the spare always the highest. So a renderer that appears after build N belongs to build N+1, not to N.
+- With `disable-features=SpareRendererForSitePerProcess`, each browser has exactly one renderer, with a new client id per build. Readiness came 540–555 ms after the build either way.
+- Memory for one healthy page: the RSS sum of CEF's children was 436 MB with the flag and 505–626 MB without it. PSS was about 173 MB. The RSS sum counts the zygote's shared pages once per process, so the cap reads PSS (`cef_rss_cap_mb`).
+- `chrome-extra-flags` is global to the process: CEF reads it once, at its first start, from the first element.
+  - It replaces `GST_CEF_CHROME_EXTRA_FLAGS`, so the adapter carries the variable's value over after its own flag.
+  - It splits on `,`, then on `=`, so only one `disable-features=` value survives. A later flag that needs its own `disable-features` (an LNA grant, Owed 22) must be merged into the same value.
+  - cefsrc logs a WARNING, "…property is deprecated and is global…", on every set.
+
+**Processes dying:**
+- **A renderer killed** (SIGKILL): cefsrc logs `Render subprocess terminated, reloading URL!` 12–35 ms later, from its `OnRenderProcessTerminated`, with no bus error. It then reloads the page under a new pid with the same client id, and the reloaded page logs `seazn:ready` again (the crash test sees it).
+- **The spare renderer killed:** no warning, and it is not relaunched.
+- **The GPU process killed:** recovered silently; 96 frames in the next 4 s.
+- **The zygote killed:** every later renderer launch fails. The warning storms at about 60 a second, for every browser after it, with 0 frames. CEF is dead for the rest of the process (Owed 56).
+
+**Teardown:**
+- `set_state(NULL)` returned in 4–17 ms, and in 7 ms for a page hung in a JS busy loop with js-signals off (the adapter's mode).
+- In js-signal mode, with a page that never signals:
+  - `set_state(PLAYING)` never returns, and `NULL` blocks behind it.
+  - SIGKILL to the renderers does not unblock it, and the reload respawns a renderer with the same client id.
+  - So the build's thread stays stuck: the reaper kills the renderers it can see, and the thread leaks (Owed 55).
+- During a JS busy loop the appsink receives nothing. The probe read 30 samples a second before the hang, 0 through its 1.4 s, and 30 a second after the revive.
+
+**Debug categories and console lines:**
+- `cefsrc` and `cefconsole` are registered in the element's `class_init`, which runs at the first element, not when the plugin loads. A threshold set by name before that adds a pattern that outranks `GST_DEBUG`'s. The adapter's first cut did this and lowered an operator's `cefsrc:7` to WARNING; the token test's child, under `GST_DEBUG=cefsrc:7`, printed 0 cefsrc LOG lines. The adapter now references the class first, then raises a threshold only when it is below the floor (196 paint lines in the same child afterwards).
+- A console line arrives as `<source>:<line> <message>`. For an inline script, the source is the page URL, token included.
+- `console.info` arrives at INFO and `console.warn` at WARNING.
+
+**Where the page token goes** (URL `…&st=<token>`):
+- **stderr:** never, at CEF's log severities default, info, debug and verbose, with GStreamer's handler at its defaults.
+- **GStreamer's default handler:** with `GST_DEBUG` ≥ 4, or `cefconsole:4`, it prints every console line, URL and token included. `GST_DEBUG=5` also prints `gst_parse`'s lines, which carry a URL put in a launch string. So the adapter replaces the handler and sets the URL as a property.
+- **`$HOME/.config/cef_user_data/chrome_debug.log`:** at CEF's default severity, every console message is written with its source URL: 4 token lines in one short run. Chromium echoes them there because cefsrc's `OnConsoleMessage` returns false.
+  - `log-severity=disable` wrote 0 lines, and the signals still arrived.
+  - `warning` wrote 0 token lines for info-level console lines.
+  - `GST_CEF_LOG_SEVERITY` in the environment overrides the property: `=info` writes them again (Owed 52).
+- **The CEF children's argv:** never carries the URL (8 argvs checked).
+
+**The environment:**
+- CEF writes its profile under `$HOME/.config/cef_user_data`, so the CEF user's HOME must exist and be writable (Owed 54). The probes ran uid 10001 with `HOME=/home/spike`.
+- **One CEF per profile.** A second process on the same HOME failed its first start: "state change failed and some element failed to post a proper error message with the reason for the failure" (`gst_base_src_start`), alongside CEF's own warning "Please customize CefSettings.root_cache_path … process singleton". So the token test's child gets a HOME of its own.
+
+**Measured in `crates/adapters/tests/graphics.rs` (19 tests, 3 runs in a row):**
+- Ready came 552–718 ms after `restart`, and the beats 2.000 s apart from ready.
+- `stop()` returned in 0.15–0.33 ms and `Drop` in 0.18–0.44 ms, with the page hung (bound 500 ms).
+- The reaper killed the js-signal renderer 3.006–3.039 s after `restart(2)`.
+- The hidden page:
+  - 180 programme frames before the retry, 45 of them after the hide, with 0 blue;
+  - 45 frames after the retry's ready, 40 of them blue (one run).
+- A reported crash (the cap lowered to 1 MB): 0 writes after the report, and 44–94 samples dropped over 1.5 s.
+- Six CEF children, one of them a renderer, ran 44 threads, all at nice 10 with `oom_score_adj` 1000 after two polls.
+- **Straight alpha costs one pass over the frame.** In place: about 4 ms optimised and 25 ms in a debug build. A two-buffer loop took 200–400 ms in a debug build, too slow for the tests' 30 fps page: frames were written about 3 a second, and the stop test missed its first write.
+
+## F-014: CEF 139 paints an error page opaque (C11, Owed 17, 2026-10-19)
+
+**Where:** F-013's image. One `cefsrc` per leg (console mode, `max-video-framerate=30/1`, BGRA 1920×1080, appsink), 5 s each. Each URL carried a made-up `st=` token.
+
+| Leg | URL | Server's answer | Frames in 5 s | BGRA at the 4 corners and the centre | `seazn:` lines |
+|---|---|---|---|---|---|
+| 404 | `http://127.0.0.1:7419/nope?host=compositor&st=…` (`phase-probe-server.py --variant pna`) | `GET` → 404, no body | 4 | (255, 255, 255, 255) at all five | none |
+| 502 | `http://127.0.0.1:7419/overlay?host=compositor&st=…` (`--variant pna --status 502`) | `GET` → 502, no body | 4 | (255, 255, 255, 255) at all five | none |
+| No such host | `http://c11-nowhere.invalid/overlay?host=compositor&st=…` | — | 3 | (255, 255, 255, 255) at all five | none |
+
+- 0 of the run's 24 stderr lines carried the token.
+- `--status N` is new in the probe server for this measurement: every request, any method and any path, gets N with no body.
+
+**Verdict:** an error page is opaque white over the whole frame. If one reached the slot, it would cover the programme in white. It never logs `seazn:ready`, so only the ready gate keeps it off air. `frames_before_ready_never_reach_the_slot` is the gate's witness, and mutant 6 reds it.
+
+## F-015: `cefsrc` scene compatibility (G1), 2026-10-19: REFUSED, no fixture in progress on stg
+
+- **The pre-conditions now hold on web.** R2005 (`seazn.club` #982) merged at 2026-10-19 09:10Z, and R2007 PR A (#974) on 2026-10-18. `stg.yml`'s run at 15:35Z (`6a7d360`, success) carries both. Its next run, at 16:49Z (`92201cc`), failed.
+- **The brief's page:** a public stg fixture, in progress at run time, whose org has the overlay entitlement. `GET https://stg.seazn.club/api/v1/public/discovery?status=live` returned 0 items at about 17:20Z.
+- **Not started:** starting one on the stg pad needs a staff login, which this session does not hold.
+- **The brief:** "if it isn't in progress, refuse the run rather than skip the check". Neither leg ran: no template leg and no scene leg. Owed 21 stays open (updated there).
+
 ## Platform notes (Fly-specific; nothing inside the image depends on them)
 
 - **CPU:** performance-4x reports AMD EPYC with 4 vCPU.

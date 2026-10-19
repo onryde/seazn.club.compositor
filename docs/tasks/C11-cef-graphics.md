@@ -387,6 +387,26 @@ return within a bound: it never waits on a pipeline, a renderer or a thread that
 reaper thread, as `stop` does, or is bounded by a timeout. **Acceptance:** a test drops the adapter
 while what it owns is hung (or stands in for hung) and the drop returns within 500 ms.
 
+## Amendment 2026-10-19 (as built, PR #__C11PR__; F-013, F-014, F-015)
+
+- **The gate is `required-features`, not `#[ignore]`.** `tests/graphics.rs` is a `[[test]]` with `required-features = ["cef"]`, and `adapters` has a feature `cef = []`. check.yml fails a run with any ignored test, and CI has no cefsrc. The C12 image runs `cargo test -p adapters --features cef --test graphics -- --test-threads=1` under `Xvfb :99`.
+- **The Events table, as built:**
+  - **"Each appsink sample"** is written only while its build's gate is open: from its own `seazn:ready` until `restart`, `stop`, the drop or a decided crash. It is converted to straight alpha first (cefsrc's is premultiplied, F-001).
+  - **"Renderer process exit"** is cefsrc's `Render subprocess terminated, reloading URL!` warning.
+  - **"The CEF child disappearing"** is not a crash signal: a killed GPU process recovers by itself (F-013).
+  - The cap reads the **PSS** sum of CEF's children, not their RSS.
+  - `CefReady`, `CefAlive` and `CefCrashed` carry their build's own generation; `ScoreStale` and `PhaseChannel` come only from the current build.
+- **Guardrails, as built:** no flag or property sets nice, so each 1 s poll renices every thread of every CEF child (Linux nice is per thread) and writes `oom_score_adj`. Every element sets `chrome-extra-flags` to `disable-features=SpareRendererForSitePerProcess` (amending F-009's "no flags"; the flag touches no networking) and `log-severity=disable`.
+- **Logging:** the first `CefGraphics` replaces GStreamer's default log handler for the process, and every line it prints is scrubbed. Never set `GST_CEF_LOG_SEVERITY` (Owed 52).
+- **The tests:**
+  - 19 in the image: the brief's 15, plus `a_renderer_born_just_before_a_restart_stays_the_retiring_pages`, `cef_children_run_at_nice_10_with_oom_score_adj_1000`, `the_page_token_never_reaches_a_log_a_file_or_an_argv` and `drop_returns_within_500_ms_while_the_page_is_hung`.
+  - 11 unit tests run in CI.
+  - The stop test waits for the observed hang (300 ms without a sample) before its hide and stop, and holds the teardown with the `delay_teardowns` hook. A console-mode teardown returns in 7 ms even for a hung page (F-013).
+  - The reaper and drop tests use the js-signal hook, F-001's real hang.
+- **Mutation:** the brief's 9, plus 22 on this task's guards: 31 red.
+- **The compatibility step (G1) was refused** (F-015): no stg fixture was in progress, and none could be started without a staff login. Both legs are owed (Owed 21).
+- **Owed for others:** 52–54 (C12), 55 and 56 (owner questions), 57 (C08: stop graphics before hiding the overlay).
+
 ## Do not touch
 
 The programme and input adapters, and the page in `seazn.club` (that's R2005). (Amended 2026-10-15)
