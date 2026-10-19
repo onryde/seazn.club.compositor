@@ -1,0 +1,97 @@
+<!doctype html>
+<!-- C11's harness overlay page (crates/adapters/tests/graphics.rs; C14 and C15 load it too).
+
+     What it draws, on a transparent 1920x1080 body:
+       - an opaque test square, #0000ff, 100x100 at the top-left (the tests sample (50,50));
+       - a white patch at 50 % opacity, 200x100 at (100,300): cefsrc's alpha is premultiplied
+         (F-001: it reads (128,128,128,128)), so the adapter's straight-alpha slot reads it as
+         (255,255,255,128);
+       - a frame-counter strip along the top that repaints every animation frame, so cefsrc keeps
+         emitting buffers (F-001: it emits only on paint).
+     The centre (960,540) stays transparent.
+
+     What it says, on F-001's console channel (console.info, read from the `cefconsole` log
+     category; never window.gstSendMsg, whose js-signal mode hangs start() and set_state(NULL)):
+       - `seazn:ready`, 500 ms after load (`ready_after_ms=N` moves it);
+       - `seazn:alive`, every 2 s after ready (the page contract's cef_alive_every_ms; Owed 18).
+
+     Query switches:
+       noready=1            never log seazn:ready (and so never beat)
+       ready_after_ms=N     log seazn:ready N ms after load (default 500)
+       crash=1              after ready, block the page in `while (true) {}` (a hang, not a crash:
+                            the renderer stays alive, and the beat stops with the rest of the page)
+       crash_after_ms=N     how long after ready the hang starts (default 500)
+       revive_after_ms=N    the hang ends after N ms, and the page beats and paints again
+                            (default: never)
+       stale=1              after ready, log `seazn:score-stale=true` once (R2005's line form)
+       fresh_after_ms=N     with stale=1, log `seazn:score-stale=false` N ms after the true line
+       channel=V            after ready, log `seazn:phase-channel=V` once (loopback, web, or any
+                            other value, which the adapter must ignore)
+       alive_twin=1         after ready, also log `seazn:alive-x` once (a near-miss the adapter
+                            must not take for a beat)
+       echo_url=1           after ready, console.warn the page's own URL once (`page url
+                            <location.href>`), token and all: a page warning, which the adapter
+                            logs (it drops the page's info and debug output), and must log scrubbed
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; width: 1920px; height: 1080px; background: transparent; overflow: hidden; }
+  .abs { position: absolute; }
+  #square { left: 0; top: 0; width: 100px; height: 100px; background: #0000ff; }
+  #white50 { left: 100px; top: 300px; width: 200px; height: 100px; background: rgba(255, 255, 255, 0.5); }
+  #strip { left: 200px; top: 0; width: 1500px; height: 60px; font: bold 48px/60px monospace; color: #ff0; }
+</style>
+</head>
+<body>
+  <div id="square" class="abs"></div>
+  <div id="white50" class="abs"></div>
+  <div id="strip" class="abs">f0</div>
+<script>
+  const q = new URLSearchParams(location.search);
+  const num = (name, fallback) => {
+    const v = q.get(name);
+    return v === null ? fallback : Number(v);
+  };
+  const strip = document.getElementById("strip");
+  let frames = 0;
+  function tick() {
+    frames++;
+    strip.textContent = "f" + frames + " t" + Date.now();
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+  function busy(ms) {
+    // `ms` absent: the hang never ends.
+    const until = ms === null ? Infinity : Date.now() + ms;
+    while (Date.now() < until) {}
+  }
+
+  function afterReady() {
+    setInterval(() => console.info("seazn:alive"), 2000);
+    if (q.get("stale") === "1") {
+      console.info("seazn:score-stale=true");
+      const fresh = num("fresh_after_ms", null);
+      if (fresh !== null) setTimeout(() => console.info("seazn:score-stale=false"), fresh);
+    }
+    const channel = q.get("channel");
+    if (channel !== null) console.info("seazn:phase-channel=" + channel);
+    if (q.get("alive_twin") === "1") console.info("seazn:alive-x");
+    if (q.get("echo_url") === "1") console.warn("page url " + location.href);
+    if (q.get("crash") === "1") {
+      const revive = num("revive_after_ms", null);
+      setTimeout(() => busy(revive), num("crash_after_ms", 500));
+    }
+  }
+
+  if (q.get("noready") !== "1") {
+    setTimeout(() => {
+      console.info("seazn:ready");
+      afterReady();
+    }, num("ready_after_ms", 500));
+  }
+</script>
+</body>
+</html>

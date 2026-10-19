@@ -2195,6 +2195,7 @@ mod tests {
             cef_backoff_cap_ms: 10_127,
             cef_alive_every_ms: 2_131,
             cef_hang_after_ms: 10_139,
+            cef_rss_cap_mb: 601,
             ladder_overruns_to_step: 3,
             ladder_window_ms: 1_151,
             drain_timeout_ms: 4_157,

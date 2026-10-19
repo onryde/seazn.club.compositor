@@ -82,6 +82,10 @@ pub struct Thresholds {
     /// shorter turns CPU starvation (CEF children run at nice 10, so beats slip under load) into
     /// restarts whose load spikes feed the ladder.
     pub cef_hang_after_ms: Ms,
+    /// Spec §6: CEF's memory is capped; above the cap C11 reports `CefCrashed` and the domain restarts
+    /// the page. C11 reads it as the PSS sum of CEF's child processes (F-013: their RSS sum counts the
+    /// zygote's shared pages once per process, 436 MB for one healthy page against 173 MB of PSS).
+    pub cef_rss_cap_mb: u64,
     /// C02 brief default (no PDF number): overruns within `ladder_window_ms` needed to step down a rung.
     pub ladder_overruns_to_step: usize,
     /// C02 brief default (no PDF number): the window `ladder_overruns_to_step` is counted in.
@@ -143,6 +147,7 @@ impl Default for Thresholds {
             cef_backoff_cap_ms: 10_000,
             cef_alive_every_ms: 2_000,
             cef_hang_after_ms: 10_000,
+            cef_rss_cap_mb: 600,
             ladder_overruns_to_step: 3,
             ladder_window_ms: 1_000,
             drain_timeout_ms: 7_000,
@@ -277,6 +282,7 @@ mod tests {
             "CEF failed"
         );
         assert_eq!(t.cef_recycle_every_ms, 7_200_000, "CEF recycle");
+        assert_eq!(t.cef_rss_cap_mb, 600, "CEF memory cap (spec §6)");
     }
 
     // PDF "loads in under 2 s" with a ×5 margin; F-001 measured cefsrc start → first buffer at 2.804 s
