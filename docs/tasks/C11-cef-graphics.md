@@ -29,7 +29,7 @@ cefsrc url=<overlayUrl> <readiness property from F-001> → video/x-raw,format=B
 | The page's readiness signal (F-001 mechanism) | `CefReady{gen}` |
 | Each appsink sample | `FrameStore::set_overlay(sample)` |
 | Bus error, renderer process exit, or the CEF child disappearing (poll the pids F-001 identified, every 1 s) | `CefCrashed{gen}` |
-| Page signals score-stale (R2005 adds a JS signal on the same channel as ready) | `ScoreStale(true/false)` |
+| (Amended 2026-10-19, R2005 as built) Page logs `seazn:score-stale=true` or `seazn:score-stale=false` on the same channel as ready: edge-triggered, the first value after ready always sent, then only on a change | `ScoreStale(true)` / `ScoreStale(false)` |
 | (Amended 2026-10-15) Page logs `seazn:phase-channel=loopback` or `=web` on the same channel | `PhaseChannel(Loopback/Web)` (C06) |
 
 **There is no load timeout in the adapter.** The domain owns it (C05 `cef_load_timeout_ms`). One
@@ -53,7 +53,7 @@ source of truth.
   query switches:
   - `?noready=1` (never signal)
   - `?crash=1` (`while(true){}` after ready, to simulate a hang)
-  - `?stale=1` (signal score-stale)
+  - `?stale=1` (after ready, log `seazn:score-stale=true` once; amended 2026-10-19, R2005's line form)
   - (amended 2026-10-15) `?channel=loopback|web|bogus` (after ready, log `seazn:phase-channel=<value>` once)
 - (Amendment 2026-10-15) Create: `harness/pages/phase-probe.html` and `harness/phase-probe-server.py`
   (Step 0).
@@ -77,7 +77,7 @@ source of truth.
   | `page_without_ready_signal_times_out` | review focus 2: with `?noready=1`, frames arrive but **no** `CefReady` within 8 s; the domain timeout is C05's, so here assert only that the adapter never fakes ready |
   | `crash_of_the_renderer_reports_cefcrashed` | kill the CEF renderer pid found by the adapter → `CefCrashed{gen}` within 2 s |
   | `restart_holds_the_last_overlay_frame` | after `restart(2)`, and before gen 2 produces a frame, `FrameStore::overlay()` is still gen 1's last frame (pointer-equal or same PTS) |
-  | `score_stale_signal_is_relayed` | `?stale=1` → `ScoreStale(true)` |
+  | `score_stale_signal_is_relayed` | `?stale=1` (the page logs `seazn:score-stale=true`) → `ScoreStale(true)`; a line `seazn:score-stale=false` → `ScoreStale(false)` |
   | `rss_over_cap_reports_crash` | construct with `rss_cap_mb = 1` → `CefCrashed{gen}` within 3 s |
   | `stale_generation_events_are_tagged_with_their_own_gen` | `restart(1)`, `restart(2)` quickly; any `CefReady` from the first page carries `gen:1`, never 2 |
 
