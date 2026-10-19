@@ -41,8 +41,10 @@
 //! bounded, and never dropping a crash or a ready); this adapter's dispatcher thread relays them.
 //!
 //! **Health** (owner ruling 2026-10-19 "B"; C11b acts on it): `health()` reports what the domain's
-//! events cannot say yet: CEF's renderer zygote gone, which ends CEF for the process (the next build
-//! fails at once; Owed 56), and the leaked teardowns.
+//! events cannot say yet: either of CEF's zygotes gone, which ends CEF for the process (Owed 56:
+//! the renderers' zygote's death fails the next build at once; the GPU process's zygote's death
+//! turns the next GPU-process death into Chromium's FATAL abort of the whole process, the PR #32
+//! confirm pass's N1), and the leaked teardowns.
 //!
 //! **The log handler** (F-013). To receive console lines this adapter raises the `cefconsole`
 //! threshold to INFO (and `cefsrc`'s to WARNING), never lowering one; GStreamer's default handler
@@ -101,9 +103,12 @@ pub const CHILD_POLL_MS: u64 = 1_000;
 pub const CEF_NICE: i32 = 10;
 /// Spec §6's OOM order: CEF's children go first (C12's encoder writes −900), and among them the
 /// renderer, the one CEF replaces by itself (its reload). PR #32 review G1: a flat 1000 left the
-/// zygote 4 points behind the renderer, and a dead zygote ends CEF for the process (Owed 56).
+/// zygote 4 points behind the renderer, and a dead zygote ends CEF for the process (Owed 56), or
+/// the process itself at the next GPU-process death (N1).
 pub const CEF_OOM_SCORE_ADJ_RENDERER: i32 = 1_000;
-/// The GPU and utility processes: Chromium relaunches them (F-013: a killed GPU process recovered).
+/// The GPU and utility processes: Chromium relaunches them under their zygote (F-013: a killed GPU
+/// process recovered while its zygote lived, 5 times; the 6th death in about 10 s, or the first
+/// after that zygote's, is Chromium's FATAL abort of the whole process: the confirm pass, Owed 61).
 pub const CEF_OOM_SCORE_ADJ_HELPER: i32 = 800;
 /// The zygotes, and any process type this table does not know: the last of CEF's to go, still
 /// ahead of the compositor itself (0) and its encoder (−900).
@@ -465,16 +470,16 @@ fn guard(kids: &[CefChild], counts: impl Fn(&CefChild) -> bool) -> Guarded {
 pub(crate) struct ZygoteWatch {
     /// Every zygote pid seen.
     seen: BTreeSet<i32>,
-    /// The zygotes seen forking a renderer.
-    renderer_parents: BTreeSet<i32>,
     /// Decided: CEF can start no renderer again in this process.
     dead: bool,
 }
 
-/// One poll's verdict, true the first time a zygote that forked renderers (or the last zygote) is
-/// gone. F-013 (the fix loop's probes): the other zygote parents the GPU process, and CEF recovered
-/// from its death (the next build signalled ready), while the renderers' zygote's death made every
-/// later build fail at once. Its orphaned renderer keeps painting, out of this process's tree.
+/// One poll's verdict, true the first time any zygote seen is gone. F-013 (CEF 139): one zygote
+/// parents the renderers, and its death makes every later build fail at once (its orphaned renderer
+/// keeps painting, out of this process's tree). The other parents the GPU process: its death looks
+/// harmless while that GPU process lives, but the next GPU-process death is Chromium's FATAL "GPU
+/// process isn't usable. Goodbye." and the whole process dies of SIGTRAP (the PR #32 confirm
+/// pass's N1, 3/3). Either way C11b's in-place restart must come first, on its own terms.
 ///
 /// A zygote missing from one poll's list counts only once `alive` says its process is gone: a
 /// command line read that failed once must not end CEF for the process.
@@ -488,19 +493,12 @@ pub(crate) fn zygote_check(w: &mut ZygoteWatch, kids: &[CefChild], alive: impl F
         .map(|k| k.pid)
         .collect();
     w.seen.extend(now.iter().copied());
-    w.renderer_parents.extend(
-        kids.iter()
-            .filter(|k| k.kind == "renderer" && now.contains(&k.ppid))
-            .map(|k| k.ppid),
-    );
     let gone = |p: &i32| !now.contains(p) && !alive(*p);
-    let lost_parent = w.renderer_parents.iter().any(gone);
-    let none_left = !w.seen.is_empty() && w.seen.iter().all(gone);
-    w.dead = lost_parent || none_left;
+    w.dead = w.seen.iter().any(gone);
     w.dead
 }
 
-/// The process's verdict: `Some(gen)` once CEF's zygote is gone (the newest build's generation
+/// The process's verdict: `Some(gen)` once a CEF zygote is gone (the newest build's generation
 /// then).
 fn unrecoverable() -> MutexGuard<'static, (ZygoteWatch, Option<u64>)> {
     static WATCH: OnceLock<Mutex<(ZygoteWatch, Option<u64>)>> = OnceLock::new();
@@ -516,6 +514,10 @@ fn unrecoverable() -> MutexGuard<'static, (ZygoteWatch, Option<u64>)> {
 /// its start: one per process. So the process gets one private directory (mode 0700), set on every
 /// element; it is removed when the last `CefGraphics` drops (the process's exit, in production), and
 /// any left by a process that died first is removed at the next start.
+///
+/// It fails closed (the PR #32 confirm pass's N4): without the directory no build is made, so CEF
+/// never falls back to HOME; the build fails as a graphics failure (`CefCrashed`), the programme
+/// runs on without the overlay, and the domain's next restart tries the directory again.
 #[derive(Default)]
 struct Profile {
     path: Option<std::path::PathBuf>,
@@ -538,8 +540,11 @@ pub(crate) fn make_profile_dir(base: &std::path::Path) -> std::io::Result<std::p
     Ok(path)
 }
 
-/// Removes every `seazn-cef-<pid>-…` directory in `base` whose process is gone. Returns how many.
-pub(crate) fn sweep_stale_profiles(base: &std::path::Path, alive: impl Fn(i32) -> bool) -> usize {
+/// Removes every `seazn-cef-<pid>-…` directory in `base` whose process is gone, or that carries
+/// `own`, this process's pid. It runs before this process image makes its own directory, so one
+/// with its pid is an earlier image's: an exec, or a restarted container that gave the compositor
+/// the same pid again (the PR #32 confirm pass's N2). Returns how many.
+pub(crate) fn sweep_stale_profiles(base: &std::path::Path, own: i32, alive: impl Fn(i32) -> bool) -> usize {
     let Ok(dir) = std::fs::read_dir(base) else {
         return 0;
     };
@@ -554,7 +559,7 @@ pub(crate) fn sweep_stale_profiles(base: &std::path::Path, alive: impl Fn(i32) -
         else {
             continue;
         };
-        if !alive(pid) && std::fs::remove_dir_all(entry.path()).is_ok() {
+        if (pid == own || !alive(pid)) && std::fs::remove_dir_all(entry.path()).is_ok() {
             removed += 1;
         }
     }
@@ -571,39 +576,51 @@ fn pid_alive(pid: i32) -> bool {
     }
 }
 
-/// One more live adapter: the profile directory exists (made, or made again) once this returns.
-fn profile_acquire(log: impl Fn(&str)) -> Option<std::path::PathBuf> {
-    let mut p = profile();
-    p.live += 1;
-    if p.path.is_none() {
-        let base = std::env::temp_dir();
-        let swept = sweep_stale_profiles(&base, pid_alive);
-        if swept > 0 {
-            log(&format!(
-                "removed {swept} CEF profile directories of processes that are gone"
-            ));
-        }
-        match make_profile_dir(&base) {
-            Ok(path) => p.path = Some(path),
-            Err(e) => log(&format!(
-                "WARN: no private CEF profile directory ({e}); CEF writes its profile, page URLs \
-                 included, under HOME"
-            )),
-        }
-    } else if let Some(path) = p.path.clone() {
-        if !path.exists() {
-            use std::os::unix::fs::DirBuilderExt;
-            if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&path) {
-                log(&format!(
-                    "WARN: the CEF profile directory was not made again: {e}"
-                ));
-            }
-        }
-    }
-    p.path.clone()
+/// One more live adapter's hold on the profile directory (made at its first build).
+fn profile_lease() -> ProfileLease {
+    profile().live += 1;
+    ProfileLease { held: true }
 }
 
-/// One live adapter's `profile_acquire`, released on drop: the last one removes the profile
+/// The profile directory, made (after the sweep) or made again if it is missing; `Err` refuses the
+/// build (N4). `log` gets the sweep's line and is called after the lock is let go.
+fn profile_ensure(log: impl Fn(&str)) -> Result<std::path::PathBuf, String> {
+    let mut lines = Vec::new();
+    let out = {
+        let mut p = profile();
+        match p.path.clone() {
+            None => {
+                let base = std::env::temp_dir();
+                let swept = sweep_stale_profiles(&base, std::process::id() as i32, pid_alive);
+                if swept > 0 {
+                    lines.push(format!(
+                        "removed {swept} CEF profile directories of processes that are gone"
+                    ));
+                }
+                make_profile_dir(&base).inspect(|path| p.path = Some(path.clone()))
+            }
+            Some(path) if path.exists() => Ok(path),
+            Some(path) => {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&path)
+                    .map(|()| path)
+            }
+        }
+    };
+    for l in &lines {
+        log(l);
+    }
+    out.map_err(|e| {
+        format!(
+            "no private CEF profile directory ({e}); the page is not loaded, so CEF writes \
+             nothing under HOME"
+        )
+    })
+}
+
+/// One live adapter's `profile_lease`, released on drop: the last one removes the profile
 /// directory.
 struct ProfileLease {
     held: bool,
@@ -1008,9 +1025,11 @@ pub enum ReaperPath {
 /// C11b decides the in-place restart from it). Read with `CefGraphics::health`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CefHealth {
-    /// `Some(gen)`: CEF's renderer zygote is gone, so CEF can start no renderer again in this
-    /// process (Owed 56); `gen` is the newest build's generation when it was seen. A live page
-    /// keeps painting from its orphaned renderer, out of reach of the guardrails and the reaper.
+    /// `Some(gen)`: a CEF zygote is gone (Owed 56; `gen` is the newest build's generation when it
+    /// was seen). The renderers' zygote: CEF can start no renderer again in this process, and a
+    /// live page keeps painting from its orphaned renderer, out of reach of the guardrails and the
+    /// reaper. The GPU process's zygote: the next GPU-process death aborts the whole process
+    /// (Chromium's FATAL, SIGTRAP; N1). Either way only a restart in place recovers (C11b).
     pub unrecoverable: Option<u64>,
     /// Retired builds whose teardown had not returned `TEARDOWN_LEAK_AFTER_MS` after the reaper's
     /// kill and still has not (Owed 55): each holds a thread, a pipeline and a renderer.
@@ -1100,8 +1119,6 @@ struct Shared {
     builds: Mutex<BTreeMap<u64, (u64, Arc<SampleStats>)>>,
     reports: Mutex<BTreeMap<u64, ReaperPath>>,
     last_guard: Mutex<Guarded>,
-    /// The process's private CEF profile directory (`None`: CEF's default, under HOME).
-    profile: Option<std::path::PathBuf>,
     #[cfg(feature = "test-hooks")]
     teardown_hold: Mutex<bool>,
     #[cfg(feature = "test-hooks")]
@@ -1296,7 +1313,7 @@ impl CefGraphics {
     pub fn new(frames: FrameStore, tx: Sender<Inbound>, fps: u32, rss_cap_mb: u64) -> Self {
         static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
         let inst = NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed);
-        let profile = profile_acquire(|l| stderr_log()(l));
+        let lease = profile_lease();
         let shared = Arc::new(Shared {
             inst,
             tx,
@@ -1314,7 +1331,6 @@ impl CefGraphics {
             builds: Mutex::new(BTreeMap::new()),
             reports: Mutex::new(BTreeMap::new()),
             last_guard: Mutex::new(Guarded::default()),
-            profile,
             #[cfg(feature = "test-hooks")]
             teardown_hold: Mutex::new(false),
             #[cfg(feature = "test-hooks")]
@@ -1332,7 +1348,7 @@ impl CefGraphics {
             current: None,
             builds: 0,
             threads: false,
-            _lease: ProfileLease { held: true },
+            _lease: lease,
         };
         g.preload();
         g
@@ -1415,10 +1431,10 @@ impl CefGraphics {
         }
     }
 
-    /// The process's private CEF profile directory (`None`: it could not be made, and CEF writes
-    /// under HOME).
+    /// The process's private CEF profile directory (`None`: not made yet, or it could not be made,
+    /// and no build was made either).
     pub fn profile_dir(&self) -> Option<std::path::PathBuf> {
-        self.shared.profile.clone()
+        profile().path.clone()
     }
 
     /// Child polls run so far.
@@ -1560,6 +1576,11 @@ impl CefGraphics {
 
     fn build(&self, gen: u64, build: u64, url: &str) -> Result<Live, String> {
         gst::init().map_err(|e| format!("gstreamer did not initialise: {e}"))?;
+        // No private profile directory, no build (N4): CEF's default is under HOME.
+        let profile = profile_ensure(|l| self.shared.log(l))?
+            .to_str()
+            .ok_or("the CEF profile directory's path is not UTF-8")?
+            .to_owned();
         let pipeline = gst::Pipeline::with_name(&format!("graphics-{gen}"));
         let src = gst::ElementFactory::make("cefsrc")
             .name(element_name(self.shared.inst, build, gen))
@@ -1576,10 +1597,8 @@ impl CefGraphics {
         let env_flags = std::env::var("GST_CEF_CHROME_EXTRA_FLAGS").ok();
         src.set_property("chrome-extra-flags", extra_flags(env_flags.as_deref()));
         src.set_property_from_str("log-severity", CEF_LOG_SEVERITY);
-        if let Some(dir) = self.shared.profile.as_ref().and_then(|p| p.to_str()) {
-            // Global, read at CEF's start (from the first element): the whole profile goes there.
-            src.set_property("cef-cache-location", dir);
-        }
+        // Global, read at CEF's start (from the first element): the whole profile goes there.
+        src.set_property("cef-cache-location", profile.as_str());
         let (w, h) = OVERLAY_SIZE;
         let caps = gst::ElementFactory::make("capsfilter")
             .name("caps")
@@ -1909,8 +1928,8 @@ fn poll_children(shared: &Shared) {
                 watch.1 = Some(newest.unwrap_or(0));
                 drop(watch);
                 shared.log(&format!(
-                    "ERROR gen={}: CEF's renderer zygote is gone; no renderer can start again in \
-                     this process (Owed 56: restart in place)",
+                    "ERROR gen={}: a CEF zygote is gone; no renderer may start again, and the next \
+                     GPU-process death aborts this process (Owed 56: restart in place)",
                     newest.unwrap_or(0)
                 ));
             }
@@ -2290,11 +2309,12 @@ mod tests {
         eprintln!("children checked: {}", cases.len());
     }
 
-    // F-013 (the fix loop's probes, CEF 139): two zygotes; the first parents the GPU process, and
-    // the next build after its death signalled ready; the second parents the renderers, and every
-    // build after its death failed at once.
+    // F-013 (CEF 139): two zygotes. The renderers' zygote's death fails every later build at once;
+    // the GPU process's zygote's death turns the next GPU-process death into Chromium's FATAL "GPU
+    // process isn't usable", an abort of the whole process (the PR #32 confirm pass's N1, probe CG).
+    // Either is the verdict, decided once.
     #[test]
-    fn a_dead_renderer_zygote_ends_cef_but_the_gpu_zygote_does_not() {
+    fn any_dead_zygote_ends_cef_for_the_process() {
         let tree = |gpu_zygote: bool, renderer_zygote: bool| {
             let mut kids = vec![kid(1581, 1544, "utility", None)];
             if gpu_zygote {
@@ -2309,26 +2329,28 @@ mod tests {
             kids
         };
         let mut checked = 0;
-        // Healthy, then the GPU zygote gone: CEF recovers.
+        // Healthy, then the GPU zygote gone: decided, once, never again.
         let mut w = ZygoteWatch::default();
         assert!(!zygote_check(&mut w, &tree(true, true), |_| false));
+        assert!(zygote_check(&mut w, &tree(false, true), |_| false));
         assert!(!zygote_check(&mut w, &tree(false, true), |_| false));
-        checked += 2;
-        // Then the renderers' zygote: decided once, never again.
-        assert!(zygote_check(&mut w, &tree(false, false), |_| false));
         assert!(!zygote_check(&mut w, &tree(false, false), |_| false));
-        checked += 2;
-        // The renderers' zygote alone, the GPU one alive: decided (its lost renderers, not "none left").
+        checked += 4;
+        // The renderers' zygote alone, the GPU one alive: decided.
         let mut w = ZygoteWatch::default();
         assert!(!zygote_check(&mut w, &tree(true, true), |_| false));
         assert!(zygote_check(&mut w, &tree(true, false), |_| false));
         checked += 2;
-        // A zygote missing from one list while its process lives (a failed cmdline read): no verdict.
-        let mut w = ZygoteWatch::default();
-        assert!(!zygote_check(&mut w, &tree(true, true), |_| false));
-        assert!(!zygote_check(&mut w, &tree(true, false), |p| p == 1557));
-        checked += 2;
-        // Every zygote gone before any renderer was seen: the last one counts.
+        // A zygote missing from one list while its process lives (a failed cmdline read): no verdict,
+        // for either zygote.
+        for gone in [1556, 1557] {
+            let mut w = ZygoteWatch::default();
+            assert!(!zygote_check(&mut w, &tree(true, true), |_| false));
+            let partial = tree(gone != 1556, gone != 1557);
+            assert!(!zygote_check(&mut w, &partial, |p| p == gone), "zygote {gone}");
+            checked += 2;
+        }
+        // Every zygote gone before any renderer was seen.
         let mut w = ZygoteWatch::default();
         let early = vec![kid(1556, 1544, "zygote", None), kid(1557, 1544, "zygote", None)];
         assert!(!zygote_check(&mut w, &early, |_| false));
@@ -2449,7 +2471,6 @@ mod tests {
             builds: Mutex::new(BTreeMap::new()),
             reports: Mutex::new(BTreeMap::new()),
             last_guard: Mutex::new(Guarded::default()),
-            profile: None,
             #[cfg(feature = "test-hooks")]
             teardown_hold: Mutex::new(false),
             #[cfg(feature = "test-hooks")]
@@ -2497,13 +2518,36 @@ mod tests {
         assert_eq!(leaked.load(Ordering::SeqCst), 0);
     }
 
-    // PR #32 review I1: the profile directory is private, and a dead process's is swept.
+    // PR #32 review I1: the profile directory is private, and a dead process's is swept. The
+    // confirm pass's N2: so is one carrying this process's own pid, an earlier image's (the sweep
+    // runs before this image makes its own).
     #[test]
-    fn the_profile_directory_is_private_and_a_dead_processs_is_swept() {
+    fn the_profile_directory_is_private_and_stale_ones_are_swept() {
         use std::os::unix::fs::PermissionsExt;
-        let base = std::env::temp_dir().join(format!("c11-unit-profiles-{}", std::process::id()));
+        let own = std::process::id() as i32;
+        let base = std::env::temp_dir().join(format!("c11-unit-profiles-{own}"));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("base");
+        let dead = base.join("seazn-cef-2147483646-1");
+        let earlier_image = base.join(format!("seazn-cef-{own}-1"));
+        let live_other = base.join("seazn-cef-2147483645-1");
+        let not_ours = [base.join("seazn-cef-notapid-2"), base.join("other-3")];
+        for d in [&dead, &earlier_image] {
+            std::fs::create_dir_all(d.join("Default")).expect("stale");
+            std::fs::write(d.join("Default").join("History"), b"stale").expect("History");
+        }
+        std::fs::create_dir_all(&live_other).expect("live");
+        for d in &not_ours {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        // Every pid alive but the dead one: the earlier image's goes for its pid alone.
+        let alive = |pid: i32| pid != 2_147_483_646;
+        assert_eq!(sweep_stale_profiles(&base, own, alive), 2);
+        assert!(!dead.exists(), "the dead process's was kept");
+        assert!(!earlier_image.exists(), "this pid's earlier image's was kept");
+        assert!(live_other.exists(), "a live process's was removed");
+        assert!(not_ours.iter().all(|d| d.exists()));
+        // Then this image's own, made after the sweep: private, and named for this pid.
         let mine = make_profile_dir(&base).expect("profile dir");
         let mode = std::fs::metadata(&mine).expect("meta").permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
@@ -2512,20 +2556,8 @@ mod tests {
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_owned();
-        assert!(
-            name.starts_with(&format!("seazn-cef-{}-", std::process::id())),
-            "{name}"
-        );
-        let dead = base.join("seazn-cef-2147483646-1");
-        let not_ours = [base.join("seazn-cef-notapid-2"), base.join("other-3")];
-        std::fs::create_dir_all(dead.join("Default")).expect("dead");
-        for d in &not_ours {
-            std::fs::create_dir_all(d).expect("dir");
-        }
-        let alive = |pid: i32| pid == std::process::id() as i32;
-        assert_eq!(sweep_stale_profiles(&base, alive), 1);
-        assert!(!dead.exists() && mine.exists());
-        assert!(not_ours.iter().all(|d| d.exists()));
+        assert!(name.starts_with(&format!("seazn-cef-{own}-")), "{name}");
+        eprintln!("directories checked: {}", 4 + not_ours.len());
         let _ = std::fs::remove_dir_all(&base);
     }
 

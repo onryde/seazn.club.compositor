@@ -238,13 +238,22 @@ fn renderer_count() -> usize {
 }
 
 /// Runs test `name` again in a child process, with a HOME of its own (this process's CEF holds its
-/// profile for good, and a second CEF on one HOME refuses to start, F-013) and `env`. The child
+/// profile for good, and a second CEF on one HOME refuses to start, F-013), a TMPDIR inside it (a
+/// child that dies leaves its private profile there, removed with the HOME) and `env`. The child
 /// takes its own branch on `C11_CHILD`.
+///
+/// The path stays short: Chromium makes its sockets under TMPDIR, and a TMPDIR of 85 characters (the
+/// test's name in it) killed the child by SIGTRAP before its first ready, with no FATAL line.
 fn rerun_in_child(name: &str, env: &[(&str, &str)]) -> std::process::Output {
-    let home = std::env::temp_dir().join(format!("c11-child-{name}-{}", std::process::id()));
+    static CHILDREN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = CHILDREN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let home = std::env::temp_dir().join(format!("c11-child-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
-    std::fs::create_dir_all(&home).expect("child HOME");
-    let out = run_child(name, &home, env);
+    let tmp = home.join("tmp");
+    std::fs::create_dir_all(&tmp).expect("child HOME");
+    let mut all = vec![("TMPDIR", tmp.to_str().expect("utf-8"))];
+    all.extend_from_slice(env);
+    let out = run_child(name, &home, &all);
     let _ = std::fs::remove_dir_all(&home);
     out
 }
@@ -252,9 +261,11 @@ fn rerun_in_child(name: &str, env: &[(&str, &str)]) -> std::process::Output {
 /// `rerun_in_child` on a HOME the caller made (and reads after the child exits).
 fn run_child(name: &str, home: &Path, env: &[(&str, &str)]) -> std::process::Output {
     let mut cmd = Command::new(std::env::current_exe().expect("test binary"));
+    // The HOME is the working directory too: a core file of a child that aborts lands in it.
     cmd.args(["--exact", name, "--test-threads=1", "--nocapture"])
         .env("C11_CHILD", "1")
-        .env("HOME", home);
+        .env("HOME", home)
+        .current_dir(home);
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -1248,34 +1259,85 @@ fn cef_children_run_at_nice_10_with_the_renderer_first_in_the_oom_order() {
     r.g.stop();
 }
 
-// Owed 56, owner ruling 2026-10-19 "B": a dead renderer zygote ends CEF for the process, so the
-// adapter reports it (C11b restarts in place). Killing a zygote can end CEF, so each case runs in a
-// child process of its own: the GPU process's zygote alone (recovered, no verdict), then the
-// renderers' zygote alone with the GPU one alive (the verdict from its lost renderers, not from
-// "no zygote left").
+// Owed 56, owner ruling 2026-10-19 "B": a dead zygote ends CEF for the process, so the adapter
+// reports it (C11b restarts in place). Killing a zygote can end CEF, so each case runs in a child
+// process of its own: the GPU process's zygote alone (the renderers' zygote alive, so the verdict
+// is not "no zygote left"), then the renderers' zygote alone (the GPU one alive).
 #[test]
-fn a_dead_renderer_zygote_is_reported_and_the_gpu_zygotes_is_not() {
+fn a_dead_zygote_either_one_is_reported() {
     let _s = serial();
-    let name = "a_dead_renderer_zygote_is_reported_and_the_gpu_zygotes_is_not";
-    let which = std::env::var("C11_ZYGOTE").unwrap_or_default();
-    if std::env::var_os("C11_CHILD").is_none() || which.is_empty() {
-        let mut checked = Vec::new();
-        for which in ["gpu", "renderer"] {
-            let out = rerun_in_child(name, &[("C11_ZYGOTE", which)]);
-            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-            let mine: Vec<String> = stderr
-                .lines()
-                .filter(|l| l.starts_with("zygote child:"))
-                .map(str::to_owned)
-                .collect();
-            assert!(out.status.success(), "the {which} child failed:\n{stderr}");
-            assert_eq!(mine.len(), 1, "{stderr}");
-            checked.extend(mine);
-        }
-        eprintln!("children checked: {}; {checked:?}", checked.len());
-        assert_eq!(checked.len(), 2);
-        return;
+    let name = "a_dead_zygote_either_one_is_reported";
+    if let Some(which) = zygote_child_case() {
+        return zygote_case(&which);
     }
+    let mut checked = Vec::new();
+    for which in ["gpu", "renderer"] {
+        let out = rerun_in_child(name, &[("C11_ZYGOTE", which)]);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let mine: Vec<String> = stderr
+            .lines()
+            .filter(|l| l.starts_with("zygote child:"))
+            .map(str::to_owned)
+            .collect();
+        assert!(out.status.success(), "the {which} child failed:\n{stderr}");
+        assert_eq!(mine.len(), 1, "{stderr}");
+        checked.extend(mine);
+    }
+    eprintln!("children checked: {}; {checked:?}", checked.len());
+    assert_eq!(checked.len(), 2);
+}
+
+// The PR #32 confirm pass's N1, pinned: why the GPU process's zygote's death is the verdict. With
+// that zygote dead, the next GPU-process death is Chromium's FATAL "GPU process isn't usable.
+// Goodbye." and the whole process dies of SIGTRAP: in production, the compositor, off air. The
+// child reports the verdict first, then kills the GPU process.
+#[test]
+fn a_gpu_process_death_after_its_zygotes_aborts_the_whole_process() {
+    use std::os::unix::process::ExitStatusExt;
+    let _s = serial();
+    let name = "a_gpu_process_death_after_its_zygotes_aborts_the_whole_process";
+    if let Some(which) = zygote_child_case() {
+        return zygote_case(&which);
+    }
+    let out = rerun_in_child(name, &[("C11_ZYGOTE", "abort")]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let reached: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.starts_with("zygote child:"))
+        .collect();
+    assert_eq!(
+        reached.len(),
+        1,
+        "the child never reached the GPU-process kill ({:?}):\n{stderr}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !stderr.contains("zygote child survived"),
+        "the process outlived the GPU process:\n{stderr}"
+    );
+    assert_eq!(
+        out.status.signal(),
+        Some(5),
+        "not SIGTRAP: {:?}\n{stderr}",
+        out.status
+    );
+    assert!(
+        stderr.contains("GPU process isn't usable"),
+        "no Chromium FATAL:\n{stderr}"
+    );
+    eprintln!("abort child: {:?}; {reached:?}", out.status);
+}
+
+/// `C11_ZYGOTE`, in a zygote test's child.
+fn zygote_child_case() -> Option<String> {
+    std::env::var_os("C11_CHILD")?;
+    std::env::var("C11_ZYGOTE").ok().filter(|w| !w.is_empty())
+}
+
+/// One zygote case, in a child process: `gpu` and `abort` kill the GPU process's zygote, `renderer`
+/// the renderers'; `abort` then kills the GPU process too.
+fn zygote_case(which: &str) {
     let mut r = rig();
     r.g.restart(1, &page(""));
     events_until(&r.rx, load_timeout(), ready(1));
@@ -1296,55 +1358,66 @@ fn a_dead_renderer_zygote_is_reported_and_the_gpu_zygotes_is_not() {
         "the renderer's parent is no zygote: {kids:?}"
     );
     let gpu: Vec<i32> = zygotes.iter().copied().filter(|z| *z != renderer.ppid).collect();
+    let gpu_processes: Vec<i32> = kids
+        .iter()
+        .filter(|k| k.kind == "gpu-process" && gpu.contains(&k.ppid))
+        .map(|k| k.pid)
+        .collect();
     assert!(!gpu.is_empty(), "one zygote only: {kids:?}");
+    assert!(
+        !gpu_processes.is_empty(),
+        "no GPU process under the GPU zygote: {kids:?}"
+    );
     assert!(two_polls(&r.g), "the child poll stopped");
     assert_eq!(r.g.health().unrecoverable, None);
-    if which == "gpu" {
-        // The GPU process's zygote: CEF recovers, and the next build reaches ready.
-        for z in &gpu {
-            let _ = Command::new("kill").args(["-KILL", &z.to_string()]).status();
-        }
-        assert!(gpu.iter().all(|z| wait_for(hang_bound(), || !alive(*z))));
-        assert!(two_polls(&r.g), "the child poll stopped");
-        r.g.restart(2, &page(""));
-        events_until(&r.rx, load_timeout(), ready(2));
-        assert!(two_polls(&r.g), "the child poll stopped");
-        assert_eq!(
-            r.g.health().unrecoverable,
-            None,
-            "the GPU zygote's death was reported"
-        );
-        eprintln!(
-            "zygote child: GPU zygotes {gpu:?} killed, gen 2 ready, {:?}",
-            r.g.health()
-        );
+    let (victims, survivors) = if which == "renderer" {
+        (vec![renderer.ppid], gpu.clone())
     } else {
-        // The renderers' zygote alone: reported with the newest generation, within two polls.
-        let _ = Command::new("kill")
-            .args(["-KILL", &renderer.ppid.to_string()])
-            .status();
-        assert!(
-            wait_for(hang_bound(), || r.g.health().unrecoverable.is_some()),
-            "the renderer zygote's death was not reported: {:?}",
-            r.g.health()
-        );
-        assert_eq!(r.g.health().unrecoverable, Some(1));
-        assert!(
-            gpu.iter().all(|z| alive(*z)),
-            "the GPU zygote died too: this run proves only \"no zygote left\""
-        );
-        assert!(lines(&r)
-            .iter()
-            .any(|l| l.contains("ERROR gen=1") && l.contains("zygote")));
-        // And the next build fails at once (F-013).
-        r.g.restart(2, &page(""));
-        events_until(&r.rx, load_timeout(), crashed(2));
-        eprintln!(
-            "zygote child: renderer zygote {} killed (GPU zygotes {gpu:?} alive), {:?}",
-            renderer.ppid,
-            r.g.health()
-        );
+        (gpu.clone(), vec![renderer.ppid])
+    };
+    for z in &victims {
+        let _ = Command::new("kill").args(["-KILL", &z.to_string()]).status();
     }
+    // Reported with the newest generation, within the child poll's next rounds.
+    assert!(
+        wait_for(hang_bound(), || r.g.health().unrecoverable.is_some()),
+        "the {which} zygote's death was not reported: {:?}",
+        r.g.health()
+    );
+    assert_eq!(r.g.health().unrecoverable, Some(1));
+    assert!(
+        survivors.iter().all(|z| alive(*z)),
+        "the other zygote died too: this run proves only \"no zygote left\""
+    );
+    assert!(lines(&r)
+        .iter()
+        .any(|l| l.contains("ERROR gen=1") && l.contains("zygote")));
+    match which {
+        "renderer" => {
+            // The next build fails at once (F-013).
+            r.g.restart(2, &page(""));
+            events_until(&r.rx, load_timeout(), crashed(2));
+        }
+        "abort" => {
+            eprintln!(
+                "zygote child: GPU zygotes {gpu:?} killed, {:?}; killing GPU processes {gpu_processes:?}",
+                r.g.health()
+            );
+            for g in &gpu_processes {
+                let _ = Command::new("kill").args(["-KILL", &g.to_string()]).status();
+            }
+            // Probe CG: the abort came within 10 s. Twice that, then say so.
+            thread::sleep(load_timeout() * 2);
+            eprintln!("zygote child survived the GPU process: {:?}", r.g.health());
+            r.g.stop();
+            return;
+        }
+        _ => {}
+    }
+    eprintln!(
+        "zygote child: {which} zygotes {victims:?} killed ({survivors:?} alive), {:?}",
+        r.g.health()
+    );
     r.g.stop();
 }
 
@@ -1396,6 +1469,92 @@ impl Drop for PageServer {
     }
 }
 
+// The PR #32 confirm pass's N4: the private profile fails closed. With no directory to be had
+// (an unwritable TMPDIR), no build is made, so CEF never starts on its HOME default; each build
+// fails as a graphics failure, logged through the adapter's sink, and the domain's retry loads once
+// the directory can be made, sweeping a dead process's first (that line through the sink too). It
+// runs in a child: the first build that does start is CEF's start, and its profile is CEF's.
+#[test]
+fn a_profile_directory_that_cannot_be_made_refuses_the_build_and_the_retry_loads() {
+    use std::os::unix::fs::PermissionsExt;
+    let _s = serial();
+    let name = "a_profile_directory_that_cannot_be_made_refuses_the_build_and_the_retry_loads";
+    const REFUSED: &str = "no private CEF profile directory";
+    // A dead process's profile, there before the child starts.
+    const STALE: &str = "seazn-cef-2147483646-1";
+    if std::env::var_os("C11_CHILD").is_some() {
+        let tmp = std::env::temp_dir();
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+        let url = page(&format!("?st={TOKEN}"));
+        let mut r = rig();
+        for gen in [1, 2] {
+            r.g.restart(gen, &url);
+            let seen = events_until(&r.rx, load_timeout(), crashed(gen));
+            assert!(!seen.contains(&Event::CefReady { gen }), "{seen:?}");
+            assert!(
+                lines(&r)
+                    .iter()
+                    .any(|l| l.contains(&format!("gen={gen}: {REFUSED}"))),
+                "{:?}",
+                lines(&r)
+            );
+        }
+        assert_eq!(r.g.profile_dir(), None);
+        assert!(cef_children().is_empty(), "CEF started: {:?}", cef_children());
+        let (hits, files) = files_holding(&home, TOKEN.as_bytes());
+        assert!(
+            hits.is_empty(),
+            "the token under HOME, of {files} files: {hits:?}"
+        );
+        // The directory can be made again: the next build loads, in it.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        r.g.restart(3, &url);
+        events_until(&r.rx, load_timeout(), ready(3));
+        let dir = r.g.profile_dir().expect("the profile directory");
+        assert!(dir.starts_with(&tmp), "{dir:?}");
+        assert!(!tmp.join(STALE).exists(), "the dead process's directory was kept");
+        assert!(
+            lines(&r)
+                .iter()
+                .any(|l| l.contains("removed 1 CEF profile directories")),
+            "{:?}",
+            lines(&r)
+        );
+        assert!(!lines(&r)
+            .iter()
+            .any(|l| l.contains("gen=3: ") && l.contains(REFUSED)));
+        eprintln!("profile child: gens 1 and 2 refused, gen 3 ready in {dir:?}");
+        r.g.stop();
+        return;
+    }
+    let ro = std::env::temp_dir().join(format!("c11-ro-tmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ro);
+    std::fs::create_dir_all(ro.join(STALE)).expect("TMPDIR");
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    let out = rerun_in_child(name, &[("TMPDIR", ro.to_str().expect("utf-8"))]);
+    let _ = std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700));
+    let _ = std::fs::remove_dir_all(&ro);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "the child failed:\n{stderr}");
+    let reached: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.starts_with("profile child:"))
+        .collect();
+    assert_eq!(reached.len(), 1, "{stderr}");
+    // Through the adapter's sink, never raw stderr: every refusal line, and the sweep's, is the
+    // sink's echo.
+    let refusals: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains(REFUSED) || l.contains("CEF profile directories"))
+        .collect();
+    assert!(refusals.len() >= 3, "{stderr}");
+    assert!(
+        refusals.iter().all(|l| l.starts_with("adapter: ")),
+        "a refusal line bypassed the sink: {refusals:?}"
+    );
+    eprintln!("refusal lines checked: {}; {reached:?}", refusals.len());
+}
+
 // PR #32 review I1: CEF writes every URL it loads, token and all, to its profile (History, Top
 // Sites, the HTTP cache). Over http (the real page's scheme) and past History's commit, the token
 // is on disk only in the adapter's private profile, and gone once the adapter is dropped.
@@ -1439,13 +1598,14 @@ fn a_page_token_rests_on_disk_only_in_the_private_profile_until_the_drop() {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     let tmp = std::env::temp_dir();
     let mut r = rig();
-    let profile = r.g.profile_dir();
     let url = format!(
         "http://127.0.0.1:{}/overlay-test.html?host=compositor&sid=SID42&st={DISK_TOKEN}",
         server.port
     );
     r.g.restart(1, &url);
     events_until(&r.rx, load_timeout(), ready(1));
+    // Made at the first build (the confirm pass's N4: no directory, no build).
+    let profile = r.g.profile_dir();
     // The positive control: the token reaches History's file (which commits on its own clock), so
     // every place CEF writes it has had its chance.
     let mut held: Vec<PathBuf> = Vec::new();
