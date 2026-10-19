@@ -37,6 +37,11 @@ const P720: OutputProfile = OutputProfile::P720;
 /// The house backdrop, from the rulebook rather than the adapter: seazn.club's `--mk-night`,
 /// `#150b36` (`apps/web/src/app/globals.css:535`; the overlay templates spec §4.2).
 const HOUSE_NIGHT: [u8; 3] = [0x15, 0x0b, 0x36];
+/// The slate on air, decoded from the programme, against `HOUSE_NIGHT`: measured 1 level off it
+/// ([22, 11, 54]; x264 codes the flat backdrop), so 2 leaves one level of slack. Left to
+/// negotiation the compositor mixes in RGB and the backdrop comes out [18, 7, 51] (F-010), which 2
+/// tells apart and the looser 8 did not (mutant G24).
+const ON_AIR_TOL: u8 = 2;
 /// The brief's pin of the vendored logo (C09 amendment 2026-10-15).
 const LOGO_SHA256: &str = "bee2648f76fa2590ac81d2c1e14050fe4c62687b8630437b0d6e6b080c2f90e8";
 /// Owed 15, option (a): poll the bytes-sent total at most every 250 ms, keeping the PDF's 5 s.
@@ -609,7 +614,7 @@ fn overlay_is_composited_on_top_and_hide_clears_it() {
     assert!(is_blue(d.frames[14].spot), "{:?}", d.frames[14].spot);
     assert!(!is_blue(d.frames[29].spot), "{:?}", d.frames[29].spot);
     assert!(
-        close(d.frames[29].spot, HOUSE_NIGHT, 8),
+        close(d.frames[29].spot, HOUSE_NIGHT, ON_AIR_TOL),
         "{:?}",
         d.frames[29].spot
     );
@@ -937,8 +942,8 @@ fn an_opaque_overlay_covers_the_slate_and_hiding_it_reveals_the_slate() {
         "the overlay covers the logo: {covered:?}"
     );
     let revealed = &d.frames[29];
-    assert!(close(revealed.corner_tl, HOUSE_NIGHT, 8), "{revealed:?}");
-    assert!(close(revealed.corner_br, HOUSE_NIGHT, 8), "{revealed:?}");
+    assert!(close(revealed.corner_tl, HOUSE_NIGHT, ON_AIR_TOL), "{revealed:?}");
+    assert!(close(revealed.corner_br, HOUSE_NIGHT, ON_AIR_TOL), "{revealed:?}");
     assert!(revealed.logo_share >= 0.10, "the logo is back: {revealed:?}");
 }
 
@@ -1371,7 +1376,7 @@ fn a_slate_then_back_to_camera_and_back_again() {
         if (20..40).contains(&i) {
             assert!(is_red(f.corner_tl) && is_red(f.centre), "frame {i}: camera {f:?}");
         } else {
-            assert!(close(f.corner_tl, HOUSE_NIGHT, 8), "frame {i}: slate {f:?}");
+            assert!(close(f.corner_tl, HOUSE_NIGHT, ON_AIR_TOL), "frame {i}: slate {f:?}");
         }
         checked += 1;
     }
@@ -1390,7 +1395,7 @@ fn emit_with_no_camera_frame_pushes_the_slate_and_counts_it() {
     assert_eq!(p.camera_missing(), 10);
     let d = decode(&dir.file("a.flv"));
     assert_eq!(d.frames.len(), 10);
-    assert!(close(d.frames[9].corner_tl, HOUSE_NIGHT, 8));
+    assert!(close(d.frames[9].corner_tl, HOUSE_NIGHT, ON_AIR_TOL));
 }
 
 #[test]
@@ -1539,7 +1544,7 @@ fn the_1080p_programme_keeps_its_own_caps() {
     assert_eq!(d.frames.len(), 30);
     assert!(d.frames.iter().all(|f| (f.w, f.h) == (1_920, 1_080)));
     assert!(
-        close(d.frames[14].corner_br, HOUSE_NIGHT, 8),
+        close(d.frames[14].corner_br, HOUSE_NIGHT, ON_AIR_TOL),
         "{:?}",
         d.frames[14]
     );
@@ -1718,7 +1723,7 @@ fn a_camera_frame_that_cannot_be_fitted_shows_the_slate_and_is_logged_once() {
     assert_eq!(logged, 1, "{lines:?}");
     let d = decode(&dir.file("a.flv"));
     assert_eq!(d.frames.len(), 20);
-    assert!(close(d.frames[9].corner_tl, HOUSE_NIGHT, 8), "{:?}", d.frames[9]);
+    assert!(close(d.frames[9].corner_tl, HOUSE_NIGHT, ON_AIR_TOL), "{:?}", d.frames[9]);
     assert!(is_red(d.frames[19].centre), "{:?}", d.frames[19]);
 }
 
