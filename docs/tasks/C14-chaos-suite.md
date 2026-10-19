@@ -120,6 +120,11 @@ Every beat in that span reads `ready`, `restarting` or `starting`, and never `fa
 ### Owed checks as acceptance criteria (Owner, 2026-10-18, in chat, relayed by the coordinator: "apply rec 4-9"; and owner, 2026-10-18, in chat, relayed by the coordinator: "fix the product gaps along with tasks")
 
 **Case 8 (`cef-killed`), reworded (Owed 19).**
+- **Superseded 2026-10-19 (PR #32's confirm pass; `docs/_INDEX.md` Owed 62).** Measured on CEF 139:
+  every CEF child SIGKILLed at once aborts the compositor process (Chromium's FATAL "GPU process
+  isn't usable", SIGTRAP), 3 of 3, before C11's next child poll. So no `CefCrashed{g}` or
+  `CefReady{g+1}` follows, and case 8 asserts case 9's shape instead. The rewrite, and the in-place
+  restart's own cases, are in `docs/tasks/C11b-cef-health.md` ("C14's case 8, rewritten").
 - *Why.* "Heartbeats go `graphics: restarting` → `ready`" asks a 5 s beat to land inside a ~1 s
   state. After a kill, the domain reads `restarting` only for the first back-off,
   `cef_backoff_base_ms` = 1 s. It reads `starting` for the ~2.8 s load (F-001). Before C11's 1 s

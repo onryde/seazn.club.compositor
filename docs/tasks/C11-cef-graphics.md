@@ -434,6 +434,22 @@ changed for this brief:
 - **F-014's residual:** a ready page that navigates paints the new document (white, on an error) until the hang
   hide; no producer is known.
 
+## Amendment 2026-10-19 (PR #32 confirm pass)
+
+The coordinator's decisions are in `docs/_INDEX.md`'s Decision log ("PR #32 (C11) confirm pass"). What changed for
+this brief:
+
+- **Health:** `unrecoverable` reports **any** zygote's death (N1). The GPU process's zygote's is not recovered: the
+  next GPU-process death is Chromium's FATAL abort of the whole process (SIGTRAP). The test
+  `a_dead_renderer_zygote_is_reported_and_the_gpu_zygotes_is_not` is now `a_dead_zygote_either_one_is_reported`,
+  and `a_gpu_process_death_after_its_zygotes_aborts_the_whole_process` pins the abort.
+- **Secrets, at rest:** the sweep also removes a directory carrying the process's own pid (N2), and the profile
+  fails closed (N4): no directory, no build, never CEF on HOME (`CefCrashed`, logged through the adapter's sink).
+  New test: `a_profile_directory_that_cannot_be_made_refuses_the_build_and_the_retry_loads`.
+- **The tests:** 25 in the image; 40 unit tests in `adapters`, 18 of them in `cef_graphics`.
+- **Measured for C11b and C14:** Owed 61 (the 6th GPU-process death aborts the process) and Owed 62 (C14's case 8
+  is a process abort).
+
 ## Do not touch
 
 The programme and input adapters, and the page in `seazn.club` (that's R2005). (Amended 2026-10-15)

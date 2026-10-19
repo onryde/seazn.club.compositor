@@ -1241,13 +1241,18 @@ echo "RUN $RUN done"
 **Processes dying:**
 - **A renderer killed** (SIGKILL): cefsrc logs `Render subprocess terminated, reloading URL!` 12–35 ms later, from its `OnRenderProcessTerminated`, with no bus error. It then reloads the page under a new pid with the same client id, and the reloaded page logs `seazn:ready` again (the crash test sees it).
 - **The spare renderer killed:** no warning, and it is not relaunched.
-- **The GPU process killed:** recovered silently; 96 frames in the next 4 s.
+- **The GPU process killed:** recovered silently; 96 frames in the next 4 s. That holds only while its zygote lives, and only up to a limit (the PR #32 confirm pass, below): with that zygote dead, the next GPU-process death aborts the whole process; with it alive, the 6th death in about 10 s did.
 - **The zygote killed:** every later renderer launch fails. The warning storms at about 60 a second, for every browser after it, with 0 frames. CEF is dead for the rest of the process (Owed 56).
 - **Which zygote** (the PR #32 fix loop's probe, 2026-10-19; corrects the line above, which killed both). CEF runs two zygotes, children of the compositor process.
-  - The first parents the GPU process. Killed alone, CEF recovered: the next build signalled ready.
+  - The first parents the GPU process. Killed alone, the page kept painting and the next build signalled ready, which this file first recorded as "CEF recovered". **It did not** (the PR #32 confirm pass's N1, below): the next GPU-process death aborts the process.
   - The second parents the renderers and a utility process. Killed alone, the current renderer is orphaned: it leaves the compositor's process tree (so the guardrails, the claims and the reaper lose it) and keeps painting and beating, and the next build gets `CefCrashed` at once, with 0 samples.
   - The review's P7: with the zygotes dead, the current build's renderer killed gave no `CefCrashed` within 3 s (2 of 2 runs), and CEF's browser side burned about 1.0–1.3 cores in the compositor process while a build existed.
-  - So the adapter's verdict (`health().unrecoverable`, Owed 56) is the renderers' zygote gone, or every zygote gone, from the child poll; a zygote missing from one poll's list counts only once its process is gone (or a zombie).
+  - So the adapter's verdict (`health().unrecoverable`, Owed 56) is **any** zygote gone, from the child poll (since the confirm pass; the fix loop decided on the renderers' zygote, or every zygote, only); a zygote missing from one poll's list counts only once its process is gone (or a zombie).
+- **Chromium's abort** (the PR #32 confirm pass, 2026-10-19; reviewer's probes CF, CG, CH, then the implementer's PK and GR, each case in a process of its own). The process logs `FATAL:content/browser/gpu/gpu_data_manager_impl_private.cc:415] GPU process isn't usable. Goodbye.` and dies of SIGTRAP (wait status 133: signal 5, core). In production that process is the compositor: the programme goes off air with it, and the exit reads as a crash to Fly (`max_retries` 2) and to R2003b.
+  - The GPU zygote killed, then the GPU process: the abort, 3 of 3 (CG; pinned by `a_gpu_process_death_after_its_zygotes_aborts_the_whole_process`). The control, the GPU process killed with its zygote alive: relaunched under the same zygote, the page kept beating and gen 2 reached ready (CH).
+  - Both zygotes killed during CEF's start, before a poll saw a renderer: the abort (CF).
+  - **Every CEF child SIGKILLed at once** (PK; C14 case 8's `pkill -KILL -f cef`): the abort, 3 of 3, before the next child poll (no verdict was ever reported). An in-place restart cannot come first.
+  - **The GPU process killed again and again, its zygote alive** (GR: a kill, then 2 s for the relaunch): relaunched 5 times, with 21–39 samples in each next 2 s; the 6th kill, about 10 s in, was the abort, 2 of 2. Whether Chromium's count decays with time was not measured (Owed 61). G1's grading puts the GPU process (800) ahead of the zygotes (500) in the OOM order, so under memory pressure its deaths come before a zygote's.
 
 **Teardown:**
 - `set_state(NULL)` returned in 4–17 ms, and in 7 ms for a page hung in a JS busy loop with js-signals off (the adapter's mode).
@@ -1274,11 +1279,13 @@ echo "RUN $RUN done"
   - cefsrc's `cef-cache-location` (or `GST_CEF_CACHE_LOCATION`) sets `CefSettings.cache_path`, and the whole profile moves there: History, Top Sites, the HTTP cache and `chrome_debug.log`. HOME then holds 4 files (GStreamer's registry and `.pki/nssdb`), none with the token. `user-data-dir=` in `chrome-extra-flags` and `XDG_CONFIG_HOME`/`XDG_CACHE_HOME` moved it too.
   - Like `chrome-extra-flags`, it is global, read once at CEF's start from the first element, and logs cefsrc's deprecation WARNING on every set. So a profile per build is impossible: it is one per process.
   - A path CEF cannot create falls back to HOME (no in-memory mode). A `/dev/shm` path worked, about 4 MB for one page.
-  - The adapter's profile is `<temp_dir>/seazn-cef-<pid>-<nanos>`, mode 0700; the last `CefGraphics` dropped removes it, and the next start removes any whose process is gone.
+  - The adapter's profile is `<temp_dir>/seazn-cef-<pid>-<nanos>`, mode 0700; the last `CefGraphics` dropped removes it, and the next start removes any whose process is gone, and any carrying its own pid (an earlier image's: an exec, or a restarted container that gave the compositor the same pid; the confirm pass's N2, where an `exec` as pid 1758 kept `seazn-cef-1758-1`).
+  - It fails closed (the confirm pass's N4): if the directory cannot be made, no build is made, so CEF never starts on HOME; the build fails as `CefCrashed` (the programme runs on without the overlay), and the domain's next restart tries again. Measured with a TMPDIR at mode 0500: gens 1 and 2 crashed with no CEF child started and no token under HOME; at 0700, gen 3 swept a dead process's directory and reached ready in the new one. The refusal and the sweep's line go through the adapter's log sink.
   - Removed under a live CEF (a test process, where adapters come and go): History stays open on the unlinked file, so a later test's History never reaches a path, and the disk cache writes its index again later (`Cache_Data/index-dir/the-real-index`: hashes, no URL). In production the drop is the process's exit. C12 puts `TMPDIR` on a tmpfs (Owed 58).
 
 **The environment:**
 - CEF writes its profile under `$HOME/.config/cef_user_data`, so the CEF user's HOME must exist and be writable (Owed 54). The probes ran uid 10001 with `HOME=/home/spike`. Since the fix loop the adapter moves the profile to its own directory (above); HOME still takes GStreamer's registry and NSS's database.
+- **A long TMPDIR kills CEF at its start** (the confirm pass, 2026-10-19). A test child with a TMPDIR of 85 characters died of SIGTRAP (wait status 133) about 1 s after its first build, before ready, with no FATAL line; the same child at 59 characters ran. Chromium makes Unix sockets under TMPDIR (`.org.chromium.Chromium.*`), and a socket path holds at most 108 bytes, which is the likely cause (not isolated). C12's TMPDIR must stay short (Owed 58).
 - **One CEF per profile.** A second process on the same HOME failed its first start: "state change failed and some element failed to post a proper error message with the reason for the failure" (`gst_base_src_start`), alongside CEF's own warning "Please customize CefSettings.root_cache_path … process singleton". So the token test's child gets a HOME of its own.
 
 **Measured in `crates/adapters/tests/graphics.rs` (19 tests, 3 runs in a row):**
@@ -1298,7 +1305,7 @@ echo "RUN $RUN done"
   - The disk token: History and the HTTP cache held it, both in the private profile; 0 files under the child's HOME or TMPDIR held it after the drop (one cache index file was written again, no URL).
   - The hidden page: 180 programme frames before the retry, 45 after the hide, 0 blue; 45 after the retry's ready, 45 blue.
   - Two builds' renderers side by side (gen 1's teardown held): 190–193 MB PSS in all, 151–153 MB counted for gen 2, 39–40 MB for gen 1's renderer; a cap halfway between crashed nothing, and a cap under gen 2's share crashed gen 2.
-  - The zygotes one at a time, each in a fresh process: the GPU zygote killed, gen 2 ready and no verdict; the renderers' zygote killed with the GPU zygote alive, `unrecoverable: Some(1)` and gen 2 crashed at once.
+  - The zygotes one at a time, each in a fresh process: the GPU zygote killed, gen 2 ready and no verdict (that verdict was wrong: the confirm pass's N1); the renderers' zygote killed with the GPU zygote alive, `unrecoverable: Some(1)` and gen 2 crashed at once.
 - **Straight alpha costs one pass over the frame.** In place: about 4 ms optimised and 25 ms in a debug build. A two-buffer loop took 200–400 ms in a debug build, too slow for the tests' 30 fps page: frames were written about 3 a second, and the stop test missed its first write.
 
 ## F-014: CEF 139 paints an error page opaque (C11, Owed 17, 2026-10-19)
