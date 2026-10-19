@@ -98,6 +98,15 @@ edits `domain/src/config.rs`, and is allowed **only** for this field.
 - 2 mutants went red.
 - The new `config.rs` field cites its source.
 
+## Amendment 2026-10-19 (C08 PR #27 review round 1: a bounded `Drop`)
+
+C08's `run()` returns after its final-beat flush, and the driver drops with every port as it returns,
+so `GstInput`'s `Drop` runs on the exit path, after the final beat and before the process ends. It must
+return within a bound: it never waits on a pipeline, a renderer or a thread that may hang (F-001:
+`set_state(NULL)` did not return for 10 s on a hung renderer); teardown that may block goes to a
+reaper thread, as `stop` does, or is bounded by a timeout. **Acceptance:** a test drops the adapter
+while what it owns is hung (or stands in for hung) and the drop returns within 500 ms.
+
 ## Do not touch
 
 `gst_programme.rs`/`gst_output.rs` (report problems, don't change them), and other domain files.

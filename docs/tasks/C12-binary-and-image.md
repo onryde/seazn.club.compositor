@@ -265,6 +265,9 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
 ## Acceptance
 
 - (Amended 2026-10-18) `graphics_log_lines_exist_in_both_driver_modes` passes in both modes.
+- (Amended 2026-10-19, Owed 35) Both driver modes wire a stderr `LogSink` (`ts=<rfc3339> level=info
+  msg=<line>`) into `Ports.log`, the log-line test reads the driver's own lines through it, and a final
+  beat whose call returned an error is logged with its scrubbed text, never the token.
 - Env, metrics and fake-run tests pass.
 - `image.yml` is green on the PR: plugin present, ~~7~~ 8 cef tests, smoke exits 0, size under the cap.
 - ~~3~~ 8 mutants went red (amended 2026-10-15).
@@ -549,6 +552,35 @@ adds a flush there (10 + 7 + 2 = 19 s).
     bare, and asserts the key is absent from stderr and from the final beat's `exitDetail`. It also
     asserts that the forced text did name the key, so the check cannot pass on a text without it
     (Owed 32).
+
+## Amendment 2026-10-19 (C08 as built: the log port, a failed final beat)
+
+`docs/_INDEX.md` Owed 35; decision row "C08, as built".
+
+- **The driver logs through a port.** The app crate reads no clock and never names the adapters
+  crate, so it cannot `eprintln!` the `ts=` form itself. C08 added `app::ports::LogSink`
+  (`fn info(&mut self, line: &str)`) as `Ports.log`. The driver writes the bare message:
+  `overlay hidden reason=<r> gen=<g>` (before `hide_overlay()`), `cef ready gen=<n>`,
+  `cef crashed gen=<n>` and `cef alive gen=<n>` (before it hands the event to `decide`, a stale one
+  included), `ticks skipped total=<n>` and `heartbeats dropped total=<n>` (at most one line a minute
+  each, and the rest at the exit; C08 review round 1), and `final beat not confirmed within 2000 ms`
+  (when `run()`'s flush times out or a final beat found its lane gone). C12 wires one stderr `LogSink` in both driver modes that writes
+  `ts=<rfc3339> level=info msg=<line>`; `graphics_log_lines_exist_in_both_driver_modes` reads the
+  driver's lines through it. `LoggedProgramme` still logs nothing on `hide_overlay()`.
+- **A failed final beat is logged by the binary.** C07's final-heartbeat section says its failure is
+  logged (redacted), but nothing produces that line: `HttpControlPlane` logs nothing, and C08's worker
+  keeps no result's text. C12 logs a final beat whose call returned an error, with its text (C07 has
+  already scrubbed it), for example through a `ControlPlane` decorator around `HttpControlPlane`
+  beside `LoggedProgramme`. Never the job token, never `ExitDetail::as_str` raw. (C08 review round 1)
+  Final beats run on the instance `ControlPlane::final_lane()` returns, so such a decorator's own
+  `final_lane()` must wrap the inner plane's lane in the decorator, or no final beat passes through it.
+- **The inbound channel is C12's to bound** (AGENTS.md §4). The control worker's `control` thread
+  posts each fetch and periodic result with a blocking `send`, so a full channel holds that thread up.
+  Its final lane never blocks on the channel: it takes the next final beat while a result waits for
+  room, so neither a final beat nor `flush` is held up by a full channel (corrected by C08 review
+  round 1; this said the final-beat ack alone kept `flush` free, which was false, since a final beat
+  queued behind a periodic result blocked on the channel). A drop-oldest channel must never drop a
+  worker result (a `Session`, a refusal, a 410). Record the choice in this brief.
 
 ## Do not touch
 

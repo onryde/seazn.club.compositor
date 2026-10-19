@@ -10,6 +10,8 @@ workspace = true
 
 [dependencies]
 domain = { path = "../domain" }
+# C08: the control worker's bounded request slots and `select`, and the loop's `recv_timeout`.
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 testkit = { path = "../testkit" }

@@ -1,6 +1,6 @@
-//! The ports the event loop drives (C07: the control plane; C08 adds the rest). Plain data and
-//! traits: the live implementations sit in the HTTP/media crate, which this crate never names
-//! (`tests/boundary.rs`).
+//! The ports the event loop drives (C07: the control plane; C08: the rest). Plain data and traits:
+//! the live implementations sit in the HTTP/media crate, which this crate never names
+//! (`tests/boundary.rs`), and `testkit` holds a fake for each.
 //!
 //! Secrets (AGENTS.md §7). A session carries four credentials: the SRT stream id and passphrase
 //! (Input A), the RTMPS stream key (Input B) and the overlay page's token inside `overlay_url`'s
@@ -8,10 +8,13 @@
 //! them write their own `Debug`: every credential prints as `****`, and every URL as its scheme and
 //! authority alone (`redacted_origin`), with no path or query.
 use std::fmt;
+use std::time::Duration;
 
 use domain::config::OutputProfile;
 use domain::health::HealthReport;
-use domain::supervisor::{Desired, Refusal};
+use domain::ladder::Rung;
+use domain::programme::{FrameChoice, ProgrammePhase};
+use domain::supervisor::{Desired, Event, Refusal};
 
 /// The final heartbeat's one attempt is bounded by this (C07 brief, "Final heartbeat with the exit
 /// reason"; wave gate 1 review I4, `docs/_INDEX.md` Owed 28): the beat whose report carries an
@@ -189,4 +192,115 @@ pub trait ControlPlane: Send {
     /// A report whose `exit` is `Some` is the final beat: one attempt, bounded by
     /// `FINAL_BEAT_TIMEOUT_MS`. Its result is classified exactly like any other beat's.
     fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Desired, HeartbeatError>;
+    /// A second instance for the final-beat lane (C08 review round 1, the coordinator's ruling), which
+    /// the control worker runs on its own thread: its own connection, so a call in flight on this
+    /// instance never holds a final beat up; and every credential this instance knows or LATER learns
+    /// (a fetched session's), so the final beat's text is scrubbed of them as this one's would be.
+    /// It only heartbeats.
+    fn final_lane(&self) -> Box<dyn ControlPlane>;
+}
+
+/// Input A's SRT pipeline (C10). `rebuild` tears down the current generation and builds `gen`;
+/// `stop` ends it for good (the drain, the exit).
+pub trait InputSource: Send {
+    fn rebuild(&mut self, gen: u64, spec: &InputSpec);
+    fn stop(&mut self);
+}
+
+/// The programme pipeline (C09): never rebuilt. `push` hands it tick `index`'s choice, and it
+/// timestamps the frame by that index, so the output stays constant-rate however the loop is paced.
+pub trait ProgrammeOutput: Send {
+    /// Builds and starts the pipeline once. Its error's text becomes the fatal exit's detail
+    /// (`Event::Fatal`), unredacted: C07's wire redacts it.
+    fn start(&mut self, profile: &OutputProfile) -> Result<(), String>;
+    fn push(&mut self, index: u64, choice: FrameChoice);
+    fn swap_sink(&mut self, gen: u64, target: &TargetSpec);
+    fn step_down(&mut self, rung: Rung);
+    fn hide_overlay(&mut self);
+    fn drain(&mut self);
+}
+
+/// The overlay page in CEF (C11). `restart` loads `url` as generation `gen`. (C05b PR #22 review I1)
+/// `stop` returns without waiting: it takes `restart`'s reaper teardown and kill fallback, and before
+/// it returns it closes the stopped generation's slot gate, so no sample of that generation reaches
+/// the overlay slot after it. It never blocks the loop (F-001: `set_state(NULL)` did not return for
+/// 10 s on a hung renderer).
+pub trait GraphicsRenderer: Send {
+    fn restart(&mut self, gen: u64, url: &str);
+    fn stop(&mut self);
+}
+
+/// The heartbeat's measured values (C12's `/proc` sampler plus C09's counters), sampled per beat.
+pub trait Metrics: Send {
+    fn sample(&mut self) -> Measured;
+}
+
+/// The compositor's programme phase, served to the overlay page on loopback (overlay templates spec
+/// 2026-10-15 §4.3). `seq` rises by one per change. The adapter (C12) holds the latest value and
+/// wakes long-polls; it serves `(Waiting, 0)` until the first `publish`.
+pub trait PhasePublisher: Send {
+    fn publish(&mut self, phase: ProgrammePhase, seq: u64);
+}
+
+/// The driver's own log lines (C12's amendment 2026-10-18; C14 cases 8 and 11 and C15 read them):
+/// `overlay hidden reason=<r> gen=<g>`, `cef ready|crashed|alive gen=<n>`,
+/// `ticks skipped total=<n>` and `heartbeats dropped total=<n>` (at most one of each a minute, and
+/// the rest at the exit; review round 1, item 4), and `run()`'s
+/// `final beat not confirmed within 2000 ms` (Owed 35). The adapter (C12)
+/// writes each as `ts=<rfc3339> level=info msg=<line>` on stderr: the timestamp is the adapter's,
+/// because this crate reads no clock. No line carries a credential or a fatal error's text: the
+/// driver never logs either (C07 confirm pass; Owed 32).
+pub trait LogSink: Send {
+    fn info(&mut self, line: &str);
+}
+
+/// What the loop asks of the control worker. A `Heartbeat` whose report carries an `exit` is a final
+/// beat, and the worker's queue never drops it (Owed 28). Its `Debug` is derived: `HealthReport`'s
+/// fatal text is an `ExitDetail`, which prints its length alone (Owed 31).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ControlRequest {
+    FetchSession,
+    Heartbeat(HealthReport, Measured),
+}
+
+/// The control worker's side of the queue (`control_worker::ControlHandle`). `request` never
+/// blocks the frame clock.
+pub trait ControlQueue: Send {
+    fn request(&mut self, req: ControlRequest);
+    /// Periodic beats replaced or retired before they were sent, so far (the driver logs it; review
+    /// round 1, item 4).
+    fn dropped(&self) -> u64;
+    /// Blocks until every final beat requested so far has been posted (its call returned, whatever
+    /// its result), or until `timeout` has passed on the queue's own clock, never the HTTP layer's
+    /// (DNS is unbounded inside ureq 2: C07 review I1, Owed 28). True if every one was posted. Only
+    /// `run()` calls it, once, after `Exit`.
+    fn flush(&mut self, timeout: Duration) -> bool;
+}
+
+/// A message into the loop: an adapter's or the worker's event, or the fetched session. Its `Debug`
+/// is derived: `SessionConfig` writes its own credential-free `Debug` (C07), and an `Event::Fatal`'s
+/// text is an `ExitDetail`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Inbound {
+    Event(Event),
+    Session(SessionConfig),
+}
+
+/// Every port the driver applies effects through.
+pub struct Ports {
+    pub input: Box<dyn InputSource>,
+    pub programme: Box<dyn ProgrammeOutput>,
+    pub graphics: Box<dyn GraphicsRenderer>,
+    pub metrics: Box<dyn Metrics>,
+    pub control: Box<dyn ControlQueue>,
+    pub phase: Box<dyn PhasePublisher>,
+    pub log: Box<dyn LogSink>,
+}
+
+// Trait objects can't derive `Debug`, and C01's `missing_debug_implementations` under `-D warnings`
+// makes a missing one fatal. The names alone: nothing a port holds is printed.
+impl fmt::Debug for Ports {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Ports { input, programme, graphics, metrics, control, phase, log }")
+    }
 }
