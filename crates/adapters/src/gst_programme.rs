@@ -37,7 +37,7 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 
-use crate::frame_store::{FrameStore, AUDIO_CHANNELS, AUDIO_FRAME_BYTES, AUDIO_RATE};
+use crate::frame_store::{FrameStore, AUDIO_CHANNELS, AUDIO_FRAME_BYTES, AUDIO_RATE, AUDIO_RING_BYTES};
 use crate::gst_output::{self, EncodedRing, Entry, LogFn, OutputGen, Shared};
 use crate::redact::Scrubber;
 use crate::slate::Slate;
@@ -60,6 +60,8 @@ const X264_OPTIONS: &str = "nal-hrd=cbr:filler=1";
 /// wave=pink-noise volume=0.001` encodes as real coded AAC, 3.9 % zero bytes, where digital silence
 /// encodes as 94.7 % zero bytes and made YouTube report Poor).
 const NOISE_PEAK: f32 = 0.001;
+/// The layers, by the index `Running::failing` keeps them at (for the push-failure lines).
+const LAYERS: [&str; 3] = ["base", "overlay", "audio"];
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -80,6 +82,10 @@ pub struct GstProgramme {
     refused_pushes: u64,
     /// `Emit`/`Repeat` ticks with no camera frame in the store (the slate was pushed instead).
     camera_missing: u64,
+    /// Events this (the driver's) thread could not deliver because the inbound channel was full.
+    events_dropped: u64,
+    /// Buffers an appsrc refused (`push_buffer` returned a flow error).
+    push_errors: u64,
     half_rate: bool,
     running: Option<Running>,
 }
@@ -101,6 +107,10 @@ struct Running {
     camera_fit: Fitter,
     overlay_fit: Fitter,
     last_index: Option<u64>,
+    /// The most missed periods a tick's audio fills (Owed 40): the frame store's ring, 400 ms.
+    audio_fill_periods: u64,
+    /// Each layer's last push failed (a run of failures is logged once).
+    failing: [bool; 3],
     drained: bool,
     output: Option<OutputGen>,
     stop: Arc<AtomicBool>,
@@ -123,6 +133,8 @@ impl GstProgramme {
             overlay_pushes: 0,
             refused_pushes: 0,
             camera_missing: 0,
+            events_dropped: 0,
+            push_errors: 0,
             half_rate: false,
             running: None,
         }
@@ -152,6 +164,22 @@ impl GstProgramme {
 
     pub fn camera_missing(&self) -> u64 {
         self.camera_missing
+    }
+
+    /// Events the driver's calls (`swap_sink`, `drain`) could not deliver: the inbound channel was
+    /// full, and the call never waits for room (its only reader is the caller's own loop).
+    pub fn events_dropped(&self) -> u64 {
+        self.events_dropped
+    }
+
+    /// `OutputProgress` events the output's poll could not deliver (the inbound channel was full).
+    pub fn progress_dropped(&self) -> u64 {
+        self.shared.progress_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Buffers the programme's appsrcs refused.
+    pub fn push_errors(&self) -> u64 {
+        self.push_errors
     }
 
     pub fn stats(&self) -> Arc<Stats> {
@@ -256,6 +284,30 @@ impl GstProgramme {
         .is_some()
     }
 
+    /// Test hook: the first PTS each of the current output's appsrcs sent downstream, (video,
+    /// audio), as the feeder rebased it. `None` if there is no output.
+    #[cfg(feature = "test-hooks")]
+    pub fn output_first_pts(&self) -> Option<(Option<gst::ClockTime>, Option<gst::ClockTime>)> {
+        Some(self.running.as_ref()?.output.as_ref()?.first_pts())
+    }
+
+    /// Test hook: stops the base layer's appsrc (NULL), so every base push is refused (flushing)
+    /// until `restart_base_layer`.
+    #[cfg(feature = "test-hooks")]
+    pub fn stop_base_layer(&self) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|r| r.base.set_state(gst::State::Null).is_ok())
+    }
+
+    /// Test hook: brings the base layer's appsrc back to the pipeline's state.
+    #[cfg(feature = "test-hooks")]
+    pub fn restart_base_layer(&self) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|r| r.base.sync_state_with_parent().is_ok())
+    }
+
     /// Test hook: posts an error on the programme's bus, as a failing element would, with `debug`
     /// as its debug text. False before `start()`.
     #[cfg(feature = "test-hooks")]
@@ -275,8 +327,19 @@ impl GstProgramme {
         self.running.as_ref()?.output.as_ref()?.sink().static_pad("sink")
     }
 
-    fn send_now(&self, e: Event) {
-        let _ = self.shared.tx.send(Inbound::Event(e));
+    /// An event from the driver's own calls: tried once, never waited for (PR #28 review item 2, the
+    /// coordinator's ruling). The driver's thread is the inbound channel's only reader, so waiting for
+    /// room there never ends. A lost `OutputError` is recovered by the domain's link, which times the
+    /// connect out and swaps again; a lost `OutputDrained` by its `drain_timeout_ms`.
+    fn send_now(&mut self, e: Event) {
+        let what = format!("{e:?}");
+        if self.shared.tx.try_send(Inbound::Event(e)).is_err() {
+            self.events_dropped += 1;
+            self.shared.log(&format!(
+                "programme: {what} not delivered: the inbound channel is full ({} dropped in all)",
+                self.events_dropped
+            ));
+        }
     }
 
     fn build(&mut self, profile: &OutputProfile) -> Result<Running, String> {
@@ -313,7 +376,13 @@ impl GstProgramme {
         let pipeline = gst::Pipeline::new();
         let base = appsrc(&base_caps, APPSRC_TICKS * base_info.size() as u64)?;
         let overlay = appsrc(&overlay_caps, APPSRC_TICKS * overlay_info.size() as u64)?;
-        let audio = appsrc(&audio_caps, APPSRC_TICKS * period_bytes as u64)?;
+        // A tick after a gap pushes the missed periods' audio too (Owed 40), up to the ring's span at
+        // once, so the audio appsrc holds that many beyond its usual three.
+        let audio_fill_periods = (AUDIO_RING_BYTES / period_bytes) as u64;
+        let audio = appsrc(
+            &audio_caps,
+            (APPSRC_TICKS + audio_fill_periods) * period_bytes as u64,
+        )?;
         let mixer = make("compositor")?;
         mixer.set_property_from_str("background", "black");
         // The first push's index is wherever the session's tick grid stands: start there, not at 0.
@@ -457,6 +526,8 @@ impl GstProgramme {
             transparent,
             noise: PinkNoise::default(),
             last_index: None,
+            audio_fill_periods,
+            failing: [false; 3],
             drained: false,
             output: None,
             stop,
@@ -561,7 +632,8 @@ impl ProgrammeOutput for GstProgramme {
             self.refused_pushes += 1;
             return;
         }
-        let gap = r.last_index.is_some_and(|last| index != last + 1);
+        let missed = r.last_index.map_or(0, |last| index - last - 1);
+        let gap = missed > 0;
         r.last_index = Some(index);
         let fps = u64::from(r.profile.fps);
         let at = |i: u64| gst::ClockTime::from_nseconds(i * 1_000_000_000 / fps);
@@ -589,7 +661,8 @@ impl ProgrammeOutput for GstProgramme {
             (None, FrameChoice::Slate(kind)) => slate_buffer(&r.slate, kind),
             (None, _) => slate_buffer(&r.slate, domain::programme::SlateKind::Waiting),
         };
-        push_timed(&r.base, base, pts, period, gap);
+        let res = push_timed(&r.base, base, pts, period, gap);
+        note_push(res, 0, &mut r.failing, &mut self.push_errors, &self.shared);
 
         // The overlay layer.
         let overlay_due = !self.half_rate || index.is_multiple_of(2);
@@ -600,16 +673,27 @@ impl ProgrammeOutput for GstProgramme {
                 .and_then(|s| r.overlay_fit.fit(&s))
                 .unwrap_or_else(|| r.transparent.clone());
             let covers = if self.half_rate { period * 2 } else { period };
-            push_timed(&r.overlay, frame, pts, covers, gap);
+            let res = push_timed(&r.overlay, frame, pts, covers, gap);
+            note_push(res, 1, &mut r.failing, &mut self.push_errors, &self.shared);
             self.overlay_pushes += 1;
         }
 
-        // The audio: the ring's real audio, and pink noise for whatever it lacks.
-        let noise = &mut r.noise;
-        let pcm = self
-            .frames
-            .take_audio_padded(r.period_bytes, |pad| noise.fill(pad));
-        push_timed(&r.audio, gst::Buffer::from_mut_slice(pcm), pts, period, gap);
+        // The audio: every missed period's first (Owed 40, owner 2026-10-19: no hole, no click; the
+        // compositor repeats the picture across the gap), then this tick's. Each is one period of
+        // the ring's real audio, and pink noise for whatever it lacks. The ring holds 400 ms, so a
+        // longer gap keeps the rest of its hole (marked DISCONT).
+        let filled = missed.min(r.audio_fill_periods);
+        let mut audio_gap = missed > filled;
+        for m in index - filled..=index {
+            let noise = &mut r.noise;
+            let pcm = self
+                .frames
+                .take_audio_padded(r.period_bytes, |pad| noise.fill(pad));
+            let buffer = gst::Buffer::from_mut_slice(pcm);
+            let res = push_timed(&r.audio, buffer, at(m), at(m + 1) - at(m), audio_gap);
+            note_push(res, 2, &mut r.failing, &mut self.push_errors, &self.shared);
+            audio_gap = false;
+        }
         self.shared.stats.on_push();
     }
 
@@ -779,15 +863,15 @@ fn slate_buffer(slate: &Slate, kind: domain::programme::SlateKind) -> gst::Buffe
         .expect("a rendered slate sample always holds its buffer")
 }
 
-/// A shallow copy of `buffer` (the memory is shared) stamped for its tick, then pushed. A push that
-/// fails is counted by appsrc's caller only as a dropped tick: it never panics or blocks.
+/// A shallow copy of `buffer` (the memory is shared) stamped for its tick, then pushed. Never panics
+/// or blocks; a refusal is the caller's to count (`note_push`).
 fn push_timed(
     src: &gst_app::AppSrc,
     buffer: gst::Buffer,
     pts: gst::ClockTime,
     duration: gst::ClockTime,
     gap: bool,
-) {
+) -> Result<(), gst::FlowError> {
     let mut b = buffer.copy();
     {
         let m = b.make_mut();
@@ -800,7 +884,32 @@ fn push_timed(
             m.unset_flags(gst::BufferFlags::DISCONT);
         }
     }
-    let _ = src.push_buffer(b);
+    src.push_buffer(b).map(|_| ())
+}
+
+/// One layer's push result (brief Step 6: "push_buffer errors are logged, redacted and counted"):
+/// every refusal is counted, and the first of a run is logged, through the scrubbing log, so a
+/// layer that keeps failing is one line, not one a tick.
+fn note_push(
+    res: Result<(), gst::FlowError>,
+    layer: usize,
+    failing: &mut [bool; 3],
+    errors: &mut u64,
+    shared: &Shared,
+) {
+    match res {
+        Ok(()) => failing[layer] = false,
+        Err(e) => {
+            *errors += 1;
+            if !std::mem::replace(&mut failing[layer], true) {
+                shared.log(&format!(
+                    "programme: the {} layer's push failed ({e:?}); each refusal is counted, and this \
+                     is said again only after the layer recovers",
+                    LAYERS[layer]
+                ));
+            }
+        }
+    }
 }
 
 /// The encoded `sample` as a ring entry, its PTS and DTS converted to running time through its own
@@ -846,14 +955,18 @@ fn hang_pad(pad: &gst::Pad, hold: Duration) -> bool {
 struct Fitter {
     target: gst_video::VideoInfo,
     border_argb: u32,
-    /// The converter for the last input shape, and the last converted frame (a `Repeat` tick
-    /// re-pushes the same camera sample, which is converted once).
+    /// The converter for the last input shape.
     converter: Option<(
         gst_video::VideoInfo,
         gst_video::VideoConverter,
         gst_video::VideoInfo,
     )>,
-    last: Option<(usize, gst::Buffer)>,
+    /// The last input buffer converted, and its conversion (a `Repeat` tick re-pushes the same
+    /// camera sample, which is converted once). The input is HELD, not just its address noted: a
+    /// buffer pool recycles a buffer nothing holds, so the next frame could arrive in the same
+    /// `GstBuffer` with new pixels (PR #28 review item 6, the coordinator's ruling). Held, it cannot
+    /// be recycled, and an equal address is the same frame.
+    last: Option<(gst::Buffer, gst::Buffer)>,
     /// The last input shape that could not be fitted, and whether it is still to be logged.
     refused: Option<(gst_video::VideoInfo, bool)>,
 }
@@ -877,15 +990,14 @@ impl Fitter {
         if same_shape(&info, &self.target) {
             return Some(buffer);
         }
-        let key = buffer.as_ptr() as usize;
-        if let Some((k, b)) = &self.last {
-            if *k == key {
-                return Some(b.clone());
+        if let Some((held, out)) = &self.last {
+            if held.as_ptr() == buffer.as_ptr() {
+                return Some(out.clone());
             }
         }
-        let fitted = self.convert(buffer, &info);
+        let fitted = self.convert(buffer.clone(), &info);
         match &fitted {
-            Some(out) => self.last = Some((key, out.clone())),
+            Some(out) => self.last = Some((buffer, out.clone())),
             None => {
                 let new = !self.refused.as_ref().is_some_and(|(i, _)| same_shape(i, &info));
                 if new {

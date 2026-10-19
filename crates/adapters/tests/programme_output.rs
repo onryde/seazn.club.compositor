@@ -872,17 +872,38 @@ fn stats_egress_and_bitrate_follow_bytes_sent() {
     );
 }
 
+/// The encoder's speed over 2 s of real-pace pushes from `from` (PR #28 review item 5). One 1 s window
+/// moves by a whole frame (1/30 = 0.033) when a frame lands on either side of its edge, the size of
+/// the 0.95 floor's margin, so one window flaked. Two consecutive windows, read exactly 1 s apart
+/// on the tick grid (the 2nd and 3rd seconds, after a whole window of real-time output), halve it.
+fn paced_speed_over_two_windows(p: &mut GstProgramme, from: u64) -> f64 {
+    let stats = p.stats();
+    let fps = u64::from(P720.fps);
+    let mut read = Vec::new();
+    pace_with(
+        p,
+        from..from + 3 * fps + 2,
+        |_| FrameChoice::Slate(SlateKind::Waiting),
+        |i| {
+            if i == from + 2 * fps || i == from + 3 * fps {
+                read.push(stats.snapshot().encoder_speed.expect("a window"));
+            }
+        },
+    );
+    assert_eq!(read.len(), 2, "{read:?}");
+    eprintln!("encoder speed windows from tick {from}: {read:?}");
+    (read[0] + read[1]) / 2.0
+}
+
 #[test]
 fn stats_encoder_speed_tracks_real_time_and_drops_when_starved() {
     let _s = serial();
     let (mut p, _rx, _f, _l) = programme();
     let band = ENCODER_SPEED_REALTIME_MIN..=1.1;
-    pace(&mut p, 0..60, FrameChoice::Slate(SlateKind::Waiting));
-    let first = p.stats().snapshot().encoder_speed.expect("a window");
+    let first = paced_speed_over_two_windows(&mut p, 0);
     thread::sleep(Duration::from_millis(1_500));
     let starved = p.stats().snapshot().encoder_speed.expect("a window");
-    pace(&mut p, 60..120, FrameChoice::Slate(SlateKind::Waiting));
-    let resumed = p.stats().snapshot().encoder_speed.expect("a window");
+    let resumed = paced_speed_over_two_windows(&mut p, 92);
     eprintln!("encoder speed: {first:.3} → starved {starved:.3} → resumed {resumed:.3}");
     assert!(band.contains(&first), "real time {first}");
     assert!(starved < 0.5, "starved {starved}");
@@ -1828,4 +1849,465 @@ fn a_drain_waits_for_the_sink_to_take_everything() {
     );
     assert!(progress > 0, "the watch was running");
     assert!(!seen.contains(&Event::OutputDrained), "{seen:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// PR #28 review, round 1
+
+/// Review item 1: a swap that lands just before the retired output's next poll. The retired watch's
+/// last reading lands after the new sink has started counting; it must change nothing. Egress never
+/// exceeds what is on disk (each sink's total is a file's size at some earlier instant), and once the
+/// new sink has one complete window its bitrate is a real rate, not the 0 a stale higher total left.
+#[test]
+fn egress_and_bitrate_survive_a_swap_just_before_the_old_poll() {
+    let _s = serial();
+    let dir = Tmp::new("swap-before-poll");
+    let (mut p, _rx, _f, _l) = programme();
+    let stats = p.stats();
+    let step = period(&P720);
+    let poll = Duration::from_millis(OUTPUT_PROGRESS_POLL_MS);
+    let t0 = Instant::now();
+    let mut i = 0u64;
+    let push_until = |p: &mut GstProgramme, until: Instant, i: &mut u64| {
+        while Instant::now() < until {
+            let due = t0 + step * (*i as u32);
+            if let Some(w) = due.checked_duration_since(Instant::now()) {
+                thread::sleep(w.min(until.saturating_duration_since(Instant::now())));
+            }
+            if Instant::now() >= due {
+                p.push(*i, FrameChoice::Slate(SlateKind::Waiting));
+                *i += 1;
+            }
+        }
+    };
+    let on_disk = |n: u64| -> u64 {
+        (1..=n)
+            .map(|g| {
+                std::fs::metadata(dir.file(&format!("g{g}.flv")))
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            })
+            .sum()
+    };
+    p.swap_sink(1, &file_target(&dir.file("g1.flv")));
+    let mut built = Instant::now();
+    // The first sink lives 4 s, so a stale reading of it is large; the swap lands 25 ms before its
+    // watch's 16th poll.
+    push_until(&mut p, built + poll * 16 - Duration::from_millis(25), &mut i);
+    let mut checked = 0;
+    for gen in 2..=7u64 {
+        p.swap_sink(gen, &file_target(&dir.file(&format!("g{gen}.flv"))));
+        built = Instant::now();
+        // 120 ms on, the retired watch's poll has landed (it was due 25 ms after the swap).
+        push_until(&mut p, built + Duration::from_millis(120), &mut i);
+        let egress = stats.snapshot().egress_bytes.unwrap_or(0);
+        let disk = on_disk(gen);
+        // 1.6 s on, the new sink's first window (from its first poll at 250 ms) is complete.
+        push_until(&mut p, built + Duration::from_millis(1_600), &mut i);
+        let later = stats.snapshot();
+        let disk_later = on_disk(gen);
+        eprintln!(
+            "gen {gen}: +120 ms egress {egress} on disk {disk}; +1.6 s egress {:?} on disk {disk_later}, bitrate {:?}",
+            later.egress_bytes, later.bitrate_kbps
+        );
+        assert!(
+            egress <= disk,
+            "gen {gen}: egress {egress} over the {disk} bytes on disk"
+        );
+        assert!(
+            later.egress_bytes.unwrap_or(0) <= disk_later,
+            "gen {gen}: {later:?} over {disk_later}"
+        );
+        // A healthy 720p sink sends at least a quarter of its video rate.
+        let floor = P720.video_kbps / 4;
+        assert!(
+            later.bitrate_kbps.is_some_and(|b| b >= floor),
+            "gen {gen}: bitrate {:?}, floor {floor}",
+            later.bitrate_kbps
+        );
+        checked += 1;
+        // The next swap lands 25 ms before this sink's watch's 7th poll.
+        push_until(&mut p, built + poll * 7 - Duration::from_millis(25), &mut i);
+    }
+    eprintln!("swaps timed before a poll checked: {checked}");
+    assert_eq!(checked, 6);
+}
+
+/// Review item 2 (ruling: `try_send` and a drop counter): the driver's thread is the inbound
+/// channel's only reader, so a call on it that waits for room never returns. A refused swap (before
+/// `start`, or a scheme the adapter refuses) and a drain with nothing started each try once and
+/// count the drop. The lost `OutputError` costs nothing lasting: the domain's link times the connect
+/// out and swaps again.
+#[test]
+fn refused_calls_never_block_on_a_full_inbound_channel() {
+    let _s = serial();
+    gst::init().expect("gstreamer");
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    tx.send(Inbound::Event(Event::Tick)).expect("fill the channel");
+    let lines: Lines = Arc::default();
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    let worker = thread::spawn({
+        let lines = Arc::clone(&lines);
+        move || {
+            let log = move |l: &str| {
+                lines
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(l.to_owned())
+            };
+            let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(log);
+            let refused = TargetSpec {
+                url: "srt://127.0.0.1:9".to_owned(),
+                stream_key: "SECRETKEY-full-channel".to_owned(),
+            };
+            // Never started: a swap and a drain.
+            let mut idle = GstProgramme::new(FrameStore::default(), tx.clone()).with_log(Arc::clone(&log));
+            idle.swap_sink(1, &file_target(Path::new("/tmp/never.flv")));
+            idle.drain();
+            // Started: a scheme the adapter refuses.
+            let mut started = GstProgramme::new(FrameStore::default(), tx).with_log(log);
+            started.start(&P720).expect("start");
+            started.swap_sink(2, &refused);
+            let _ = done_tx.send((idle.events_dropped(), started.events_dropped()));
+        }
+    });
+    let returned = done_rx.recv_timeout(Duration::from_secs(3));
+    // Unblock a blocked worker either way, so the test process can end.
+    let mut seen = Vec::new();
+    while let Ok(m) = rx.recv_timeout(Duration::from_millis(200)) {
+        if let Inbound::Event(e) = m {
+            seen.push(e);
+        }
+    }
+    let _ = worker.join();
+    let (idle, started) = returned.expect("the calls returned within 3 s with the channel full");
+    let lines = lines.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let logged = lines.iter().filter(|l| l.contains("not delivered")).count();
+    eprintln!("dropped: idle {idle}, started {started}; lines naming the drop {logged}; delivered {seen:?}");
+    assert_eq!((idle, started), (2, 1));
+    assert_eq!(logged, 3, "{lines:?}");
+    assert_eq!(seen, vec![Event::Tick], "only what was there before");
+    assert!(lines.iter().all(|l| !l.contains("SECRETKEY")), "{lines:?}");
+}
+
+/// Review item 3: a sink that dies mid-stream and is not swapped (the domain is in its back-off, or
+/// in the hold), then the session drains. Nothing more can reach the dead sink, so the drain ends
+/// when the encoders do, well inside the domain's `drain_timeout_ms`.
+#[test]
+fn a_failed_sink_left_in_place_still_drains() {
+    let _s = serial();
+    let dir = Tmp::new("failed-in-place");
+    let (mut p, rx, _f, _l) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    pace(&mut p, 0..15, FrameChoice::Slate(SlateKind::Waiting));
+    assert!(p.fail_sink_writes());
+    pace(&mut p, 15..30, FrameChoice::Slate(SlateKind::Waiting));
+    events_until(&rx, Duration::from_secs(2), |e| {
+        *e == Event::OutputError { gen: 1 }
+    });
+    let t = Instant::now();
+    p.drain();
+    let seen = events_for(&rx, Duration::from_millis(2_000));
+    let drained = seen.iter().filter(|e| **e == Event::OutputDrained).count();
+    let bound = Thresholds::default().drain_timeout_ms;
+    eprintln!(
+        "drained events {drained} within 2 s of the drain (took {:?}); the domain waits {bound} ms",
+        t.elapsed()
+    );
+    assert_eq!(drained, 1, "{seen:?}");
+}
+
+/// Review item 3, the other order: the sink stops taking writes during the drain (the encoders have
+/// reached EOS, and the sink never will), then errors, as rtmp2sink does when its write times out.
+/// The error ends the drain: nothing more can reach that sink.
+#[test]
+fn a_sink_that_fails_during_the_drain_ends_it() {
+    let _s = serial();
+    let dir = Tmp::new("fail-in-drain");
+    let (mut p, rx, _f, _l) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    pace(&mut p, 0..30, FrameChoice::Slate(SlateKind::Waiting));
+    assert!(p.hold_sink_writes());
+    p.drain();
+    let before = events_for(&rx, Duration::from_millis(1_000));
+    assert!(!before.contains(&Event::OutputDrained), "{before:?}");
+    assert!(p.plant_output_error());
+    let after = events_for(&rx, Duration::from_millis(1_000));
+    let drained = after.iter().filter(|e| **e == Event::OutputDrained).count();
+    eprintln!("held drain, then the sink's error: {after:?}");
+    assert!(after.contains(&Event::OutputError { gen: 1 }), "{after:?}");
+    assert_eq!(drained, 1, "{after:?}");
+}
+
+/// Review item 4 (ruling: keep the rebase, witnessed on the appsrc side): flvmux starts its own
+/// timestamps at 0, so the file cannot tell a rebased output from one that is not. What the feeder
+/// sends into the output's appsrcs can: a second sink, built 2 s into the programme, starts its video
+/// at exactly 0 and its audio within one AAC frame of it.
+#[test]
+fn each_output_rebases_its_first_timestamps_to_zero() {
+    let _s = serial();
+    let dir = Tmp::new("rebase");
+    let (mut p, rx, _f, _l) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    pace(&mut p, 0..60, FrameChoice::Slate(SlateKind::Waiting));
+    p.swap_sink(2, &file_target(&dir.file("b.flv")));
+    pace(&mut p, 60..90, FrameChoice::Slate(SlateKind::Waiting));
+    let (video, audio) = p.output_first_pts().expect("an output");
+    drain_and_wait(&mut p, &rx);
+    eprintln!("second sink's first PTS: video {video:?}, audio {audio:?} (built at 2 s of programme)");
+    assert_eq!(video, Some(gst::ClockTime::ZERO));
+    let aac_frame = gst::ClockTime::from_nseconds(1_024 * 1_000_000_000 / 48_000);
+    assert!(audio.is_some_and(|a| a <= aac_frame), "{audio:?}");
+}
+
+/// Review item 6 (ruling: the fitter holds the input buffer it cached by): a camera's buffer pool
+/// recycles a buffer as soon as nothing holds it, so the next frame can arrive in the very same
+/// `GstBuffer` with new pixels. Keyed by address alone, the fitter served the old frame's conversion.
+#[test]
+fn a_recycled_camera_buffer_is_converted_again() {
+    let _s = serial();
+    let dir = Tmp::new("pool-recycle");
+    let (mut p, rx, frames, _l) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    let i420 = gst_video::VideoFormat::I420;
+    // A shape the programme does not take (640×360), so every frame goes through the fitter.
+    let info = gst_video::VideoInfo::builder(i420, 640, 360)
+        .build()
+        .expect("info");
+    let caps = info.to_caps().expect("caps");
+    let pool = gst::BufferPool::new();
+    let mut config = pool.config();
+    config.set_params(Some(&caps), info.size() as u32, 1, 2);
+    pool.set_config(config).expect("pool config");
+    pool.set_active(true).expect("pool active");
+    let from_pool = |rgba: [u8; 4]| -> (gst::Sample, usize) {
+        let pixels = solid(i420, 640, 360, rgba);
+        let bytes = pixels
+            .buffer()
+            .expect("buffer")
+            .map_readable()
+            .expect("map")
+            .to_vec();
+        let mut b = pool.acquire_buffer(None).expect("a pool buffer");
+        b.get_mut()
+            .expect("writable")
+            .copy_from_slice(0, &bytes)
+            .expect("fill");
+        let at = b.as_ptr() as usize;
+        (gst::Sample::builder().buffer(&b).caps(&caps).build(), at)
+    };
+    // The programme's own shape skips the fitter; it releases the pool buffer from the store.
+    let native = solid(i420, P720.width, P720.height, [0, 255, 0, 255]);
+    let colours = [[255u8, 0, 0, 255], [0, 0, 255, 255]];
+    let mut addresses = Vec::new();
+    let mut want = Vec::new();
+    let step = period(&P720);
+    let t0 = Instant::now();
+    for i in 0..20u64 {
+        if let Some(w) = (t0 + step * i as u32).checked_duration_since(Instant::now()) {
+            thread::sleep(w);
+        }
+        frames.set_camera(native.clone());
+        let c = colours[(i % 2) as usize];
+        let (sample, at) = from_pool(c);
+        addresses.push(at);
+        frames.set_camera(sample);
+        want.push(i % 2);
+        p.push(i, FrameChoice::Emit);
+    }
+    drain_and_wait(&mut p, &rx);
+    pool.set_active(false).expect("pool inactive");
+    let d = decode(&dir.file("a.flv"));
+    assert_eq!(d.frames.len(), 20);
+    let wrong: Vec<(usize, u64)> = d
+        .frames
+        .iter()
+        .enumerate()
+        .filter(|(i, f)| {
+            if want[*i] == 0 {
+                !is_red(f.centre)
+            } else {
+                !is_blue(f.centre)
+            }
+        })
+        .map(|(i, _)| (i, want[i]))
+        .collect();
+    let reused = addresses.windows(2).filter(|w| w[0] == w[1]).count();
+    eprintln!(
+        "pool frames checked: {}, consecutive frames in a reused buffer: {reused}, wrong: {wrong:?}",
+        d.frames.len()
+    );
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
+
+/// Review item 7: progress the poll could not deliver is counted and said, once when the channel
+/// fills and once, with the count, when it drains.
+#[test]
+fn progress_dropped_on_a_full_channel_is_counted_and_logged() {
+    let _s = serial();
+    let dir = Tmp::new("progress-dropped");
+    gst::init().expect("gstreamer");
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    tx.send(Inbound::Event(Event::Tick)).expect("fill the channel");
+    let lines: Lines = Arc::default();
+    let sink = Arc::clone(&lines);
+    let mut p = GstProgramme::new(FrameStore::default(), tx).with_log(Arc::new(move |l: &str| {
+        sink.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(l.to_owned());
+    }));
+    p.start(&P720).expect("start");
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    pace(&mut p, 0..30, FrameChoice::Slate(SlateKind::Waiting));
+    let dropped = p.progress_dropped();
+    // Room again: the next poll is delivered, and says how many were not.
+    let _ = rx.recv();
+    let first = events_until(&rx, Duration::from_secs(2), |e| {
+        matches!(e, Event::OutputProgress { .. })
+    });
+    let lines_now = lines.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let full = lines_now
+        .iter()
+        .filter(|l| l.contains("inbound channel is full"))
+        .count();
+    let summed: Vec<&String> = lines_now
+        .iter()
+        .filter(|l| l.contains("progress events were dropped"))
+        .collect();
+    eprintln!("dropped {dropped} over 1 s; lines: full {full}, summed {summed:?}; first after {first:?}");
+    assert!(dropped >= 3, "{dropped}");
+    assert_eq!(full, 1, "{lines_now:?}");
+    assert_eq!(summed.len(), 1, "{lines_now:?}");
+    // The line's count is the streak's: at least what was dropped before the channel drained, and
+    // no more than the counter now.
+    let said: u64 = summed[0]
+        .split(": ")
+        .nth(1)
+        .and_then(|t| t.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .expect("a count in the line");
+    assert!(
+        (dropped..=p.progress_dropped()).contains(&said),
+        "{said} against {dropped}..={}",
+        p.progress_dropped()
+    );
+    drain_and_wait(&mut p, &rx);
+}
+
+/// Review item 8 (brief Step 6: "push_buffer errors are logged, redacted and counted"): a layer whose
+/// appsrc refuses buffers counts every refusal and says so once a run: once when it starts failing,
+/// and once more only after it has recovered and fails again.
+#[test]
+fn a_refused_layer_push_is_counted_and_logged_once_a_run() {
+    let _s = serial();
+    let dir = Tmp::new("push-errors");
+    let (mut p, _rx, _f, lines) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    pace(&mut p, 0..10, FrameChoice::Slate(SlateKind::Waiting));
+    assert_eq!(p.push_errors(), 0);
+    let said = |lines: &Lines| -> Vec<String> {
+        let l = lines.lock().unwrap_or_else(PoisonError::into_inner);
+        l.iter().filter(|l| l.contains("push failed")).cloned().collect()
+    };
+    assert!(p.stop_base_layer());
+    pace(&mut p, 10..20, FrameChoice::Slate(SlateKind::Waiting));
+    let first_run = (p.push_errors(), said(&lines).len());
+    assert!(p.restart_base_layer());
+    pace(&mut p, 20..30, FrameChoice::Slate(SlateKind::Waiting));
+    let recovered = (p.push_errors(), said(&lines).len());
+    assert!(p.stop_base_layer());
+    pace(&mut p, 30..35, FrameChoice::Slate(SlateKind::Waiting));
+    let second_run = (p.push_errors(), said(&lines));
+    eprintln!("(errors, lines): first run {first_run:?}, recovered {recovered:?}, second run {second_run:?}");
+    assert_eq!(first_run, (10, 1));
+    assert_eq!(recovered, (10, 1), "the restarted layer pushes again");
+    assert_eq!(second_run.0, 15);
+    assert_eq!(second_run.1.len(), 2, "{:?}", second_run.1);
+    assert!(
+        second_run.1.iter().all(|l| l.contains("base")),
+        "{:?}",
+        second_run.1
+    );
+}
+
+/// Owed 40's bound: the ring holds 400 ms of audio, so a 1 s gap fills its last 400 ms (12 periods at
+/// 30 fps) and keeps the rest as one hole, never a burst of a whole second of filler.
+#[test]
+fn a_long_gap_fills_only_the_rings_span_of_audio() {
+    let _s = serial();
+    let dir = Tmp::new("long-gap");
+    let (mut p, rx, _f, _l) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    pace(&mut p, 0..30, FrameChoice::Slate(SlateKind::Waiting));
+    thread::sleep(Duration::from_secs(1));
+    pace(&mut p, 60..90, FrameChoice::Slate(SlateKind::Waiting));
+    drain_and_wait(&mut p, &rx);
+    let d = decode(&dir.file("a.flv"));
+    let jumps: Vec<u64> = d
+        .audio_pts_ms
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|&dt| dt > 22)
+        .collect();
+    // 30 periods missed, 12 filled (`AUDIO_RING_BYTES` over one period): an 18-period hole, 600 ms,
+    // seen as one jump of the hole plus one AAC frame.
+    let period_ms = 1_000 / u64::from(P720.fps);
+    let fill = (AUDIO_RING_BYTES / (48_000 / P720.fps as usize * 4)) as u64;
+    let hole_ms = (30 - fill) * 1_000 / u64::from(P720.fps);
+    eprintln!("audio frames checked {}, jumps {jumps:?}; filled {fill} periods, hole {hole_ms} ms ({period_ms} ms a period)", d.audio_pts_ms.len());
+    assert_eq!(fill, 12);
+    assert_eq!(jumps.len(), 1, "{jumps:?}");
+    assert!(
+        jumps[0].abs_diff(hole_ms + 21) <= 22,
+        "{jumps:?} against {hole_ms} + one frame"
+    );
+}
+
+/// Owed 40 (owner, 2026-10-19: "1 ok"): a skipped tick leaves no hole in the audio. The compositor
+/// repeats the last picture across the gap; the audio of every missed period is pushed with the next
+/// tick, from the ring and then the filler, so the track has no jump and its full length.
+#[test]
+fn skipped_ticks_leave_no_hole_in_the_audio() {
+    let _s = serial();
+    let dir = Tmp::new("skipped-ticks");
+    let (mut p, rx, _f, _l) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    let step = period(&P720);
+    let t0 = Instant::now();
+    let mut skipped = 0;
+    for i in 0..150u64 {
+        if let Some(w) = (t0 + step * i as u32).checked_duration_since(Instant::now()) {
+            thread::sleep(w);
+        }
+        if i % 10 == 9 {
+            skipped += 1;
+            continue;
+        }
+        p.push(i, FrameChoice::Slate(SlateKind::Waiting));
+    }
+    drain_and_wait(&mut p, &rx);
+    let d = decode(&dir.file("a.flv"));
+    // One AAC frame is 21.3 ms; a jump past 22 ms is a hole.
+    let jumps: Vec<u64> = d
+        .audio_pts_ms
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|&dt| dt > 22)
+        .collect();
+    // Index 148 is the last pushed, so the audio covers 149 periods.
+    let want_ms = 149 * 1_000 / u64::from(P720.fps);
+    eprintln!(
+        "ticks skipped {skipped}; video frames {}; audio frames checked {}, jumps {jumps:?}; audio {} ms against {want_ms}",
+        d.frames.len(),
+        d.audio_pts_ms.len(),
+        d.audio_ms()
+    );
+    assert_eq!(skipped, 15, "9, 19, … 149");
+    assert!(d.audio_pts_ms.len() > 200, "{}", d.audio_pts_ms.len());
+    assert!(jumps.is_empty(), "{jumps:?}");
+    assert!(
+        d.audio_ms().abs_diff(want_ms) <= AV_TOLERANCE_MS,
+        "audio {} ms",
+        d.audio_ms()
+    );
 }

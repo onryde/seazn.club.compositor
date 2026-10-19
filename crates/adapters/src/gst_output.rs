@@ -259,8 +259,14 @@ pub(crate) struct OutputGen {
     sink: gst::Element,
     #[cfg(feature = "test-hooks")]
     srcs: (gst_app::AppSrc, gst_app::AppSrc),
+    #[cfg(feature = "test-hooks")]
+    first_pts: FirstPts,
     retired: Arc<AtomicBool>,
 }
+
+/// The first PTS each output appsrc sent downstream, (video, audio) (the test hooks read it).
+#[cfg(feature = "test-hooks")]
+type FirstPts = Arc<Mutex<(Option<gst::ClockTime>, Option<gst::ClockTime>)>>;
 
 impl fmt::Debug for OutputGen {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -286,6 +292,12 @@ impl OutputGen {
             .src(&self.sink)
             .build();
         self.pipeline.post_message(msg).is_ok()
+    }
+
+    /// The first PTS each appsrc sent downstream (the test hooks read it).
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn first_pts(&self) -> (Option<gst::ClockTime>, Option<gst::ClockTime>) {
+        *locked(&self.first_pts)
     }
 
     /// The bytes queued in the video and audio appsrcs (the test hooks read them).
@@ -390,12 +402,14 @@ pub(crate) fn build(shared: &Shared, gen: u64, target: &TargetSpec) -> Result<Ou
         return Err(format!("output gen={gen}: did not start: {e}"));
     }
 
-    shared.stats.on_new_sink();
+    let stats_sink = shared.stats.on_new_sink();
     shared.ring.set_owner(gen);
     let retired = Arc::new(AtomicBool::new(false));
 
     #[cfg(feature = "test-hooks")]
     let srcs = (vsrc.clone(), asrc.clone());
+    #[cfg(feature = "test-hooks")]
+    let first_pts = record_first_pts(&vsrc, &asrc);
     let feeder = Feeder {
         gen,
         vsrc,
@@ -410,6 +424,8 @@ pub(crate) fn build(shared: &Shared, gen: u64, target: &TargetSpec) -> Result<Ou
 
     let watch = Watch {
         gen,
+        stats_sink,
+        dropped_streak: 0,
         bus: pipeline.bus().ok_or("output: pipeline has no bus")?,
         sink: sink.clone(),
         file: match &dest {
@@ -431,8 +447,33 @@ pub(crate) fn build(shared: &Shared, gen: u64, target: &TargetSpec) -> Result<Ou
         sink,
         #[cfg(feature = "test-hooks")]
         srcs,
+        #[cfg(feature = "test-hooks")]
+        first_pts,
         retired,
     })
+}
+
+/// A probe on each appsrc's src pad that records the first buffer's PTS, then removes itself.
+#[cfg(feature = "test-hooks")]
+fn record_first_pts(vsrc: &gst_app::AppSrc, asrc: &gst_app::AppSrc) -> FirstPts {
+    let first: FirstPts = Arc::default();
+    for (video, src) in [(true, vsrc), (false, asrc)] {
+        let Some(pad) = src.static_pad("src") else {
+            continue;
+        };
+        let first = Arc::clone(&first);
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            let pts = info.buffer().and_then(|b| b.pts());
+            let mut f = locked(&first);
+            if video {
+                f.0 = pts;
+            } else {
+                f.1 = pts;
+            }
+            gst::PadProbeReturn::Remove
+        });
+    }
+    first
 }
 
 fn link_to_mux(src: &gst::Element, mux: &gst::Element, template: &str) -> Result<(), String> {
@@ -586,6 +627,10 @@ fn rebased(sample: &gst::Sample, base: gst::ClockTime) -> Option<gst::Sample> {
 /// The output's bus and its progress poll.
 struct Watch {
     gen: u64,
+    /// This sink's serial in `Stats` (`Stats::on_new_sink`).
+    stats_sink: u64,
+    /// Progress events not delivered since the last one that was.
+    dropped_streak: u64,
     bus: gst::Bus,
     sink: gst::Element,
     file: Option<PathBuf>,
@@ -594,7 +639,7 @@ struct Watch {
 }
 
 impl Watch {
-    fn run(self) {
+    fn run(mut self) {
         let poll = Duration::from_millis(OUTPUT_PROGRESS_POLL_MS);
         let mut next_poll = Instant::now() + poll;
         let mut failed = false;
@@ -625,7 +670,16 @@ impl Watch {
                         ));
                         if !failed {
                             failed = true;
+                            // Nothing more reaches a failed sink, so the ring is no longer its: a
+                            // drain now ends when the encoders do, whether it started before the
+                            // failure or after it, with the dead sink still in place (PR #28 review
+                            // item 3; the domain swaps it only after its back-off, and never in
+                            // the hold).
+                            self.shared.ring.release(self.gen);
                             self.shared.send(Event::OutputError { gen: self.gen });
+                            if self.shared.ring.take_drained_without_output() {
+                                self.shared.send(Event::OutputDrained);
+                            }
                         }
                     }
                     gst::MessageView::Warning(w) => self.shared.log(&format!(
@@ -659,15 +713,31 @@ impl Watch {
         }
     }
 
-    fn progress(&self) {
+    /// One reading into `Stats` and one `OutputProgress`, never waited for: a full channel drops it
+    /// (the next poll carries a newer total), counts it, and says so once when the channel fills and
+    /// once, with the count, when an event is delivered again.
+    fn progress(&mut self) {
         let total = self.total();
-        self.shared.stats.on_sink_total(total);
+        self.shared.stats.on_sink_total(self.stats_sink, total);
         let e = Inbound::Event(Event::OutputProgress {
             gen: self.gen,
             total_bytes: total,
         });
         if self.shared.tx.try_send(e).is_err() {
             self.shared.progress_dropped.fetch_add(1, Ordering::Relaxed);
+            if self.dropped_streak == 0 {
+                self.shared.log(&format!(
+                    "output gen={}: the inbound channel is full; progress events are dropped until it drains",
+                    self.gen
+                ));
+            }
+            self.dropped_streak += 1;
+        } else if self.dropped_streak > 0 {
+            self.shared.log(&format!(
+                "output gen={}: {} progress events were dropped while the inbound channel was full",
+                self.gen, self.dropped_streak
+            ));
+            self.dropped_streak = 0;
         }
     }
 

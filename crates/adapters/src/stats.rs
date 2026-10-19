@@ -46,6 +46,10 @@ struct Inner {
     egress_before_sink: u64,
     /// The current sink's latest total.
     sink_total: u64,
+    /// The sink whose readings count: `on_new_sink`'s serial (0 before the first).
+    sink: u64,
+    /// Sinks started so far.
+    sinks: u64,
     egress_seen: bool,
     bitrate: Windowed,
     encoder: Windowed,
@@ -66,17 +70,22 @@ impl Stats {
         self.on_encoded_video_at(Instant::now(), pts);
     }
 
-    /// A new sink starts counting from 0: the bitrate window restarts, the egress carries on.
-    pub fn on_new_sink(&self) {
+    /// A new sink starts counting from 0: the bitrate window restarts, the egress carries on. Returns
+    /// the sink's serial, which its readings carry: from now on only its readings count.
+    pub fn on_new_sink(&self) -> u64 {
         let mut s = locked(&self.inner);
         s.egress_before_sink += s.sink_total;
         s.sink_total = 0;
         s.bitrate = Windowed::default();
+        s.sinks += 1;
+        s.sink = s.sinks;
+        s.sink
     }
 
-    /// A poll read the current sink's bytes-sent total.
-    pub fn on_sink_total(&self, total_bytes: u64) {
-        self.on_sink_total_at(Instant::now(), total_bytes);
+    /// A poll read sink `sink`'s bytes-sent total. A retired sink's last poll can land after its
+    /// successor started (PR #28 review item 1): it is not the current sink's, and changes nothing.
+    pub fn on_sink_total(&self, sink: u64, total_bytes: u64) {
+        self.on_sink_total_at(Instant::now(), sink, total_bytes);
     }
 
     pub fn snapshot(&self) -> StatsSnapshot {
@@ -108,8 +117,12 @@ impl Stats {
         s.encoder.record(now, pts, pts);
     }
 
-    pub(crate) fn on_sink_total_at(&self, now: Instant, total_bytes: u64) {
+    pub(crate) fn on_sink_total_at(&self, now: Instant, sink: u64, total_bytes: u64) {
         let mut s = locked(&self.inner);
+        // Checked under the lock `on_new_sink` takes, so no reading slips in between.
+        if sink != s.sink {
+            return;
+        }
         // A sink's total never falls; a lower reading is a stale one and changes nothing.
         let total = total_bytes.max(s.sink_total);
         s.sink_total = total;
@@ -241,29 +254,57 @@ mod tests {
     fn egress_is_cumulative_across_sinks_and_the_bitrate_restarts_per_sink() {
         let s = Stats::default();
         let t0 = Instant::now();
-        s.on_sink_total_at(t0, 0);
+        let first = s.on_new_sink();
+        s.on_sink_total_at(t0, first, 0);
         assert_eq!(
             s.snapshot_at(t0).egress_bytes,
             None,
             "a zero total has sent nothing"
         );
-        s.on_sink_total_at(t0 + ms(250), 125_000);
-        s.on_sink_total_at(t0 + ms(1_250), 625_000);
+        s.on_sink_total_at(t0 + ms(250), first, 125_000);
+        s.on_sink_total_at(t0 + ms(1_250), first, 625_000);
         let snap = s.snapshot_at(t0 + ms(1_300));
         assert_eq!(snap.egress_bytes, Some(625_000));
         // Window 0 ran from 0 (the first reading) to 125 000 at its last reading.
         assert_eq!(snap.bitrate_kbps, Some(1_000));
-        s.on_new_sink();
+        let second = s.on_new_sink();
         assert_eq!(
             s.snapshot_at(t0 + ms(1_300)).bitrate_kbps,
             None,
             "a new sink has no window"
         );
-        s.on_sink_total_at(t0 + ms(1_500), 1_000);
+        s.on_sink_total_at(t0 + ms(1_500), second, 1_000);
         assert_eq!(s.snapshot_at(t0 + ms(1_500)).egress_bytes, Some(626_000));
         // A stale lower reading never lowers the total.
-        s.on_sink_total_at(t0 + ms(1_600), 10);
+        s.on_sink_total_at(t0 + ms(1_600), second, 10);
         assert_eq!(s.snapshot_at(t0 + ms(1_600)).egress_bytes, Some(626_000));
+    }
+
+    // PR #28 review item 1: the retired sink's last poll lands after its successor started. It
+    // counts for nothing: not in the egress, and not as the new sink's first bitrate reading.
+    #[test]
+    fn a_retired_sinks_late_reading_changes_nothing() {
+        let s = Stats::default();
+        let t0 = Instant::now();
+        let old = s.on_new_sink();
+        s.on_sink_total_at(t0, old, 4_000_000);
+        let new = s.on_new_sink();
+        assert_ne!(old, new);
+        s.on_sink_total_at(t0 + ms(10), old, 4_100_000);
+        assert_eq!(
+            s.snapshot_at(t0 + ms(10)).egress_bytes,
+            Some(4_000_000),
+            "the late reading"
+        );
+        // The new sink at 1 Mbps: its window 0 runs from its first poll (250 ms, 0 bytes) and ends
+        // before 1 250 ms (half-open, as `egress_is_cumulative…` pins), at 125 000 bytes.
+        for (at, total) in [(250, 0), (750, 62_500), (1_240, 125_000)] {
+            s.on_sink_total_at(t0 + ms(at), new, total);
+        }
+        let snap = s.snapshot_at(t0 + ms(1_300));
+        assert_eq!(snap.egress_bytes, Some(4_125_000));
+        assert_eq!(snap.bitrate_kbps, Some(1_000));
+        // Before the fix the late reading was the new sink's: egress 8 100 000, bitrate 0.
     }
 
     #[test]
