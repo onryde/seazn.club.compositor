@@ -17,7 +17,10 @@
 //!   `(Waiting, 0)` (amendment 2026-10-15).
 //! - **The log** gets one line per hide (`overlay hidden reason=<r> gen=<g>`) and one per graphics
 //!   event handed to `decide`, a stale one included (`cef ready|crashed|alive gen=<n>`; C12's
-//!   amendment 2026-10-18). No line carries a credential or a fatal error's text.
+//!   amendment 2026-10-18). The skipped ticks and the queue's dropped beats reach it too
+//!   (`ticks skipped total=<n>`, `heartbeats dropped total=<n>`; review round 1, item 4): a line when
+//!   the count rises, at most one a minute, and whatever rose since the last line at the exit. No line
+//!   carries a credential or a fatal error's text.
 //! - **After `Exit`** nothing reaches a port from `step` or `tick_due`. `run()`'s flush follows, and
 //!   logs `final beat not confirmed within 2000 ms` when it times out.
 use std::time::Duration;
@@ -33,6 +36,9 @@ use crate::ports::{ControlRequest, Inbound, Ports, SessionConfig, FINAL_BEAT_TIM
 
 /// Ticks per second before the session gives a profile.
 const BOOT_RATE: u64 = 10;
+
+/// The least time between two lines of one counter (review round 1, item 4).
+const TALLY_EVERY_MS: u64 = 60_000;
 
 /// The fatal text for a wiring effect with no session to wire from.
 pub(crate) const NO_SESSION: &str = "a session effect arrived before a session";
@@ -60,6 +66,35 @@ impl Grid {
     }
 }
 
+/// A counter's log line: the total last logged, and when.
+#[derive(Debug, Clone, Copy, Default)]
+struct Tally {
+    logged: u64,
+    at: Option<u64>,
+}
+
+impl Tally {
+    /// True (and the line counted as written) when `total` rose past the last line and that line is
+    /// at least `TALLY_EVERY_MS` old, or there is none.
+    fn due(&mut self, total: u64, now: u64) -> bool {
+        if total <= self.logged || self.at.is_some_and(|at| now.saturating_sub(at) < TALLY_EVERY_MS) {
+            return false;
+        }
+        self.logged = total;
+        self.at = Some(now);
+        true
+    }
+
+    /// At the exit: true when `total` rose past the last line, whenever that was.
+    fn rest(&mut self, total: u64) -> bool {
+        if total <= self.logged {
+            return false;
+        }
+        self.logged = total;
+        true
+    }
+}
+
 #[derive(Debug)]
 pub struct Driver {
     supervisor: Supervisor,
@@ -68,6 +103,8 @@ pub struct Driver {
     deadline_ms: u64,
     grid: Grid,
     skipped_ticks: u64,
+    skips: Tally,
+    drops: Tally,
     phase: ProgrammePhase,
     phase_seq: u64,
     exited: bool,
@@ -86,6 +123,8 @@ impl Driver {
                 next: 0,
             },
             skipped_ticks: 0,
+            skips: Tally::default(),
+            drops: Tally::default(),
             phase: ProgrammePhase::Waiting,
             phase_seq: 0,
             exited: false,
@@ -117,6 +156,10 @@ impl Driver {
                 let to = self.grid.first_not_due(now);
                 self.skipped_ticks += to - self.grid.next;
                 self.grid.next = to;
+                if self.skips.due(self.skipped_ticks, now) {
+                    let line = format!("ticks skipped total={}", self.skipped_ticks);
+                    self.ports.log.info(&line);
+                }
                 break;
             }
             let index = self.grid.next;
@@ -258,6 +301,10 @@ impl Driver {
             Effect::SendHeartbeat(h) => {
                 let m = p.metrics.sample();
                 p.control.request(ControlRequest::Heartbeat(h, m));
+                let dropped = p.control.dropped();
+                if self.drops.due(dropped, now) {
+                    p.log.info(&format!("heartbeats dropped total={dropped}"));
+                }
             }
             Effect::DrainOutput => {
                 p.programme.drain();
@@ -267,6 +314,13 @@ impl Driver {
             Effect::Exit(code) => {
                 p.input.stop();
                 p.graphics.stop();
+                if self.skips.rest(self.skipped_ticks) {
+                    p.log.info(&format!("ticks skipped total={}", self.skipped_ticks));
+                }
+                let dropped = p.control.dropped();
+                if self.drops.rest(dropped) {
+                    p.log.info(&format!("heartbeats dropped total={dropped}"));
+                }
                 self.exited = true;
                 return Some(code);
             }

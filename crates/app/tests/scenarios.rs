@@ -1,5 +1,8 @@
 //! The driver (C08) folding the REAL `Supervisor` through fakes for every port, on a manual clock.
 //! Every duration comes from `Thresholds::default()` (or a named override), never from the driver.
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use app::driver::Driver;
 use app::ports::{ControlRequest, Inbound, Measured, SessionConfig};
 use domain::config::{OutputProfile, Thresholds};
@@ -8,7 +11,7 @@ use domain::ladder::Rung;
 use domain::lifecycle::ExitReason;
 use domain::programme::{FrameChoice, ProgrammePhase, SlateKind};
 use domain::supervisor::{Desired, Event, HeartbeatRefusal, Refusal, SignalKind};
-use testkit::fakes::{ports, session_720p, Call, FakeGraphics, FakeProgramme, Log};
+use testkit::fakes::{ports, session_720p, Call, FakeControl, FakeGraphics, FakeProgramme, Log};
 
 const FAR: u64 = 100_000_000;
 /// The scenario's session arrives here (the brief's `boot`); its tick 0 is due at this instant.
@@ -1386,4 +1389,190 @@ fn graphics_events_are_logged_by_name_as_they_are_decided() {
     assert!(log.calls_from(mark).iter().all(|c| !matches!(c, Call::Log(_))));
     eprintln!("graphics lines checked: {checked}");
     assert_eq!(checked, 5);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1, item 4: the skipped ticks and the dropped beats reach the log
+// ---------------------------------------------------------------------------------------------
+
+/// The rate limit the lines are held to (the driver's own constant is private).
+const TALLY_EVERY_MS: u64 = 60_000;
+
+fn lines_starting(log: &Log, prefix: &str) -> Vec<String> {
+    log.lines()
+        .into_iter()
+        .filter(|l| l.starts_with(prefix))
+        .collect()
+}
+
+/// A `tick_due` at `now` with tick `next` the next to run, by the grid's rule (tick `i` is due at
+/// `SESSION_AT + ⌈i·1000 / fps⌉`, a call runs at most `fps` of the due ticks and skips the rest):
+/// the next index after the call, and how many were skipped.
+fn stalled(next: u64, now: u64, fps: u64) -> (u64, u64) {
+    let last_due = (now - SESSION_AT) * fps / 1_000;
+    let due = last_due + 1 - next;
+    (last_due + 1, due.saturating_sub(fps))
+}
+
+/// Skips reach the log as `ticks skipped total=<n>`: one line at the first, then at most one a minute
+/// (a skip 30 s on is held; one exactly a minute on is logged, with the total so far), and the rest
+/// at the exit, before it.
+#[test]
+fn skipped_ticks_are_logged_at_most_once_a_minute_and_at_the_exit() {
+    let log = Log::default();
+    let mut d = boot(&log);
+    let fps = u64::from(OutputProfile::P720.fps);
+    assert_eq!(d.tick_due(SESSION_AT), None);
+    let (mut next, mut total) = (1, 0);
+    let mut stall = |d: &mut Driver, now: u64| {
+        let (n, k) = stalled(next, now, fps);
+        assert!(k > 0, "the stall at {now} skips");
+        next = n;
+        total += k;
+        assert_eq!(d.tick_due(now), None);
+        assert_eq!(d.skipped_ticks(), total, "the grid's rule");
+        total
+    };
+    let first = SESSION_AT + 10_000;
+    let t1 = stall(&mut d, first);
+    assert_eq!(
+        lines_starting(&log, "ticks skipped"),
+        vec![format!("ticks skipped total={t1}")]
+    );
+    stall(&mut d, first + TALLY_EVERY_MS / 2);
+    assert_eq!(
+        lines_starting(&log, "ticks skipped").len(),
+        1,
+        "held: 30 s after the line"
+    );
+    let t3 = stall(&mut d, first + TALLY_EVERY_MS);
+    assert_eq!(
+        lines_starting(&log, "ticks skipped"),
+        vec![
+            format!("ticks skipped total={t1}"),
+            format!("ticks skipped total={t3}")
+        ],
+        "a minute after the line: logged, the held skips included"
+    );
+    let t4 = stall(&mut d, first + TALLY_EVERY_MS + 20_000);
+    assert_eq!(lines_starting(&log, "ticks skipped").len(), 2, "held again");
+    let at = first + TALLY_EVERY_MS + 20_001;
+    assert_eq!(d.step(ev(Event::Signal(SignalKind::Term)), at), None);
+    assert_eq!(
+        lines_starting(&log, "ticks skipped").len(),
+        2,
+        "the drain is not the exit"
+    );
+    assert_eq!(d.step(ev(Event::OutputDrained), at + 1), Some(0));
+    assert_eq!(
+        lines_starting(&log, "ticks skipped"),
+        vec![
+            format!("ticks skipped total={t1}"),
+            format!("ticks skipped total={t3}"),
+            format!("ticks skipped total={t4}")
+        ],
+        "the held rest, at the exit"
+    );
+    assert!(t1 < t3 && t3 < t4);
+}
+
+/// Dropped periodic beats (the queue's count) reach the log as `heartbeats dropped total=<n>`, read
+/// after each beat is requested: one line at the first rise, then at most one a minute, and the rest
+/// at the exit. The session beats every 5 s, on the tick grid, so a beat falls exactly a minute after
+/// the line.
+#[test]
+fn dropped_heartbeats_are_logged_at_most_once_a_minute_and_at_the_exit() {
+    let log = Log::default();
+    let dropped = Arc::new(AtomicU64::new(0));
+    let mut p = ports(&log, metrics());
+    p.control = Box::new(FakeControl {
+        log: log.clone(),
+        dropped: Arc::clone(&dropped),
+    });
+    let mut d = Driver::new(th(), p, FAR, 0);
+    assert_eq!(d.tick_due(0), None);
+    assert_eq!(d.step(Inbound::Session(session_720p()), SESSION_AT), None);
+    let is_beat = |c: &Call| matches!(c, Call::Control(ControlRequest::Heartbeat(..)));
+    // One tick at a time to the next beat; its instant.
+    let next_beat = |d: &mut Driver| {
+        let mark = log.len();
+        loop {
+            let at = d.next_tick_at();
+            assert!(at < FAR, "no beat");
+            assert_eq!(d.tick_due(at), None);
+            if log.calls_from(mark).iter().any(is_beat) {
+                return at;
+            }
+        }
+    };
+    let b0 = next_beat(&mut d);
+    let dropped_lines = || lines_starting(&log, "heartbeats dropped");
+    assert!(dropped_lines().is_empty(), "nothing dropped, nothing logged");
+    dropped.store(1, Ordering::SeqCst);
+    let line1 = next_beat(&mut d);
+    assert!(line1 > b0);
+    assert_eq!(dropped_lines(), vec!["heartbeats dropped total=1".to_owned()]);
+    dropped.store(2, Ordering::SeqCst);
+    let mut beats = 0;
+    let mut at = line1;
+    while at < line1 + TALLY_EVERY_MS {
+        at = next_beat(&mut d);
+        beats += 1;
+        if at < line1 + TALLY_EVERY_MS {
+            assert_eq!(dropped_lines().len(), 1, "held at the beat at {at}");
+        }
+    }
+    assert_eq!(
+        at,
+        line1 + TALLY_EVERY_MS,
+        "a beat falls exactly a minute after the line"
+    );
+    assert_eq!(beats, TALLY_EVERY_MS / session_720p().heartbeat_interval_ms);
+    assert_eq!(
+        dropped_lines(),
+        vec![
+            "heartbeats dropped total=1".to_owned(),
+            "heartbeats dropped total=2".to_owned()
+        ]
+    );
+    dropped.store(5, Ordering::SeqCst);
+    assert_eq!(d.step(ev(Event::Signal(SignalKind::Term)), at + 1), None);
+    assert_eq!(
+        dropped_lines().len(),
+        2,
+        "the drain's beat is held: inside the minute"
+    );
+    assert_eq!(d.step(ev(Event::OutputDrained), at + 2), Some(0));
+    assert_eq!(
+        dropped_lines(),
+        vec![
+            "heartbeats dropped total=1".to_owned(),
+            "heartbeats dropped total=2".to_owned(),
+            "heartbeats dropped total=5".to_owned()
+        ],
+        "the held rest, at the exit"
+    );
+    eprintln!("beats inside the minute: {beats}");
+}
+
+/// The empty case: a run that skipped no tick and dropped no beat logs neither line, at the exit
+/// included.
+#[test]
+fn nothing_skipped_or_dropped_logs_no_tally() {
+    let log = Log::default();
+    let mut d = boot(&log);
+    let mut ticks = 0;
+    while d.next_tick_at() < SESSION_AT + 12_000 {
+        assert_eq!(d.tick_due(d.next_tick_at()), None);
+        ticks += 1;
+    }
+    let at = d.next_tick_at();
+    assert_eq!(d.step(ev(Event::Signal(SignalKind::Term)), at), None);
+    assert_eq!(d.step(ev(Event::OutputDrained), at + 1), Some(0));
+    assert_eq!(d.skipped_ticks(), 0);
+    let beats = log.count(|c| matches!(c, Call::Control(ControlRequest::Heartbeat(..))));
+    assert!(lines_starting(&log, "ticks skipped").is_empty());
+    assert!(lines_starting(&log, "heartbeats dropped").is_empty());
+    eprintln!("ticks driven: {ticks}, beats requested: {beats}");
+    assert!(ticks > 0 && beats > 1);
 }
