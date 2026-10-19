@@ -42,9 +42,12 @@
 //! rebuilds, a back-off later; a connection that starts delivering again in between would put the
 //! camera back on air for the back-off. So each sample is held against the same two rules, read from
 //! the same `Thresholds` and `DOMAIN_LAG_ALLOWANCE_MS` sooner: the first sample past the connect
-//! timeout (before `InputConnected` was delivered), or past the stall rule since the sample before,
-//! closes the gate for good. No event is sent: the domain has given the generation up, or will
-//! within the allowance, since nothing more of it arrives.
+//! timeout (before `InputConnected` was delivered), or past the stall rule since the video frame
+//! before, closes the gate for good, for both branches: an audio sample is held against the same
+//! clock, so a camera whose video died while its audio carried on is off air too (the confirm
+//! pass's m2). No event is sent: the domain has given the generation up, or will within the
+//! allowance while its loop lags by 250 ms or less (`_INDEX.md` Owed 50 has the residuals, and the
+//! port call that replaces this copy of the rules).
 //!
 //! **Never blocks the caller.** Each build has one thread of its own, which starts it, reads its bus
 //! and then tears it down: `srtsrc` resolves its host inside `set_state(PAUSED)`, and a hanging
@@ -88,7 +91,9 @@ pub const APPSINK_MAX_BUFFERS: u32 = 2;
 /// How much sooner than the domain's stall rule and connect timeout a sample gives its generation up
 /// (G1). The domain reads each event on its loop's clock, after the adapter saw the sample, so a
 /// sample just inside the rule here could land just past it there; 250 ms (about seven ticks at
-/// 30 fps) covers that lag, so whatever the adapter lets through, the domain still counts.
+/// 30 fps) covers that lag, so whatever the adapter lets through, the domain still counts. A loop
+/// that lags by more lets a given-up generation back on air for the back-off; `_INDEX.md` Owed 50
+/// (the domain's own `abandon(gen)`) removes this constant and that window together.
 pub const DOMAIN_LAG_ALLOWANCE_MS: u64 = 250;
 /// Every element factory the input pipeline makes, loaded when the adapter is built (review M4).
 pub const INPUT_FACTORIES: [&str; 12] = [
@@ -180,6 +185,18 @@ impl Shared {
     fn report(&self, gen: u64, reason: LossReason) {
         self.log(&format!("gen={gen}: lost ({reason:?})"));
         let _ = self.tx.send(Inbound::Event(Event::InputLost { gen, reason }));
+    }
+
+    /// The domain's rules have given `gen` up (G1): the gate, held open for this build by the caller,
+    /// closes for good, for video and audio alike. Counted and logged; no event is sent.
+    fn give_up(&self, mut open: MutexGuard<'_, Option<u64>>, gen: u64, at: &str, why: &str) {
+        *open = None;
+        drop(open);
+        self.gate_dropped.fetch_add(1, Ordering::Relaxed);
+        self.abandoned.fetch_add(1, Ordering::SeqCst);
+        self.log(&format!(
+            "gen={gen}: given up at {at} sample: {why}; nothing more of it reaches the programme"
+        ));
     }
 
     /// Decides `gen` lost and reports it, once: only while `build` is the open one.
@@ -465,6 +482,9 @@ impl GstInput {
         let vqueue = leaky_queue("vqueue", VIDEO_QUEUE_NS)?;
         let vparse = make("h264parse", "vparse")?;
         let vdec = make("avdec_h264", "vdec")?;
+        // The owner's ruling, 2026-10-19 (Owed 48): a frame with damaged macroblocks is dropped, so
+        // after a loss the slot holds the last good picture for a moment instead of airing smears.
+        vdec.set_property("output-corrupt", false);
         let scale = make("videoconvertscale", "scale")?;
         // Black borders keep the camera's aspect inside the fixed box (its default, set so it is
         // stated: the fixed caps below are what keep the programme's caps still).
@@ -531,8 +551,15 @@ impl GstInput {
         .map_err(|e| format!("input audio chain: {e}"))?;
 
         self.link_demux(&demux, &vqueue, &aqueue, gen);
-        self.wire_video(&vsink, build, gen);
-        self.wire_audio(&asink, build);
+        // One clock for both branches: the domain's rules are about video frames, and a generation
+        // they gave up is off air for its audio too (G1; the confirm pass's m2).
+        let clock = Arc::new(Mutex::new(SampleClock::new(
+            Instant::now(),
+            self.stall,
+            self.connect,
+        )));
+        self.wire_video(&vsink, build, gen, Arc::clone(&clock));
+        self.wire_audio(&asink, build, gen, clock);
         let errored = Arc::new(AtomicBool::new(false));
         self.sync_handler(&pipeline, build, &errored)?;
         Ok(Live {
@@ -573,31 +600,23 @@ impl GstInput {
         });
     }
 
-    fn wire_video(&self, sink: &gst_app::AppSink, build: u64, gen: u64) {
+    fn wire_video(&self, sink: &gst_app::AppSink, build: u64, gen: u64, clock: Arc<Mutex<SampleClock>>) {
         let shared = Arc::clone(&self.shared);
         let eos = Arc::clone(&self.shared);
-        let clock = Mutex::new(SampleClock::new(Instant::now(), self.stall, self.connect));
         sink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |s| {
                     let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                     let now = Instant::now();
-                    let mut open = locked(&shared.gate);
+                    let open = locked(&shared.gate);
                     if *open != Some(build) {
                         shared.gate_dropped.fetch_add(1, Ordering::Relaxed);
                         return Ok(gst::FlowSuccess::Ok);
                     }
                     let mut c = locked(&clock);
                     if let Some(why) = c.given_up(now) {
-                        // The domain has given this generation up: nothing more of it passes.
-                        *open = None;
                         drop(c);
-                        drop(open);
-                        shared.gate_dropped.fetch_add(1, Ordering::Relaxed);
-                        shared.abandoned.fetch_add(1, Ordering::SeqCst);
-                        shared.log(&format!(
-                            "gen={gen}: given up: {why}; nothing more of it reaches the programme"
-                        ));
+                        shared.give_up(open, gen, "a video", why);
                         return Ok(gst::FlowSuccess::Ok);
                     }
                     c.last = Some(now);
@@ -622,7 +641,10 @@ impl GstInput {
         );
     }
 
-    fn wire_audio(&self, sink: &gst_app::AppSink, build: u64) {
+    /// Audio passes the same gate and the same clock as the video: an audio sample that comes after
+    /// the domain's rules gave the generation up (no video frame within the stall rule, or none yet
+    /// at the connect timeout) closes the gate for both branches.
+    fn wire_audio(&self, sink: &gst_app::AppSink, build: u64, gen: u64, clock: Arc<Mutex<SampleClock>>) {
         let shared = Arc::clone(&self.shared);
         sink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
@@ -634,9 +656,15 @@ impl GstInput {
                     let Ok(map) = buffer.map_readable() else {
                         return Ok(gst::FlowSuccess::Ok);
                     };
+                    let now = Instant::now();
                     let open = locked(&shared.gate);
                     if *open != Some(build) {
                         shared.gate_dropped.fetch_add(1, Ordering::Relaxed);
+                        return Ok(gst::FlowSuccess::Ok);
+                    }
+                    let given_up = locked(&clock).given_up(now);
+                    if let Some(why) = given_up {
+                        shared.give_up(open, gen, "an audio", why);
                         return Ok(gst::FlowSuccess::Ok);
                     }
                     shared.frames.push_audio(map.as_slice());
@@ -773,7 +801,8 @@ fn run_build(
     shared.reapers.fetch_sub(1, Ordering::SeqCst);
 }
 
-/// When a generation's samples came, held against the domain's two rules (G1).
+/// When a generation's video frames came, held against the domain's two rules (G1). Both branches
+/// read it; only a video sample that passes moves it.
 struct SampleClock {
     built: Instant,
     /// The generation's `InputConnected` was delivered.
@@ -795,17 +824,17 @@ impl SampleClock {
         }
     }
 
-    /// Why a sample at `now` comes after the domain has given the generation up, if it does: before
-    /// `InputConnected` was delivered, at or past the connect timeout from the build; after it, at or
-    /// past the stall rule from the sample before.
+    /// Why a sample (video or audio) at `now` comes after the domain has given the generation up, if
+    /// it does: before `InputConnected` was delivered, at or past the connect timeout from the build;
+    /// after it, at or past the stall rule from the last video frame that passed.
     fn given_up(&self, now: Instant) -> Option<&'static str> {
         if !self.connected {
             (now.saturating_duration_since(self.built) >= self.connect)
-                .then_some("its first frame came after the connect timeout")
+                .then_some("no video frame came within the connect timeout")
         } else {
             self.last
                 .filter(|l| now.saturating_duration_since(*l) >= self.stall)
-                .map(|_| "its frames came back after the stall rule")
+                .map(|_| "no video frame came within the stall rule")
         }
     }
 }
@@ -1101,5 +1130,28 @@ mod tests {
         );
         checked += 3;
         assert_eq!(checked, 8);
+    }
+
+    /// m1 (PR #30 confirm pass): the allowance is 250 ms (the as-built row's (16)), read here as a
+    /// number of its own, never from the constant: a sample 250 ms inside either rule is given up,
+    /// one 251 ms inside passes, for the domain's defaults and the integration tests' short rules.
+    #[test]
+    fn the_allowance_gives_up_250_ms_inside_each_rule() {
+        let ms = Duration::from_millis;
+        let t = Thresholds::default();
+        let mut checked = 0;
+        for rule in [t.input_stall_after_ms, t.input_connect_timeout_ms, 2_000, 3_000] {
+            assert!(rule > 500, "a rule this short is held whole: {rule}");
+            let t0 = Instant::now();
+            let mut c = SampleClock::new(t0, ruled(rule), ruled(rule));
+            assert_eq!(c.given_up(t0 + ms(rule - 251)), None, "connect {rule}");
+            assert!(c.given_up(t0 + ms(rule - 250)).is_some(), "connect {rule}");
+            c.connected = true;
+            c.last = Some(t0);
+            assert_eq!(c.given_up(t0 + ms(rule - 251)), None, "stall {rule}");
+            assert!(c.given_up(t0 + ms(rule - 250)).is_some(), "stall {rule}");
+            checked += 4;
+        }
+        assert_eq!(checked, 16);
     }
 }

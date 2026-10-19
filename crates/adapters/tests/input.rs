@@ -7,7 +7,7 @@
 //! declared audio format and the findings (F-002, F-012), never from the adapter.
 use std::net::UdpSocket;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1189,17 +1189,21 @@ fn frames_after_the_stall_rule_never_reach_the_programme() {
     let in_flight = rx.try_iter().count();
     let pts = camera_pts(&frames);
     let dropped = input.gate_dropped();
+    let _ = frames.take_audio(frames.audio_level());
     l.pipeline.set_state(gst::State::Playing).expect("resume");
     let after = events_for(&rx, Duration::from_secs(2));
     let gate = input.gate_dropped() - dropped;
+    let audio_after = frames.audio_level();
     pauses += 1;
     eprintln!(
         "pauses checked: {pauses}; events in flight at the pause {in_flight}; events after the \
-         stall: {after:?}; samples dropped at the gate: {gate}; abandoned {}",
+         stall: {after:?}; samples dropped at the gate: {gate}; audio bytes after it \
+         {audio_after}; abandoned {}",
         input.abandoned()
     );
     assert_eq!(pauses, 2);
     assert!(after.is_empty(), "{after:?}");
+    assert_eq!(audio_after, 0, "none of the generation's audio reached the ring");
     assert_eq!(
         camera_pts(&frames),
         pts,
@@ -1251,6 +1255,11 @@ fn a_late_connect_is_dropped_and_a_fresh_generation_connects() {
         frames.camera().is_none(),
         "no frame of the late generation reached the slot"
     );
+    assert_eq!(
+        frames.audio_level(),
+        0,
+        "none of the late generation's audio reached the ring"
+    );
     assert!(
         dropped > 0,
         "the late generation delivered, and the gate dropped it"
@@ -1266,6 +1275,116 @@ fn a_late_connect_is_dropped_and_a_fresh_generation_connects() {
     assert!(frames_in(&second) >= FRAMES_IN_THE_FIRST_SECOND);
     assert_eq!(input.generation_of_last_frame(), Some(2));
     assert_eq!(input.abandoned(), 1, "the fresh generation was not given up");
+    finish(input);
+}
+
+/// m2 (PR #30 confirm pass, the review's probe P6b): a generation the stall rule has given up is off
+/// air for its audio too. The video stops inside the adapter (parsed H.264 dropped before the
+/// decoder, as a camera whose video goes quiet while its audio carries on). Inside the rule the
+/// audio still reaches the ring; past it, none does, and none when the video comes back. Measured
+/// before the fix: 76 800 B (the ring's full 400 ms) in every read for 5 s, and `abandoned` 0.
+#[test]
+fn audio_stops_with_the_video_past_the_stall_rule() {
+    let _s = serial();
+    let rules = short_rules();
+    let l = Listener::new(&cfg(640, 360));
+    let (tx, rx) = crossbeam_channel::bounded(8_192);
+    let (mut input, frames, lines) = input_ruled(tx, &P720, &rules);
+    connect(&mut input, &rx, 1, &spec(l.port));
+    let drop_video = Arc::new(AtomicBool::new(false));
+    let d = Arc::clone(&drop_video);
+    let pad = input
+        .pipeline()
+        .and_then(|p| p.by_name("vparse"))
+        .and_then(|e| e.static_pad("src"))
+        .expect("the parser's src pad");
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+        if d.load(Ordering::SeqCst) {
+            gst::PadProbeReturn::Drop
+        } else {
+            gst::PadProbeReturn::Ok
+        }
+    });
+    thread::sleep(Duration::from_millis(500));
+    let _ = rx.try_iter().count();
+    let _ = frames.take_audio(frames.audio_level());
+    let t0 = Instant::now();
+    drop_video.store(true, Ordering::SeqCst);
+    let mut reads: Vec<(u128, usize)> = Vec::new();
+    while t0.elapsed() < Duration::from_millis(rules.input_stall_after_ms + 3_000) {
+        thread::sleep(Duration::from_millis(500));
+        let n = frames.audio_level();
+        let _ = frames.take_audio(n);
+        reads.push((t0.elapsed().as_millis(), n));
+    }
+    let rule = u128::from(rules.input_stall_after_ms);
+    let inside: usize = reads
+        .iter()
+        .filter(|(t, _)| *t < rule - 250)
+        .map(|(_, n)| n)
+        .sum();
+    let past: usize = reads
+        .iter()
+        .filter(|(t, _)| *t > rule + 500)
+        .map(|(_, n)| n)
+        .sum();
+    let past_reads = reads.iter().filter(|(t, _)| *t > rule + 500).count();
+    let abandoned_dead = input.abandoned();
+    // The video comes back: still nothing of the generation passes.
+    let _ = rx.try_iter().count();
+    drop_video.store(false, Ordering::SeqCst);
+    let back = events_for(&rx, Duration::from_secs(2));
+    let audio_back = frames.audio_level();
+    let given_up = lines
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.contains("gen=1: given up"))
+        .count();
+    eprintln!(
+        "audio bytes per 500 ms read after the video died: {reads:?}; inside the rule {inside}, \
+         past it {past} ({past_reads} reads); abandoned {abandoned_dead}; video back: events \
+         {back:?}, audio {audio_back}"
+    );
+    assert!(past_reads >= 4, "the window past the rule was read: {reads:?}");
+    assert!(
+        inside > 0,
+        "the audio flowed inside the rule while the video was dead"
+    );
+    assert_eq!(past, 0, "no audio past the stall rule: {reads:?}");
+    assert_eq!(
+        abandoned_dead, 1,
+        "the audio past the rule gave the generation up"
+    );
+    assert!(back.is_empty(), "{back:?}");
+    assert_eq!(audio_back, 0);
+    assert_eq!(input.abandoned(), 1);
+    assert_eq!(given_up, 1, "one line for the generation given up");
+    finish(input);
+}
+
+/// The owner's ruling, 2026-10-19 (Owed 48): damaged frames are hidden. After a loss beyond the SRT
+/// latency the decoder drops a frame with corrupt macroblocks, so viewers see the last good picture
+/// held for a moment, never smears. `avdec_h264`'s own default shows them, and it is read here too,
+/// so the built decoder's `false` is witnessed as a setting.
+#[test]
+fn damaged_frames_are_held_back_not_shown() {
+    let _s = serial();
+    let (mut input, _rx, _frames, _lines) = input(&P720);
+    input.rebuild(1, &spec(free_port()));
+    let vdec = input
+        .pipeline()
+        .and_then(|p| p.by_name("vdec"))
+        .expect("the build's decoder");
+    let default = gst::ElementFactory::make("avdec_h264")
+        .build()
+        .expect("an avdec_h264")
+        .property::<bool>("output-corrupt");
+    assert!(default, "avdec_h264's own default shows damaged frames");
+    assert!(
+        !vdec.property::<bool>("output-corrupt"),
+        "the built decoder hides them"
+    );
     finish(input);
 }
 
