@@ -480,3 +480,22 @@ fn a_second_final_beat_is_posted_while_the_first_result_waits_on_a_full_channel(
         "each result posted once there was room, the first beat's first"
     );
 }
+
+/// The loop may go (it returned) while the handle lives on: the final lane serves on. A result it
+/// cannot post is dropped, and the next final beat still posts.
+#[test]
+fn the_final_lane_serves_on_after_the_loop_has_gone() {
+    let (tx, rx) = unbounded();
+    let (plane, log) = ScriptedPlane::new(session_720p());
+    let mut h = spawn(Box::new(plane), tx);
+    drop(rx);
+    h.request(beat(final_beat(1, ExitReason::Signalled)));
+    assert!(log.wait_for(WAIT, |c| c
+        .iter()
+        .any(|c| matches!(c, PlaneCall::Beat(h, _) if h.heartbeat_failures == 1))));
+    // Long enough for the lane to try the first result's post, and find the loop gone.
+    std::thread::sleep(Duration::from_millis(50));
+    h.request(beat(final_beat(2, ExitReason::Fatal)));
+    assert!(h.flush(WAIT), "the second final beat posted too");
+    assert_eq!(marks(&log), vec![(1, true), (2, true)]);
+}
