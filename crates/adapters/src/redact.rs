@@ -29,6 +29,10 @@ use std::fmt;
 const LIVE_PATHS: [&str; 4] = ["/live/", "/live2/", "%2flive%2f", "%2flive2%2f"];
 const SRT_SECRET_KEYS: [&str; 2] = ["streamid", "passphrase"];
 const MASK: &str = "****";
+/// A value shorter than this is never scrubbed by value (the coordinator, 2026-10-19, after web's
+/// `MIN_SECRET_LENGTH`): it would mask ordinary words. No credential is that short: an SRT
+/// passphrase is 10 to 79 characters, and stream keys and job tokens are far longer.
+const MIN_SECRET_LENGTH: usize = 8;
 
 /// `url` (or any text holding URLs) with every stream key, query and SRT credential masked.
 pub fn redact(url: &str) -> String {
@@ -143,10 +147,11 @@ pub struct Scrubber {
 }
 
 impl Scrubber {
-    /// Learn `value` and its percent-encoded forms. An empty value is ignored: it is no credential,
-    /// and it would mask every gap between two characters.
+    /// Learn `value` and its percent-encoded forms. A value shorter than `MIN_SECRET_LENGTH`
+    /// characters is ignored (an empty one would mask every gap between two characters); the
+    /// pattern rules of `redact` still apply to it.
     pub fn add(&mut self, value: &str) {
-        if value.is_empty() {
+        if value.chars().count() < MIN_SECRET_LENGTH {
             return;
         }
         for form in [
@@ -336,21 +341,24 @@ mod tests {
     #[test]
     fn a_scrubber_masks_known_values_raw_and_percent_encoded() {
         let mut s = Scrubber::default();
-        s.add("SK/1+2=");
-        s.add("PASS-9");
+        s.add("SK/1+2=key");
+        s.add("PASS-9-SRT");
         s.add("");
         // A value inside another: the longer is masked whole, whichever was learned first.
-        s.add("AB");
-        s.add("AB-CD-EF");
+        s.add("ABCDEFGH");
+        s.add("ABCDEFGH-IJ");
         let rows = [
-            ("stream 'SK/1+2=' publish failed", "stream '****' publish failed"),
-            ("key SK%2F1%2B2%3D in a query", "key **** in a query"),
-            ("key SK%2f1%2b2%3d lower", "key **** lower"),
-            ("bare PASS-9 here", "bare **** here"),
-            ("PASS-9PASS-9", "********"),
-            ("rtmps://h/live/OTHER and SK/1+2=", "rtmps://h/live/****"),
+            (
+                "stream 'SK/1+2=key' publish failed",
+                "stream '****' publish failed",
+            ),
+            ("key SK%2F1%2B2%3Dkey in a query", "key **** in a query"),
+            ("key SK%2f1%2b2%3dkey lower", "key **** lower"),
+            ("bare PASS-9-SRT here", "bare **** here"),
+            ("PASS-9-SRTPASS-9-SRT", "********"),
+            ("rtmps://h/live/OTHER and SK/1+2=key", "rtmps://h/live/****"),
             ("nothing known here", "nothing known here"),
-            ("x AB-CD-EF y AB", "x **** y ****"),
+            ("x ABCDEFGH-IJ y ABCDEFGH", "x **** y ****"),
         ];
         for (input, want) in rows {
             assert_eq!(s.scrub(input), want, "{input:?}");
@@ -360,6 +368,34 @@ mod tests {
         let dbg = format!("{s:?}");
         assert!(!dbg.contains("SK/1") && !dbg.contains("PASS-9"), "{dbg}");
         eprintln!("scrubber rows checked: {}", rows.len());
+    }
+
+    /// A value shorter than 8 characters is never scrubbed by value (the coordinator, 2026-10-19,
+    /// after web's `MIN_SECRET_LENGTH`): it would mask ordinary words, and no credential is that
+    /// short (an SRT passphrase is 10 to 79). The pattern rules still apply to it. The length counts
+    /// characters, not bytes.
+    #[test]
+    fn a_value_shorter_than_eight_characters_is_not_scrubbed_by_value() {
+        let mut s = Scrubber::default();
+        s.add("SEVEN-7");
+        s.add("EIGHT-88");
+        s.add("P\u{e4}SS-77");
+        assert_eq!("SEVEN-7".chars().count(), 7);
+        assert_eq!("EIGHT-88".chars().count(), 8);
+        assert_eq!(("P\u{e4}SS-77".chars().count(), "P\u{e4}SS-77".len()), (7, 8));
+        let rows = [
+            ("x SEVEN-7 y", "x SEVEN-7 y"),
+            ("x EIGHT-88 y", "x **** y"),
+            ("x P\u{e4}SS-77 y", "x P\u{e4}SS-77 y"),
+            ("x P%C3%A4SS-77 y", "x P%C3%A4SS-77 y"),
+            ("rtmps://h/live/SEVEN-7", "rtmps://h/live/****"),
+            ("passphrase=SEVEN-7 next", "passphrase=**** next"),
+        ];
+        for (input, want) in rows {
+            assert_eq!(s.scrub(input), want, "{input:?}");
+        }
+        eprintln!("minimum-length rows checked: {}", rows.len());
+        assert_eq!(rows.len(), 6);
     }
 
     /// Deterministic fuzz over marker fragments (the reviewer's P4): `redact` never panics, is

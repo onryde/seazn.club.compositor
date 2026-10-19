@@ -791,6 +791,17 @@ fn a_zero_timeout_is_refused_at_construction() {
     assert!(HttpControlPlane::new("http://127.0.0.1:9", SID, TOKEN.to_owned(), 1).is_ok());
 }
 
+/// An empty `JOB_TOKEN` (an unset secret read as `""`) is a misconfigured Machine: refused at
+/// construction, the same path as a bad token (the coordinator, 2026-10-19; C12 exits 78 on it).
+/// One byte is a token.
+#[test]
+fn an_empty_token_is_refused_at_construction() {
+    let got = HttpControlPlane::new("http://127.0.0.1:9", SID, String::new(), 1_000).map(|_| ());
+    assert_eq!(got, Err(PlaneConfigError::EmptyToken));
+    assert_eq!(got.unwrap_err().to_string(), "the job token is empty");
+    assert!(HttpControlPlane::new("http://127.0.0.1:9", SID, "x".to_owned(), 1_000).is_ok());
+}
+
 // ---- the session it fetched (C07 review M3, I3) ----
 
 /// Web answered with a different session than the plane asked for (C07 review M3): refused, as a

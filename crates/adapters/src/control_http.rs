@@ -383,6 +383,9 @@ pub enum PlaneConfigError {
     TokenNotVisibleAscii,
     /// A 0 ms timeout fails every call forever (C07 review M2).
     ZeroTimeout,
+    /// The job token is empty: an unset secret read as `""`. A misconfigured Machine, refused like
+    /// a bad token (the coordinator, 2026-10-19).
+    EmptyToken,
 }
 
 impl fmt::Display for PlaneConfigError {
@@ -390,6 +393,7 @@ impl fmt::Display for PlaneConfigError {
         f.write_str(match self {
             Self::TokenNotVisibleAscii => "the job token holds a byte outside visible ASCII",
             Self::ZeroTimeout => "the control plane's timeout is 0 ms",
+            Self::EmptyToken => "the job token is empty",
         })
     }
 }
@@ -404,14 +408,17 @@ fn page_token_in(overlay_url: &str) -> Option<&str> {
 
 impl HttpControlPlane {
     /// `timeout_ms` bounds every request, connect to last byte; the connect phase and the final beat
-    /// are bounded by the smaller of it and `FINAL_BEAT_TIMEOUT_MS`. Refuses a token outside visible
-    /// ASCII and a 0 ms timeout.
+    /// are bounded by the smaller of it and `FINAL_BEAT_TIMEOUT_MS`. Refuses an empty token, a token
+    /// outside visible ASCII and a 0 ms timeout.
     pub fn new(
         app_url: &str,
         session_id: &str,
         job_token: String,
         timeout_ms: u64,
     ) -> Result<Self, PlaneConfigError> {
+        if job_token.is_empty() {
+            return Err(PlaneConfigError::EmptyToken);
+        }
         if !job_token.bytes().all(|b| b.is_ascii_graphic()) {
             return Err(PlaneConfigError::TokenNotVisibleAscii);
         }
