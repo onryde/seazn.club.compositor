@@ -47,11 +47,11 @@ pub const ENCODED_RING_SPAN: Duration = Duration::from_secs(2);
 /// A hard cap on the ring's entries beside its span, so that samples with no PTS cannot grow it:
 /// 2 s holds 60 video frames at 30 fps and about 94 AAC frames at 48 kHz (1 024 samples each), 154 in
 /// all; twice that is the cap.
-const ENCODED_RING_MAX_ENTRIES: usize = 308;
+pub const ENCODED_RING_MAX_ENTRIES: usize = 308;
 /// The feeder stops taking from the ring when the output's two appsrcs both hold data and either holds
 /// at least this much: the sink is not consuming, so the backlog stays in the (bounded) ring rather
 /// than in the output. 512 KiB is about 1 s at 4 Mbps.
-const OUTPUT_QUEUE_BYTES: u64 = 512 * 1024;
+pub const OUTPUT_QUEUE_BYTES: u64 = 512 * 1024;
 /// How long the feeder and the bus thread wait before looking again (a retire is seen within it).
 const WAKE: Duration = Duration::from_millis(20);
 /// The bus thread's longest wait for one message.
@@ -124,6 +124,12 @@ impl EncodedRing {
         }
         drop(r);
         self.wake.notify_all();
+    }
+
+    /// The entries held now (the test hooks read it).
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn len(&self) -> usize {
+        locked(&self.state).entries.len()
     }
 
     pub(crate) fn end_of_stream(&self, video: bool) {
@@ -238,6 +244,8 @@ pub(crate) struct OutputGen {
     pipeline: gst::Pipeline,
     #[cfg(feature = "test-hooks")]
     sink: gst::Element,
+    #[cfg(feature = "test-hooks")]
+    srcs: (gst_app::AppSrc, gst_app::AppSrc),
     retired: Arc<AtomicBool>,
 }
 
@@ -256,6 +264,15 @@ impl OutputGen {
     #[cfg(feature = "test-hooks")]
     pub(crate) fn sink(&self) -> &gst::Element {
         &self.sink
+    }
+
+    /// The bytes queued in the video and audio appsrcs (the test hooks read them).
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn queued(&self) -> (u64, u64) {
+        (
+            self.srcs.0.current_level_bytes(),
+            self.srcs.1.current_level_bytes(),
+        )
     }
 
     /// Stops this generation's threads and hands its pipeline to a reaper thread, which sets it to
@@ -355,6 +372,8 @@ pub(crate) fn build(shared: &Shared, gen: u64, target: &TargetSpec) -> Result<Ou
     shared.ring.set_owner(gen);
     let retired = Arc::new(AtomicBool::new(false));
 
+    #[cfg(feature = "test-hooks")]
+    let srcs = (vsrc.clone(), asrc.clone());
     let feeder = Feeder {
         gen,
         vsrc,
@@ -388,6 +407,8 @@ pub(crate) fn build(shared: &Shared, gen: u64, target: &TargetSpec) -> Result<Ou
         pipeline,
         #[cfg(feature = "test-hooks")]
         sink,
+        #[cfg(feature = "test-hooks")]
+        srcs,
         retired,
     })
 }

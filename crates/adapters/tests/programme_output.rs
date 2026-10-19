@@ -13,7 +13,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use adapters::frame_store::{FrameStore, AUDIO_RING_BYTES};
-use adapters::gst_output::OUTPUT_PROGRESS_POLL_MS;
+use adapters::gst_output::{
+    ENCODED_RING_MAX_ENTRIES, ENCODED_RING_SPAN, OUTPUT_PROGRESS_POLL_MS, OUTPUT_QUEUE_BYTES,
+};
 use adapters::gst_programme::{GstProgramme, OVERLAY_SIZE};
 use adapters::slate::{logo_box, Slate, LOGO_PNG, SLATE_BACKDROP_RGB};
 use adapters::stats::StatsSnapshot;
@@ -350,6 +352,8 @@ struct Frame {
 struct Decoded {
     video_pts_ms: Vec<u64>,
     keys: Vec<bool>,
+    /// What h264parse passed on, before the decoder: (PTS ms, keyframe).
+    parsed: Vec<(u64, bool)>,
     frames: Vec<Frame>,
     /// The raw AAC payload (flvdemux's access units) and their count.
     aac: Vec<u8>,
@@ -405,10 +409,10 @@ fn decode(path: &Path) -> Decoded {
         .expect("hp src")
         .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
             if let Some(b) = info.buffer() {
-                o.lock()
-                    .unwrap()
-                    .keys
-                    .push(!b.flags().contains(gst::BufferFlags::DELTA_UNIT));
+                let key = !b.flags().contains(gst::BufferFlags::DELTA_UNIT);
+                let mut d = o.lock().unwrap();
+                d.keys.push(key);
+                d.parsed.push((b.pts().map_or(u64::MAX, |p| p.mseconds()), key));
             }
             gst::PadProbeReturn::Ok
         });
@@ -652,6 +656,13 @@ fn unreachable_rtmp_target_reports_output_error_with_its_generation() {
         matches!(e, Event::OutputError { .. })
     });
     assert_eq!(seen.last(), Some(&Event::OutputError { gen: 3 }));
+    // Once per generation: the domain's swap is the answer, and the dead sink says nothing more.
+    let later = events_for(&rx, Duration::from_millis(1_000));
+    let errors = later
+        .iter()
+        .filter(|e| matches!(e, Event::OutputError { .. }))
+        .count();
+    assert_eq!(errors, 0, "{later:?}");
     let t = Instant::now();
     let mut worst = Duration::ZERO;
     for i in 0..30 {
@@ -1518,4 +1529,146 @@ fn the_1080p_programme_keeps_its_own_caps() {
     );
     assert!(is_blue(d.frames[14].spot) && is_blue(d.frames[29].spot));
     assert!(is_red(d.frames[29].centre), "{:?}", d.frames[29]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The adapter's own guards (each mutated once: the PR lists them)
+
+#[test]
+fn a_programme_error_is_fatal_once_and_its_text_is_scrubbed() {
+    let _s = serial();
+    let dir = Tmp::new("fatal");
+    let (mut p, rx, _f, lines) = programme();
+    let key = "SECRETKEY-fatal-0001";
+    p.swap_sink(
+        1,
+        &TargetSpec {
+            url: format!("file://{}", dir.file("a.flv").display()),
+            stream_key: key.to_owned(),
+        },
+    );
+    for _ in 0..2 {
+        assert!(p.plant_programme_error(&format!("the element said {key}")));
+    }
+    let seen = events_for(&rx, Duration::from_millis(800));
+    let fatals: Vec<&Event> = seen.iter().filter(|e| matches!(e, Event::Fatal { .. })).collect();
+    assert_eq!(fatals.len(), 1, "{seen:?}");
+    let Event::Fatal { detail: Some(detail) } = fatals[0] else {
+        panic!("a fatal error with no detail: {fatals:?}");
+    };
+    assert!(detail.as_str().contains("planted programme error"), "{detail:?}");
+    assert!(
+        !detail.as_str().contains(key) && detail.as_str().contains("****"),
+        "{detail:?}"
+    );
+    let lines = lines.lock().unwrap().clone();
+    let logged = lines.iter().filter(|l| l.starts_with("programme error")).count();
+    eprintln!("programme error lines: {logged}");
+    assert_eq!(logged, 2, "{lines:?}");
+    assert!(lines.iter().all(|l| !l.contains(key)), "{lines:?}");
+}
+
+#[test]
+fn an_encoder_that_stalls_reports_encoder_overrun_and_the_programme_carries_on() {
+    let _s = serial();
+    let dir = Tmp::new("overrun");
+    let (mut p, rx, _f, _l) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    pace(&mut p, 0..15, FrameChoice::Slate(SlateKind::Waiting));
+    assert!(p.hang_encoder(Duration::from_millis(2_000)), "the encoder hook");
+    pace(&mut p, 15..120, FrameChoice::Slate(SlateKind::Waiting));
+    let seen = drain_and_wait(&mut p, &rx);
+    let overruns = seen.iter().filter(|e| **e == Event::EncoderOverrun).count();
+    eprintln!("encoder overruns read: {overruns}");
+    assert!(overruns >= 1, "{seen:?}");
+    let d = decode(&dir.file("a.flv"));
+    eprintln!("frames after a 2 s encoder stall: {} of 120", d.frames.len());
+    // The leaky queue dropped what the stalled encoder could not take; the programme went on.
+    assert!(
+        d.frames.len() < 120,
+        "nothing was dropped, so the stall was not real"
+    );
+    assert!(d.frames.len() >= 60, "{}", d.frames.len());
+    assert_eq!(p.builds(), 1);
+}
+
+/// The bound a held sink leaves on the output's two appsrcs: the feeder's own bound plus the one
+/// entry it may push past it.
+fn queue_bound() -> u64 {
+    2 * OUTPUT_QUEUE_BYTES
+}
+
+/// The entries 2 s of encoded output holds: 30 video frames a second at 30 fps and 48 000 / 1 024
+/// AAC frames a second, with a tenth of a second of slack.
+fn ring_bound() -> usize {
+    let per_second = f64::from(P720.fps) + 48_000.0 / 1_024.0;
+    (per_second * (ENCODED_RING_SPAN.as_secs_f64() + 0.1)).ceil() as usize
+}
+
+#[test]
+fn a_held_sink_backs_up_into_the_bounded_ring_not_the_output() {
+    let _s = serial();
+    let dir = Tmp::new("held");
+    let (mut p, _rx, _f, _l) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    pace(&mut p, 0..15, FrameChoice::Slate(SlateKind::Waiting));
+    assert!(p.hold_sink_writes(), "the hook found the sink");
+    let (mut queued, mut ring, mut samples) = (0u64, 0usize, 0);
+    for second in 0..5u64 {
+        let from = 15 + second * 30;
+        pace(&mut p, from..from + 30, FrameChoice::Slate(SlateKind::Waiting));
+        let (v, a) = p.output_queued_bytes().expect("an output");
+        queued = queued.max(v.max(a));
+        ring = ring.max(p.ring_entries());
+        samples += 1;
+        assert!(
+            v <= queue_bound() && a <= queue_bound(),
+            "second {second}: queued {v} / {a}"
+        );
+        assert!(
+            p.ring_entries() <= ring_bound().min(ENCODED_RING_MAX_ENTRIES),
+            "{}",
+            p.ring_entries()
+        );
+    }
+    eprintln!(
+        "held-sink samples: {samples}; most queued {queued} B (bound {}), ring at most {ring} (bound {})",
+        queue_bound(),
+        ring_bound()
+    );
+    assert_eq!(samples, 5);
+    assert!(
+        queued >= OUTPUT_QUEUE_BYTES,
+        "the output never filled to the feeder's bound"
+    );
+    assert!(ring * 10 >= ring_bound() * 8, "the ring never filled: {ring}");
+}
+
+#[test]
+fn a_sink_that_stalls_past_the_ring_resumes_at_a_keyframe() {
+    let _s = serial();
+    let dir = Tmp::new("stall-recover");
+    let (mut p, rx, _f, _l) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    pace(&mut p, 0..30, FrameChoice::Slate(SlateKind::Waiting));
+    // 5 s: the output fills (about 1 s), then the ring's 2 s fill and drop their oldest.
+    assert!(p.hang_sink(Duration::from_secs(5)), "the hook found the sink");
+    pace(&mut p, 30..300, FrameChoice::Slate(SlateKind::Waiting));
+    drain_and_wait(&mut p, &rx);
+    let d = decode(&dir.file("a.flv"));
+    let step = (1_000.0 / f64::from(P720.fps)).round() as u64;
+    let mut gaps = 0;
+    for w in d.parsed.windows(2) {
+        let ((before, _), (after, key)) = (w[0], w[1]);
+        if after > before + step + 1 {
+            gaps += 1;
+            assert!(
+                key,
+                "the frame at {after} ms after a gap from {before} ms is not a keyframe"
+            );
+        }
+    }
+    eprintln!("gaps checked: {gaps}; frames parsed: {}", d.parsed.len());
+    assert!(gaps >= 1, "the stall never outlasted the ring");
+    assert!(d.first_is_key());
 }

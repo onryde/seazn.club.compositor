@@ -203,6 +203,32 @@ impl GstProgramme {
         hang_pad(&pad, hold)
     }
 
+    /// Test hook: the encoded ring's entries now.
+    #[cfg(feature = "test-hooks")]
+    pub fn ring_entries(&self) -> usize {
+        self.shared.ring.len()
+    }
+
+    /// Test hook: the bytes queued in the current output's video and audio appsrcs.
+    #[cfg(feature = "test-hooks")]
+    pub fn output_queued_bytes(&self) -> Option<(u64, u64)> {
+        Some(self.running.as_ref()?.output.as_ref()?.queued())
+    }
+
+    /// Test hook: posts an error on the programme's bus, as a failing element would, with `debug`
+    /// as its debug text. False before `start()`.
+    #[cfg(feature = "test-hooks")]
+    pub fn plant_programme_error(&self, debug: &str) -> bool {
+        let Some(r) = self.running.as_ref() else {
+            return false;
+        };
+        let msg = gst::message::Error::builder(gst::CoreError::Failed, "planted programme error")
+            .debug(debug)
+            .src(&r.pipeline)
+            .build();
+        r.pipeline.post_message(msg).is_ok()
+    }
+
     #[cfg(feature = "test-hooks")]
     fn current_sink_pad(&self) -> Option<gst::Pad> {
         self.running.as_ref()?.output.as_ref()?.sink().static_pad("sink")
