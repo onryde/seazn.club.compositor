@@ -31,6 +31,13 @@ struct Rig {
     done: Receiver<Ran>,
     plane: PlaneLog,
     started: Instant,
+    /// The driver's port calls, its log lines included.
+    log: Log,
+}
+
+/// `run()`'s line when a final beat was not confirmed within the bound (C08 as built; Owed 35).
+fn unconfirmed() -> String {
+    format!("final beat not confirmed within {FINAL_BEAT_TIMEOUT_MS} ms")
 }
 
 /// Wires a driver to a real control worker over `plane`, and runs `run()` on its own thread.
@@ -64,6 +71,7 @@ fn launch(plane: ScriptedPlane, plane_log: PlaneLog, programme_fails: Option<&st
         done,
         plane: plane_log,
         started,
+        log,
     }
 }
 
@@ -187,6 +195,10 @@ fn the_final_beat_is_posted_on_a_fatal_start() {
         finals(&ran.plane),
         vec![(ExitReason::Fatal, Some("boom".to_owned()))]
     );
+    assert!(
+        !rig.log.lines().contains(&unconfirmed()),
+        "a posted final beat logs nothing"
+    );
 }
 
 #[test]
@@ -220,6 +232,17 @@ fn a_hung_final_beat_delays_exit_at_most_2_s() {
         waited <= bound + Duration::from_millis(400),
         "returned late: {waited:?}"
     );
+    let lines = rig.log.lines();
+    assert_eq!(
+        lines.iter().filter(|l| **l == unconfirmed()).count(),
+        1,
+        "{lines:?}"
+    );
+    assert_eq!(
+        lines.last(),
+        Some(&unconfirmed()),
+        "the line is the last thing run() does"
+    );
 }
 
 #[test]
@@ -239,6 +262,10 @@ fn a_heartbeat_410_exits_0_with_no_beat() {
         "{after:?}"
     );
     assert!(finals(&after).is_empty(), "no final beat after a 410");
+    assert!(
+        !rig.log.lines().contains(&unconfirmed()),
+        "nothing to flush, nothing logged"
+    );
 }
 
 /// The drain's own beat draws the 410: the drain is cut short, well inside `drain_timeout_ms`.

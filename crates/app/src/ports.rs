@@ -237,7 +237,8 @@ pub trait PhasePublisher: Send {
 }
 
 /// The driver's own log lines (C12's amendment 2026-10-18; C14 cases 8 and 11 and C15 read them):
-/// `overlay hidden reason=<r> gen=<g>`, and `cef ready|crashed|alive gen=<n>`. The adapter (C12)
+/// `overlay hidden reason=<r> gen=<g>`, `cef ready|crashed|alive gen=<n>`, and `run()`'s
+/// `final beat not confirmed within 2000 ms` (Owed 35). The adapter (C12)
 /// writes each as `ts=<rfc3339> level=info msg=<line>` on stderr: the timestamp is the adapter's,
 /// because this crate reads no clock. No line carries a credential or a fatal error's text: the
 /// driver never logs either (C07 confirm pass; Owed 32).

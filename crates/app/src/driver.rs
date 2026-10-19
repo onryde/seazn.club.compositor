@@ -18,7 +18,8 @@
 //! - **The log** gets one line per hide (`overlay hidden reason=<r> gen=<g>`) and one per graphics
 //!   event handed to `decide`, a stale one included (`cef ready|crashed|alive gen=<n>`; C12's
 //!   amendment 2026-10-18). No line carries a credential or a fatal error's text.
-//! - **After `Exit`** nothing reaches a port.
+//! - **After `Exit`** nothing reaches a port from `step` or `tick_due`. `run()`'s flush follows, and
+//!   logs `final beat not confirmed within 2000 ms` when it times out.
 use std::time::Duration;
 
 use domain::config::Thresholds;
@@ -153,12 +154,19 @@ impl Driver {
             .unwrap_or(ExitReason::Fatal.code())
     }
 
-    /// Waits for the final beats to post, at most `FINAL_BEAT_TIMEOUT_MS` (Owed 28). `run()` calls
-    /// it once, after `Exit`.
+    /// Waits for the final beats to post, at most `FINAL_BEAT_TIMEOUT_MS` (Owed 28), and logs a
+    /// beat it could not confirm (one that hung, as in DNS, or whose worker has gone). `run()` calls
+    /// it once, after `Exit`: the one line after it.
     pub(crate) fn flush_final_beats(&mut self) -> bool {
-        self.ports
+        let posted = self
+            .ports
             .control
-            .flush(Duration::from_millis(FINAL_BEAT_TIMEOUT_MS))
+            .flush(Duration::from_millis(FINAL_BEAT_TIMEOUT_MS));
+        if !posted {
+            let line = format!("final beat not confirmed within {FINAL_BEAT_TIMEOUT_MS} ms");
+            self.ports.log.info(&line);
+        }
+        posted
     }
 
     fn bootstrap(&mut self, cfg: SessionConfig, now: u64) -> Option<i32> {
