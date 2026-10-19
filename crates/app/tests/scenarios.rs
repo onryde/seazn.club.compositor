@@ -165,6 +165,20 @@ impl Sim {
         }
     }
 
+    /// One tick at a time until a port call made from now on matches `pred`; returns that tick's
+    /// instant. Fails, never hangs, past `limit`.
+    fn tick_until(&mut self, limit: u64, pred: impl Fn(&Call) -> bool) -> u64 {
+        let mark = self.log.len();
+        loop {
+            let at = self.d.next_tick_at();
+            assert!(at < limit, "nothing matched by {limit}");
+            self.drive(at + 1, vec![]);
+            if self.log.calls_from(mark).iter().any(&pred) {
+                return at;
+            }
+        }
+    }
+
     /// `drive` to `x`, then run the first tick at or after `x`, and return its instant.
     fn drive_to_tick(&mut self, x: u64, events: Vec<(u64, Inbound)>) -> u64 {
         self.drive(x, events);
@@ -207,7 +221,7 @@ impl Sim {
             .unwrap_or_else(|| panic!("no tick at or after {x}"))
     }
 
-    /// The last beat requested at or before `at`.
+    /// The first beat requested after `at` (strictly).
     fn beat_after(&self, at: u64) -> HealthReport {
         let calls = self.calls();
         let times = self.times_of(|c| matches!(c, Call::Control(ControlRequest::Heartbeat(..))));
@@ -891,7 +905,57 @@ fn a_crash_hide_leaves_the_reload_loading_1_crash() {
     assert_eq!(sim.beat_after(hide + 1).graphics, GraphicsStatus::Ready);
     assert_eq!(sim.times_of(|c| *c == Call::HideOverlay).len(), 1);
     assert!(sim.times_of(|c| *c == Call::GraphicsStop).is_empty());
-    eprintln!("calls checked: {}", sim.calls().len());
+    let scanned = sim.calls().len();
+    eprintln!("calls scanned: {scanned}");
+    assert!(scanned > 0);
+}
+
+/// Review round 1, item 3: at the count, the crash itself hides, inside the `decide` it is handed to.
+/// Its line comes first: `cef crashed gen=<n>`, then the hide's line, `HideOverlay` and the stop (a
+/// failed page is stopped), in that order and at the crash's instant. Each generation crashes as it
+/// loads, 1 ms after the tick that started it; the next starts on its back-off's tick.
+#[test]
+fn a_crash_at_the_count_logs_the_crash_before_its_hide() {
+    let t = th();
+    let count = t.cef_fail_count as u64;
+    assert!(count >= 2, "the count is reached after a reload");
+    let mut sim = Sim::new(t.clone(), session_720p());
+    sim.drive(SESSION_AT + 1, vec![]);
+    let mut started = sim.times_of(restart(1))[0];
+    let mut crashes = 0;
+    for gen in 1..count {
+        sim.drive(started + 2, vec![(started + 1, ev(Event::CefCrashed { gen }))]);
+        crashes += 1;
+        started = sim.tick_until(started + t.cef_fail_window_ms, restart(gen + 1));
+    }
+    let at = started + 1;
+    sim.drive(at + 1, vec![(at, ev(Event::CefCrashed { gen: count }))]);
+    crashes += 1;
+    let calls = sim.calls();
+    let crash = Call::Log(format!("cef crashed gen={count}"));
+    let i = calls
+        .iter()
+        .position(|c| *c == crash)
+        .expect("the counting crash's line");
+    assert_eq!(
+        calls[i..i + 4],
+        [
+            crash,
+            Call::Log(format!("overlay hidden reason=failed gen={count}")),
+            Call::HideOverlay,
+            Call::GraphicsStop,
+        ],
+        "the crash's line, then its hide"
+    );
+    assert_eq!(sim.at(i), at);
+    assert_eq!(sim.at(i + 3), at);
+    assert_eq!(
+        sim.times_of(|c| *c == Call::HideOverlay),
+        vec![at],
+        "no hide below the count"
+    );
+    eprintln!("crashes driven: {crashes}");
+    assert_eq!(crashes, count);
 }
 
 /// The positive pair: generation 2 then hangs, and that hide does stop it.
@@ -938,7 +1002,9 @@ fn a_crash_hide_leaves_the_reload_loading_3_recycle() {
         sim.times_of(|c| *c == Call::GraphicsStop).is_empty(),
         "the reload is left loading"
     );
-    eprintln!("calls checked: {}", sim.calls().len());
+    let scanned = sim.calls().len();
+    eprintln!("calls scanned: {scanned}");
+    assert!(scanned > 0);
 }
 
 /// A hang while the camera is away: the overlay's watch does not depend on the programme phase.
