@@ -1670,8 +1670,11 @@ impl CefGraphics {
                     #[cfg(feature = "test-hooks")]
                     shared.write_hold.hold_here();
                     shared.frames.set_overlay(straight);
-                    drop(gate);
+                    // Counted under the gate too: a stop that returns has seen every write
+                    // counted (the confirm pass: counted after the unlock, a stop between the two
+                    // read one write short).
                     stats.written.fetch_add(1, Ordering::SeqCst);
+                    drop(gate);
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),

@@ -803,9 +803,12 @@ fn reaper_kills_a_renderer_that_will_not_tear_down() {
     assert!(leaked_seen >= leak_at, "counted leaked at {leaked_seen:?}");
     assert_eq!(r.g.health().leaked_teardowns, 1);
     assert_eq!(r.g.teardowns_in_flight(), 1);
-    assert!(lines(&r)
-        .iter()
-        .any(|l| l.contains("WARN") && l.contains("1 leaked")));
+    // The count is published before its line is logged: wait for the line, bounded.
+    assert!(
+        wait_line(&r, hang_bound(), &["WARN", "1 leaked"]),
+        "{:?}",
+        lines(&r)
+    );
     r.g.stop();
 }
 
@@ -1197,7 +1200,12 @@ fn cef_children_run_at_nice_10_with_the_renderer_first_in_the_oom_order() {
     r.g.restart(1, &page(""));
     events_until(&r.rx, load_timeout(), ready(1));
     assert!(two_polls(&r.g), "the child poll stopped");
+    // A child launched after a poll is graded at the next one: read the children listed here only
+    // after two more polls, so a poll has seen each (a utility launched late read Chromium's own
+    // 200 once, under a host at load 100).
     let kids = cef_children();
+    assert!(two_polls(&r.g), "the child poll stopped");
+    let kids: Vec<_> = kids.into_iter().filter(|k| alive(k.pid)).collect();
     let own = read_i32("/proc/self/oom_score_adj".to_owned()).expect("own oom_score_adj");
     let mut threads = 0;
     // (kind, oom_score_adj, oom_score): the kernel's own ordering is what the grading is for.
@@ -1389,9 +1397,12 @@ fn zygote_case(which: &str) {
         survivors.iter().all(|z| alive(*z)),
         "the other zygote died too: this run proves only \"no zygote left\""
     );
-    assert!(lines(&r)
-        .iter()
-        .any(|l| l.contains("ERROR gen=1") && l.contains("zygote")));
+    // The verdict is published before its line is logged: wait for the line, bounded.
+    assert!(
+        wait_line(&r, hang_bound(), &["ERROR gen=1", "zygote"]),
+        "{:?}",
+        lines(&r)
+    );
     match which {
         "renderer" => {
             // The next build fails at once (F-013).
