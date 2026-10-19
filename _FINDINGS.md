@@ -1076,6 +1076,93 @@ echo "=== gst.log"; cat "$OUT/gst.log"
 echo "RUN $RUN done"
 ```
 
+## F-010: GStreamer element facts for the programme and the output (C09 Step 1, 2026-10-19)
+
+**Where:** `ubuntu:24.04` (24.04.5 LTS) in Docker, with exactly the CI apt set (`.github/workflows/check.yml`, step "GStreamer"); gstreamer-rs 0.24.5 (`v1_24`), Rust 1.91.0. The C00 spike image is GStreamer 1.24.2 too (F-001).
+
+**Versions:** GStreamer 1.24.2 (`libgstreamer1.0-0` 1.24.2-1ubuntu0.1); plugins-base 1.24.2-1ubuntu0.5; good 1.24.2-1ubuntu1.8; bad 1.24.2-1ubuntu4; ugly 1.24.1-1build1; libav 1.24.1-1build1.
+
+**Element facts (gst-inspect-1.0, then used):**
+- **rtmp2sink `stats`:** a `GstStructure` with `in-/out-chunk-size`, `in-/out-window-ack-size`, `in-/out-bytes-total` and `in-/out-bytes-acked`. Progress reads **`out-bytes-total`** (Owed 13). `out-bytes-acked` read 0 through every CF leg below, as F-005 found. `async-connect` defaults to true (connects on READY). Its RTMP `timeout` errored every dead or trickling leg about 5 s after the last write (F-011).
+- **x264enc `speed-preset`:** `readable, writable`, not changeable in PLAYING (F-001 holds). `bitrate` and `vbv-buf-capacity` are changeable in PLAYING. Nothing branches on it (amendment 2026-10-18: no `FastPreset`, no deviation owed).
+- **compositor:** `latency`, `min-upstream-latency`, `ignore-inactive-pads`, `start-time-selection` (`first` used: the first push's index is wherever the session's tick grid stands). `force-live` can be set only at construction. `background` defaults to `checker`; set `black`.
+- **appsrc:** `is-live` defaults to false; `leaky-type` is changeable only in NULL or READY; `max-bytes` defaults to 200 000.
+- **flvmux:** `streamable` defaults to false; set true.
+- **Present / absent:** `pngdec` (good) and `avdec_h264` / `avdec_aac` (libav) are present, and the tests decode with them. **`textoverlay` is absent** (no pango in the CI set). The slate is textless anyway (amendment 2026-10-15).
+
+**Colour: GStreamer's 8-bit converters truncate.**
+- One RGB → I420 → RGB trip through `videoconvert` turns the house night `#150b36` ([21, 11, 54]) into [16, 7, 49].
+- A logo-sized AYUV frame with no colorimetry is taken as BT.601, while 720p and 1080p default to BT.709. The slate's logo pad therefore converted on a different matrix from its backdrop.
+- Left to negotiation, the compositor mixed in RGB.
+- **Built:** `colorimetry=bt709` is pinned on every raw caps: the slate's backdrop AYUV, its I420 output and the logo AYUV; the mix (`AYUV`) and the encoder's input (`I420`). The base layer then never leaves YUV.
+- **Measured, decoded from the programme with the exact BT.709 limited-range matrix:** the slate backdrop on air is [22, 11, 54], 1 level off the house colour (x264 codes the flat field). With the mix pin removed it is [18, 7, 51]. The tests' tolerance is 2 (`ON_AIR_TOL`); the earlier 8 could not tell the two apart, and the mix-pin mutant (G24) survived all 44 tests until it was tightened.
+
+**Not live (deviation from Step 6's `is-live=true`).** The programme's appsrcs are not live. Every buffer is stamped by tick index, and nothing in the pipeline waits on, or times out against, the GStreamer clock.
+- **Measured** by switching every appsrc to `is-live=true` (mutant L1) against the whole file: **9 of 44 tests red**.
+- The live compositor times out against the clock and composites without the late push: 92 frames for 60 ticks, 61 for 60, 36 / 33 / 32 for 30 and 21 for 20. The starved-encoder speed read 0.967 against its bound.
+- Output frames then stop being one per tick, which breaks the "never rebuilt, constant-rate by index" contract the domain's tick grid relies on.
+
+**A skipped tick (index gap).** Probe, 150 ticks with every tenth skipped:
+- The compositor fills each video gap by repeating its last frame: 149 frames, no PTS jump.
+- The audio track keeps a hole of one period per skip: 14 jumps of 55 ms (21 + 33).
+- The `DISCONT` flag `push` sets on a gap changes neither: identical with and without it (mutant G33, argued equivalent).
+- The audio hole is Owed 40.
+
+## F-011: the output's progress feed, its poll, and the live legs (C09, Owed 13–16, 2026-10-19)
+
+**The poll (Owed 15): option (a).**
+- `OUTPUT_PROGRESS_POLL_MS` = 250 (`crates/adapters/src/gst_output.rs`), so the PDF's 5 s holds.
+- `stall_is_detected_within_budget_of_the_last_byte` measures 5 122–5 127 ms from the last growing total to the domain's `SwapSink`, against a bound of 5 284 ms: `output_stall_after_ms` 5 000, plus the poll, plus one tick.
+- C14 case 5's bound and spec §6 keep 5 s, but see "The last counted byte" below.
+
+**Harnesses (the bytes that ran):**
+- **Local legs:** the real adapter. `crates/adapters/examples/live_leg.rs` pushes slate ticks at 720p30 pace and prints every `OutputProgress` total and every event. It ran in the CI-equivalent container with `NET_ADMIN`, against mediamtx v1.9.3 (`mediamtx_v1.9.3_linux_amd64.tar.gz`, sha256 `0b885dbfa4ef9c14cd00191c57d90d804255ff50403a28b85ceee7988c535b60`) on 127.0.0.1, with `tc netem` on `lo`.
+- **CF legs:** rtmp2sink alone, from a fresh `performance-2x` Machine in lhr on `seazn-relay-spike`, running the C00 image (GStreamer 1.24.2), one Machine per batch. The script was a scratch Python + gi pipeline: `videotestsrc` 1280x720@30, then x264 veryfast/zerolatency at 3 000 kbps with keyint 60, then `flvmux`, then `rtmp2sink`, plus AAC 128k pink noise. The measured quantity is rtmp2sink's own counter, the same element and version as the adapter's. `tc netem` ran on `eth0`.
+- **Push target:** `SPIKE_A_RTMPS_PUSH_URL` (Input A, no Outputs) over RTMPS, read from the Machine's env. The scripts print neither the URL nor the key, and scrub both from every message.
+- **Not used:** Input B, which carries the YouTube Output (viewer-visible; not mine to decide).
+
+**Owed 13: the total grows on a healthy push and stops on a dead one. PASS.**
+- **CF, healthy:** about 394 KB/s (3.15 Mbps), every 250 ms sample larger than the last, for 15 s.
+- **CF, `netem loss 100%` at 15.05 s:** the total grew until 19.06 s, then froze at 7 567 188 to the end (32 s), including 5 s after netem was cleared. rtmp2sink errored "Socket I/O timed out" at 23.97 s.
+- **Local, the adapter:** loss at 6 s; last growth at 10.77 s; `OutputError { gen: 1 }` at 15.63 s.
+
+**The last counted byte is not the last delivered byte.**
+- `out-bytes-total` counts what rtmp2sink hands the socket. The kernel's send buffer keeps it growing for about 4 s after the link dies: 1.43 MB on CF, at 3 Mbps.
+- So the stall rule fires about 4 s + 5 s + poll after the cut, and rtmp2sink's own 5 s timeout errors at about the same moment (CF: 8.9 s after the cut).
+- 5 s from the last counted byte holds. Measured from the cut, it is about 9–10 s (Owed 39).
+
+**Owed 16 (a): command bytes. FAILS: the first nonzero total is not media.**
+- **CF, 10 healthy connects:** the first nonzero total was 476 B (the `connect` command) at 22–36 ms, and 1 664 B at 69 ms on the first. Media (above 64 KiB) arrived at 132–173 ms.
+- **CF, a made-up key on the same host and app:** 52 769 B at 138 ms, 262 334 B at 538 ms, then "connection closed remotely" at 522 ms.
+- **mediamtx, a publish-denied path:** the adapter reported 9 growing totals, up to 1 008 779 B, for 2 s. mediamtx then logged "authentication failed" and reset the connection: `OutputError { gen: 1 }` at 2 033 ms.
+- **Consequence:** a refused publish is "Connected" by C04's rule, and the back-off resets to attempt 0. It then ends by an error, 0.5 s on CF and 2 s on mediamtx, never by the stall rule. A wrong stream key therefore retries at the base back-off for as long as the session lasts.
+- **A byte floor alone does not fix it:** a refusal let 262 KB–1 MB through.
+- C04 reopens (Owed 38). Per the brief, C09's progress feed does not merge alone.
+
+**Owed 16 (b): trickle at `netem rate 8kbit`. PASS: the total stops.**
+- **CF:** the trickle started at 10.28 s. The total grew to 13.54 s (the socket buffer), then held at 5 424 296 until rtmp2sink's timeout error at about 18.3 s.
+- **Local, the adapter:** the trickle started at 4 s. The total grew to 9.03 s, held, and the error came at 14.03 s.
+- **Why it holds:** rtmp2sink writes whole RTMP messages, and at 8 kbit a 720p frame (about 12 KB) never completes inside the 5 s timeout.
+- **Unmeasured:** a faster trickle, tens of kbit/s, could complete a message every few seconds and keep the total growing. C14 case 12 (`dest-trickle`) stays the witness.
+
+**Owed 14: RTMPS connect → first bytes, n = 10 (Input A, not B, as above).**
+- First nonzero total: 22–69 ms, median 31.
+- First media (above 64 KiB): 132–173 ms, median 138.5.
+- The 5 s `output_connect_timeout_ms` has about 30× headroom; no change proposed.
+
+**A dead sink sends an EOS after its error (found by these legs; fixed in C09).**
+- Each output appsrc whose push fails sends an EOS downstream. The watch took that EOS for a drain: `OutputDrained` 34 ms after the error, with no drain asked for, spending the once-only event, so the session's real drain later always waited out `drain_timeout_ms`.
+- **Fixed** (`take_drained_at_eos`). Test: `a_failed_output_neither_reports_drained_nor_spends_the_drain`; mutants G38 and G39.
+
+**Teardown (C09):**
+- **Fly Machines created:** `874749ef304748` (c09-cf-leg; exited at boot on a bad entrypoint), `6839327a2021d8` (c09-cf-leg2) and `8744410f632118` (c09-cf-leg3). Each was destroyed. `fly machines list -a seazn-relay-spike`: "No machines are available on this app".
+- **Cloudflare:** no input or Output was created or changed. Pushes went only to Input A (recording `off` since the C00 teardown; not re-read) and to one made-up key, which CF refused.
+- **flyctl** used its stored login; no token went on argv.
+
+**BLOCKED: F-004's 10 min direct-to-YouTube test of the noise filler and of a no-audio-track variant.**
+- It needs an owner session: the push is a broadcast on the owner's channel (`SPIKE_YT_DIRECT_URL` is staged), and the verdict is YouTube Studio's health readout. Owed 41.
+- **In CI instead:** the filler's encode, through the adapter. 137–140 AAC frames for 3 s; 46.88 frames/s; 128 kbps; zero-byte share 0.106 (fail above 0.5); level between −80 and −45 dBFS. A real tone passes at −23 dBFS; its zero share is 0.618, which is CBR fill on a pure tone, so it is reported and not asserted.
+
 ## Platform notes (Fly-specific; nothing inside the image depends on them)
 
 - **CPU:** performance-4x reports AMD EPYC with 4 vCPU.
