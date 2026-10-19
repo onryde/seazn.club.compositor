@@ -19,7 +19,8 @@
        noready=1            never log seazn:ready (and so never beat)
        ready_after_ms=N     log seazn:ready N ms after load (default 500)
        crash=1              after ready, block the page in `while (true) {}` (a hang, not a crash:
-                            the renderer stays alive, and the beat stops with the rest of the page)
+                            the renderer stays alive, and the beat stops with the rest of the page);
+                            it console.warns `hang starts` first, so a test sees the moment
        crash_after_ms=N     how long after ready the hang starts (default 500)
        revive_after_ms=N    the hang ends after N ms, and the page beats and paints again
                             (default: never)
@@ -32,6 +33,9 @@
        echo_url=1           after ready, console.warn the page's own URL once (`page url
                             <location.href>`), token and all: a page warning, which the adapter
                             logs (it drops the page's info and debug output), and must log scrubbed
+       echo_token=1         after ready, console.warn the bare `st` value once (`page token <st>`):
+                            no `?` before it, so only the adapter's scrubber, which learned the token
+                            from the URL, can mask it (PR #32 review m1)
 -->
 <html>
 <head>
@@ -80,9 +84,13 @@
     if (channel !== null) console.info("seazn:phase-channel=" + channel);
     if (q.get("alive_twin") === "1") console.info("seazn:alive-x");
     if (q.get("echo_url") === "1") console.warn("page url " + location.href);
+    if (q.get("echo_token") === "1") console.warn("page token " + q.get("st"));
     if (q.get("crash") === "1") {
       const revive = num("revive_after_ms", null);
-      setTimeout(() => busy(revive), num("crash_after_ms", 500));
+      setTimeout(() => {
+        console.warn("hang starts");
+        busy(revive);
+      }, num("crash_after_ms", 500));
     }
   }
 

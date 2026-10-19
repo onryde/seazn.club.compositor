@@ -2,19 +2,27 @@
 //! and an X display, so they run in the C12 image (or the C00 spike image with a Rust toolchain)
 //! only: `Xvfb :99 & DISPLAY=:99 cargo test -p adapters --features cef --test graphics --
 //! --test-threads=1`. CEF is initialised once per process and outlives every adapter, so the tests
-//! take `serial()` and run one at a time.
+//! take `serial()` and run one at a time; the two that need a CEF of their own (a real GST_DEBUG, a
+//! killed zygote) run again in a child process.
 //!
 //! Expected values come from the page (`harness/pages/overlay-test.html`, its CSS and its lines),
 //! the brief, `Thresholds::default()` and the findings (F-001, F-013), never from the adapter.
-use std::path::Path;
-use std::process::Command;
+//!
+//! **Waits** (PR #32 review m5): a test waits for an event, a line or a count, never a fixed sleep
+//! it then trusts. Each wait's bound is the domain's own: a ready within `cef_load_timeout_ms` (a
+//! slower page is restarted, a cold CEF start included), and anything a live page does continually
+//! (a paint, a beat, a crash's report) within `cef_hang_after_ms`. A bound only ends a wait that would
+//! otherwise hang; none is the claim under test, except the brief's 500 ms for the drop.
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use adapters::cef_graphics::{
-    cef_children, CefGraphics, ReaperPath, CEF_NICE, CEF_OOM_SCORE_ADJ, REAPER_KILL_AFTER_MS,
-    SPARE_RENDERER_OFF,
+    cef_children, CefGraphics, ReaperPath, CEF_NICE, CHILD_POLL_MS, REAPER_KILL_AFTER_MS, SPARE_RENDERER_OFF,
+    TEARDOWN_LEAK_AFTER_MS,
 };
 use adapters::frame_store::FrameStore;
 use adapters::gst_programme::GstProgramme;
@@ -34,9 +42,23 @@ const BLUE_BGRA: [u8; 4] = [255, 0, 0, 255];
 /// The page's `#white50`: `rgba(255, 255, 255, 0.5)` at (100, 300), 200 × 100. Straight alpha in the
 /// slot (the adapter's job: cefsrc's own reads (128, 128, 128, 128), F-001). 0.5 × 255 rounds to 128.
 const WHITE50_STRAIGHT: [u8; 4] = [255, 255, 255, 128];
+/// Chromium's History backend commits every 10 s (`kCommitIntervalSeconds`): the token reaches
+/// History's file no sooner (the review's P1 waited 12 s).
+const HISTORY_COMMIT: Duration = Duration::from_secs(10);
+
 /// The page beats every `cef_alive_every_ms` after ready (R2005; the page's own setInterval).
 fn beat() -> Duration {
     Duration::from_millis(Thresholds::default().cef_alive_every_ms)
+}
+
+/// The domain's load timeout: no test waits longer for a ready.
+fn load_timeout() -> Duration {
+    Duration::from_millis(Thresholds::default().cef_load_timeout_ms)
+}
+
+/// The domain's hang bound: the wait for anything a live page does continually.
+fn hang_bound() -> Duration {
+    Duration::from_millis(Thresholds::default().cef_hang_after_ms)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -47,12 +69,15 @@ fn serial() -> MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn page(query: &str) -> String {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../harness/pages/overlay-test.html")
+fn pages_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../harness/pages")
         .canonicalize()
-        .expect("the harness page");
-    format!("file://{}{query}", p.display())
+        .expect("the harness pages")
+}
+
+fn page(query: &str) -> String {
+    format!("file://{}/overlay-test.html{query}", pages_dir().display())
 }
 
 type Lines = Arc<Mutex<Vec<String>>>;
@@ -69,8 +94,8 @@ fn rig_with(frames: FrameStore, cap_mb: u64) -> Rig {
     let (tx, rx) = crossbeam_channel::bounded(8_192);
     let lines: Lines = Arc::default();
     let sink = Arc::clone(&lines);
-    // The token test's child prints the adapter's lines too: they join the stderr it checks.
-    let echo = std::env::var_os("C11_TOKEN_CHILD").is_some();
+    // A child test process prints the adapter's lines too: they join the stderr its parent reads.
+    let echo = std::env::var_os("C11_CHILD").is_some();
     let g = CefGraphics::new(frames.clone(), tx, 30, cap_mb).with_log(Arc::new(move |l: &str| {
         if echo {
             eprintln!("adapter: {l}");
@@ -90,24 +115,43 @@ fn lines(r: &Rig) -> Vec<String> {
     r.lines.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
-/// Every event until `pred` matches one (included), or panics after `timeout`.
-fn events_until(rx: &Receiver<Inbound>, timeout: Duration, pred: impl Fn(&Event) -> bool) -> Vec<Event> {
+/// True once a line of the adapter's log contains every one of `needles` (within `timeout`).
+fn wait_line(r: &Rig, timeout: Duration, needles: &[&str]) -> bool {
+    wait_for(timeout, || {
+        lines(r).iter().any(|l| needles.iter().all(|n| l.contains(n)))
+    })
+}
+
+/// Every event until `n` of them match `pred` (the last included), or panics after `timeout`.
+fn events_until_n(
+    rx: &Receiver<Inbound>,
+    timeout: Duration,
+    n: usize,
+    pred: impl Fn(&Event) -> bool,
+) -> Vec<Event> {
     let end = Instant::now() + timeout;
     let mut seen = Vec::new();
+    let mut hits = 0;
     loop {
         let left = end.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left) {
             Ok(Inbound::Event(e)) => {
-                let hit = pred(&e);
+                if pred(&e) {
+                    hits += 1;
+                }
                 seen.push(e);
-                if hit {
+                if hits >= n {
                     return seen;
                 }
             }
             Ok(Inbound::Session(_)) => {}
-            Err(_) => panic!("no matching event within {timeout:?}; saw {seen:?}"),
+            Err(_) => panic!("{hits} of {n} matching events within {timeout:?}; saw {seen:?}"),
         }
     }
+}
+
+fn events_until(rx: &Receiver<Inbound>, timeout: Duration, pred: impl Fn(&Event) -> bool) -> Vec<Event> {
+    events_until_n(rx, timeout, 1, pred)
 }
 
 /// Every event within `window`, each with when it arrived.
@@ -122,8 +166,22 @@ fn events_for(rx: &Receiver<Inbound>, window: Duration) -> Vec<(Instant, Event)>
     seen
 }
 
+/// Every event already queued.
+fn drain(rx: &Receiver<Inbound>) -> Vec<Event> {
+    rx.try_iter()
+        .filter_map(|m| match m {
+            Inbound::Event(e) => Some(e),
+            Inbound::Session(_) => None,
+        })
+        .collect()
+}
+
 fn ready(gen: u64) -> impl Fn(&Event) -> bool {
     move |e| *e == Event::CefReady { gen }
+}
+
+fn crashed(gen: u64) -> impl Fn(&Event) -> bool {
+    move |e| *e == Event::CefCrashed { gen }
 }
 
 fn wait_for(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
@@ -135,6 +193,12 @@ fn wait_for(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
         thread::sleep(Duration::from_millis(20));
     }
     cond()
+}
+
+/// Two child polls after this call (renice, OOM order, claims and the cap are each a poll's work).
+fn two_polls(g: &CefGraphics) -> bool {
+    let p0 = g.polls();
+    wait_for(hang_bound(), || g.polls() >= p0 + 2)
 }
 
 fn bytes(s: &gst::Sample) -> Vec<u8> {
@@ -173,6 +237,54 @@ fn renderer_count() -> usize {
     cef_children().iter().filter(|c| c.kind == "renderer").count()
 }
 
+/// Runs test `name` again in a child process, with a HOME of its own (this process's CEF holds its
+/// profile for good, and a second CEF on one HOME refuses to start, F-013) and `env`. The child
+/// takes its own branch on `C11_CHILD`.
+fn rerun_in_child(name: &str, env: &[(&str, &str)]) -> std::process::Output {
+    let home = std::env::temp_dir().join(format!("c11-child-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("child HOME");
+    let out = run_child(name, &home, env);
+    let _ = std::fs::remove_dir_all(&home);
+    out
+}
+
+/// `rerun_in_child` on a HOME the caller made (and reads after the child exits).
+fn run_child(name: &str, home: &Path, env: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = Command::new(std::env::current_exe().expect("test binary"));
+    cmd.args(["--exact", name, "--test-threads=1", "--nocapture"])
+        .env("C11_CHILD", "1")
+        .env("HOME", home);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("child")
+}
+
+/// Every file under `root` whose bytes hold `needle`, and how many files were read.
+fn files_holding(root: &Path, needle: &[u8]) -> (Vec<PathBuf>, usize) {
+    fn walk(dir: &Path, needle: &[u8], hits: &mut Vec<PathBuf>, files: &mut usize) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                walk(&p, needle, hits, files);
+            } else if ft.is_file() {
+                *files += 1;
+                // An empty needle lists every file.
+                if needle.is_empty() || std::fs::read(&p).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle)) {
+                    hits.push(p);
+                }
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    let mut files = 0;
+    walk(root, needle, &mut hits, &mut files);
+    (hits, files)
+}
+
 // ---------------------------------------------------------------------------------------------
 // The brief's tests (Step 1, amended)
 
@@ -181,9 +293,9 @@ fn ready_signal_arrives_with_its_generation() {
     let _s = serial();
     let mut r = rig();
     r.g.restart(1, &page(""));
-    events_until(&r.rx, Duration::from_secs(5), ready(1));
+    events_until(&r.rx, load_timeout(), ready(1));
     assert!(
-        wait_for(Duration::from_secs(2), || r.frames.overlay().is_some()),
+        wait_for(hang_bound(), || r.frames.overlay().is_some()),
         "no overlay sample after CefReady"
     );
     let s = r.frames.overlay().expect("overlay");
@@ -219,13 +331,17 @@ fn page_without_ready_signal_times_out() {
     let _s = serial();
     let mut r = rig();
     r.g.restart(1, &page("?noready=1"));
-    let seen = events_for(&r.rx, Duration::from_secs(8));
+    assert!(
+        wait_for(load_timeout(), || r.g.samples(1).delivered > 0),
+        "the page painted no frame at all"
+    );
+    // The page paints, and for the domain's whole load timeout after that it never signals.
+    let seen = events_for(&r.rx, load_timeout());
     let samples = r.g.samples(1);
     eprintln!(
         "noready: {} samples delivered, events {seen:?}",
         samples.delivered
     );
-    assert!(samples.delivered > 0, "the page painted no frame at all");
     assert!(
         !seen.iter().any(|(_, e)| matches!(e, Event::CefReady { .. })),
         "the adapter faked ready: {seen:?}"
@@ -237,25 +353,31 @@ fn page_without_ready_signal_times_out() {
 fn frames_before_ready_never_reach_the_slot() {
     let _s = serial();
     let mut r = rig();
-    // The first generation, on an empty slot.
+    // The first generation, on an empty slot: a second of its paints (30 fps).
     r.g.restart(1, &page("?noready=1"));
-    thread::sleep(Duration::from_secs(3));
+    assert!(
+        wait_for(load_timeout(), || r.g.samples(1).delivered >= 30),
+        "gen 1 painted too little: {:?}",
+        r.g.samples(1)
+    );
     let first = r.g.samples(1);
-    assert!(first.delivered > 0, "gen 1 painted nothing: {first:?}");
     assert!(
         r.frames.overlay().is_none(),
         "a frame of an unready page reached the slot"
     );
     // A previous generation's frame, held through an unready one.
     r.g.restart(2, &page(""));
-    events_until(&r.rx, Duration::from_secs(5), ready(2));
-    assert!(wait_for(Duration::from_secs(2), || r.frames.overlay().is_some()));
+    events_until(&r.rx, load_timeout(), ready(2));
+    assert!(wait_for(hang_bound(), || r.frames.overlay().is_some()));
     r.g.restart(3, &page("?noready=1"));
     let held = bytes(&r.frames.overlay().expect("gen 2's frame"));
-    thread::sleep(Duration::from_secs(3));
+    assert!(
+        wait_for(load_timeout(), || r.g.samples(3).delivered >= 30),
+        "gen 3 painted too little: {:?}",
+        r.g.samples(3)
+    );
     let third = r.g.samples(3);
     eprintln!("unready samples: gen 1 {first:?}; gen 3 {third:?}");
-    assert!(third.delivered > 0, "gen 3 painted nothing: {third:?}");
     assert_eq!(third.written, 0);
     assert_eq!(
         bytes(&r.frames.overlay().expect("held")),
@@ -270,12 +392,13 @@ fn restart_holds_the_last_overlay_frame() {
     let _s = serial();
     let mut r = rig();
     r.g.restart(1, &page(""));
-    events_until(&r.rx, Duration::from_secs(5), ready(1));
-    assert!(wait_for(Duration::from_secs(2), || r.frames.overlay().is_some()));
-    r.g.restart(2, &page("?ready_after_ms=4000"));
+    events_until(&r.rx, load_timeout(), ready(1));
+    assert!(wait_for(hang_bound(), || r.frames.overlay().is_some()));
+    // Gen 2 loads and paints, and is not ready (it never will be): the slot holds gen 1's frame.
+    r.g.restart(2, &page("?noready=1"));
     let held = r.frames.overlay().expect("gen 1's last frame");
     assert!(
-        wait_for(Duration::from_secs(3), || r.g.samples(2).delivered >= 3),
+        wait_for(load_timeout(), || r.g.samples(2).delivered >= 3),
         "gen 2 produced no frame"
     );
     let now = r.frames.overlay().expect("still held");
@@ -296,39 +419,37 @@ fn crash_of_the_renderer_reports_cefcrashed() {
     let _s = serial();
     let mut r = rig();
     r.g.restart(1, &page(""));
-    events_until(&r.rx, Duration::from_secs(5), ready(1));
-    assert!(wait_for(Duration::from_secs(2), || !r
-        .g
-        .renderer_pids(1)
-        .is_empty()));
+    events_until(&r.rx, load_timeout(), ready(1));
+    assert!(wait_for(hang_bound(), || !r.g.renderer_pids(1).is_empty()));
     let pids = r.g.renderer_pids(1);
     // F-013: no spare renderer, so the build has exactly one.
     assert_eq!(pids.len(), 1, "gen 1's renderers: {pids:?}");
-    assert!(wait_for(Duration::from_secs(1), || r.frames.overlay().is_some()));
+    assert!(wait_for(hang_bound(), || r.frames.overlay().is_some()));
     let killed = Command::new("kill")
         .args(["-KILL", &pids[0].to_string()])
         .status()
         .expect("kill");
     assert!(killed.success());
-    events_until(&r.rx, Duration::from_secs(2), |e| {
-        *e == Event::CefCrashed { gen: 1 }
-    });
+    events_until(&r.rx, hang_bound(), crashed(1));
     let held = bytes(&r.frames.overlay().expect("held"));
     // cefsrc reloads the page, and the reloaded page signals ready again: the crashed build's gate
     // stays shut (the reload's frames never reach the slot).
-    events_until(&r.rx, Duration::from_secs(5), ready(1));
+    events_until(&r.rx, load_timeout(), ready(1));
     let at_reload = r.g.samples(1);
-    thread::sleep(Duration::from_secs(1));
+    assert!(
+        wait_for(hang_bound(), || r.g.samples(1).dropped >= at_reload.dropped + 10),
+        "the reloaded page painted nothing: {:?}",
+        r.g.samples(1)
+    );
     let later = r.g.samples(1);
     eprintln!(
         "killed renderer {}; after the reload: {at_reload:?} → {later:?}",
         pids[0]
     );
-    assert!(
-        later.dropped > at_reload.dropped,
-        "the reloaded page painted nothing"
-    );
+    assert_eq!(later.written, at_reload.written);
     assert_eq!(bytes(&r.frames.overlay().expect("held")), held);
+    // A renderer's death is a crash, not CEF's end (the zygote test's negative pair).
+    assert_eq!(r.g.health().unrecoverable, None);
     r.g.stop();
 }
 
@@ -337,9 +458,9 @@ fn rss_over_cap_reports_crash() {
     let _s = serial();
     let mut r = rig_with(FrameStore::default(), 1);
     r.g.restart(1, &page(""));
-    events_until(&r.rx, Duration::from_secs(3), |e| {
-        *e == Event::CefCrashed { gen: 1 }
-    });
+    // CEF's children exist once it starts (a load's work), and the cap is read every child poll.
+    let bound = load_timeout() + Duration::from_millis(2 * CHILD_POLL_MS);
+    events_until(&r.rx, bound, crashed(1));
     r.g.stop();
 }
 
@@ -348,24 +469,22 @@ fn a_reported_crash_closes_its_generations_gate() {
     let _s = serial();
     let mut r = rig();
     r.g.restart(1, &page(""));
-    events_until(&r.rx, Duration::from_secs(5), ready(1));
-    assert!(wait_for(Duration::from_secs(3), || r.g.samples(1).written >= 5));
+    events_until(&r.rx, load_timeout(), ready(1));
+    assert!(wait_for(hang_bound(), || r.g.samples(1).written >= 5));
     r.g.set_rss_cap_mb(1);
-    events_until(&r.rx, Duration::from_secs(3), |e| {
-        *e == Event::CefCrashed { gen: 1 }
-    });
+    events_until(&r.rx, hang_bound(), crashed(1));
     let held = bytes(&r.frames.overlay().expect("the last frame"));
     let at_report = r.g.samples(1);
-    thread::sleep(Duration::from_millis(1_500));
+    assert!(
+        wait_for(hang_bound(), || r.g.samples(1).dropped >= at_report.dropped + 10),
+        "the page painted nothing after the report: {:?}",
+        r.g.samples(1)
+    );
     let later = r.g.samples(1);
-    eprintln!("at the report {at_report:?}; 1.5 s later {later:?}");
+    eprintln!("at the report {at_report:?}; later {later:?}");
     assert_eq!(
         later.written, at_report.written,
         "a sample reached the slot after the report"
-    );
-    assert!(
-        later.dropped > at_report.dropped,
-        "the page painted nothing after the report"
     );
     assert_eq!(
         bytes(&r.frames.overlay().expect("held")),
@@ -379,27 +498,53 @@ fn a_reported_crash_closes_its_generations_gate() {
 fn stale_generation_events_are_tagged_with_their_own_gen() {
     let _s = serial();
     let mut r = rig();
-    // Gen 1's teardown is held (a stand-in for a slow one), so its page signals ready, stale and
-    // its channel AFTER it was retired; gen 2 signals much later.
-    r.g.delay_teardowns(Duration::from_millis(2_800));
+    // Gen 1's teardown is held (and its renderer left alone), so its page signals ready, stale and
+    // its channel after it was retired.
+    r.g.hold_teardowns(true);
+    r.g.set_reaper_kill_after(Duration::from_secs(60));
     r.g.restart(1, &page("?ready_after_ms=1200&stale=1&channel=web"));
-    thread::sleep(Duration::from_millis(300));
-    r.g.restart(2, &page("?ready_after_ms=3500"));
-    let seen = events_for(&r.rx, Duration::from_secs(6));
-    r.g.delay_teardowns(Duration::ZERO);
-    let readies: Vec<u64> = seen
-        .iter()
-        .filter_map(|(_, e)| match e {
-            Event::CefReady { gen } => Some(*gen),
-            _ => None,
-        })
-        .collect();
-    eprintln!("readies in order: {readies:?}; all events {seen:?}");
-    assert_eq!(readies, vec![1, 2], "the first page's ready must carry gen 1");
+    r.g.restart(2, &page(""));
+    let mut seen = events_until(&r.rx, load_timeout(), ready(1));
+    let at_ready = r.g.samples(1);
+    // The page logs both lines right after its ready; the dispatcher handles them in order.
+    let handled = wait_for(hang_bound(), || {
+        seen.extend(drain(&r.rx));
+        let not_relayed = lines(&r)
+            .iter()
+            .filter(|l| l.contains("from a retired page; not relayed"))
+            .count();
+        not_relayed >= 2
+            || seen
+                .iter()
+                .any(|e| matches!(e, Event::ScoreStale(_) | Event::PhaseChannel(_)))
+    });
+    assert!(handled, "gen 1's stale and channel lines were never handled");
+    if !seen.iter().any(ready(2)) {
+        seen.extend(events_until(&r.rx, load_timeout(), ready(2)));
+    }
+    assert!(
+        wait_for(hang_bound(), || r.g.samples(1).delivered
+            >= at_ready.delivered + 10),
+        "the retired page painted nothing after its ready"
+    );
+    seen.extend(drain(&r.rx));
+    r.g.hold_teardowns(false);
+    r.g.set_reaper_kill_after(Duration::from_millis(REAPER_KILL_AFTER_MS));
+    let readies = |gen: u64| seen.iter().filter(|e| ready(gen)(e)).count();
+    eprintln!(
+        "readies: gen 1 {}, gen 2 {}; all events {seen:?}",
+        readies(1),
+        readies(2)
+    );
+    assert_eq!(
+        (readies(1), readies(2)),
+        (1, 1),
+        "the first page's ready must carry gen 1"
+    );
     assert!(
         !seen
             .iter()
-            .any(|(_, e)| matches!(e, Event::ScoreStale(_) | Event::PhaseChannel(_))),
+            .any(|e| matches!(e, Event::ScoreStale(_) | Event::PhaseChannel(_))),
         "a retired page's stale or channel line was relayed"
     );
     assert_eq!(
@@ -415,7 +560,9 @@ fn score_stale_signal_is_relayed() {
     let _s = serial();
     let mut r = rig();
     r.g.restart(1, &page("?stale=1&fresh_after_ms=1000"));
-    let seen = events_until(&r.rx, Duration::from_secs(7), |e| *e == Event::ScoreStale(false));
+    let seen = events_until(&r.rx, load_timeout() + hang_bound(), |e| {
+        *e == Event::ScoreStale(false)
+    });
     let order: Vec<&Event> = seen
         .iter()
         .filter(|e| matches!(e, Event::CefReady { .. } | Event::ScoreStale(_)))
@@ -443,10 +590,12 @@ fn phase_channel_signal_is_relayed() {
     for (n, (value, want)) in cases.iter().enumerate() {
         let gen = n as u64 + 1;
         r.g.restart(gen, &page(&format!("?channel={value}")));
-        events_until(&r.rx, Duration::from_secs(5), ready(gen));
-        let got: Vec<PhaseChannel> = events_for(&r.rx, Duration::from_secs(3))
+        events_until(&r.rx, load_timeout(), ready(gen));
+        // The page logs its channel right after ready and beats a beat later: everything relayed
+        // for the line comes before the first beat.
+        let got: Vec<PhaseChannel> = events_until(&r.rx, hang_bound(), |e| *e == Event::CefAlive { gen })
             .into_iter()
-            .filter_map(|(_, e)| match e {
+            .filter_map(|e| match e {
                 Event::PhaseChannel(c) => Some(c),
                 _ => None,
             })
@@ -471,41 +620,26 @@ fn phase_channel_signal_is_relayed() {
 fn alive_beats_are_relayed_with_their_generation() {
     let _s = serial();
     let mut r = rig();
-    let t0 = Instant::now();
     // `alive_twin=1`: the page logs `seazn:alive-x` right after ready, a near miss.
     r.g.restart(1, &page("?alive_twin=1"));
-    let seen = events_for(&r.rx, Duration::from_secs(7));
-    let at_ready = seen
-        .iter()
-        .position(|(_, e)| *e == Event::CefReady { gen: 1 })
-        .expect("CefReady{1}");
-    let ready_at = seen[at_ready].0;
+    let before = events_until(&r.rx, load_timeout(), ready(1));
     assert!(
-        !seen[..at_ready]
-            .iter()
-            .any(|(_, e)| matches!(e, Event::CefAlive { .. })),
-        "a beat before ready: {seen:?}"
+        !before.iter().any(|e| matches!(e, Event::CefAlive { .. })),
+        "a beat before ready: {before:?}"
     );
-    let beats: Vec<Duration> = seen[at_ready..]
-        .iter()
-        .filter(|(_, e)| *e == Event::CefAlive { gen: 1 })
-        .map(|(t, _)| t.duration_since(ready_at))
-        .collect();
-    eprintln!(
-        "ready {:?} after restart; beats after ready: {beats:?}",
-        ready_at - t0
-    );
-    assert!(beats.len() >= 2, "{seen:?}");
-    // The first real beat is one beat after ready; the twin came at once and is no beat.
-    assert!(beats[0] > beat() * 3 / 4, "{beats:?}");
+    let seen = events_until_n(&r.rx, hang_bound() * 2, 2, |e| *e == Event::CefAlive { gen: 1 });
+    eprintln!("after ready: {seen:?}");
     assert!(
         seen.iter()
-            .all(|(_, e)| !matches!(e, Event::CefAlive { gen } if *gen != 1)),
+            .all(|e| !matches!(e, Event::CefAlive { gen } if *gen != 1)),
         "{seen:?}"
     );
-    assert!(lines(&r)
-        .iter()
-        .any(|l| l.contains("WARN") && l.contains("seazn:alive-x")));
+    // The twin is no beat: it is logged at WARN as a line that is no signal.
+    assert!(
+        wait_line(&r, hang_bound(), &["WARN", "seazn:alive-x"]),
+        "the twin was not logged at WARN: {:?}",
+        lines(&r)
+    );
     r.g.stop();
 }
 
@@ -519,18 +653,20 @@ fn hung_page_stops_beating() {
         1,
         &page(&format!("?crash=1&crash_after_ms={}", hang_after.as_millis())),
     );
-    events_until(&r.rx, Duration::from_secs(5), ready(1));
-    let ready_at = Instant::now();
-    let before = events_for(&r.rx, hang_after - Duration::from_millis(100));
+    events_until(&r.rx, load_timeout(), ready(1));
     let pids = r.g.renderer_pids(1);
     assert_eq!(pids.len(), 1, "{pids:?}");
-    thread::sleep(
-        (ready_at + hang_after + Duration::from_millis(100)).saturating_duration_since(Instant::now()),
+    // The page warns `hang starts` just before its busy loop; every beat before it was relayed
+    // before the line was logged.
+    assert!(
+        wait_line(&r, hang_after + hang_bound(), &["page console: hang starts"]),
+        "the page never hung"
     );
-    let during = events_for(&r.rx, Duration::from_secs(3));
+    let before = drain(&r.rx);
+    let during = events_for(&r.rx, beat() * 3);
     let beats_before = before
         .iter()
-        .filter(|(_, e)| *e == Event::CefAlive { gen: 1 })
+        .filter(|e| **e == Event::CefAlive { gen: 1 })
         .count();
     eprintln!("beats before the hang: {beats_before}; events during it: {during:?}");
     assert!(beats_before >= 1, "{before:?}");
@@ -549,23 +685,23 @@ fn reaper_kills_a_renderer_that_will_not_tear_down() {
     r.g.js_signal_builds(true);
     r.g.restart(1, &page("?noready=1"));
     assert!(
-        wait_for(Duration::from_secs(5), || !r.g.renderer_pids(1).is_empty()),
+        wait_for(load_timeout(), || !r.g.renderer_pids(1).is_empty()),
         "gen 1 never got a renderer"
     );
-    thread::sleep(Duration::from_millis(500));
     let pids = r.g.renderer_pids(1);
     r.g.js_signal_builds(false);
     let t0 = Instant::now();
     r.g.restart(2, &page(""));
-    let budget = Duration::from_millis(REAPER_KILL_AFTER_MS + 2_000);
-    events_until(&r.rx, budget, ready(2));
+    events_until(&r.rx, load_timeout(), ready(2));
+    let kill_bound = Duration::from_millis(REAPER_KILL_AFTER_MS) + hang_bound();
     assert!(
-        wait_for(budget.saturating_sub(t0.elapsed()), || r
+        wait_for(kill_bound.saturating_sub(t0.elapsed()), || r
             .g
             .reaper_path(1)
             .is_some()),
         "the reaper reported nothing for gen 1"
     );
+    let killed_at = t0.elapsed();
     let path = r.g.reaper_path(1).expect("path");
     let killed = match path {
         ReaperPath::Killed { pids } => pids,
@@ -574,18 +710,38 @@ fn reaper_kills_a_renderer_that_will_not_tear_down() {
         }
     };
     eprintln!(
-        "gen 1 renderers {pids:?}; killed {killed:?} {:?} after restart(2); respawned by CEF's reload: {:?}",
-        t0.elapsed(),
+        "gen 1 renderers {pids:?}; killed {killed:?} by {killed_at:?} after restart(2); respawned by \
+         CEF's reload: {:?}",
         r.g.renderer_pids(1)
+    );
+    // Never before the bound: the reaper waits for the teardown first.
+    assert!(
+        killed_at >= Duration::from_millis(REAPER_KILL_AFTER_MS),
+        "killed at {killed_at:?}"
     );
     assert!(!killed.is_empty(), "the reaper killed no pid");
     assert_eq!(killed, pids, "the reaper killed other pids than gen 1's");
     assert!(
-        wait_for(budget.saturating_sub(t0.elapsed()), || pids
-            .iter()
-            .all(|p| !alive(*p))),
+        wait_for(hang_bound(), || pids.iter().all(|p| !alive(*p))),
         "a gen-1 renderer outlived the kill: {pids:?}"
     );
+    // The teardown stays stuck (F-013): counted leaked once, no sooner than its bound (Owed 55).
+    let leak_at = Duration::from_millis(REAPER_KILL_AFTER_MS + TEARDOWN_LEAK_AFTER_MS);
+    assert!(
+        wait_for((leak_at + hang_bound()).saturating_sub(t0.elapsed()), || {
+            r.g.health().leaked_teardowns >= 1
+        }),
+        "the stuck teardown was never counted leaked: {:?}",
+        r.g.health()
+    );
+    let leaked_seen = t0.elapsed();
+    eprintln!("leaked counted by {leaked_seen:?}; {:?}", r.g.health());
+    assert!(leaked_seen >= leak_at, "counted leaked at {leaked_seen:?}");
+    assert_eq!(r.g.health().leaked_teardowns, 1);
+    assert_eq!(r.g.teardowns_in_flight(), 1);
+    assert!(lines(&r)
+        .iter()
+        .any(|l| l.contains("WARN") && l.contains("1 leaked")));
     r.g.stop();
 }
 
@@ -631,16 +787,17 @@ fn the_hidden_page_stays_off_air_and_the_retry_reaches_air() {
         r.g.restart(gen, &page("?noready=1"));
         pace(&mut p, 45);
     }
-    // C08's mapping of the Failed hide.
-    p.hide_overlay();
+    // C08's mapping of the Failed hide (PR #32 review I2): stop, then hide.
     r.g.stop();
+    p.hide_overlay();
     let hidden_from = pace(&mut p, 0);
     pace(&mut p, 45);
     let retry_at = pace(&mut p, 0);
     r.g.restart(fails + 1, &page(""));
     let mut ready_tick = None;
     let mut now = retry_at;
-    while ready_tick.is_none() && now < retry_at + 30 * 6 {
+    let ready_ticks = load_timeout().as_millis() as u64 * u64::from(profile.fps) / 1_000;
+    while ready_tick.is_none() && now < retry_at + ready_ticks {
         now = pace(&mut p, 1);
         while let Ok(Inbound::Event(e)) = r.rx.try_recv() {
             if e == (Event::CefReady { gen: fails + 1 }) {
@@ -651,11 +808,18 @@ fn the_hidden_page_stays_off_air_and_the_retry_reaches_air() {
     let ready_tick = ready_tick.expect("the retry never signalled ready");
     pace(&mut p, 45);
     p.drain();
-    events_until(&prx, Duration::from_secs(15), |e| *e == Event::OutputDrained);
+    let drain_bound = Duration::from_millis(Thresholds::default().drain_timeout_ms) + hang_bound();
+    events_until(&prx, drain_bound, |e| *e == Event::OutputDrained);
     let blue = decode_blue(&target);
     let _ = std::fs::remove_dir_all(&dir);
-    let unready: Vec<bool> = blue[..retry_at as usize].to_vec();
-    let after_ready: Vec<bool> = blue[ready_tick as usize..].to_vec();
+    let pushed = pace(&mut p, 0);
+    let unready = blue.get(..retry_at as usize).unwrap_or_else(|| {
+        panic!(
+            "decoded {} frames, fewer than the {retry_at} pushed before the retry ({pushed} in all)",
+            blue.len()
+        )
+    });
+    let after_ready = blue.get(ready_tick as usize..).unwrap_or_default();
     eprintln!(
         "frames checked: {} before the retry ({} from the hide), {} after its ready ({} blue)",
         unready.len(),
@@ -719,32 +883,49 @@ fn decode_blue(path: &Path) -> Vec<bool> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// stop() and the slot gate; the bounded drop
+// stop() and the slot gate; the hide's order; the bounded drop
+
+/// `g.stop()` on another thread: true if it returned within `limit` (a stop that waited for a
+/// held teardown would not).
+fn stop_returns_within(g: &mut CefGraphics, limit: Duration) -> bool {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    thread::scope(|s| {
+        s.spawn(move || {
+            g.stop();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(limit).is_ok()
+    })
+}
 
 #[test]
 fn stop_never_blocks_and_closes_the_slot_on_a_page_hung_after_ready() {
     let _s = serial();
     let mut r = rig();
-    // The page hangs 500 ms after ready and revives 1 500 ms later. A teardown in this mode returns
-    // in milliseconds (F-013), so the held teardown stands in for F-001's hung one: the revived
-    // page paints while it waits, and the gate must drop it.
-    r.g.delay_teardowns(Duration::from_millis(2_500));
-    r.g.restart(1, &page("?crash=1&crash_after_ms=500&revive_after_ms=1500"));
-    events_until(&r.rx, Duration::from_secs(5), ready(1));
-    let ready_at = Instant::now();
-    let first_write = wait_for(Duration::from_millis(450), || r.g.samples(1).written > 0);
+    // The page hangs 3 s after ready and revives 1.5 s later. A teardown in this mode returns in
+    // milliseconds (F-013), so the held teardown stands in for F-001's hung one: the revived page
+    // paints while it waits, and the gate must drop it.
+    r.g.hold_teardowns(true);
+    r.g.restart(1, &page("?crash=1&crash_after_ms=3000&revive_after_ms=1500"));
+    events_until(&r.rx, load_timeout(), ready(1));
     assert!(
-        first_write,
-        "no write {:?} after ready: {:?}",
-        ready_at.elapsed(),
-        r.g.samples(1)
+        wait_line(&r, hang_bound(), &["page console: hang starts"]) || r.g.samples(1).written > 0,
+        "neither a write nor the hang"
+    );
+    assert!(
+        wait_line(&r, hang_bound(), &["page console: hang starts"]),
+        "the page never hung"
+    );
+    let written = r.g.samples(1).written;
+    assert!(
+        written > 0,
+        "the page hung before any write (a host that starved it for 3 s): this run proves nothing"
     );
     let pids = r.g.renderer_pids(1);
-    // Wait for the hang itself, seen as no sample for 300 ms (the page paints at 30 fps until it
-    // starts; a loaded host delays the page's timer), so the hide and the stop land inside it.
+    // The hang itself: no sample for 300 ms (a paint in flight at the line may still land).
     let mut last = r.g.samples(1).delivered;
     let mut quiet_since = Instant::now();
-    let hung = wait_for(Duration::from_secs(3), || {
+    let quiet = wait_for(hang_bound(), || {
         let now = r.g.samples(1).delivered;
         if now != last {
             last = now;
@@ -752,39 +933,113 @@ fn stop_never_blocks_and_closes_the_slot_on_a_page_hung_after_ready() {
         }
         quiet_since.elapsed() >= Duration::from_millis(300)
     });
-    assert!(hung, "the page never hung: {:?}", r.g.samples(1));
-    let written = r.g.samples(1).written;
-    // C08's mapping of a Hang hide: hide_overlay (the programme clears the slot), then stop.
+    assert!(
+        quiet,
+        "the page kept painting through its hang: {:?}",
+        r.g.samples(1)
+    );
+    // C08's mapping of a Hang hide (PR #32 review I2): stop, then hide_overlay (the slot cleared).
+    assert!(
+        stop_returns_within(&mut r.g, hang_bound()),
+        "stop() waited for the held teardown"
+    );
+    assert_eq!(
+        r.g.teardowns_in_flight(),
+        1,
+        "stop() returned once the teardown had"
+    );
     r.frames.clear_overlay();
-    let t = Instant::now();
-    r.g.stop();
-    let took = t.elapsed();
     let at_stop = r.g.samples(1);
-    thread::sleep(Duration::from_millis(2_000));
+    assert!(
+        wait_for(hang_bound(), || r.g.samples(1).dropped > at_stop.dropped),
+        "the page never painted after stop(): this run proves nothing"
+    );
     let later = r.g.samples(1);
     eprintln!(
-        "gen 1 wrote {written} before the hang; stop() took {took:?}; dropped after stop: {}",
+        "gen 1 wrote {written} before the hang; dropped after stop: {}",
         later.dropped - at_stop.dropped
     );
-    assert!(written > 0);
-    assert!(took < Duration::from_millis(200), "stop() took {took:?}");
     assert!(
         r.frames.overlay().is_none(),
         "a gen-1 sample reached the slot after stop()"
     );
     assert_eq!(later.written, at_stop.written);
-    assert!(
-        later.dropped > at_stop.dropped,
-        "the page never painted after stop(): this run proves nothing"
-    );
     assert!(!pids.is_empty());
+    r.g.hold_teardowns(false);
     assert!(
-        wait_for(Duration::from_millis(REAPER_KILL_AFTER_MS + 2_000), || pids
-            .iter()
-            .all(|p| !alive(*p))),
+        wait_for(hang_bound(), || pids.iter().all(|p| !alive(*p))),
         "gen-1 renderers outlived the teardown: {pids:?}"
     );
-    r.g.delay_teardowns(Duration::ZERO);
+}
+
+// PR #32 review I2: a sample being written when the slot is cleared lands after the clear unless the
+// stop came first. The write is held (a test hook, inside the gate's lock) so both orders are exact.
+#[test]
+fn a_hide_before_the_stop_can_leave_a_stale_frame_and_after_it_cannot() {
+    let _s = serial();
+    let mut r = rig();
+    // C08's former order: hide, then stop.
+    r.g.restart(1, &page(""));
+    events_until(&r.rx, load_timeout(), ready(1));
+    assert!(wait_for(hang_bound(), || r.g.samples(1).written > 0));
+    let hold = r.g.hold_next_write();
+    assert!(hold.wait_holding(hang_bound()), "no sample came to be written");
+    let written = r.g.samples(1).written;
+    r.frames.clear_overlay();
+    hold.release();
+    assert!(
+        wait_for(hang_bound(), || r.g.samples(1).written > written),
+        "the held sample was never written"
+    );
+    r.g.stop();
+    let stale = r.frames.overlay();
+    eprintln!(
+        "hide then stop: a frame in the slot after both: {}",
+        stale.is_some()
+    );
+    assert!(
+        stale.is_some(),
+        "hide, then stop: the held write did not land after the hide"
+    );
+
+    // The order C08 now uses: stop (which waits out the write in hand), then hide. The retired
+    // page's teardown is held, so it keeps painting after the stop and the gate must drop it.
+    r.frames.clear_overlay();
+    r.g.hold_teardowns(true);
+    r.g.restart(2, &page(""));
+    events_until(&r.rx, load_timeout(), ready(2));
+    assert!(wait_for(hang_bound(), || r.g.samples(2).written > 0));
+    let hold = r.g.hold_next_write();
+    assert!(hold.wait_holding(hang_bound()), "no sample came to be written");
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    thread::scope(|s| {
+        let g = &mut r.g;
+        s.spawn(move || {
+            g.stop();
+            let _ = tx.send(());
+        });
+        // The stop waits for the held write: it holds the gate.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "stop() returned while a write was in hand"
+        );
+        hold.release();
+        assert!(rx.recv_timeout(hang_bound()).is_ok(), "stop() never returned");
+    });
+    r.frames.clear_overlay();
+    let at_stop = r.g.samples(2);
+    assert!(
+        wait_for(hang_bound(), || r.g.samples(2).dropped >= at_stop.dropped + 10),
+        "the page painted nothing after the stop: this run proves nothing"
+    );
+    let later = r.g.samples(2);
+    r.g.hold_teardowns(false);
+    eprintln!("stop then hide: dropped after both {}", later.dropped - at_stop.dropped);
+    assert!(
+        r.frames.overlay().is_none(),
+        "stop, then hide: a frame reached the slot"
+    );
+    assert_eq!(later.written, at_stop.written);
 }
 
 #[test]
@@ -795,16 +1050,13 @@ fn drop_returns_within_500_ms_while_the_page_is_hung() {
     // set_state and its teardown can never run.
     r.g.js_signal_builds(true);
     r.g.restart(1, &page("?noready=1"));
-    assert!(wait_for(Duration::from_secs(5), || !r
-        .g
-        .renderer_pids(1)
-        .is_empty()));
-    thread::sleep(Duration::from_millis(500));
+    assert!(wait_for(load_timeout(), || !r.g.renderer_pids(1).is_empty()));
     let Rig { g, .. } = r;
     let t = Instant::now();
     drop(g);
     let took = t.elapsed();
     eprintln!("drop took {took:?}");
+    // The brief's bound (amendment 2026-10-19).
     assert!(took <= Duration::from_millis(500), "drop took {took:?}");
 }
 
@@ -817,16 +1069,18 @@ fn a_renderer_born_just_before_a_restart_stays_the_retiring_pages() {
         .filter(|c| c.kind == "renderer")
         .map(|c| c.pid)
         .collect();
-    // Gen 1's teardown is held, so its renderer is still alive for every claim pass after the
-    // restart (a quick teardown would end it before any pass could misattribute it).
-    r.g.delay_teardowns(Duration::from_millis(2_500));
+    // Gen 1's teardown is held, and the reaper's kill put off, so its renderer is still alive for
+    // every claim pass after the restart (a quick teardown would end it before any pass could
+    // misattribute it).
+    r.g.hold_teardowns(true);
+    r.g.set_reaper_kill_after(Duration::from_secs(60));
     r.g.restart(1, &page("?noready=1"));
     // Read /proc here, not through the adapter (whose read claims): restart(2) follows the new
     // renderer within ~20 ms, well inside the 1 s child poll, so only restart's own claim pass can
     // give it to gen 1.
     let mut born = None;
     assert!(
-        wait_for(Duration::from_secs(5), || {
+        wait_for(load_timeout(), || {
             born = cef_children()
                 .into_iter()
                 .find(|c| c.kind == "renderer" && !before.contains(&c.pid))
@@ -837,9 +1091,16 @@ fn a_renderer_born_just_before_a_restart_stays_the_retiring_pages() {
     );
     let born = born.expect("pid");
     r.g.restart(2, &page(""));
-    events_until(&r.rx, Duration::from_secs(5), ready(2));
-    // Past one child poll, while gen 1's teardown is still held.
-    thread::sleep(Duration::from_millis(1_200));
+    // Gen 2's renderer, then two child polls (each claims what it finds for the newest build).
+    assert!(
+        wait_for(load_timeout(), || cef_children()
+            .iter()
+            .any(|c| c.kind == "renderer"
+                && c.pid != born
+                && !before.contains(&c.pid))),
+        "gen 2 never got a renderer"
+    );
+    assert!(two_polls(&r.g), "the child poll stopped");
     assert!(
         alive(born),
         "gen 1's renderer ended before the check: this run proves nothing"
@@ -847,7 +1108,8 @@ fn a_renderer_born_just_before_a_restart_stays_the_retiring_pages() {
     let gen1 = r.g.renderer_pids(1);
     let gen2 = r.g.renderer_pids(2);
     eprintln!("gen 1's renderer {born}: claimed by gen 1 {gen1:?}, gen 2 {gen2:?}");
-    r.g.delay_teardowns(Duration::ZERO);
+    r.g.hold_teardowns(false);
+    r.g.set_reaper_kill_after(Duration::from_millis(REAPER_KILL_AFTER_MS));
     assert_eq!(gen1, vec![born], "gen 1's renderer was not gen 1's");
     assert_eq!(gen2.len(), 1, "gen 2's renderers: {gen2:?}");
     assert!(!gen2.contains(&born));
@@ -855,21 +1117,28 @@ fn a_renderer_born_just_before_a_restart_stays_the_retiring_pages() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Guardrails and secrets (spec §6; the dispatch's secret rule)
+// Guardrails (spec §6; PR #32 review G1)
+
+fn read_i32(path: String) -> Option<i32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
 
 #[test]
-fn cef_children_run_at_nice_10_with_oom_score_adj_1000() {
+fn cef_children_run_at_nice_10_with_the_renderer_first_in_the_oom_order() {
     let _s = serial();
     let mut r = rig();
     r.g.restart(1, &page(""));
-    events_until(&r.rx, Duration::from_secs(5), ready(1));
-    // Two polls.
-    thread::sleep(Duration::from_millis(2_500));
+    events_until(&r.rx, load_timeout(), ready(1));
+    assert!(two_polls(&r.g), "the child poll stopped");
     let kids = cef_children();
+    let own = read_i32("/proc/self/oom_score_adj".to_owned()).expect("own oom_score_adj");
     let mut threads = 0;
+    // (kind, oom_score_adj, oom_score): the kernel's own ordering is what the grading is for.
+    let mut oom = Vec::new();
     for kid in &kids {
-        let oom = std::fs::read_to_string(format!("/proc/{}/oom_score_adj", kid.pid)).unwrap_or_default();
-        assert_eq!(oom.trim(), CEF_OOM_SCORE_ADJ.to_string(), "{kid:?}");
+        let adj = read_i32(format!("/proc/{}/oom_score_adj", kid.pid)).expect("oom_score_adj");
+        let score = read_i32(format!("/proc/{}/oom_score", kid.pid)).expect("oom_score");
+        oom.push((kid.kind.clone(), adj, score));
         for task in std::fs::read_dir(format!("/proc/{}/task", kid.pid))
             .expect("tasks")
             .flatten()
@@ -889,22 +1158,276 @@ fn cef_children_run_at_nice_10_with_oom_score_adj_1000() {
         }
     }
     eprintln!(
-        "CEF children checked: {} ({} renderers), threads checked: {threads}",
+        "CEF children checked: {} ({} renderers), threads checked: {threads}; own adj {own}; \
+         (kind, adj, score): {oom:?}",
         kids.len(),
         renderer_count()
     );
     assert!(!kids.is_empty() && threads > 0);
+    let of = |k: &str| oom.iter().filter(|o| o.0 == k).collect::<Vec<_>>();
+    let (renderers, zygotes) = (of("renderer"), of("zygote"));
+    assert!(!renderers.is_empty() && !zygotes.is_empty(), "{oom:?}");
+    for (kind, adj, score) in &oom {
+        // Every CEF child goes before the compositor itself.
+        assert!(*adj > own, "{kind} at {adj}, not above the compositor's {own}");
+        for (_, r_adj, r_score) in &renderers {
+            if kind != "renderer" {
+                assert!(
+                    adj < r_adj && score < r_score,
+                    "{kind} ({adj}, {score}) ties a renderer"
+                );
+            }
+        }
+        for (_, z_adj, z_score) in &zygotes {
+            if kind != "zygote" {
+                assert!(
+                    adj > z_adj && score > z_score,
+                    "{kind} ({adj}, {score}) at or below a zygote"
+                );
+            }
+        }
+    }
+    // Spec §6: the renderer at 1000, the top of the scale.
+    assert!(renderers.iter().all(|r| r.1 == 1_000), "{renderers:?}");
     r.g.stop();
 }
 
-/// Made up for the test; no credential.
+// Owed 56, owner ruling 2026-10-19 "B": a dead renderer zygote ends CEF for the process, so the
+// adapter reports it (C11b restarts in place). It kills CEF, so it runs in a child process.
+#[test]
+fn a_dead_renderer_zygote_is_reported_and_the_gpu_zygotes_is_not() {
+    let _s = serial();
+    if std::env::var_os("C11_CHILD").is_none() {
+        let out = rerun_in_child(
+            "a_dead_renderer_zygote_is_reported_and_the_gpu_zygotes_is_not",
+            &[],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let checked: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.starts_with("zygote child:"))
+            .collect();
+        eprintln!("child: {}; {checked:?}", out.status);
+        assert!(out.status.success(), "the child failed:\n{stderr}");
+        assert_eq!(checked.len(), 1, "{stderr}");
+        return;
+    }
+    let mut r = rig();
+    r.g.restart(1, &page(""));
+    events_until(&r.rx, load_timeout(), ready(1));
+    assert!(wait_for(hang_bound(), || !r.g.renderer_pids(1).is_empty()));
+    let kids = cef_children();
+    let renderer = kids
+        .iter()
+        .find(|k| k.kind == "renderer")
+        .expect("renderer")
+        .clone();
+    let zygotes: Vec<i32> = kids
+        .iter()
+        .filter(|k| k.kind == "zygote")
+        .map(|k| k.pid)
+        .collect();
+    assert!(
+        zygotes.contains(&renderer.ppid),
+        "the renderer's parent is no zygote: {kids:?}"
+    );
+    let other: Vec<i32> = zygotes.iter().copied().filter(|z| *z != renderer.ppid).collect();
+    assert!(two_polls(&r.g), "the child poll stopped");
+    assert_eq!(r.g.health().unrecoverable, None);
+    // The other zygote (the GPU process's): CEF recovers, and the next build reaches ready.
+    for z in &other {
+        let _ = Command::new("kill").args(["-KILL", &z.to_string()]).status();
+    }
+    assert!(other.iter().all(|z| wait_for(hang_bound(), || !alive(*z))));
+    assert!(two_polls(&r.g), "the child poll stopped");
+    assert_eq!(
+        r.g.health().unrecoverable,
+        None,
+        "the GPU zygote's death was reported"
+    );
+    r.g.restart(2, &page(""));
+    events_until(&r.rx, load_timeout(), ready(2));
+    // The renderers' zygote: reported with the newest generation, within two polls.
+    let _ = Command::new("kill")
+        .args(["-KILL", &renderer.ppid.to_string()])
+        .status();
+    assert!(
+        wait_for(hang_bound(), || r.g.health().unrecoverable.is_some()),
+        "the renderer zygote's death was not reported: {:?}",
+        r.g.health()
+    );
+    assert_eq!(r.g.health().unrecoverable, Some(2));
+    assert!(lines(&r)
+        .iter()
+        .any(|l| l.contains("ERROR gen=2") && l.contains("zygote")));
+    // And the next build fails at once (F-013).
+    r.g.restart(3, &page(""));
+    events_until(&r.rx, load_timeout(), crashed(3));
+    eprintln!(
+        "zygote child: other zygotes {other:?} killed and recovered; renderer zygote {} killed, {:?}",
+        renderer.ppid,
+        r.g.health()
+    );
+    r.g.stop();
+}
+
+// ---------------------------------------------------------------------------------------------
+// The page token (the dispatch's secret rule)
+
+/// Made up for the tests; no credential.
 const TOKEN: &str = "c11madeuptokenNOTREAL0123456789";
+const DISK_TOKEN: &str = "c11madeupDISKtokenNOTREAL0123456";
+
+/// A local HTTP server for the harness pages (`python3 -m http.server`), and its port.
+struct PageServer {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl PageServer {
+    fn start() -> Self {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("a free port")
+            .port();
+        let child = Command::new("python3")
+            .args([
+                "-m",
+                "http.server",
+                &port.to_string(),
+                "--bind",
+                "127.0.0.1",
+                "--directory",
+            ])
+            .arg(pages_dir())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("python3 http.server");
+        let up = wait_for(Duration::from_secs(5), || {
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+        });
+        assert!(up, "the page server never listened on {port}");
+        Self { child, port }
+    }
+}
+
+impl Drop for PageServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+// PR #32 review I1: CEF writes every URL it loads, token and all, to its profile (History, Top
+// Sites, the HTTP cache). Over http (the real page's scheme) and past History's commit, the token
+// is on disk only in the adapter's private profile, and gone once the adapter is dropped.
+//
+// It runs in a child process, with a HOME and a TMPDIR of its own that are read once more after it
+// exits: CEF opens History once, in its first profile, and the last adapter's drop (the process's
+// exit, in production) removes that directory under it, so a later test's History goes to an
+// unlinked file no scan can see.
+#[test]
+fn a_page_token_rests_on_disk_only_in_the_private_profile_until_the_drop() {
+    let _s = serial();
+    let name = "a_page_token_rests_on_disk_only_in_the_private_profile_until_the_drop";
+    if std::env::var_os("C11_CHILD").is_none() {
+        let base = std::env::temp_dir().join(format!("c11-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (home, tmp) = (base.join("home"), base.join("tmp"));
+        std::fs::create_dir_all(&home).expect("child HOME");
+        std::fs::create_dir_all(&tmp).expect("child TMPDIR");
+        let out = run_child(name, &home, &[("TMPDIR", tmp.to_str().expect("utf-8"))]);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let (hits, files): (Vec<PathBuf>, usize) = [&home, &tmp]
+            .iter()
+            .map(|root| files_holding(root, DISK_TOKEN.as_bytes()))
+            .fold((Vec::new(), 0), |(mut h, n), (more, m)| {
+                h.extend(more);
+                (h, n + m)
+            });
+        let _ = std::fs::remove_dir_all(&base);
+        let checked: Vec<&str> = stderr.lines().filter(|l| l.starts_with("disk child:")).collect();
+        eprintln!(
+            "child: {}; {checked:?}; after its exit: files checked {files}, hits {hits:?}",
+            out.status
+        );
+        assert!(out.status.success(), "the child failed:\n{stderr}");
+        assert_eq!(checked.len(), 1, "{stderr}");
+        assert!(files > 0);
+        assert!(hits.is_empty(), "the token outlived the child: {hits:?}");
+        return;
+    }
+    let server = PageServer::start();
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let tmp = std::env::temp_dir();
+    let mut r = rig();
+    let profile = r.g.profile_dir();
+    let url = format!(
+        "http://127.0.0.1:{}/overlay-test.html?host=compositor&sid=SID42&st={DISK_TOKEN}",
+        server.port
+    );
+    r.g.restart(1, &url);
+    events_until(&r.rx, load_timeout(), ready(1));
+    // The positive control: the token reaches History's file (which commits on its own clock), so
+    // every place CEF writes it has had its chance.
+    let mut held: Vec<PathBuf> = Vec::new();
+    let reached = wait_for(HISTORY_COMMIT + hang_bound(), || {
+        held = [&home, &tmp]
+            .iter()
+            .flat_map(|root| files_holding(root, DISK_TOKEN.as_bytes()).0)
+            .collect();
+        held.iter().any(|p| p.file_name().is_some_and(|n| n == "History"))
+    });
+    eprintln!("profile {profile:?}; token on disk in {held:?}");
+    assert!(reached, "the token never reached History: this run proves nothing");
+    let in_home: Vec<&PathBuf> = held.iter().filter(|p| p.starts_with(&home)).collect();
+    assert!(
+        in_home.is_empty(),
+        "CEF's profile under HOME holds the token: {in_home:?}"
+    );
+    let profile = profile.expect("a private profile directory");
+    assert!(
+        held.iter().all(|p| p.starts_with(&profile)),
+        "the token outside the private profile: {held:?}"
+    );
+    r.g.stop();
+    let Rig { g, .. } = r;
+    drop(g);
+    drop(server);
+    // Past one more commit, in case anything writes after the drop.
+    thread::sleep(HISTORY_COMMIT + Duration::from_secs(2));
+    let (home_hits, home_files) = files_holding(&home, DISK_TOKEN.as_bytes());
+    let (tmp_hits, tmp_files) = files_holding(&tmp, DISK_TOKEN.as_bytes());
+    eprintln!(
+        "after the drop: files checked {home_files} under HOME, {tmp_files} under {}; hits {:?}",
+        tmp.display(),
+        [&home_hits, &tmp_hits]
+    );
+    assert!(home_files + tmp_files > 0);
+    assert!(
+        home_hits.is_empty() && tmp_hits.is_empty(),
+        "the token outlived the drop: {home_hits:?} {tmp_hits:?}"
+    );
+    // The drop removed the directory, but the live CEF's disk cache writes its index again later
+    // (`Cache_Data/index-dir/the-real-index`, hashes and no URL; F-013): what comes back holds no
+    // token (above), and the next start's sweep removes it.
+    let back = files_holding(&profile, b"").0;
+    eprintln!("written again after the drop: {back:?}");
+    eprintln!(
+        "disk child: History and {} other files held the token, all in {}; none after the drop ({} \
+         written again)",
+        held.len() - 1,
+        profile.display(),
+        back.len()
+    );
+}
 
 #[test]
-fn the_page_token_never_reaches_a_log_a_file_or_an_argv() {
+fn the_page_token_never_reaches_a_log_line_chrome_debug_log_or_an_argv() {
     let _s = serial();
     // The child (below) runs this test under a real GST_DEBUG and prints to its real stderr.
-    let child = std::env::var_os("C11_TOKEN_CHILD").is_some();
+    let child = std::env::var_os("C11_CHILD").is_some();
     let forwarded: Lines = Arc::default();
     gst::init().expect("gstreamer");
     if !child {
@@ -921,11 +1444,21 @@ fn the_page_token_never_reaches_a_log_a_file_or_an_argv() {
     }
     let mut r = rig();
     let url = page(&format!(
-        "?host=compositor&sid=SID42&st={TOKEN}&stale=1&channel=bogus&alive_twin=1&echo_url=1"
+        "?host=compositor&sid=SID42&st={TOKEN}&stale=1&channel=bogus&alive_twin=1&echo_url=1&echo_token=1"
     ));
     r.g.restart(1, &url);
-    events_until(&r.rx, Duration::from_secs(5), ready(1));
-    thread::sleep(Duration::from_millis(2_500));
+    events_until(&r.rx, load_timeout(), ready(1));
+    // The page's own lines, which carry the token: its URL (with a `?` before the token, which
+    // `redact` masks by shape too) and the bare token (which only the scrubber, from the URL it
+    // learned, can mask: PR #32 review m1).
+    assert!(
+        wait_line(&r, hang_bound(), &["page console: page url "])
+            && wait_line(&r, hang_bound(), &["page console: page token "])
+            && wait_line(&r, hang_bound(), &["WARN", "seazn:alive-x"]),
+        "the page's lines never reached the adapter's log: {:?}",
+        lines(&r)
+    );
+    assert!(two_polls(&r.g), "the child poll stopped");
     let argvs: Vec<String> = cef_children()
         .iter()
         .map(|c| {
@@ -934,7 +1467,6 @@ fn the_page_token_never_reaches_a_log_a_file_or_an_argv() {
         })
         .collect();
     r.g.stop();
-    thread::sleep(Duration::from_millis(300));
     if !child {
         CefGraphics::forward_gst_lines(None);
         gst::log::set_threshold_for_name("cefsrc", gst::DebugLevel::Warning);
@@ -943,9 +1475,16 @@ fn the_page_token_never_reaches_a_log_a_file_or_an_argv() {
     }
     let own = lines(&r);
     let fwd = forwarded.lock().unwrap_or_else(PoisonError::into_inner).clone();
-    let home = std::env::var("HOME").unwrap_or_default();
-    let cef_log = std::fs::read_to_string(Path::new(&home).join(".config/cef_user_data/chrome_debug.log"))
-        .unwrap_or_default();
+    // CEF writes chrome_debug.log beside its profile: the private one (I1), and HOME's in case.
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let cef_log: String = [
+        r.g.profile_dir().map(|p| p.join("chrome_debug.log")),
+        Some(home.join(".config/cef_user_data/chrome_debug.log")),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+    .collect();
     eprintln!(
         "lines checked: {} of the adapter's, {} forwarded, {} of chrome_debug.log; argvs checked: {}",
         own.len(),
@@ -962,40 +1501,26 @@ fn the_page_token_never_reaches_a_log_a_file_or_an_argv() {
             l.replace(TOKEN, "<TOKEN>")
         );
     }
+    // The bare token's line, masked.
+    let token_line = own
+        .iter()
+        .find(|l| l.contains("page console: page token "))
+        .expect("the token line");
+    assert!(token_line.contains("page token ****"), "{token_line}");
     // Empty is the expected state (log-severity=disable); at CEF's default severity it holds every
     // console line with its source URL, token included (F-013), which the mutation sweep shows red.
     assert!(!cef_log.contains(TOKEN), "chrome_debug.log carries the token");
     for a in &argvs {
         assert!(!a.contains(TOKEN), "a CEF child's argv carries the token");
     }
-    // The page's own lines did arrive (scrubbed): the WARN for the twin.
-    assert!(own.iter().any(|l| l.contains("seazn:alive-x")));
-    // ...and the page's echo of its own URL, which carries the token: logged, scrubbed.
-    assert!(
-        own.iter().any(|l| l.contains("page console: page url ")),
-        "the page's URL echo never reached the adapter's log: {own:?}"
-    );
 
     // GStreamer's own handler, under a real GST_DEBUG: this test again, in a child process, whose
     // stderr is read whole.
     if !child {
-        // A HOME of its own: this process's CEF holds the profile in `~/.config/cef_user_data` for
-        // good, and a second CEF on the same profile refuses to start.
-        let home = std::env::temp_dir().join(format!("c11-token-child-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).expect("child HOME");
-        let out = Command::new(std::env::current_exe().expect("test binary"))
-            .args([
-                "--exact",
-                "the_page_token_never_reaches_a_log_a_file_or_an_argv",
-                "--test-threads=1",
-                "--nocapture",
-            ])
-            .env("C11_TOKEN_CHILD", "1")
-            .env("HOME", &home)
-            .env("GST_DEBUG", "4,cefsrc:7,cefconsole:7")
-            .output()
-            .expect("child");
+        let out = rerun_in_child(
+            "the_page_token_never_reaches_a_log_line_chrome_debug_log_or_an_argv",
+            &[("GST_DEBUG", "4,cefsrc:7,cefconsole:7")],
+        );
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stdout = String::from_utf8_lossy(&out.stdout);
         eprintln!(
@@ -1009,9 +1534,6 @@ fn the_page_token_never_reaches_a_log_a_file_or_an_argv() {
             stdout.replace(TOKEN, "<TOKEN>"),
             stderr.replace(TOKEN, "<TOKEN>")
         );
-        let child_cef_log =
-            std::fs::read_to_string(home.join(".config/cef_user_data/chrome_debug.log")).unwrap_or_default();
-        let _ = std::fs::remove_dir_all(&home);
         assert!(stderr.lines().count() > 0, "the child printed nothing to stderr");
         // The operator's `cefsrc:7` is honoured (the adapter only ever raises a threshold): cefsrc's
         // LOG lines (`painting, width / height`, once a paint) are printed, through the scrubber.
@@ -1021,10 +1543,6 @@ fn the_page_token_never_reaches_a_log_a_file_or_an_argv() {
             .count();
         eprintln!("child cefsrc paint lines: {painting}");
         assert!(painting > 0, "GST_DEBUG=cefsrc:7 printed no cefsrc LOG line");
-        assert!(
-            !child_cef_log.contains(TOKEN),
-            "the child's chrome_debug.log carries the token"
-        );
         assert!(!stderr.contains(TOKEN), "the child's stderr carries the token");
         assert!(!stdout.contains(TOKEN), "the child's stdout carries the token");
     }

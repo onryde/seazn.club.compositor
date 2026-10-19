@@ -34,10 +34,15 @@
 //! **Never blocks the caller.** Each build has one thread, which starts it (CEF initialises inside the
 //! first build's NULL→READY), waits for its retirement and tears it down. `restart`, `stop` and the
 //! drop only close the gate, set the stop flag and start a reaper watch: when the teardown has not
-//! returned within `REAPER_KILL_AFTER_MS`, the watch sends SIGKILL to the build's renderer processes,
-//! logs their pids at WARN and ends. Nothing here joins a thread. Page lines arrive on CEF's own UI
-//! thread, so the log handler only queues them (bounded, the oldest dropped); this adapter's
-//! dispatcher thread relays them.
+//! returned within `REAPER_KILL_AFTER_MS`, the watch sends SIGKILL to the build's renderer processes
+//! and logs their pids at WARN; if it has still not returned `TEARDOWN_LEAK_AFTER_MS` later, it is
+//! counted leaked (`health()`, Owed 55). Nothing here joins a thread. Page lines arrive on CEF's own
+//! UI thread, so the log handler only decides what closes a gate and queues the rest (`NoteQueue`:
+//! bounded, and never dropping a crash or a ready); this adapter's dispatcher thread relays them.
+//!
+//! **Health** (owner ruling 2026-10-19 "B"; C11b acts on it): `health()` reports what the domain's
+//! events cannot say yet: CEF's renderer zygote gone, which ends CEF for the process (the next build
+//! fails at once; Owed 56), and the leaked teardowns.
 //!
 //! **The log handler** (F-013). To receive console lines this adapter raises the `cefconsole`
 //! threshold to INFO (and `cefsrc`'s to WARNING), never lowering one; GStreamer's default handler
@@ -50,12 +55,16 @@
 //! launch string, which `GST_DEBUG=5` prints) and logged as its origin alone; every text this adapter
 //! logs passes the scrubber, which knows the URL and its `st` value. `log-severity=disable` keeps CEF
 //! from writing each console message with its source URL to `chrome_debug.log` (F-013); a
-//! `GST_CEF_LOG_SEVERITY` in the environment overrides it, and is warned about.
+//! `GST_CEF_LOG_SEVERITY` in the environment overrides it, and is warned about. CEF's profile
+//! (History, Top Sites, the HTTP cache) holds every URL it loaded, token included: it lives in the
+//! process's private directory (`cef-cache-location`, mode 0700, under `std::env::temp_dir()`),
+//! which the last adapter's drop removes (PR #32 review I1; C12 puts that directory on tmpfs).
 //!
 //! **Guardrails** (spec §6), every `CHILD_POLL_MS` on every CEF child process (a descendant whose
 //! command line carries Chromium's `--type=`): nice `CEF_NICE` on each of its threads (Linux nice is
-//! per thread; the zygote's carries over to the renderers it forks), `oom_score_adj`
-//! `CEF_OOM_SCORE_ADJ`, and the PSS sum against the cap.
+//! per thread; the zygote's carries over to the renderers it forks), `oom_score_adj` by kind (the
+//! renderer first, the zygote last: `oom_score_adj_for`), and the PSS sum against the cap, counting
+//! no other build's renderer.
 //!
 //! **Renderer attribution** (F-013). The reaper kills one build's renderers only. A renderer's
 //! `--renderer-client-id` survives CEF's reload of a crashed page, so each client id is claimed by
@@ -90,8 +99,21 @@ pub const REAPER_KILL_AFTER_MS: u64 = 3_000;
 pub const CHILD_POLL_MS: u64 = 1_000;
 /// Spec §6: CEF runs under nice 10.
 pub const CEF_NICE: i32 = 10;
-/// Spec §6's OOM order: CEF's children go first (C12's encoder writes −900).
-pub const CEF_OOM_SCORE_ADJ: i32 = 1_000;
+/// Spec §6's OOM order: CEF's children go first (C12's encoder writes −900), and among them the
+/// renderer, the one CEF replaces by itself (its reload). PR #32 review G1: a flat 1000 left the
+/// zygote 4 points behind the renderer, and a dead zygote ends CEF for the process (Owed 56).
+pub const CEF_OOM_SCORE_ADJ_RENDERER: i32 = 1_000;
+/// The GPU and utility processes: Chromium relaunches them (F-013: a killed GPU process recovered).
+pub const CEF_OOM_SCORE_ADJ_HELPER: i32 = 800;
+/// The zygotes, and any process type this table does not know: the last of CEF's to go, still
+/// ahead of the compositor itself (0) and its encoder (−900).
+pub const CEF_OOM_SCORE_ADJ_ZYGOTE: i32 = 500;
+/// A retired build whose teardown has still not returned this long after the reaper's kill is
+/// counted leaked (Owed 55, owner ruling 2026-10-19 "B"): its thread, pipeline and renderer stay
+/// until the process restarts.
+pub const TEARDOWN_LEAK_AFTER_MS: u64 = 3_000;
+/// The process's private CEF profile directory, under `std::env::temp_dir()` (PR #32 review I1).
+const PROFILE_DIR_PREFIX: &str = "seazn-cef-";
 /// F-013: no spare renderer, so each browser has exactly one renderer and the reaper can tell whose
 /// it is. Global to the process, read when CEF initialises.
 pub const SPARE_RENDERER_OFF: &str = "disable-features=SpareRendererForSitePerProcess";
@@ -266,10 +288,21 @@ pub(crate) fn straight_alpha(sample: &gst::Sample) -> Option<gst::Sample> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CefChild {
     pub pid: i32,
+    /// Its parent: the compositor, or the zygote that forked it.
+    pub ppid: i32,
     /// Chromium's `--type=` (`renderer`, `zygote`, `gpu-process`, `utility`).
     pub kind: String,
     /// A renderer's `--renderer-client-id=`.
     pub client_id: Option<i64>,
+}
+
+/// The `oom_score_adj` each kind of CEF child is given.
+pub fn oom_score_adj_for(kind: &str) -> i32 {
+    match kind {
+        "renderer" => CEF_OOM_SCORE_ADJ_RENDERER,
+        "gpu-process" | "utility" => CEF_OOM_SCORE_ADJ_HELPER,
+        _ => CEF_OOM_SCORE_ADJ_ZYGOTE,
+    }
 }
 
 /// `/proc/<pid>/stat`: (ppid, nice). The command name sits in parentheses and may hold either, so the
@@ -337,6 +370,7 @@ pub fn cef_children() -> Vec<CefChild> {
             if let Some(kind) = flag_value(&args, "--type=") {
                 out.push(CefChild {
                     pid: kid,
+                    ppid: p,
                     kind: kind.to_owned(),
                     client_id: flag_value(&args, "--renderer-client-id=").and_then(|v| v.parse().ok()),
                 });
@@ -355,17 +389,28 @@ pub struct Guarded {
     pub reniced: usize,
     pub oom_written: usize,
     pub failures: usize,
+    /// Every CEF child's PSS, summed.
     pub pss_mb: u64,
+    /// The part the memory cap reads: every child but the renderers of other builds (a retiring
+    /// or leaked one; PR #32 review G2).
+    pub pss_counted_mb: u64,
 }
 
-/// Nice `CEF_NICE` on every thread and `oom_score_adj` `CEF_OOM_SCORE_ADJ` on every child, where it
-/// differs; and the children's PSS sum.
-fn guard(kids: &[CefChild]) -> Guarded {
+/// Whether a child's memory counts against `current`'s cap: shared processes and unclaimed
+/// renderers do; another build's renderer does not.
+pub(crate) fn counts_against(kid: &CefChild, owner: Option<(u64, u64)>, current: (u64, u64)) -> bool {
+    kid.kind != "renderer" || owner.is_none_or(|o| o == current)
+}
+
+/// Nice `CEF_NICE` on every thread and `oom_score_adj_for` its kind on every child, where it
+/// differs; and the children's PSS sums.
+fn guard(kids: &[CefChild], counts: impl Fn(&CefChild) -> bool) -> Guarded {
     let mut g = Guarded {
         children: kids.len(),
         ..Guarded::default()
     };
     let mut pss_kb_sum = 0u64;
+    let mut counted_kb = 0u64;
     for kid in kids {
         if let Ok(tasks) = std::fs::read_dir(format!("/proc/{}/task", kid.pid)) {
             for task in tasks.flatten() {
@@ -389,7 +434,7 @@ fn guard(kids: &[CefChild]) -> Guarded {
             }
         }
         let oom_path = format!("/proc/{}/oom_score_adj", kid.pid);
-        let want = CEF_OOM_SCORE_ADJ.to_string();
+        let want = oom_score_adj_for(&kid.kind).to_string();
         if let Ok(now) = std::fs::read_to_string(&oom_path) {
             if now.trim() != want {
                 match std::fs::write(&oom_path, &want) {
@@ -398,13 +443,185 @@ fn guard(kids: &[CefChild]) -> Guarded {
                 }
             }
         }
-        pss_kb_sum += std::fs::read_to_string(format!("/proc/{}/smaps_rollup", kid.pid))
+        let pss = std::fs::read_to_string(format!("/proc/{}/smaps_rollup", kid.pid))
             .ok()
             .and_then(|r| pss_kb(&r))
             .unwrap_or(0);
+        pss_kb_sum += pss;
+        if counts(kid) {
+            counted_kb += pss;
+        }
     }
     g.pss_mb = pss_kb_sum / 1024;
+    g.pss_counted_mb = counted_kb / 1024;
     g
+}
+
+// ---------------------------------------------------------------------------------------------
+// Zygote death (Owed 56; owner ruling 2026-10-19 "B")
+
+/// What the child polls have seen of CEF's zygotes (process-wide: CEF is one per process).
+#[derive(Debug, Default)]
+pub(crate) struct ZygoteWatch {
+    /// Every zygote pid seen.
+    seen: BTreeSet<i32>,
+    /// The zygotes seen forking a renderer.
+    renderer_parents: BTreeSet<i32>,
+    /// Decided: CEF can start no renderer again in this process.
+    dead: bool,
+}
+
+/// One poll's verdict, true the first time a zygote that forked renderers (or the last zygote) is
+/// gone. F-013 (the fix loop's probes): the other zygote parents the GPU process, and CEF recovered
+/// from its death (the next build signalled ready), while the renderers' zygote's death made every
+/// later build fail at once. Its orphaned renderer keeps painting, out of this process's tree.
+///
+/// A zygote missing from one poll's list counts only once `alive` says its process is gone: a
+/// command line read that failed once must not end CEF for the process.
+pub(crate) fn zygote_check(w: &mut ZygoteWatch, kids: &[CefChild], alive: impl Fn(i32) -> bool) -> bool {
+    if w.dead {
+        return false;
+    }
+    let now: BTreeSet<i32> = kids
+        .iter()
+        .filter(|k| k.kind == "zygote")
+        .map(|k| k.pid)
+        .collect();
+    w.seen.extend(now.iter().copied());
+    w.renderer_parents.extend(
+        kids.iter()
+            .filter(|k| k.kind == "renderer" && now.contains(&k.ppid))
+            .map(|k| k.ppid),
+    );
+    let gone = |p: &i32| !now.contains(p) && !alive(*p);
+    let lost_parent = w.renderer_parents.iter().any(gone);
+    let none_left = !w.seen.is_empty() && w.seen.iter().all(gone);
+    w.dead = lost_parent || none_left;
+    w.dead
+}
+
+/// The process's verdict: `Some(gen)` once CEF's zygote is gone (the newest build's generation
+/// then).
+fn unrecoverable() -> MutexGuard<'static, (ZygoteWatch, Option<u64>)> {
+    static WATCH: OnceLock<Mutex<(ZygoteWatch, Option<u64>)>> = OnceLock::new();
+    locked(WATCH.get_or_init(Mutex::default))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The private profile (PR #32 review I1)
+
+/// CEF writes its profile (History, Top Sites, the HTTP cache, `ukm_db`) with every page URL it
+/// loads, job token included, to disk; incognito does not stop it (the review's P1). cefsrc's
+/// `cef-cache-location` moves the whole profile (the fix loop's probe), but CEF reads it once, at
+/// its start: one per process. So the process gets one private directory (mode 0700), set on every
+/// element; it is removed when the last `CefGraphics` drops (the process's exit, in production), and
+/// any left by a process that died first is removed at the next start.
+#[derive(Default)]
+struct Profile {
+    path: Option<std::path::PathBuf>,
+    live: usize,
+}
+
+fn profile() -> MutexGuard<'static, Profile> {
+    static PROFILE: OnceLock<Mutex<Profile>> = OnceLock::new();
+    locked(PROFILE.get_or_init(Mutex::default))
+}
+
+/// `<base>/seazn-cef-<pid>-<nanos>`, created with mode 0700.
+pub(crate) fn make_profile_dir(base: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let path = base.join(format!("{PROFILE_DIR_PREFIX}{}-{nanos}", std::process::id()));
+    std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+    Ok(path)
+}
+
+/// Removes every `seazn-cef-<pid>-…` directory in `base` whose process is gone. Returns how many.
+pub(crate) fn sweep_stale_profiles(base: &std::path::Path, alive: impl Fn(i32) -> bool) -> usize {
+    let Ok(dir) = std::fs::read_dir(base) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(PROFILE_DIR_PREFIX))
+            .and_then(|rest| rest.split_once('-'))
+            .and_then(|(pid, _)| pid.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if !alive(pid) && std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// The process exists and is not a zombie.
+fn pid_alive(pid: i32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => !stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+        Err(_) => false,
+    }
+}
+
+/// One more live adapter: the profile directory exists (made, or made again) once this returns.
+fn profile_acquire(log: impl Fn(&str)) -> Option<std::path::PathBuf> {
+    let mut p = profile();
+    p.live += 1;
+    if p.path.is_none() {
+        let base = std::env::temp_dir();
+        let swept = sweep_stale_profiles(&base, pid_alive);
+        if swept > 0 {
+            log(&format!(
+                "removed {swept} CEF profile directories of processes that are gone"
+            ));
+        }
+        match make_profile_dir(&base) {
+            Ok(path) => p.path = Some(path),
+            Err(e) => log(&format!(
+                "WARN: no private CEF profile directory ({e}); CEF writes its profile, page URLs \
+                 included, under HOME"
+            )),
+        }
+    } else if let Some(path) = p.path.clone() {
+        if !path.exists() {
+            use std::os::unix::fs::DirBuilderExt;
+            if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                log(&format!(
+                    "WARN: the CEF profile directory was not made again: {e}"
+                ));
+            }
+        }
+    }
+    p.path.clone()
+}
+
+/// One live adapter's `profile_acquire`, released on drop: the last one removes the profile
+/// directory.
+struct ProfileLease {
+    held: bool,
+}
+
+impl Drop for ProfileLease {
+    fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
+        let mut p = profile();
+        p.live = p.live.saturating_sub(1);
+        if p.live == 0 {
+            if let Some(path) = &p.path {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -552,6 +769,16 @@ fn on_gst_log(
                 if let Some(note) = classify(category, level, ids, text, || {
                     default_layout(level, category, file, line, function, object, text)
                 }) {
+                    // A renderer's exit closes its build's gate here, before anything is queued
+                    // (PR #32 review m3): a dispatcher blocked on a full channel must not hold it
+                    // open while cefsrc's reload paints.
+                    let note = match note {
+                        Note::RendererGone { build, gen } if shared.decide_crash(build) => Note::Crashed {
+                            gen,
+                            why: "the renderer process exited (cefsrc reloads the page)".to_owned(),
+                        },
+                        other => other,
+                    };
                     shared.push(note);
                 }
             }
@@ -657,6 +884,85 @@ enum Note {
     },
 }
 
+impl Note {
+    /// Which notes a full queue gives up first (PR #32 review m6): `Some(0)` only logs, `Some(1)`
+    /// is a signal the page repeats or the domain outlives (a beat, a stale or channel value), and
+    /// `None` is never dropped: a decided crash (its gate is already shut, so a lost note would
+    /// freeze the overlay unannounced) and a ready (at most one queued per build, below).
+    fn rank(&self) -> Option<u8> {
+        match self {
+            Note::Crashed { .. }
+            | Note::Page {
+                signal: PageSignal::Ready,
+                ..
+            } => None,
+            Note::Page {
+                signal: PageSignal::Alive | PageSignal::ScoreStale(_) | PageSignal::Channel(_),
+                ..
+            } => Some(1),
+            Note::Page { .. } | Note::RendererGone { .. } | Note::Element { .. } | Note::Forward(_) => {
+                Some(0)
+            }
+        }
+    }
+
+    fn ready_of(&self) -> Option<u64> {
+        match self {
+            Note::Page {
+                build,
+                signal: PageSignal::Ready,
+                ..
+            } => Some(*build),
+            _ => None,
+        }
+    }
+}
+
+/// The dispatcher's queue: `NOTE_QUEUE_CAP` notes, where a full queue drops a log-only note first,
+/// then a repeatable signal, and never a crash or a ready. A ready of a build that already has one
+/// queued is dropped (the queued one stands for it), so the notes kept past the cap are at most two
+/// a build.
+#[derive(Debug, Default)]
+pub(crate) struct NoteQueue {
+    q: VecDeque<Note>,
+    dropped: u64,
+}
+
+impl NoteQueue {
+    fn push(&mut self, note: Note) {
+        if let Some(b) = note.ready_of() {
+            if self.q.iter().any(|n| n.ready_of() == Some(b)) {
+                self.dropped += 1;
+                return;
+            }
+        }
+        if self.q.len() >= NOTE_QUEUE_CAP {
+            let incoming = note.rank();
+            let victim = (0..=1u8)
+                .filter(|r| incoming.is_none_or(|i| *r <= i))
+                .find_map(|r| self.q.iter().position(|n| n.rank() == Some(r)));
+            match victim {
+                Some(i) => {
+                    self.q.remove(i);
+                    self.dropped += 1;
+                }
+                // Nothing as cheap as the newcomer: it is the one dropped.
+                None if incoming.is_some() => {
+                    self.dropped += 1;
+                    return;
+                }
+                // Only crashes and readies queued, and this is one too: kept, past the cap.
+                None => {}
+            }
+        }
+        self.q.push_back(note);
+    }
+
+    fn pop(&mut self) -> Option<Note> {
+        self.q.pop_front()
+    }
+}
+
 #[derive(Default)]
 struct Gate {
     /// The current build and its generation (`None` after `stop`).
@@ -698,27 +1004,112 @@ pub enum ReaperPath {
     Killed { pids: Vec<i32> },
 }
 
+/// What the adapter knows that the domain's events cannot say yet (owner ruling 2026-10-19 "B";
+/// C11b decides the in-place restart from it). Read with `CefGraphics::health`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CefHealth {
+    /// `Some(gen)`: CEF's renderer zygote is gone, so CEF can start no renderer again in this
+    /// process (Owed 56); `gen` is the newest build's generation when it was seen. A live page
+    /// keeps painting from its orphaned renderer, out of reach of the guardrails and the reaper.
+    pub unrecoverable: Option<u64>,
+    /// Retired builds whose teardown had not returned `TEARDOWN_LEAK_AFTER_MS` after the reaper's
+    /// kill and still has not (Owed 55): each holds a thread, a pipeline and a renderer.
+    pub leaked_teardowns: usize,
+}
+
+/// Test hook: a sample about to be written waits here until released (`CefGraphics::hold_next_write`).
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Default)]
+pub struct WriteHold {
+    /// 0 off, 1 armed, 2 holding a sample, 3 released.
+    state: Mutex<u8>,
+    cv: Condvar,
+}
+
+#[cfg(feature = "test-hooks")]
+impl WriteHold {
+    fn hold_here(&self) {
+        let mut s = locked(&self.state);
+        if *s != 1 {
+            return;
+        }
+        *s = 2;
+        self.cv.notify_all();
+        let end = Instant::now() + Duration::from_secs(60);
+        while *s == 2 && Instant::now() < end {
+            s = self
+                .cv
+                .wait_timeout(s, Duration::from_millis(100))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        *s = 0;
+        self.cv.notify_all();
+    }
+
+    /// True once a sample is held (within `limit`).
+    pub fn wait_holding(&self, limit: Duration) -> bool {
+        let end = Instant::now() + limit;
+        let mut s = locked(&self.state);
+        while *s != 2 {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            s = self
+                .cv
+                .wait_timeout(s, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        true
+    }
+
+    /// Lets the held sample be written.
+    pub fn release(&self) {
+        let mut s = locked(&self.state);
+        if *s == 2 {
+            *s = 3;
+        } else {
+            *s = 0;
+        }
+        self.cv.notify_all();
+    }
+}
+
 /// What the pipeline threads share with the adapter.
 struct Shared {
     inst: u64,
     tx: Sender<Inbound>,
     frames: FrameStore,
-    log: LogFn,
+    /// Swappable at any time (`with_log`; PR #32 review m7).
+    log: Mutex<LogFn>,
     scrubber: Mutex<Scrubber>,
     gate: Mutex<Gate>,
-    notes: Mutex<VecDeque<Note>>,
+    notes: Mutex<NoteQueue>,
     notes_cv: Condvar,
-    notes_dropped: AtomicU64,
     retired: AtomicBool,
     rss_cap_mb: AtomicU64,
     /// Retired builds whose teardown has not returned.
     teardowns: AtomicUsize,
+    /// Teardowns counted leaked (`TEARDOWN_LEAK_AFTER_MS` after the kill) and still not returned.
+    leaked: AtomicUsize,
+    /// Child polls run.
+    polls: AtomicU64,
     /// Recent builds: their generation and sample counts.
     builds: Mutex<BTreeMap<u64, (u64, Arc<SampleStats>)>>,
     reports: Mutex<BTreeMap<u64, ReaperPath>>,
     last_guard: Mutex<Guarded>,
+    /// The process's private CEF profile directory (`None`: CEF's default, under HOME).
+    profile: Option<std::path::PathBuf>,
     #[cfg(feature = "test-hooks")]
-    teardown_delay_ms: AtomicU64,
+    teardown_hold: Mutex<bool>,
+    #[cfg(feature = "test-hooks")]
+    teardown_cv: Condvar,
+    #[cfg(feature = "test-hooks")]
+    kill_after_ms: AtomicU64,
+    #[cfg(feature = "test-hooks")]
+    write_hold: Arc<WriteHold>,
     #[cfg(feature = "test-hooks")]
     js_signals: AtomicBool,
 }
@@ -726,26 +1117,29 @@ struct Shared {
 impl Shared {
     fn log(&self, line: &str) {
         let clean = locked(&self.scrubber).scrub(line);
-        (self.log)(&clean);
+        let sink = Arc::clone(&*locked(&self.log));
+        sink(&clean);
     }
 
-    /// Queues a note for the dispatcher; never waits (a full queue drops its oldest).
+    /// Queues a note for the dispatcher; never waits (`NoteQueue`'s policy when full).
     fn push(&self, note: Note) {
-        let mut q = locked(&self.notes);
-        if q.len() >= NOTE_QUEUE_CAP {
-            q.pop_front();
-            self.notes_dropped.fetch_add(1, Ordering::Relaxed);
-        }
-        q.push_back(note);
-        drop(q);
+        locked(&self.notes).push(note);
         self.notes_cv.notify_one();
+    }
+
+    /// The reaper's wait before its kill.
+    fn kill_after(&self) -> Duration {
+        #[cfg(feature = "test-hooks")]
+        return Duration::from_millis(self.kill_after_ms.load(Ordering::SeqCst));
+        #[cfg(not(feature = "test-hooks"))]
+        Duration::from_millis(REAPER_KILL_AFTER_MS)
     }
 
     /// The next note; `None` once the adapter is dropped and the queue is empty.
     fn next_note(&self) -> Option<Note> {
         let mut q = locked(&self.notes);
         loop {
-            if let Some(n) = q.pop_front() {
+            if let Some(n) = q.pop() {
                 return Some(n);
             }
             if self.retired.load(Ordering::SeqCst) {
@@ -801,29 +1195,57 @@ impl Shared {
     }
 }
 
+#[derive(Default)]
+struct LifeState {
+    stop: bool,
+    took: Option<Duration>,
+    leaked: bool,
+}
+
 /// One build's start, retirement and teardown, shared by its thread and its reaper watch.
 #[derive(Default)]
-struct Life {
-    state: Mutex<(bool, Option<Duration>)>,
+pub(crate) struct Life {
+    state: Mutex<LifeState>,
     cv: Condvar,
 }
 
 impl Life {
     fn stop(&self) {
-        locked(&self.state).0 = true;
+        locked(&self.state).stop = true;
         self.cv.notify_all();
     }
 
     fn wait_stop(&self) {
         let mut s = locked(&self.state);
-        while !s.0 {
+        while !s.stop {
             s = self.cv.wait(s).unwrap_or_else(PoisonError::into_inner);
         }
     }
 
-    fn finish(&self, took: Duration) {
-        locked(&self.state).1 = Some(took);
+    /// The teardown returned. True if it had been counted leaked: `leaked` is counted down, under
+    /// the lock `leaked_after` counts it up under.
+    pub(crate) fn finish(&self, took: Duration, leaked: &AtomicUsize) -> bool {
+        let mut s = locked(&self.state);
+        s.took = Some(took);
+        let was = std::mem::take(&mut s.leaked);
+        if was {
+            leaked.fetch_sub(1, Ordering::SeqCst);
+        }
+        drop(s);
         self.cv.notify_all();
+        was
+    }
+
+    /// Waits up to `limit` for the teardown; if it has not returned by then, marks it leaked and
+    /// counts it in `leaked`, under the lock `finish` takes. Returns the new count.
+    pub(crate) fn leaked_after(&self, limit: Duration, leaked: &AtomicUsize) -> Option<usize> {
+        let _ = self.wait_done(limit);
+        let mut s = locked(&self.state);
+        if s.took.is_some() {
+            return None;
+        }
+        s.leaked = true;
+        Some(leaked.fetch_add(1, Ordering::SeqCst) + 1)
     }
 
     /// How long the teardown took, if it ended within `limit` of this call.
@@ -831,7 +1253,7 @@ impl Life {
         let end = Instant::now() + limit;
         let mut s = locked(&self.state);
         loop {
-            if let Some(took) = s.1 {
+            if let Some(took) = s.took {
                 return Some(took);
             }
             let left = end.saturating_duration_since(Instant::now());
@@ -864,6 +1286,8 @@ pub struct CefGraphics {
     builds: u64,
     /// The dispatcher and the child poll run (they start at the first `restart`, after `with_log`).
     threads: bool,
+    /// This adapter's hold on the process's profile directory (dropped after `drop`'s body).
+    _lease: ProfileLease,
 }
 
 impl CefGraphics {
@@ -872,24 +1296,33 @@ impl CefGraphics {
     pub fn new(frames: FrameStore, tx: Sender<Inbound>, fps: u32, rss_cap_mb: u64) -> Self {
         static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
         let inst = NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed);
+        let profile = profile_acquire(|l| stderr_log()(l));
         let shared = Arc::new(Shared {
             inst,
             tx,
             frames,
-            log: stderr_log(),
+            log: Mutex::new(stderr_log()),
             scrubber: Mutex::new(Scrubber::default()),
             gate: Mutex::new(Gate::default()),
-            notes: Mutex::new(VecDeque::new()),
+            notes: Mutex::new(NoteQueue::default()),
             notes_cv: Condvar::new(),
-            notes_dropped: AtomicU64::new(0),
             retired: AtomicBool::new(false),
             rss_cap_mb: AtomicU64::new(rss_cap_mb),
             teardowns: AtomicUsize::new(0),
+            leaked: AtomicUsize::new(0),
+            polls: AtomicU64::new(0),
             builds: Mutex::new(BTreeMap::new()),
             reports: Mutex::new(BTreeMap::new()),
             last_guard: Mutex::new(Guarded::default()),
+            profile,
             #[cfg(feature = "test-hooks")]
-            teardown_delay_ms: AtomicU64::new(0),
+            teardown_hold: Mutex::new(false),
+            #[cfg(feature = "test-hooks")]
+            teardown_cv: Condvar::new(),
+            #[cfg(feature = "test-hooks")]
+            kill_after_ms: AtomicU64::new(REAPER_KILL_AFTER_MS),
+            #[cfg(feature = "test-hooks")]
+            write_hold: Arc::default(),
             #[cfg(feature = "test-hooks")]
             js_signals: AtomicBool::new(false),
         });
@@ -899,6 +1332,7 @@ impl CefGraphics {
             current: None,
             builds: 0,
             threads: false,
+            _lease: ProfileLease { held: true },
         };
         g.preload();
         g
@@ -952,11 +1386,9 @@ impl CefGraphics {
     }
 
     /// Routes this adapter's log lines (each one scrubbed of every secret it knows) to `log` instead
-    /// of stderr. C12 wires its log sink here. Call it before the first `restart`.
-    pub fn with_log(mut self, log: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
-        if let Some(shared) = Arc::get_mut(&mut self.shared) {
-            shared.log = log;
-        }
+    /// of stderr, from the next line on. C12 wires its log sink here.
+    pub fn with_log(self, log: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        *locked(&self.shared.log) = log;
         self
     }
 
@@ -970,9 +1402,28 @@ impl CefGraphics {
         self.shared.teardowns.load(Ordering::SeqCst)
     }
 
-    /// Page lines dropped because the dispatcher's queue was full.
+    /// Notes the dispatcher's queue dropped (`NoteQueue`).
     pub fn notes_dropped(&self) -> u64 {
-        self.shared.notes_dropped.load(Ordering::Relaxed)
+        locked(&self.shared.notes).dropped
+    }
+
+    /// What the domain's events cannot say yet: a dead zygote and leaked teardowns (C11b).
+    pub fn health(&self) -> CefHealth {
+        CefHealth {
+            unrecoverable: unrecoverable().1,
+            leaked_teardowns: self.shared.leaked.load(Ordering::SeqCst),
+        }
+    }
+
+    /// The process's private CEF profile directory (`None`: it could not be made, and CEF writes
+    /// under HOME).
+    pub fn profile_dir(&self) -> Option<std::path::PathBuf> {
+        self.shared.profile.clone()
+    }
+
+    /// Child polls run so far.
+    pub fn polls(&self) -> u64 {
+        self.shared.polls.load(Ordering::SeqCst)
     }
 
     /// What the last child poll did.
@@ -1022,13 +1473,30 @@ impl CefGraphics {
         self.shared.rss_cap_mb.store(mb, Ordering::SeqCst);
     }
 
-    /// Test hook: every later teardown waits `hold` before its `set_state(NULL)`, standing in for a
-    /// teardown that does not return, so a retired page keeps painting and the gate must drop it.
+    /// Test hook: while on, every retired build's teardown waits before its `set_state(NULL)` (at
+    /// most 60 s), standing in for a teardown that does not return, so a retired page keeps
+    /// painting and the gate must drop it. Off lets the held ones go.
     #[cfg(feature = "test-hooks")]
-    pub fn delay_teardowns(&self, hold: Duration) {
+    pub fn hold_teardowns(&self, on: bool) {
+        *locked(&self.shared.teardown_hold) = on;
+        self.shared.teardown_cv.notify_all();
+    }
+
+    /// Test hook: the reaper's wait before its kill (default `REAPER_KILL_AFTER_MS`).
+    #[cfg(feature = "test-hooks")]
+    pub fn set_reaper_kill_after(&self, after: Duration) {
         self.shared
-            .teardown_delay_ms
-            .store(hold.as_millis() as u64, Ordering::SeqCst);
+            .kill_after_ms
+            .store(after.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    /// Test hook: the next sample about to be written (its gate open, converted) waits, holding
+    /// the gate, until the returned handle releases it.
+    #[cfg(feature = "test-hooks")]
+    pub fn hold_next_write(&self) -> Arc<WriteHold> {
+        let h = Arc::clone(&self.shared.write_hold);
+        *locked(&h.state) = 1;
+        h
     }
 
     /// Test hook: later builds use cefsrc's js-signal mode, F-001's hang: a page that never calls
@@ -1108,6 +1576,10 @@ impl CefGraphics {
         let env_flags = std::env::var("GST_CEF_CHROME_EXTRA_FLAGS").ok();
         src.set_property("chrome-extra-flags", extra_flags(env_flags.as_deref()));
         src.set_property_from_str("log-severity", CEF_LOG_SEVERITY);
+        if let Some(dir) = self.shared.profile.as_ref().and_then(|p| p.to_str()) {
+            // Global, read at CEF's start (from the first element): the whole profile goes there.
+            src.set_property("cef-cache-location", dir);
+        }
         let (w, h) = OVERLAY_SIZE;
         let caps = gst::ElementFactory::make("capsfilter")
             .name("caps")
@@ -1176,6 +1648,8 @@ impl CefGraphics {
                         }
                         return Ok(gst::FlowSuccess::Ok);
                     };
+                    #[cfg(feature = "test-hooks")]
+                    shared.write_hold.hold_here();
                     shared.frames.set_overlay(straight);
                     drop(gate);
                     stats.written.fetch_add(1, Ordering::SeqCst);
@@ -1244,22 +1718,34 @@ fn run_build(shared: &Shared, pipeline: &gst::Pipeline, life: &Life, build: u64,
     life.wait_stop();
     #[cfg(feature = "test-hooks")]
     {
-        let hold = shared.teardown_delay_ms.load(Ordering::SeqCst);
-        if hold > 0 {
-            thread::sleep(Duration::from_millis(hold));
+        let end = Instant::now() + Duration::from_secs(60);
+        let mut held = locked(&shared.teardown_hold);
+        while *held && Instant::now() < end {
+            held = shared
+                .teardown_cv
+                .wait_timeout(held, Duration::from_millis(100))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
     }
     let t0 = Instant::now();
     if pipeline.set_state(gst::State::Null).is_err() {
         shared.log(&format!("gen={gen}: teardown to NULL failed"));
     }
-    life.finish(t0.elapsed());
+    let took = t0.elapsed();
+    if life.finish(took, &shared.leaked) {
+        shared.log(&format!(
+            "gen={gen}: a teardown counted leaked returned after all ({} ms)",
+            took.as_millis()
+        ));
+    }
     shared.teardowns.fetch_sub(1, Ordering::SeqCst);
 }
 
-/// The reaper's watch on one retired build: the kill fallback after `REAPER_KILL_AFTER_MS`.
+/// The reaper's watch on one retired build: the kill fallback after `REAPER_KILL_AFTER_MS`, then
+/// the leak count `TEARDOWN_LEAK_AFTER_MS` after the kill.
 fn reap(shared: &Shared, life: &Life, build: u64, gen: u64) {
-    if let Some(took) = life.wait_done(Duration::from_millis(REAPER_KILL_AFTER_MS)) {
+    if let Some(took) = life.wait_done(shared.kill_after()) {
         shared.report(
             build,
             ReaperPath::TornDown {
@@ -1280,10 +1766,18 @@ fn reap(shared: &Shared, life: &Life, build: u64, gen: u64) {
         }
     }
     shared.log(&format!(
-        "WARN gen={gen}: teardown has not returned after {REAPER_KILL_AFTER_MS} ms; SIGKILL sent to \
-         renderer pids {killed:?} (of {pids:?})"
+        "WARN gen={gen}: teardown has not returned after {} ms; SIGKILL sent to renderer pids \
+         {killed:?} (of {pids:?})",
+        shared.kill_after().as_millis()
     ));
     shared.report(build, ReaperPath::Killed { pids: killed });
+    if let Some(n) = life.leaked_after(Duration::from_millis(TEARDOWN_LEAK_AFTER_MS), &shared.leaked) {
+        shared.log(&format!(
+            "WARN gen={gen}: teardown still has not returned {TEARDOWN_LEAK_AFTER_MS} ms after the \
+             kill: its thread, pipeline and renderer stay until the process restarts ({n} leaked; \
+             Owed 55)"
+        ));
+    }
 }
 
 /// The dispatcher: relays page signals and crashes in order, and logs, off CEF's UI thread.
@@ -1343,18 +1837,13 @@ fn dispatch(shared: &Shared) {
                     }
                 }
             },
+            // A renderer exit after its build's crash was decided (the log handler decides the
+            // first, where it arrives): the storm after a zygote's death, counted.
             Note::RendererGone { build, gen } => {
-                if shared.decide_crash(build) {
-                    shared.log(&format!(
-                        "gen={gen}: the renderer process exited (cefsrc reloads the page)"
-                    ));
-                    shared.send(Event::CefCrashed { gen });
-                } else {
-                    let n = storms.entry(build).or_insert(0);
-                    *n += 1;
-                    if (*n).is_multiple_of(STORM_LOG_EVERY) {
-                        shared.log(&format!("gen={gen}: {n} more renderer exits"));
-                    }
+                let n = storms.entry(build).or_insert(0);
+                *n += 1;
+                if (*n).is_multiple_of(STORM_LOG_EVERY) {
+                    shared.log(&format!("gen={gen}: {n} more renderer exits"));
                 }
             }
             Note::Element { gen, text } => shared.log(&format!("gen={gen}: cefsrc {}", clip(&text))),
@@ -1394,7 +1883,17 @@ fn poll_children(shared: &Shared) {
                  tell one build's renderer from the next's (F-013)",
             );
         }
-        let g = guard(&kids);
+        let current = locked(&shared.gate).current;
+        let owners: HashMap<i32, (u64, u64)> = {
+            let c = claims();
+            kids.iter()
+                .filter_map(|k| Some((k.pid, *c.by_client.get(&k.client_id?)?)))
+                .collect()
+        };
+        let mine = current.map(|(b, _)| (shared.inst, b));
+        let g = guard(&kids, |k| {
+            mine.is_some_and(|m| counts_against(k, owners.get(&k.pid).copied(), m))
+        });
         if g.failures > 0 && !failures_logged {
             failures_logged = true;
             shared.log(&format!(
@@ -1403,19 +1902,32 @@ fn poll_children(shared: &Shared) {
             ));
         }
         *locked(&shared.last_guard) = g;
+        {
+            let mut watch = unrecoverable();
+            if zygote_check(&mut watch.0, &kids, pid_alive) {
+                let newest = locked(&shared.builds).last_key_value().map(|(_, (gen, _))| *gen);
+                watch.1 = Some(newest.unwrap_or(0));
+                drop(watch);
+                shared.log(&format!(
+                    "ERROR gen={}: CEF's renderer zygote is gone; no renderer can start again in \
+                     this process (Owed 56: restart in place)",
+                    newest.unwrap_or(0)
+                ));
+            }
+        }
         let cap = shared.rss_cap_mb.load(Ordering::SeqCst);
-        let current = locked(&shared.gate).current;
         if let Some((build, gen)) = current {
-            if g.pss_mb > cap && shared.decide_crash(build) {
+            if g.pss_counted_mb > cap && shared.decide_crash(build) {
                 shared.push(Note::Crashed {
                     gen,
                     why: format!(
-                        "CEF's {} child processes use {} MB (PSS), over the {cap} MB cap",
-                        g.children, g.pss_mb
+                        "CEF's child processes use {} MB (PSS, of {} MB in all), over the {cap} MB cap",
+                        g.pss_counted_mb, g.pss_mb
                     ),
                 });
             }
         }
+        shared.polls.fetch_add(1, Ordering::SeqCst);
         thread::sleep(Duration::from_millis(CHILD_POLL_MS));
     }
 }
@@ -1723,6 +2235,293 @@ mod tests {
         }
         // The two lines of no adapter's element are counted; the dropped instance's is its own.
         assert_eq!(router().unrouted_console.load(Ordering::SeqCst) - unrouted, 2);
+    }
+
+    // PR #32 review G1: the renderer, which CEF replaces by itself, is the OOM killer's first CEF
+    // victim; the zygote, whose death ends CEF for the process (Owed 56), its last; every one of them
+    // still ahead of the compositor (0) and its encoder (−900). The renderer's 1000 is spec §6's.
+    #[test]
+    fn oom_score_adj_is_graded_renderer_first_zygote_last() {
+        let kinds = ["renderer", "gpu-process", "utility", "zygote", "broker"];
+        let renderer = oom_score_adj_for("renderer");
+        assert_eq!(renderer, 1_000);
+        let zygote = oom_score_adj_for("zygote");
+        for kind in kinds {
+            let adj = oom_score_adj_for(kind);
+            // Above the compositor (0), and so above its encoder (−900) too.
+            assert!(adj > 0, "{kind}: {adj}");
+            assert!(adj <= renderer && adj >= zygote, "{kind}: {adj}");
+            if kind != "renderer" {
+                assert!(adj < renderer, "{kind} ties the renderer: {adj}");
+            }
+        }
+        assert!(oom_score_adj_for("gpu-process") > zygote);
+        eprintln!("kinds checked: {}", kinds.len());
+    }
+
+    fn kid(pid: i32, ppid: i32, kind: &str, client_id: Option<i64>) -> CefChild {
+        CefChild {
+            pid,
+            ppid,
+            kind: kind.to_owned(),
+            client_id,
+        }
+    }
+
+    // PR #32 review G2: a retiring or leaked build's renderer is not the current build's memory.
+    #[test]
+    fn another_builds_renderer_does_not_count_against_the_cap() {
+        let current = (1, 7);
+        let cases = [
+            (kid(10, 1, "zygote", None), None, true),
+            (kid(11, 10, "gpu-process", None), None, true),
+            (kid(12, 10, "renderer", Some(5)), None, true),
+            (kid(13, 10, "renderer", Some(6)), Some((1, 7)), true),
+            (kid(14, 10, "renderer", Some(4)), Some((1, 6)), false),
+            (kid(15, 10, "renderer", Some(3)), Some((2, 7)), false),
+        ];
+        for (k, owner, want) in &cases {
+            assert_eq!(
+                counts_against(k, *owner, current),
+                *want,
+                "{k:?} owned by {owner:?}"
+            );
+        }
+        eprintln!("children checked: {}", cases.len());
+    }
+
+    // F-013 (the fix loop's probes, CEF 139): two zygotes; the first parents the GPU process, and
+    // the next build after its death signalled ready; the second parents the renderers, and every
+    // build after its death failed at once.
+    #[test]
+    fn a_dead_renderer_zygote_ends_cef_but_the_gpu_zygote_does_not() {
+        let tree = |gpu_zygote: bool, renderer_zygote: bool| {
+            let mut kids = vec![kid(1581, 1544, "utility", None)];
+            if gpu_zygote {
+                kids.push(kid(1556, 1544, "zygote", None));
+                kids.push(kid(1578, 1556, "gpu-process", None));
+            }
+            if renderer_zygote {
+                kids.push(kid(1557, 1544, "zygote", None));
+                kids.push(kid(1589, 1557, "utility", None));
+                kids.push(kid(1622, 1557, "renderer", Some(5)));
+            }
+            kids
+        };
+        let mut checked = 0;
+        // Healthy, then the GPU zygote gone: CEF recovers.
+        let mut w = ZygoteWatch::default();
+        assert!(!zygote_check(&mut w, &tree(true, true), |_| false));
+        assert!(!zygote_check(&mut w, &tree(false, true), |_| false));
+        checked += 2;
+        // Then the renderers' zygote: decided once, never again.
+        assert!(zygote_check(&mut w, &tree(false, false), |_| false));
+        assert!(!zygote_check(&mut w, &tree(false, false), |_| false));
+        checked += 2;
+        // A zygote missing from one list while its process lives (a failed cmdline read): no verdict.
+        let mut w = ZygoteWatch::default();
+        assert!(!zygote_check(&mut w, &tree(true, true), |_| false));
+        assert!(!zygote_check(&mut w, &tree(true, false), |p| p == 1557));
+        checked += 2;
+        // Every zygote gone before any renderer was seen: the last one counts.
+        let mut w = ZygoteWatch::default();
+        let early = vec![kid(1556, 1544, "zygote", None), kid(1557, 1544, "zygote", None)];
+        assert!(!zygote_check(&mut w, &early, |_| false));
+        assert!(zygote_check(&mut w, &[], |_| false));
+        checked += 2;
+        // Nothing seen yet (CEF not started): nothing decided.
+        let mut w = ZygoteWatch::default();
+        assert!(!zygote_check(&mut w, &[], |_| false));
+        checked += 1;
+        eprintln!("polls checked: {checked}");
+    }
+
+    fn page_note(build: u64, signal: PageSignal) -> Note {
+        Note::Page {
+            build,
+            gen: build,
+            signal,
+            text: String::new(),
+        }
+    }
+
+    // PR #32 review m6: a full queue gives up log lines first, repeatable signals next, and never a
+    // decided crash or a build's ready.
+    #[test]
+    fn a_full_note_queue_keeps_every_crash_and_ready() {
+        let log = |n: u64| Note::Element {
+            gen: 1,
+            text: format!("line {n}"),
+        };
+        let crashed = |gen: u64| Note::Crashed {
+            gen,
+            why: "test".to_owned(),
+        };
+        let count = |q: &NoteQueue, f: &dyn Fn(&Note) -> bool| q.q.iter().filter(|n| f(n)).count();
+        let is_crash = |n: &Note| matches!(n, Note::Crashed { .. });
+        let is_ready = |n: &Note| n.ready_of().is_some();
+        let is_beat = |n: &Note| {
+            matches!(
+                n,
+                Note::Page {
+                    signal: PageSignal::Alive,
+                    ..
+                }
+            )
+        };
+        let mut checked = 0;
+
+        // A crash and a ready, then a flood of log lines: both kept, the log lines rotate.
+        let mut q = NoteQueue::default();
+        q.push(crashed(1));
+        q.push(page_note(1, PageSignal::Ready));
+        for n in 0..(NOTE_QUEUE_CAP as u64 * 3) {
+            q.push(log(n));
+        }
+        assert_eq!(q.q.len(), NOTE_QUEUE_CAP);
+        assert_eq!((count(&q, &is_crash), count(&q, &is_ready)), (1, 1));
+        checked += 1;
+
+        // A queue of beats takes a crash in place of the oldest beat, and drops a log line outright.
+        let mut q = NoteQueue::default();
+        for _ in 0..NOTE_QUEUE_CAP {
+            q.push(page_note(2, PageSignal::Alive));
+        }
+        q.push(crashed(2));
+        assert_eq!((q.q.len(), count(&q, &is_crash)), (NOTE_QUEUE_CAP, 1));
+        let dropped = q.dropped;
+        q.push(log(0));
+        assert_eq!(q.dropped, dropped + 1);
+        assert_eq!(count(&q, &is_beat), NOTE_QUEUE_CAP - 1);
+        checked += 2;
+
+        // A second ready of a build with one queued is dropped; another build's is kept.
+        let mut q = NoteQueue::default();
+        q.push(page_note(3, PageSignal::Ready));
+        q.push(page_note(3, PageSignal::Ready));
+        q.push(page_note(4, PageSignal::Ready));
+        assert_eq!(count(&q, &is_ready), 2);
+        checked += 1;
+
+        // Only crashes and readies queued: one more is kept past the cap.
+        let mut q = NoteQueue::default();
+        for b in 0..NOTE_QUEUE_CAP as u64 {
+            q.push(page_note(b, PageSignal::Ready));
+        }
+        q.push(crashed(9));
+        assert_eq!(q.q.len(), NOTE_QUEUE_CAP + 1);
+        assert_eq!(count(&q, &is_crash), 1);
+        checked += 1;
+        // The order is kept: the crash comes out last.
+        let mut last = None;
+        while let Some(n) = q.pop() {
+            last = Some(n);
+        }
+        assert!(matches!(last, Some(Note::Crashed { gen: 9, .. })));
+        checked += 1;
+        eprintln!("queue cases checked: {checked}");
+    }
+
+    // PR #32 review m7: `with_log` once the dispatcher holds the shared state (after the first
+    // `restart`) used to be a silent no-op.
+    #[test]
+    fn with_log_swaps_the_sink_after_the_threads_hold_the_state() {
+        let (tx, _rx) = crossbeam_channel::bounded(8);
+        let shared = Arc::new(Shared {
+            inst: u64::MAX,
+            tx,
+            frames: FrameStore::default(),
+            log: Mutex::new(stderr_log()),
+            scrubber: Mutex::new(Scrubber::default()),
+            gate: Mutex::new(Gate::default()),
+            notes: Mutex::new(NoteQueue::default()),
+            notes_cv: Condvar::new(),
+            retired: AtomicBool::new(false),
+            rss_cap_mb: AtomicU64::new(600),
+            teardowns: AtomicUsize::new(0),
+            leaked: AtomicUsize::new(0),
+            polls: AtomicU64::new(0),
+            builds: Mutex::new(BTreeMap::new()),
+            reports: Mutex::new(BTreeMap::new()),
+            last_guard: Mutex::new(Guarded::default()),
+            profile: None,
+            #[cfg(feature = "test-hooks")]
+            teardown_hold: Mutex::new(false),
+            #[cfg(feature = "test-hooks")]
+            teardown_cv: Condvar::new(),
+            #[cfg(feature = "test-hooks")]
+            kill_after_ms: AtomicU64::new(REAPER_KILL_AFTER_MS),
+            #[cfg(feature = "test-hooks")]
+            write_hold: Arc::default(),
+            #[cfg(feature = "test-hooks")]
+            js_signals: AtomicBool::new(false),
+        });
+        locked(&shared.scrubber).add("unitSECRETmadeup0042");
+        // The dispatcher's clone.
+        let dispatcher = Arc::clone(&shared);
+        let g = CefGraphics {
+            shared,
+            fps: 30,
+            current: None,
+            builds: 0,
+            threads: true,
+            _lease: ProfileLease { held: false },
+        };
+        let got: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = Arc::clone(&got);
+        let g = g.with_log(Arc::new(move |l: &str| locked(&sink).push(l.to_owned())));
+        dispatcher.log("after the swap unitSECRETmadeup0042");
+        drop(g);
+        assert_eq!(*locked(&got), vec!["after the swap ****".to_owned()]);
+    }
+
+    // Owed 55: a teardown is counted leaked once, and counted down if it returns after all, in
+    // either order of the two threads.
+    #[test]
+    fn a_leaked_teardown_is_counted_once_and_down_when_it_returns() {
+        let leaked = AtomicUsize::new(0);
+        let life = Life::default();
+        assert_eq!(life.leaked_after(Duration::from_millis(10), &leaked), Some(1));
+        assert_eq!(leaked.load(Ordering::SeqCst), 1);
+        assert!(life.finish(Duration::from_millis(5), &leaked));
+        assert_eq!(leaked.load(Ordering::SeqCst), 0);
+        // Returned first: never counted.
+        let life = Life::default();
+        assert!(!life.finish(Duration::from_millis(5), &leaked));
+        assert_eq!(life.leaked_after(Duration::from_millis(10), &leaked), None);
+        assert_eq!(leaked.load(Ordering::SeqCst), 0);
+    }
+
+    // PR #32 review I1: the profile directory is private, and a dead process's is swept.
+    #[test]
+    fn the_profile_directory_is_private_and_a_dead_processs_is_swept() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("c11-unit-profiles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("base");
+        let mine = make_profile_dir(&base).expect("profile dir");
+        let mode = std::fs::metadata(&mine).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let name = mine
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            name.starts_with(&format!("seazn-cef-{}-", std::process::id())),
+            "{name}"
+        );
+        let dead = base.join("seazn-cef-2147483646-1");
+        let not_ours = [base.join("seazn-cef-notapid-2"), base.join("other-3")];
+        std::fs::create_dir_all(dead.join("Default")).expect("dead");
+        for d in &not_ours {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let alive = |pid: i32| pid == std::process::id() as i32;
+        assert_eq!(sweep_stale_profiles(&base, alive), 1);
+        assert!(!dead.exists() && mine.exists());
+        assert!(not_ours.iter().all(|d| d.exists()));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
