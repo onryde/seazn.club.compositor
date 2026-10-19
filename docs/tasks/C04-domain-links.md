@@ -483,10 +483,84 @@ happen" turned into a tested guard.
 - 18 new tests pass.
 - 5 mutants went red.
 - Clippy is clean.
+- (Amended 2026-10-19, Owed 38.) A refused publish in F-011's measured shapes (CF: 476 B, then
+  262 334 B by 538 ms, then an error; mediamtx: 9 growing totals to 1 008 779 B, then an error at
+  2 033 ms) is never Connected, and backs off as a failure.
+- (Amended 2026-10-19.) Refusals in a row keep growing the back-off (0.5, 1, 2, 2 s); only Connected
+  resets it, and an error from Connected is failure 1.
+- (Amended 2026-10-19.) Growth past the bound connects at the first growth at least
+  `output_connected_after_ms` after the first growth (inclusive), and not 1 ms sooner.
+- (Amended 2026-10-19.) A generation change mid-window restarts the proof: the old sink's bytes never
+  count toward the new one.
+- (Amended 2026-10-19.) Growth that stops before the bound is a stall that counts as a failure, never
+  Connected.
+- (Amended 2026-10-19.) Every sweep prints its count and fails on 0. Each guard's mutant goes red: the
+  bound's `>=`, the reset placement, and the generation checks.
+
+## Amendment 2026-10-19 (Owed 38: Connected is earned by sustained growth)
+
+**Why.** C09's live legs (F-011) found that rtmp2sink's first nonzero `out-bytes-total` is the 476 B
+RTMP `connect` command (22–69 ms after the build, n = 10 on CF). A refused publish then keeps
+counting until its refusal arrives: 262 334 B by 538 ms on CF (a made-up key) and 1 008 779 B over
+2 033 ms on mediamtx (a denied path). Under the rule as first built ("Connected is the first progress
+after a build"; "a first progress resets" the back-off), a wrong stream key was Connected, reset the
+back-off to attempt 0, and retried at the base back-off for the whole session. C04's own unit test
+`a_first_progress_resets_the_backoff_to_its_base` had frozen that rule as its expected value.
+
+**The coordinator's ruling** (medium, under the owner's standing medium delegation; relayed in the
+C04b dispatch). Connected is earned by SUSTAINED progress, not by the first bytes:
+- an OutputLink becomes Connected only after `OutputProgress` totals have kept growing for
+  `output_connected_after_ms`, with no `OutputError` for that generation;
+- the default comes from F-011's data, with margin over the measured refusals (5 000 ms);
+- the back-off resets to attempt 0 only on Connected;
+- an error before Connected counts as a failed attempt, so the back-off grows;
+- the stall rule is unchanged.
+
+**As built (PR #29).**
+- **A fourth state: `OutputState::Proving { attempt, first_progress, last_progress, sent }`.** The
+  first growth after a build moves Connecting to Proving, and never connects. The sink is Connected
+  at the first growth at least `output_connected_after_ms` after its first growth (the bound is
+  inclusive). Connected is decided on a growth, never on a tick, so it lands in the final hold too,
+  where no link is ticked.
+- **`Thresholds::output_connected_after_ms` = 5 000** (`config.rs`, cited to F-011). That is about
+  2.5× the slowest refusal measured (2 033 ms on mediamtx) and over 9× CF's (538 ms). It is no
+  longer, because the first `playing` beat and the back-off's reset both wait on Connected.
+- **The connect timeout runs from the build to the first growth.** Once bytes flow, the stall rule
+  takes over. Otherwise a healthy sink, first growth at 31 ms, would time out at 5 000 ms, before its
+  proof ends at 5 031 ms.
+- **Every end before Connected is one more failure**: a connect that times out, an error, or no growth
+  for `output_stall_after_ms` while proving. The last one backs off; it is not a swap. **Only
+  Connected resets the count**: an error from Connected is failure 1, and a Connected sink's stall
+  still swaps at once with attempt 0. The stall rule for a Connected sink is unchanged.
+- **`OutputLink::on_progress(now, gen, total_bytes, t)` takes the thresholds.** C06's supervisor
+  passes `&self.t`, and reports a proving sink as `LinkStatus::Connecting`. Its beat stays `starting`
+  (or `stalled`, after an earlier connect) until Connected. No event, effect, port or contract changed.
+- **The 15 s budget** (`tests/links.rs`, `recover`) still ends a recovery at the new sink's first
+  bytes, when its output is back, not at its Connected.
+- **Consequences** (Owed 42): the first `playing` beat comes at least 5 s after the first bytes; each
+  swap reads `stalled` until the new sink earns Connected; a refused stream key never reads `playing`,
+  and its retries slow to the 2 s cap.
+
+**Tests.** These are added to the brief's acceptance below.
+- Unit tests in `output_link.rs`:
+  - F-011's two refusals, as measured;
+  - four refusals in a row (waits 0.5, 1, 2, 2 s);
+  - a CF-shaped healthy publish that connects at the bound and resets the count;
+  - the bound's edge, 1 ms short and exact, under default and distinct thresholds;
+  - the connect timeout ending at the first growth;
+  - a generation change mid-window: a refusal, a stall swap, and a generation never built;
+  - growth that stops before the bound (a stall that is a failure);
+  - a repeated total while proving.
+- In `supervisor.rs`: a refused stream key, beat by beat, for 40 s.
+- In `tests/links.rs`: the pair matrix gains Proving, and the failures each state carries. The
+  generated sweep gains Proving's rules and counters.
+- In `tests/output_connected.rs`: a proptest property over random refusals, random thresholds and
+  random tick grids. Its oracle is written from the rule's text.
 
 ## Do not touch
 
-`config.rs` values, `programme.rs`.
+`config.rs` values, `programme.rs`. (Amended 2026-10-19: Owed 38's ruling adds
+`output_connected_after_ms`; every existing value is unchanged.)
 
 ## Output cap
 
