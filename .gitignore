@@ -1,6 +1,8 @@
 /target
 # Evidence PNGs never live in the repo.
 *.png
+# The one PNG that is not evidence: the slate's vendored logo (C09, amended 2026-10-15).
+!crates/adapters/assets/logo-wide-night.png
 .DS_Store
 harness/out/
 __pycache__/
