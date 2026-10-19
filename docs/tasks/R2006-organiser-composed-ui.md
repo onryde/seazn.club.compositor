@@ -4,7 +4,10 @@
 `git worktree add ../seazn.club-wt/r2006-composed-ui -b feat/stream-panel-composed origin/main`.
 **Depends on:** R2004 and R2005 merged. **Amended 2026-10-15:** also R2007 PR A (`templatesForSport`,
 `resolveTemplate`, `OverlayPreview`, `OVERLAY_SCENES`) and R2007 PR B (`PROGRAMME_PHASES` with `final`)
-merged. See "Amendment 2026-10-15 (overlay templates spec)" at the end. **Use the `frontend-design` skill.** It's a house rule for
+merged. See "Amendment 2026-10-15 (overlay templates spec)" at the end. **Amended 2026-10-19:** the
+owner picked **Option C** (neither A nor B). It supersedes the product shape, the default selection
+and several tests below; see "Amendment 2026-10-19 (owner ruling: Option C)" at the end, which wins
+wherever the two disagree. **Use the `frontend-design` skill.** It's a house rule for
 every UI task; put the invocation in the dispatch.
 
 ## Context
@@ -40,6 +43,10 @@ Pinned 2026-10-14 at `09290de3c`. **Re-pin everything.**
   lives inside the existing stream panel.
 
 ## Product shape
+
+> **Superseded 2026-10-19.** The owner picked Option C (amendment at the end): the score is ON by
+> default, there is no segmented control and no second Go live. Options A and B are kept below as the
+> record of what was presented.
 
 The owner chooses between the options in step 1. These are the two to present:
 
@@ -98,7 +105,8 @@ existing tone.
        through the real start call (fake drivers)
      - *Camera only* sends `passthrough`
      - when composed is unavailable, the option is disabled and the reason is shown
-     - the default selection is *Camera only*, so the existing behaviour holds
+     - ~~the default selection is *Camera only*, so the existing behaviour holds~~ (superseded
+       2026-10-19: the default is the score whenever it can stream; *Camera only* is the opt-out)
   3. **Effective-delay display.** With null it shows the default from the server, never a hardcoded
      number. With 0 it shows 0.0 s.
   4. **Composed camera chip** (ruling A: the session stays `live` while the camera is out, so the
@@ -256,6 +264,85 @@ Copy (`ui.json`, all 4 locales, then `pnpm i18n:gen-keys`):
 | PM5 | the OBS URL keeps `?style=` | P3 |
 | PM6 | a pick isn't persisted (local state only) | PE1's reload |
 | PM7 | the refusal is skipped | P1's `"nope"` case |
+
+## Amendment 2026-10-19 (owner ruling: Option C)
+
+The owner approved **Option C** on 2026-10-19 ("Ok approved"), from the mocks posted in chat. It is
+neither A nor B. Built on `onryde/seazn.club` branch `feat/r2006-organiser-composed-ui` (PR #989).
+
+### Product shape (replaces A/B)
+
+- **The score is on by default.** On the Phone tab's Ready card the style grid (default preselected)
+  and a collapsed *Score timing* row sit above ONE *Go live*. Go live sends `mode: "composed"` with the
+  shown `themeId`.
+- **Camera only** is a small link under the card ("Camera only (no score)"); it stores
+  `streamMode: "passthrough"` and swaps the card for a one-line camera-only note with *Add the score
+  back*, which stores `streamMode: "composed"` (corrected 2026-10-19, PR #989 review m5: it does not
+  clear the field; a stored `composed` and a null both read as the score whenever it can stream).
+- **Composed unavailable** (no compositor image, or the relay not entitled): a one-line reason and a
+  camera-only Go live. Never blocked, never a disabled option.
+- **The OBS tab:** the style grid replaces the style tabs and the big preview.
+- **A live composed session** shows its style and timing read-only (the session's own copy, "Set
+  before going live") and the line "YouTube delivery isn't monitored for score streams yet"; the
+  signal chain's YouTube node is NEUTRAL, never green or red (Owed 26).
+- **Switch heights:** 36 px at ≥768, 44 px on phones.
+
+### The stored mode, read by all three starts
+
+- `fixture_stream_settings.stream_mode` (`'composed' | 'passthrough' | null`), migration **V466**.
+  It was renumbered twice on 2026-10-19: V464 → V465 for PR #989 review C1, then V465 → V466 at the
+  coordinator's word.
+  - `seazn.club` main's max is V464 (#991, merged). PR #992 (`feat/chess-checkin-extend`, open)
+    holds V465.
+  - **Flyway has no `outOfOrder`, so V466 must stay above main's max at merge time. Renumber again if
+    something higher lands first.**
+  - W2c's V463 is no longer a prerequisite: W2c takes a number above main's max itself.
+- `effectiveStreamMode(stored, available)` in `lib/stream-settings.ts` is the one rule: a stored
+  `passthrough` is Camera only; anything else is the score when it can stream, else the camera.
+- The organiser's Go live, the phone's own start and the automatic start all read it
+  (`startModeFor`). The automatic-stream line says what it will start with.
+- `PutStreamSettings` gains `streamMode`; the answer `StreamSettings` carries `streamMode`,
+  `overlayTemplate` and `overlayDelayMs` (all nullable).
+
+### Score timing
+
+- 0–30 s, step 0.1, *Reset to default*; null = the server default (handed in), 0 a real override.
+- Editable before going live only; read-only while live with "Set before going live".
+- No delay cap (Owed 36).
+
+### Out of scope (follow-ups)
+
+- The camera phone's own timing control (capture app).
+- Adjusting the delay while live.
+- The composed camera chip (`programmePhase`) — Step 2.4 and mutant 3 above are deferred, not built.
+  It is owed to a web follow-up before C17 (`_INDEX.md` Owed 65), and C17 Step 3 row 3 no longer
+  expects it.
+
+### Added during the build
+
+- **I3 (PR #987 review, routed here):** the style-grid thumbnails render the AIRED sides — read through
+  the overlay page's own loader (`relayOverlayPageFacts`), org-checked — so a person pair previews the
+  codes it airs (Lee Chong Wei v Viktor Axelsen: WEI/AXE, not LEE/VIK).
+- **CI e2e:** e2e-parallel sets a dummy `RELAY_IMAGE`, so the score is every start's default there; a
+  walkthrough that follows the camera's lifecycle stores Camera only on its fixture first.
+- **The owner's per-screen sign-off** (2026-10-19, relayed by the coordinator: "approve"): all 6 screens,
+  as built.
+- **PR #989 review fixes (2026-10-19), as built:**
+  - Step 3's width e2e is built: `e2e/overlay-compositor.spec.ts`, one test per width (320, 360, 375,
+    390, 430, 768, 834 and 1280), on the e2e-parallel leg, which has the image. `mobile.spec.ts` runs
+    without the image, so the score card never renders there. Each test checks two things: reachability
+    (`elementFromPoint`, 44 px below 768 and 36 px from 768), and no clipping (`overflowingIn`). It then
+    runs the sequence: Camera only and back, a style and 2.5 s that survive a reload, Reset, and Go live,
+    with the mode read back through the API.
+  - Go live sends `overlayDelayMs`, the timing the card showed, in `CreateStreamSession`. Without it the
+    request raced the timing's own save, which fires on blur. If the field is absent, the stored timing
+    applies; if it is null, the server's default applies. That covers the phone's start and the
+    automatic start, which send none.
+  - While a composed session is open, the OBS tab's grid says "Applies to the next stream". It is still
+    editable, and a running session never moves.
+  - The stored preferences re-seed from a newer page read for every field with no save in flight.
+  - Both radiogroups use arrow keys with a roving tabindex.
+  - A number the browser rejects shows the invalid line.
 
 ## Do not touch
 
