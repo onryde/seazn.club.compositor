@@ -530,8 +530,15 @@ one redactor, and an empty text reaches the wire as no `exitDetail`.
   `Event::Fatal { detail: Some(e.to_string()) }` above reads
   `Event::Fatal { detail: Some(ExitDetail::new(e.to_string())) }`. Every test sketch's
   `Some("x")`/`Some("boom")` reads `Some(ExitDetail::new("x"))`. Its `Debug` prints the length
-  alone, so the derived `Debug` on `ControlRequest`, `Inbound` and `Driver` is safe. Log the text
-  only through C07's wire or `adapters::redact`, never `as_str` raw.
+  alone, so the derived `Debug` on `ControlRequest`, `Inbound` and `Driver` is safe. Never log the
+  text through `as_str` raw.
+- (Amended 2026-10-19, the coordinator, C07 PR #25 confirm pass) A fatal text logged to stderr goes
+  through a `Scrubber` built from the `SessionConfig` (its credentials, by value) AND `redact` (the
+  patterns), never `redact` alone: a stream key in a GStreamer error follows no marker. The app
+  crate never names the adapters crate (the layering guard), so the driver never logs a fatal text
+  itself. It hands the text to the control port, whose wire scrubs it, and C12's binary logs it
+  through that `Scrubber` (C12's amendment of this date). Before the session is fetched, only
+  `redact` plus the job token's scrub apply.
 - C07's final beat can still hang in DNS: ureq 2 never bounds a lookup (C07's amendment I1). The
   flush's own `recv_timeout` bound, and its mutant, stay as written (Owed 28).
 

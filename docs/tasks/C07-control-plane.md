@@ -529,6 +529,29 @@ under the owner's medium delegation). `domain::health::ExitDetail(String)`:
 
 **Results.** Tests: 13 new in the round (domain 1, redact 3, control_http 2 inline and 6 integration, app ports 1); the workspace runs 319 passed, 0 failed, 0 ignored, the five CI guards pass, and clippy `-D warnings`, fmt and check-portable are clean; each new test was red against a stub (or under the derived `Debug`) first. Mutation: 54 mutants of the new and moved guards (20 on the plane, 6 earlier ones re-pinned to the moved code, 18 on `redact` and `Scrubber`, 9 on `redacted_origin`, 1 on `ExitDetail`'s `Debug`), 54/54 red; the 61 earlier mutants whose pins still hold re-ran 61/61 red.
 
+### The confirm pass (2026-10-19): APPROVED c3447ca, and one last round
+
+The coordinator's decisions (medium), built in PR #25:
+- **The empty token.** `HttpControlPlane::new` refuses an empty `JOB_TOKEN`
+  (`PlaneConfigError::EmptyToken`, "the job token is empty"), the same path as a bad token, so C12
+  exits 78 on it (Owed 32).
+- **The `Scrubber`'s minimum.** `Scrubber::add` ignores a value shorter than 8 characters
+  (`MIN_SECRET_LENGTH`, counted in characters, not bytes). A shorter one would mask ordinary words.
+  An SRT passphrase is 10 to 79 characters, and keys and tokens are long. `redact`'s patterns still
+  apply to a short value. *As found:* web's `MIN_SECRET_LENGTH` is `"[redacted]".length`, 10. It
+  exists so web's 10-character replacement never lengthens the text, which `****` cannot do at 8.
+  The coordinator's 8 masks strictly more. A token shorter than 8 is still accepted, but it is not
+  scrubbed by value; web mints a JWT.
+- **C08 and C12** log a fatal text through a `Scrubber` built from the `SessionConfig` and then
+  `redact`, never `redact` alone (their amendments of this date; Owed 32 carries the exit code, 78).
+
+**Results.** Tests: 2 new (`an_empty_token_is_refused_at_construction`,
+`a_value_shorter_than_eight_characters_is_not_scrubbed_by_value`, 6 rows). The scrubber test's
+values grew to 8 characters or more. Mutation: 7 new mutants (the empty-token guard off, and the
+wrong variant; the minimum at 1 and at 9, `<=`, counted in bytes, and off), 7/7 red. The 43
+earlier mutants on the plane and on `redact` re-ran 43/43 red. R17 (the empty value learned) is
+superseded by the minimum's mutants.
+
 ## Do not touch
 
 `contracts/` by hand (only the script writes it), and the domain crate.
