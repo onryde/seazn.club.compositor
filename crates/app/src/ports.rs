@@ -20,21 +20,66 @@ use domain::supervisor::{Desired, Refusal};
 /// (D15, 20 s) beside the final hold and the drain: 10 + 7 + 2 s (`Thresholds::default()`).
 pub const FINAL_BEAT_TIMEOUT_MS: u64 = 2_000;
 
-/// The scheme and authority of `url` (`srt://host:port`, `https://host`), with every path, query
+/// The scheme and host[:port] of `url` (`srt://host:port`, `https://host`), with every path, query
 /// and fragment cut and replaced by `/…` when anything followed. `Debug` output of a session uses
-/// it so that no stream key in a path and no page token in a query is ever printed. A string with
-/// no `://` prints as `****`: it is not a URL this crate can show safely.
+/// it so that no stream key in a path and no page token in a query is ever printed. Nothing of a
+/// malformed URL prints (C07 review M1): with no `://`, or a scheme that is not purely alphanumeric
+/// (text before it), the whole of it is `****`; a userinfo (`user:pass@`, a credential) ends at the
+/// last `@` before the first `/`; and a host that is not one (empty, or a port that is not digits,
+/// as a userinfo holding a `/` reads) prints as `****`.
 pub fn redacted_origin(url: &str) -> String {
     let Some(i) = url.find("://") else {
         return "****".to_owned();
     };
+    let scheme = &url[..i];
+    if scheme.is_empty() || !scheme.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return "****".to_owned();
+    }
     let rest = &url[i + 3..];
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    // Userinfo (`user:pass@host`) is a credential too: keep only what follows the last `@`.
-    let authority = &rest[..end];
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    let cut = if end < rest.len() { "/…" } else { "" };
-    format!("{}://{host}{cut}", &url[..i])
+    let before_path = &rest[..rest.find('/').unwrap_or(rest.len())];
+    let host_at = before_path.rfind('@').map_or(0, |at| at + 1);
+    let after_userinfo = &rest[host_at..];
+    let end = after_userinfo
+        .find(['/', '?', '#'])
+        .unwrap_or(after_userinfo.len());
+    let host = &after_userinfo[..end];
+    let host = if is_host_and_port(host) { host } else { "****" };
+    let cut = if end < after_userinfo.len() { "/…" } else { "" };
+    format!("{scheme}://{host}{cut}")
+}
+
+/// `host` or `host:port`: a name or IPv4 (`[A-Za-z0-9.-]+`) or a bracketed IPv6 literal, and a port of
+/// digits.
+fn is_host_and_port(s: &str) -> bool {
+    let (host_ok, port) = match s.strip_prefix('[') {
+        Some(v6) => {
+            let Some((addr, tail)) = v6.split_once(']') else {
+                return false;
+            };
+            let port = match tail.strip_prefix(':') {
+                Some(p) => Some(p),
+                None if tail.is_empty() => None,
+                None => return false,
+            };
+            let addr_ok = !addr.is_empty()
+                && addr
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.');
+            (addr_ok, port)
+        }
+        None => {
+            let (host, port) = match s.split_once(':') {
+                Some((h, p)) => (h, Some(p)),
+                None => (s, None),
+            };
+            let name_ok = !host.is_empty()
+                && host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
+            (name_ok, port)
+        }
+    };
+    host_ok && port.is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Cloudflare Input A's SRT playback (contract `session.input`): `url` is `srt://host:port` and

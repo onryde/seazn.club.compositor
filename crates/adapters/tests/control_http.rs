@@ -6,10 +6,10 @@
 //! The fake is a raw `TcpListener`, not `tiny_http`: the error paths need a reply cut mid-body, a
 //! connection closed with no reply and a server that never answers, and `tiny_http` answers a dropped
 //! request with a 500.
-use adapters::control_http::{heartbeat_wire, parse_session, HttpControlPlane};
+use adapters::control_http::{heartbeat_wire, parse_session, HttpControlPlane, PlaneConfigError};
 use app::ports::{ControlPlane, FetchError, HeartbeatError, Measured, FINAL_BEAT_TIMEOUT_MS};
 use domain::config::Thresholds;
-use domain::health::{BeatState, ExitInfo, HealthReport};
+use domain::health::{BeatState, ExitDetail, ExitInfo, HealthReport};
 use domain::lifecycle::ExitReason;
 use domain::supervisor::{Desired, Event, Refusal, Supervisor};
 use serde_json::{json, Value};
@@ -222,7 +222,10 @@ fn unbound_url() -> String {
 }
 
 fn plane(url: &str) -> HttpControlPlane {
-    HttpControlPlane::new(url, SID, TOKEN.to_owned(), PLANE_TIMEOUT_MS)
+    plane_with(url, PLANE_TIMEOUT_MS)
+}
+fn plane_with(url: &str, timeout_ms: u64) -> HttpControlPlane {
+    HttpControlPlane::new(url, SID, TOKEN.to_owned(), timeout_ms).expect("a valid plane")
 }
 
 fn periodic() -> HealthReport {
@@ -257,11 +260,15 @@ fn assert_no_token(what: &str, text: &str) {
 fn fetch_session_sends_bearer_token_and_parses_200() {
     let mut checked = 0;
     for name in ["session-composed-720p.json", "session-composed-1080p.json"] {
+        // Each fixture is its own session: the plane asks for that one (C07 review M3).
+        let sid = fixture(name)["sessionId"].as_str().unwrap().to_owned();
         let fake = serve(vec![Reply::Status(200, ok(fixture(name)))]);
-        let got = plane(&fake.url).fetch_session();
+        let got = HttpControlPlane::new(&fake.url, &sid, TOKEN.to_owned(), PLANE_TIMEOUT_MS)
+            .unwrap()
+            .fetch_session();
         let seen = fake.next();
         assert_eq!(seen.method, "GET");
-        assert_eq!(seen.path, format!("/api/internal/relay/sessions/{SID}"));
+        assert_eq!(seen.path, format!("/api/internal/relay/sessions/{sid}"));
         assert_eq!(
             seen.header("authorization"),
             Some(format!("Bearer {TOKEN}").as_str())
@@ -517,7 +524,7 @@ fn hung_server() -> Fake {
 #[test]
 fn a_hung_final_beat_gives_up_within_its_2_s_bound() {
     let fake = hung_server();
-    let mut p = HttpControlPlane::new(&fake.url, SID, TOKEN.to_owned(), 8_000);
+    let mut p = plane_with(&fake.url, 8_000);
     let t0 = Instant::now();
     let got = p.heartbeat(&final_beat(ExitReason::Fatal), &Measured::default());
     let took = t0.elapsed();
@@ -538,7 +545,7 @@ fn a_hung_final_beat_gives_up_within_its_2_s_bound() {
 #[test]
 fn a_shorter_plane_timeout_bounds_the_final_beat() {
     let fake = hung_server();
-    let mut p = HttpControlPlane::new(&fake.url, SID, TOKEN.to_owned(), 600);
+    let mut p = plane_with(&fake.url, 600);
     let t0 = Instant::now();
     let got = p.heartbeat(&final_beat(ExitReason::Ended), &Measured::default());
     assert!(matches!(got, Err(HeartbeatError::Transport(_))), "{got:?}");
@@ -549,12 +556,15 @@ fn a_shorter_plane_timeout_bounds_the_final_beat() {
     );
 }
 
-/// A periodic beat and the session GET wait out the plane's own timeout, and then give up.
+/// A periodic beat and the session GET to a server that accepts and then never answers wait out the
+/// plane's own timeout, and then give up. This covers a hung REPLY only: the connect phase has its
+/// own bound (`timeout_connect`, pinned by the inline `the_agent_bounds_connect_and_pools_nothing`,
+/// C07 review I1), and DNS has none in ureq 2 (`docs/_INDEX.md` Owed 28).
 #[test]
-fn the_plane_timeout_bounds_every_call() {
+fn the_plane_timeout_bounds_a_hung_reply_on_every_call() {
     for call in ["fetch", "beat"] {
         let fake = hung_server();
-        let mut p = HttpControlPlane::new(&fake.url, SID, TOKEN.to_owned(), 2_500);
+        let mut p = plane_with(&fake.url, 2_500);
         let t0 = Instant::now();
         let text = match call {
             "fetch" => match p.fetch_session() {
@@ -653,7 +663,7 @@ fn transport_errors_never_contain_the_token() {
                 None => unbound_url(),
                 Some(r) => serve(vec![r.clone()]).url,
             };
-            let mut p = HttpControlPlane::new(&url, SID, TOKEN.to_owned(), 1_000);
+            let mut p = plane_with(&url, 1_000);
             let text = match call {
                 "fetch" => format!("{:?}", p.fetch_session().err()),
                 _ => format!(
@@ -670,14 +680,42 @@ fn transport_errors_never_contain_the_token() {
             checked += 1;
         }
     }
+    // C07 review I2: ureq's header check prints the whole `Authorization` line for a token holding a
+    // CR, LF, DEL or non-ASCII byte. The constructor refuses such a token, and its refusal never
+    // names it.
+    let bad_tokens = [
+        format!("{TOKEN}\r"),
+        format!("{TOKEN}\n"),
+        format!("{TOKEN}\u{7f}"),
+        format!("{TOKEN}é"),
+    ];
+    for tok in &bad_tokens {
+        let refused = HttpControlPlane::new(&unbound_url(), SID, tok.clone(), 1_000).map(|_| ());
+        assert_eq!(refused, Err(PlaneConfigError::TokenNotVisibleAscii), "{tok:?}");
+        let e = refused.unwrap_err();
+        assert_no_token(&format!("refusal of {tok:?}"), &format!("{e:?} {e}"));
+        checked += 1;
+    }
     eprintln!("error paths checked for secrets: {checked}");
-    assert_eq!(checked, paths.len() * 2);
+    assert_eq!(checked, paths.len() * 2 + bad_tokens.len());
+}
+
+/// The plane's `Debug` prints APP_URL as its origin alone: no userinfo, path or query of it.
+#[test]
+fn the_plane_debug_prints_only_its_origin() {
+    let p = plane_with(
+        "https://user:PLANTED-PW@seazn.club/base/PLANTED-PATH?k=PLANTED-Q",
+        1_000,
+    );
+    let dbg = format!("{p:?} {p:#?}");
+    assert!(!dbg.contains("PLANTED"), "{dbg}");
+    assert!(dbg.contains("https://seazn.club/…"), "{dbg}");
 }
 
 /// The plane's own `Debug` (C01's `missing_debug_implementations`) names the session, never the token.
 #[test]
 fn the_plane_never_prints_its_token() {
-    let p = HttpControlPlane::new("https://seazn.club", SID, TOKEN.to_owned(), 1_000);
+    let p = plane_with("https://seazn.club", 1_000);
     let dbg = format!("{p:?}");
     assert_no_token("debug", &dbg);
     assert!(dbg.contains(SID), "{dbg}");
@@ -689,7 +727,7 @@ fn the_plane_never_prints_its_token() {
 fn a_transport_error_is_redacted() {
     let planted = "PLANTED-URL-SECRET-4d5e";
     let base = format!("{}/?probe={planted}", unbound_url());
-    let mut p = HttpControlPlane::new(&base, SID, TOKEN.to_owned(), 1_000);
+    let mut p = plane_with(&base, 1_000);
     let fetch = format!("{:?}", p.fetch_session());
     let beat = format!("{:?}", p.heartbeat(&periodic(), &Measured::default()));
     for (what, text) in [("fetch", &fetch), ("beat", &beat)] {
@@ -716,4 +754,183 @@ fn a_reply_past_the_body_cap_is_transient() {
     let fake = serve(vec![Reply::Status(200, ok(big_reply))]);
     let got = plane(&fake.url).heartbeat(&periodic(), &Measured::default());
     assert!(matches!(got, Err(HeartbeatError::Transport(_))), "{got:?}");
+}
+
+// ---- the constructor's guards (C07 review I2, M2) ----
+
+/// A bearer token is visible ASCII (RFC 6750 `b64token` is a subset): every byte 0x21..=0x7E is
+/// accepted, and the bytes just outside it (space, DEL), a control byte and a non-ASCII one are
+/// refused, with a refusal that never names the token.
+#[test]
+fn the_constructor_refuses_a_token_outside_visible_ascii() {
+    let every_visible: String = (0x21u8..=0x7e).map(char::from).collect();
+    assert_eq!(every_visible.len(), 94);
+    assert!(
+        HttpControlPlane::new("http://127.0.0.1:9", SID, every_visible, 1_000).is_ok(),
+        "every visible ASCII byte is a token byte"
+    );
+    let mut checked = 0;
+    for bad in [" ", "\u{7f}", "\t", "\0", "\r\n", "é", "😀"] {
+        let tok = format!("PLANTED-JOB-TOKEN{bad}tail");
+        let got = HttpControlPlane::new("http://127.0.0.1:9", SID, tok.clone(), 1_000).map(|_| ());
+        assert_eq!(got, Err(PlaneConfigError::TokenNotVisibleAscii), "{tok:?}");
+        let e = got.unwrap_err();
+        assert_no_token(&format!("{tok:?}"), &format!("{e:?} {e}"));
+        checked += 1;
+    }
+    eprintln!("refused token bytes checked: {checked}");
+    assert_eq!(checked, 7);
+}
+
+/// A 0 ms timeout would fail every call forever (C07 review M2): refused. 1 ms is a timeout.
+#[test]
+fn a_zero_timeout_is_refused_at_construction() {
+    let got = HttpControlPlane::new("http://127.0.0.1:9", SID, TOKEN.to_owned(), 0).map(|_| ());
+    assert_eq!(got, Err(PlaneConfigError::ZeroTimeout));
+    assert_no_token("zero timeout", &format!("{:?} {}", got, got.unwrap_err()));
+    assert!(HttpControlPlane::new("http://127.0.0.1:9", SID, TOKEN.to_owned(), 1).is_ok());
+}
+
+// ---- the session it fetched (C07 review M3, I3) ----
+
+/// Web answered with a different session than the plane asked for (C07 review M3): refused, as a
+/// session that is not ours. The id compares as a UUID, so its case does not matter.
+#[test]
+fn a_session_for_another_session_id_is_refused() {
+    let mut other = fixture("session-composed-720p.json");
+    other["sessionId"] = json!("00000000-0000-4000-8000-000000000000");
+    let fake = serve(vec![Reply::Status(200, ok(other))]);
+    assert_eq!(
+        plane(&fake.url).fetch_session(),
+        Err(FetchError::Refused(Refusal::WrongMode))
+    );
+    let mut upper = fixture("session-composed-720p.json");
+    upper["sessionId"] = json!(SID.to_ascii_uppercase());
+    let fake = serve(vec![Reply::Status(200, ok(upper))]);
+    let got = plane(&fake.url).fetch_session();
+    assert!(got.is_ok(), "the same UUID in upper case: {got:?}");
+}
+
+/// C07 review I3 (a): once a session is fetched, the plane scrubs its four credentials by value, raw
+/// and percent-encoded, from the final beat's `exitDetail` and from every error text, so a key that
+/// follows no marker is masked too. Each expected detail is the input with the value replaced by
+/// `****`; each encoded form is written from RFC 3986, not from the code.
+#[test]
+fn the_sessions_credentials_are_scrubbed_by_value_from_the_final_beat_and_errors() {
+    const KEY: &str = "PLANTED-SK/1+2=";
+    const PASS: &str = "PLANTED-PASS-9";
+    const STREAM_ID: &str = "PLANTED-SID-8";
+    const PAGE: &str = "PLANTED-PT-7";
+    // The overlay URL's `st=`, planted apart from `pageToken` so each is proven learned on its own.
+    const ST: &str = "PLANTED-ST-6";
+    let mut session = fixture("session-composed-720p.json");
+    session["target"]["streamKey"] = json!(KEY);
+    session["input"]["passphrase"] = json!(PASS);
+    session["input"]["streamId"] = json!(STREAM_ID);
+    session["pageToken"] = json!(PAGE);
+    let overlay = session["overlayUrl"]
+        .as_str()
+        .unwrap()
+        .replace("fixture-page-token-720p", ST);
+    session["overlayUrl"] = json!(overlay);
+    let forms = [
+        KEY,
+        "PLANTED-SK%2F1%2B2%3D",
+        "PLANTED-SK%2f1%2b2%3d",
+        PASS,
+        STREAM_ID,
+        PAGE,
+        ST,
+    ];
+    let mut replies = vec![Reply::Status(200, ok(session))];
+    replies.extend(
+        forms
+            .iter()
+            .map(|_| Reply::Status(200, ok(fixture("reply-live.json")))),
+    );
+    replies.push(Reply::Close);
+    // APP_URL carries the key in its path, so ureq's own error text names it (it prints the URL).
+    let fake = serve(replies);
+    let mut p = plane(&format!("{}/{KEY}", fake.url));
+    assert!(p.fetch_session().is_ok());
+    fake.next();
+    let mut checked = 0;
+    for form in forms {
+        let beat = HealthReport {
+            state: BeatState::Stopped,
+            exit: Some(ExitInfo {
+                reason: ExitReason::Fatal,
+                detail: Some(ExitDetail::new(format!("stream '{form}' publish failed"))),
+            }),
+            ..periodic()
+        };
+        assert_eq!(
+            p.heartbeat(&beat, &Measured::default()),
+            Ok(Desired::Live),
+            "{form}"
+        );
+        let posted: Value = serde_json::from_str(&fake.next().body).unwrap();
+        assert_eq!(posted["exitDetail"], "stream '****' publish failed", "{form}");
+        checked += 1;
+    }
+    let text = match p.heartbeat(&periodic(), &Measured::default()) {
+        Err(HeartbeatError::Transport(t)) => t,
+        other => panic!("a closed connection: {other:?}"),
+    };
+    assert!(!text.contains("PLANTED"), "{text}");
+    assert!(text.contains("****"), "the URL was in the error, masked: {text}");
+    eprintln!("credential forms scrubbed from a final beat: {checked}");
+    assert_eq!(checked, 7);
+}
+
+// ---- pooling (C07 review M4) ----
+
+/// A fake that keeps each connection open (no `Connection: close`) and answers every request on it
+/// with `body`; it reports the index of the connection each request came on.
+fn serve_keep_alive(body: String) -> (String, Receiver<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let born = Instant::now();
+        let mut conn = 0;
+        while born.elapsed() < SERVER_LIFE {
+            let Ok((mut s, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            s.set_nonblocking(false).unwrap();
+            let (tx, body, idx) = (tx.clone(), body.clone(), conn);
+            conn += 1;
+            std::thread::spawn(move || {
+                while read_request(&mut s).is_some() {
+                    let _ = tx.send(idx);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = s.write_all(head.as_bytes());
+                    let _ = s.write_all(body.as_bytes());
+                    let _ = s.flush();
+                }
+            });
+        }
+    });
+    (url, rx)
+}
+
+/// No connection is pooled: ureq never retries a POST on a stale pooled connection, so a reused one
+/// the server had closed would lose that beat, the final one included (C07 review M4). Each call
+/// opens its own, even when the server would keep the last one open.
+#[test]
+fn every_call_opens_a_fresh_connection() {
+    let (url, conns) = serve_keep_alive(ok(fixture("reply-live.json")));
+    let mut p = plane(&url);
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        assert_eq!(p.heartbeat(&periodic(), &Measured::default()), Ok(Desired::Live));
+        seen.push(conns.recv_timeout(SEEN_WAIT).expect("the fake saw the beat"));
+    }
+    assert_eq!(seen, vec![0, 1, 2], "one connection per call");
 }

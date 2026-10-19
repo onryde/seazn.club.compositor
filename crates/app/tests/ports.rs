@@ -98,3 +98,34 @@ fn redacted_origin_keeps_scheme_and_host_only() {
     }
     eprintln!("origins checked: {}", table.len());
 }
+
+/// C07 review M1. Only the scheme and the host[:port] ever print: a scheme that is not purely
+/// alphanumeric (text before it, or empty) prints as `****`; a userinfo ends at the last `@` before
+/// the first `/` (so one holding `?` is dropped); and a host that is not a host (empty, or a port
+/// that is not digits: a userinfo holding a `/`) prints as `****`.
+#[test]
+fn redacted_origin_prints_nothing_of_a_malformed_url() {
+    let table = [
+        ("SECRETKEY rtmps://h/live/", "****"),
+        ("://x", "****"),
+        ("svn+ssh://h", "****"),
+        (
+            "rtmps://user:pa?ss@live.cloudflare.com/live/",
+            "rtmps://live.cloudflare.com/…",
+        ),
+        ("srt://user:pa/ss@h:1", "srt://****/…"),
+        ("rtmps://KEY@h/live/", "rtmps://h/…"),
+        ("rtmps://h?st=T@x/y", "rtmps://x/…"),
+        ("rtmps://h/live/AB@CD", "rtmps://h/…"),
+        ("rtmps:///x", "rtmps://****/…"),
+        ("https://h:44a3/x", "https://****/…"),
+        ("https://h!x:443/p", "https://****/…"),
+        ("srt://[::1]:778", "srt://[::1]:778"),
+        ("srt://[::1]:778?streamid=S", "srt://[::1]:778/…"),
+    ];
+    for (url, want) in table {
+        assert_eq!(redacted_origin(url), want, "{url}");
+    }
+    eprintln!("malformed origins checked: {}", table.len());
+    assert_eq!(table.len(), 13);
+}
