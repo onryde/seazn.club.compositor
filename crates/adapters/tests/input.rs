@@ -251,22 +251,25 @@ impl Drop for Listener {
 type Lines = Arc<Mutex<Vec<String>>>;
 
 fn input_with(tx: Sender<Inbound>, out: &OutputProfile) -> (GstInput, FrameStore, Lines) {
+    input_ruled(tx, out, &t())
+}
+
+/// An adapter under the rules `rules` (the domain's thresholds it reads).
+fn input_ruled(
+    tx: Sender<Inbound>,
+    out: &OutputProfile,
+    rules: &Thresholds,
+) -> (GstInput, FrameStore, Lines) {
     gst::init().expect("gstreamer");
     let frames = FrameStore::default();
     let lines: Lines = Arc::default();
     let sink = Arc::clone(&lines);
-    let input = GstInput::new(
-        frames.clone(),
-        tx,
-        t().input_srt_latency_ms,
-        out.width,
-        out.height,
-    )
-    .with_log(Arc::new(move |l: &str| {
-        sink.lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(l.to_owned());
-    }));
+    let input =
+        GstInput::new(frames.clone(), tx, rules, out.width, out.height).with_log(Arc::new(move |l: &str| {
+            sink.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(l.to_owned());
+        }));
     (input, frames, lines)
 }
 
@@ -453,10 +456,12 @@ fn input_caps_change_does_not_reach_programme() {
     assert_eq!(checked, 30);
 }
 
-/// Brief test 3, as measured (F-012): `srtsrc` 1.24 with `auto-reconnect` off posts an ERROR, never
-/// an EOS, when its peer closes the connection. So the loss is `Error`, with the closed generation's
-/// number, and it is the generation's only loss. F-002 never saw Cloudflare close a reader (it holds
-/// a silent socket open instead), so nothing measured says CF would produce anything else.
+/// Brief test 3, as measured (F-012, amended by the PR #30 review): when its peer closes the
+/// connection, `srtsrc` 1.24 with `auto-reconnect` off posts an ERROR, and `basesrc` then pushes an
+/// EOS that reaches the video appsink 1–7 ms later. The error decides the loss when it is posted, so
+/// the loss is `Error`, with the closed generation's number, and it is the generation's only loss
+/// (`a_peer_close_is_an_error_even_when_the_log_is_slow` holds it with a slow log). F-002 never saw
+/// Cloudflare close a reader (it holds a silent socket open instead).
 #[test]
 fn listener_closing_reports_an_error_loss_with_the_right_generation() {
     let _s = serial();
@@ -489,7 +494,7 @@ fn rebuild_tears_down_the_old_pipeline() {
     connect(&mut input, &rx, 1, &spec(l.port));
     assert_eq!(input.generation_of_last_frame(), Some(1));
     input.delay_teardowns(Duration::from_secs(3));
-    input.delay_starts(Duration::from_secs(2));
+    let hold = input.hold_starts();
     let dropped_before = input.gate_dropped();
     input.rebuild(2, &spec(l.port));
     let pts = camera_pts(&frames);
@@ -504,9 +509,8 @@ fn rebuild_tears_down_the_old_pipeline() {
         thread::sleep(Duration::from_millis(5));
     }
     let gate = input.gate_dropped() - dropped_before;
-    events_until(&rx, connect_budget() + Duration::from_secs(2), |e| {
-        *e == Event::InputConnected { gen: 2 }
-    });
+    hold.release();
+    events_until(&rx, connect_budget(), |e| *e == Event::InputConnected { gen: 2 });
     eprintln!("slot and ring reads: {reads}; generation-1 samples dropped at the gate: {gate}");
     assert!(reads > 100, "{reads} reads");
     assert!(
@@ -1101,24 +1105,335 @@ fn a_full_inbound_channel_never_holds_the_camera_slot() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// PR #30 review round 1
+
+/// I1: on a peer close `srtsrc` posts an error, and `basesrc` then pushes an EOS that reaches the video
+/// appsink a few ms later (the review's probe P2: 1.4–7 ms). The reason is decided when the error is
+/// posted, so a log sink that takes 300 ms on the error's line (a slow stderr, a pipe to a shipper)
+/// cannot let the EOS overtake it: every close is `Error`, three times over.
+#[test]
+fn a_peer_close_is_an_error_even_when_the_log_is_slow() {
+    let _s = serial();
+    gst::init().expect("gstreamer");
+    let (tx, rx) = crossbeam_channel::bounded(8_192);
+    let slow_lines = Arc::new(AtomicUsize::new(0));
+    let slowed = Arc::clone(&slow_lines);
+    let mut input = GstInput::new(FrameStore::default(), tx, &t(), P720.width, P720.height).with_log(
+        Arc::new(move |line: &str| {
+            if line.contains(": error:") {
+                slowed.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(300));
+            }
+        }),
+    );
+    let mut closes = 0;
+    for gen in 1..=3u64 {
+        let port = free_port();
+        let l = Listener::start(port, &cfg(640, 360));
+        connect(&mut input, &rx, gen, &spec(port));
+        drop(l);
+        let seen = events_until(&rx, LOSS_BUDGET, |e| matches!(e, Event::InputLost { .. }));
+        assert_eq!(losses(&seen), vec![(gen, LossReason::Error)], "close {gen}");
+        closes += 1;
+    }
+    let after = events_for(&rx, Duration::from_secs(1));
+    eprintln!(
+        "closes checked: {closes}; slowed error lines: {}",
+        slow_lines.load(Ordering::SeqCst)
+    );
+    assert_eq!(closes, 3);
+    assert!(losses(&after).is_empty(), "one loss a close: {after:?}");
+    assert!(
+        slow_lines.load(Ordering::SeqCst) >= 3,
+        "the slow log was on each close's road"
+    );
+    finish(input);
+}
+
+/// The domain's rules, made short so the tests run in seconds: the adapter reads them from the
+/// `Thresholds` it is given, as it reads the defaults in production.
+fn short_rules() -> Thresholds {
+    Thresholds {
+        input_stall_after_ms: 2_000,
+        input_connect_timeout_ms: 3_000,
+        ..Thresholds::default()
+    }
+}
+
+/// G1 (the coordinator's ruling): once the domain's stall rule has given a generation up, its frames
+/// never reach the programme again, though the same connection starts delivering. A pause well
+/// inside the rule (500 ms of a 2 s rule) is not a stall: the frames come back. A pause past it
+/// (3 s) is: the camera slot keeps its last frame, no `InputFrame` reaches the loop, and the samples
+/// are dropped at the gate.
+#[test]
+fn frames_after_the_stall_rule_never_reach_the_programme() {
+    let _s = serial();
+    let rules = short_rules();
+    let l = Listener::new(&cfg(640, 360));
+    let (tx, rx) = crossbeam_channel::bounded(8_192);
+    let (mut input, frames, lines) = input_ruled(tx, &P720, &rules);
+    connect(&mut input, &rx, 1, &spec(l.port));
+    let mut pauses = 0;
+    // Inside the rule: the frames come back.
+    l.pipeline.set_state(gst::State::Paused).expect("pause");
+    thread::sleep(Duration::from_millis(500));
+    l.pipeline.set_state(gst::State::Playing).expect("resume");
+    let back = events_for(&rx, Duration::from_secs(2));
+    eprintln!("frames after a 500 ms pause: {}", frames_in(&back));
+    assert!(frames_in(&back) >= FRAMES_IN_THE_FIRST_SECOND, "{back:?}");
+    pauses += 1;
+    // Past the rule: nothing more of this generation reaches the slot or the loop.
+    l.pipeline.set_state(gst::State::Paused).expect("pause");
+    thread::sleep(Duration::from_millis(rules.input_stall_after_ms + 1_000));
+    // The frames in flight at the pause (the SRT latency's second) came in its first second.
+    let in_flight = rx.try_iter().count();
+    let pts = camera_pts(&frames);
+    let dropped = input.gate_dropped();
+    l.pipeline.set_state(gst::State::Playing).expect("resume");
+    let after = events_for(&rx, Duration::from_secs(2));
+    let gate = input.gate_dropped() - dropped;
+    pauses += 1;
+    eprintln!(
+        "pauses checked: {pauses}; events in flight at the pause {in_flight}; events after the \
+         stall: {after:?}; samples dropped at the gate: {gate}; abandoned {}",
+        input.abandoned()
+    );
+    assert_eq!(pauses, 2);
+    assert!(after.is_empty(), "{after:?}");
+    assert_eq!(
+        camera_pts(&frames),
+        pts,
+        "the slot keeps the last frame before the stall"
+    );
+    assert!(
+        gate > 0,
+        "the connection delivered again, and the gate dropped it"
+    );
+    assert_eq!(input.abandoned(), 1);
+    let given_up = lines
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.contains("gen=1: given up"))
+        .count();
+    assert_eq!(given_up, 1, "one line for the generation given up");
+    finish(input);
+}
+
+/// G1: a generation's first frame after the domain's connect timeout is dropped with everything after
+/// it (no `InputConnected`, no frame on air), and the fresh generation the domain builds next
+/// connects within the rule and is honoured.
+#[test]
+fn a_late_connect_is_dropped_and_a_fresh_generation_connects() {
+    let _s = serial();
+    let rules = short_rules();
+    let l = Listener::new(&cfg(640, 360));
+    let (tx, rx) = crossbeam_channel::bounded(8_192);
+    let (mut input, frames, _lines) = input_ruled(tx, &P720, &rules);
+    let hold = input.hold_starts();
+    input.rebuild(1, &spec(l.port));
+    let end = Instant::now() + Duration::from_secs(20);
+    while hold.waiting() == 0 {
+        assert!(Instant::now() < end, "the start never reached the hold");
+        thread::sleep(Duration::from_millis(5));
+    }
+    // Held past the connect timeout, then let go: the camera's first frame is late.
+    thread::sleep(Duration::from_millis(rules.input_connect_timeout_ms + 200));
+    hold.release();
+    let late = events_for(&rx, Duration::from_secs(3));
+    let dropped = input.gate_dropped();
+    eprintln!(
+        "gen 1 (late): events {late:?}; samples dropped at the gate {dropped}; abandoned {}",
+        input.abandoned()
+    );
+    assert!(late.is_empty(), "{late:?}");
+    assert!(
+        frames.camera().is_none(),
+        "no frame of the late generation reached the slot"
+    );
+    assert!(
+        dropped > 0,
+        "the late generation delivered, and the gate dropped it"
+    );
+    assert_eq!(input.abandoned(), 1);
+    // The domain's next generation: built at once, it connects inside the rule.
+    let took = connect(&mut input, &rx, 2, &spec(l.port));
+    let second = events_for(&rx, Duration::from_secs(1));
+    eprintln!(
+        "gen 2 connected in {took:?}; {} frames in the next second",
+        frames_in(&second)
+    );
+    assert!(frames_in(&second) >= FRAMES_IN_THE_FIRST_SECOND);
+    assert_eq!(input.generation_of_last_frame(), Some(2));
+    assert_eq!(input.abandoned(), 1, "the fresh generation was not given up");
+    finish(input);
+}
+
+/// M1: `stop` while a start is held inside its state change (where a hanging resolver holds it) leaves
+/// no pipeline PLAYING: it goes no further than PAUSED, decodes nothing, and goes to NULL, even with
+/// the teardown held 1.5 s behind it. (The listener may count one caller: `srtsrc` completes the SRT
+/// handshake inside its start, READY→PAUSED, before the hold's message, as it would after a real
+/// resolver came back. What the stop owes is no PLAYING and nothing decoded.)
+#[test]
+fn stop_during_a_held_start_leaves_nothing_playing() {
+    let _s = serial();
+    let l = Listener::new(&cfg(640, 360));
+    let (mut input, rx, frames, _lines) = input(&P720);
+    let hold = input.hold_starts();
+    input.delay_teardowns(Duration::from_millis(1_500));
+    input.rebuild(1, &spec(l.port));
+    let end = Instant::now() + Duration::from_secs(20);
+    while hold.waiting() == 0 {
+        assert!(Instant::now() < end, "the start never reached the hold");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let p = input.pipeline().expect("the held build's pipeline");
+    input.stop();
+    hold.release();
+    // Inside the held teardown: the start went no further than PAUSED.
+    thread::sleep(Duration::from_millis(800));
+    let during = p.state(gst::ClockTime::ZERO).1;
+    let callers_during = l.callers.load(Ordering::SeqCst);
+    let teardowns = input.teardown_counter();
+    let end = Instant::now() + Duration::from_secs(10);
+    while teardowns.load(Ordering::SeqCst) > 0 && Instant::now() < end {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let after = p.state(gst::ClockTime::ZERO).1;
+    let events = events_for(&rx, Duration::from_millis(300));
+    eprintln!(
+        "during the teardown hold: {during:?}, callers {callers_during}; after: {after:?}, callers {}; \
+         events {events:?}",
+        l.callers.load(Ordering::SeqCst)
+    );
+    assert_eq!(during, gst::State::Paused, "the stopped build never went PLAYING");
+    assert_eq!(input.gate_dropped(), 0, "the stopped build decoded nothing");
+    assert_eq!(teardowns.load(Ordering::SeqCst), 0, "the teardown returned");
+    assert_eq!(after, gst::State::Null);
+    assert!(events.is_empty(), "{events:?}");
+    assert!(frames.camera().is_none());
+    drop(p);
+    finish(input);
+}
+
+/// This process's threads named `input-build` (each build's own), from `/proc` (Linux). The name is
+/// matched whole: the test binary's own main thread is `input-<hash>`.
+fn input_threads() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .map(|d| {
+            d.filter_map(Result::ok)
+                .filter(|e| {
+                    std::fs::read_to_string(e.path().join("comm"))
+                        .is_ok_and(|c| c.trim_end() == "input-build")
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// M2: each generation's threads end with it. Across three generations (each connected, then lost)
+/// and a stop, the count of the adapter's threads goes back to where it started; while a generation
+/// is live it is above it, so the count can see them.
+#[test]
+fn every_generations_threads_end_with_it() {
+    let _s = serial();
+    thread::sleep(Duration::from_millis(300));
+    let baseline = input_threads();
+    let port = free_port();
+    let (mut input, rx, _frames, _lines) = input(&P720);
+    let mut live = Vec::new();
+    for gen in 1..=3u64 {
+        let l = Listener::start(port, &cfg(640, 360));
+        connect(&mut input, &rx, gen, &spec(port));
+        live.push(input_threads());
+        l.stop();
+        events_until(&rx, LOSS_BUDGET, |e| matches!(e, Event::InputLost { .. }));
+    }
+    input.stop();
+    // Judged on the thread count itself, before `finish` looks at the teardown counter.
+    let end = Instant::now() + Duration::from_secs(5);
+    while input_threads() > baseline && Instant::now() < end {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let after = input_threads();
+    eprintln!("input threads: baseline {baseline}, while live {live:?}, after the stop {after}");
+    assert_eq!(live.len(), 3);
+    assert!(
+        live.iter().all(|&n| n > baseline),
+        "the count sees a live generation's threads"
+    );
+    assert_eq!(after, baseline, "every generation's threads ended");
+    finish(input);
+}
+
+/// M3: the loss of a generation waits for room in a full inbound channel and is then delivered,
+/// never dropped. The channel holds one event and is full when the listener closes.
+#[test]
+fn a_loss_waits_for_room_in_a_full_channel() {
+    let _s = serial();
+    let port = free_port();
+    let l = Listener::start(port, &cfg(640, 360));
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let (mut input, frames, _lines) = input_with(tx.clone(), &P720);
+    input.rebuild(1, &spec(port));
+    let end = Instant::now() + connect_budget();
+    while frames.camera().is_none() {
+        assert!(Instant::now() < end, "no frame reached the slot");
+        thread::sleep(Duration::from_millis(20));
+    }
+    while rx.try_recv().is_ok() {}
+    tx.try_send(Inbound::Event(Event::Tick))
+        .expect("fills the channel");
+    l.stop();
+    thread::sleep(Duration::from_millis(1_500));
+    assert_eq!(rx.len(), 1, "the channel stayed full through the loss");
+    assert_eq!(rx.recv().ok(), Some(Inbound::Event(Event::Tick)));
+    let seen = events_for(&rx, Duration::from_secs(3));
+    eprintln!("after room: losses {:?}; events {}", losses(&seen), seen.len());
+    assert_eq!(losses(&seen), vec![(1, LossReason::Error)]);
+    drop(tx);
+    finish(input);
+}
+
+// ---------------------------------------------------------------------------------------------
 // The caller's thread never waits
 
-/// `rebuild` returns at once while the start is held (a resolver that hangs: F-012 measured 10 s on
-/// `set_state` with an unanswered DNS), and the generation connects once the start goes ahead.
+/// `rebuild` returns while its start is held, and the hold lasts until this test releases it, so a
+/// rebuild that waited on its start could never return at all (a resolver that hangs: F-012 measured
+/// 10 s on `set_state` with an unanswered DNS). What decides the test is the order, not a clock: the
+/// rebuild has returned, and only then is the start found blocked in the hold and released. The
+/// 20 s wait is a guard against a hang, never the verdict. Then the generation connects.
 #[test]
 fn rebuild_never_waits_on_the_start() {
     let _s = serial();
     let l = Listener::new(&cfg(640, 360));
     let (mut input, rx, _frames, _lines) = input(&P720);
-    input.delay_starts(Duration::from_secs(2));
-    let t0 = Instant::now();
-    input.rebuild(1, &spec(l.port));
-    let took = t0.elapsed();
-    eprintln!("rebuild returned in {took:?}");
-    assert!(took < Duration::from_millis(200), "{took:?}");
-    events_until(&rx, connect_budget() + Duration::from_secs(2), |e| {
-        *e == Event::InputConnected { gen: 1 }
+    let hold = input.hold_starts();
+    let port = l.port;
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    let caller = thread::spawn(move || {
+        input.rebuild(1, &spec(port));
+        let _ = done_tx.send(());
+        input
     });
+    let returned = done_rx.recv_timeout(Duration::from_secs(20)).is_ok();
+    assert!(returned, "rebuild did not return while its start was held");
+    let input = caller.join().expect("the caller's thread");
+    let end = Instant::now() + Duration::from_secs(20);
+    while hold.waiting() == 0 {
+        assert!(Instant::now() < end, "the start never reached the hold");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "nothing was delivered while the start was held"
+    );
+    eprintln!(
+        "rebuild returned; the start was then held ({} waiting)",
+        hold.waiting()
+    );
+    hold.release();
+    events_until(&rx, connect_budget(), |e| *e == Event::InputConnected { gen: 1 });
     finish(input);
 }
 

@@ -21,6 +21,12 @@
 //! `InputConnected` are tried, never waited for, so a full inbound channel can never hold the camera
 //! slot still: a dropped frame is counted, and `InputConnected` is tried again on the next sample.
 //!
+//! **Error or EOS is decided when the error is posted** (PR #30 review I1). On a peer close `srtsrc`
+//! posts an error and `basesrc` then pushes an EOS, which reaches the video appsink 1–7 ms later. The
+//! bus's sync handler, on the posting thread and before that EOS exists, closes the gate for the
+//! build, and that close is the decision: the EOS that follows finds the gate shut. The build's own
+//! thread logs the error and sends the event, so a slow log sink delays the event, never changes it.
+//!
 //! **No watchdog and no retry here** (AGENTS.md §4): the domain owns the stall rule, the connect
 //! timeout and the back-off. So `srtsrc`'s own `auto-reconnect`, on by default in 1.24, is switched
 //! off: with it on, a peer that goes away is retried inside the element forever and never reported.
@@ -31,22 +37,37 @@
 //! `InputFrame` carries no generation, so the gate is what keeps a torn-down pipeline's late frames
 //! out of the slot and off the loop.
 //!
-//! **Never blocks the caller.** `set_state(PLAYING)` runs on a starter thread: `srtsrc` resolves its
-//! host there, and a hanging resolver held it for 10 s (`_FINDINGS.md` F-012). Teardown runs on a
-//! reaper thread (F-001: `set_state(NULL)` did not return for 10 s on a hung renderer); nothing here
-//! joins a thread.
+//! **The domain's own losses close it too** (G1, the coordinator's ruling on PR #30). The domain gives
+//! a generation up by its stall rule or its connect timeout and tells the adapter nothing until it
+//! rebuilds, a back-off later; a connection that starts delivering again in between would put the
+//! camera back on air for the back-off. So each sample is held against the same two rules, read from
+//! the same `Thresholds` and `DOMAIN_LAG_ALLOWANCE_MS` sooner: the first sample past the connect
+//! timeout (before `InputConnected` was delivered), or past the stall rule since the sample before,
+//! closes the gate for good. No event is sent: the domain has given the generation up, or will
+//! within the allowance, since nothing more of it arrives.
+//!
+//! **Never blocks the caller.** Each build has one thread of its own, which starts it, reads its bus
+//! and then tears it down: `srtsrc` resolves its host inside `set_state(PAUSED)`, and a hanging
+//! resolver held that for 10 s (`_FINDINGS.md` F-012); a teardown can hang as long (F-001). With the
+//! start and the teardown on one thread, a build retired mid-start never goes PLAYING after its
+//! teardown (review M1). `rebuild`, `stop` and the drop only close the gate and set the build's stop
+//! flag; nothing here joins a thread. The plugins are loaded once, when the adapter is built, so no
+//! `rebuild` loads one on the driver's thread (review M4).
 //!
 //! **Secrets.** The URI carries the SRT stream id and passphrase, so it is never logged: each build logs
 //! the URL's scheme and authority alone, and every GStreamer text this adapter forwards passes the
 //! scrubber, which knows both values by value.
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(feature = "test-hooks")]
+use std::sync::Condvar;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use app::ports::{redacted_origin, Inbound, InputSource, InputSpec};
 use crossbeam_channel::Sender;
+use domain::config::Thresholds;
 use domain::input_link::LossReason;
 use domain::supervisor::Event;
 use gstreamer as gst;
@@ -64,7 +85,27 @@ pub const VIDEO_QUEUE_NS: u64 = 1_000_000_000;
 pub const AUDIO_QUEUE_NS: u64 = 400_000_000;
 /// Each appsink keeps at most two samples and drops the oldest (C10 brief, Step 3).
 pub const APPSINK_MAX_BUFFERS: u32 = 2;
-/// How long the bus thread waits for one message before looking at its stop flag again.
+/// How much sooner than the domain's stall rule and connect timeout a sample gives its generation up
+/// (G1). The domain reads each event on its loop's clock, after the adapter saw the sample, so a
+/// sample just inside the rule here could land just past it there; 250 ms (about seven ticks at
+/// 30 fps) covers that lag, so whatever the adapter lets through, the domain still counts.
+pub const DOMAIN_LAG_ALLOWANCE_MS: u64 = 250;
+/// Every element factory the input pipeline makes, loaded when the adapter is built (review M4).
+pub const INPUT_FACTORIES: [&str; 12] = [
+    "srtsrc",
+    "tsdemux",
+    "queue",
+    "h264parse",
+    "avdec_h264",
+    "videoconvertscale",
+    "capsfilter",
+    "appsink",
+    "aacparse",
+    "avdec_aac",
+    "audioconvert",
+    "audioresample",
+];
+/// How long a build's thread waits for one bus message before looking at its stop flag again.
 const BUS_WAIT_MS: u64 = 50;
 /// RFC 3986 upper-case hex, the form `Scrubber::add` also learns.
 const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
@@ -78,6 +119,17 @@ fn stderr_log() -> LogFn {
     Arc::new(|line: &str| eprintln!("input: {line}"))
 }
 
+/// A domain rule (`Thresholds` ms) as the adapter holds a sample against it: `DOMAIN_LAG_ALLOWANCE_MS`
+/// sooner, unless the rule is too short to give that much (then the rule itself), so a rule never
+/// shrinks to nothing and gives up every sample.
+fn ruled(rule_ms: u64) -> Duration {
+    if rule_ms > 2 * DOMAIN_LAG_ALLOWANCE_MS {
+        Duration::from_millis(rule_ms - DOMAIN_LAG_ALLOWANCE_MS)
+    } else {
+        Duration::from_millis(rule_ms)
+    }
+}
+
 /// What the pipeline threads share with the adapter.
 struct Shared {
     /// The build whose samples and events may pass; `None` while no generation is live.
@@ -86,7 +138,7 @@ struct Shared {
     frames: FrameStore,
     log: LogFn,
     scrubber: Arc<Mutex<Scrubber>>,
-    /// Teardowns (`set_state(NULL)` on a reaper thread) not yet returned.
+    /// Retired builds whose teardown (`set_state(NULL)` on the build's own thread) has not returned.
     reapers: Arc<AtomicUsize>,
     /// `InputFrame` events not delivered: the inbound channel was full.
     frames_dropped: AtomicU64,
@@ -96,12 +148,14 @@ struct Shared {
     gate_dropped: AtomicU64,
     /// The generation of the last frame that reached the camera slot (0: none yet).
     last_frame_gen: AtomicU64,
-    /// Test hook: each reaper waits this many ms before its `set_state(NULL)` (0: none).
+    /// Generations given up at a sample that came past the domain's stall rule or connect timeout.
+    abandoned: AtomicU64,
+    /// Test hook: each teardown waits this many ms before its `set_state(NULL)` (0: none).
     #[cfg(feature = "test-hooks")]
     reaper_delay_ms: AtomicU64,
-    /// Test hook: each starter waits this many ms before its `set_state(PLAYING)` (0: none).
+    /// Test hook: while set, every start blocks inside its state change (`hold_starts`).
     #[cfg(feature = "test-hooks")]
-    starter_delay_ms: AtomicU64,
+    start_hold: Mutex<Option<Arc<HoldInner>>>,
 }
 
 impl Shared {
@@ -110,19 +164,29 @@ impl Shared {
         (self.log)(&clean);
     }
 
-    /// Reports `gen` lost, once: only while `build` is the open one, and the gate closes first, so
-    /// nothing of that build reaches the slot or the loop afterwards. The event waits for room: this
-    /// runs on the pipeline's own threads, never the driver's.
-    fn lose(&self, build: u64, gen: u64, reason: LossReason) {
-        {
-            let mut open = locked(&self.gate);
-            if *open != Some(build) {
-                return;
-            }
-            *open = None;
+    /// Closes the gate if `build` is the open one. True when this call closed it: the generation's
+    /// loss is decided here, once, and nothing of that build reaches the slot or the loop afterwards.
+    fn close(&self, build: u64) -> bool {
+        let mut open = locked(&self.gate);
+        if *open != Some(build) {
+            return false;
         }
+        *open = None;
+        true
+    }
+
+    /// `InputLost { gen, reason }` for a loss already decided. It waits for room: this runs on the
+    /// pipeline's own threads, never the driver's.
+    fn report(&self, gen: u64, reason: LossReason) {
         self.log(&format!("gen={gen}: lost ({reason:?})"));
         let _ = self.tx.send(Inbound::Event(Event::InputLost { gen, reason }));
+    }
+
+    /// Decides `gen` lost and reports it, once: only while `build` is the open one.
+    fn lose(&self, build: u64, gen: u64, reason: LossReason) {
+        if self.close(build) {
+            self.report(gen, reason);
+        }
     }
 }
 
@@ -130,6 +194,10 @@ impl Shared {
 pub struct GstInput {
     shared: Arc<Shared>,
     latency_ms: u64,
+    /// The domain's stall rule, as a sample is held against it (`ruled`).
+    stall: Duration,
+    /// The domain's connect timeout, likewise.
+    connect: Duration,
     out_w: u32,
     out_h: u32,
     current: Option<Live>,
@@ -146,15 +214,22 @@ pub struct GstInput {
 struct Live {
     gen: u64,
     pipeline: gst::Pipeline,
-    /// Ends this generation's bus thread.
+    /// Ends the build's thread: it then tears the pipeline down.
     stop: Arc<AtomicBool>,
+    /// Set by the bus's sync handler when an error decided this build's loss; the build's thread
+    /// sends the event.
+    errored: Arc<AtomicBool>,
+    /// The build's thread is running (false: it could not be spawned, and the pipeline never started).
+    running: bool,
 }
 
 impl GstInput {
-    /// `latency_ms` is `Thresholds::input_srt_latency_ms`; `out_w × out_h` is the programme's size
-    /// (`OutputProfile`), which every camera frame is scaled into.
-    pub fn new(frames: FrameStore, tx: Sender<Inbound>, latency_ms: u64, out_w: u32, out_h: u32) -> Self {
-        Self {
+    /// `t` gives the SRT latency (`input_srt_latency_ms`) and the domain's two rules this adapter
+    /// holds each sample against (`input_stall_after_ms`, `input_connect_timeout_ms`; G1);
+    /// `out_w × out_h` is the programme's size (`OutputProfile`), which every camera frame is scaled
+    /// into. It loads the pipeline's plugins (`INPUT_FACTORIES`), so build it before the loop starts.
+    pub fn new(frames: FrameStore, tx: Sender<Inbound>, t: &Thresholds, out_w: u32, out_h: u32) -> Self {
+        let input = Self {
             shared: Arc::new(Shared {
                 gate: Mutex::new(None),
                 tx,
@@ -166,12 +241,15 @@ impl GstInput {
                 dropping: AtomicBool::new(false),
                 gate_dropped: AtomicU64::new(0),
                 last_frame_gen: AtomicU64::new(0),
+                abandoned: AtomicU64::new(0),
                 #[cfg(feature = "test-hooks")]
                 reaper_delay_ms: AtomicU64::new(0),
                 #[cfg(feature = "test-hooks")]
-                starter_delay_ms: AtomicU64::new(0),
+                start_hold: Mutex::new(None),
             }),
-            latency_ms,
+            latency_ms: t.input_srt_latency_ms,
+            stall: ruled(t.input_stall_after_ms),
+            connect: ruled(t.input_connect_timeout_ms),
             out_w,
             out_h,
             current: None,
@@ -179,6 +257,25 @@ impl GstInput {
             stopped: false,
             refused_rebuilds: 0,
             events_dropped: 0,
+        };
+        input.preload();
+        input
+    }
+
+    /// Loads every factory's plugin now: a plugin's first use otherwise loads it inside `make`, on
+    /// the driver's thread (the review measured 48–77 ms for the first `rebuild`). A factory that
+    /// does not load is logged; the build that needs it then fails as a loss.
+    fn preload(&self) {
+        if let Err(e) = gst::init() {
+            self.shared.log(&format!("gstreamer did not initialise: {e}"));
+            return;
+        }
+        for name in INPUT_FACTORIES {
+            let loaded = gst::ElementFactory::find(name).is_some_and(|f| f.load().is_ok());
+            if !loaded {
+                self.shared
+                    .log(&format!("input: the {name} element did not load"));
+            }
         }
     }
 
@@ -233,6 +330,12 @@ impl GstInput {
         self.shared.gate_dropped.load(Ordering::Relaxed)
     }
 
+    /// Generations given up because a sample came after the domain's stall rule or connect timeout
+    /// had already given them up.
+    pub fn abandoned(&self) -> u64 {
+        self.shared.abandoned.load(Ordering::SeqCst)
+    }
+
     /// `rebuild` calls refused (after `stop`).
     pub fn refused_rebuilds(&self) -> u64 {
         self.refused_rebuilds
@@ -243,7 +346,7 @@ impl GstInput {
         self.events_dropped
     }
 
-    /// Teardowns handed to reaper threads that have not returned yet.
+    /// Retired builds whose teardown has not returned yet.
     pub fn teardowns_in_flight(&self) -> usize {
         self.shared.reapers.load(Ordering::SeqCst)
     }
@@ -278,13 +381,16 @@ impl GstInput {
             .store(hold.as_millis() as u64, Ordering::SeqCst);
     }
 
-    /// Test hook: every later start waits `hold` before its `set_state(PLAYING)`, standing in for
-    /// `srtsrc` resolving a host on a hanging resolver.
+    /// Test hook: every later start blocks until the returned hold is released (or dropped), inside
+    /// its state change: the SRT source's READY→PAUSED state message is held in the bus's sync
+    /// handler, on the starting thread, with the pipeline's state lock held. That is where a hanging
+    /// resolver holds a real start (F-012: 10 s inside `srtsrc`'s start, under `set_state(PAUSED)`),
+    /// so a teardown orders against it as it would against the real hang.
     #[cfg(feature = "test-hooks")]
-    pub fn delay_starts(&self, hold: Duration) {
-        self.shared
-            .starter_delay_ms
-            .store(hold.as_millis() as u64, Ordering::SeqCst);
+    pub fn hold_starts(&self) -> StartHold {
+        let inner = Arc::new(HoldInner::default());
+        *locked(&self.shared.start_hold) = Some(Arc::clone(&inner));
+        StartHold(inner)
     }
 
     /// Test hook: posts an error from the current pipeline's SRT source, with `debug` as its debug
@@ -334,12 +440,16 @@ impl GstInput {
         }
     }
 
-    /// Closes the gate and hands the current pipeline, if any, to a reaper. Returns at once.
+    /// Closes the gate and tells the current build's thread to tear its pipeline down. Returns at once.
     fn retire_current(&mut self) {
         *locked(&self.shared.gate) = None;
         if let Some(live) = self.current.take() {
-            live.stop.store(true, Ordering::SeqCst);
-            reap(&self.shared, live.pipeline, live.gen);
+            if live.running {
+                // Counted before the flag is set: the build's thread counts down once it sees it.
+                self.shared.reapers.fetch_add(1, Ordering::SeqCst);
+                live.stop.store(true, Ordering::SeqCst);
+            }
+            // A build with no thread never started: dropping its pipeline here changes no state.
         }
     }
 
@@ -369,7 +479,7 @@ impl GstInput {
                 .field("colorimetry", "bt709")
                 .build(),
         )?;
-        let vsink = appsink("vsink");
+        let vsink = appsink("vsink")?;
 
         let aqueue = leaky_queue("aqueue", AUDIO_QUEUE_NS)?;
         let aparse = make("aacparse", "aparse")?;
@@ -385,7 +495,7 @@ impl GstInput {
                 .field("layout", "interleaved")
                 .build(),
         )?;
-        let asink = appsink("asink");
+        let asink = appsink("asink")?;
 
         pipeline
             .add_many([
@@ -423,9 +533,15 @@ impl GstInput {
         self.link_demux(&demux, &vqueue, &aqueue, gen);
         self.wire_video(&vsink, build, gen);
         self.wire_audio(&asink, build);
-        let stop = Arc::new(AtomicBool::new(false));
-        self.watch_bus(&pipeline, &stop, build, gen)?;
-        Ok(Live { gen, pipeline, stop })
+        let errored = Arc::new(AtomicBool::new(false));
+        self.sync_handler(&pipeline, build, &errored)?;
+        Ok(Live {
+            gen,
+            pipeline,
+            stop: Arc::new(AtomicBool::new(false)),
+            errored,
+            running: false,
+        })
     }
 
     /// `tsdemux`'s pads are dynamic: the first H.264 pad goes to the video queue and the first AAC pad
@@ -460,27 +576,43 @@ impl GstInput {
     fn wire_video(&self, sink: &gst_app::AppSink, build: u64, gen: u64) {
         let shared = Arc::clone(&self.shared);
         let eos = Arc::clone(&self.shared);
-        let connected = AtomicBool::new(false);
+        let clock = Mutex::new(SampleClock::new(Instant::now(), self.stall, self.connect));
         sink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |s| {
                     let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                    let open = locked(&shared.gate);
+                    let now = Instant::now();
+                    let mut open = locked(&shared.gate);
                     if *open != Some(build) {
                         shared.gate_dropped.fetch_add(1, Ordering::Relaxed);
                         return Ok(gst::FlowSuccess::Ok);
                     }
+                    let mut c = locked(&clock);
+                    if let Some(why) = c.given_up(now) {
+                        // The domain has given this generation up: nothing more of it passes.
+                        *open = None;
+                        drop(c);
+                        drop(open);
+                        shared.gate_dropped.fetch_add(1, Ordering::Relaxed);
+                        shared.abandoned.fetch_add(1, Ordering::SeqCst);
+                        shared.log(&format!(
+                            "gen={gen}: given up: {why}; nothing more of it reaches the programme"
+                        ));
+                        return Ok(gst::FlowSuccess::Ok);
+                    }
+                    c.last = Some(now);
                     shared.frames.set_camera(sample);
                     shared.last_frame_gen.store(gen, Ordering::SeqCst);
-                    if !connected.load(Ordering::SeqCst)
+                    if !c.connected
                         && shared
                             .tx
                             .try_send(Inbound::Event(Event::InputConnected { gen }))
                             .is_ok()
                     {
-                        connected.store(true, Ordering::SeqCst);
+                        c.connected = true;
                     }
                     let delivered = shared.tx.try_send(Inbound::Event(Event::InputFrame)).is_ok();
+                    drop(c);
                     drop(open);
                     note_frame(&shared, delivered);
                     Ok(gst::FlowSuccess::Ok)
@@ -514,82 +646,166 @@ impl GstInput {
         );
     }
 
-    /// A bus error is this generation's loss (`Error`); every error and warning text is logged after
-    /// the scrubber.
-    fn watch_bus(
+    /// Runs on the thread that posts each message, before it is queued: an error decides its build's
+    /// loss there and then (I1), ahead of the EOS `basesrc` pushes after it. Nothing slow runs here.
+    fn sync_handler(
         &self,
         pipeline: &gst::Pipeline,
-        stop: &Arc<AtomicBool>,
         build: u64,
-        gen: u64,
+        errored: &Arc<AtomicBool>,
     ) -> Result<(), String> {
         let bus = pipeline.bus().ok_or("input pipeline has no bus")?;
         let shared = Arc::clone(&self.shared);
-        let stop = Arc::clone(stop);
-        thread::Builder::new()
-            .name("input-bus".to_owned())
-            .spawn(move || {
-                while !stop.load(Ordering::SeqCst) {
-                    let Some(msg) = bus.timed_pop_filtered(
-                        gst::ClockTime::from_mseconds(BUS_WAIT_MS),
-                        &[gst::MessageType::Error, gst::MessageType::Warning],
-                    ) else {
-                        continue;
-                    };
-                    if stop.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    match msg.view() {
-                        gst::MessageView::Error(e) => {
-                            shared.log(&format!(
-                                "gen={gen}: error: {} ({})",
-                                e.error(),
-                                e.debug().as_deref().unwrap_or("")
-                            ));
-                            shared.lose(build, gen, LossReason::Error);
-                        }
-                        gst::MessageView::Warning(w) => shared.log(&format!(
-                            "gen={gen}: warning: {} ({})",
-                            w.error(),
-                            w.debug().as_deref().unwrap_or("")
-                        )),
-                        _ => {}
+        let errored = Arc::clone(errored);
+        bus.set_sync_handler(move |_, msg| {
+            match msg.view() {
+                gst::MessageView::Error(_) => {
+                    if shared.close(build) {
+                        errored.store(true, Ordering::SeqCst);
                     }
                 }
-            })
-            .map(|_| ())
-            .map_err(|e| format!("input: no bus thread: {e}"))
+                #[cfg(feature = "test-hooks")]
+                gst::MessageView::StateChanged(s) => hold_at_the_start(&shared, msg, s),
+                _ => {}
+            }
+            gst::BusSyncReply::Pass
+        });
+        Ok(())
     }
 
-    /// `set_state(PLAYING)` on a starter thread (F-012). A refusal is logged here; the loss is the
-    /// error the refusing element posts on the bus (measured: `srtsrc`'s "Could not open resource"
-    /// 20 ms in), so there is one road to `InputLost`, and the domain's connect timeout behind it.
-    fn start(&mut self, live: &Live) {
+    /// Hands the build to a thread of its own (`run_build`). If no thread can be had, the generation
+    /// is lost at once and its pipeline, never started, is let go.
+    fn start(&mut self, live: &mut Live) {
+        let gen = live.gen;
+        let Some(bus) = live.pipeline.bus() else {
+            return self.lost_unstarted(gen, "no bus");
+        };
         let shared = Arc::clone(&self.shared);
         let pipeline = live.pipeline.clone();
-        let gen = live.gen;
+        let stop = Arc::clone(&live.stop);
+        let errored = Arc::clone(&live.errored);
         let spawned = thread::Builder::new()
-            .name("input-start".to_owned())
-            .spawn(move || {
-                #[cfg(feature = "test-hooks")]
-                {
-                    let hold = shared.starter_delay_ms.load(Ordering::SeqCst);
-                    if hold > 0 {
-                        thread::sleep(Duration::from_millis(hold));
-                    }
+            .name("input-build".to_owned())
+            .spawn(move || run_build(&shared, &pipeline, &bus, &stop, &errored, gen));
+        match spawned {
+            Ok(_) => live.running = true,
+            Err(_) => self.lost_unstarted(gen, "no thread"),
+        }
+    }
+
+    fn lost_unstarted(&mut self, gen: u64, why: &str) {
+        *locked(&self.shared.gate) = None;
+        self.shared
+            .log(&format!("gen={gen}: {why} to start it; the generation is lost"));
+        self.send_now(Event::InputLost {
+            gen,
+            reason: LossReason::Error,
+        });
+    }
+}
+
+/// One build's thread, from its start to its teardown, so the two can never cross (review M1).
+///
+/// 1. The start. READY→PAUSED is where `srtsrc` resolves its host and opens its socket (F-012: a
+///    hanging resolver held it 10 s); its connect waits for PLAYING. A build retired by then never
+///    goes PLAYING, so a stopped build never reaches the camera. A refused start is lost through
+///    the error its element posts on the bus (measured: "Could not open resource" 20 ms in), the one
+///    road to `InputLost`, with the domain's connect timeout behind it.
+/// 2. The bus, until the build is retired: every error and warning text is logged after the
+///    scrubber, and the error that decided the build's loss (the sync handler) is reported.
+/// 3. The teardown, `set_state(NULL)`, counted in `teardowns_in_flight` until it returns.
+fn run_build(
+    shared: &Arc<Shared>,
+    pipeline: &gst::Pipeline,
+    bus: &gst::Bus,
+    stop: &AtomicBool,
+    errored: &AtomicBool,
+    gen: u64,
+) {
+    match pipeline.set_state(gst::State::Paused) {
+        Err(e) => shared.log(&format!("gen={gen}: did not start: {e}")),
+        Ok(_) if stop.load(Ordering::SeqCst) => {}
+        Ok(_) => {
+            if let Err(e) = pipeline.set_state(gst::State::Playing) {
+                shared.log(&format!("gen={gen}: did not start: {e}"));
+            }
+        }
+    }
+    while !stop.load(Ordering::SeqCst) {
+        let Some(msg) = bus.timed_pop_filtered(
+            gst::ClockTime::from_mseconds(BUS_WAIT_MS),
+            &[gst::MessageType::Error, gst::MessageType::Warning],
+        ) else {
+            continue;
+        };
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        match msg.view() {
+            gst::MessageView::Error(e) => {
+                shared.log(&format!(
+                    "gen={gen}: error: {} ({})",
+                    e.error(),
+                    e.debug().as_deref().unwrap_or("")
+                ));
+                if errored.swap(false, Ordering::SeqCst) {
+                    shared.report(gen, LossReason::Error);
                 }
-                if let Err(e) = pipeline.set_state(gst::State::Playing) {
-                    shared.log(&format!("gen={gen}: did not start: {e}"));
-                }
-            });
-        if spawned.is_err() {
-            *locked(&self.shared.gate) = None;
-            self.shared
-                .log(&format!("gen={gen}: no starter thread; the generation is lost"));
-            self.send_now(Event::InputLost {
-                gen,
-                reason: LossReason::Error,
-            });
+            }
+            gst::MessageView::Warning(w) => shared.log(&format!(
+                "gen={gen}: warning: {} ({})",
+                w.error(),
+                w.debug().as_deref().unwrap_or("")
+            )),
+            _ => {}
+        }
+    }
+    #[cfg(feature = "test-hooks")]
+    {
+        let hold = shared.reaper_delay_ms.load(Ordering::SeqCst);
+        if hold > 0 {
+            thread::sleep(Duration::from_millis(hold));
+        }
+    }
+    if pipeline.set_state(gst::State::Null).is_err() {
+        shared.log(&format!("gen={gen}: teardown to NULL failed"));
+    }
+    shared.reapers.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// When a generation's samples came, held against the domain's two rules (G1).
+struct SampleClock {
+    built: Instant,
+    /// The generation's `InputConnected` was delivered.
+    connected: bool,
+    /// The last sample that passed.
+    last: Option<Instant>,
+    stall: Duration,
+    connect: Duration,
+}
+
+impl SampleClock {
+    fn new(built: Instant, stall: Duration, connect: Duration) -> Self {
+        Self {
+            built,
+            connected: false,
+            last: None,
+            stall,
+            connect,
+        }
+    }
+
+    /// Why a sample at `now` comes after the domain has given the generation up, if it does: before
+    /// `InputConnected` was delivered, at or past the connect timeout from the build; after it, at or
+    /// past the stall rule from the sample before.
+    fn given_up(&self, now: Instant) -> Option<&'static str> {
+        if !self.connected {
+            (now.saturating_duration_since(self.built) >= self.connect)
+                .then_some("its first frame came after the connect timeout")
+        } else {
+            self.last
+                .filter(|l| now.saturating_duration_since(*l) >= self.stall)
+                .map(|_| "its frames came back after the stall rule")
         }
     }
 }
@@ -618,7 +834,7 @@ impl InputSource for GstInput {
         }
         let build = self.builds + 1;
         match self.build(gen, build, spec) {
-            Ok(live) => {
+            Ok(mut live) => {
                 self.builds = build;
                 self.shared.log(&format!(
                     "gen={gen}: {} latency={}",
@@ -626,8 +842,10 @@ impl InputSource for GstInput {
                     self.latency_ms
                 ));
                 *locked(&self.shared.gate) = Some(build);
-                self.start(&live);
-                self.current = Some(live);
+                self.start(&mut live);
+                if live.running {
+                    self.current = Some(live);
+                }
             }
             Err(text) => {
                 self.shared.log(&format!("gen={gen}: {text}"));
@@ -649,8 +867,8 @@ impl InputSource for GstInput {
 }
 
 impl Drop for GstInput {
-    /// Returns at once (C08 amendment 2026-10-19: within 500 ms): the gate closes, the pipeline goes
-    /// to a reaper thread, and no thread is joined.
+    /// Returns at once (C08 amendment 2026-10-19: within 500 ms): the gate closes, the build's thread
+    /// is told to tear its pipeline down, and no thread is joined.
     fn drop(&mut self) {
         self.retire_current();
     }
@@ -663,6 +881,8 @@ impl fmt::Debug for GstInput {
             .field("gen", &self.current.as_ref().map(|l| l.gen))
             .field("stopped", &self.stopped)
             .field("latency_ms", &self.latency_ms)
+            .field("stall", &self.stall)
+            .field("connect", &self.connect)
             .field("out", &(self.out_w, self.out_h))
             .finish()
     }
@@ -706,37 +926,67 @@ fn note_frame(shared: &Shared, delivered: bool) {
     }
 }
 
-/// `set_state(NULL)` on a reaper thread of its own, counted while it runs; nothing waits for it.
-/// (`gst_output::reap` does the same for the programme's pipelines, but takes the programme's state.)
-fn reap(shared: &Arc<Shared>, pipeline: gst::Pipeline, gen: u64) {
-    shared.reapers.fetch_add(1, Ordering::SeqCst);
-    let bg = Arc::clone(shared);
-    let spawned = thread::Builder::new()
-        .name("input-reaper".to_owned())
-        .spawn(move || {
-            #[cfg(feature = "test-hooks")]
-            {
-                let hold = bg.reaper_delay_ms.load(Ordering::SeqCst);
-                if hold > 0 {
-                    thread::sleep(Duration::from_millis(hold));
-                }
-            }
-            if pipeline.set_state(gst::State::Null).is_err() {
-                bg.log(&format!("gen={gen}: teardown to NULL failed"));
-            }
-            drop(pipeline);
-            bg.reapers.fetch_sub(1, Ordering::SeqCst);
-        });
-    if spawned.is_err() {
-        // No thread: the pipeline is left as it is rather than torn down on the caller's thread,
-        // which must never block (F-001).
-        shared.reapers.fetch_sub(1, Ordering::SeqCst);
-        shared.log(&format!(
-            "gen={gen}: no reaper thread; the pipeline is left as it is"
-        ));
+/// Test hook (`hold_starts`): a start is held at its SRT source's READY→PAUSED state message.
+#[cfg(feature = "test-hooks")]
+fn hold_at_the_start(shared: &Shared, msg: &gst::MessageRef, s: &gst::message::StateChanged) {
+    let from_src = msg.src().is_some_and(|e| e.name() == "src");
+    if from_src && s.old() == gst::State::Ready && s.current() == gst::State::Paused {
+        let hold = locked(&shared.start_hold).clone();
+        if let Some(h) = hold {
+            h.wait();
+        }
     }
 }
 
+/// Test hook: a start hold (`GstInput::hold_starts`). Released by `release` or on drop.
+#[cfg(feature = "test-hooks")]
+#[derive(Debug)]
+pub struct StartHold(Arc<HoldInner>);
+
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Default)]
+struct HoldInner {
+    released: Mutex<bool>,
+    cv: Condvar,
+    waiting: AtomicUsize,
+}
+
+#[cfg(feature = "test-hooks")]
+impl HoldInner {
+    fn wait(&self) {
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        let mut released = locked(&self.released);
+        while !*released {
+            released = self.cv.wait(released).unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(released);
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl StartHold {
+    /// Starts blocked in the hold now.
+    pub fn waiting(&self) -> usize {
+        self.0.waiting.load(Ordering::SeqCst)
+    }
+
+    /// Lets every held start, and every later one, go ahead.
+    pub fn release(&self) {
+        *locked(&self.0.released) = true;
+        self.0.cv.notify_all();
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl Drop for StartHold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Every factory used here belongs in `INPUT_FACTORIES`, or its plugin loads here on the first build,
+/// on the driver's thread (`tests/input_preload.rs` compares the two).
 fn make(factory: &str, name: &str) -> Result<gst::Element, String> {
     gst::ElementFactory::make(factory)
         .name(name)
@@ -762,20 +1012,23 @@ fn leaky_queue(name: &str, max_ns: u64) -> Result<gst::Element, String> {
 /// Two samples at most, the oldest dropped, never synced to the clock, and never waiting to preroll:
 /// a stream with no audio leaves the audio branch unlinked (spike trap: a sink that cannot preroll
 /// holds the pipeline in PAUSED).
-fn appsink(name: &str) -> gst_app::AppSink {
-    let sink = gst_app::AppSink::builder()
-        .name(name)
-        .max_buffers(APPSINK_MAX_BUFFERS)
-        .drop(true)
-        .sync(false)
-        .build();
+fn appsink(name: &str) -> Result<gst_app::AppSink, String> {
+    let sink = make("appsink", name)?
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| format!("input: {name} is not an appsink"))?;
+    sink.set_max_buffers(APPSINK_MAX_BUFFERS);
+    sink.set_drop(true);
+    sink.set_sync(false);
     sink.set_property("async", false);
-    sink
+    Ok(sink)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::check_url;
+    use std::time::{Duration, Instant};
+
+    use super::{check_url, ruled, SampleClock, DOMAIN_LAG_ALLOWANCE_MS};
+    use domain::config::Thresholds;
 
     #[test]
     fn only_a_bare_srt_host_and_port_is_taken() {
@@ -805,5 +1058,48 @@ mod tests {
             assert!(!e.contains("streamid") && !e.contains("pass"), "{e}");
         }
         assert!(ok.len() + refused.len() > 0);
+    }
+
+    /// G1's two rules at their edges, from the domain's own defaults: a sample 1 ms inside the rule
+    /// passes, one at it is given up; before the connect, from the build; after it, from the last
+    /// sample. A rule too short to give the allowance is held as it is, never as zero.
+    #[test]
+    fn a_sample_is_held_against_the_domains_rules() {
+        let t = Thresholds::default();
+        let (stall, connect) = (ruled(t.input_stall_after_ms), ruled(t.input_connect_timeout_ms));
+        assert_eq!(
+            stall,
+            Duration::from_millis(t.input_stall_after_ms - DOMAIN_LAG_ALLOWANCE_MS)
+        );
+        assert_eq!(
+            connect,
+            Duration::from_millis(t.input_connect_timeout_ms - DOMAIN_LAG_ALLOWANCE_MS)
+        );
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut c = SampleClock::new(t0, stall, connect);
+        let mut checked = 0;
+        assert_eq!(c.given_up(t0 + connect - ms(1)), None);
+        assert!(c.given_up(t0 + connect).is_some_and(|w| w.contains("connect")));
+        checked += 2;
+        c.connected = true;
+        c.last = Some(t0);
+        assert_eq!(c.given_up(t0 + stall - ms(1)), None);
+        assert!(c.given_up(t0 + stall).is_some_and(|w| w.contains("stall")));
+        // Connected, the build's age no longer counts: only the gap since the last sample.
+        c.last = Some(t0 + ms(60_000));
+        assert_eq!(c.given_up(t0 + ms(60_001)), None);
+        checked += 3;
+        assert_eq!(
+            ruled(2 * DOMAIN_LAG_ALLOWANCE_MS),
+            ms(2 * DOMAIN_LAG_ALLOWANCE_MS)
+        );
+        assert_eq!(ruled(0), ms(0));
+        assert_eq!(
+            ruled(2 * DOMAIN_LAG_ALLOWANCE_MS + 1),
+            ms(DOMAIN_LAG_ALLOWANCE_MS + 1)
+        );
+        checked += 3;
+        assert_eq!(checked, 8);
     }
 }

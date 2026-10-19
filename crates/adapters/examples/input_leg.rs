@@ -113,24 +113,19 @@ fn main() {
     let leaks = Arc::new(AtomicU64::new(0));
     let leaked = Arc::clone(&leaks);
     let t0 = Instant::now();
-    let mut input = GstInput::new(
-        frames.clone(),
-        tx,
-        t.input_srt_latency_ms,
-        profile.width,
-        profile.height,
-    )
-    .with_log(Arc::new(move |l: &str| {
-        if forms.iter().any(|f| l.contains(f.as_str())) {
-            leaked.fetch_add(1, Ordering::SeqCst);
-            eprintln!(
-                "log t_ms={} <withheld: it holds a credential>",
-                t0.elapsed().as_millis()
-            );
-        } else {
-            eprintln!("log t_ms={} {l}", t0.elapsed().as_millis());
-        }
-    }));
+    let mut input = GstInput::new(frames.clone(), tx, &t, profile.width, profile.height).with_log(Arc::new(
+        move |l: &str| {
+            if forms.iter().any(|f| l.contains(f.as_str())) {
+                leaked.fetch_add(1, Ordering::SeqCst);
+                eprintln!(
+                    "log t_ms={} <withheld: it holds a credential>",
+                    t0.elapsed().as_millis()
+                );
+            } else {
+                eprintln!("log t_ms={} {l}", t0.elapsed().as_millis());
+            }
+        },
+    ));
 
     let (mut gen, mut built_at, mut last_frame, mut connected) = (1u64, Instant::now(), None, false);
     let (mut frames_seen, mut connects, mut losses) = (0u64, 0u64, 0u64);
