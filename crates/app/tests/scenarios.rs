@@ -693,6 +693,14 @@ fn assert_hang_hide(sim: &Sim, gen: u64, last_alive: u64) -> u64 {
         Call::GraphicsStop,
         "the hide, then the stop (gen {gen})"
     );
+    assert!(
+        !(0..l).any(|i| sim.at(i) == want && matches!(calls[i], Call::Push(..))),
+        "the hide comes before its tick's frame (gen {gen})"
+    );
+    assert!(
+        (l..calls.len()).any(|i| sim.at(i) == want && matches!(calls[i], Call::Push(..))),
+        "its tick pushed a frame (gen {gen})"
+    );
     assert_eq!(
         sim.at(l),
         want,

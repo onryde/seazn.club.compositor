@@ -359,3 +359,30 @@ fn the_final_beat_reaches_the_plane_with_its_detail() {
     assert!(h.flush(WAIT));
     assert_eq!(log.beats(), vec![report]);
 }
+
+/// A worker that died (its plane panicked) can post nothing: `flush` says so at once rather than
+/// report a final beat posted that never was.
+#[test]
+fn flush_reports_a_final_beat_the_worker_could_not_take() {
+    let (tx, rx) = unbounded();
+    let (plane, log) = ScriptedPlane::new(session_720p());
+    let plane = plane.reply(|h| {
+        assert!(h.exit.is_some(), "planted: the plane fails on a periodic beat");
+        (Duration::ZERO, Ok(Desired::Live))
+    });
+    let mut h = spawn(Box::new(plane), tx);
+    h.request(beat(periodic(1)));
+    assert_eq!(
+        rx.recv_timeout(WAIT),
+        Err(RecvTimeoutError::Disconnected),
+        "the worker died"
+    );
+    h.request(beat(final_beat(2, ExitReason::Fatal)));
+    let t0 = Instant::now();
+    assert!(!h.flush(WAIT), "a final beat nobody took is not posted");
+    assert!(
+        t0.elapsed() < Duration::from_millis(100),
+        "and flush says so at once"
+    );
+    assert!(log.beats().is_empty());
+}
