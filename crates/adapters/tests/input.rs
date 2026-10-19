@@ -849,6 +849,26 @@ fn a_lost_generation_writes_nothing_more() {
     assert!(gate > 0, "the pipeline kept delivering, so the gate was tested");
 }
 
+/// A camera with no audio track (the demuxer offers no AAC pad, so the audio branch stays unlinked)
+/// still connects and delivers: neither appsink waits to preroll, so the empty branch holds nothing.
+#[test]
+fn a_stream_without_audio_still_delivers_video() {
+    let _s = serial();
+    let mut c = cfg(640, 360);
+    c.audio = None;
+    let l = Listener::new(&c);
+    let (mut input, rx, frames, _lines) = input(&P720);
+    connect(&mut input, &rx, 1, &spec(l.port));
+    let second = events_for(&rx, Duration::from_secs(1));
+    let n = frames_in(&second);
+    eprintln!(
+        "{n} frames in the second after connecting; ring {} bytes",
+        frames.audio_level()
+    );
+    assert!(n >= FRAMES_IN_THE_FIRST_SECOND, "{n} frames");
+    assert_eq!(frames.audio_level(), 0, "no audio track, no audio");
+}
+
 /// The video decoder hangs for 3 s: the audio keeps reaching the ring throughout, because the video
 /// queue before the decoder is leaky and drops its oldest buffer rather than holding up the demuxer
 /// (a blocking queue full of 1 s of video stops `tsdemux`, and the audio with it, about 1 s in).
@@ -1030,6 +1050,15 @@ fn a_full_inbound_channel_never_holds_the_camera_slot() {
     let more = events_for(&rx, Duration::from_millis(500));
     assert!(connects(&more).is_empty(), "{more:?}");
     assert!(!seen.is_empty());
+    // The run's end is logged, with the count. Then the loop stops reading again: the channel holds
+    // one event, so it fills at once, and that is a new run, logged again.
+    thread::sleep(Duration::from_millis(300));
+    let lines = lines.lock().unwrap().clone();
+    let again = lines.iter().filter(|l| l.contains("takes frames again")).count();
+    let runs = lines.iter().filter(|l| l.contains("channel is full")).count();
+    eprintln!("recoveries logged {again}, runs logged {runs}");
+    assert!(again >= 1, "{lines:?}");
+    assert!(runs >= 2, "{lines:?}");
 }
 
 // ---------------------------------------------------------------------------------------------
