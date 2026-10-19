@@ -289,11 +289,14 @@ neither A nor B. Built on `onryde/seazn.club` branch `feat/r2006-organiser-compo
 
 ### The stored mode, read by all three starts
 
-- `fixture_stream_settings.stream_mode` (`'composed' | 'passthrough' | null`), migration **V465**
-  (renumbered from V464 on 2026-10-19, PR #989 review C1). W2c (`feat/format-matrix-w2c`) holds V463
-  and `seazn.club` PR #991 (`feat/claim-email-signin`) holds V464, both unmerged. Flyway runs without
-  `outOfOrder`, so the required merge order is **V463 (W2c) → V464 (#991) → V465 (#989)**, with no prod
-  tag cut between them (the coordinator sequences it).
+- `fixture_stream_settings.stream_mode` (`'composed' | 'passthrough' | null`), migration **V466**.
+  It was renumbered twice on 2026-10-19: V464 → V465 for PR #989 review C1, then V465 → V466 at the
+  coordinator's word.
+  - `seazn.club` main's max is V464 (#991, merged). PR #992 (`feat/chess-checkin-extend`, open)
+    holds V465.
+  - **Flyway has no `outOfOrder`, so V466 must stay above main's max at merge time. Renumber again if
+    something higher lands first.**
+  - W2c's V463 is no longer a prerequisite: W2c takes a number above main's max itself.
 - `effectiveStreamMode(stored, available)` in `lib/stream-settings.ts` is the one rule: a stored
   `passthrough` is Camera only; anything else is the score when it can stream, else the camera.
 - The organiser's Go live, the phone's own start and the automatic start all read it
