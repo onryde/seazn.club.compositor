@@ -1746,3 +1746,24 @@ fn an_output_error_is_reported_once_and_its_progress_stops() {
     eprintln!("after the error: {errors} more errors, {progress} progress events");
     assert_eq!((errors, progress), (0, 0), "{after:?}");
 }
+
+#[test]
+fn a_drain_waits_for_the_sink_to_take_everything() {
+    let _s = serial();
+    let dir = Tmp::new("drain-held");
+    let (mut p, rx, _f, _l) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    pace(&mut p, 0..30, FrameChoice::Slate(SlateKind::Waiting));
+    assert!(p.hold_sink_writes(), "the hook found the sink");
+    p.drain();
+    // The encoders reach EOS at once; the sink, holding its writes, never does. Drained is the
+    // sink's to say (the domain's drain_timeout_ms is the bound on waiting for it).
+    let seen = events_for(&rx, Duration::from_millis(1_500));
+    let progress = progress_of(&seen, 1).len();
+    eprintln!(
+        "events while the held sink drains: {}, progress among them: {progress}",
+        seen.len()
+    );
+    assert!(progress > 0, "the watch was running");
+    assert!(!seen.contains(&Event::OutputDrained), "{seen:?}");
+}
