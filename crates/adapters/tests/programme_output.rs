@@ -1134,7 +1134,9 @@ fn the_progress_poll_keeps_the_pdf_stall_bound() {
 
 /// Owed 15: a sink whose writes stop is swapped within `output_stall_after_ms` + the poll of its
 /// true last byte, by the domain's own `OutputLink` in the loop (one tick of quantisation added: the
-/// domain sees time only at ticks).
+/// domain sees time only at ticks). Owed 43 (after PR #29): the sink must first earn Connected
+/// (`output_connected_after_ms` of growth), so the writes stop 1 s after `is_connected()` first
+/// reads true, never at a fixed time, and the deadline follows the cut.
 #[test]
 fn stall_is_detected_within_budget_of_the_last_byte() {
     let _s = serial();
@@ -1166,9 +1168,12 @@ fn stall_is_detected_within_budget_of_the_last_byte() {
 
     let step = period(&P720);
     let mut held = false;
+    let mut connected_at: Option<Instant> = None;
     let mut swapped_at: Option<Instant> = None;
     let mut i = 0u64;
-    let deadline = t0 + Duration::from_secs(15);
+    // Until the cut, the sink has its connect bound and 4 s more to earn Connected; then the
+    // stall bound and 4 s more to be swapped.
+    let mut deadline = t0 + Duration::from_millis(t.output_connected_after_ms + 4_000);
     while Instant::now() < deadline {
         let due = t0 + step * i as u32;
         if let Some(wait) = due.checked_duration_since(Instant::now()) {
@@ -1177,7 +1182,7 @@ fn stall_is_detected_within_budget_of_the_last_byte() {
         let now = Instant::now();
         while let Ok(Inbound::Event(e)) = rx.try_recv() {
             match e {
-                Event::OutputProgress { gen, total_bytes } => link.on_progress(ms(now), gen, total_bytes),
+                Event::OutputProgress { gen, total_bytes } => link.on_progress(ms(now), gen, total_bytes, &t),
                 Event::OutputError { gen } => link.on_error(ms(now), gen, &t),
                 _ => {}
             }
@@ -1191,22 +1196,31 @@ fn stall_is_detected_within_budget_of_the_last_byte() {
             }
             p.swap_sink(gen, &file_target(&path(gen)));
         }
-        // Three healthy seconds, then the sink stops taking writes.
-        if !held && now.duration_since(t0) >= Duration::from_secs(3) {
-            assert!(link.is_connected(), "the sink connected before the cut");
+        if connected_at.is_none() && link.is_connected() {
+            connected_at = Some(now);
+        }
+        // One healthy second after the sink earns Connected, it stops taking writes.
+        if !held && connected_at.is_some_and(|c| now.duration_since(c) >= Duration::from_secs(1)) {
+            assert!(link.is_connected(), "the sink is still connected at the cut");
             held = p.hold_sink_writes();
             assert!(held, "the hook found the sink");
+            deadline = now + Duration::from_millis(t.output_stall_after_ms + 4_000);
         }
         p.push(i, FrameChoice::Slate(SlateKind::Waiting));
         i += 1;
     }
     watching.store(false, Ordering::SeqCst);
     watcher.join().expect("watcher");
-    let swapped_at = swapped_at.expect("the stall swapped the sink within 15 s");
+    let connected_at = connected_at.expect("the sink earned Connected within its bound and 4 s");
+    assert!(held, "the writes were cut");
+    let swapped_at = swapped_at.expect("the stall swapped the sink within its bound and 4 s of the cut");
     let (bytes, last) = *last_growth.lock().unwrap();
     let gap = swapped_at.duration_since(last).as_millis() as u64;
     let bound = t.output_stall_after_ms + OWED_15_POLL_MAX_MS + period(&P720).as_millis() as u64 + 1;
-    eprintln!("last byte (total {bytes}) to SwapSink: {gap} ms; bound {bound} ms");
+    eprintln!(
+        "connected {} ms after t0; last byte (total {bytes}) to SwapSink: {gap} ms; bound {bound} ms",
+        ms(connected_at)
+    );
     assert!(bytes > 0);
     assert!(
         gap >= t.output_stall_after_ms,
