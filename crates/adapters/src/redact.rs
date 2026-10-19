@@ -185,8 +185,10 @@ impl fmt::Debug for Scrubber {
     }
 }
 
-/// RFC 3986 percent-encoding of every byte outside the unreserved set, with this hex alphabet.
-fn percent_encoded(value: &str, hex: &[u8; 16]) -> String {
+/// RFC 3986 percent-encoding of every byte outside the unreserved set, with this hex alphabet. C10's
+/// `srt_uri` encodes the SRT stream id and passphrase with the uppercase alphabet, which `Scrubber::add`
+/// also learns, so the scrubber masks exactly the form the URI carries.
+pub(crate) fn percent_encoded(value: &str, hex: &[u8; 16]) -> String {
     let mut out = String::with_capacity(value.len());
     for b in value.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {

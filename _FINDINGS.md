@@ -1163,6 +1163,68 @@ echo "RUN $RUN done"
 - It needs an owner session: the push is a broadcast on the owner's channel (`SPIKE_YT_DIRECT_URL` is staged), and the verdict is YouTube Studio's health readout. Owed 41.
 - **In CI instead:** the filler's encode, through the adapter. 137–140 AAC frames for 3 s; 46.88 frames/s; 128 kbps; zero-byte share 0.106 (fail above 0.5); level between −80 and −45 dBFS. A real tone passes at −23 dBFS; its zero share is 0.618, which is CBR fill on a pure tone, so it is reported and not asserted.
 
+## F-012: the input pipeline's element facts, and the CF Input A leg (C10, 2026-10-19)
+
+**Where:** F-010's container (`ubuntu:24.04` with exactly the CI apt set; gstreamer-rs 0.24.5, Rust 1.91.0). `srtsrc`/`srtsink` come from plugins-bad 1.24.2-1ubuntu4 on libsrt1.5-gnutls 1.5.3. The live leg ran the C00 image (GStreamer 1.24.2).
+
+**`srtsrc`, the adapter's caller:**
+- **`auto-reconnect` defaults to TRUE.** With it on, a peer that goes away is retried inside the element: warnings forever and never an error, a retry policy the domain cannot see. Built: `false`.
+- With it off, the connect runs on the streaming thread and `set_state` returns at once. With nothing listening, an ERROR "Error on SRT socket: Connection timeout (16)" arrives after 3.0 s (3.01–3.03 s across the tests).
+- **A peer that closes gives an ERROR, and then an EOS.** A graceful close (the listening `gst-launch-1.0` stopped by SIGINT) gave the ERROR about 47 ms later; a killed listener gave "Error on SRT socket: Unknown or erroneous (0)" about 5.2 s later. *Corrected by the PR #30 review (probe P2):* `basesrc` then pushes an EOS, which reaches the video appsink 1.4–7 ms after the error was posted. The C10 build first reported whichever reached it first, so a slow log line gave `Eos` (3 of 3 with a 300 ms log). Since round 1 a bus sync handler decides the loss when the error is posted, before that EOS exists: a peer close is `Error`, always (`a_peer_close_is_an_error_even_when_the_log_is_slow`).
+- A passphrase under 10 characters fails inside `set_state` (READY to PAUSED), and the element posts it on the bus about 20 ms in: "Could not open resource for reading … failed to set passphrase (reason: Operation not supported: Bad parameters)". The text holds no secret.
+- **A hanging resolver** (a container with `--dns 192.0.2.1`) held `set_state(PAUSED)` for 10 s inside `srtsrc`'s start, then "Failed to resolve host". So the adapter starts each pipeline on a starter thread.
+- GStreamer percent-decodes the URI's query. `streamid=play%3DMADEUP%26X` reached libsrt as `play=MADEUP&X`: the listener's `caller-connecting` and `srtobject`'s debug line both showed the decoded stream id, byte for byte. A `latency=` in the URI sets the property (read back as 1 000).
+- `GST_DEBUG=srtobject:5` prints `passphrase=(string)…` and `streamid=(string)…` raw in its "Opening SRT socket with parameters" line (Owed 47).
+- Other defaults read: `latency` 125, `poll-timeout` 1 000, `wait-for-connection` true and `authentication` true. `passphrase` is write-only.
+
+**`srtsink`, the tests' listener only:**
+- It sends each buffer as one SRT message. At `mpegtsmux`'s default alignment, every keyframe went out in a buffer over 1 316 bytes and never arrived: the caller decoded 0 buffers in 6 s, against 135 with `alignment=7` (7 × 188 = 1 316, SRT's live payload).
+- `authentication` reads as default true, but `caller-connecting` is not emitted until the property is set: 0 calls unset, 1 once set.
+
+**The other elements:**
+- `videoconvertscale` `add-borders` defaults to true, so removing that line alone changes nothing. The brief's mutant 1 also removes the fixed caps.
+- `queue` `max-size-time` defaults to 1 s. `appsink` `max-buffers` defaults to 0 (unbounded) and `drop` to false, so the adapter sets both.
+- `avdec_h264` `output-corrupt` defaults to true (Owed 48). *Since PR #30 round 2 it is set false, by the owner's ruling of 2026-10-19 (hide damaged frames): the slot keeps the last good picture.* `tsdemux` `latency` is 700 ms, left at its default.
+- Two warnings on every connect are harmless: `srtsrc` logs "discont detected" at its first packet, and `tsdemux`'s first buffers carry no timestamp ("Not enough information to calculate proper timestamp").
+- `appsink` `async=false` is needed for a camera with no audio track. Without it the audio appsink waits to preroll, the pipeline never reaches PLAYING, and nothing reaches the slot (mutant G37: the video-only test went red).
+- `audioconvert` dithers its float-to-S16 step per channel (TPDF, its default), so the two copies of a mono source differed by up to 3 LSB.
+
+**Measured in the local tests (`crates/adapters/tests/input.rs`, 25 tests):**
+- The first decoded frame (`InputConnected`) came 1.08–1.09 s after `rebuild`, at 720p and at 1080p, with the listener's keyframes 1 s apart. 30 frames followed in the next second.
+- `rebuild` returned in about 6–7 ms. `Drop` returned in 0.23 ms with the video decoder hung for 3 s (bound: 500 ms).
+- A video decoder hung for 3 s did not stall the audio: the ring stayed full (76 800 bytes) through the hang.
+- With the inbound channel full, the camera slot still took every new frame (its PTS advanced at each 200 ms read). 31 events were dropped, with one log line for the run.
+
+**The CF Input A leg (live). PASS for connect, shape, letterbox, audio and scrubbing; and CF never reports a lost source.**
+- **Harness:** one fresh performance-4x Machine in lhr (`815406b9946e68`), running the C00 image. Three files went up with `--file-local`:
+  - `input_leg`: `crates/adapters/examples/input_leg.rs`, release build, stripped, sha256 `e5e174530b1b3e98f293e818fd538bce1fffe1ee405bec156a515ef75bc9f1f6`;
+  - `source.py`: a scratch Python + gi pusher, sha256 `83ec0a83871b4b2d23ff9b0d9dea551d248d625515b66b7f525f100459784a0d`;
+  - `run.sh`: the timeline, sha256 `bcf1be96fec248b6156c4f688c062678d5a1d65aae2d5b84e8379292fc226d11`.
+- **The source:** `videotestsrc pattern=white` at 30 fps, then x264 veryfast/zerolatency at 3 000 kbps with keyframes 60 frames apart, plus a 440 Hz AAC tone. It pushed over RTMPS to `SPIKE_A_RTMPS_PUSH_URL` (Input A, which has no Outputs).
+- **The reader:** the real adapter, reading `SPIKE_A_SRT_PLAY_URL`. Neither URL was printed; the leg printed only their lengths (stream id 36 characters, passphrase 65). It stood in for the domain's two timers (a 5 s stall and a 5 s connect timeout), with no back-off.
+- **Timeline:** the source ran at 1280×720 from 0 to 30 s, was off from 30 to 50 s, and ran portrait (720×1280) from 50 to 95 s. The leg ran 105 s.
+- **What happened:**
+  - Gen 1 was built at 0.06 s, before CF was live. Nothing came; the connect timeout fired at 5.0 s.
+  - Gen 2: `InputConnected` 2 915 ms after its build (t = 7.92 s).
+  - The source stopped at 30 s. **No event at all: no error and no EOS.** The frames stopped, and the stand-in stall rule rebuilt at 36.0 s.
+  - Gens 3–5, while there was no source: each was silent (no error, no frame) until its connect timeout.
+  - Gen 6 was built at 51.0 s, 1 s after the portrait source started: `InputConnected` 2 908 ms after its build.
+  - The source stopped at 95 s: again no event; the stall rebuild came at 100.9 s.
+- **Over the run:**
+  - 7 generations, 2 connects, **0 losses**, 1 989 frames.
+  - 192 reads of the camera slot, all I420 1280×720, PAR 1/1, BT.709. The 91 landscape reads had luma (edge, centre) = (235, 235). The 101 portrait reads had (16, 235): pillarboxed.
+  - The audio read back at 440 Hz, the source's tone.
+  - 0 log lines held any form of either credential (raw, percent-encoded in either case, or the URI). 0 samples were dropped at the gate, and 0 frame events.
+- **Verdict:**
+  - On CF, the input is lost only by the domain's stall rule and connect timeout; the adapter never reports `InputLost` for a source that stops. This matches F-002's silent socket.
+  - `LossReason::Eos` never occurred on CF. Locally it could, through the race above; since round 1 it needs a bare EOS with no error before it, and nothing measured produces one (Owed 46).
+  - Connects took 2.9 s from the build, inside F-002's 2.22–4.19 s.
+
+**Teardown (C10):**
+- **Fly Machines:** 1 created (`815406b9946e68`) and destroyed with `--force`. `fly machine list -a seazn-relay-spike` then read "No machines are available on this app"; `--json` gave a total of 0.
+- **Cloudflare:** no input or Output was created or changed. Pushes went only to Input A; its recording setting was not re-read.
+- **flyctl** used its stored login; no token went on argv.
+
 ## Platform notes (Fly-specific; nothing inside the image depends on them)
 
 - **CPU:** performance-4x reports AMD EPYC with 4 vCPU.

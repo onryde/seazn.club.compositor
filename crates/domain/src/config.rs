@@ -26,6 +26,12 @@ pub struct Thresholds {
     /// confirmed it is needed: CF holds a silent, encrypted playback socket open indefinitely after the
     /// phone stops publishing.
     pub input_stall_after_ms: Ms,
+    /// C10: the SRT receive latency the input pipeline asks of CF Input A's playback (`srtsrc`
+    /// `latency`, in its URI). The POC's `INPUT_LATENCY_MS` (1 000). F-002 measured every CF reader
+    /// at 1 000 ms: 0 packets lost or retransmitted in 120 s, the first AU at 2.22–3.89 s, and an
+    /// in-chain camera→overlay delay of 3 083–3 105 ms that includes it, so the overlay delay's
+    /// default (F-002, ADR 0006) moves with this value.
+    pub input_srt_latency_ms: Ms,
     /// PDF failure table: "alert if it repeats > 3 times in 5 min" (alert when count EXCEEDS this).
     pub kick_alert_count: usize,
     /// PDF failure table: the "5 min" of "> 3 times in 5 min".
@@ -121,6 +127,7 @@ impl Default for Thresholds {
             input_backoff_cap_ms: 10_000,
             input_connect_timeout_ms: 5_000,
             input_stall_after_ms: 5_000,
+            input_srt_latency_ms: 1_000,
             kick_alert_count: 3,
             kick_window_ms: 300_000,
             output_stall_after_ms: 5_000,
@@ -306,6 +313,14 @@ mod tests {
             "{} ms",
             t.input_connect_timeout_ms
         );
+    }
+
+    // C10: the SRT latency is the one every F-002 reader used (1 000 ms), so the measured first-frame
+    // times and the in-chain overlay delay (ADR 0006's default) hold for it. A different value owes a
+    // re-measure and moves the overlay delay with it.
+    #[test]
+    fn input_srt_latency_is_the_one_f002_measured() {
+        assert_eq!(Thresholds::default().input_srt_latency_ms, 1_000);
     }
 
     // F-004 addendum: YouTube split the organiser's broadcast after a 30 s output gap and kept it
