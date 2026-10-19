@@ -359,13 +359,13 @@ fn a_reported_crash_closes_its_generations_gate() {
     thread::sleep(Duration::from_millis(1_500));
     let later = r.g.samples(1);
     eprintln!("at the report {at_report:?}; 1.5 s later {later:?}");
-    assert!(
-        later.dropped > at_report.dropped,
-        "the page painted nothing after the report"
-    );
     assert_eq!(
         later.written, at_report.written,
         "a sample reached the slot after the report"
+    );
+    assert!(
+        later.dropped > at_report.dropped,
+        "the page painted nothing after the report"
     );
     assert_eq!(
         bytes(&r.frames.overlay().expect("held")),
@@ -739,9 +739,21 @@ fn stop_never_blocks_and_closes_the_slot_on_a_page_hung_after_ready() {
         ready_at.elapsed(),
         r.g.samples(1)
     );
-    let written = r.g.samples(1).written;
     let pids = r.g.renderer_pids(1);
-    thread::sleep((ready_at + Duration::from_millis(900)).saturating_duration_since(Instant::now()));
+    // Wait for the hang itself, seen as no sample for 300 ms (the page paints at 30 fps until it
+    // starts; a loaded host delays the page's timer), so the hide and the stop land inside it.
+    let mut last = r.g.samples(1).delivered;
+    let mut quiet_since = Instant::now();
+    let hung = wait_for(Duration::from_secs(3), || {
+        let now = r.g.samples(1).delivered;
+        if now != last {
+            last = now;
+            quiet_since = Instant::now();
+        }
+        quiet_since.elapsed() >= Duration::from_millis(300)
+    });
+    assert!(hung, "the page never hung: {:?}", r.g.samples(1));
+    let written = r.g.samples(1).written;
     // C08's mapping of a Hang hide: hide_overlay (the programme clears the slot), then stop.
     r.frames.clear_overlay();
     let t = Instant::now();
