@@ -615,4 +615,49 @@ mod tests {
         }
         assert_eq!(texts.len(), 2);
     }
+
+    /// C08 confirm pass (the reviewer's L5): a thread that panicked while holding the scrubber's lock
+    /// poisons it, and the plane recovers the lock rather than panic on it. The plane, and the final
+    /// lane that shares the lock, still scrub the job token from an error text, and `Debug` still
+    /// prints. Hermetic: the URL names a port nothing listens on, and carries the token in its path so
+    /// ureq's own error text names it.
+    #[test]
+    fn a_poisoned_scrubber_lock_still_scrubs_and_never_panics() {
+        const TOKEN: &str = "PLANTED-POISONED-LOCK-TOKEN";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/{TOKEN}", listener.local_addr().unwrap());
+        drop(listener);
+        let p = HttpControlPlane::build(&url, "sid", TOKEN.to_owned(), 1_000);
+        let mut lane = p.final_lane();
+        let shared = Arc::clone(&p.scrubber);
+        let poisoner = std::thread::spawn(move || {
+            let _held = shared.lock().unwrap();
+            panic!("planted: a panic while the scrubber's lock is held");
+        });
+        assert!(poisoner.join().is_err(), "the planted panic ran");
+        assert!(p.scrubber.is_poisoned(), "the lock is poisoned");
+        let mut checked = 0;
+        let HeartbeatError::Transport(text) = p.transport(&format!("refused at {TOKEN}")) else {
+            panic!("a transport error");
+        };
+        assert_eq!(text, "refused at ****");
+        checked += 1;
+        let beat = Supervisor::new(Thresholds::default())
+            .decide(Event::Tick, 0)
+            .next
+            .health(0);
+        let text = match lane.heartbeat(&beat, &Measured::default()) {
+            Err(HeartbeatError::Transport(t)) => t,
+            other => panic!("nothing listens: {other:?}"),
+        };
+        assert!(!text.contains("PLANTED"), "{text}");
+        assert!(text.contains("****"), "the URL was in the error, masked: {text}");
+        checked += 1;
+        let dbg = format!("{p:?}");
+        assert!(dbg.contains("Scrubber { values: "), "{dbg}");
+        assert!(!dbg.contains("PLANTED"), "{dbg}");
+        checked += 1;
+        eprintln!("scrubs through a poisoned lock: {checked}");
+        assert_eq!(checked, 3);
+    }
 }
