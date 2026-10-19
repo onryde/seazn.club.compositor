@@ -1684,14 +1684,43 @@ mod tests {
             Some("pipeline0"),
             &other,
         );
+        // Other adapters' credentials, which this handler does not know by value: `redact` masks
+        // them by their shape (Owed 45 and 47's lines: srtobject's parameters, rtmp2sink's location).
+        let srt = "Opening SRT socket with parameters: passphrase=(string)srtPASSmadeup01, \
+                   streamid=(string)play=srtSTREAMmadeup02";
+        on_gst_log(
+            "srtobject",
+            gst::DebugLevel::Debug,
+            "srt.c",
+            "f",
+            3,
+            Some("srtsrc0"),
+            srt,
+        );
+        let rtmp = "location=rtmps://live.example:443/live/rtmpKEYmadeup03";
+        on_gst_log(
+            "rtmp2sink",
+            gst::DebugLevel::Debug,
+            "rtmp.c",
+            "f",
+            4,
+            Some("sink"),
+            rtmp,
+        );
         CefGraphics::forward_gst_lines(None);
         let got = locked(&got).clone();
-        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got.len(), 3, "{got:?}");
         assert!(
             got[0].contains("GST_STATES") && got[0].contains("pipeline url"),
             "{got:?}"
         );
-        assert!(!got[0].contains(secret), "printed unscrubbed: {got:?}");
+        assert!(
+            got[1].contains("srtobject") && got[2].contains("rtmp2sink"),
+            "{got:?}"
+        );
+        for s in [secret, "srtPASSmadeup01", "srtSTREAMmadeup02", "rtmpKEYmadeup03"] {
+            assert!(got.iter().all(|l| !l.contains(s)), "printed unscrubbed: {got:?}");
+        }
         // The two lines of no adapter's element are counted; the dropped instance's is its own.
         assert_eq!(router().unrouted_console.load(Ordering::SeqCst) - unrouted, 2);
     }
