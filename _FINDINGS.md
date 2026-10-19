@@ -1106,7 +1106,7 @@ echo "RUN $RUN done"
 - The compositor fills each video gap by repeating its last frame: 149 frames, no PTS jump.
 - The audio track keeps a hole of one period per skip: 14 jumps of 55 ms (21 + 33).
 - The `DISCONT` flag `push` sets on a gap changes neither: identical with and without it (mutant G33, argued equivalent).
-- The audio hole is Owed 40.
+- The audio hole was Owed 40. **Fixed 2026-10-19 (owner: "1 ok"; PR #28 review round 1):** a tick after a gap pushes every missed period's audio first, from the ring and then the filler, up to the ring's 400 ms. The same probe now reads 0 jumps and 4 949 ms of audio against 4 966 (232 AAC frames); a 1 s gap leaves one 600 ms hole (30 periods missed, 12 filled).
 
 ## F-011: the output's progress feed, its poll, and the live legs (C09, Owed 13–16, 2026-10-19)
 
