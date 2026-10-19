@@ -315,7 +315,7 @@ neither A nor B. Built on `onryde/seazn.club` branch `feat/r2006-organiser-compo
 - The camera phone's own timing control (capture app).
 - Adjusting the delay while live.
 - The composed camera chip (`programmePhase`) — Step 2.4 and mutant 3 above are deferred, not built.
-  It is owed to a web follow-up before C17 (`_INDEX.md` Owed 52), and C17 Step 3 row 3 no longer
+  It is owed to a web follow-up before C17 (`_INDEX.md` Owed 65), and C17 Step 3 row 3 no longer
   expects it.
 
 ### Added during the build
