@@ -225,6 +225,37 @@ impl GstProgramme {
             .is_some_and(|o| o.plant_error())
     }
 
+    /// Test hook: the current output's sink fails as a dropped connection does: its next write
+    /// posts a write error from the sink and returns a flow error upstream, so each of the output's
+    /// appsrcs posts its own error and sends an EOS down (F-011's live legs). False if there is no
+    /// output.
+    #[cfg(feature = "test-hooks")]
+    pub fn fail_sink_writes(&self) -> bool {
+        let Some(pad) = self.current_sink_pad() else {
+            return false;
+        };
+        let posted = AtomicBool::new(false);
+        pad.add_probe(
+            gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+            move |pad, info| {
+                if !posted.swap(true, Ordering::SeqCst) {
+                    if let Some(sink) = pad.parent_element() {
+                        let msg = gst::message::Error::builder(
+                            gst::ResourceError::Write,
+                            "planted: the connection was lost",
+                        )
+                        .src(&sink)
+                        .build();
+                        let _ = sink.post_message(msg);
+                    }
+                }
+                info.flow_res = Err(gst::FlowError::Error);
+                gst::PadProbeReturn::Handled
+            },
+        )
+        .is_some()
+    }
+
     /// Test hook: posts an error on the programme's bus, as a failing element would, with `debug`
     /// as its debug text. False before `start()`.
     #[cfg(feature = "test-hooks")]

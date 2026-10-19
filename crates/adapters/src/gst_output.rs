@@ -159,6 +159,19 @@ impl EncodedRing {
         !std::mem::replace(&mut r.drained_sent, true)
     }
 
+    /// An output reached EOS after the programme's drain reached the ring (both encoders at EOS):
+    /// the EOS is that drain's, and `OutputDrained` is due now (once). An output's EOS before then
+    /// is a failed sink's aftermath (each appsrc whose push fails sends one down; F-011), not a
+    /// drain, and must not spend the once-only event.
+    pub(crate) fn take_drained_at_eos(&self) -> bool {
+        let mut r = locked(&self.state);
+        if r.video_eos && r.audio_eos && !r.drained_sent {
+            r.drained_sent = true;
+            return true;
+        }
+        false
+    }
+
     fn set_owner(&self, gen: u64) {
         locked(&self.state).owner = gen;
         self.wake.notify_all();
@@ -622,9 +635,12 @@ impl Watch {
                         w.debug().as_deref().unwrap_or("")
                     )),
                     gst::MessageView::Eos(_) => {
-                        // One final sample, so the last snapshot equals what the sink wrote.
-                        self.progress();
-                        if self.shared.ring.take_drained() {
+                        // One final sample, so the last snapshot equals what the sink wrote; a sink
+                        // that failed is not sampled again (its EOS follows the error).
+                        if !failed {
+                            self.progress();
+                        }
+                        if self.shared.ring.take_drained_at_eos() {
                             self.shared.send(Event::OutputDrained);
                         }
                     }

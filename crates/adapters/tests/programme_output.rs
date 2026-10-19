@@ -684,6 +684,56 @@ fn unreachable_rtmp_target_reports_output_error_with_its_generation() {
     assert!(worst < period(&P720), "a push blocked for {worst:?}");
 }
 
+/// A failed output's own EOS is not a drain. Each appsrc whose push fails sends an EOS downstream,
+/// so a sink that dies mid-stream posts its error and then an EOS (F-011's live legs: `OutputError`,
+/// then `OutputDrained` 34 ms later with no drain asked for). That EOS neither samples progress after
+/// the error nor spends the once-only `OutputDrained`, so the session's real drain, on the next
+/// sink, still reports.
+#[test]
+fn a_failed_output_neither_reports_drained_nor_spends_the_drain() {
+    let _s = serial();
+    let dir = Tmp::new("failed-then-drain");
+    let (mut p, rx, _f, _l) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    pace(&mut p, 0..15, FrameChoice::Slate(SlateKind::Waiting));
+    assert!(p.fail_sink_writes());
+    pace(&mut p, 15..45, FrameChoice::Slate(SlateKind::Waiting));
+    let after = events_for(&rx, Duration::from_millis(1_500));
+    let error_at = after
+        .iter()
+        .position(|e| *e == Event::OutputError { gen: 1 })
+        .unwrap_or_else(|| panic!("no OutputError: {after:?}"));
+    let drained = after.iter().filter(|e| **e == Event::OutputDrained).count();
+    let progress = after[error_at..]
+        .iter()
+        .filter(|e| matches!(e, Event::OutputProgress { gen: 1, .. }))
+        .count();
+    eprintln!(
+        "after the sink failed: {} events, {drained} drained, {progress} gen-1 progress after the error",
+        after.len()
+    );
+    assert_eq!(drained, 0, "{after:?}");
+    assert_eq!(progress, 0, "{after:?}");
+
+    p.swap_sink(2, &file_target(&dir.file("b.flv")));
+    pace(&mut p, 45..75, FrameChoice::Slate(SlateKind::Waiting));
+    let seen = drain_and_wait(&mut p, &rx);
+    let mut drained = seen.iter().filter(|e| **e == Event::OutputDrained).count();
+    drained += events_for(&rx, Duration::from_millis(500))
+        .iter()
+        .filter(|e| **e == Event::OutputDrained)
+        .count();
+    eprintln!("the real drain: {drained} drained");
+    assert_eq!(drained, 1);
+    let d = decode(&dir.file("b.flv"));
+    eprintln!("frames on the second sink: {}", d.frames.len());
+    assert!(
+        d.first_is_key() && !d.frames.is_empty(),
+        "{} frames",
+        d.frames.len()
+    );
+}
+
 /// Both shapes of key: one after `/live/` (the pattern rule catches it) and one after another path,
 /// which only the scrub by value catches.
 #[test]
@@ -1376,7 +1426,10 @@ fn a_slate_then_back_to_camera_and_back_again() {
         if (20..40).contains(&i) {
             assert!(is_red(f.corner_tl) && is_red(f.centre), "frame {i}: camera {f:?}");
         } else {
-            assert!(close(f.corner_tl, HOUSE_NIGHT, ON_AIR_TOL), "frame {i}: slate {f:?}");
+            assert!(
+                close(f.corner_tl, HOUSE_NIGHT, ON_AIR_TOL),
+                "frame {i}: slate {f:?}"
+            );
         }
         checked += 1;
     }
@@ -1723,7 +1776,11 @@ fn a_camera_frame_that_cannot_be_fitted_shows_the_slate_and_is_logged_once() {
     assert_eq!(logged, 1, "{lines:?}");
     let d = decode(&dir.file("a.flv"));
     assert_eq!(d.frames.len(), 20);
-    assert!(close(d.frames[9].corner_tl, HOUSE_NIGHT, ON_AIR_TOL), "{:?}", d.frames[9]);
+    assert!(
+        close(d.frames[9].corner_tl, HOUSE_NIGHT, ON_AIR_TOL),
+        "{:?}",
+        d.frames[9]
+    );
     assert!(is_red(d.frames[19].centre), "{:?}", d.frames[19]);
 }
 
