@@ -1243,6 +1243,11 @@ echo "RUN $RUN done"
 - **The spare renderer killed:** no warning, and it is not relaunched.
 - **The GPU process killed:** recovered silently; 96 frames in the next 4 s.
 - **The zygote killed:** every later renderer launch fails. The warning storms at about 60 a second, for every browser after it, with 0 frames. CEF is dead for the rest of the process (Owed 56).
+- **Which zygote** (the PR #32 fix loop's probe, 2026-10-19; corrects the line above, which killed both). CEF runs two zygotes, children of the compositor process.
+  - The first parents the GPU process. Killed alone, CEF recovered: the next build signalled ready.
+  - The second parents the renderers and a utility process. Killed alone, the current renderer is orphaned: it leaves the compositor's process tree (so the guardrails, the claims and the reaper lose it) and keeps painting and beating, and the next build gets `CefCrashed` at once, with 0 samples.
+  - The review's P7: with the zygotes dead, the current build's renderer killed gave no `CefCrashed` within 3 s (2 of 2 runs), and CEF's browser side burned about 1.0–1.3 cores in the compositor process while a build existed.
+  - So the adapter's verdict (`health().unrecoverable`, Owed 56) is the renderers' zygote gone, or every zygote gone, from the child poll; a zygote missing from one poll's list counts only once its process is gone (or a zombie).
 
 **Teardown:**
 - `set_state(NULL)` returned in 4–17 ms, and in 7 ms for a page hung in a JS busy loop with js-signals off (the adapter's mode).
@@ -1265,9 +1270,15 @@ echo "RUN $RUN done"
   - `warning` wrote 0 token lines for info-level console lines.
   - `GST_CEF_LOG_SEVERITY` in the environment overrides the property: `=info` writes them again (Owed 52).
 - **The CEF children's argv:** never carries the URL (8 argvs checked).
+- **CEF's profile, on disk** (the PR #32 review's I1, probe P1; the fix loop's probes). Over http (the real page's scheme) and past History's 10 s commit, the token was in `.config/cef_user_data/Default/History`, `…/Default/Top Sites` and `.cache/cef_user_data/Default/Cache/Cache_Data/<hash>_0`, in clear. Incognito does not stop it, and `file://` pages write no History, which is why the token test missed it.
+  - cefsrc's `cef-cache-location` (or `GST_CEF_CACHE_LOCATION`) sets `CefSettings.cache_path`, and the whole profile moves there: History, Top Sites, the HTTP cache and `chrome_debug.log`. HOME then holds 4 files (GStreamer's registry and `.pki/nssdb`), none with the token. `user-data-dir=` in `chrome-extra-flags` and `XDG_CONFIG_HOME`/`XDG_CACHE_HOME` moved it too.
+  - Like `chrome-extra-flags`, it is global, read once at CEF's start from the first element, and logs cefsrc's deprecation WARNING on every set. So a profile per build is impossible: it is one per process.
+  - A path CEF cannot create falls back to HOME (no in-memory mode). A `/dev/shm` path worked, about 4 MB for one page.
+  - The adapter's profile is `<temp_dir>/seazn-cef-<pid>-<nanos>`, mode 0700; the last `CefGraphics` dropped removes it, and the next start removes any whose process is gone.
+  - Removed under a live CEF (a test process, where adapters come and go): History stays open on the unlinked file, so a later test's History never reaches a path, and the disk cache writes its index again later (`Cache_Data/index-dir/the-real-index`: hashes, no URL). In production the drop is the process's exit. C12 puts `TMPDIR` on a tmpfs (Owed 58).
 
 **The environment:**
-- CEF writes its profile under `$HOME/.config/cef_user_data`, so the CEF user's HOME must exist and be writable (Owed 54). The probes ran uid 10001 with `HOME=/home/spike`.
+- CEF writes its profile under `$HOME/.config/cef_user_data`, so the CEF user's HOME must exist and be writable (Owed 54). The probes ran uid 10001 with `HOME=/home/spike`. Since the fix loop the adapter moves the profile to its own directory (above); HOME still takes GStreamer's registry and NSS's database.
 - **One CEF per profile.** A second process on the same HOME failed its first start: "state change failed and some element failed to post a proper error message with the reason for the failure" (`gst_base_src_start`), alongside CEF's own warning "Please customize CefSettings.root_cache_path … process singleton". So the token test's child gets a HOME of its own.
 
 **Measured in `crates/adapters/tests/graphics.rs` (19 tests, 3 runs in a row):**
@@ -1279,6 +1290,15 @@ echo "RUN $RUN done"
   - 45 frames after the retry's ready, 40 of them blue (one run).
 - A reported crash (the cap lowered to 1 MB): 0 writes after the report, and 44–94 samples dropped over 1.5 s.
 - Six CEF children, one of them a renderer, ran 44 threads, all at nice 10 with `oom_score_adj` 1000 after two polls.
+- **The PR #32 fix loop's file** (23 tests: 23 of 23 in 3 runs in a row, the file alone, VM load average 0.9–1.6, about 114 s a run; before its last two witnesses, the 22-test file was also green in 3 runs; the ranges below cover all 6):
+  - `oom_score_adj` graded after two polls, with the kernel's `oom_score` in the same order: zygotes 500 (score 1006), the GPU and utility processes 800 (1204–1210), the renderer 1000 (1344); the compositor 0.
+  - The reaper killed the js-signal renderer 3.005–3.023 s after `restart(2)`; the stuck teardown was counted leaked 6.007–6.021 s after it (bound 3 + 3 s), once.
+  - `Drop` returned in 0.37–0.65 ms with the page hung.
+  - The write race, exact (a held write): hide then stop left a frame in the slot in every run; stop then hide left none, with 10 samples dropped after both.
+  - The disk token: History and the HTTP cache held it, both in the private profile; 0 files under the child's HOME or TMPDIR held it after the drop (one cache index file was written again, no URL).
+  - The hidden page: 180 programme frames before the retry, 45 after the hide, 0 blue; 45 after the retry's ready, 45 blue.
+  - Two builds' renderers side by side (gen 1's teardown held): 190–193 MB PSS in all, 151–153 MB counted for gen 2, 39–40 MB for gen 1's renderer; a cap halfway between crashed nothing, and a cap under gen 2's share crashed gen 2.
+  - The zygotes one at a time, each in a fresh process: the GPU zygote killed, gen 2 ready and no verdict; the renderers' zygote killed with the GPU zygote alive, `unrecoverable: Some(1)` and gen 2 crashed at once.
 - **Straight alpha costs one pass over the frame.** In place: about 4 ms optimised and 25 ms in a debug build. A two-buffer loop took 200–400 ms in a debug build, too slow for the tests' 30 fps page: frames were written about 3 a second, and the stop test missed its first write.
 
 ## F-014: CEF 139 paints an error page opaque (C11, Owed 17, 2026-10-19)
@@ -1295,6 +1315,12 @@ echo "RUN $RUN done"
 - `--status N` is new in the probe server for this measurement: every request, any method and any path, gets N with no body.
 
 **Verdict:** an error page is opaque white over the whole frame. If one reached the slot, it would cover the programme in white. It never logs `seazn:ready`, so only the ready gate keeps it off air. `frames_before_ready_never_reach_the_slot` is the gate's witness, and mutant 6 reds it.
+
+**Known residual: a ready page that navigates** (the PR #32 review's m2, probe P5; recorded in the fix loop, 2026-10-19). The gate trusts a build's ready for the build's whole life. A page that logged `seazn:ready` and then set `location.href = "http://127.0.0.1:9/nope"` 1.5 s later put Chromium's error page into the slot through the open gate: (255, 255, 255, 255) at the four corners and the centre, with no ready and no beat after it.
+- **Bound:** the domain's hang hide, `cef_hang_after_ms` (10 s) after the last beat. Until then, a white 1920×1080 frame covers the programme.
+- **No producer known.** R2005's page has no self-navigation (no `location.*` or `router.*` under `components/overlay`). Next's own hard-reload paths are unverified.
+- **Caught otherwise:** a 404, a 502 or a DNS failure on the FIRST load never signals ready, so the gate stays shut and the load timeout restarts the page; cefsrc's reload after a renderer crash is shut out by the crashed set (`crash_of_the_renderer_reports_cefcrashed`).
+- **A fix, if a producer appears:** close the gate on any main-frame load start. cefsrc surfaces none today (no signal, no log line), so it would need a cefsrc change.
 
 ## F-015: `cefsrc` scene compatibility (G1), 2026-10-19: REFUSED, no fixture in progress on stg
 
