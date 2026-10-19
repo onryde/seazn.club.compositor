@@ -1184,7 +1184,7 @@ echo "RUN $RUN done"
 **The other elements:**
 - `videoconvertscale` `add-borders` defaults to true, so removing that line alone changes nothing. The brief's mutant 1 also removes the fixed caps.
 - `queue` `max-size-time` defaults to 1 s. `appsink` `max-buffers` defaults to 0 (unbounded) and `drop` to false, so the adapter sets both.
-- `avdec_h264` `output-corrupt` defaults to true (Owed 48). `tsdemux` `latency` is 700 ms, left at its default.
+- `avdec_h264` `output-corrupt` defaults to true (Owed 48). *Since PR #30 round 2 it is set false, by the owner's ruling of 2026-10-19 (hide damaged frames): the slot keeps the last good picture.* `tsdemux` `latency` is 700 ms, left at its default.
 - Two warnings on every connect are harmless: `srtsrc` logs "discont detected" at its first packet, and `tsdemux`'s first buffers carry no timestamp ("Not enough information to calculate proper timestamp").
 - `appsink` `async=false` is needed for a camera with no audio track. Without it the audio appsink waits to preroll, the pipeline never reaches PLAYING, and nothing reaches the slot (mutant G37: the video-only test went red).
 - `audioconvert` dithers its float-to-S16 step per channel (TPDF, its default), so the two copies of a mono source differed by up to 3 LSB.

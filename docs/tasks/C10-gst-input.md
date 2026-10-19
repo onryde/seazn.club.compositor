@@ -126,6 +126,13 @@ while what it owns is hung (or stands in for hung) and the drop returns within 5
 - **Plugins load in `new` (M4):** `INPUT_FACTORIES`; `tests/input_preload.rs` (its own binary, so nothing is loaded before it).
 - **The start hold** (`hold_starts`) replaces `delay_starts`: it holds inside READY→PAUSED, where a hanging resolver holds a real start. `rebuild_never_waits_on_the_start` proves the order with no clock bound.
 
+## Amendment 2026-10-19 (PR #30 confirm pass, round 2)
+
+- **The owner's ruling (Owed 48): damaged frames are hidden.** Step 3's decoder runs with `output-corrupt=false`. Test: `damaged_frames_are_held_back_not_shown`.
+- **The gate closes audio with the video (m2).** Both branches read one `SampleClock`; an audio sample past either rule gives the generation up. Test: `audio_stops_with_the_video_past_the_stall_rule`; both G1 tests also assert an empty audio ring.
+- **The allowance is pinned (m1):** `the_allowance_gives_up_250_ms_inside_each_rule`.
+- **The interim G1 design's residuals** and the port call that replaces it are Owed 50 (task C10b, `docs/tasks/C10b-input-abandon.md`); C12 passes one `Thresholds` to the driver and the adapter (Owed 51).
+
 ## Do not touch
 
 `gst_programme.rs`/`gst_output.rs` (report problems, don't change them), and other domain files.
