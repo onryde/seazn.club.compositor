@@ -664,18 +664,28 @@ fn health_passes_through_the_graphics_decorators() {
     assert_eq!(knob.reads(), 1);
 }
 
-/// The two sides of the stop seam agree (F-016): every signal the image's entrypoint traps is
-/// forwarded under a name the binary reads as the same stop, and the entrypoint never `exec`s the
-/// compositor (an `exec` would hand SIGINT and SIGTERM straight to CEF's handlers). The meanings come
-/// from R1 (SIGINT is its stop: the Final hold) and the platform (SIGTERM: the drain), not the table.
+/// The two sides of the stop seam agree (F-016): every signal `docker/supervise.sh` traps is
+/// forwarded under a name the binary reads as the same stop, the entrypoint sources that file before
+/// any other command (so its traps exist from the start: the PR #36 review's m1), the image installs
+/// it where the entrypoint looks, and the entrypoint never `exec`s the compositor (an `exec` would
+/// hand SIGINT and SIGTERM straight to CEF's handlers). The meanings come from R1 (SIGINT is its stop:
+/// the Final hold) and the platform (SIGTERM: the drain), not the table.
 #[test]
 fn the_entrypoint_forwards_each_stop_signal_as_the_binary_reads_it() {
     use domain::supervisor::SignalKind;
     use signal_hook::consts::{SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
-    let script = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docker/entrypoint.sh"),
-    )
-    .expect("docker/entrypoint.sh");
+    let read = |rel: &str| {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(rel),
+        )
+        .unwrap_or_else(|e| panic!("{rel}: {e}"))
+    };
+    let supervise = read("docker/supervise.sh");
+    let entrypoint = read("docker/entrypoint.sh");
+    let dockerfile = read("docker/Dockerfile");
+    let installed = "/usr/local/lib/seazn/supervise.sh";
     let number = |name: &str| match name {
         "INT" => SIGINT,
         "TERM" => SIGTERM,
@@ -691,15 +701,14 @@ fn the_entrypoint_forwards_each_stop_signal_as_the_binary_reads_it() {
     };
     let mut checked = 0;
     for (trapped, want) in [("INT", SignalKind::Int), ("TERM", SignalKind::Term)] {
-        let line = script
+        let line = supervise
             .lines()
             .map(str::trim)
-            .find(|l| l.starts_with("trap ") && l.ends_with(&format!("' {trapped}")))
-            .unwrap_or_else(|| panic!("the entrypoint traps no {trapped}"));
+            .find(|l| l.starts_with("trap '_sv_forward ") && l.split_whitespace().last() == Some(trapped))
+            .unwrap_or_else(|| panic!("supervise.sh traps no {trapped}"));
         let sent = line
-            .split("kill -")
-            .nth(1)
-            .and_then(|r| r.split_whitespace().next())
+            .strip_prefix("trap '_sv_forward ")
+            .and_then(|r| r.split('\'').next())
             .unwrap_or_else(|| panic!("{line:?} forwards nothing"));
         assert_ne!(
             sent, trapped,
@@ -713,8 +722,20 @@ fn the_entrypoint_forwards_each_stop_signal_as_the_binary_reads_it() {
         assert_eq!(kind_of(number(sent)), Some(want), "{trapped} forwarded as {sent}");
         checked += 1;
     }
+    let first = entrypoint
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("set "))
+        .expect("an entrypoint command");
+    assert_eq!(first, format!(". {installed}"), "the entrypoint's first command");
     assert!(
-        !script
+        dockerfile
+            .lines()
+            .any(|l| l.trim() == format!("COPY docker/supervise.sh {installed}")),
+        "the image installs supervise.sh at {installed}"
+    );
+    assert!(
+        !entrypoint
             .lines()
             .any(|l| l.trim_start().starts_with("exec ") && l.contains("compositor")),
         "the entrypoint execs the compositor"

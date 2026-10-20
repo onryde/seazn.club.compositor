@@ -38,7 +38,7 @@ RUN test -n "$GSTCEF_COMMIT" \
  && mkdir build && cd build && cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release .. && make -j"$(nproc)" \
  && strip --strip-unneeded Release/libcef.so \
  && { echo "gstcefsrc_commit=$(git -C /src/gstcefsrc rev-parse HEAD)"; \
-      echo "cef_dir=$(ls /src/gstcefsrc/third_party/cef | grep -m1 cef_binary)"; } > Release/BUILDINFO \
+      echo "cef_dir=$(find /src/gstcefsrc/third_party/cef -mindepth 1 -maxdepth 1 -type d -name 'cef_binary*' -printf '%f\n' | head -n 1)"; } > Release/BUILDINFO \
  && cat Release/BUILDINFO && du -sh Release
 
 FROM gst-base AS rust-build
@@ -66,10 +66,12 @@ FROM gst-base
 COPY --from=cef-build /src/gstcefsrc/build/Release /opt/gstcef
 COPY --from=rust-build /usr/local/bin/compositor /usr/local/bin/compositor
 COPY docker/entrypoint.sh /entrypoint.sh
+COPY docker/supervise.sh /usr/local/lib/seazn/supervise.sh
 ENV GST_PLUGIN_PATH=/opt/gstcef COMPOSITOR_DRIVERS=live DISPLAY=:99
 # Owed 54: the CEF user's HOME exists and is writable (GStreamer's registry, NSS's database), and
 # only this one process's CEF uses it.
-RUN chmod 0755 /entrypoint.sh \
+RUN chmod 0755 /entrypoint.sh && chmod 0644 /usr/local/lib/seazn/supervise.sh \
+ && command -v prlimit >/dev/null \
  && useradd --system --uid 10001 --home /home/relay --create-home --shell /usr/sbin/nologin relay \
  && missing=$(ldd /opt/gstcef/libcef.so /opt/gstcef/libgstcef.so /opt/gstcef/gstcefsubprocess /usr/local/bin/compositor \
       | grep "not found" || true) \
@@ -82,4 +84,8 @@ RUN for e in cefsrc srtsrc tsdemux queue h264parse avdec_h264 videoconvertscale 
       aacparse avdec_aac audioconvert audioresample appsrc compositor videoconvert x264enc voaacenc \
       flvmux rtmp2sink filesink videotestsrc pngdec; do \
       gst-inspect-1.0 "$e" >/dev/null 2>&1 || { echo "missing element $e"; exit 1; }; done
-ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
+# `-s`: tini is PID 1 under Docker but not on every host; as a subreaper it reaps the orphans CEF
+# leaves (a GPU process whose browser is gone) and prints no "not running as PID 1" warning, three
+# unformatted lines on every boot (the PR #36 review's m5). No `-g`: tini signals the entrypoint
+# alone, which forwards the stops (F-016).
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/entrypoint.sh"]
