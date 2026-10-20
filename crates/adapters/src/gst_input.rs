@@ -230,6 +230,8 @@ pub struct GstInput {
 /// One generation's pipeline.
 struct Live {
     gen: u64,
+    /// The gate's key for this build (`Shared::gate`).
+    build: u64,
     pipeline: gst::Pipeline,
     /// Ends the build's thread: it then tears the pipeline down.
     stop: Arc<AtomicBool>,
@@ -564,6 +566,7 @@ impl GstInput {
         self.sync_handler(&pipeline, build, &errored)?;
         Ok(Live {
             gen,
+            build,
             pipeline,
             stop: Arc::new(AtomicBool::new(false)),
             errored,
@@ -883,6 +886,27 @@ impl InputSource for GstInput {
                     reason: LossReason::Error,
                 });
             }
+        }
+    }
+
+    /// The domain has given `gen` up (C10b): the gate closes for its build, video and audio alike,
+    /// before this returns, and no event is sent (the domain decided it). The pipeline stays up,
+    /// gated, until the next `rebuild` tears it down. A `gen` that is not the current build's, a
+    /// build this adapter already reported lost, and a second call change nothing.
+    fn abandon(&mut self, gen: u64) {
+        let Some(build) = self.current.as_ref().filter(|l| l.gen == gen).map(|l| l.build) else {
+            self.shared
+                .log(&format!("gen={gen}: abandon ignored: not the current build"));
+            return;
+        };
+        if self.shared.close(build) {
+            self.shared.abandoned.fetch_add(1, Ordering::SeqCst);
+            self.shared.log(&format!(
+                "gen={gen}: abandoned by the domain; nothing more of it reaches the programme"
+            ));
+        } else {
+            self.shared
+                .log(&format!("gen={gen}: abandon: its gate was already shut"));
         }
     }
 

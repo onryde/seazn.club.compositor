@@ -202,9 +202,15 @@ pub trait ControlPlane: Send {
 }
 
 /// Input A's SRT pipeline (C10). `rebuild` tears down the current generation and builds `gen`;
-/// `stop` ends it for good (the drain, the exit).
+/// `stop` ends it for good (the drain, the exit). `abandon` (C10b, Owed 50) is the domain's word that
+/// it has given generation `gen` up by its own rule (the connect timeout or the stall rule): before
+/// it returns, nothing more of that generation (video, audio or event) passes the adapter, and the
+/// next `rebuild` tears it down. The adapter keeps no copy of those rules. A `gen` that is not the
+/// current build's (one already rebuilt past, or after `stop`) changes nothing, and so does a second
+/// call. It never blocks the loop: it closes a gate.
 pub trait InputSource: Send {
     fn rebuild(&mut self, gen: u64, spec: &InputSpec);
+    fn abandon(&mut self, gen: u64);
     fn stop(&mut self);
 }
 

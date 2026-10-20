@@ -1363,6 +1363,146 @@ fn audio_stops_with_the_video_past_the_stall_rule() {
     finish(input);
 }
 
+// ---------------------------------------------------------------------------------------------
+// C10b (Owed 50): the domain's give-up is a port call, `abandon(gen)`
+
+/// The lines the adapter logged that contain `needle`.
+fn lines_with(lines: &Lines, needle: &str) -> usize {
+    lines
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .filter(|l| l.contains(needle))
+        .count()
+}
+
+/// `abandon(gen)` of the current build shuts it out before the call returns, video, audio and events
+/// alike, while its connection keeps delivering: nothing reaches the slot, the ring or the loop after
+/// the call, no loss is reported (the domain decided it), and the samples are dropped at the gate.
+/// The pipeline stays up, gated, until the next `rebuild` (the as-built row's choice, for Owed 49's
+/// measurement). A second call changes nothing.
+#[test]
+fn abandon_shuts_the_current_build_out_at_once() {
+    let _s = serial();
+    let l = Listener::new(&cfg(640, 360));
+    let (mut input, rx, frames, lines) = input(&P720);
+    connect(&mut input, &rx, 1, &spec(l.port));
+    let before = events_for(&rx, Duration::from_millis(500));
+    assert!(
+        frames_in(&before) > 0,
+        "frames flowed before the call: {before:?}"
+    );
+    input.abandon(1);
+    // Whatever the build sent before the call is queued already; the call shut the gate.
+    let _ = rx.try_iter().count();
+    let _ = frames.take_audio(frames.audio_level());
+    let pts = camera_pts(&frames);
+    let dropped = input.gate_dropped();
+    input.abandon(1);
+    let after = events_for(&rx, Duration::from_secs(2));
+    let gate = input.gate_dropped() - dropped;
+    let audio = frames.audio_level();
+    let state = input.pipeline().map(|p| p.current_state());
+    eprintln!(
+        "after abandon(1): events {after:?}; dropped at the gate {gate}; audio bytes {audio}; \
+         pipeline {state:?}; abandoned {}",
+        input.abandoned()
+    );
+    assert!(after.is_empty(), "{after:?}");
+    assert_eq!(audio, 0, "none of its audio reached the ring");
+    assert_eq!(camera_pts(&frames), pts, "the slot keeps its last frame");
+    assert!(
+        gate > 0,
+        "the connection kept delivering, and the gate dropped it"
+    );
+    assert_eq!(state, Some(gst::State::Playing), "abandon tears nothing down");
+    assert_eq!(input.abandoned(), 1, "the second call changed nothing");
+    assert_eq!(lines_with(&lines, "gen=1: abandoned by the domain"), 1);
+    finish(input);
+}
+
+/// The generation after an abandoned one connects and delivers as any other: the rebuild retires
+/// the abandoned build, and every teardown returns.
+#[test]
+fn the_generation_after_an_abandoned_one_connects() {
+    let _s = serial();
+    let l = Listener::new(&cfg(640, 360));
+    let (mut input, rx, _frames, _lines) = input(&P720);
+    connect(&mut input, &rx, 1, &spec(l.port));
+    input.abandon(1);
+    let took = connect(&mut input, &rx, 2, &spec(l.port));
+    let second = events_for(&rx, Duration::from_secs(1));
+    eprintln!(
+        "gen 2 after the abandoned gen 1: connected in {took:?}, {} frames in the next second",
+        frames_in(&second)
+    );
+    assert!(frames_in(&second) >= FRAMES_IN_THE_FIRST_SECOND, "{second:?}");
+    assert!(losses(&second).is_empty(), "{second:?}");
+    assert_eq!(input.generation_of_last_frame(), Some(2));
+    assert_eq!(input.abandoned(), 1);
+    finish(input);
+}
+
+/// A stale `abandon` changes nothing: one for the generation before the current build (the domain
+/// rebuilt past it), one for a generation never built, and one after `stop`.
+#[test]
+fn a_stale_abandon_changes_nothing() {
+    let _s = serial();
+    let l = Listener::new(&cfg(640, 360));
+    let (mut input, rx, _frames, lines) = input(&P720);
+    connect(&mut input, &rx, 1, &spec(l.port));
+    connect(&mut input, &rx, 2, &spec(l.port));
+    let mut checked = 0;
+    for stale in [1, 3] {
+        input.abandon(stale);
+        let _ = rx.try_iter().count();
+        let next = events_for(&rx, Duration::from_secs(1));
+        eprintln!(
+            "after abandon({stale}): {} frames of the current build in the next second",
+            frames_in(&next)
+        );
+        assert!(
+            frames_in(&next) >= FRAMES_IN_THE_FIRST_SECOND,
+            "abandon({stale}): {next:?}"
+        );
+        assert_eq!(input.generation_of_last_frame(), Some(2));
+        checked += 1;
+    }
+    assert_eq!(input.abandoned(), 0);
+    assert_eq!(lines_with(&lines, "abandon ignored: not the current build"), 2);
+    input.stop();
+    input.abandon(2);
+    assert_eq!(input.abandoned(), 0, "after stop");
+    checked += 1;
+    eprintln!("stale abandons checked: {checked}");
+    assert_eq!(checked, 3);
+    finish(input);
+}
+
+/// The second call from the other side: the adapter already reported the build lost (its peer
+/// closed: `Error`), so the domain owes no abandon; one that comes anyway changes nothing.
+#[test]
+fn abandon_after_a_reported_loss_changes_nothing() {
+    let _s = serial();
+    let port = free_port();
+    let (mut input, rx, _frames, lines) = input(&P720);
+    let l = Listener::start(port, &cfg(640, 360));
+    connect(&mut input, &rx, 1, &spec(port));
+    drop(l);
+    let seen = events_until(&rx, LOSS_BUDGET, |e| matches!(e, Event::InputLost { .. }));
+    assert_eq!(losses(&seen), vec![(1, LossReason::Error)]);
+    input.abandon(1);
+    let after = events_for(&rx, Duration::from_millis(500));
+    eprintln!(
+        "abandon after the loss: events {after:?}, abandoned {}",
+        input.abandoned()
+    );
+    assert!(after.is_empty(), "{after:?}");
+    assert_eq!(input.abandoned(), 0);
+    assert_eq!(lines_with(&lines, "gen=1: abandon: its gate was already shut"), 1);
+    finish(input);
+}
+
 /// The owner's ruling, 2026-10-19 (Owed 48): damaged frames are hidden. After a loss beyond the SRT
 /// latency the decoder drops a frame with corrupt macroblocks, so viewers see the last good picture
 /// held for a moment, never smears. `avdec_h264`'s own default shows them, and it is read here too,
