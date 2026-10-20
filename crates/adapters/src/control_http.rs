@@ -101,11 +101,9 @@ fn phase_channel_wire(c: PhaseChannel) -> &'static str {
 
 /// The snake_case of `ExitReason` (contract `heartbeat.exitReason`).
 ///
-/// C11b: the contract has no word for an in-place restart yet (web's enum is strict, so a new word
-/// would refuse the final beat), and `fatal` is the one whose path web already runs as one: a
-/// crash below RUNNER_CRASH_CAP is only recorded, the Machine restarts in place and beats again on
-/// the same attempt (R2003b). It is counted as a crash until web adds the word (Owed 66); the beat's
-/// `exitDetail` names the restart.
+/// C11b's in-place restart is `restart` (Owed 66): web's #1000 (`seazn.club` `dec7b95d9`) added the
+/// word to its strict beat enum and runs it as an in-place restart, not a crash (until then it rode
+/// `fatal`). The beat's `exitDetail` still names the cause (`restart in place: …`).
 fn exit_reason_wire(r: ExitReason) -> &'static str {
     match r {
         ExitReason::Ended => "ended",
@@ -113,7 +111,8 @@ fn exit_reason_wire(r: ExitReason) -> &'static str {
         ExitReason::Signalled => "signalled",
         ExitReason::SessionGone => "session_gone",
         ExitReason::Refused => "refused",
-        ExitReason::Fatal | ExitReason::Restart => "fatal",
+        ExitReason::Fatal => "fatal",
+        ExitReason::Restart => "restart",
     }
 }
 
@@ -239,8 +238,11 @@ fn single_delay(overlay_url: &str) -> Option<&str> {
     found.next().is_none().then_some(first)
 }
 
-/// The output must be one of the two declared profiles (ADR 0005; web's `relayOutputProfile`, R2004),
-/// never improvised from the numbers.
+/// The two declared output profiles (ADR 0005; web's `relayOutputProfile`, R2004): the one list the
+/// session parser and C12's wiring (CEF's frame rate) read.
+pub const DECLARED_PROFILES: [OutputProfile; 2] = [OutputProfile::P720, OutputProfile::P1080];
+
+/// The output must be one of the declared profiles, never improvised from the numbers.
 fn declared_profile(o: &Value) -> Result<OutputProfile, FetchError> {
     let field = |k: &str| u64_at(o, k).and_then(|n| u32::try_from(n).or(wrong_mode()));
     let got = OutputProfile {
@@ -249,7 +251,7 @@ fn declared_profile(o: &Value) -> Result<OutputProfile, FetchError> {
         fps: field("fps")?,
         video_kbps: field("videoKbps")?,
     };
-    [OutputProfile::P720, OutputProfile::P1080]
+    DECLARED_PROFILES
         .into_iter()
         .find(|p| *p == got)
         .ok_or(FetchError::Refused(Refusal::WrongMode))
@@ -431,12 +433,6 @@ impl fmt::Display for PlaneConfigError {
 
 impl std::error::Error for PlaneConfigError {}
 
-/// The page token in `overlayUrl`'s query (`st=`), the fourth credential a session carries.
-fn page_token_in(overlay_url: &str) -> Option<&str> {
-    let (_, query) = overlay_url.split_once('?')?;
-    query.split('&').find_map(|kv| kv.strip_prefix("st="))
-}
-
 impl HttpControlPlane {
     /// `timeout_ms` bounds every request, connect to last byte; the connect phase and the final beat
     /// are bounded by the smaller of it and `FINAL_BEAT_TIMEOUT_MS`. Refuses an empty token, a token
@@ -476,16 +472,13 @@ impl HttpControlPlane {
         }
     }
 
-    /// Learns a fetched session's four credentials, so every later text is scrubbed of them.
+    /// Learns a fetched session's four credentials, so every later text is scrubbed of them: the
+    /// session's own list (`Scrubber::add_session`, which C12's binary scrubber shares, so the two
+    /// cannot drift), and the reply's `pageToken` as sent.
     fn learn(&mut self, session: &SessionConfig, data: &Value) {
         let mut scrubber = locked(&self.scrubber);
-        scrubber.add(&session.input.stream_id);
-        scrubber.add(&session.input.passphrase);
-        scrubber.add(&session.target.stream_key);
+        scrubber.add_session(session);
         if let Some(t) = data.get("pageToken").and_then(Value::as_str) {
-            scrubber.add(t);
-        }
-        if let Some(t) = page_token_in(&session.overlay_url) {
             scrubber.add(t);
         }
     }

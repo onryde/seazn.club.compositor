@@ -450,7 +450,7 @@
           ]
         },
         "exitReason": {
-          "description": "Sent only with `state: \"stopped\"`, on the final beat: why the Machine is exiting (compositor C06 `ExitReason`). ended, deadline, signalled and session_gone exit 0; refused exits 78; fatal exits 70. A beat in any other state that carries exitReason or exitDetail is refused (400); this schema states it as its if/then. The server records the reason with the beat; the runner's observed exit stays the authority for how the session ends.",
+          "description": "Sent only with `state: \"stopped\"`, on the final beat: why the Machine is exiting (compositor C06 `ExitReason`). ended, deadline, signalled and session_gone exit 0; refused exits 78; fatal exits 70; restart exits 75 (the compositor restarts itself in place: the host restarts the process on the same Machine, and the server records the beat and does not count it as a crash). A beat in any other state that carries exitReason or exitDetail is refused (400); this schema states it as its if/then. The server records the reason with the beat; the runner's observed exit stays the authority for how the session ends.",
           "anyOf": [
             {
               "type": "string",
@@ -460,7 +460,8 @@
                 "signalled",
                 "session_gone",
                 "refused",
-                "fatal"
+                "fatal",
+                "restart"
               ]
             },
             {
