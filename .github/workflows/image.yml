@@ -72,6 +72,11 @@ jobs:
             echo "::error::the image sets GST_CEF_LOG_SEVERITY or GST_DEBUG (Owed 52)"
             exit 1
           fi
+          # tini would signal the compositor directly, around supervise.sh (F-016; PR #36 review m6).
+          if grep -Eq '"TINI_KILL_PROCESS_GROUP=' <<<"$env"; then
+            echo "::error::the image sets TINI_KILL_PROCESS_GROUP"
+            exit 1
+          fi
       - name: C11's graphics tests beside cefsrc
         run: |
           docker volume create relay-target > /dev/null
@@ -132,8 +137,12 @@ jobs:
           [ "$code" -eq 75 ]
           grep -q 'msg=cef health zygote_gone=1 ' smoke75.log
           grep -q 'msg=exit code=75' smoke75.log
-      - name: Live-mode probe (core limit, TMPDIR, stop)
-        run: python3 scripts/image_probe.py "$IMAGE" --keep-log probe.log
+      # Phase B repeats a live exit with CEF up 32 times, 24 of them stops, at both profiles (F-017:
+      # before hard_exit::now, 1 in 6 such exits aborted after their exit line here, and 6 of 12
+      # stops on a Fly Machine). About 8 minutes.
+      - name: Live-mode probe (no core, TMPDIR, 32 live exits)
+        timeout-minutes: 25
+        run: python3 -I scripts/image_probe.py "$IMAGE" --keep-log probe.log --exits 32
       - name: Image size
         run: |
           bytes=$(docker image inspect -f '{{.Size}}' "$IMAGE")

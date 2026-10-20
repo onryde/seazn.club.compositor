@@ -1,31 +1,37 @@
 #!/usr/bin/env python3
-"""The relay image's live-mode probe (C12; Owed 58 and 68). Run by image.yml, stdlib only.
+"""The relay image's live-mode probe (C12; Owed 58 and 68, F-016, F-017). Run by image.yml, stdlib only.
 
 Starts the image in LIVE mode against a fake control plane on this host (host network), with a
 session whose overlay is C11's harness page served from here and whose input and target are local
-ports nothing listens on, so nothing leaves the host. Once CEF's children exist, it reads, from
-inside the container:
+ports nothing listens on, so nothing leaves the host. Every session credential is a probe value.
 
-  - `/proc/<pid>/limits` of the compositor and of every CEF child: `Max core file size 0 0`
-    (Owed 68: a CEF abort writes a 93-117 MB core holding the page token);
-  - TMPDIR: `/dev/shm/seazn`, mode 0700, owned by the relay user, on a tmpfs, and the CEF profile
-    inside it (Owed 58);
-  - the image's and the compositor's environment: no GST_CEF_LOG_SEVERITY, no GST_DEBUG (Owed 52).
+Phase A, one container, once CEF's children exist:
 
-Then three stops, one container each:
+  - `/proc/<pid>/limits` of tini, the entrypoint's bash, Xvfb, the compositor and every CEF child:
+    `Max core file size` is `CORE_LIMIT_BYTES` soft and hard (Owed 68, the PR #36 review's I1 and m2);
+    the compositor is non-dumpable (`/proc/<pid>` belongs to root); `core_pattern` is printed;
+  - no session credential or token in any process's `/proc/<pid>/cmdline` (the review's m3);
+  - TMPDIR: `/dev/shm/seazn`, mode 0700, owned by the relay user, on a tmpfs, with the CEF profile
+    inside (Owed 58); no GST_CEF_LOG_SEVERITY or GST_DEBUG in the image or the compositor (Owed 52);
+  - a forced abort of a CEF child (SIGABRT): the kernel refuses its core (for a piped core_pattern,
+    the kernel log's "RLIMIT_CORE … set to 1" line names its pid); then of the compositor itself:
+    exit 134, and the entrypoint's bash reports `Aborted` without `(core dumped)`.
 
-  - `docker kill -s INT` (R1's stop signal), through tini and the entrypoint: the Final hold, then the
-    drain; exit 0 inside R1's stop grace, an earlier POST carrying `programmePhase: final`, the last
-    POST `signalled`;
-  - `docker stop` (SIGTERM, the platform stop): the drain at once; exit 0, the last POST `signalled`,
-    no POST carrying `final`;
-  - a measurement, not a check (F-016): SIGTERM sent straight to the compositor once CEF is up,
-    around the entrypoint. CEF's own handlers take SIGINT and SIGTERM in the process, which is why
-    the entrypoint forwards them as SIGUSR1 and SIGUSR2.
+Phase B, `--exits` containers (32 by default; F-017, the review's C1): a live exit with CEF up, in
+cycles of 8 alternating 720p and 1080p (the review's m7): 4 `docker stop` (SIGTERM through tini: the
+drain), 2 `docker kill -s INT` (R1's stop: the Final hold, inside R1's grace), the session's deadline
+(the hold) and a killed CEF zygote (C11b's in-place restart, 75): 24 stops in all. Every exit status is exact, with its own `exit
+code=` line, the right last POST, and no abort text (a double free after the exit line was status
+134 once in six such exits before `hard_exit::now`). `/dev/shm`'s peak use is printed.
 
-No run's log may carry a byte of either token.
+Then a SIGTERM and a SIGINT 0.3 s into a container's boot (the review's m1): held by the entrypoint
+until the compositor's handlers exist, then the compositor's own exit 0.
 
-Usage: image_probe.py <image> [--keep-log <path>]
+Phase C, a measurement, not a check (F-016): SIGTERM straight to the compositor once CEF is up.
+
+No log may carry a byte of any credential.
+
+Usage: image_probe.py <image> [--keep-log <path>] [--exits N]
 """
 
 import argparse
@@ -40,10 +46,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-FIXTURE = ROOT / "contracts/fixtures/relay-job.v1/session-composed-720p.json"
+FIXTURES = ROOT / "contracts/fixtures/relay-job.v1"
+P720 = FIXTURES / "session-composed-720p.json"
+P1080 = FIXTURES / "session-composed-1080p.json"
 PAGE = ROOT / "harness/pages/overlay-test.html"
 TOKEN = "probe-job-token-not-a-secret-7f3a9c"
 PAGE_TOKEN = "probe-page-token-not-a-secret-2b8d"
+STREAM_KEY = "probe-stream-key-not-a-secret-5e1b"
+STREAM_ID = "probe-stream-id-not-a-secret-9c4d"
+PASSPHRASE = "probe-passphrase-not-a-secret-3a7f"
+SECRETS = (TOKEN, PAGE_TOKEN, STREAM_KEY, STREAM_ID, PASSPHRASE)
+# What a process that died abnormally leaves in the container's log (glibc, bash's job report).
+ABORT = re.compile(r"double free|corruption|Aborted|core dumped|Segmentation fault|malloc\(\)|free\(\)|"
+                   r"stack smashing|Illegal instruction|Trace/breakpoint trap|Killed")
 NAME = "relay-probe"
 CORE_LINE = "Max core file size"
 
@@ -52,10 +67,13 @@ fetches = []
 ROOT_LIB = ROOT / "crates/compositor/src/lib.rs"
 
 
-def session(port):
-    s = json.loads(FIXTURE.read_text())
+def session(port, fixture):
+    s = json.loads(fixture.read_text())
     sid = s["sessionId"]
     s["pageToken"] = PAGE_TOKEN
+    s["target"]["streamKey"] = STREAM_KEY
+    s["input"]["streamId"] = STREAM_ID
+    s["input"]["passphrase"] = PASSPHRASE
     s["overlayUrl"] = (
         f"http://127.0.0.1:{port}/overlay-test.html?sid={sid}&st={PAGE_TOKEN}&host=compositor"
         f"&delay={s['overlayDelayMs']}"
@@ -112,8 +130,8 @@ def sh(*args, check=True, timeout=120):
     return r
 
 
-def in_container(script):
-    return sh("docker", "exec", NAME, "sh", "-c", script).stdout
+def in_container(script, root=False):
+    return sh("docker", "exec", *(["-u", "0"] if root else []), NAME, "sh", "-c", script).stdout
 
 
 def procs():
@@ -130,37 +148,69 @@ def procs():
     return rows
 
 
-def grace_ms():
-    """R1's stop grace, read from its one authority in this repo (`R1_STOP_GRACE_MS`)."""
-    m = re.search(r"pub const R1_STOP_GRACE_MS: u64 = ([0-9_]+);", ROOT_LIB.read_text())
+def cmdlines():
+    """{pid: (ppid, argv joined by spaces)} of every process in the container, read as root."""
+    out = in_container(
+        'for d in /proc/[0-9]*; do p=${d#/proc/}; '
+        'pp=$(sed -n "s/^PPid:[[:space:]]*//p" $d/status 2>/dev/null) || continue; '
+        'a=$(tr "\\0" " " < $d/cmdline 2>/dev/null) || continue; echo "$p|$pp|$a"; done',
+        root=True,
+    )
+    rows = {}
+    for line in out.splitlines():
+        pid, ppid, argv = line.split("|", 2)
+        rows[int(pid)] = (int(ppid or 0), argv)
+    return rows
+
+
+def lib_const(name):
+    """A constant from its one authority in this repo, `crates/compositor/src/lib.rs`."""
+    m = re.search(rf"pub const {name}: u64 = ([0-9_]+);", ROOT_LIB.read_text())
     if not m:
-        raise SystemExit("R1_STOP_GRACE_MS not found in crates/compositor/src/lib.rs")
+        raise SystemExit(f"{name} not found in crates/compositor/src/lib.rs")
     return int(m.group(1).replace("_", ""))
+
+
+def kernel_log():
+    r = sh("sudo", "-n", "dmesg", check=False)
+    return r.stdout if r.returncode == 0 else None
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("image")
     ap.add_argument("--keep-log")
+    ap.add_argument("--exits", type=int, default=32)
     a = ap.parse_args()
     failures = []
     kept = []
+    shm_peak = [0, 0]  # used KiB, size KiB
 
     def check(ok, what):
         print(("ok   " if ok else "FAIL ") + what)
         if not ok:
             failures.append(what)
+        return ok
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     port = server.server_address[1]
-    Handler.sess = session(port)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    grace = grace_ms() / 1000
+    grace = lib_const("R1_STOP_GRACE_MS") / 1000
+    limit = str(lib_const("CORE_LIMIT_BYTES"))
 
-    def start():
+    def sample_shm():
+        r = sh("docker", "exec", NAME, "df", "-k", "/dev/shm", check=False)
+        rows = r.stdout.splitlines()
+        if r.returncode == 0 and len(rows) >= 2:
+            size, used = (int(x) for x in rows[-1].split()[1:3])
+            shm_peak[0] = max(shm_peak[0], used)
+            shm_peak[1] = size
+
+    def start(fixture, deadline_in=600):
         posts.clear()
         fetches.clear()
-        deadline = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + 600))
+        Handler.sess = session(port, fixture)
+        deadline = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + deadline_in))
         sh("docker", "rm", "-f", NAME, check=False)
         sh(
             "docker", "run", "-d", "--name", NAME, "--network", "host",
@@ -176,15 +226,19 @@ def main():
                 break
             time.sleep(0.5)
         logs = sh("docker", "logs", NAME).stderr
-        check("msg=programme started" in logs, "programme started (live)")
-        check("msg=cef ready gen=1" in logs, "the harness page readied (cef ready gen=1)")
+        ready = "msg=cef ready gen=1" in logs
+        check("msg=programme started" in logs, f"programme started ({fixture.name})")
+        check(ready, f"the harness page readied (cef ready gen=1, {fixture.name})")
+        sample_shm()
+        return ready
 
-    def wait_exit(limit):
+    def wait_exit(limit_s):
         t0 = time.time()
-        while time.time() - t0 < limit:
+        while time.time() - t0 < limit_s:
             if sh("docker", "inspect", "-f", "{{.State.Running}}", NAME).stdout.strip() != "true":
                 break
-            time.sleep(0.1)
+            sample_shm()
+            time.sleep(0.2)
         took = time.time() - t0
         code = sh("docker", "inspect", "-f", "{{.State.ExitCode}}", NAME).stdout.strip()
         logs = sh("docker", "logs", NAME).stderr
@@ -192,9 +246,13 @@ def main():
         sh("docker", "rm", "-f", NAME, check=False)
         return took, code, logs
 
+    def compositor_pid():
+        comp = [r for r in procs() if r[1] == "compositor"]
+        return comp[0][0] if len(comp) == 1 else 0
+
     try:
-        # ---- run 1: the process facts, then R1's SIGINT ----
-        start()
+        # ---- phase A: the process facts, then forced aborts ----
+        start(P720)
         rows = procs()
         print("processes (pid, comm, core soft, core hard):")
         for r in rows:
@@ -203,64 +261,152 @@ def main():
         cef = [r for r in rows if r[1].startswith("gstcef")]
         check(len(comp) == 1, f"one compositor process ({len(comp)})")
         check(len(cef) >= 1, f"CEF children exist ({len(cef)})")
-        checked = 0
-        for r in comp + cef:
-            check(r[2:] == ("0", "0"), f"{r[1]} pid {r[0]}: core limit {r[2]} {r[3]}, want 0 0")
-            checked += 1
-        check(checked >= 2, f"core limits checked: {checked}")
+        named = {"tini", "bash", "Xvfb"}
+        held = [r for r in rows if r[1] in named or r in comp or r in cef]
+        check({r[1] for r in held} >= named, f"tini, bash and Xvfb found: {sorted({r[1] for r in held})}")
+        for r in held:
+            check(r[2:] == (limit, limit), f"{r[1]} pid {r[0]}: core limit {r[2]} {r[3]}, want {limit} {limit}")
+        check(len(held) >= 5, f"core limits checked: {len(held)}")
         pid = comp[0][0] if comp else 0
-        # CEF may mark the process non-dumpable, which hides its environ; the profile-under-TMPDIR
-        # check below then stands for TMPDIR, and the image env check for the variables.
-        r = sh("docker", "exec", NAME, "sh", "-c", f"tr '\\0' '\\n' < /proc/{pid}/environ", check=False)
-        if pid and r.returncode == 0:
-            env = r.stdout.splitlines()
-            check("TMPDIR=/dev/shm/seazn" in env, "the compositor's TMPDIR is /dev/shm/seazn")
-            for bad in ("GST_CEF_LOG_SEVERITY", "GST_DEBUG"):
-                check(not any(l.startswith(bad + "=") for l in env), f"no {bad} in its environment")
-        else:
-            print(f"note: the compositor's environ is unreadable ({r.stderr.strip()!r})")
+        owner = in_container(f"stat -c %u /proc/{pid}").strip() if pid else ""
+        check(owner == "0", f"the compositor is non-dumpable (/proc/{pid} owned by uid {owner!r})")
+        pattern = Path("/proc/sys/kernel/core_pattern").read_text().strip()
+        print(f"core_pattern (the host's, shared with the container): {pattern!r}")
+        argv = cmdlines()
+        leaked = [(p_, a_) for p_, (_, a_) in argv.items() if any(x in a_ for x in SECRETS)]
+        check(len(argv) >= 5 and not leaked, f"no credential in any of {len(argv)} command lines: {leaked}")
+        r = sh("docker", "exec", "-u", "0", NAME, "sh", "-c", f"tr '\\0' '\\n' < /proc/{pid}/environ", check=False)
+        env = r.stdout.splitlines() if pid and r.returncode == 0 else []
+        check("TMPDIR=/dev/shm/seazn" in env, "the compositor's TMPDIR is /dev/shm/seazn")
+        for bad in ("GST_CEF_LOG_SEVERITY", "GST_DEBUG", "TINI_KILL_PROCESS_GROUP"):
+            check(len(env) > 0 and not any(l.startswith(bad + "=") for l in env), f"no {bad} in its environment")
         st = in_container("stat -c '%a %U' /dev/shm/seazn; stat -f -c %T /dev/shm/seazn; ls -A /dev/shm/seazn").split("\n")
         check(st[0] == "700 relay", f"TMPDIR mode and owner: {st[0]!r}")
         check(st[1] == "tmpfs", f"TMPDIR filesystem: {st[1]!r}")
         check(any(x.strip() for x in st[2:]), f"the CEF profile is under TMPDIR: {st[2:]}")
+        # The job token stays with the compositor (which removes it from its environment once parsed,
+        # so CEF's children start without it) and leaves Xvfb out (the PR #36 review's m2).
+        tokenless = [r_ for r_ in rows if r_[1] == "Xvfb" or r_ in cef]
+        for r_ in tokenless:
+            e_ = sh("docker", "exec", "-u", "0", NAME, "sh", "-c", f"tr '\\0' '\\n' < /proc/{r_[0]}/environ", check=False)
+            check(e_.returncode == 0 and TOKEN not in e_.stdout and "JOB_TOKEN=" not in e_.stdout,
+                  f"{r_[1]} pid {r_[0]}: no JOB_TOKEN in its environment")
+        check(len(tokenless) >= 2, f"environments checked for the token: {len(tokenless)}")
         image_env = sh("docker", "inspect", "-f", "{{json .Config.Env}}", a.image).stdout
-        for bad in ("GST_CEF_LOG_SEVERITY", "GST_DEBUG"):
+        for bad in ("GST_CEF_LOG_SEVERITY", "GST_DEBUG", "TINI_KILL_PROCESS_GROUP"):
             check(f'"{bad}=' not in image_env, f"the image sets no {bad}")
         print(f"compositor signal masks: {in_container(f'grep -E ^Sig /proc/{pid}/status').split()}")
 
-        sh("docker", "kill", "-s", "INT", NAME)
-        took, code, logs = wait_exit(grace + 10)
-        print(f"SIGINT to exit: {took:.1f} s, exit {code} (R1's grace {grace:.0f} s)")
-        check(code == "0", f"SIGINT: exit status 0 (got {code})")
-        check(took < grace, f"SIGINT: exit inside R1's stop grace ({took:.1f} s)")
-        check("msg=exit code=0" in logs, "SIGINT: the compositor's own exit line")
-        check(any(p.get("programmePhase") == "final" for p in posts[:-1]), "SIGINT: an earlier POST carries final")
-        last = posts[-1] if posts else {}
-        check(last.get("exitReason") == "signalled", f"SIGINT: last POST signalled ({last.get('exitReason')})")
-        check(len(fetches) == 1, f"one session fetch ({len(fetches)})")
+        # A CEF child's abort: its core is refused by the kernel, which says so for a piped pattern.
+        # Counted by comm, not pid: the kernel may print the pid of another pid namespace.
+        refused = re.compile(r"\(([^)]*)\).*RLIMIT_CORE (is )?set to 1")
 
-        # ---- run 2: the platform's SIGTERM ----
-        start()
-        sh("docker", "stop", "-t", str(int(grace)), NAME, timeout=60)
-        took, code, logs = wait_exit(5)
-        print(f"docker stop to exit: {took:.1f} s after stop returned, exit {code}")
-        check(code == "0", f"SIGTERM: exit status 0 (got {code})")
-        check("msg=exit code=0" in logs, "SIGTERM: the compositor's own exit line")
-        check(all(p.get("programmePhase") != "final" for p in posts), "SIGTERM: no POST carries final")
-        last = posts[-1] if posts else {}
-        check(last.get("exitReason") == "signalled", f"SIGTERM: last POST signalled ({last.get('exitReason')})")
+        def refusals(comm_prefix):
+            klog = kernel_log()
+            if klog is None:
+                return None
+            return sum(1 for m in refused.finditer(klog) if m.group(1).startswith(comm_prefix))
 
-        # ---- run 3 (F-016, a measurement): SIGTERM straight to the compositor, around tini ----
-        start()
-        pid = [r for r in procs() if r[1] == "compositor"]
+        child = next((p_ for p_, (pp, a_) in argv.items() if pp == pid and "--type=gpu-process" in a_), 0) or (
+            cef[0][0] if cef else 0)
+        if check(child > 0, f"a CEF child to abort ({child})"):
+            before = refusals("gstcef")
+            sh("docker", "exec", NAME, "kill", "-ABRT", str(child), check=False)
+            time.sleep(2)
+            after = refusals("gstcef")
+            if pattern.startswith("|"):
+                if check(before is not None and after is not None, "the kernel log is readable (sudo dmesg)"):
+                    check(after > before, f"the kernel refused CEF child {child}'s core: refusals {before} -> {after}")
+            else:
+                cores = in_container("ls -1 /home/relay /tmp 2>/dev/null | grep -c '^core' || true", root=True).strip()
+                check(cores == "0", f"no core file from CEF child {child} (file core_pattern): {cores}")
+        # The compositor's own abort: exit 134, and no core of it (it is non-dumpable, so the kernel
+        # refuses it silently; a refusal line for it would mean the 1-byte limit stopped it instead).
         if pid:
-            sh("docker", "exec", NAME, "kill", "-TERM", str(pid[0][0]))
+            before = refusals("compositor")
+            sh("docker", "exec", NAME, "kill", "-ABRT", str(pid), check=False)
+            took, code, logs = wait_exit(15)
+            check(code == "134", f"the compositor's abort exits 134 (got {code})")
+            check("Aborted" in logs, "the entrypoint reports the abort")
+            check("core dumped" not in logs, "no core of the compositor")
+            print(f"kernel refusal lines for the compositor: {before} -> {refusals('compositor')}")
+
+        # ---- phase B: live exits with CEF up, each kind at both profiles ----
+        term = ("SIGTERM (docker stop)", "0", "signalled", False)
+        sigint = ("SIGINT (docker kill -s INT)", "0", "signalled", True)
+        # A cycle of 8: 6 stops (Fly's 50c6643 probe: 6 of 12 stops aborted after the exit line), a
+        # deadline (1 of 2 aborted there, and Fly restarted the ended session) and a dead zygote (75).
+        kinds = [term, sigint, term, ("the deadline", "0", "deadline", True), term,
+                 ("a killed CEF zygote", "75", "restart", False), term, sigint]
+        hold = 10
+        exits = stops = 0
+        for i in range(a.exits):
+            kind, want, reason, final = kinds[i % len(kinds)]
+            fixture = P1080 if (i // len(kinds)) % 2 else P720
+            what = f"exit {i + 1} of {a.exits}, {kind}, {fixture.name}"
+            deadline_in = 15 if kind == "the deadline" else 600
+            t0 = time.time()
+            if not start(fixture, deadline_in):
+                sh("docker", "rm", "-f", NAME, check=False)
+                check(False, f"{what}: CEF never came up")
+                continue
+            if kind.startswith("SIGTERM"):
+                sh("docker", "stop", "-t", str(int(grace)), NAME, timeout=60)
+                took, code, logs = wait_exit(5)
+            elif kind.startswith("SIGINT"):
+                sh("docker", "kill", "-s", "INT", NAME)
+                took, code, logs = wait_exit(grace + 10)
+                check(took < grace, f"{what}: inside R1's stop grace ({took:.1f} s)")
+            elif kind == "the deadline":
+                check(time.time() - t0 < deadline_in, f"{what}: CEF was up before the deadline")
+                took, code, logs = wait_exit(deadline_in + hold + grace + 10)
+            else:
+                cpid = compositor_pid()
+                zyg = [p_ for p_, (pp, a_) in cmdlines().items() if pp == cpid and "--type=zygote" in a_]
+                check(len(zyg) >= 1, f"{what}: a zygote of the compositor ({zyg})")
+                for z in zyg[:1]:
+                    sh("docker", "exec", NAME, "kill", "-KILL", str(z), check=False)
+                took, code, logs = wait_exit(30)
+            last = posts[-1] if posts else {}
+            ok = check(code == want, f"{what}: exit status {code}, want {want} ({took:.1f} s)")
+            ok &= check(f"msg=exit code={want}" in logs, f"{what}: the compositor's own exit line")
+            bad = ABORT.findall(logs)
+            ok &= check(not bad, f"{what}: no abort text ({bad})")
+            ok &= check(last.get("exitReason") == reason, f"{what}: last POST {last.get('exitReason')}, want {reason}")
+            ok &= check(any(p_.get("programmePhase") == "final" for p_ in posts[:-1]) == final,
+                        f"{what}: an earlier POST carries final: {final}")
+            exits += 1 if ok else 0
+            stops += 1 if ok and kind.startswith("SIG") else 0
+        check(exits == a.exits and a.exits > 0, f"clean live exits: {exits} of {a.exits}")
+        check(stops >= 20 or a.exits < 32, f"clean live stops (SIGTERM and SIGINT): {stops}")
+        print(f"/dev/shm peak use: {shm_peak[0]} KiB of {shm_peak[1]} KiB")
+
+        # ---- a stop while the container boots (the PR #36 review's m1): held, then the compositor's ----
+        for sig in ("TERM", "INT"):
+            posts.clear()
+            Handler.sess = session(port, P720)
+            deadline = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + 600))
+            sh("docker", "rm", "-f", NAME, check=False)
+            sh("docker", "run", "-d", "--name", NAME, "--network", "host",
+               "-e", f"SESSION_ID={Handler.sess['sessionId']}", "-e", f"JOB_TOKEN={TOKEN}",
+               "-e", f"APP_URL=http://127.0.0.1:{port}", "-e", f"RELAY_DEADLINE_AT={deadline}", a.image)
+            time.sleep(0.3)
+            sh("docker", "kill", "-s", sig, NAME, check=False)
+            took, code, logs = wait_exit(grace + 10)
+            check(code == "0", f"SIG{sig} 0.3 s into the boot: exit {code}, want 0 ({took:.1f} s)")
+            check("msg=exit code=0" in logs, f"SIG{sig} 0.3 s into the boot: the compositor's own exit line")
+
+        # ---- phase C (F-016, a measurement): SIGTERM straight to the compositor, around tini ----
+        start(P720)
+        cpid = compositor_pid()
+        if cpid:
+            sh("docker", "exec", NAME, "kill", "-TERM", str(cpid))
             took, code, logs = wait_exit(grace + 10)
             print(f"measured (F-016): a direct SIGTERM once CEF is up: exit {code} after {took:.1f} s; "
                   f"the compositor's exit line {'present' if 'msg=exit code=' in logs else 'ABSENT'}; "
                   f"posts {len(posts)}, last exitReason {(posts[-1] if posts else {}).get('exitReason')}")
-        for logs in kept:
-            check(TOKEN not in logs and PAGE_TOKEN not in logs, "no token in a container log")
+        leaks = [x for x in SECRETS for logs in kept if x in logs]
+        check(not leaks and len(kept) >= a.exits, f"no credential in {len(kept)} container logs ({len(set(leaks))} leaked)")
         if a.keep_log:
             Path(a.keep_log).write_text("\n==== next run ====\n".join(kept))
     finally:
