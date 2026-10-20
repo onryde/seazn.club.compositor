@@ -664,7 +664,7 @@ fn health_passes_through_the_graphics_decorators() {
     assert_eq!(knob.reads(), 1);
 }
 
-/// The two sides of the stop seam agree (F-015): every signal the image's entrypoint traps is
+/// The two sides of the stop seam agree (F-016): every signal the image's entrypoint traps is
 /// forwarded under a name the binary reads as the same stop, and the entrypoint never `exec`s the
 /// compositor (an `exec` would hand SIGINT and SIGTERM straight to CEF's handlers). The meanings come
 /// from R1 (SIGINT is its stop: the Final hold) and the platform (SIGTERM: the drain), not the table.

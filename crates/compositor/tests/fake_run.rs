@@ -536,7 +536,7 @@ fn start_failure_exits_70_with_the_detail_scrubbed_of_a_bare_key() {
     assert_eq!(checked, 2);
 }
 
-/// A host stop (SIGTERM, or SIGUSR2 as the image's entrypoint forwards it: F-015) drains at once:
+/// A host stop (SIGTERM, or SIGUSR2 as the image's entrypoint forwards it: F-016) drains at once:
 /// exit 0 within the drain bound, the last POST `signalled`, and no POST carries `final` (a host stop
 /// never shows "Stream ended"). The final beat is answered 503 here, and the binary logs that failure,
 /// scrubbed.
@@ -588,7 +588,7 @@ fn sigterm_two_seconds_after_start_drains_and_posts_signalled() {
     assert_eq!(checked, 2);
 }
 
-/// R1's stop (SIGINT, or SIGUSR1 as the image's entrypoint forwards it: F-015) holds the Final scene
+/// R1's stop (SIGINT, or SIGUSR1 as the image's entrypoint forwards it: F-016) holds the Final scene
 /// for `final_hold_ms`, then drains: exit 0 no sooner than the hold and within hold + drain + 1 s, an
 /// earlier POST carrying `programmePhase: final`, the last POST `signalled`.
 #[test]

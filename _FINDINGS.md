@@ -1347,6 +1347,32 @@ echo "RUN $RUN done"
 - **Not started:** starting one on the stg pad needs a staff login, which this session does not hold.
 - **The brief:** "if it isn't in progress, refuse the run rather than skip the check". Neither leg ran: no template leg and no scene leg. Owed 21 stays open (updated there).
 
+## F-016: CEF takes over SIGINT and SIGTERM in the compositor's process (C12, 2026-10-20)
+
+**Where:** image.yml on PR #36 (GitHub's ubuntu-24.04 runner, Docker), the relay image in live mode
+(`scripts/image_probe.py`): a fake control plane on the runner, C11's harness page as the overlay, and
+input and target on local ports nothing listens on. Each run waited for `cef ready gen=1`.
+
+| Run (image, entrypoint) | Signal and path | Exit status | Time to exit | The compositor's `exit code=` line | Final beat |
+|---|---|---|---|---|---|
+| `7da159f` (`exec` compositor) | `docker stop`: SIGTERM, tini → compositor | 0 | 0.1 s | absent; the log ends at `cef ready gen=1` | none (1 POST, periodic) |
+| `91a5123` (forwarding entrypoint) | `docker exec … kill -TERM <compositor>`, around tini | 0 | 0.2 s | absent | none (1 POST, periodic) |
+| `91a5123` | `docker kill -s INT`: tini → entrypoint → SIGUSR1 | 0 | 10.3 s | present | `signalled`, an earlier POST carrying `final` |
+| `91a5123` | `docker stop`: tini → entrypoint → SIGUSR2 | 0 | at once | present | `signalled`, no POST carrying `final` |
+
+- The compositor's `/proc/<pid>/status` once CEF was up: `SigCgt 0000000100014a03` (SIGHUP, SIGINT,
+  SIGUSR1, SIGUSR2, SIGTERM, SIGCHLD and signal 33 caught), `SigIgn 0000000000001000` (SIGPIPE).
+- In the binary run alone with no CEF (`tests/fake_run.rs`, check.yml), SIGTERM and SIGINT reach the
+  domain: the drain in 12 ms and the hold in 10.04 s, each with its final beat.
+
+**Verdict:** once CEF starts in the process, a SIGINT or SIGTERM delivered to the compositor ends it
+with status 0 at once, before the domain hears of it: no Final scene, no drain, no final beat, no exit
+line. The caught HUP/INT/TERM set matches Chromium's shutdown handlers; the handler's owner was not
+traced further. So the image's entrypoint does not `exec` the compositor: it runs it as a child and
+forwards SIGINT as SIGUSR1 and SIGTERM as SIGUSR2, which the compositor reads as the same stops
+(`wiring::STOP_SIGNALS`), and tini (no `-g`) signals the entrypoint alone. On a Fly Machine, the
+platform's SIGINT and SIGTERM reaching tini is unmeasured (`docs/_INDEX.md` Owed 73).
+
 ## Platform notes (Fly-specific; nothing inside the image depends on them)
 
 - **CPU:** performance-4x reports AMD EPYC with 4 vCPU.

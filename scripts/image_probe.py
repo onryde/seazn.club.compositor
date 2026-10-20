@@ -19,7 +19,7 @@ Then three stops, one container each:
     POST `signalled`;
   - `docker stop` (SIGTERM, the platform stop): the drain at once; exit 0, the last POST `signalled`,
     no POST carrying `final`;
-  - a measurement, not a check (F-015): SIGTERM sent straight to the compositor once CEF is up,
+  - a measurement, not a check (F-016): SIGTERM sent straight to the compositor once CEF is up,
     around the entrypoint. CEF's own handlers take SIGINT and SIGTERM in the process, which is why
     the entrypoint forwards them as SIGUSR1 and SIGUSR2.
 
@@ -250,13 +250,13 @@ def main():
         last = posts[-1] if posts else {}
         check(last.get("exitReason") == "signalled", f"SIGTERM: last POST signalled ({last.get('exitReason')})")
 
-        # ---- run 3 (F-015, a measurement): SIGTERM straight to the compositor, around tini ----
+        # ---- run 3 (F-016, a measurement): SIGTERM straight to the compositor, around tini ----
         start()
         pid = [r for r in procs() if r[1] == "compositor"]
         if pid:
             sh("docker", "exec", NAME, "kill", "-TERM", str(pid[0][0]))
             took, code, logs = wait_exit(grace + 10)
-            print(f"measured (F-015): a direct SIGTERM once CEF is up: exit {code} after {took:.1f} s; "
+            print(f"measured (F-016): a direct SIGTERM once CEF is up: exit {code} after {took:.1f} s; "
                   f"the compositor's exit line {'present' if 'msg=exit code=' in logs else 'ABSENT'}; "
                   f"posts {len(posts)}, last exitReason {(posts[-1] if posts else {}).get('exitReason')}")
         for logs in kept:

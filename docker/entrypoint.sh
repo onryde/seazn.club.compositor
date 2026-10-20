@@ -5,7 +5,7 @@
 # tini passes it through).
 #
 # Why not `exec`: CEF takes over SIGINT and SIGTERM inside the compositor's process once it starts
-# (F-015). A SIGTERM the process receives then exits it at once with status 0: no drain, no final
+# (F-016). A SIGTERM the process receives then exits it at once with status 0: no drain, no final
 # beat, no exit line. CEF leaves SIGUSR1 and SIGUSR2 alone, and the compositor reads them as SIGINT
 # (the Final hold) and SIGTERM (the drain). tini sends a signal to this shell only (no -g), so the
 # compositor never receives SIGINT or SIGTERM itself.
@@ -34,15 +34,20 @@ export TMPDIR="$tmp"
 
 /usr/local/bin/compositor &
 pid=$!
-trap 'kill -USR1 "$pid" 2>/dev/null || true' INT
-trap 'kill -USR2 "$pid" 2>/dev/null || true' TERM
-# `wait` returns early (above 128) when a trap runs; the child is then still alive, or a zombie that
-# `kill -0` still finds, so the loop waits again until it has reaped the child and holds its status.
-code=0
-while kill -0 "$pid" 2>/dev/null; do
+trap 'forwarded=1; kill -USR1 "$pid" 2>/dev/null || true' INT
+trap 'forwarded=1; kill -USR2 "$pid" 2>/dev/null || true' TERM
+# `wait` returns early (above 128) when a trap runs during it, with the child still running or not
+# yet reported, so it waits again for the child's own status. A 127 on that second wait means the
+# first one had already returned the child's status (a stop landed just as it ended): keep that one.
+code=
+while :; do
+  forwarded=
   set +e
   wait "$pid"
-  code=$?
+  rc=$?
   set -e
+  if [ "$rc" -eq 127 ] && [ -n "$code" ]; then break; fi
+  code=$rc
+  [ -n "$forwarded" ] || break
 done
 exit "$code"

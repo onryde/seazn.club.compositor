@@ -382,7 +382,7 @@ fn plane(env: &Env, t: &Thresholds, log: &Logger) -> Result<Box<dyn ControlPlane
 /// The stop signals the process reads, and what each means to the domain. SIGINT (R1's stop: the
 /// Final hold) and SIGTERM (the platform's: the drain) when the binary runs on its own; SIGUSR1 and
 /// SIGUSR2 are the same two from the image's entrypoint, which forwards them under those names
-/// because CEF takes over SIGINT and SIGTERM in this process once it starts (F-015).
+/// because CEF takes over SIGINT and SIGTERM in this process once it starts (F-016).
 pub const STOP_SIGNALS: [(i32, SignalKind); 4] = [
     (signal_hook::consts::SIGINT, SignalKind::Int),
     (signal_hook::consts::SIGTERM, SignalKind::Term),
