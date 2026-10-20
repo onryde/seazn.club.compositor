@@ -7,6 +7,7 @@ use app::driver::Driver;
 use app::ports::{ControlRequest, Inbound, Measured, SessionConfig};
 use domain::config::{OutputProfile, Thresholds};
 use domain::health::{ExitDetail, GraphicsStatus, HealthReport};
+use domain::input_link::LossReason;
 use domain::ladder::Rung;
 use domain::lifecycle::ExitReason;
 use domain::programme::{FrameChoice, ProgrammePhase, SlateKind};
@@ -1577,4 +1578,157 @@ fn nothing_skipped_or_dropped_logs_no_tally() {
     assert!(lines_starting(&log, "heartbeats dropped").is_empty());
     eprintln!("ticks driven: {ticks}, beats requested: {beats}");
     assert!(ticks > 0 && beats > 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// C10b (Owed 50): the domain gives the input up through the driver, `InputSource::abandon(gen)`
+// ---------------------------------------------------------------------------------------------
+
+/// A frame of input generation `gen`.
+fn frame(_gen: u64) -> Inbound {
+    ev(Event::InputFrame)
+}
+
+fn abandons(log: &Log) -> Vec<u64> {
+    log.calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::InputAbandon(g) => Some(g),
+            _ => None,
+        })
+        .collect()
+}
+
+fn rebuilt(gen: u64) -> impl Fn(&Call) -> bool {
+    move |c| matches!(c, Call::InputRebuild(g, _) if *g == gen)
+}
+
+fn abandoned(gen: u64) -> impl Fn(&Call) -> bool {
+    move |c| *c == Call::InputAbandon(gen)
+}
+
+/// The position of the first call matching `pred`.
+fn position(log: &Log, pred: impl Fn(&Call) -> bool) -> usize {
+    log.calls().iter().position(pred).expect("the call was made")
+}
+
+/// The stall rule, through the real driver: gen 1 connects, frames stop, and the driver calls
+/// `abandon(1)` once, on the first tick at or after the last frame plus `input_stall_after_ms`, and
+/// before it rebuilds gen 2; nothing else is abandoned before gen 2's own connect timeout.
+#[test]
+fn the_stall_rule_abandons_the_input_once_through_the_driver() {
+    let t = th();
+    let mut sim = Sim::new(t.clone(), session_720p());
+    let step = OutputProfile::P720.frame_period_ms().round() as u64;
+    let stop = SESSION_AT + 3_000;
+    let mut events = vec![(SESSION_AT + 1, ev(Event::InputConnected { gen: 1 }))];
+    events.extend(every(SESSION_AT + 1, stop, step, || frame(1)));
+    let last = events.last().expect("frames").0;
+    sim.drive(stop, events);
+    let r2 = sim.tick_until(stop + t.input_stall_after_ms + t.input_backoff_cap_ms, rebuilt(2));
+    let next_timeout = r2 + t.input_connect_timeout_ms;
+    sim.drive(next_timeout - 1, vec![]);
+    let at = sim.times_of(abandoned(1));
+    eprintln!("stall: last frame {last}, abandon(1) at {at:?}, rebuild(2) at {r2}");
+    assert_eq!(
+        at,
+        vec![sim.first_tick_at_or_after(last + t.input_stall_after_ms)]
+    );
+    assert_eq!(
+        abandons(&sim.log),
+        vec![1],
+        "once, and nothing else before gen 2's timeout"
+    );
+    assert!(position(&sim.log, abandoned(1)) < position(&sim.log, rebuilt(2)));
+}
+
+/// The connect timeout, through the real driver: no generation ever connects, and each is
+/// abandoned once, on the first tick at or after its build plus `input_connect_timeout_ms`, before
+/// the next is built.
+#[test]
+fn a_connect_timeout_abandons_each_generation_once_through_the_driver() {
+    let t = th();
+    let mut sim = Sim::new(t.clone(), session_720p());
+    let mut checked = 0;
+    let mut built = SESSION_AT;
+    for gen in 1..=3u64 {
+        let next = sim.tick_until(
+            built + t.input_connect_timeout_ms + t.input_backoff_cap_ms,
+            rebuilt(gen + 1),
+        );
+        let at = sim.times_of(abandoned(gen));
+        eprintln!(
+            "connect timeout: gen {gen} built {built}, abandoned at {at:?}, gen {} built {next}",
+            gen + 1
+        );
+        assert_eq!(
+            at,
+            vec![sim.first_tick_at_or_after(built + t.input_connect_timeout_ms)],
+            "gen {gen}"
+        );
+        assert!(position(&sim.log, abandoned(gen)) < position(&sim.log, rebuilt(gen + 1)));
+        built = next;
+        checked += 1;
+    }
+    assert_eq!(abandons(&sim.log), vec![1, 2, 3], "each once");
+    assert_eq!(checked, 3);
+}
+
+/// A loss the adapter reported owes no abandon: EOS, an error, or a stall it saw, while running.
+/// The next generation is built, connects and runs, and the driver never calls `abandon`.
+#[test]
+fn a_reported_loss_is_never_abandoned_through_the_driver() {
+    let t = th();
+    let step = OutputProfile::P720.frame_period_ms().round() as u64;
+    let mut checked = 0;
+    for reason in [LossReason::Eos, LossReason::Error, LossReason::Stalled] {
+        let mut sim = Sim::new(t.clone(), session_720p());
+        let lose = SESSION_AT + 1_000;
+        let mut events = vec![(SESSION_AT + 1, ev(Event::InputConnected { gen: 1 }))];
+        events.extend(every(SESSION_AT + 1, lose, step, || frame(1)));
+        events.push((lose, ev(Event::InputLost { gen: 1, reason })));
+        sim.drive(lose + 1, events);
+        let r2 = sim.tick_until(lose + t.input_backoff_cap_ms, rebuilt(2));
+        let mut events = vec![(r2 + 1, ev(Event::InputConnected { gen: 2 }))];
+        let end = r2 + 3 * t.input_stall_after_ms;
+        events.extend(every(r2 + 1, end, step, || frame(2)));
+        sim.drive(end, events);
+        assert_eq!(abandons(&sim.log), Vec::<u64>::new(), "{reason:?}");
+        assert_eq!(
+            sim.log.count(|c| matches!(c, Call::InputRebuild(..))),
+            2,
+            "{reason:?}: gen 2 ran"
+        );
+        checked += 1;
+    }
+    eprintln!("reported losses checked: {checked}");
+    assert_eq!(checked, 3);
+}
+
+/// The hold ticks no link: an input whose connect would time out on the tick after the end request
+/// is not abandoned through the hold. Its pair without the request is, on that tick.
+#[test]
+fn the_hold_abandons_nothing_through_the_driver() {
+    let t = th();
+    let mut checked = 0;
+    for ending in [false, true] {
+        let mut sim = Sim::new(t.clone(), session_720p());
+        let due = SESSION_AT + t.input_connect_timeout_ms;
+        sim.drive(due - 1, vec![]);
+        if ending {
+            let at = sim.d.next_tick_at().min(due - 1);
+            sim.drive(at + 1, vec![(at, ev(Event::HeartbeatReply(Desired::Ending)))]);
+        }
+        let tick = sim.drive_to_tick(due, vec![]);
+        if ending {
+            assert_eq!(sim.d.programme_phase(), ProgrammePhase::Final, "held at {tick}");
+            sim.drive(due + t.final_hold_ms - 1, vec![]);
+            assert_eq!(abandons(&sim.log), Vec::<u64>::new(), "the hold");
+        } else {
+            assert_eq!(sim.times_of(abandoned(1)), vec![tick], "the pair");
+        }
+        checked += 1;
+    }
+    eprintln!("hold pairs checked: {checked}");
+    assert_eq!(checked, 2);
 }

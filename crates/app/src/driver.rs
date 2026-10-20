@@ -302,6 +302,8 @@ impl Driver {
                 };
                 p.input.rebuild(gen, &cfg.input);
             }
+            // The domain gave the generation up (C10b): the adapter shuts it out. No session needed.
+            Effect::AbandonInput { gen } => p.input.abandon(gen),
             Effect::SwapSink { gen } => {
                 let Some(cfg) = &self.session else {
                     return self.no_session(now);

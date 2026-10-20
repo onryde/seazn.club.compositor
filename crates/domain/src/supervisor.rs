@@ -48,7 +48,7 @@ use crate::graphics::{Graphics, GraphicsAction, GraphicsState, HideReason};
 use crate::health::{
     BeatState, ExitDetail, ExitInfo, GraphicsStatus, HealthReport, LinkStatus, PhaseChannel,
 };
-use crate::input_link::{InputLink, InputState, LossReason};
+use crate::input_link::{InputAction, InputLink, InputState, LossReason};
 use crate::ladder::{Ladder, Rung};
 use crate::lifecycle::{ExitReason, Lifecycle};
 use crate::output_link::{OutputLink, OutputState};
@@ -151,6 +151,12 @@ pub enum Effect {
     FetchSession,
     StartProgramme,
     RebuildInput {
+        gen: u64,
+    },
+    /// The domain gave input generation `gen` up by its own rule, the connect timeout or the stall
+    /// rule (C10b, Owed 50): the adapter shuts that generation out (`InputSource::abandon`). Pushed
+    /// once a generation, on the Running tick that decided it; a loss the adapter reported owes none.
+    AbandonInput {
         gen: u64,
     },
     SwapSink {
@@ -386,12 +392,10 @@ impl Supervisor {
                     self.start_hold(now, ExitReason::Deadline);
                     return self.holding(Event::Tick, now, now, ExitReason::Deadline, fx);
                 }
-                self.input.check_stall(now, self.programme.last_frame_at(), &t);
-                if self.input.on_tick(now, &t) {
-                    fx.push(Effect::RebuildInput {
-                        gen: self.input.generation(),
-                    });
-                }
+                // A stall gives the generation up before the tick that may rebuild it (C10b).
+                let stall = self.input.check_stall(now, self.programme.last_frame_at(), &t);
+                let tick = self.input.on_tick(now, &t);
+                fx.extend(stall.into_iter().chain(tick).map(input_effect));
                 if self.output.on_tick(now, &t) {
                     fx.push(Effect::SwapSink {
                         gen: self.output.generation(),
@@ -585,6 +589,14 @@ impl Supervisor {
             phase_channel: self.phase_channel,
             exit,
         }
+    }
+}
+
+/// The effect the input link asked for (C10b).
+fn input_effect(a: InputAction) -> Effect {
+    match a {
+        InputAction::Rebuild { gen } => Effect::RebuildInput { gen },
+        InputAction::Abandon { gen } => Effect::AbandonInput { gen },
     }
 }
 

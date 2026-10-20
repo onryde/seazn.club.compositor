@@ -94,6 +94,7 @@ fn programme_and_generation_properties_hold_on_random_streams() {
     let into_live = Cell::new(0u64);
     let alive_while_ready = Cell::new(0u64);
     let stale_alive = Cell::new(0u64);
+    let abandons = Cell::new(0u64);
     let mut runner = TestRunner::new(Config {
         cases: CASES,
         ..Config::default()
@@ -106,6 +107,7 @@ fn programme_and_generation_properties_hold_on_random_streams() {
             let mut now: Ms = 0;
             let mut frames: Vec<Ms> = Vec::new();
             let mut last_rebuild = 0u64;
+            let mut last_abandon = 0u64;
             for (dt, kind) in steps {
                 now += dt;
                 let ev = event_for(kind, &s, &mut h);
@@ -151,6 +153,14 @@ fn programme_and_generation_properties_hold_on_random_streams() {
                         prop_assert_eq!(*gen, last_rebuild + 1);
                         last_rebuild = *gen;
                     }
+                    // C10b: an abandon names the generation built last, once, on a tick
+                    if let Effect::AbandonInput { gen } = e {
+                        prop_assert_eq!(*gen, last_rebuild, "abandoned a generation not current");
+                        prop_assert!(*gen > last_abandon, "gen {} abandoned twice", gen);
+                        prop_assert_eq!(&ev, &Event::Tick);
+                        last_abandon = *gen;
+                        abandons.set(abandons.get() + 1);
+                    }
                 }
                 // P4, the page's beat (Owed 18): a beat from any page but the current one changes
                 // nothing; one from the current page while Ready is delivered (counted below)
@@ -169,12 +179,13 @@ fn programme_and_generation_properties_hold_on_random_streams() {
         })
         .expect("property failed");
     eprintln!(
-        "cases checked: {}, on-air ticks: {}, transitions into Live: {}, beats while Ready: {}, stale beats: {}",
+        "cases checked: {}, on-air ticks: {}, transitions into Live: {}, beats while Ready: {}, stale beats: {}, abandons: {}",
         checked.get(),
         ticks.get(),
         into_live.get(),
         alive_while_ready.get(),
-        stale_alive.get()
+        stale_alive.get(),
+        abandons.get()
     );
     assert_eq!(checked.get(), CASES, "anti-vacuity: every configured case ran");
     assert!(ticks.get() > 0, "anti-vacuity: no on-air tick was ever checked");
@@ -187,6 +198,7 @@ fn programme_and_generation_properties_hold_on_random_streams() {
         "anti-vacuity: no beat reached a Ready page"
     );
     assert!(stale_alive.get() > 0, "anti-vacuity: no stale beat was checked");
+    assert!(abandons.get() > 0, "anti-vacuity: no abandon was checked");
 }
 
 /// The exit contract, written independently of `ExitReason::code`.
@@ -591,6 +603,7 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
                             !matches!(
                                 e,
                                 Effect::RebuildInput { .. }
+                                    | Effect::AbandonInput { .. }
                                     | Effect::SwapSink { .. }
                                     | Effect::RestartGraphics { .. }
                                     | Effect::StepDown(_)

@@ -1005,7 +1005,9 @@ impl World {
                 Effect::DrainOutput => self.pending.push(Event::OutputDrained),
                 Effect::SendHeartbeat(h) => self.beats.push(h),
                 Effect::Exit(c) => self.exit = Some(c),
-                Effect::FetchSession
+                // The input connects at once here, so no generation is given up (C10b).
+                Effect::AbandonInput { .. }
+                | Effect::FetchSession
                 | Effect::StartProgramme
                 | Effect::HideOverlay { .. }
                 | Effect::StepDown(_) => {}
