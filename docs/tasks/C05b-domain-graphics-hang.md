@@ -341,7 +341,7 @@ started it.
 
 ## Amendment 2026-10-20 (C11b: CEF's health is the process's, not this machine's)
 
-C11b (PR #C11B) adds no state or action here. A dead zygote, the GPU-process deaths and leaked teardowns are facts
+C11b (PR #34) adds no state or action here. A dead zygote, the GPU-process deaths and leaked teardowns are facts
 about the process's one CEF, so the supervisor reads them (`Event::CefHealth`) and restarts the process in place;
 this machine keeps the page's life (the beat, the crash count, the bound). One consequence: a renderers' zygote's
 death no longer walks graphics to `Failed` by its storm of `CefCrashed` (Owed 56's road), because the verdict reaches

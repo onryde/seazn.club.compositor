@@ -1308,7 +1308,7 @@ decisions, as built:
 
 ## Amendment 2026-10-20 (C11b: the in-place restart)
 
-C11b (PR #C11B; `docs/tasks/C11b-cef-health.md`, "As built") adds to this aggregate:
+C11b (PR #34; `docs/tasks/C11b-cef-health.md`, "As built") adds to this aggregate:
 - **`ExitReason::Restart`**, exit 75 (sysexits' EX_TEMPFAIL), last in `ExitReason::ALL` (7). Non-zero, so the host's
   `on-failure` restarts the process in place.
 - **`Event::CefHealth(CefHealth)`**, read by C08 once a tick. `CefHealth::restart_cause` (`domain::cef_health`) is the

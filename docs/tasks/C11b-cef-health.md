@@ -1,6 +1,6 @@
 # C11b: the compositor acts on CEF's health (stub)
 
-**Status:** ~~stub~~ **built 2026-10-20 (PR #C11B; "As built (2026-10-20)" below).** Written as a stub in the
+**Status:** ~~stub~~ **built 2026-10-20 (PR #34; "As built (2026-10-20)" below).** Written as a stub in the
 PR #32 review fix loop (2026-10-19) from `docs/_INDEX.md` Owed 55, 56 and 58, and amended in the PR #32 confirm pass
 (2026-10-19: N1, N3; Owed 61 and 62). The coordinator dispatched it with this stub as the spec, plus the final C11
 review's G1–G4 (2026-10-20).

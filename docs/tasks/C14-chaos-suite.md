@@ -177,7 +177,7 @@ Every beat in that span reads `ready`, `restarting` or `starting`, and never `fa
 
 ## Amendment 2026-10-20 (C11b: the in-place restart's cases and its outage measurement)
 
-C11b (PR #C11B; `docs/tasks/C11b-cef-health.md`, "As built") restarts the process in place when CEF's health asks
+C11b (PR #34; `docs/tasks/C11b-cef-health.md`, "As built") restarts the process in place when CEF's health asks
 for it: a dead zygote (either one), `cef_gpu_deaths_to_restart` (4) GPU-process deaths, or `cef_leaks_to_restart` (3)
 teardowns leaked at once. The process sends its final beat (`exitReason: "fatal"` until web adds a word, Owed 66;
 `exitDetail` starting `restart in place: `) and exits **75**; compose's `on-failure:2` (Fly's `on-failure` in

@@ -608,7 +608,7 @@ image:
 
 ## Amendment 2026-10-20 (C11b: the in-place restart's exit, and no core file)
 
-- **Exit 75** (C11b, PR #C11B): `run()` returns 75 (`ExitReason::Restart`, sysexits' EX_TEMPFAIL) when CEF's health
+- **Exit 75** (C11b, PR #34): `run()` returns 75 (`ExitReason::Restart`, sysexits' EX_TEMPFAIL) when CEF's health
   asks for an in-place restart, after the final beat (`exitReason: "fatal"` until Owed 66, `exitDetail` starting
   `restart in place: `). `main` exits with it, and tini passes it through, so the host's `on-failure` restarts the
   process. Add a fake-mode smoke run: the fake graphics driver reports a dead zygote after `programme started`, and
