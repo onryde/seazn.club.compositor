@@ -582,6 +582,25 @@ adds a flush there (10 + 7 + 2 = 19 s).
   queued behind a periodic result blocked on the channel). A drop-oldest channel must never drop a
   worker result (a `Session`, a refusal, a 410). Record the choice in this brief.
 
+## Amendment 2026-10-19 (C10 and C11 owe C12: pointers)
+
+These items are owed by C12 and are written in full in `docs/_INDEX.md` Owed (the PR #32 confirm
+pass asked for these pointers). Read each row there before building the composition root and the
+image:
+- **Owed 51:** build `GstInput` from the Driver's own `Thresholds` (one value passed to both), and
+  pass `Thresholds::cef_rss_cap_mb` and the programme profile's fps to `CefGraphics::new`.
+- **Owed 52:** never set `GST_CEF_LOG_SEVERITY` in the image or the environment: it overrides the
+  element's `log-severity=disable`, and CEF then writes every console line, the job token included,
+  to `chrome_debug.log`.
+- **Owed 53:** install C11's log handler first (build the graphics adapter before the other
+  adapters build pipelines, or install the handler at start), and keep `gst-launch` off tokened
+  URLs.
+- **Owed 54:** the CEF user's HOME exists and is writable (GStreamer's registry and NSS's database
+  are still there), and only one CEF uses it.
+- **Owed 58:** `TMPDIR` on a tmpfs for the compositor, nothing else writing there, and a short path
+  (85 characters killed CEF at its start in a test, 59 ran). The adapter fails closed: a `TMPDIR` it
+  cannot write is no overlay at all, never a profile under HOME.
+
 ## Do not touch
 
 Domain and app crates (except to read them), and fly configs (C16). (Amended 2026-10-15) No Fly

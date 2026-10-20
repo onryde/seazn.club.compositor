@@ -24,6 +24,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # C11 (PR #32 review m4): `tests/graphics.rs` RUNS only where cefsrc is (the C12 image), but it
+      # compiles wherever GStreamer does, so a change that breaks it reds here first.
+      - run: cargo clippy -p adapters --features cef --all-targets -- -D warnings
       # --show-output prints each guard's "checked N" line on a passing run, too.
       - run: cargo test --workspace --no-fail-fast -- --show-output 2>&1 | tee test.log
       - name: Refuse a vacuous run

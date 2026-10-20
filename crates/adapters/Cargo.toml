@@ -21,11 +21,22 @@ gstreamer = { version = "0.24", features = ["v1_24"] }
 gstreamer-app = { version = "0.24", features = ["v1_24"] }
 gstreamer-video = { version = "0.24", features = ["v1_24"] }
 crossbeam-channel = "0.5"
+# C11: the reaper's SIGKILL and the CEF children's nice (`setpriority` per thread) without `unsafe`
+# (the workspace forbids it). Already in the lock through tempfile.
+rustix = { version = "1", default-features = false, features = ["std", "process"] }
 
 [features]
 # C09: `Stats::force_snapshot` and the pipeline stand-ins the C09 tests drive (a held sink write, a
 # teardown that hangs). Only dev-dependencies enable it, so a release build never carries it.
 test-hooks = []
+# C11: the graphics tests need cefsrc (F-001's gstcefsrc build), which only the C12 image and the
+# C00 spike image carry. CI's GStreamer has none, so `tests/graphics.rs` is built only with this
+# feature (`required-features`, not `#[ignore]`: check.yml refuses a run with an ignored test).
+cef = []
+
+[[test]]
+name = "graphics"
+required-features = ["cef"]
 
 [dev-dependencies]
 # This crate's own integration tests (C09) and C12's join test use the test hooks.

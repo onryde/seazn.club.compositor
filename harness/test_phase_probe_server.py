@@ -273,6 +273,22 @@ class PhaseProbeServerTest(unittest.TestCase):
             self.assertGreaterEqual(b - a, 600 - 20)
             self.assertLess(b - a, 600 + 200)
 
+    def test_status_answers_every_request_with_that_status_and_no_body(self):
+        # C11's `cef error pages` measurement: a 502 from a failing edge, on any path and method.
+        server = self.start("--variant", "pna", "--status", "502")
+        cases = [("GET", "/phase?after=0"), ("GET", "/overlay"), ("OPTIONS", "/phase"), ("POST", "/phase")]
+        for method, path in cases:
+            status, headers, body, _ = call(method, path, {"Origin": ORIGIN})
+            self.assertEqual((status, body), (502, ""), f"{method} {path}")
+            self.assertEqual(cors_headers(headers), [], f"{method} {path}: {headers}")
+        deadline = time.monotonic() + 2
+        while len(server.replies()) < len(cases) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(len(server.replies()), len(cases), server.lines)
+        for line in server.replies():
+            self.assertIn(" status=502 ", line)
+        print(f"\nstatus cases checked: {len(cases)}")
+
     def test_refusals_at_start_up_exit_2_and_never_bind(self):
         # Each refusal names its reason: a bare exit 2 is also what Python returns for a missing
         # script file, so the code alone cannot tell a refusal from a server that never ran.
@@ -285,6 +301,11 @@ class PhaseProbeServerTest(unittest.TestCase):
             (["--variant", "pna", "--script", "waiting:500", "--hold-ms", "100"], "--hold-ms"),
             (["--variant", "pna", "--hold-ms", "-1"], "--hold-ms"),
             (["--variant", "bogus"], "bogus"),
+            (["--variant", "pna", "--status", "99"], "--status 99"),
+            (["--variant", "pna", "--status", "600"], "--status 600"),
+            (["--variant", "pna", "--status", "abc"], "--status"),
+            (["--variant", "pna", "--status", "502", "--hold-ms", "100"], "--status"),
+            (["--variant", "pna", "--status", "502", "--script", "waiting:500"], "--status"),
             ([], "--variant"),
         ]
         for args, needle in bad:

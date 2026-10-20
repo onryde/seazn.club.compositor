@@ -15,6 +15,7 @@ dependencies = [
  "gstreamer-video",
  "hex",
  "jsonschema",
+ "rustix",
  "serde_json",
  "sha2",
  "ureq",

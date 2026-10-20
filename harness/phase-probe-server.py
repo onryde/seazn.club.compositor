@@ -15,6 +15,9 @@ Python stdlib only. Bound to 127.0.0.1:7419, web's RELAY_PHASE_PORT (lib/relay-p
                    behind the current seq answers at once; a poll on it is answered at the next
                    change, or at RELAY_PHASE_LONG_POLL_MAX_MS with the current value. A phase outside
                    the five programme phases is refused at start-up (exit 2), never served.
+  --status N       (C11, the `cef error pages` measurement) answer EVERY request, any method and
+                   any path, with status N (100-599) and no body, as a failing edge would. It
+                   excludes --hold-ms and --script.
 
 Every request logs one `request …` line to stdout at arrival (method, path, Origin,
 Access-Control-Request-Private-Network, Access-Control-Request-Method, then every header as JSON);
@@ -100,7 +103,7 @@ class Script:
             return self.phase, self.seq
 
 
-def make_handler(variant, hold_ms, script):
+def make_handler(variant, hold_ms, script, status=None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "phase-probe"
@@ -148,6 +151,9 @@ def make_handler(variant, hold_ms, script):
         def _route(self):
             """The `after` value for a well-formed /phase request, or None once refused."""
             parts = urlsplit(self.path)
+            if status is not None:
+                self._send(status)
+                return None
             if parts.path != PHASE_PATH:
                 self._send(404)
                 return None
@@ -194,7 +200,7 @@ def make_handler(variant, hold_ms, script):
 
         def _refuse_method(self):
             self._log_request()
-            self._send(405)
+            self._send(405 if status is None else status)
 
         do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = _refuse_method
 
@@ -218,7 +224,13 @@ def main(argv=None):
     parser.add_argument("--variant", required=True, choices=("none", "pna"))
     parser.add_argument("--hold-ms", type=int, default=None, help=f"fixed mode only (default {DEFAULT_HOLD_MS})")
     parser.add_argument("--script", default=None, help="e.g. waiting:5000,reconnecting:5000,final:5000")
+    parser.add_argument("--status", type=int, default=None, help="answer every request with this status, no body")
     args = parser.parse_args(argv)
+    if args.status is not None:
+        if not 100 <= args.status <= 599:
+            parser.error(f"--status {args.status} is not an HTTP status (100-599)")
+        if args.script is not None or args.hold_ms is not None:
+            parser.error("--status answers every request itself; it excludes --hold-ms and --script")
     script = None
     if args.script is not None:
         if args.hold_ms is not None:
@@ -229,9 +241,12 @@ def main(argv=None):
     hold_ms = DEFAULT_HOLD_MS if args.hold_ms is None else args.hold_ms
     if hold_ms < 0:
         parser.error("--hold-ms must be 0 or more")
-    server = ThreadingHTTPServer((HOST, PORT), make_handler(args.variant, hold_ms, script))
+    server = ThreadingHTTPServer((HOST, PORT), make_handler(args.variant, hold_ms, script, args.status))
     server.daemon_threads = True
-    mode = f"script={args.script}" if script else f"hold_ms={hold_ms}"
+    if args.status is not None:
+        mode = f"status={args.status}"
+    else:
+        mode = f"script={args.script}" if script else f"hold_ms={hold_ms}"
     print(f"phase-probe-server listening {HOST}:{PORT} variant={args.variant} {mode}", file=sys.stderr, flush=True)
     try:
         server.serve_forever()

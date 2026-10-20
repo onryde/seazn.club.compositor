@@ -387,6 +387,69 @@ return within a bound: it never waits on a pipeline, a renderer or a thread that
 reaper thread, as `stop` does, or is bounded by a timeout. **Acceptance:** a test drops the adapter
 while what it owns is hung (or stands in for hung) and the drop returns within 500 ms.
 
+## Amendment 2026-10-19 (as built, PR #32; F-013, F-014, F-015)
+
+- **The gate is `required-features`, not `#[ignore]`.** `tests/graphics.rs` is a `[[test]]` with `required-features = ["cef"]`, and `adapters` has a feature `cef = []`. check.yml fails a run with any ignored test, and CI has no cefsrc. The C12 image runs `cargo test -p adapters --features cef --test graphics -- --test-threads=1` under `Xvfb :99`.
+- **The Events table, as built:**
+  - **"Each appsink sample"** is written only while its build's gate is open: from its own `seazn:ready` until `restart`, `stop`, the drop or a decided crash. It is converted to straight alpha first (cefsrc's is premultiplied, F-001).
+  - **"Renderer process exit"** is cefsrc's `Render subprocess terminated, reloading URL!` warning.
+  - **"The CEF child disappearing"** is not a crash signal: a killed GPU process recovers by itself (F-013).
+  - The cap reads the **PSS** sum of CEF's children, not their RSS.
+  - `CefReady`, `CefAlive` and `CefCrashed` carry their build's own generation; `ScoreStale` and `PhaseChannel` come only from the current build.
+- **Guardrails, as built:** no flag or property sets nice, so each 1 s poll renices every thread of every CEF child (Linux nice is per thread) and writes `oom_score_adj`. Every element sets `chrome-extra-flags` to `disable-features=SpareRendererForSitePerProcess` (amending F-009's "no flags"; the flag touches no networking) and `log-severity=disable`.
+- **Logging:** the first `CefGraphics` replaces GStreamer's default log handler for the process, and every line it prints is scrubbed. Never set `GST_CEF_LOG_SEVERITY` (Owed 52).
+- **The tests:**
+  - 19 in the image: the brief's 15, plus `a_renderer_born_just_before_a_restart_stays_the_retiring_pages`, `cef_children_run_at_nice_10_with_oom_score_adj_1000`, `the_page_token_never_reaches_a_log_a_file_or_an_argv` and `drop_returns_within_500_ms_while_the_page_is_hung`.
+  - 11 unit tests run in CI.
+  - The stop test waits for the observed hang (300 ms without a sample) before its hide and stop, and holds the teardown with the `delay_teardowns` hook. A console-mode teardown returns in 7 ms even for a hung page (F-013).
+  - The reaper and drop tests use the js-signal hook, F-001's real hang.
+- **Mutation:** the brief's 9, plus 22 on this task's guards: 31 red.
+- **The compatibility step (G1) was refused** (F-015): no stg fixture was in progress, and none could be started without a staff login. Both legs are owed (Owed 21).
+- **Owed for others:** 52–54 (C12), 55 and 56 (owner questions), 57 (C08: stop graphics before hiding the overlay).
+
+## Amendment 2026-10-19 (PR #32 review round 1: the fix loop)
+
+The coordinator's decisions and the owner's ruling "B" are in `docs/_INDEX.md`'s Decision log (two rows). What
+changed for this brief:
+
+- **Do not touch, one exception:** `crates/app/src/driver.rs` stops graphics before hiding the overlay, and
+  `crates/app/tests/scenarios.rs` pins the order (Owed 57, closed).
+- **Secrets, at rest:** CEF's profile holds every URL it loaded. The adapter gives the process one private profile
+  directory (`cef-cache-location`, mode 0700, under `temp_dir`), removed by the last drop and swept at the next
+  start; a profile per build is impossible (CEF reads it once per process). C12 puts `TMPDIR` on tmpfs (Owed 58).
+- **Guardrails:** `oom_score_adj` is graded by kind (renderer 1000, GPU and utility 800, zygote 500), not 1000 on
+  every child. The cap counts no other build's renderer.
+- **Health (owner ruling "B"):** `CefGraphics::health()` reports a dead renderer zygote (`unrecoverable`) and the
+  leaked teardowns. Acting on them is C11b (`docs/tasks/C11b-cef-health.md`, Owed 59).
+- **Waits:** the image tests wait on events and counts, bounded by the domain's thresholds; the hooks
+  `hold_teardowns`, `set_reaper_kill_after` and `hold_next_write` replace `delay_teardowns`.
+- **The tests:** 23 in the image. Renamed: `the_page_token_never_reaches_a_log_line_chrome_debug_log_or_an_argv`
+  and `cef_children_run_at_nice_10_with_the_renderer_first_in_the_oom_order`. New:
+  `a_page_token_rests_on_disk_only_in_the_private_profile_until_the_drop`,
+  `a_hide_before_the_stop_can_leave_a_stale_frame_and_after_it_cannot`,
+  `a_dead_renderer_zygote_is_reported_and_the_gpu_zygotes_is_not` (two child processes, one zygote each) and
+  `a_retiring_builds_renderer_does_not_count_against_the_new_builds_cap`. 18 unit tests in `cef_graphics` run in CI, and
+  check.yml now compiles `tests/graphics.rs` too.
+- **The harness page** gains `echo_token=1` and a `hang starts` warning before its busy loop.
+- **F-014's residual:** a ready page that navigates paints the new document (white, on an error) until the hang
+  hide; no producer is known.
+
+## Amendment 2026-10-19 (PR #32 confirm pass)
+
+The coordinator's decisions are in `docs/_INDEX.md`'s Decision log ("PR #32 (C11) confirm pass"). What changed for
+this brief:
+
+- **Health:** `unrecoverable` reports **any** zygote's death (N1). The GPU process's zygote's is not recovered: the
+  next GPU-process death is Chromium's FATAL abort of the whole process (SIGTRAP). The test
+  `a_dead_renderer_zygote_is_reported_and_the_gpu_zygotes_is_not` is now `a_dead_zygote_either_one_is_reported`,
+  and `a_gpu_process_death_after_its_zygotes_aborts_the_whole_process` pins the abort.
+- **Secrets, at rest:** the sweep also removes a directory carrying the process's own pid (N2), and the profile
+  fails closed (N4): no directory, no build, never CEF on HOME (`CefCrashed`, logged through the adapter's sink).
+  New test: `a_profile_directory_that_cannot_be_made_refuses_the_build_and_the_retry_loads`.
+- **The tests:** 25 in the image; 40 unit tests in `adapters`, 18 of them in `cef_graphics`.
+- **Measured for C11b and C14:** Owed 61 (the 6th GPU-process death aborts the process) and Owed 62 (C14's case 8
+  is a process abort).
+
 ## Do not touch
 
 The programme and input adapters, and the page in `seazn.club` (that's R2005). (Amended 2026-10-15)
