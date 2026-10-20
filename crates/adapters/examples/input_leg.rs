@@ -1,6 +1,7 @@
 //! C10's live leg (`_FINDINGS.md` F-012): the real input adapter reading one SRT playback URL, with
-//! a minimal stand-in for the domain's rules around it (rebuild after `input_stall_after_ms` with no
-//! frame, or `input_connect_timeout_ms` with no connect, or at once on a loss), printing every event.
+//! a minimal stand-in for the domain's rules around it (abandon and rebuild after
+//! `input_stall_after_ms` with no frame, or `input_connect_timeout_ms` with no connect, as the domain
+//! does since C10b; rebuild at once on a loss), printing every event.
 //!
 //! The playback URL comes from the environment and is never printed: `C10_SRT_PLAY_URL`, in
 //! Cloudflare's form `srt://host:port?passphrase=…&streamid=…` (its values may be percent-encoded).
@@ -177,6 +178,8 @@ fn main() {
         let no_connect =
             !connected && now.duration_since(built_at) >= Duration::from_millis(t.input_connect_timeout_ms);
         if stalled || no_connect {
+            // The domain's give-up (C10b): the adapter shuts the generation out, then the rebuild.
+            input.abandon(gen);
             gen += 1;
             built_at = Instant::now();
             connected = false;
