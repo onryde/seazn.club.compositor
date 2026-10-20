@@ -2,6 +2,7 @@
 //! every exit path's final beat, and the ladder's one step per session. They live here, not inline,
 //! because the domain's crate root forbids `clippy::print_stderr`, and a sweep must print the count
 //! it checked (AGENTS.md §5).
+use domain::cef_health::CefHealth;
 use domain::config::{OutputProfile, Thresholds};
 use domain::health::{BeatState, ExitDetail, ExitInfo, HealthReport, PhaseChannel};
 use domain::input_link::LossReason;
@@ -26,11 +27,13 @@ fn period() -> Ms {
 
 /// The plan's Global Constraints, written independently of `ExitReason::code`: 0 for ended,
 /// deadline, signal or session gone (410); 78 for a refusal (401/404/wrong mode); 70 for fatal.
+/// C11b: 75 for an in-place restart (sysexits' EX_TEMPFAIL; non-zero, so the host restarts it).
 fn contract_code(r: ExitReason) -> i32 {
     match r {
         ExitReason::Ended | ExitReason::Deadline | ExitReason::Signalled | ExitReason::SessionGone => 0,
         ExitReason::Refused => 78,
         ExitReason::Fatal => 70,
+        ExitReason::Restart => 75,
     }
 }
 
@@ -49,6 +52,25 @@ fn booted(now: Ms, deadline_at: Ms) -> Supervisor {
 
 /// The fatal error's text every `Kind::Fatal` sample carries (Owed 27, option a).
 const FATAL_DETAIL: &str = "decoder: not-negotiated";
+
+/// The `Kind::CefRestart` sample: a dead zygote seen at generation 1 (C11b).
+const ZYGOTE_GONE: CefHealth = CefHealth {
+    unrecoverable: Some(1),
+    leaked_teardowns: 0,
+    gpu_process_deaths: 0,
+};
+
+/// Its final beat's text, written out (C11b).
+const RESTART_DETAIL: &str = "restart in place: a CEF zygote is gone (gen 1)";
+
+/// The text a Stopped beat carries for `reason`'s sample (Owed 27, option a; C11b).
+fn detail_of(reason: ExitReason) -> Option<ExitDetail> {
+    match reason {
+        ExitReason::Fatal => Some(ExitDetail::new(FATAL_DETAIL)),
+        ExitReason::Restart => Some(ExitDetail::new(RESTART_DETAIL)),
+        _ => None,
+    }
+}
 
 fn stopped_reason(h: &HealthReport) -> Option<ExitReason> {
     (h.state == BeatState::Stopped)
@@ -108,9 +130,13 @@ enum Kind {
     Term,
     Int,
     Fatal,
+    /// CEF's health with nothing wrong (C11b).
+    CefHealthy,
+    /// CEF's health asking for an in-place restart: a dead zygote (C11b).
+    CefRestart,
 }
 
-const KINDS: [Kind; 24] = [
+const KINDS: [Kind; 26] = [
     Kind::Tick,
     Kind::BootstrapOk,
     Kind::BootstrapFailed,
@@ -135,6 +161,8 @@ const KINDS: [Kind; 24] = [
     Kind::Term,
     Kind::Int,
     Kind::Fatal,
+    Kind::CefHealthy,
+    Kind::CefRestart,
 ];
 
 /// An exhaustive `match`, so a new `Event` variant is a compile error here and `KINDS` cannot go
@@ -167,6 +195,8 @@ fn kind_of(e: &Event) -> Kind {
         Event::Signal(SignalKind::Term) => Kind::Term,
         Event::Signal(SignalKind::Int) => Kind::Int,
         Event::Fatal { .. } => Kind::Fatal,
+        Event::CefHealth(h) if *h == CefHealth::default() => Kind::CefHealthy,
+        Event::CefHealth(_) => Kind::CefRestart,
     }
 }
 
@@ -218,6 +248,8 @@ fn sample(kind: Kind, s: &Supervisor) -> Event {
         Kind::Fatal => Event::Fatal {
             detail: Some(ExitDetail::new(FATAL_DETAIL)),
         },
+        Kind::CefHealthy => Event::CefHealth(CefHealth::default()),
+        Kind::CefRestart => Event::CefHealth(ZYGOTE_GONE),
     };
     assert_eq!(kind_of(&e), kind, "sample");
     e
@@ -324,6 +356,10 @@ fn brief(st: Setup, k: Kind) -> Want {
         (S::Running | S::Holding, K::HeartbeatGone) => W::ExitAlone(R::SessionGone),
         (S::Running, K::Ending) => W::Hold(R::Ended),
         (S::Running, K::Int) => W::Hold(R::Signalled),
+        // C11b: a restart only while Running; the hold already ends the process (exit 0), and a
+        // healthy report asks for nothing anywhere.
+        (S::Running, K::CefRestart) => W::Exit(R::Restart),
+        (S::Holding, K::CefRestart) | (S::Running | S::Holding, K::CefHealthy) => W::Ignored,
         // A second end request keeps the first hold's clock; an overrun changes nothing in the hold.
         (S::Holding, K::Ending | K::Int | K::EncoderOverrun) => W::Ignored,
         (
@@ -337,11 +373,15 @@ fn brief(st: Setup, k: Kind) -> Want {
 fn check(st: Setup, k: Kind, s: &Supervisor, now: Ms, d: &Decision) {
     let at = format!("({st:?}, {k:?})");
     let th = t();
-    // Owed 27 (a): a Stopped beat carries the fatal error's text iff the event was the fatal error.
-    let detail = (k == Kind::Fatal).then(|| ExitDetail::new(FATAL_DETAIL));
+    // Owed 27 (a): a Stopped beat carries the fatal error's text iff the event was the fatal error,
+    // and the restart's cause iff it was the restart (C11b).
     let beat_with = |fx: &Effect, r: ExitReason| {
+        let detail = match k {
+            Kind::Fatal | Kind::CefRestart => detail_of(r),
+            _ => None,
+        };
         matches!(fx, Effect::SendHeartbeat(h) if stopped_reason(h) == Some(r)
-            && h.exit == Some(ExitInfo { reason: r, detail: detail.clone() }))
+            && h.exit == Some(ExitInfo { reason: r, detail }))
     };
     match brief(st, k) {
         Want::Ignored => {
@@ -524,6 +564,10 @@ fn every_exit_but_a_heartbeat_410_is_preceded_by_a_final_beat_with_its_reason() 
     let (s, fx) = run(on_air(), &[(100, fatal)]);
     paths.push(("a fatal error while Running", ExitReason::Fatal, s, fx));
 
+    // C11b: CEF's health asks for an in-place restart.
+    let (s, fx) = run(on_air(), &[(100, Event::CefHealth(ZYGOTE_GONE))]);
+    paths.push(("a dead CEF zygote while Running", ExitReason::Restart, s, fx));
+
     // The one exit with no final beat (coordinator decision, wave gate 1 review I5): web refuses every
     // beat on a terminal session with this same 410.
     let no_beat = "a heartbeat 410 while Running";
@@ -552,7 +596,7 @@ fn every_exit_but_a_heartbeat_410_is_preceded_by_a_final_beat_with_its_reason() 
                 unreachable!()
             };
             assert_eq!(stopped_reason(h), Some(*reason), "{name}");
-            let detail = (*reason == ExitReason::Fatal).then(|| ExitDetail::new(FATAL_DETAIL));
+            let detail = detail_of(*reason);
             assert_eq!(h.exit.as_ref().and_then(|x| x.detail.clone()), detail, "{name}");
         }
         for e in fx {
@@ -569,7 +613,7 @@ fn every_exit_but_a_heartbeat_410_is_preceded_by_a_final_beat_with_its_reason() 
         checked += 1;
     }
     eprintln!("exit paths checked: {checked}");
-    assert_eq!(checked, 8, "every exit path, each reason at least once");
+    assert_eq!(checked, 9, "every exit path, each reason at least once");
     let reasons: Vec<ExitReason> = paths.iter().map(|p| p.1).collect();
     for r in ExitReason::ALL {
         assert!(reasons.contains(&r), "{r:?}: no path reaches it");

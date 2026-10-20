@@ -375,6 +375,10 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
   and the lane's plane is scrubbed of credentials learned after it was made (C07's suite). A crash at
   the count logs its line before its hide (the reviewer's mutant M13 went red). The skipped ticks and
   the dropped beats reach the log, at most a line a minute each, and the rest at the exit.
+- (Amended 2026-10-20, C11b) The driver reads `GraphicsRenderer::health()` once per `tick_due` that ran a tick and
+  hands every read to `decide`, with a `cef health …` line on a change and no read after `Exit`:
+  `tests/cef_health.rs` (7) takes each trigger through the real driver to one final beat and one `Exit(75)`, and
+  `run.rs` posts the restart's final beat before `run()` returns 75. 7 mutants red.
 
 ## Amendment 2026-10-15 (overlay templates spec)
 
@@ -661,6 +665,19 @@ The implementer's choices, inside the brief. None is an owner ruling; each mediu
   never recorded, and five new on the lane: a blocking post, no take while a result waits, the lane
   ending when the loop has gone, a result dropped, results newest first) went red. B2c is now red: a
   late tick past an unlatched exit logs a skip. W12 is gone (the lanes share no priority).
+
+## Amendment 2026-10-20 (C11b: CEF's health)
+
+- **The port:** `GraphicsRenderer` gains `fn health(&self) -> CefHealth` (the domain's type): counters only, never
+  blocking. `testkit`'s `FakeGraphics` reads a `CefKnob` (`ports_with_cef`), which counts the reads.
+- **The read:** once per `tick_due` that ran a tick, after its ticks (an exit inside them returns first, so nothing is
+  read after `Exit`). Every read goes to `decide` as `Event::CefHealth`, a changed one or not: the domain alone
+  decides the in-place restart, and a report read while booting (ignored there) must still restart on the first tick
+  on air.
+- **The line:** `cef health zygote_gone=<gen|-> leaked_teardowns=<n> gpu_process_deaths=<n>`, when the read differs
+  from the last one (none for a healthy process).
+- **The exit:** the decision's `Exit(75)` takes the existing arm: input and graphics stopped, the tallies' rest
+  logged, `run()`'s bounded flush, then 75.
 
 ## Do not touch
 

@@ -26,6 +26,11 @@
 //!   once from Running or Holding, with no Final scene.
 //! - **Draining** sends EOS to the output and exits once drained, or after `drain_timeout_ms`.
 //! - **Exited** is terminal and ignores every later event.
+//! - **An in-place restart** (C11b; owner ruling 2026-10-19 "B"): while Running, a `CefHealth` that
+//!   asks for one (`CefHealth::restart_cause`) exits at once like a fatal error, its cause on the
+//!   final beat, with `Restart`'s own code, so the host starts the process again and the overlay
+//!   comes back. Nothing is drained: the broadcast is to carry on. The hold and the drain ignore it
+//!   (they already end the process, exit 0), and so does booting (no CEF runs before the session).
 //! - **The final beat** (owner ruling 2026-10-15): every path to `Exit` sends a `Stopped` beat that
 //!   carries its reason first. A drain sends it when the drain starts; an immediate exit sends it in
 //!   the same `Decision`, before `Exit`. A fatal error's text rides its beat as `ExitInfo.detail`
@@ -37,6 +42,7 @@
 //! - **Generations.** Every adapter event carries the generation of the pipeline or page that sent
 //!   it, and each sub-machine ignores any other (C04, C05).
 use crate::backoff::delay;
+use crate::cef_health::CefHealth;
 use crate::config::Thresholds;
 use crate::graphics::{Graphics, GraphicsAction, GraphicsState, HideReason};
 use crate::health::{
@@ -135,6 +141,9 @@ pub enum Event {
     },
     /// The page's phase channel, as it reports it (overlay templates spec 2026-10-15 §4.3; C11).
     PhaseChannel(PhaseChannel),
+    /// CEF's health, read from the graphics adapter once per tick (C11b; C08 sends it). A fact about
+    /// the process, not a page, so it carries no generation and none is checked (`cef_health`).
+    CefHealth(CefHealth),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +278,14 @@ impl Supervisor {
     fn fatal(&mut self, now: Ms, detail: Option<ExitDetail>, fx: &mut Vec<Effect>) {
         self.exit_detail = detail;
         self.exit(now, ExitReason::Fatal, fx);
+    }
+
+    /// An in-place restart (C11b): the cause rides the final beat, then `Exit(75)`.
+    fn restart_in_place(&mut self, now: Ms, h: CefHealth, fx: &mut Vec<Effect>) {
+        if let Some(cause) = h.restart_cause(&self.t) {
+            self.exit_detail = Some(ExitDetail::new(cause.detail()));
+            self.exit(now, ExitReason::Restart, fx);
+        }
     }
 
     /// A heartbeat 410: web has ended the session. `Exit` alone, at once: no hold, no drain, and no
@@ -415,6 +432,7 @@ impl Supervisor {
             Event::Signal(SignalKind::Term) => self.start_drain(now, ExitReason::Signalled, fx),
             Event::Fatal { detail } => self.fatal(now, detail, fx),
             Event::HeartbeatRefused(HeartbeatRefusal::Gone) => self.gone(fx),
+            Event::CefHealth(h) => self.restart_in_place(now, h, fx),
             Event::OutputDrained
             | Event::BootstrapOk { .. }
             | Event::BootstrapFailed
@@ -472,8 +490,11 @@ impl Supervisor {
             // Web has ended the session: no Final card is owed to it (the hold is cut short).
             Event::HeartbeatRefused(HeartbeatRefusal::Gone) => self.gone(fx),
             // A second end request (the reply after the SIGINT, or the reverse) keeps the FIRST hold's
-            // clock. An overrun changes nothing: the hold is ≤ final_hold_ms.
+            // clock. An overrun changes nothing: the hold is ≤ final_hold_ms. CEF's health asks for
+            // nothing here (C11b): the hold already ends the process with exit 0, and a restart would
+            // cut the Final card short to boot a process for a session that is over.
             Event::HeartbeatReply(Desired::Ending)
+            | Event::CefHealth(_)
             | Event::Signal(SignalKind::Int)
             | Event::EncoderOverrun
             | Event::OutputDrained
@@ -2196,6 +2217,8 @@ mod tests {
             cef_alive_every_ms: 2_131,
             cef_hang_after_ms: 10_139,
             cef_rss_cap_mb: 601,
+            cef_leaks_to_restart: 5,
+            cef_gpu_deaths_to_restart: 7,
             ladder_overruns_to_step: 3,
             ladder_window_ms: 1_151,
             drain_timeout_ms: 4_157,

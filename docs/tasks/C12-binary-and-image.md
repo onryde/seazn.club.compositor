@@ -274,6 +274,11 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
 - (Amended 2026-10-15) The phase endpoint tests pass, and `final_hold_and_drain_fit_inside_r1_stop_grace`
   is green against the ruled 20 s grace (D15). It is never ignored or weakened to get there.
 - The image runs as non-root.
+- (Amended 2026-10-20, C11b) Exit 75 reaches the process's exit status in the fake-mode smoke, its last POST `fatal`
+  with a `restart in place: ` `exitDetail`; the `cef health` line is in
+  `graphics_log_lines_exist_in_both_driver_modes`, once per mode.
+- (Amended 2026-10-20, Owed 68) RLIMIT_CORE is 0 for the compositor and its CEF children, read from
+  `/proc/<pid>/limits` in the image test.
 
 
 ## Final heartbeat with the exit reason (owner ruling 2026-10-15)
@@ -600,6 +605,24 @@ image:
 - **Owed 58:** `TMPDIR` on a tmpfs for the compositor, nothing else writing there, and a short path
   (85 characters killed CEF at its start in a test, 59 ran). The adapter fails closed: a `TMPDIR` it
   cannot write is no overlay at all, never a profile under HOME.
+
+## Amendment 2026-10-20 (C11b: the in-place restart's exit, and no core file)
+
+- **Exit 75** (C11b, PR #34): `run()` returns 75 (`ExitReason::Restart`, sysexits' EX_TEMPFAIL) when CEF's health
+  asks for an in-place restart, after the final beat (`exitReason: "fatal"` until Owed 66, `exitDetail` starting
+  `restart in place: `). `main` exits with it, and tini passes it through, so the host's `on-failure` restarts the
+  process. Add a fake-mode smoke run: the fake graphics driver reports a dead zygote after `programme started`, and
+  the run exits 75 with that last POST.
+- **The log port gains a driver line** (C08 as amended): `cef health zygote_gone=<gen|-> leaked_teardowns=<n>
+  gpu_process_deaths=<n>`, on a change. `graphics_log_lines_exist_in_both_driver_modes` asserts it once in each mode,
+  driven by the fake graphics health.
+- **Owed 68: no core file** (the final C11 review's G1). Chromium's abort (a dead GPU zygote's next GPU death, the 6th
+  GPU death, C14 case 8's `pkill`) is SIGTRAP with a core: in the rig, with `ulimit -c` unlimited and `core_pattern`
+  `core`, a 93–117 MB core of the whole process landed in the cwd, the page token in it 46 and 61 times (and the
+  stream key and control token live in the same heap). The compositor runs with **RLIMIT_CORE 0**, inherited by CEF:
+  `setrlimit(RLIMIT_CORE, 0, 0)` first thing in `main` (or `ulimit -c 0` in the entrypoint before `exec`). An image
+  test reads `/proc/<compositor pid>/limits` and a CEF child's: `Max core file size 0 0`. Fly's own `core_pattern`
+  and RLIMIT_CORE are unmeasured, so the limit is ours either way.
 
 ## Do not touch
 

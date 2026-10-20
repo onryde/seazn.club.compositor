@@ -5,6 +5,7 @@
 #![forbid(clippy::print_stderr)]
 
 pub mod backoff;
+pub mod cef_health;
 pub mod config;
 pub mod graphics;
 pub mod health;

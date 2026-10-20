@@ -21,10 +21,15 @@
 //!   (`ticks skipped total=<n>`, `heartbeats dropped total=<n>`; review round 1, item 4): a line when
 //!   the count rises, at most one a minute, and whatever rose since the last line at the exit. No line
 //!   carries a credential or a fatal error's text.
+//! - **CEF's health** (C11b) is read from the graphics port once per `tick_due` that ran a tick, after
+//!   its ticks, and handed to `decide` every time (the domain decides the in-place restart, never the
+//!   driver), with one line when it changes (`cef health zygote_gone=<gen|-> leaked_teardowns=<n>
+//!   gpu_process_deaths=<n>`). Never after `Exit`.
 //! - **After `Exit`** nothing reaches a port from `step` or `tick_due`. `run()`'s flush follows, and
 //!   logs `final beat not confirmed within 2000 ms` when it times out.
 use std::time::Duration;
 
+use domain::cef_health::CefHealth;
 use domain::config::Thresholds;
 use domain::graphics::HideReason;
 use domain::health::ExitDetail;
@@ -107,6 +112,8 @@ pub struct Driver {
     drops: Tally,
     phase: ProgrammePhase,
     phase_seq: u64,
+    /// CEF's health as last read (C11b): its line is written when it changes.
+    cef: CefHealth,
     exited: bool,
 }
 
@@ -127,6 +134,7 @@ impl Driver {
             drops: Tally::default(),
             phase: ProgrammePhase::Waiting,
             phase_seq: 0,
+            cef: CefHealth::default(),
             exited: false,
         }
     }
@@ -174,7 +182,26 @@ impl Driver {
                 self.ports.programme.push(index, choice);
             }
         }
+        // An exit returned above, so a tick that ran means the driver is live.
+        if ran > 0 {
+            return self.cef_health(now);
+        }
         None
+    }
+
+    /// CEF's health, read once and handed to `decide` (C11b), with its line when it changed.
+    fn cef_health(&mut self, now: u64) -> Option<i32> {
+        let h = self.ports.graphics.health();
+        if h != self.cef {
+            self.cef = h;
+            let zygote = h.unrecoverable.map_or_else(|| "-".to_owned(), |g| g.to_string());
+            let line = format!(
+                "cef health zygote_gone={zygote} leaked_teardowns={} gpu_process_deaths={}",
+                h.leaked_teardowns, h.gpu_process_deaths
+            );
+            self.ports.log.info(&line);
+        }
+        self.decide(Event::CefHealth(h), now)
     }
 
     pub fn next_tick_at(&self) -> u64 {

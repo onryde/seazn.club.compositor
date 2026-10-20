@@ -339,6 +339,14 @@ started it.
 - The grid test covers both paths at every phase of both modes, and pins its case count.
 - 54 of 54 mutants red, none equivalent: 10 on the reason and generation each hide names, 16 on the bound (its comparison, its field, its anchor, its precedence over a restart, a load timeout and a recycle), 7 on how a life ends, 7 on the beat (C05b's, re-pinned), and 14 anti-vacuity mutants on the harness. With the matrix assert and the air probes switched off, the sweep's bound invariant alone still goes red on a held frame that never hides and on a bound 1 ms late.
 
+## Amendment 2026-10-20 (C11b: CEF's health is the process's, not this machine's)
+
+C11b (PR #34) adds no state or action here. A dead zygote, the GPU-process deaths and leaked teardowns are facts
+about the process's one CEF, so the supervisor reads them (`Event::CefHealth`) and restarts the process in place;
+this machine keeps the page's life (the beat, the crash count, the bound). One consequence: a renderers' zygote's
+death no longer walks graphics to `Failed` by its storm of `CefCrashed` (Owed 56's road), because the verdict reaches
+the domain within a child poll (1 s) and a tick, and the process exits first.
+
 ## Do not touch
 
 - The ladder, the links, the programme and the supervisor (C06 routes the event).

@@ -13,6 +13,7 @@ use app::ports::{
     HeartbeatError, Inbound, InputSource, InputSpec, LogSink, Measured, Metrics, PhasePublisher, Ports,
     ProgrammeOutput, SessionConfig, TargetSpec,
 };
+use domain::cef_health::CefHealth;
 use domain::config::OutputProfile;
 use domain::health::HealthReport;
 use domain::ladder::Rung;
@@ -167,8 +168,25 @@ impl ProgrammeOutput for FakeProgramme {
     }
 }
 
+/// CEF's health as `FakeGraphics` reports it (C11b): a test sets it, and reads how many times the
+/// driver asked. A cloneable handle, like `Log`, so it survives the move into `Ports`.
+#[derive(Debug, Clone, Default)]
+pub struct CefKnob(Arc<Mutex<(CefHealth, u64)>>);
+
+impl CefKnob {
+    pub fn set(&self, h: CefHealth) {
+        locked(&self.0).0 = h;
+    }
+
+    /// `GraphicsRenderer::health` calls so far.
+    pub fn reads(&self) -> u64 {
+        locked(&self.0).1
+    }
+}
+
+/// Records `restart` and `stop`; `health` reads the knob (a healthy process until a test sets it).
 #[derive(Debug)]
-pub struct FakeGraphics(pub Log);
+pub struct FakeGraphics(pub Log, pub CefKnob);
 
 impl FakeGraphics {
     /// The page's `seazn:alive` beat as C11 relays it (Owed 18), so a scenario sends it by name.
@@ -184,6 +202,12 @@ impl GraphicsRenderer for FakeGraphics {
 
     fn stop(&mut self) {
         self.0.push(Call::GraphicsStop);
+    }
+
+    fn health(&self) -> CefHealth {
+        let mut k = locked(&(self.1).0);
+        k.1 += 1;
+        k.0
     }
 }
 
@@ -239,13 +263,18 @@ impl LogSink for FakeLog {
 
 /// Every port faked onto one shared log.
 pub fn ports(log: &Log, metrics: Measured) -> Ports {
+    ports_with_cef(log, metrics, &CefKnob::default())
+}
+
+/// `ports`, with CEF's health read from `cef` (C11b).
+pub fn ports_with_cef(log: &Log, metrics: Measured, cef: &CefKnob) -> Ports {
     Ports {
         input: Box::new(FakeInput(log.clone())),
         programme: Box::new(FakeProgramme {
             log: log.clone(),
             fail_start: None,
         }),
-        graphics: Box::new(FakeGraphics(log.clone())),
+        graphics: Box::new(FakeGraphics(log.clone(), cef.clone())),
         metrics: Box::new(FakeMetrics(metrics)),
         control: Box::new(FakeControl {
             log: log.clone(),

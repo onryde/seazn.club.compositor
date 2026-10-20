@@ -10,6 +10,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use domain::cef_health::CefHealth;
 use domain::config::OutputProfile;
 use domain::health::HealthReport;
 use domain::ladder::Rung;
@@ -224,10 +225,13 @@ pub trait ProgrammeOutput: Send {
 /// `stop` returns without waiting: it takes `restart`'s reaper teardown and kill fallback, and before
 /// it returns it closes the stopped generation's slot gate, so no sample of that generation reaches
 /// the overlay slot after it. It never blocks the loop (F-001: `set_state(NULL)` did not return for
-/// 10 s on a hung renderer).
+/// 10 s on a hung renderer). `health` is what the adapter knows of CEF itself, one per process
+/// (C11b): the driver reads it once per `tick_due` that ran a tick, and the domain decides from it
+/// (`CefHealth::restart_cause`), never the adapter. It must not block: it reads counters.
 pub trait GraphicsRenderer: Send {
     fn restart(&mut self, gen: u64, url: &str);
     fn stop(&mut self);
+    fn health(&self) -> CefHealth;
 }
 
 /// The heartbeat's measured values (C12's `/proc` sampler plus C09's counters), sampled per beat.
@@ -245,7 +249,8 @@ pub trait PhasePublisher: Send {
 /// The driver's own log lines (C12's amendment 2026-10-18; C14 cases 8 and 11 and C15 read them):
 /// `overlay hidden reason=<r> gen=<g>`, `cef ready|crashed|alive gen=<n>`,
 /// `ticks skipped total=<n>` and `heartbeats dropped total=<n>` (at most one of each a minute, and
-/// the rest at the exit; review round 1, item 4), and `run()`'s
+/// the rest at the exit; review round 1, item 4), `cef health zygote_gone=<gen|-> leaked_teardowns=<n>
+/// gpu_process_deaths=<n>` when CEF's health changes (C11b), and `run()`'s
 /// `final beat not confirmed within 2000 ms` (Owed 35). The adapter (C12)
 /// writes each as `ts=<rfc3339> level=info msg=<line>` on stderr: the timestamp is the adapter's,
 /// because this crate reads no clock. No line carries a credential or a fatal error's text: the

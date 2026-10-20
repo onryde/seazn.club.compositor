@@ -28,7 +28,8 @@ use adapters::frame_store::FrameStore;
 use adapters::gst_programme::GstProgramme;
 use app::ports::{GraphicsRenderer, Inbound, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::Receiver;
-use domain::config::{OutputProfile, Thresholds};
+use domain::cef_health::CefHealth;
+use domain::config::{OutputProfile, Thresholds, CHROMIUM_GPU_DEATHS_ABORT};
 use domain::health::PhaseChannel;
 use domain::programme::{FrameChoice, SlateKind};
 use domain::supervisor::Event;
@@ -1294,12 +1295,20 @@ fn a_dead_zygote_either_one_is_reported() {
             .filter(|l| l.starts_with("zygote child:"))
             .map(str::to_owned)
             .collect();
+        let g4: Vec<String> = stderr
+            .lines()
+            .filter(|l| l.starts_with("zygote orphans:"))
+            .map(str::to_owned)
+            .collect();
         assert!(out.status.success(), "the {which} child failed:\n{stderr}");
         assert_eq!(mine.len(), 1, "{stderr}");
+        // G4 is checked in the GPU zygote's child only, and there once.
+        assert_eq!(g4.len(), usize::from(which == "gpu"), "{stderr}");
         checked.extend(mine);
+        checked.extend(g4);
     }
-    eprintln!("children checked: {}; {checked:?}", checked.len());
-    assert_eq!(checked.len(), 2);
+    eprintln!("children checked: 2, lines {}; {checked:?}", checked.len());
+    assert_eq!(checked.len(), 3);
 }
 
 // The PR #32 confirm pass's N1, pinned: why the GPU process's zygote's death is the verdict. With
@@ -1342,6 +1351,84 @@ fn a_gpu_process_death_after_its_zygotes_aborts_the_whole_process() {
         "no Chromium FATAL:\n{stderr}"
     );
     eprintln!("abort child: {:?}; {reached:?}", out.status);
+}
+
+// Owed 61 (C11b): Chromium aborts the process at the 6th GPU-process death of its life (F-013), so
+// the adapter counts each one, from real kills: the GPU process killed `cef_gpu_deaths_to_restart`
+// times (under the abort, which is the 6th), each counted once it is gone, and its relaunch killed next. It
+// spends the process's GPU deaths, so it runs in a child of its own.
+#[test]
+fn gpu_process_deaths_are_counted_from_real_kills() {
+    let _s = serial();
+    let name = "gpu_process_deaths_are_counted_from_real_kills";
+    if std::env::var_os("C11_CHILD").is_some() {
+        return gpu_deaths_case();
+    }
+    let out = rerun_in_child(name, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let reached: Vec<&str> = stderr.lines().filter(|l| l.starts_with("gpu child:")).collect();
+    assert!(
+        out.status.success(),
+        "the child failed ({:?}):\n{stderr}",
+        out.status
+    );
+    assert_eq!(reached.len(), 1, "{stderr}");
+    eprintln!("{}", reached[0]);
+}
+
+fn gpu_deaths_case() {
+    let n = Thresholds::default().cef_gpu_deaths_to_restart;
+    assert!(n < CHROMIUM_GPU_DEATHS_ABORT, "the child would abort");
+    let mut r = rig();
+    r.g.restart(1, &page(""));
+    events_until(&r.rx, load_timeout(), ready(1));
+    assert!(two_polls(&r.g), "the child poll stopped");
+    assert_eq!(
+        r.g.health(),
+        CefHealth::default(),
+        "healthy before the first kill"
+    );
+    let mut killed: Vec<i32> = Vec::new();
+    for k in 1..=n {
+        // The GPU process now: the first one, then each relaunch (a pid not killed yet).
+        let mut pid = None;
+        let found = wait_for(hang_bound(), || {
+            pid = cef_children()
+                .iter()
+                .find(|c| c.kind == "gpu-process" && !killed.contains(&c.pid))
+                .map(|c| c.pid);
+            pid.is_some()
+        });
+        let pid = pid
+            .filter(|_| found)
+            .unwrap_or_else(|| panic!("death {k}: no GPU process"));
+        // A poll has listed it before it dies (a pid no poll saw cannot be counted).
+        assert!(two_polls(&r.g), "the child poll stopped");
+        let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).status();
+        killed.push(pid);
+        assert!(
+            wait_for(hang_bound(), || r.g.health().gpu_process_deaths >= k),
+            "death {k} (pid {pid}) was not counted: {:?}",
+            r.g.health()
+        );
+        assert_eq!(r.g.health().gpu_process_deaths, k, "death {k}: counted once");
+    }
+    assert!(two_polls(&r.g), "the child poll stopped");
+    let h = r.g.health();
+    assert_eq!(h.gpu_process_deaths, n, "{h:?}");
+    assert_eq!(h.unrecoverable, None, "the zygotes live: {h:?}");
+    assert!(
+        wait_line(&r, hang_bound(), &[&format!("{n} in this process")]),
+        "{:?}",
+        lines(&r)
+    );
+    let warned = lines(&r)
+        .iter()
+        .filter(|l| l.starts_with("WARN gen=1:") && l.contains("GPU process(es) gone"))
+        .count();
+    assert_eq!(warned, n, "one line per poll that saw a death: {:?}", lines(&r));
+    eprintln!("gpu child: {n} GPU processes killed {killed:?}, {h:?}");
+    r.g.stop();
 }
 
 /// `C11_ZYGOTE`, in a zygote test's child.
@@ -1411,6 +1498,26 @@ fn zygote_case(which: &str) {
         "{:?}",
         lines(&r)
     );
+    if which != "renderer" {
+        // The final C11 review's G4: the dead zygote's GPU process is reparented away and leaves
+        // `cef_children()` while it lives on. It is no GPU-process death until it is gone (C11b).
+        assert!(two_polls(&r.g), "the child poll stopped");
+        let orphans: Vec<i32> = gpu_processes.iter().copied().filter(|p| alive(*p)).collect();
+        let tree: Vec<i32> = cef_children().iter().map(|k| k.pid).collect();
+        let h = r.g.health();
+        eprintln!("zygote orphans: GPU processes {gpu_processes:?}, alive {orphans:?}, {h:?}");
+        // Anti-vacuity: an orphan to check. One that died has aborted this process already (F-013).
+        assert!(!orphans.is_empty(), "G4: no orphan to check: {gpu_processes:?}");
+        assert!(
+            orphans.iter().all(|p| !tree.contains(p)),
+            "G4: {orphans:?} still in {tree:?}"
+        );
+        assert_eq!(
+            h.gpu_process_deaths,
+            gpu_processes.len() - orphans.len(),
+            "G4: an orphan that lives is no death"
+        );
+    }
     match which {
         "renderer" => {
             // The next build fails at once (F-013).
