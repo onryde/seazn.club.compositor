@@ -274,8 +274,9 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
 - (Amended 2026-10-15) The phase endpoint tests pass, and `final_hold_and_drain_fit_inside_r1_stop_grace`
   is green against the ruled 20 s grace (D15). It is never ignored or weakened to get there.
 - The image runs as non-root.
-- (Amended 2026-10-20, C11b) Exit 75 reaches the process's exit status in the fake-mode smoke, its last POST `fatal`
-  with a `restart in place: ` `exitDetail`; the `cef health` line is in
+- (Amended 2026-10-20, C11b) Exit 75 reaches the process's exit status in the fake-mode smoke, its last POST ~~`fatal`~~
+  `restart` (amended 2026-10-20, Owed 66: web's #1000, contract re-vendored at `dec7b95d9`) with a `restart in place: `
+  `exitDetail`; the `cef health` line is in
   `graphics_log_lines_exist_in_both_driver_modes`, once per mode.
 - (Amended 2026-10-20, Owed 68) RLIMIT_CORE is 0 for the compositor and its CEF children, read from
   `/proc/<pid>/limits` in the image test.
@@ -626,6 +627,71 @@ image:
   `setrlimit(RLIMIT_CORE, 0, 0)` first thing in `main` (or `ulimit -c 0` in the entrypoint before `exec`). An image
   test reads `/proc/<compositor pid>/limits` and a CEF child's: `Max core file size 0 0`. Fly's own `core_pattern`
   and RLIMIT_CORE are unmeasured, so the limit is ours either way.
+
+## Amendment 2026-10-20 (C12 as built; Owed 66's compositor follow-up; the owner's rulings)
+
+`docs/_INDEX.md` decision rows "C12, as built" and "Owner rulings 2026-10-20" hold the detail.
+
+- **Exit 75's final beat says `restart`** (Owed 66, compositor follow-up). Web's #1000 (`dec7b95d9`) added the word to
+  the strict beat enum; the contract is re-vendored at that commit (`relay-job.v1.json` sha `e6568677…a06a23`, plus
+  `heartbeat-final-restart.json`), `exit_reason_wire` maps `ExitReason::Restart` to `restart`, and the contract sweep's
+  `restart` row and `the_final_beat_under_a_410_is_gone` moved with it. The exit-75 smoke asserts the vendored
+  fixture's `state`, `exitReason` and `exitDetail` on the last POST.
+- **The inbound channel** (C08 amendment: "record the choice in this brief"): bounded at 1 024
+  (`wiring::INBOUND_CAPACITY`), never drop-oldest. The control worker and the signal thread `send` (blocking), so no
+  worker result is lost; every adapter and the fake drain `try_send` (each counts or logs a drop), so the loop never
+  blocks on its own channel.
+- **"fake-control" is this task's own server**, in `tests/fake_run.rs` (tiny_http): C13's harness is not built. The
+  fake mode takes three knobs, read only when `COMPOSITOR_DRIVERS=fake`: `COMPOSITOR_FAKE_CONTROL=http` (the real
+  `HttpControlPlane` against `APP_URL`; the scripted plane otherwise), `COMPOSITOR_FAKE_START_FAIL=<text>` and
+  `COMPOSITOR_FAKE_ZYGOTE_GONE=1`.
+- **`GstInput` is built lazily** (false premise): its frame size is the session's profile, so `LazyInput` builds it
+  at the first rebuild after a successful `start` and refuses an earlier rebuild with a warn line.
+- **The phase endpoint's origin is the page's** (F-009; the PR #20 review's M6, option (ii) taken per page): it starts
+  as APP_URL's origin and moves to the overlay URL's origin before each graphics restart (`PageOrigin`).
+- **`R1_STOP_GRACE_MS` and `EXIT_HEADROOM_MS` live in `crates/compositor/src/lib.rs`**, not `main.rs`: a test cannot
+  import from a binary.
+- **The Dockerfile follows F-001 and the C00 spike**, not this brief's sketch: the runtime and build library lists,
+  `strip` of `libcef.so`, the pin in `docker/GSTCEF_COMMIT` (image.yml reads it; a trailing `# from F-001` on the
+  `ARG` line would be part of the instruction), a `cef-test` stage running C11's tests as uid 10001, and a
+  `gst-inspect-1.0` check of every element factory the adapters make.
+- **The image test of Owed 58 and 68** is `scripts/image_probe.py`: one live-mode run against a fake control plane on
+  the runner, reading `/proc/<pid>/limits` of the compositor and every CEF child, `TMPDIR` (`/dev/shm/seazn`, 0700,
+  tmpfs, the CEF profile inside), the environment (no `GST_CEF_LOG_SEVERITY`, no `GST_DEBUG`), then `docker stop`:
+  exit 0, the last POST `signalled`, no token in the log.
+- **The hand mutants are written, not run** (Owed 75): the owner stopped local VMs on 2026-10-20 (relayed by the
+  coordinator) before Step 9, and CI runs no mutants. One witness exists: before the wire fix, the unmapped `Restart`
+  word reddened `a_dead_zygote_exits_75_posting_restart`. The list (each alone; expected red in brackets):
+
+  | # | Mutant | Expected red |
+  |---|---|---|
+  | 1 | unset `COMPOSITOR_DRIVERS` defaults to fake in release (`env.rs`) | `drivers_unset_refuses_in_release…` |
+  | 2 | `EnvError::Missing` carries the token (a leaked `format!`) | `missing_each_required_key_is_refused_naming_the_key` |
+  | 3 | `encoder_speed: None` in `ProcMetrics::sample` | `copies_every_stats_field_into_measured` |
+  | 4 | the `NotLoopback` guard off (`if false && …`) | `binds_loopback_only` |
+  | 5 | `Access-Control-Allow-Origin: *` | `serves_the_published_phase…`, `preflight_allows_private_network…` |
+  | 6 | the private-network header dropped | `preflight_allows_private_network…` |
+  | 7 | `wait_past` answers at once | `long_poll_waits_for_a_newer_seq…` |
+  | 8 | `phase_endpoint`'s bind failure exits 70 | `phase_port_taken_still_runs_to_exit_zero` |
+  | 9 | no `setrlimit` in `main` | `the_compositor_runs_with_no_core_file_limit` |
+  | 10 | `Clock::now_ms` reads the wall per call | `now_ms_is_monotonic_across_a_wall_clock_step` |
+  | 11 | `LazyInput` builds at 720p with no started profile | `lazy_input_is_built_once_from_the_started_profile` |
+  | 12 | `PageOrigin` never moves the origin | `the_phase_endpoint_answers_the_overlay_urls_origin` |
+  | 13 | `LoggedPlane::final_lane` returns the inner lane | `a_failed_final_beat_is_logged_scrubbed_on_the_final_lane` |
+  | 14 | the plane's refusal exits 70 | `a_job_token_with_a_cr_exits_78_and_never_prints_it` |
+  | 15 | `LoggedPlane` never learns the session | `start_failure_exits_70_with_the_detail_scrubbed_of_a_bare_key` |
+  | 16 | `Restart` on the wire as `fatal` | `the_restart_beat_is_the_vendored_restart_fixture`, `the_final_beat_under_a_410_is_gone`, `a_dead_zygote_exits_75_posting_restart` (witnessed) |
+  | 17 | `DrainingFake` never queues `OutputDrained` | `fake_mode_drain_reports_output_drained`, `fake_run_exits_zero_through_the_drain…` |
+  | 18 | no CR/LF escape in `Logger::line` | `log_lines_are_rfc3339_ms_one_per_message_and_masked` |
+  | 19 | `add_session` drops the page token | `add_session_learns_all_four_credentials` |
+  | 20 | an empty value is not missing | `missing_each_required_key…` |
+  | 21 | `ProfileTap` records a failed start | `lazy_input_is_built_once_from_the_started_profile` |
+  | 22 | the swap line's URL unredacted | `logged_programme_logs_start_swap…`, `graphics_log_lines_exist_in_both_driver_modes` |
+  | 23 | a 5th poll admitted | `fifth_concurrent_poll_is_refused_503` |
+  | 24 | the first sample's CPU is `Some(0.0)` | `first_sample_has_no_cpu` |
+- **The owner's rulings of 2026-10-20** change no C12 code: the exit-based restart stays (C14 measures its outage),
+  leaked teardowns below 3 stay until the session ends, the outage target is 15 s, and web caps self-restarts at 6 a
+  session.
 
 ## Do not touch
 
