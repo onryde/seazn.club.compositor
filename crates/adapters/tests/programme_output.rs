@@ -933,6 +933,30 @@ fn audio_ring_is_bounded_at_400ms_and_pads_silence() {
     assert_eq!((f.audio_level(), f.audio_refused()), (0, 1));
 }
 
+/// The PR #35 review's m1: `clear_audio` empties the ring and says how much it dropped (the input's
+/// abandon, loss and rebuild call it), and `audio_taken` counts the ring's real bytes handed out,
+/// never the padding, so a test can tell what of a camera's audio went on air. The sequence: an
+/// empty ring, a second clear, and a take after a clear.
+#[test]
+fn clear_audio_empties_the_ring_and_audio_taken_counts_real_bytes_only() {
+    let f = FrameStore::default();
+    assert_eq!(f.clear_audio(), 0, "an empty ring drops nothing");
+    assert_eq!(f.audio_taken(), 0);
+    f.push_audio(&[7u8; 4_000]);
+    assert_eq!(f.take_audio(1_000).len(), 1_000);
+    assert_eq!(f.audio_taken(), 1_000);
+    assert_eq!(f.clear_audio(), 3_000, "the rest of the ring");
+    assert_eq!(f.audio_level(), 0);
+    assert_eq!(f.clear_audio(), 0, "a second clear drops nothing");
+    let pad = f.take_audio(6_400);
+    assert_eq!(pad, vec![0u8; 6_400], "after a clear only padding comes out");
+    assert_eq!(f.audio_taken(), 1_000, "padding is not counted");
+    f.push_audio(&[9u8; 400]);
+    let mixed = f.take_audio(1_000);
+    assert_eq!(&mixed[600..], &[9u8; 400][..], "the real bytes come last");
+    assert_eq!(f.audio_taken(), 1_400, "only the 400 real bytes of a padded take");
+}
+
 // ---------------------------------------------------------------------------------------------
 // Amendment 2026-10-15: the textless slate
 

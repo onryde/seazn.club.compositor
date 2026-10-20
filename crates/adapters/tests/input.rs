@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use adapters::frame_store::{FrameStore, AUDIO_CHANNELS, AUDIO_RATE, AUDIO_RING_BYTES};
+use adapters::frame_store::{FrameStore, AUDIO_CHANNELS, AUDIO_FRAME_BYTES, AUDIO_RATE, AUDIO_RING_BYTES};
 use adapters::gst_input::GstInput;
 use adapters::gst_programme::GstProgramme;
 use app::ports::{Inbound, InputSource, InputSpec, ProgrammeOutput, TargetSpec};
@@ -503,20 +503,23 @@ fn listener_closing_reports_an_error_loss_with_the_right_generation() {
 /// Brief test 4: after `rebuild(2)` returns, nothing of generation 1 reaches the camera slot or the
 /// audio ring, though the retired pipeline is still running and delivering (its teardown is held 3 s).
 /// Generation 2's start is held 2 s, so in that window the only pipeline delivering is the retired
-/// one: any change to the slot or the ring is generation 1's. Then generation 2 takes over.
+/// one: any change to the slot or the ring is generation 1's. Then generation 2 takes over. The
+/// rebuild also empties the ring of what generation 1 left in it, so none of that plays under the
+/// next camera (the PR #35 review's m1): nothing here drains it by hand. No abandon, so no
+/// `video again` line (Owed 49's is an abandoned build's alone).
 #[test]
 fn rebuild_tears_down_the_old_pipeline() {
     let _s = serial();
     let l = Listener::new(&cfg(640, 360));
-    let (mut input, rx, frames, _lines) = input(&P720);
+    let (mut input, rx, frames, lines) = input(&P720);
     connect(&mut input, &rx, 1, &spec(l.port));
     assert_eq!(input.generation_of_last_frame(), Some(1));
     input.delay_teardowns(Duration::from_secs(3));
     let hold = input.hold_starts();
     let dropped_before = input.gate_dropped();
+    let ring_before = frames.audio_level();
     input.rebuild(2, &spec(l.port));
     let pts = camera_pts(&frames);
-    frames.take_audio(frames.audio_level());
     let end = Instant::now() + Duration::from_millis(1_800);
     let mut reads = 0;
     while Instant::now() < end {
@@ -529,8 +532,16 @@ fn rebuild_tears_down_the_old_pipeline() {
     let gate = input.gate_dropped() - dropped_before;
     hold.release();
     events_until(&rx, connect_budget(), |e| *e == Event::InputConnected { gen: 2 });
-    eprintln!("slot and ring reads: {reads}; generation-1 samples dropped at the gate: {gate}");
+    eprintln!(
+        "slot and ring reads: {reads}; generation-1 samples dropped at the gate: {gate}; ring \
+         {ring_before} B before the rebuild"
+    );
     assert!(reads > 100, "{reads} reads");
+    assert!(
+        ring_before > 0,
+        "generation 1 left audio in the ring for the rebuild to empty"
+    );
+    assert_eq!(lines_with(&lines, "video again"), 0, "nothing was abandoned");
     assert!(
         gate > 0,
         "the retired pipeline delivered while held, and the gate dropped it"
@@ -877,7 +888,9 @@ fn eos_and_error_are_told_apart_once_a_generation() {
 }
 
 /// After the adapter reports a generation lost, nothing of it reaches the slot or the loop, though its
-/// pipeline (a planted error leaves it running) keeps delivering: the gate drops those samples.
+/// pipeline (a planted error leaves it running) keeps delivering: the gate drops those samples. The
+/// loss also empties the ring of the generation's audio (the PR #35 review's m1): nothing here drains
+/// it by hand.
 #[test]
 fn a_lost_generation_writes_nothing_more() {
     let _s = serial();
@@ -885,19 +898,21 @@ fn a_lost_generation_writes_nothing_more() {
     let (mut input, rx, frames, _lines) = input(&P720);
     connect(&mut input, &rx, 1, &spec(l.port));
     events_for(&rx, Duration::from_millis(300));
+    let before = frames.audio_level();
     assert!(input.plant_error("planted"));
     events_until(&rx, LOSS_BUDGET, |e| matches!(e, Event::InputLost { .. }));
     let pts = camera_pts(&frames);
     let dropped = input.gate_dropped();
-    let emptied = frames.take_audio(frames.audio_level()).len();
+    let at_loss = frames.audio_level();
     let after = events_for(&rx, Duration::from_secs(1));
     let gate = input.gate_dropped() - dropped;
     let ring = frames.audio_level();
     eprintln!(
-        "events after the loss: {after:?}; ring {emptied} bytes before, {ring} after; samples dropped \
-         at the gate: {gate}"
+        "events after the loss: {after:?}; ring {before} bytes before, {at_loss} at the loss, {ring} \
+         after; samples dropped at the gate: {gate}"
     );
-    assert!(emptied > 0, "audio reached the ring before the loss");
+    assert!(before > 0, "audio reached the ring before the loss");
+    assert_eq!(at_loss, 0, "the loss emptied the ring of the generation's audio");
     assert!(after.is_empty(), "{after:?}");
     assert_eq!(
         camera_pts(&frames),
@@ -1220,14 +1235,14 @@ fn frames_after_the_domain_gives_up_never_reach_the_programme() {
     }
     assert_eq!(input.abandoned(), 0, "the adapter gave nothing up by itself");
     // The domain gives gen 1 up mid-pause: nothing more of it reaches the slot or the loop.
-    let (mut in_flight, mut pts, mut dropped) = (0, None, 0);
+    let (mut in_flight, mut pts, mut dropped, mut ring_before) = (0, None, 0, 0);
     pause(&l, rules.input_stall_after_ms + 1_000, || {
+        ring_before = frames.audio_level();
         input.abandon(1);
         // The frames in flight at the pause (the SRT latency's second) came in its first second.
         in_flight = rx.try_iter().count();
         pts = camera_pts(&frames);
         dropped = input.gate_dropped();
-        let _ = frames.take_audio(frames.audio_level());
     });
     let after = events_for(&rx, Duration::from_secs(2));
     let gate = input.gate_dropped() - dropped;
@@ -1235,13 +1250,20 @@ fn frames_after_the_domain_gives_up_never_reach_the_programme() {
     pauses += 1;
     eprintln!(
         "pauses checked: {pauses}; events in flight at the abandon {in_flight}; events after it: \
-         {after:?}; samples dropped at the gate: {gate}; audio bytes after it {audio_after}; \
-         abandoned {}",
+         {after:?}; samples dropped at the gate: {gate}; audio bytes {ring_before} before it, \
+         {audio_after} after it; abandoned {}",
         input.abandoned()
     );
     assert_eq!(pauses, 3);
     assert!(after.is_empty(), "{after:?}");
-    assert_eq!(audio_after, 0, "none of the generation's audio reached the ring");
+    assert!(
+        ring_before > 0,
+        "the generation's audio was in the ring at the abandon"
+    );
+    assert_eq!(
+        audio_after, 0,
+        "the abandon emptied the ring, and none came after it"
+    );
     assert_eq!(
         camera_pts(&frames),
         pts,
@@ -1256,6 +1278,11 @@ fn frames_after_the_domain_gives_up_never_reach_the_programme() {
         lines_with(&lines, "gen=1: abandoned by the domain"),
         1,
         "one line for it"
+    );
+    assert_eq!(
+        lines_with(&lines, "gen=1: video again"),
+        1,
+        "the connection's video came back once, gated"
     );
     finish(input);
 }
@@ -1309,12 +1336,11 @@ fn a_late_connect_is_dropped_and_a_fresh_generation_connects() {
     assert!(frames_in(&kept) >= FRAMES_IN_THE_FIRST_SECOND);
     assert_eq!(input.abandoned(), 0, "the adapter gave nothing up by itself");
     // The domain gave gen 2 up at its timeout, before the first frame came. Gen 1 was retired by
-    // the rebuild, so what it left is cleared at the abandon.
+    // the rebuild, which emptied the ring of its audio (m1): nothing here drains it by hand.
     let (mut pts, mut dropped) = (None, 0);
     let late = late_start(&mut input, &rx, 2, &spec(l.port), late_by, |i| {
         let _ = rx.try_iter().count();
         pts = camera_pts(&frames);
-        let _ = frames.take_audio(frames.audio_level());
         dropped = i.gate_dropped();
         i.abandon(2);
     });
@@ -1402,21 +1428,34 @@ fn audio_stops_with_the_video_when_the_domain_gives_up() {
         .filter(|(t, _)| *t > rule)
         .map(|&(_, n)| n)
         .collect();
+    // No hand drain after the call: the abandon itself empties the ring (the PR #35 review's m1).
+    // The reads above leave it empty, so 200 ms of audio is let in first, for the call to flush.
+    thread::sleep(Duration::from_millis(200));
+    let at_abandon = frames.audio_level();
     input.abandon(1);
-    let _ = frames.take_audio(frames.audio_level());
+    let abandoned_at = Instant::now();
+    let flushed = frames.audio_level();
     let mut after = Vec::new();
     let t1 = Instant::now();
     read(t1, 2_000, &mut after);
     let past: usize = after.iter().map(|(_, n)| n).sum();
     // The video comes back: still nothing of the generation passes.
     let _ = rx.try_iter().count();
+    let restored_ms = abandoned_at.elapsed().as_millis();
     drop_video.store(false, Ordering::SeqCst);
     let back = events_for(&rx, Duration::from_secs(2));
     let audio_back = frames.audio_level();
+    let again = ms_after_the_abandon(&lines, 1);
     eprintln!(
         "audio bytes per 500 ms read after the video died: {before:?} (past the rule {past_rule:?}); \
-         after the abandon {after:?}; video back: events {back:?}, audio {audio_back}"
+         ring {at_abandon} B before the abandon, {flushed} B after it; after the abandon {after:?}; \
+         video back {restored_ms} ms after it: events {back:?}, audio {audio_back}, logged {again:?}"
     );
+    assert!(
+        at_abandon > 0,
+        "the generation's audio was in the ring at the abandon"
+    );
+    assert_eq!(flushed, 0, "the abandon emptied the ring");
     assert!(
         past_rule.len() >= 2,
         "the window past the rule was read: {before:?}"
@@ -1438,7 +1477,27 @@ fn audio_stops_with_the_video_when_the_domain_gives_up() {
         1,
         "one line for it"
     );
+    // Owed 49's line: the video came back after the abandon, logged once with its delay, and the
+    // audio that flowed all along never produced it.
+    assert_eq!(again.len(), 1, "one line: {again:?}");
+    assert!(
+        u128::from(again[0]) >= restored_ms,
+        "the delay {again:?} ms is the video's, which came back {restored_ms} ms after the abandon"
+    );
     finish(input);
+}
+
+/// The delays the adapter logged for `gen`'s first video sample after the abandon (Owed 49).
+fn ms_after_the_abandon(lines: &Lines, gen: u64) -> Vec<u64> {
+    let head = format!("gen={gen}: video again ");
+    lines
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .filter_map(|l| l.strip_prefix(&head))
+        .filter_map(|rest| rest.split(' ').next())
+        .map(|ms| ms.parse().expect("a delay in ms"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1470,10 +1529,11 @@ fn abandon_shuts_the_current_build_out_at_once() {
         frames_in(&before) > 0,
         "frames flowed before the call: {before:?}"
     );
+    let ring_before = frames.audio_level();
     input.abandon(1);
-    // Whatever the build sent before the call is queued already; the call shut the gate.
+    // Whatever the build sent before the call is queued already; the call shut the gate and emptied
+    // the ring of the build's audio (m1), so nothing here drains it by hand.
     let _ = rx.try_iter().count();
-    let _ = frames.take_audio(frames.audio_level());
     let pts = camera_pts(&frames);
     let dropped = input.gate_dropped();
     input.abandon(1);
@@ -1482,12 +1542,17 @@ fn abandon_shuts_the_current_build_out_at_once() {
     let audio = frames.audio_level();
     let state = input.pipeline().map(|p| p.current_state());
     eprintln!(
-        "after abandon(1): events {after:?}; dropped at the gate {gate}; audio bytes {audio}; \
-         pipeline {state:?}; abandoned {}",
-        input.abandoned()
+        "after abandon(1): events {after:?}; dropped at the gate {gate}; audio bytes {ring_before} \
+         before, {audio} after; pipeline {state:?}; abandoned {}; video again {:?} ms",
+        input.abandoned(),
+        ms_after_the_abandon(&lines, 1)
     );
     assert!(after.is_empty(), "{after:?}");
-    assert_eq!(audio, 0, "none of its audio reached the ring");
+    assert!(ring_before > 0, "the build's audio was in the ring at the call");
+    assert_eq!(
+        audio, 0,
+        "the call emptied the ring, and none of its audio came after"
+    );
     assert_eq!(camera_pts(&frames), pts, "the slot keeps its last frame");
     assert!(
         gate > 0,
@@ -1496,6 +1561,11 @@ fn abandon_shuts_the_current_build_out_at_once() {
     assert_eq!(state, Some(gst::State::Playing), "abandon tears nothing down");
     assert_eq!(input.abandoned(), 1, "the second call changed nothing");
     assert_eq!(lines_with(&lines, "gen=1: abandoned by the domain"), 1);
+    assert_eq!(
+        ms_after_the_abandon(&lines, 1).len(),
+        1,
+        "the connection kept delivering, and its first gated video sample is logged once"
+    );
     finish(input);
 }
 
@@ -1582,6 +1652,94 @@ fn abandon_after_a_reported_loss_changes_nothing() {
     assert!(after.is_empty(), "{after:?}");
     assert_eq!(input.abandoned(), 0);
     assert_eq!(lines_with(&lines, "gen=1: abandon: its gate was already shut"), 1);
+    finish(input);
+}
+
+/// The PR #35 review's m1, measured with the real programme: none of a given-up generation's audio
+/// goes on air. The programme takes one period of the ring a tick at 30 fps, whatever its phase, so
+/// what the build left in the ring at the abandon would play over the next ticks (the review's probe
+/// P2, before the flush: 57 ms with the ring drained, 293–394 ms behind a backlog, all of it played
+/// out within 30 ticks). Four generations, each abandoned mid-run behind a fresh programme: the ring
+/// is empty when the call returns, and the programme plays 0 bytes of the ring's audio in the 30
+/// ticks after it (pink noise only). Anti-vacuity: each programme played the camera's audio before
+/// the abandon, and at least one abandon found audio in the ring to flush.
+#[test]
+fn none_of_a_given_up_generations_audio_reaches_the_programme() {
+    let _s = serial();
+    let l = Listener::new(&cfg(640, 360));
+    let (mut input, rx, frames, lines) = input(&P720);
+    let per_ms = AUDIO_RATE as usize * AUDIO_FRAME_BYTES / 1_000;
+    let after_ticks = 30;
+    let mut rows = Vec::new();
+    for gen in 1..=4u64 {
+        connect(&mut input, &rx, gen, &spec(l.port));
+        let (ptx, _prx) = crossbeam_channel::bounded(8_192);
+        let mut p = GstProgramme::new(frames.clone(), ptx);
+        p.start(&P720).expect("programme");
+        let dir = std::env::temp_dir().join(format!("c10b-flush-{}-{gen}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        p.swap_sink(
+            1,
+            &TargetSpec {
+                url: format!("file://{}", dir.join("p.flv").display()),
+                stream_key: String::new(),
+            },
+        );
+        let step = Duration::from_nanos(1_000_000_000 / u64::from(P720.fps));
+        let abandon_at = 60 + 7 * gen;
+        let started = frames.audio_taken();
+        let (mut ring_at, mut played_before, mut from, mut emptied) = (0, 0, 0, usize::MAX);
+        let t0 = Instant::now();
+        for i in 0..abandon_at + after_ticks {
+            if let Some(wait) = (t0 + step * i as u32).checked_duration_since(Instant::now()) {
+                thread::sleep(wait);
+            }
+            if i == abandon_at {
+                ring_at = frames.audio_level();
+                input.abandon(gen);
+                from = frames.audio_taken();
+                emptied = frames.audio_level();
+                played_before = from - started;
+            }
+            p.push(i, FrameChoice::Emit);
+        }
+        let played_after = frames.audio_taken() - from;
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = rx.try_iter().count();
+        rows.push((
+            gen,
+            ring_at,
+            ring_at / per_ms,
+            emptied,
+            played_before,
+            played_after,
+        ));
+    }
+    let flushed = rows.iter().filter(|r| r.1 > 0).count();
+    eprintln!(
+        "per generation (gen, ring B at the abandon, its ms, ring B after the call, ring B played \
+         before it, ring B played in the {after_ticks} ticks after it): {rows:?}; {} abandons, {flushed} \
+         with audio to flush; abandon lines {}",
+        rows.len(),
+        lines_with(&lines, "abandoned by the domain")
+    );
+    assert_eq!(rows.len(), 4);
+    for &(gen, _, _, emptied, played_before, played_after) in &rows {
+        assert!(
+            played_before > 0,
+            "gen {gen}: the programme played the camera's audio before"
+        );
+        assert_eq!(emptied, 0, "gen {gen}: the abandon emptied the ring");
+        assert_eq!(
+            played_after, 0,
+            "gen {gen}: none of its audio went on air after the abandon"
+        );
+    }
+    assert!(
+        flushed >= 1,
+        "at least one abandon found audio to flush: {rows:?}"
+    );
     finish(input);
 }
 

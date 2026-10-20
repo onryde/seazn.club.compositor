@@ -204,7 +204,8 @@ pub trait ControlPlane: Send {
 /// Input A's SRT pipeline (C10). `rebuild` tears down the current generation and builds `gen`;
 /// `stop` ends it for good (the drain, the exit). `abandon` (C10b, Owed 50) is the domain's word that
 /// it has given generation `gen` up by its own rule (the connect timeout or the stall rule): before
-/// it returns, nothing more of that generation (video, audio or event) passes the adapter, and the
+/// it returns, nothing more of that generation (video, audio or event) passes the adapter, its
+/// audio already buffered for the programme is dropped too (so none of it goes on air), and the
 /// next `rebuild` tears it down. The adapter keeps no copy of those rules. A `gen` that is not the
 /// current build's (one already rebuilt past, or after `stop`) changes nothing, and so does a second
 /// call. It never blocks the loop: it closes a gate.

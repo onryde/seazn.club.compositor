@@ -34,7 +34,9 @@
 //! **The gate.** One field holds the build whose samples and events may pass. It closes, before the
 //! call returns or the event is sent, on `rebuild` (for the old build), on `abandon`, on `stop`, on
 //! the drop, and when this adapter reports a generation lost; a sample from a closed build is dropped
-//! and counted.
+//! and counted. A close for `abandon` or a loss, and every `rebuild`, also empties the frame store's
+//! audio ring (the PR #35 review's m1): the ring has no generation of its own, and what the build left
+//! in it would otherwise go on air over the programme's next ticks.
 //! The gate is what keeps a torn-down pipeline's late frames out of the slot; the generation each
 //! `InputFrame` carries (C10b) is what lets the domain ignore one already queued when the gate shut.
 //!
@@ -62,7 +64,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use app::ports::{redacted_origin, Inbound, InputSource, InputSpec};
 use crossbeam_channel::Sender;
@@ -147,15 +149,18 @@ impl Shared {
         (self.log)(&clean);
     }
 
-    /// Closes the gate if `build` is the open one. True when this call closed it: the generation's
-    /// loss is decided here, once, and nothing of that build reaches the slot or the loop afterwards.
-    fn close(&self, build: u64) -> bool {
+    /// Closes the gate if `build` is the open one, and empties the audio ring under the same lock:
+    /// what the build pushed and the programme has not played yet is the build's alone (the ring's
+    /// only writer is the open build), so none of it goes on air after the close (the PR #35
+    /// review's m1). `Some(bytes flushed)` when this call closed it: the generation's loss is decided
+    /// here, once, and nothing of that build reaches the slot, the ring or the loop afterwards.
+    fn close(&self, build: u64) -> Option<usize> {
         let mut open = locked(&self.gate);
         if *open != Some(build) {
-            return false;
+            return None;
         }
         *open = None;
-        true
+        Some(self.frames.clear_audio())
     }
 
     /// `InputLost { gen, reason }` for a loss already decided. It waits for room: this runs on the
@@ -167,7 +172,7 @@ impl Shared {
 
     /// Decides `gen` lost and reports it, once: only while `build` is the open one.
     fn lose(&self, build: u64, gen: u64, reason: LossReason) {
-        if self.close(build) {
+        if self.close(build).is_some() {
             self.report(gen, reason);
         }
     }
@@ -194,6 +199,9 @@ struct Live {
     gen: u64,
     /// The gate's key for this build (`Shared::gate`).
     build: u64,
+    /// When the domain gave this build up (`abandon`), until its first video sample after that is
+    /// logged (Owed 49).
+    abandoned_at: Arc<Mutex<Option<Instant>>>,
     pipeline: gst::Pipeline,
     /// Ends the build's thread: it then tears the pipeline down.
     stop: Arc<AtomicBool>,
@@ -512,13 +520,15 @@ impl GstInput {
         .map_err(|e| format!("input audio chain: {e}"))?;
 
         self.link_demux(&demux, &vqueue, &aqueue, gen);
-        self.wire_video(&vsink, build, gen);
+        let abandoned_at = Arc::new(Mutex::new(None));
+        self.wire_video(&vsink, build, gen, Arc::clone(&abandoned_at));
         self.wire_audio(&asink, build);
         let errored = Arc::new(AtomicBool::new(false));
         self.sync_handler(&pipeline, build, &errored)?;
         Ok(Live {
             gen,
             build,
+            abandoned_at,
             pipeline,
             stop: Arc::new(AtomicBool::new(false)),
             errored,
@@ -559,7 +569,19 @@ impl GstInput {
     /// first one delivered sends `InputConnected { gen }` before it, tried again on each sample
     /// until delivered. The gate lock is held throughout, so a close (`abandon`, `rebuild`, a loss)
     /// that returns has let nothing more of the build through.
-    fn wire_video(&self, sink: &gst_app::AppSink, build: u64, gen: u64) {
+    ///
+    /// Owed 49's measurement: the first video sample of a build the domain gave up, once it is gated,
+    /// logs `gen=<g>: video again <ms> ms after the abandon`, once a build. A stalled connection that
+    /// starts delivering again inside the back-off is what the line records (does CF wake a silent
+    /// reader?); video only, so a camera whose audio carries on never writes it, and a build retired
+    /// without an abandon never does.
+    fn wire_video(
+        &self,
+        sink: &gst_app::AppSink,
+        build: u64,
+        gen: u64,
+        abandoned_at: Arc<Mutex<Option<Instant>>>,
+    ) {
         let shared = Arc::clone(&self.shared);
         let eos = Arc::clone(&self.shared);
         let mut connected = false;
@@ -569,7 +591,14 @@ impl GstInput {
                     let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                     let open = locked(&shared.gate);
                     if *open != Some(build) {
+                        drop(open);
                         shared.gate_dropped.fetch_add(1, Ordering::Relaxed);
+                        if let Some(at) = locked(&abandoned_at).take() {
+                            shared.log(&format!(
+                                "gen={gen}: video again {} ms after the abandon, gated (Owed 49)",
+                                at.elapsed().as_millis()
+                            ));
+                        }
                         return Ok(gst::FlowSuccess::Ok);
                     }
                     shared.frames.set_camera(sample);
@@ -635,7 +664,7 @@ impl GstInput {
         bus.set_sync_handler(move |_, msg| {
             match msg.view() {
                 gst::MessageView::Error(_) => {
-                    if shared.close(build) {
+                    if shared.close(build).is_some() {
                         errored.store(true, Ordering::SeqCst);
                     }
                 }
@@ -762,6 +791,10 @@ impl InputSource for GstInput {
             scrubber.add(&spec.passphrase);
         }
         self.retire_current();
+        // What the retired build left in the ring is its own: emptied, so none of it plays under the
+        // next camera (m1). The gate is shut, so nothing writes the ring until the new build opens
+        // it. `stop` and the drop leave the ring as it is: no camera follows them.
+        self.shared.frames.clear_audio();
         if let Err(why) = check_url(&spec.url) {
             self.shared.log(&format!("gen={gen}: {why}"));
             self.send_now(Event::InputLost {
@@ -796,23 +829,29 @@ impl InputSource for GstInput {
     }
 
     /// The domain has given `gen` up (C10b): the gate closes for its build, video and audio alike,
-    /// before this returns, and no event is sent (the domain decided it). The pipeline stays up,
-    /// gated, until the next `rebuild` tears it down. A `gen` that is not the current build's, a
-    /// build this adapter already reported lost, and a second call change nothing.
+    /// before this returns, and the build's audio still in the ring is flushed with it (m1), so none
+    /// of it goes on air; no event is sent (the domain decided it). The pipeline stays up, gated,
+    /// until the next `rebuild` tears it down, and its first video sample after this is logged
+    /// (Owed 49). A `gen` that is not the current build's, a build this adapter already reported
+    /// lost, and a second call change nothing.
     fn abandon(&mut self, gen: u64) {
-        let Some(build) = self.current.as_ref().filter(|l| l.gen == gen).map(|l| l.build) else {
+        let Some(live) = self.current.as_ref().filter(|l| l.gen == gen) else {
             self.shared
                 .log(&format!("gen={gen}: abandon ignored: not the current build"));
             return;
         };
-        if self.shared.close(build) {
-            self.shared.abandoned.fetch_add(1, Ordering::SeqCst);
-            self.shared.log(&format!(
-                "gen={gen}: abandoned by the domain; nothing more of it reaches the programme"
-            ));
-        } else {
-            self.shared
-                .log(&format!("gen={gen}: abandon: its gate was already shut"));
+        match self.shared.close(live.build) {
+            Some(flushed) => {
+                *locked(&live.abandoned_at) = Some(Instant::now());
+                self.shared.abandoned.fetch_add(1, Ordering::SeqCst);
+                self.shared.log(&format!(
+                    "gen={gen}: abandoned by the domain; {flushed} B of its audio flushed; nothing \
+                     more of it reaches the programme"
+                ));
+            }
+            None => self
+                .shared
+                .log(&format!("gen={gen}: abandon: its gate was already shut")),
         }
     }
 

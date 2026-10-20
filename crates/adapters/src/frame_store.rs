@@ -33,6 +33,8 @@ struct Inner {
     audio: Mutex<VecDeque<u8>>,
     /// Audio pushes refused because they were not whole S16LE stereo frames.
     audio_refused: AtomicU64,
+    /// The ring's real bytes handed out by `take_audio*` (the padding is not counted).
+    audio_taken: AtomicU64,
 }
 
 /// A slot's lock, taken even if a writer panicked while holding it: the slot holds plain data, so
@@ -96,9 +98,26 @@ impl FrameStore {
         for (slot, b) in out[gap..].iter_mut().zip(ring.drain(..real)) {
             *slot = b;
         }
+        // Counted under the ring's lock, so a `clear_audio` that returns has seen every take before it.
+        self.inner.audio_taken.fetch_add(real as u64, Ordering::Relaxed);
         drop(ring);
         pad(&mut out[..gap]);
         out
+    }
+
+    /// Empties the ring and returns the bytes it dropped. The input calls it when a build stops
+    /// passing (its abandon, its loss, its rebuild), with that build's gate shut, so none of the
+    /// build's audio still in the ring plays after it (the PR #35 review's m1).
+    pub fn clear_audio(&self) -> usize {
+        let mut ring = locked(&self.inner.audio);
+        let dropped = ring.len();
+        ring.clear();
+        dropped
+    }
+
+    /// The ring's real bytes handed out by `take_audio*` so far; the padding is not counted.
+    pub fn audio_taken(&self) -> u64 {
+        self.inner.audio_taken.load(Ordering::Relaxed)
     }
 
     /// The bytes the ring holds now.
