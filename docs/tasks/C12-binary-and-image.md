@@ -655,13 +655,26 @@ image:
   `strip` of `libcef.so`, the pin in `docker/GSTCEF_COMMIT` (image.yml reads it; a trailing `# from F-001` on the
   `ARG` line would be part of the instruction), a `cef-test` stage running C11's tests as uid 10001, and a
   `gst-inspect-1.0` check of every element factory the adapters make.
-- **The image test of Owed 58 and 68** is `scripts/image_probe.py`: one live-mode run against a fake control plane on
+- **The image test of Owed 58 and 68** is `scripts/image_probe.py`: live-mode runs against a fake control plane on
   the runner, reading `/proc/<pid>/limits` of the compositor and every CEF child, `TMPDIR` (`/dev/shm/seazn`, 0700,
-  tmpfs, the CEF profile inside), the environment (no `GST_CEF_LOG_SEVERITY`, no `GST_DEBUG`), then `docker stop`:
-  exit 0, the last POST `signalled`, no token in the log.
-- **The hand mutants are written, not run** (Owed 75): the owner stopped local VMs on 2026-10-20 (relayed by the
-  coordinator) before Step 9, and CI runs no mutants. One witness exists: before the wire fix, the unmapped `Restart`
-  word reddened `a_dead_zygote_exits_75_posting_restart`. The list (each alone; expected red in brackets):
+  tmpfs, the CEF profile inside) and the environment (no `GST_CEF_LOG_SEVERITY`, no `GST_DEBUG`), then three stops,
+  one container each: `docker kill -s INT` (the Final hold, exit 0 inside R1's grace, an earlier POST carrying
+  `final`, the last POST `signalled`), `docker stop` (the drain, exit 0, the last POST `signalled`, no `final`), and a
+  measurement of a SIGTERM sent straight to the compositor; no token in any log.
+- **The entrypoint does not `exec` the compositor** (false premise; F-016, medium). Once CEF starts in the process,
+  a SIGINT or SIGTERM it receives exits it with status 0 at once: no Final scene, no drain, no final beat (image.yml's
+  first probe: `docker stop` exited in 0.1 s with one periodic POST). The entrypoint runs the compositor as its child
+  and forwards SIGINT as SIGUSR1 and SIGTERM as SIGUSR2, which CEF leaves alone; `wiring::STOP_SIGNALS` reads both
+  pairs (the binary run alone keeps SIGINT and SIGTERM), and the child's own exit status is the entrypoint's.
+  `the_entrypoint_forwards_each_stop_signal_as_the_binary_reads_it` pins the two sides against each other; the fake-run
+  stop tests drive each signal by both names.
+- **The hand mutants ran on a real runner** (Owed 75): the owner stopped local VMs on 2026-10-20 (relayed by the
+  coordinator), so each batch ran in check.yml (ubuntu-24.04, GStreamer) on a throwaway draft PR from PR #36's head
+  (#37: 19 mutants, #38: 5; expected-red sets disjoint), each closed and deleted once read. **23 of 24 killed; 22 is
+  equivalent:** `Logger` scrubs every line through `Scrubber::scrub`, which ends in `redact`, so the swap line's own
+  `redact` is a second guard nothing can kill alone. Mutant 16 was also witnessed before the wire fix. Mutants 25
+  (`STOP_SIGNALS` reads SIGUSR1 as nothing) and 26 (the entrypoint forwards SIGTERM as itself) are on draft PRs #39 and
+  #40, not yet read. The list (expected red in brackets):
 
   | # | Mutant | Expected red |
   |---|---|---|
@@ -688,7 +701,9 @@ image:
   | 21 | `ProfileTap` records a failed start | `lazy_input_is_built_once_from_the_started_profile` |
   | 22 | the swap line's URL unredacted | `logged_programme_logs_start_swap…`, `graphics_log_lines_exist_in_both_driver_modes` |
   | 23 | a 5th poll admitted | `fifth_concurrent_poll_is_refused_503` |
-  | 24 | the first sample's CPU is `Some(0.0)` | `first_sample_has_no_cpu` |
+  | 24 | the first sample's CPU is `Some(0.0)` | `linux::first_sample_has_no_cpu` |
+  | 25 | `STOP_SIGNALS`' SIGUSR1 row reads SIGINT | `the_entrypoint_forwards_each_stop_signal…`, `sigint_holds_the_final_scene_then_drains` |
+  | 26 | the entrypoint forwards SIGTERM as SIGTERM | `the_entrypoint_forwards_each_stop_signal…` |
 - **The owner's rulings of 2026-10-20** change no C12 code: the exit-based restart stays (C14 measures its outage),
   leaked teardowns below 3 stay until the session ends, the outage target is 15 s, and web caps self-restarts at 6 a
   session.
