@@ -16,11 +16,10 @@ set -euo pipefail
 # environment and are dumpable. A core limit of 1 byte is refused by the kernel for a piped
 # core_pattern and is below the ELF minimum for a file one; 0 would stop only the file case. tini is
 # this shell's parent (PID 1 under Docker, not elsewhere). The compositor sets its own.
-prlimit --pid "$$" --core=1:1 2>/dev/null || log warn "core limit 1 not set on the entrypoint"
-prlimit --pid "$PPID" --core=1:1 2>/dev/null || log warn "core limit 1 not set on tini (pid $PPID)"
+# MUT31: no prlimit
 
 # Xvfb needs no token (the PR #36 review's m2).
-env -u JOB_TOKEN Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp >/dev/null 2>&1 &
+Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp >/dev/null 2>&1 &
 for _ in $(seq 1 50); do [ -e /tmp/.X11-unix/X99 ] && break; sleep 0.1; done
 [ -e /tmp/.X11-unix/X99 ] || { log error "Xvfb did not start"; exit 70; }
 

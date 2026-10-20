@@ -23,4 +23,4 @@ pub const EXIT_HEADROOM_MS: u64 = 3_000;
 /// I1): 1, the value at which the kernel refuses a core to a piped `core_pattern` ("RLIMIT_CORE is
 /// set to 1, aborting core", `fs/coredump.c`) and below the ELF minimum for a file one. CEF's
 /// children inherit it; the compositor itself is also made non-dumpable.
-pub const CORE_LIMIT_BYTES: u64 = 1;
+pub const CORE_LIMIT_BYTES: u64 = /*MUT30*/ 0;
