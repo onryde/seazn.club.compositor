@@ -1295,12 +1295,20 @@ fn a_dead_zygote_either_one_is_reported() {
             .filter(|l| l.starts_with("zygote child:"))
             .map(str::to_owned)
             .collect();
+        let g4: Vec<String> = stderr
+            .lines()
+            .filter(|l| l.starts_with("zygote orphans:"))
+            .map(str::to_owned)
+            .collect();
         assert!(out.status.success(), "the {which} child failed:\n{stderr}");
         assert_eq!(mine.len(), 1, "{stderr}");
+        // G4 is checked in the GPU zygote's child only, and there once.
+        assert_eq!(g4.len(), usize::from(which == "gpu"), "{stderr}");
         checked.extend(mine);
+        checked.extend(g4);
     }
-    eprintln!("children checked: {}; {checked:?}", checked.len());
-    assert_eq!(checked.len(), 2);
+    eprintln!("children checked: 2, lines {}; {checked:?}", checked.len());
+    assert_eq!(checked.len(), 3);
 }
 
 // The PR #32 confirm pass's N1, pinned: why the GPU process's zygote's death is the verdict. With
@@ -1498,6 +1506,8 @@ fn zygote_case(which: &str) {
         let tree: Vec<i32> = cef_children().iter().map(|k| k.pid).collect();
         let h = r.g.health();
         eprintln!("zygote orphans: GPU processes {gpu_processes:?}, alive {orphans:?}, {h:?}");
+        // Anti-vacuity: an orphan to check. One that died has aborted this process already (F-013).
+        assert!(!orphans.is_empty(), "G4: no orphan to check: {gpu_processes:?}");
         assert!(
             orphans.iter().all(|p| !tree.contains(p)),
             "G4: {orphans:?} still in {tree:?}"
