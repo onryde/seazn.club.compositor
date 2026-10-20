@@ -194,6 +194,7 @@ fn contract_code(r: ExitReason) -> i32 {
         ExitReason::Ended | ExitReason::Deadline | ExitReason::Signalled | ExitReason::SessionGone => 0,
         ExitReason::Refused => 78,
         ExitReason::Fatal => 70,
+        ExitReason::Restart => 75,
     }
 }
 

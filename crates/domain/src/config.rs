@@ -86,6 +86,17 @@ pub struct Thresholds {
     /// the page. C11 reads it as the PSS sum of CEF's child processes (F-013: their RSS sum counts the
     /// zygote's shared pages once per process, 436 MB for one healthy page against 173 MB of PSS).
     pub cef_rss_cap_mb: u64,
+    /// Owner ruling 2026-10-19 "B" (Owed 55; C11b): a teardown that never returns leaks its build's
+    /// thread, pipeline and renderer (about 22–38 MB PSS each, the PR #32 review's P6). The process
+    /// restarts in place once this many are leaked AT ONCE: a live count, so a leak whose teardown
+    /// returns after all no longer counts (the coordinator's recommendation, matching C11's gauge).
+    /// Fewer stay until the process ends.
+    pub cef_leaks_to_restart: usize,
+    /// F-013 / Owed 61 (C11b): Chromium aborts the whole process at its `CHROMIUM_GPU_DEATHS_ABORT`-th
+    /// GPU-process death. The process restarts in place at this many, two deaths short of the abort:
+    /// one the 1 s child poll has not read yet, and one during the exit (the coordinator's
+    /// recommendation, 2026-10-20).
+    pub cef_gpu_deaths_to_restart: usize,
     /// C02 brief default (no PDF number): overruns within `ladder_window_ms` needed to step down a rung.
     pub ladder_overruns_to_step: usize,
     /// C02 brief default (no PDF number): the window `ladder_overruns_to_step` is counted in.
@@ -121,6 +132,13 @@ pub const ENCODER_SPEED_REALTIME_MIN: f64 = 0.95;
 /// not a `Thresholds` field: it is YouTube's behaviour, not a setting of ours.
 pub const OUTPUT_GAP_BUDGET_MS: Ms = 15_000;
 
+/// F-013 (C11's confirm pass, probe GR, 2 of 2; the final C11 review's probe FD, kills 20 s apart):
+/// with its zygote alive, a killed GPU process is relaunched 5 times, and the 6th death is Chromium's
+/// FATAL "GPU process isn't usable. Goodbye." and SIGTRAP of the whole process. A count over the
+/// process's life, not a rate (no decay over 100 s). A const, not a `Thresholds` field: it is
+/// Chromium's behaviour, not a setting of ours. `cef_gpu_deaths_to_restart` stays under it.
+pub const CHROMIUM_GPU_DEATHS_ABORT: usize = 6;
+
 impl Default for Thresholds {
     fn default() -> Self {
         Self {
@@ -148,6 +166,8 @@ impl Default for Thresholds {
             cef_alive_every_ms: 2_000,
             cef_hang_after_ms: 10_000,
             cef_rss_cap_mb: 600,
+            cef_leaks_to_restart: 3,
+            cef_gpu_deaths_to_restart: 4,
             ladder_overruns_to_step: 3,
             ladder_window_ms: 1_000,
             drain_timeout_ms: 7_000,
@@ -363,6 +383,28 @@ mod tests {
     #[test]
     fn output_gap_budget_is_the_15_s_youtube_kept_in_f004() {
         assert_eq!(OUTPUT_GAP_BUDGET_MS, 15_000);
+    }
+
+    // C11b, each number against its own source. Owner ruling 2026-10-19 "B": an early in-place restart
+    // once 3 teardowns are leaked (a live count). F-013 / Owed 61: Chromium aborts the process at the
+    // 6th GPU-process death of its life (probe GR 2 of 2; the final C11 review's FD, kills 20 s apart).
+    // The restart comes at 4 (the coordinator's recommendation): at least two deaths short of it, one
+    // for a death the 1 s child poll has not read yet and one for a death during the exit.
+    #[test]
+    fn cef_restart_thresholds_match_their_sources() {
+        let t = Thresholds::default();
+        assert_eq!(t.cef_leaks_to_restart, 3, "owner ruling B");
+        assert_eq!(CHROMIUM_GPU_DEATHS_ABORT, 6, "F-013: the 6th death aborts");
+        assert_eq!(t.cef_gpu_deaths_to_restart, 4, "the coordinator's recommendation");
+        assert!(
+            t.cef_gpu_deaths_to_restart >= 1,
+            "0 would restart a healthy process"
+        );
+        assert!(
+            t.cef_gpu_deaths_to_restart + 2 <= CHROMIUM_GPU_DEATHS_ABORT,
+            "two deaths of headroom before Chromium's abort"
+        );
+        assert!(t.cef_leaks_to_restart >= 1, "0 would restart a healthy process");
     }
 
     // The C00 cost gate is "encoder speed ≥ 0.95"; F-005's worst 10 s window (0.9963) and a healthy
