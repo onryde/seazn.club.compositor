@@ -27,6 +27,8 @@ use domain::supervisor::{Desired, Event};
 #[derive(Clone, PartialEq)]
 pub enum Call {
     InputRebuild(u64, InputSpec),
+    /// `InputSource::abandon(gen)` (C10b).
+    InputAbandon(u64),
     InputStop,
     Start(OutputProfile),
     Push(u64, FrameChoice),
@@ -48,6 +50,7 @@ impl fmt::Debug for Call {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Call::InputRebuild(g, s) => f.debug_tuple("InputRebuild").field(g).field(s).finish(),
+            Call::InputAbandon(g) => f.debug_tuple("InputAbandon").field(g).finish(),
             Call::InputStop => f.write_str("InputStop"),
             Call::Start(p) => f.debug_tuple("Start").field(p).finish(),
             Call::Push(i, c) => f.debug_tuple("Push").field(i).field(c).finish(),
@@ -123,6 +126,10 @@ pub struct FakeInput(pub Log);
 impl InputSource for FakeInput {
     fn rebuild(&mut self, gen: u64, spec: &InputSpec) {
         self.0.push(Call::InputRebuild(gen, spec.clone()));
+    }
+
+    fn abandon(&mut self, gen: u64) {
+        self.0.push(Call::InputAbandon(gen));
     }
 
     fn stop(&mut self) {

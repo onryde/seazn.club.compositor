@@ -592,8 +592,11 @@ adds a flush there (10 + 7 + 2 = 19 s).
 These items are owed by C12 and are written in full in `docs/_INDEX.md` Owed (the PR #32 confirm
 pass asked for these pointers). Read each row there before building the composition root and the
 image:
-- **Owed 51:** build `GstInput` from the Driver's own `Thresholds` (one value passed to both), and
-  pass `Thresholds::cef_rss_cap_mb` and the programme profile's fps to `CefGraphics::new`.
+- **Owed 51:** ~~build `GstInput` from the Driver's own `Thresholds` (one value passed to both),
+  and~~ pass `Thresholds::cef_rss_cap_mb` and the programme profile's fps to `CefGraphics::new`.
+  (Amended 2026-10-20, C10b: the input adapter keeps no copy of the domain's rules, so only its SRT
+  latency is read from the `Thresholds` it is given; passing the driver's value is still the
+  natural wiring, but no mismatch can give a generation up.)
 - **Owed 52:** never set `GST_CEF_LOG_SEVERITY` in the image or the environment: it overrides the
   element's `log-severity=disable`, and CEF then writes every console line, the job token included,
   to `chrome_debug.log`.

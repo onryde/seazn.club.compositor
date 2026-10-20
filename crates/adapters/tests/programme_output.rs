@@ -933,6 +933,30 @@ fn audio_ring_is_bounded_at_400ms_and_pads_silence() {
     assert_eq!((f.audio_level(), f.audio_refused()), (0, 1));
 }
 
+/// The PR #35 review's m1: `clear_audio` empties the ring and says how much it dropped (the input's
+/// abandon, loss and rebuild call it), and `audio_taken` counts the ring's real bytes handed out,
+/// never the padding, so a test can tell what of a camera's audio went on air. The sequence: an
+/// empty ring, a second clear, and a take after a clear.
+#[test]
+fn clear_audio_empties_the_ring_and_audio_taken_counts_real_bytes_only() {
+    let f = FrameStore::default();
+    assert_eq!(f.clear_audio(), 0, "an empty ring drops nothing");
+    assert_eq!(f.audio_taken(), 0);
+    f.push_audio(&[7u8; 4_000]);
+    assert_eq!(f.take_audio(1_000).len(), 1_000);
+    assert_eq!(f.audio_taken(), 1_000);
+    assert_eq!(f.clear_audio(), 3_000, "the rest of the ring");
+    assert_eq!(f.audio_level(), 0);
+    assert_eq!(f.clear_audio(), 0, "a second clear drops nothing");
+    let pad = f.take_audio(6_400);
+    assert_eq!(pad, vec![0u8; 6_400], "after a clear only padding comes out");
+    assert_eq!(f.audio_taken(), 1_000, "padding is not counted");
+    f.push_audio(&[9u8; 400]);
+    let mixed = f.take_audio(1_000);
+    assert_eq!(&mixed[600..], &[9u8; 400][..], "the real bytes come last");
+    assert_eq!(f.audio_taken(), 1_400, "only the 400 real bytes of a padded take");
+}
+
 // ---------------------------------------------------------------------------------------------
 // Amendment 2026-10-15: the textless slate
 
@@ -1132,11 +1156,39 @@ fn the_progress_poll_keeps_the_pdf_stall_bound() {
     assert!(poll > 0);
 }
 
+/// The stall test's bound (Owed 71), from the constants alone: the worst case on time is the stall
+/// rule, plus the poll of the true last byte (Owed 15's pin, never the adapter's own constant, so a
+/// slower poll is not folded into its own bound) and one tick (the domain sees time only at ticks);
+/// a loaded runner may run one tick and one poll late on top. Returns (worst on time, allowance).
+fn stall_bound(t: &Thresholds) -> (u64, u64) {
+    let tick = period(&P720).as_millis() as u64;
+    let worst = t.output_stall_after_ms + OWED_15_POLL_MAX_MS + tick;
+    (worst, tick + OWED_15_POLL_MAX_MS)
+}
+
+/// Owed 71: the allowance is one tick and one poll, and it never stretches far enough to pass a
+/// detection a full second late (Owed 15's original 1 s poll). Pure arithmetic, so it runs anywhere.
+#[test]
+fn the_stall_bound_still_refuses_a_late_detection() {
+    let t = Thresholds::default();
+    let (worst, allowance) = stall_bound(&t);
+    let tick = period(&P720).as_millis() as u64;
+    eprintln!("stall bound: {worst} ms on time, {allowance} ms allowance");
+    assert_eq!(worst, t.output_stall_after_ms + OWED_15_POLL_MAX_MS + tick);
+    assert_eq!(allowance, tick + OWED_15_POLL_MAX_MS);
+    assert!(
+        worst + allowance < t.output_stall_after_ms + 1_000,
+        "a detection 1 s late would pass: {} ms",
+        worst + allowance
+    );
+}
+
 /// Owed 15: a sink whose writes stop is swapped within `output_stall_after_ms` + the poll of its
 /// true last byte, by the domain's own `OutputLink` in the loop (one tick of quantisation added: the
 /// domain sees time only at ticks). Owed 43 (after PR #29): the sink must first earn Connected
 /// (`output_connected_after_ms` of growth), so the writes stop 1 s after `is_connected()` first
-/// reads true, never at a fixed time, and the deadline follows the cut.
+/// reads true, never at a fixed time, and the deadline follows the cut. Owed 71: the bound allows one
+/// more tick and one more poll for a loaded runner (`stall_bound`); the exact sum went red under load.
 #[test]
 fn stall_is_detected_within_budget_of_the_last_byte() {
     let _s = serial();
@@ -1225,10 +1277,11 @@ fn stall_is_detected_within_budget_of_the_last_byte() {
     let (bytes, last) = at_swap.expect("the snapshot is taken with the swap");
     let flushed = last_growth.lock().unwrap().0 - bytes;
     let gap = swapped_at.duration_since(last).as_millis() as u64;
-    let bound = t.output_stall_after_ms + OWED_15_POLL_MAX_MS + period(&P720).as_millis() as u64 + 1;
+    let (worst, allowance) = stall_bound(&t);
+    let bound = worst + allowance + 1;
     eprintln!(
-        "connected {} ms after t0; last byte (total {bytes}) to SwapSink: {gap} ms; bound {bound} ms; \
-         flushed by the teardown: {flushed} bytes",
+        "connected {} ms after t0; last byte (total {bytes}) to SwapSink: {gap} ms; bound {bound} ms \
+         ({worst} on time + {allowance} allowance); flushed by the teardown: {flushed} bytes",
         ms(connected_at)
     );
     assert!(bytes > 0);

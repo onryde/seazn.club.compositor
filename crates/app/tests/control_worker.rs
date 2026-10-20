@@ -333,7 +333,8 @@ fn flush_waits_for_the_final_beat_and_never_past_its_timeout() {
 #[test]
 fn flush_is_not_held_up_by_a_full_inbound_channel() {
     let (tx, rx) = bounded(1);
-    tx.send(Inbound::Event(Event::InputFrame)).expect("fill");
+    tx.send(Inbound::Event(Event::InputFrame { gen: 1 }))
+        .expect("fill");
     let (plane, log) = ScriptedPlane::new(session_720p());
     let mut h = spawn(Box::new(plane), tx);
     h.request(beat(final_beat(1, ExitReason::Ended)));
@@ -454,7 +455,8 @@ fn a_final_beat_is_posted_while_a_periodic_beat_is_stalled_in_flight() {
 #[test]
 fn a_second_final_beat_is_posted_while_the_first_result_waits_on_a_full_channel() {
     let (tx, rx) = bounded(1);
-    tx.send(Inbound::Event(Event::InputFrame)).expect("fill");
+    tx.send(Inbound::Event(Event::InputFrame { gen: 1 }))
+        .expect("fill");
     let (plane, log) = ScriptedPlane::new(session_720p());
     let plane = plane.reply(|h| {
         let d = if h.heartbeat_failures == 1 {
@@ -473,7 +475,7 @@ fn a_second_final_beat_is_posted_while_the_first_result_waits_on_a_full_channel(
     assert_eq!(
         got,
         vec![
-            Inbound::Event(Event::InputFrame),
+            Inbound::Event(Event::InputFrame { gen: 1 }),
             Inbound::Event(Event::HeartbeatReply(Desired::Ending)),
             Inbound::Event(Event::HeartbeatReply(Desired::Live)),
         ],

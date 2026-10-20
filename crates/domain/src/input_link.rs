@@ -18,6 +18,12 @@
 //! - **Stall.** A Running input with no frame for `input_stall_after_ms` is lost as `Stalled`, because
 //!   CF holds a silent playback socket open (F-002). The connect has its own budget,
 //!   `input_connect_timeout_ms`, so the stall rule reads Running only.
+//! - **Give-ups (C10b, Owed 50).** The connect timeout and the stall rule are the link's own
+//!   decisions, so it reports each one as `InputAction::Abandon` for the generation it gave up, and the
+//!   adapter shuts that generation out: the domain is the one authority on them, and the adapter
+//!   keeps no copy of the rules. Each generation is given up at most once, since the link then backs
+//!   off and only a rebuild moves it on. A loss the adapter reported (`on_lost`) owes no abandon: the
+//!   adapter decided it, and its gate is shut already.
 use crate::backoff::delay;
 use crate::config::Thresholds;
 use crate::time::{elapsed, Ms};
@@ -38,6 +44,16 @@ pub enum InputState {
     Running { since: Ms },
     /// `attempt` consecutive failures so far; the next build is at the first tick at or after `until`.
     Backoff { attempt: u32, until: Ms },
+}
+
+/// What the link asks of the input adapter (C10b): the effect a tick or a stall check decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputAction {
+    /// Build generation `gen` (`Effect::RebuildInput`).
+    Rebuild { gen: u64 },
+    /// The link gave generation `gen` up by its own rule, the connect timeout or the stall rule
+    /// (`Effect::AbandonInput`).
+    Abandon { gen: u64 },
 }
 
 /// Kick history bound: the window never holds more than this many stamps (AGENTS.md §4, nothing
@@ -77,6 +93,16 @@ impl InputLink {
         self.generation
     }
 
+    /// Whether a frame of generation `gen` counts (C10b): it is the current generation, and the link
+    /// has not given it up or lost it (Backoff). A frame from a generation rebuilt past, or one queued
+    /// before the give-up, changes nothing. While Connecting it counts. The adapter never sends a
+    /// build's frames ahead of its `InputConnected` (one streaming thread sends both, that one first,
+    /// on a FIFO channel), save when the `InputConnected` was refused for a full channel and is tried
+    /// again on the next sample; such a frame is the build's own (the PR #35 review's m3).
+    pub fn takes_frames_from(&self, gen: u64) -> bool {
+        gen == self.generation && !matches!(self.state, InputState::Backoff { .. })
+    }
+
     /// The current generation's first decoded frame (C10 times "connected" to it, F-002). It counts
     /// only while Connecting: a second one while Running must not restart the stall clock.
     pub fn on_connected(&mut self, now: Ms, gen: u64) {
@@ -105,32 +131,36 @@ impl InputLink {
     }
 
     /// Running but no frame since max(running since, last frame) for `input_stall_after_ms`: lost as
-    /// `Stalled`. A frame from before this connection does not count.
-    pub fn check_stall(&mut self, now: Ms, last_frame_at: Option<Ms>, t: &Thresholds) {
-        if let InputState::Running { since } = self.state {
-            let fresh = last_frame_at.map_or(since, |f| f.max(since));
-            if elapsed(now, fresh) >= t.input_stall_after_ms {
-                let gen = self.generation;
-                self.on_lost(now, gen, LossReason::Stalled, t);
-            }
+    /// `Stalled`, and given up (`Abandon`). A frame from before this connection does not count.
+    pub fn check_stall(&mut self, now: Ms, last_frame_at: Option<Ms>, t: &Thresholds) -> Option<InputAction> {
+        let InputState::Running { since } = self.state else {
+            return None;
+        };
+        let fresh = last_frame_at.map_or(since, |f| f.max(since));
+        if elapsed(now, fresh) < t.input_stall_after_ms {
+            return None;
         }
+        let gen = self.generation;
+        self.on_lost(now, gen, LossReason::Stalled, t);
+        Some(InputAction::Abandon { gen })
     }
 
-    /// `true` ⇒ effect `RebuildInput(generation())`.
-    pub fn on_tick(&mut self, now: Ms, t: &Thresholds) -> bool {
+    /// A due back-off builds the next generation (`Rebuild`); a connect past
+    /// `input_connect_timeout_ms` is given up (`Abandon`) and backs off.
+    pub fn on_tick(&mut self, now: Ms, t: &Thresholds) -> Option<InputAction> {
         match self.state {
             InputState::Backoff { attempt, until } if now >= until => {
                 self.generation += 1;
                 self.state = InputState::Connecting { attempt, since: now };
-                true
+                Some(InputAction::Rebuild { gen: self.generation })
             }
             InputState::Connecting { attempt, since }
                 if elapsed(now, since) >= t.input_connect_timeout_ms =>
             {
                 self.back_off(now, attempt, t);
-                false
+                Some(InputAction::Abandon { gen: self.generation })
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -162,10 +192,15 @@ mod tests {
         Thresholds::default()
     }
 
+    /// A tick that built (`Rebuild`), as against one that gave a generation up or did nothing.
+    fn built(a: Option<InputAction>) -> bool {
+        matches!(a, Some(InputAction::Rebuild { .. }))
+    }
+
     /// Build, connect, run: returns a link in Running at generation 1.
     fn running(now: Ms) -> InputLink {
         let mut l = InputLink::new();
-        assert!(l.on_tick(now, &t()));
+        assert!(built(l.on_tick(now, &t())));
         l.on_connected(now, 1);
         l
     }
@@ -180,7 +215,7 @@ mod tests {
     /// plus the capped back-off, so a link that never builds fails here instead of hanging the suite.
     fn next_build_every(l: &mut InputLink, mut now: Ms, step: Ms, th: &Thresholds) -> Ms {
         let horizon = now + th.input_connect_timeout_ms + th.input_backoff_cap_ms + step;
-        while !l.on_tick(now, th) {
+        while !built(l.on_tick(now, th)) {
             now += step;
             assert!(now <= horizon, "no build by {horizon} ms: {:?}", l.state());
         }
@@ -202,10 +237,10 @@ mod tests {
     #[test]
     fn first_tick_builds_generation_one() {
         let mut l = InputLink::new();
-        assert!(l.on_tick(0, &t()));
+        assert_eq!(l.on_tick(0, &t()), Some(InputAction::Rebuild { gen: 1 }));
         assert_eq!(l.generation(), 1);
         assert!(matches!(l.state(), InputState::Connecting { attempt: 0, .. }));
-        assert!(!l.on_tick(1, &t()), "no second build while connecting");
+        assert_eq!(l.on_tick(1, &t()), None, "no second build while connecting");
     }
 
     #[test]
@@ -256,9 +291,13 @@ mod tests {
         let th = t();
         let mut l = InputLink::new();
         l.on_tick(0, &th);
-        assert!(!l.on_tick(th.input_connect_timeout_ms - 1, &th));
+        assert_eq!(l.on_tick(th.input_connect_timeout_ms - 1, &th), None);
         assert!(matches!(l.state(), InputState::Connecting { .. }), "1 ms early");
-        l.on_tick(th.input_connect_timeout_ms, &th);
+        assert_eq!(
+            l.on_tick(th.input_connect_timeout_ms, &th),
+            Some(InputAction::Abandon { gen: 1 }),
+            "the link gives up the generation it timed out"
+        );
         assert!(matches!(l.state(), InputState::Backoff { attempt: 1, .. }));
     }
 
@@ -268,7 +307,7 @@ mod tests {
         let mut l = running(0);
         l.on_lost(1_000, 1, LossReason::Eos, &th);
         // A wait loop on a fixed `now` hangs when the back-off is wrong; the assertion fails instead.
-        assert!(l.on_tick(2_000, &th), "the 1 s back-off ends at 2 s");
+        assert!(built(l.on_tick(2_000, &th)), "the 1 s back-off ends at 2 s");
         l.on_connected(2_000, 2);
         l.on_lost(2_100, 1, LossReason::Error, &th); // late event from the torn-down gen-1 pipeline
         assert_eq!(l.state(), InputState::Running { since: 2_000 });
@@ -335,7 +374,10 @@ mod tests {
                 // The 1 s back-off after a kick, then the rebuild's first frame: long before the next.
                 let rebuilt = at + th.input_backoff_base_ms;
                 assert!(rebuilt < t0 + w * (i + 1) / n);
-                assert!(l.on_tick(rebuilt, &th), "the kick's back-off ends at {rebuilt}");
+                assert!(
+                    built(l.on_tick(rebuilt, &th)),
+                    "the kick's back-off ends at {rebuilt}"
+                );
                 l.on_connected(rebuilt, l.generation());
             }
         }
@@ -375,9 +417,13 @@ mod tests {
         // CF can keep the playback socket open with nothing flowing (phone backgrounded)
         let th = t();
         let mut l = running(0);
-        l.check_stall(th.input_stall_after_ms - 1, None, &th);
+        assert_eq!(l.check_stall(th.input_stall_after_ms - 1, None, &th), None);
         assert!(matches!(l.state(), InputState::Running { .. }));
-        l.check_stall(th.input_stall_after_ms, None, &th);
+        assert_eq!(
+            l.check_stall(th.input_stall_after_ms, None, &th),
+            Some(InputAction::Abandon { gen: 1 }),
+            "the link gives up the generation that stalled"
+        );
         assert!(matches!(l.state(), InputState::Backoff { attempt: 1, .. }));
     }
 
@@ -577,8 +623,147 @@ mod tests {
                 until: Ms::MAX
             }
         );
-        assert!(l.on_tick(Ms::MAX, &th), "the build still comes, at the top");
-        assert!(!l.on_tick(Ms::MAX, &th));
+        assert!(
+            built(l.on_tick(Ms::MAX, &th)),
+            "the build still comes, at the top"
+        );
+        assert_eq!(l.on_tick(Ms::MAX, &th), None);
         assert!(matches!(l.state(), InputState::Connecting { attempt: 1, .. }));
+    }
+
+    // ---- C10b: the link's own give-ups (Owed 50) ----
+
+    // A second call: once a generation is given up, the link backs off, and neither rule gives it up
+    // again, however long nothing comes; the next tick that acts is the rebuild, for the next one.
+    #[test]
+    fn a_generation_is_given_up_once_by_either_rule() {
+        let th = t();
+        let mut checked = 0;
+        // The connect timeout.
+        let mut l = InputLink::new();
+        l.on_tick(0, &th);
+        let at = th.input_connect_timeout_ms;
+        assert_eq!(l.on_tick(at, &th), Some(InputAction::Abandon { gen: 1 }));
+        for later in [at, at + 1, at + th.input_backoff_base_ms - 1] {
+            assert_eq!(l.on_tick(later, &th), None, "connect: tick at {later}");
+            assert_eq!(l.check_stall(later, None, &th), None, "connect: stall at {later}");
+            checked += 2;
+        }
+        assert_eq!(
+            l.on_tick(at + th.input_backoff_base_ms, &th),
+            Some(InputAction::Rebuild { gen: 2 })
+        );
+        // The stall rule.
+        let mut l = running(0);
+        let at = th.input_stall_after_ms;
+        assert_eq!(
+            l.check_stall(at, None, &th),
+            Some(InputAction::Abandon { gen: 1 })
+        );
+        for later in [at, at + 1, at + th.input_backoff_base_ms - 1] {
+            assert_eq!(l.check_stall(later, None, &th), None, "stall: stall at {later}");
+            assert_eq!(l.on_tick(later, &th), None, "stall: tick at {later}");
+            checked += 2;
+        }
+        assert_eq!(
+            l.on_tick(at + th.input_backoff_base_ms, &th),
+            Some(InputAction::Rebuild { gen: 2 })
+        );
+        assert_eq!(checked, 12);
+    }
+
+    // A loss the adapter reported (EOS, error, or its own stall report) is the adapter's decision: no
+    // abandon is owed, from Running or from Connecting, at the loss or on any tick of the back-off.
+    #[test]
+    fn a_loss_the_adapter_reported_is_never_abandoned() {
+        let th = t();
+        let mut checked = 0;
+        for reason in [LossReason::Eos, LossReason::Error, LossReason::Stalled] {
+            for from_running in [true, false] {
+                let mut l = if from_running {
+                    running(0)
+                } else {
+                    InputLink::new()
+                };
+                if !from_running {
+                    l.on_tick(0, &th);
+                }
+                l.on_lost(100, 1, reason, &th);
+                let mut now = 100;
+                loop {
+                    let a = l.on_tick(now, &th).or(l.check_stall(now, None, &th));
+                    match a {
+                        Some(InputAction::Rebuild { gen: 2 }) => break,
+                        None => {}
+                        other => panic!("({reason:?}, running {from_running}) at {now}: {other:?}"),
+                    }
+                    now += 10;
+                    assert!(now < 100 + th.input_backoff_cap_ms + 20, "no rebuild");
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 6);
+    }
+
+    // The two rules name the generation they gave up, never a later one: after rebuilds, the
+    // abandon carries the current generation, and a rebuild in the same tick (a back-off of 0)
+    // follows it with the next.
+    #[test]
+    fn an_abandon_names_the_generation_it_gave_up() {
+        let th = Thresholds {
+            input_backoff_base_ms: 0,
+            ..t()
+        };
+        let mut l = InputLink::new();
+        assert_eq!(l.on_tick(0, &th), Some(InputAction::Rebuild { gen: 1 }));
+        let at = th.input_connect_timeout_ms;
+        assert_eq!(l.on_tick(at, &th), Some(InputAction::Abandon { gen: 1 }));
+        assert_eq!(l.on_tick(at, &th), Some(InputAction::Rebuild { gen: 2 }));
+        l.on_connected(at, 2);
+        let stall = at + th.input_stall_after_ms;
+        assert_eq!(
+            l.check_stall(stall, None, &th),
+            Some(InputAction::Abandon { gen: 2 })
+        );
+        assert_eq!(l.on_tick(stall, &th), Some(InputAction::Rebuild { gen: 3 }));
+    }
+
+    // C10b: frames count only from the current generation while it is not given up or lost.
+    #[test]
+    fn frames_count_only_from_the_current_live_generation() {
+        let th = t();
+        let mut checked = 0;
+        let mut l = InputLink::new();
+        assert!(!l.takes_frames_from(0), "nothing built");
+        assert!(!l.takes_frames_from(1), "nothing built");
+        l.on_tick(0, &th);
+        for (gen, want) in [(0, false), (1, true), (2, false)] {
+            assert_eq!(l.takes_frames_from(gen), want, "connecting, gen {gen}");
+            checked += 1;
+        }
+        l.on_connected(10, 1);
+        for (gen, want) in [(0, false), (1, true), (2, false)] {
+            assert_eq!(l.takes_frames_from(gen), want, "running, gen {gen}");
+            checked += 1;
+        }
+        // Given up by the stall rule: none, the given-up generation included.
+        assert!(l.check_stall(10 + th.input_stall_after_ms, None, &th).is_some());
+        for gen in 0..=2 {
+            assert!(!l.takes_frames_from(gen), "given up, gen {gen}");
+            checked += 1;
+        }
+        // Rebuilt: the next generation's, never the given-up one's.
+        let at = next_build(&mut l, 10 + th.input_stall_after_ms, &th);
+        assert_eq!(l.generation(), 2, "rebuilt at {at}");
+        for (gen, want) in [(1, false), (2, true), (3, false)] {
+            assert_eq!(l.takes_frames_from(gen), want, "rebuilt, gen {gen}");
+            checked += 1;
+        }
+        // Lost as the adapter reported it: none.
+        l.on_lost(at + 1, 2, LossReason::Error, &th);
+        assert!(!l.takes_frames_from(2), "lost");
+        checked += 1;
+        assert_eq!(checked, 13);
     }
 }

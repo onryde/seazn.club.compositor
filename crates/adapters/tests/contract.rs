@@ -1005,7 +1005,9 @@ impl World {
                 Effect::DrainOutput => self.pending.push(Event::OutputDrained),
                 Effect::SendHeartbeat(h) => self.beats.push(h),
                 Effect::Exit(c) => self.exit = Some(c),
-                Effect::FetchSession
+                // The input connects at once here, so no generation is given up (C10b).
+                Effect::AbandonInput { .. }
+                | Effect::FetchSession
                 | Effect::StartProgramme
                 | Effect::HideOverlay { .. }
                 | Effect::StepDown(_) => {}
@@ -1031,7 +1033,9 @@ impl World {
                 self.decide(ev);
             }
             if self.camera {
-                self.decide(Event::InputFrame);
+                self.decide(Event::InputFrame {
+                    gen: self.s.input_generation(),
+                });
             }
             if self.sink_gen > 0 && self.now - self.last_progress >= 1_000 {
                 self.sink_total += bytes_per_second();

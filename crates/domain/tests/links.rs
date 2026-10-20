@@ -4,7 +4,7 @@
 //! domain's crate root forbids `clippy::print_stderr`, and a sweep must print the count it checked
 //! (AGENTS.md §5).
 use domain::config::{OutputProfile, Thresholds, OUTPUT_GAP_BUDGET_MS};
-use domain::input_link::{InputLink, InputState, LossReason, KICK_HISTORY_CAP};
+use domain::input_link::{InputAction, InputLink, InputState, LossReason, KICK_HISTORY_CAP};
 use domain::output_link::{OutputLink, OutputState};
 use domain::time::Ms;
 
@@ -89,11 +89,11 @@ fn output_attempt(s: OutputState) -> Option<u32> {
 /// rule, the end of the back-off).
 fn input_in(kind: Kind, t: &Thresholds) -> (InputLink, Ms) {
     let mut l = InputLink::new();
-    assert!(l.on_tick(0, t));
+    assert_eq!(l.on_tick(0, t), Some(InputAction::Rebuild { gen: 1 }));
     l.on_connected(0, 1);
     l.on_lost(100, 1, LossReason::Error, t);
     let built = 100 + t.input_backoff_base_ms;
-    assert!(l.on_tick(built, t));
+    assert_eq!(l.on_tick(built, t), Some(InputAction::Rebuild { gen: 2 }));
     let up = built + 50;
     match kind {
         Kind::Connecting => {}
@@ -130,63 +130,93 @@ const INPUT_EVENTS: [InputEvent; 6] = [
     InputEvent::Stall,
 ];
 
-/// Applies `e` at `now`, from generation `gen`. Returns whether a tick built.
-fn apply_input(l: &mut InputLink, e: InputEvent, now: Ms, gen: u64, t: &Thresholds) -> bool {
+/// Applies `e` at `now`, from generation `gen`. Returns what a tick or a stall check asked for.
+fn apply_input(l: &mut InputLink, e: InputEvent, now: Ms, gen: u64, t: &Thresholds) -> Option<InputAction> {
     match e {
         InputEvent::Tick => l.on_tick(now, t),
         InputEvent::Connected => {
             l.on_connected(now, gen);
-            false
+            None
         }
         InputEvent::Lost(r) => {
             l.on_lost(now, gen, r, t);
-            false
+            None
         }
-        InputEvent::Stall => {
-            l.check_stall(now, None, t);
-            false
-        }
+        InputEvent::Stall => l.check_stall(now, None, t),
     }
 }
 
-/// The brief's transitions (Step 3), written from its prose: (kind after, built, kicks added).
-fn brief_input(from: Kind, e: InputEvent) -> (Kind, bool, usize) {
+/// What a pair asks of the adapter: nothing, a build of the next generation, or (C10b) an abandon of
+/// the one the link gave up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asks {
+    Nothing,
+    Build,
+    Abandon,
+}
+
+/// The brief's transitions (Step 3), written from its prose: (kind after, what it asks, kicks added).
+/// C10b: the link's own two rules (the connect timeout, the stall rule) give the generation up; a
+/// loss the adapter reported does not.
+fn brief_input(from: Kind, e: InputEvent) -> (Kind, Asks, usize) {
+    use Asks as A;
     use InputEvent as E;
     use Kind as K;
     match (from, e) {
-        (K::Backoff, E::Tick) => (K::Connecting, true, 0),
-        (K::Connecting, E::Tick) => (K::Backoff, false, 0), // the connect timed out
-        (K::Connecting, E::Connected) => (K::Up, false, 0),
-        (K::Connecting, E::Lost(_)) => (K::Backoff, false, 0), // a failure, never a kick
-        (K::Up, E::Lost(r)) => (K::Backoff, false, usize::from(r == LossReason::Eos)),
-        (K::Up, E::Stall) => (K::Backoff, false, 0), // no frame for 5 s
-        (k, _) => (k, false, 0),                     // everything else changes nothing
+        (K::Backoff, E::Tick) => (K::Connecting, A::Build, 0),
+        (K::Connecting, E::Tick) => (K::Backoff, A::Abandon, 0), // the connect timed out
+        (K::Connecting, E::Connected) => (K::Up, A::Nothing, 0),
+        (K::Connecting, E::Lost(_)) => (K::Backoff, A::Nothing, 0), // a failure, never a kick
+        (K::Up, E::Lost(r)) => (K::Backoff, A::Nothing, usize::from(r == LossReason::Eos)),
+        (K::Up, E::Stall) => (K::Backoff, A::Abandon, 0), // no frame for 5 s
+        (k, _) => (k, A::Nothing, 0),                     // everything else changes nothing
+    }
+}
+
+/// What the link asked for, as the matrix reads it; the generation each action names is checked
+/// beside it.
+fn asks(a: Option<InputAction>) -> Asks {
+    match a {
+        None => Asks::Nothing,
+        Some(InputAction::Rebuild { .. }) => Asks::Build,
+        Some(InputAction::Abandon { .. }) => Asks::Abandon,
     }
 }
 
 #[test]
 fn every_input_pair_follows_the_brief() {
     let t = Thresholds::default();
-    let (mut checked, mut moved) = (0usize, 0usize);
+    let (mut checked, mut moved, mut abandons) = (0usize, 0usize, 0usize);
     for kind in INPUT_KINDS {
         for e in INPUT_EVENTS {
             let (mut l, due) = input_in(kind, &t);
-            let built = apply_input(&mut l, e, due, 2, &t);
-            let (want, want_built, want_kicks) = brief_input(kind, e);
-            let got = (input_kind(l.state()), built, l.kicks(due, &t));
-            assert_eq!(got, (want, want_built, want_kicks), "({kind:?}, {e:?})");
-            assert_eq!(l.generation(), 2 + u64::from(want_built), "({kind:?}, {e:?})");
+            let a = apply_input(&mut l, e, due, 2, &t);
+            let (want, want_asks, want_kicks) = brief_input(kind, e);
+            let got = (input_kind(l.state()), asks(a), l.kicks(due, &t));
+            assert_eq!(got, (want, want_asks, want_kicks), "({kind:?}, {e:?})");
+            let built = want_asks == Asks::Build;
+            assert_eq!(l.generation(), 2 + u64::from(built), "({kind:?}, {e:?})");
+            // Each action names its generation: the build the next one, the abandon the one given up.
+            match a {
+                Some(InputAction::Rebuild { gen }) => assert_eq!(gen, 3, "({kind:?}, {e:?})"),
+                Some(InputAction::Abandon { gen }) => {
+                    assert_eq!(gen, 2, "({kind:?}, {e:?})");
+                    abandons += 1;
+                }
+                None => {}
+            }
             checked += 1;
             moved += usize::from(want != kind);
         }
     }
-    eprintln!("input pairs checked: {checked} ({moved} move the state)");
+    eprintln!("input pairs checked: {checked} ({moved} move the state, {abandons} abandon)");
     assert_eq!(
         checked,
         INPUT_KINDS.len() * INPUT_EVENTS.len(),
         "every pair, once"
     );
     assert!(moved > 0, "a matrix where nothing moves is vacuous");
+    assert_eq!(abandons, 2, "the connect timeout and the stall rule");
 }
 
 // Ticks 1 ms before each timer is due, and every event from generation 1 (torn down) and 3 (never
@@ -198,7 +228,7 @@ fn input_early_ticks_and_other_generations_change_nothing() {
     for kind in INPUT_KINDS {
         let (mut l, due) = input_in(kind, &t);
         let before = l.clone();
-        assert!(!l.on_tick(due - 1, &t), "{kind:?}: built 1 ms early");
+        assert_eq!(l.on_tick(due - 1, &t), None, "{kind:?}: acted 1 ms early");
         assert_eq!(l, before, "{kind:?}: early tick");
         checked += 1;
         for gen in [1, 3] {
@@ -669,6 +699,8 @@ struct InputCounts {
     alert_cleared: usize,
     kick_cap_reached: usize,
     waits_at_cap: usize,
+    /// C10b: abandons, each checked against the rule that owed it.
+    abandons: usize,
 }
 
 #[test]
@@ -691,6 +723,8 @@ fn input_link_keeps_its_rules_over_generated_schedules() {
         let mut failures: u32 = 0;
         let mut kicks: Vec<Ms> = Vec::new();
         let mut alerted = false;
+        // C10b: the generations given up so far, each at most once.
+        let mut given_up: Vec<u64> = Vec::new();
         for _ in 0..STEPS {
             let due = match l.state() {
                 InputState::Connecting { since, .. } => Some(since + timeout),
@@ -708,17 +742,24 @@ fn input_link_keeps_its_rules_over_generated_schedules() {
             let roll = if storm { g.pick(&[0, 0, 5, 7]) } else { g.next(12) };
             match roll {
                 0..=4 => {
-                    let built = l.on_tick(now, &t);
+                    let a = l.on_tick(now, &t);
                     match before {
                         InputState::Backoff { attempt, until } if now >= until => {
-                            assert!(built, "case {case}: a due back-off must build");
+                            assert_eq!(
+                                a,
+                                Some(InputAction::Rebuild { gen: gen + 1 }),
+                                "case {case}: a due back-off must build"
+                            );
                             assert_eq!(attempt, failures, "case {case}");
                             assert_eq!(l.state(), InputState::Connecting { attempt, since: now });
                             assert_eq!(l.generation(), gen + 1);
                             c.builds += 1;
                         }
                         InputState::Connecting { attempt, since } if now - since >= timeout => {
-                            assert!(!built);
+                            assert_eq!(a, Some(InputAction::Abandon { gen }), "case {case}: timed out");
+                            assert!(!given_up.contains(&gen), "case {case}: {gen} given up twice");
+                            given_up.push(gen);
+                            c.abandons += 1;
                             assert_eq!(attempt, failures, "case {case}");
                             let w = in_wait(&t, failures);
                             failures += 1;
@@ -731,7 +772,7 @@ fn input_link_keeps_its_rules_over_generated_schedules() {
                             c.waits_at_cap += usize::from(w == t.input_backoff_cap_ms);
                         }
                         _ => {
-                            assert!(!built, "case {case}: built from {before:?}");
+                            assert_eq!(a, None, "case {case}: acted from {before:?}");
                             assert_eq!(l.state(), before, "case {case}: a quiet tick");
                             c.quiet_ticks += 1;
                         }
@@ -772,19 +813,27 @@ fn input_link_keeps_its_rules_over_generated_schedules() {
                         3 => Some(now.saturating_sub(stall - 1)),
                         _ => Some(now.saturating_sub(g.next(3 * stall))),
                     };
-                    l.check_stall(now, last_frame, &t);
+                    let a = l.check_stall(now, last_frame, &t);
                     match before {
                         InputState::Running { since } => {
                             let fresh = last_frame.map_or(since, |f| f.max(since));
                             if now.saturating_sub(fresh) >= stall {
+                                assert_eq!(a, Some(InputAction::Abandon { gen }), "case {case}: stalled");
+                                assert!(!given_up.contains(&gen), "case {case}: {gen} given up twice");
+                                given_up.push(gen);
+                                c.abandons += 1;
                                 lost(&t, &mut c, before, l.state(), now, &mut failures, case);
                                 c.stalls += 1;
                             } else {
+                                assert_eq!(a, None, "case {case}: a fresh frame holds");
                                 assert_eq!(l.state(), before, "case {case}: a fresh frame holds");
                                 c.stall_checks_held += 1;
                             }
                         }
-                        _ => assert_eq!(l.state(), before, "case {case}: the stall rule is Running only"),
+                        _ => {
+                            assert_eq!(a, None, "case {case}: the stall rule is Running only");
+                            assert_eq!(l.state(), before, "case {case}: the stall rule is Running only");
+                        }
                     }
                 }
                 _ => {
@@ -833,6 +882,7 @@ fn input_link_keeps_its_rules_over_generated_schedules() {
         ("losses while running", c.losses_running),
         ("losses ignored while backing off", c.ignored_while_backing_off),
         ("stalls", c.stalls),
+        ("abandons", c.abandons),
         ("stall checks that held", c.stall_checks_held),
         ("stale events", c.stale),
         ("alert on", c.alert_on),

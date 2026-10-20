@@ -133,6 +133,27 @@ while what it owns is hung (or stands in for hung) and the drop returns within 5
 - **The allowance is pinned (m1):** `the_allowance_gives_up_250_ms_inside_each_rule`.
 - **The interim G1 design's residuals** and the port call that replaces it are Owed 50 (task C10b, `docs/tasks/C10b-input-abandon.md`); C12 passes one `Thresholds` to the driver and the adapter (Owed 51).
 
+## Amendment 2026-10-20 (C10b: the port call replaces G1's copy; Owed 50)
+
+- **`GstInput::abandon(gen)`** closes the current build's gate (video, audio, events) before it
+  returns and sends no event; the pipeline stays up, gated, until the next `rebuild` tears it down.
+  A `gen` not the current build's, a build already reported lost, and a second call change nothing
+  (each logged). Tests: `abandon_shuts_the_current_build_out_at_once`,
+  `the_generation_after_an_abandoned_one_connects`, `a_stale_abandon_changes_nothing`,
+  `abandon_after_a_reported_loss_changes_nothing`.
+- **G1's copy is deleted:** `SampleClock`, `ruled`, `DOMAIN_LAG_ALLOWANCE_MS`, `give_up`, and the two
+  unit tests of the allowance (round 2's m1 pin goes with the constant). `GstInput::new` keeps
+  `&Thresholds` for `input_srt_latency_ms` alone. `abandoned()` counts the domain's abandons.
+- **The G1 tests, re-pointed at the port call** (the test stands in for the domain), each also
+  proving the adapter gives nothing up by itself under the short rules it is handed:
+  `frames_after_the_domain_gives_up_never_reach_the_programme` (was
+  `frames_after_the_stall_rule_never_reach_the_programme`),
+  `a_late_connect_is_dropped_and_a_fresh_generation_connects`,
+  `audio_stops_with_the_video_when_the_domain_gives_up` (was
+  `audio_stops_with_the_video_past_the_stall_rule`).
+- **`InputFrame { gen }`**: every frame carries its build's generation (the events table's
+  `InputFrame` row), and the domain ignores one it does not take frames from.
+
 ## Do not touch
 
 `gst_programme.rs`/`gst_output.rs` (report problems, don't change them), and other domain files.

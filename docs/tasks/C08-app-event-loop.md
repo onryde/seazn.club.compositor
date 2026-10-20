@@ -679,6 +679,19 @@ The implementer's choices, inside the brief. None is an owner ruling; each mediu
 - **The exit:** the decision's `Exit(75)` takes the existing arm: input and graphics stopped, the tallies' rest
   logged, `run()`'s bounded flush, then 75.
 
+## Amendment 2026-10-20 (C10b: `InputSource::abandon`; Owed 50)
+
+- **`InputSource::abandon(&mut self, gen: u64)`**: the domain's word that it gave generation `gen` up
+  by its own rule. Before it returns, nothing more of that generation passes the adapter; a stale
+  `gen`, one after `stop`, and a second call change nothing; it never blocks. The driver applies
+  `Effect::AbandonInput { gen }` as `p.input.abandon(gen)` (no session needed). `FakeInput` logs
+  `Call::InputAbandon(gen)`.
+- Scenarios through the real driver: the stall rule and the connect timeout (each generation once,
+  at the first tick at or after the rule's instant, before the next rebuild), reported losses (none),
+  the hold (none), and a given-up generation's late frames (never on air). Frames in the scenarios
+  carry their generation (`frame(gen)`); a walk that feeds frames past the 5 s connect timeout
+  connects the generation first, as the adapter does.
+
 ## Do not touch
 
 The domain crate's API, and the adapters (except to keep them compiling). (Amended 2026-10-15) The

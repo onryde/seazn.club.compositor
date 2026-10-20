@@ -23,8 +23,8 @@ const CASES: u32 = 512;
 const END_CASES: u32 = 2_048;
 
 fn steps() -> impl Strategy<Value = Vec<(Ms, u8)>> {
-    // dt 0..300 ms; kind 0..=17, ticks (0..=4) and camera frames (5..=9) dominant
-    prop::collection::vec((0u64..300, 0u8..=17), 1..600)
+    // dt 0..300 ms; kind 0..=18, ticks (0..=4) and camera frames (5..=9) dominant
+    prop::collection::vec((0u64..300, 0u8..=18), 1..600)
 }
 
 /// The harness's own facts, carried across a stream: the output's growing bytes-sent total.
@@ -35,7 +35,16 @@ struct Harness {
 fn event_for(kind: u8, s: &Supervisor, h: &mut Harness) -> Event {
     match kind {
         0..=4 => Event::Tick,
-        5..=9 => Event::InputFrame,
+        5..=9 => Event::InputFrame {
+            gen: s.input_generation(),
+        },
+        // A frame of a generation not the current one (C10b): the one before it, or one never built.
+        18 => Event::InputFrame {
+            gen: match s.input_generation() {
+                0 => 1,
+                g => g - 1,
+            },
+        },
         10 => Event::InputConnected {
             gen: s.input_generation(),
         },
@@ -64,6 +73,9 @@ fn event_for(kind: u8, s: &Supervisor, h: &mut Harness) -> Event {
             },
         },
         16 => Event::HeartbeatReply(Desired::Live),
+        17 => Event::OutputError {
+            gen: s.output_generation(),
+        },
         _ => Event::OutputError {
             gen: s.output_generation(),
         },
@@ -94,6 +106,8 @@ fn programme_and_generation_properties_hold_on_random_streams() {
     let into_live = Cell::new(0u64);
     let alive_while_ready = Cell::new(0u64);
     let stale_alive = Cell::new(0u64);
+    let abandons = Cell::new(0u64);
+    let uncounted_frames = Cell::new(0u64);
     let mut runner = TestRunner::new(Config {
         cases: CASES,
         ..Config::default()
@@ -106,14 +120,30 @@ fn programme_and_generation_properties_hold_on_random_streams() {
             let mut now: Ms = 0;
             let mut frames: Vec<Ms> = Vec::new();
             let mut last_rebuild = 0u64;
+            let mut last_abandon = 0u64;
+            // The harness's own model (C10b): the generation whose frames count, set by its build,
+            // cleared by its loss or its abandon.
+            let mut live: Option<u64> = None;
             for (dt, kind) in steps {
                 now += dt;
                 let ev = event_for(kind, &s, &mut h);
-                if ev == Event::InputFrame {
+                let counts =
+                    matches!(ev, Event::InputFrame { gen } if Some(gen) == live) && on_air(s.lifecycle());
+                if counts {
                     frames.push(now);
                 }
                 let before = s.programme_phase();
                 let d = s.decide(ev.clone(), now);
+                // C10b: a frame the model says does not count leaves the supervisor as it was
+                if matches!(ev, Event::InputFrame { .. }) && !counts {
+                    prop_assert_eq!(&d.next, &s, "an uncounted frame changed the supervisor");
+                    uncounted_frames.set(uncounted_frames.get() + 1);
+                }
+                if let Event::InputLost { gen, .. } = ev {
+                    if Some(gen) == live && on_air(s.lifecycle()) {
+                        live = None;
+                    }
+                }
                 // P1′: a tick yields exactly one frame iff the supervisor is on air before and after
                 // it; nothing else ever does
                 let air = on_air(s.lifecycle()) && on_air(d.next.lifecycle());
@@ -150,6 +180,16 @@ fn programme_and_generation_properties_hold_on_random_streams() {
                     if let Effect::RebuildInput { gen } = e {
                         prop_assert_eq!(*gen, last_rebuild + 1);
                         last_rebuild = *gen;
+                        live = Some(*gen);
+                    }
+                    // C10b: an abandon names the generation built last, once, on a tick
+                    if let Effect::AbandonInput { gen } = e {
+                        prop_assert_eq!(*gen, last_rebuild, "abandoned a generation not current");
+                        prop_assert!(*gen > last_abandon, "gen {} abandoned twice", gen);
+                        prop_assert_eq!(&ev, &Event::Tick);
+                        last_abandon = *gen;
+                        live = None;
+                        abandons.set(abandons.get() + 1);
                     }
                 }
                 // P4, the page's beat (Owed 18): a beat from any page but the current one changes
@@ -169,12 +209,14 @@ fn programme_and_generation_properties_hold_on_random_streams() {
         })
         .expect("property failed");
     eprintln!(
-        "cases checked: {}, on-air ticks: {}, transitions into Live: {}, beats while Ready: {}, stale beats: {}",
+        "cases checked: {}, on-air ticks: {}, transitions into Live: {}, beats while Ready: {}, stale beats: {}, abandons: {}, uncounted frames: {}",
         checked.get(),
         ticks.get(),
         into_live.get(),
         alive_while_ready.get(),
-        stale_alive.get()
+        stale_alive.get(),
+        abandons.get(),
+        uncounted_frames.get()
     );
     assert_eq!(checked.get(), CASES, "anti-vacuity: every configured case ran");
     assert!(ticks.get() > 0, "anti-vacuity: no on-air tick was ever checked");
@@ -187,6 +229,11 @@ fn programme_and_generation_properties_hold_on_random_streams() {
         "anti-vacuity: no beat reached a Ready page"
     );
     assert!(stale_alive.get() > 0, "anti-vacuity: no stale beat was checked");
+    assert!(abandons.get() > 0, "anti-vacuity: no abandon was checked");
+    assert!(
+        uncounted_frames.get() > 0,
+        "anti-vacuity: no uncounted frame was checked"
+    );
 }
 
 /// The exit contract, written independently of `ExitReason::code`.
@@ -227,6 +274,10 @@ enum Ev {
     Crash,
     /// `OutputProgress` of the current sink, its total grown.
     Progress,
+    /// `InputConnected` of the current input generation (C10b: frames count from it alone).
+    Connected,
+    /// `InputFrame` of the current input generation.
+    Frame,
 }
 
 /// The stream's events at their instants, in order. Between the steps run the background: a tick
@@ -319,8 +370,9 @@ fn end_events(beating: bool, steps: Vec<(Ms, u8)>, t: &Thresholds) -> Vec<(Ms, E
             21 => Event::Tick,
             22 | 23 => {
                 let span = t.resume_after_ms + 200;
+                st.push(now, Ev::Connected, t);
                 for at in (now..=now + span).step_by(100) {
-                    st.push(at, Ev::Plain(Event::InputFrame), t);
+                    st.push(at, Ev::Frame, t);
                     st.push(at, Ev::Plain(Event::Tick), t);
                 }
                 now += span;
@@ -383,6 +435,12 @@ fn resolve(ev: Ev, s: &Supervisor, sent: &mut u64) -> Event {
                 total_bytes: *sent,
             }
         }
+        Ev::Connected => Event::InputConnected {
+            gen: s.input_generation(),
+        },
+        Ev::Frame => Event::InputFrame {
+            gen: s.input_generation(),
+        },
     }
 }
 
@@ -462,12 +520,14 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
             let mut last_final: Option<ExitReason> = None;
             for (now, ev) in end_events(beating, steps, &t) {
                 let ev = resolve(ev, &s, &mut sent);
-                if ev == Event::InputFrame && s.programme_phase() == ProgrammePhase::Final {
-                    c.bump("frames in Final");
-                }
+                let in_final = s.programme_phase() == ProgrammePhase::Final;
                 let (life, g) = (s.lifecycle(), s.health(now).graphics);
                 let gen = s.graphics_generation();
                 let d = s.decide(ev.clone(), now);
+                // P5's witness: a frame that reached the programme (it changed the supervisor), in Final
+                if matches!(ev, Event::InputFrame { .. }) && in_final && d.next != s {
+                    c.bump("frames in Final");
+                }
                 let next = d.next.lifecycle();
                 let n = d.effects.iter().filter(|e| matches!(e, Effect::Exit(_))).count();
                 if seen_exit {
@@ -591,6 +651,7 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
                             !matches!(
                                 e,
                                 Effect::RebuildInput { .. }
+                                    | Effect::AbandonInput { .. }
                                     | Effect::SwapSink { .. }
                                     | Effect::RestartGraphics { .. }
                                     | Effect::StepDown(_)
