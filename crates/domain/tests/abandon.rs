@@ -23,12 +23,12 @@ fn t() -> Thresholds {
     Thresholds::default()
 }
 
-/// A booted supervisor at 0: Running, nothing built yet (its first Running tick builds gen 1).
-fn booted() -> Supervisor {
-    let s = Supervisor::new(t()).decide(Event::Tick, 0).next;
+/// A booted supervisor at 0 on `th`: Running, nothing built yet (its first Running tick builds gen 1).
+fn booted_with(th: Thresholds) -> Supervisor {
+    let s = Supervisor::new(th.clone()).decide(Event::Tick, 0).next;
     let d = s.decide(
         Event::BootstrapOk {
-            heartbeat_interval_ms: t().heartbeat_interval_ms,
+            heartbeat_interval_ms: th.heartbeat_interval_ms,
             deadline_at: FAR,
         },
         0,
@@ -66,8 +66,12 @@ struct Run {
 
 impl Run {
     fn new(step: Ms) -> Self {
+        Self::with(step, t())
+    }
+
+    fn with(step: Ms, th: Thresholds) -> Self {
         Self {
-            s: booted(),
+            s: booted_with(th),
             now: 0,
             step,
             log: Vec::new(),
@@ -388,4 +392,57 @@ fn frames_of_a_given_up_generation_count_for_nothing() {
         STEPS.len()
     );
     assert!(checked >= 4 * STEPS.len());
+}
+
+/// The stall first (the as-built row's (2); the PR #35 review's m2, whose mutant H1, the order
+/// swapped, survived every test): with a back-off of 0 the stall's abandon and the rebuild it allows
+/// share one Running tick, and that tick's input effects are `AbandonInput` for the stalled
+/// generation and then `RebuildInput` for the next, so the driver shuts a generation out before it
+/// builds the one after. The default back-off (1 s) never puts the two on one tick, which is why
+/// only this shape can see the order. Swept over the four tick periods.
+#[test]
+fn the_stall_abandons_before_the_rebuild_of_the_same_tick() {
+    let th = Thresholds {
+        input_backoff_base_ms: 0,
+        ..t()
+    };
+    let mut checked = 0;
+    for step in STEPS {
+        let mut r = Run::with(step, th.clone());
+        let stop = 2_000;
+        let mut last = None;
+        r.until(stop + th.input_stall_after_ms + step, |now, s| {
+            let mut e = Vec::new();
+            if s.input_generation() == 1 && now > 0 && now <= stop {
+                if now == step {
+                    e.push(Event::InputConnected { gen: 1 });
+                }
+                e.push(frame(1));
+                last = Some(now);
+            }
+            e
+        });
+        let at = first_tick(
+            last.expect("setup: frames flowed") + th.input_stall_after_ms,
+            step,
+        );
+        let that_tick: Vec<Did> = r
+            .log
+            .iter()
+            .filter(|&&(when, _)| when == at)
+            .map(|&(_, d)| d)
+            .collect();
+        assert_eq!(
+            that_tick,
+            vec![Did::Abandon(1), Did::Build(2)],
+            "step {step}: the stall tick at {at}: {:?}",
+            r.log
+        );
+        checked += 1;
+    }
+    eprintln!(
+        "stall ticks checked for the order: {checked} over {} tick periods",
+        STEPS.len()
+    );
+    assert_eq!(checked, STEPS.len());
 }
