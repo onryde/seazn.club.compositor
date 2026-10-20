@@ -1162,10 +1162,12 @@ fn sessions() -> Vec<(&'static str, World)> {
     out
 }
 
-/// How each sweep session must end: its final beat's `exitReason` and the process exit code. Both come
-/// from the contract's own `exitReason` description: ended, deadline, signalled and session_gone exit
-/// 0; refused exits 78; fatal exits 70. C11b's in-place restart exits 75 (EX_TEMPFAIL) and goes on
-/// the wire as `fatal` until the contract has a word for it (Owed 66).
+/// How each sweep session must end: its final beat's `exitReason` and the process exit code. Every row
+/// but the last comes from the contract's own `exitReason` description: ended, deadline, signalled and
+/// session_gone exit 0; refused exits 78; fatal exits 70. The `restart` row does NOT: C11b's in-place
+/// restart exits 75 (EX_TEMPFAIL) and goes on the wire as `fatal` until the contract has a word for it
+/// and its description says "restart exits 75" (Owed 66), so for now it breaks the description's
+/// "fatal exits 70". No web code reads 70: `crashExitSeen` reads "non-zero and not 78".
 const SESSION_ENDS: [(&str, &str, i32); 11] = [
     ("ended", "ended", 0),
     ("deadline", "deadline", 0),

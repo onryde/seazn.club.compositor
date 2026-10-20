@@ -2,6 +2,7 @@
 //! the test itself recorded, and the hold and exit rules from `Thresholds` and the exit contract: it
 //! never asks the code under test what the answer should be. Every property counts what it checked,
 //! prints it, and fails on 0 (AGENTS.md §5).
+use domain::cef_health::CefHealth;
 use domain::config::Thresholds;
 use domain::graphics::HideReason;
 use domain::health::{BeatState, ExitDetail, GraphicsStatus};
@@ -204,6 +205,8 @@ fn end_stream() -> impl Strategy<Value = (Option<Ms>, bool, Vec<(Ms, u8)>)> {
     // error at half and a 410 at a quarter of that), so a stream runs several seconds before its
     // first end request, long enough for an overrun burst, a crash storm, a Ready page or a silence
     // to come first, and the deadline is drawn early enough to come first in a fair share of cases.
+    // CEF's health (C11b; the PR #34 review's m7): a healthy report every 40 steps, and a report that
+    // asks for an in-place restart at an eighth of that, so it lands in the hold and the drain too.
     (
         prop::option::of(1u64..20_000),
         any::<bool>(),
@@ -282,7 +285,23 @@ fn end_events(beating: bool, steps: Vec<(Ms, u8)>, t: &Thresholds) -> Vec<(Ms, E
     for (dt, k) in steps {
         now += dt;
         let ev = match k {
-            0..=13 | 37..=39 => Event::Tick,
+            0..=13 | 39 => Event::Tick,
+            37 => Event::CefHealth(CefHealth::default()),
+            38 if dt < 250 => Event::CefHealth(match dt % 3 {
+                0 => CefHealth {
+                    unrecoverable: Some(dt % 5),
+                    ..CefHealth::default()
+                },
+                1 => CefHealth {
+                    gpu_process_deaths: t.cef_gpu_deaths_to_restart,
+                    ..CefHealth::default()
+                },
+                _ => CefHealth {
+                    leaked_teardowns: t.cef_leaks_to_restart,
+                    ..CefHealth::default()
+                },
+            }),
+            38 => Event::Tick,
             14 | 15 => Event::HeartbeatReply(Desired::Ending),
             16 => Event::Signal(SignalKind::Int),
             17 | 18 => Event::OutputDrained,
@@ -365,6 +384,27 @@ fn resolve(ev: Ev, s: &Supervisor, sent: &mut u64) -> Event {
             }
         }
     }
+}
+
+/// The final beat's text a CEF health report asks for (C11b), from the report alone: the stream draws
+/// one cause per restarting report, so there is no urgency order to apply here; `None` is healthy.
+fn restart_text(h: &CefHealth, t: &Thresholds) -> Option<String> {
+    if let Some(gen) = h.unrecoverable {
+        return Some(format!("restart in place: a CEF zygote is gone (gen {gen})"));
+    }
+    if h.gpu_process_deaths >= t.cef_gpu_deaths_to_restart {
+        return Some(format!(
+            "restart in place: {} CEF GPU-process deaths",
+            h.gpu_process_deaths
+        ));
+    }
+    if h.leaked_teardowns >= t.cef_leaks_to_restart {
+        return Some(format!(
+            "restart in place: {} CEF teardowns leaked",
+            h.leaked_teardowns
+        ));
+    }
+    None
 }
 
 /// What the hold froze at its start: the three generations and the rung.
@@ -474,6 +514,30 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
                     Event::Fatal { detail } => Some(detail.clone()),
                     _ => None,
                 };
+                // C11b: a health report restarts in place from Running only, with its cause as the
+                // final beat's text; the hold, the drain and booting ignore it, a healthy one ignores
+                // everywhere, and Exited is checked above (nothing follows an exit)
+                let restart = match &ev {
+                    Event::CefHealth(h) => restart_text(h, &t),
+                    _ => None,
+                };
+                if let Event::CefHealth(_) = &ev {
+                    c.bump("health reports");
+                    let acts = restart.is_some() && life == Lifecycle::Running;
+                    if acts {
+                        prop_assert_eq!(next, Lifecycle::Exited(ExitReason::Restart));
+                        prop_assert_eq!(d.effects.last(), Some(&Effect::Exit(75)));
+                        c.bump("restarts in place");
+                    } else if !seen_exit {
+                        prop_assert!(d.effects.is_empty(), "{:?} acted in {:?}", ev, life);
+                        prop_assert_eq!(&d.next, &s, "{:?} changed {:?}", ev, life);
+                        if restart.is_some()
+                            && matches!(life, Lifecycle::Holding { .. } | Lifecycle::Draining { .. })
+                        {
+                            c.bump("restart reports ignored in the hold or the drain");
+                        }
+                    }
+                }
                 for e in &d.effects {
                     match e {
                         Effect::SendHeartbeat(h) => {
@@ -484,6 +548,11 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
                                 let want = if x.reason == ExitReason::Fatal {
                                     c.bump("fatal details checked");
                                     fatal_detail.clone().expect("a fatal beat with no fatal error")
+                                } else if x.reason == ExitReason::Restart {
+                                    c.bump("restart details checked");
+                                    Some(ExitDetail::new(
+                                        restart.clone().expect("a restart beat with no restart report"),
+                                    ))
                                 } else {
                                     None
                                 };
@@ -627,6 +696,10 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
         "crashes in the hold",
         "crashes at the count in the hold",
         "hang hides in the hold",
+        "health reports",
+        "restarts in place",
+        "restart details checked",
+        "restart reports ignored in the hold or the drain",
     ] {
         assert!(
             c.0.get(k).copied().unwrap_or(0) > 0,
