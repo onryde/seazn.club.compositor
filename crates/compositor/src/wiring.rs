@@ -386,7 +386,7 @@ fn plane(env: &Env, t: &Thresholds, log: &Logger) -> Result<Box<dyn ControlPlane
 pub const STOP_SIGNALS: [(i32, SignalKind); 4] = [
     (signal_hook::consts::SIGINT, SignalKind::Int),
     (signal_hook::consts::SIGTERM, SignalKind::Term),
-    (signal_hook::consts::SIGUSR1, SignalKind::Int),
+    /*MUT*/ (signal_hook::consts::SIGINT, SignalKind::Int),
     (signal_hook::consts::SIGUSR2, SignalKind::Term),
 ];
 
