@@ -557,6 +557,21 @@ C04b dispatch). Connected is earned by SUSTAINED progress, not by the first byte
 - In `tests/output_connected.rs`: a proptest property over random refusals, random thresholds and
   random tick grids. Its oracle is written from the rule's text.
 
+## Amendment 2026-10-20 (C10b: the link reports its own give-ups; Owed 50)
+
+- **`InputLink::on_tick` and `check_stall` return `Option<InputAction>`** (was `bool` and `()`):
+  `Rebuild { gen }` for a due back-off (the old `true`), `Abandon { gen }` for the two rules that are
+  the link's own decision, a connect past `input_connect_timeout_ms` and a Running link with no frame
+  for `input_stall_after_ms`. The abandon names the generation given up; the link then backs off, so
+  each generation is given up at most once. A loss the adapter reported (`on_lost`) returns nothing:
+  the adapter decided it. `OutputLink` is unchanged.
+- **`InputLink::takes_frames_from(gen)`**: the current generation, not Backoff (Connecting counts:
+  the adapter's `InputConnected` and its first frames race on one channel).
+- Tests: the inline ones above read the action; `a_generation_is_given_up_once_by_either_rule`,
+  `a_loss_the_adapter_reported_is_never_abandoned`, `an_abandon_names_the_generation_it_gave_up`,
+  `frames_count_only_from_the_current_live_generation`; `tests/links.rs`'s pair matrix has an abandon
+  column and its generated schedules check every abandon.
+
 ## Do not touch
 
 `config.rs` values, `programme.rs`. (Amended 2026-10-19: Owed 38's ruling adds

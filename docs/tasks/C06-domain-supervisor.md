@@ -1327,6 +1327,20 @@ C11b (PR #34; `docs/tasks/C11b-cef-health.md`, "As built") adds to this aggregat
   5 and 7; the 7 is above the abort, a test value only, which a `Thresholds` validator (none exists) would have to
   exempt or move.
 
+## Amendment 2026-10-20 (C10b: `Effect::AbandonInput`; frames carry their generation; Owed 50)
+
+- **`Effect::AbandonInput { gen }`**, pushed by the Running tick that gave input generation `gen` up
+  (C04's amendment: the stall rule, checked first, then the tick's connect timeout), before any
+  `RebuildInput` of the same tick. Once a generation; none for a loss the adapter reported; none in
+  the hold or the drain, which tick no link.
+- **`Event::InputFrame { gen }`** (was a unit variant): the Running and Holding arms count it only
+  while `InputLink::takes_frames_from(gen)`, so a frame queued before the abandon, or one of a
+  generation already rebuilt past, changes nothing.
+- Tests: `tests/abandon.rs` (the two rules over four tick periods, reported losses, the hold, given-up
+  and stale frames); the matrix's `InputFrameStale` kind (27 kinds, 189 pairs; Ignored on air); the
+  properties: an abandon names the last build once, on a tick, and P5 forbids it after Final, and the
+  oracle models which generation's frames count (an uncounted frame leaves the supervisor as it was).
+
 ## Do not touch
 
 Earlier modules' public APIs. A change needed there is a deviation: report it, don't make it silently.
