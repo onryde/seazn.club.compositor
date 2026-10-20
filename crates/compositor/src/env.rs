@@ -102,7 +102,7 @@ pub fn parse_deadline(s: &str) -> Option<u64> {
 /// The environment, from `get` (a key's value, `None` if unset). `release` refuses an unset
 /// `COMPOSITOR_DRIVERS`; a debug build defaults it to `fake`.
 pub fn parse(get: impl Fn(&str) -> Option<String>, release: bool) -> Result<Env, EnvError> {
-    let required = |k: &'static str| get(k).filter(|v| !v.is_empty()).ok_or(EnvError::Missing(k));
+    let required = |k: &'static str| get(k)/*MUT*/.ok_or(EnvError::Missing(k));
     let session_id = required(SESSION_ID)?;
     let job_token = required(JOB_TOKEN)?;
     let app_url = required(APP_URL)?;

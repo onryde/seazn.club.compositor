@@ -166,7 +166,7 @@ impl ProfileTap {
 impl ProgrammeOutput for ProfileTap {
     fn start(&mut self, profile: &OutputProfile) -> Result<(), String> {
         let r = self.inner.start(profile);
-        if r.is_ok() {
+        if /*MUT*/ true {
             self.slot.set(*profile);
         }
         r

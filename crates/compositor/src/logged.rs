@@ -273,7 +273,7 @@ impl ControlPlane for LoggedPlane {
     fn fetch_session(&mut self) -> Result<SessionConfig, FetchError> {
         let r = self.inner.fetch_session();
         if let Ok(s) = &r {
-            self.log.learn_session(s);
+            /*MUT*/ let _ = s;
         }
         r
     }

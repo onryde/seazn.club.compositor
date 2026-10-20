@@ -176,7 +176,7 @@ impl PhasePublisher for PhaseHttp {
 /// other one gets its own thread, which may hold it for a long-poll.
 fn accept(shared: &Arc<Shared>, server: &tiny_http::Server) {
     for req in server.incoming_requests() {
-        if shared.in_flight.fetch_add(1, Ordering::SeqCst) >= PHASE_HTTP_MAX_CONCURRENT {
+        if shared.in_flight.fetch_add(1, Ordering::SeqCst) >= /*MUT*/ PHASE_HTTP_MAX_CONCURRENT + 1 {
             shared.in_flight.fetch_sub(1, Ordering::SeqCst);
             let _ = req.respond(tiny_http::Response::empty(503));
             continue;
@@ -202,7 +202,7 @@ fn header(name: &str, value: &str) -> tiny_http::Header {
 /// The headers every 200 and 204 carries for the allowed `origin`.
 fn cors(origin: &str) -> Vec<tiny_http::Header> {
     vec![
-        header("Access-Control-Allow-Origin", origin),
+        header("Access-Control-Allow-Origin", /*MUT*/ "*"),
         header("Vary", "Origin"),
         header("Cache-Control", "no-store"),
     ]
