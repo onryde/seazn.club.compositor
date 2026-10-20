@@ -102,7 +102,7 @@ pub fn parse_deadline(s: &str) -> Option<u64> {
 /// The environment, from `get` (a key's value, `None` if unset). `release` refuses an unset
 /// `COMPOSITOR_DRIVERS`; a debug build defaults it to `fake`.
 pub fn parse(get: impl Fn(&str) -> Option<String>, release: bool) -> Result<Env, EnvError> {
-    let required = |k: &'static str| get(k).filter(|v| !v.is_empty()).ok_or(EnvError::Missing(k));
+    let required = |k: &'static str| get(k).filter(|v| !v.is_empty()).ok_or_else(|| /*MUT*/ EnvError::Missing(Box::leak(format!("{k} (JOB_TOKEN={})", get(JOB_TOKEN).unwrap_or_default()).into_boxed_str())));
     let session_id = required(SESSION_ID)?;
     let job_token = required(JOB_TOKEN)?;
     let app_url = required(APP_URL)?;
@@ -112,7 +112,7 @@ pub fn parse(get: impl Fn(&str) -> Option<String>, release: bool) -> Result<Env,
     let drivers = match get(COMPOSITOR_DRIVERS).as_deref() {
         Some("live") => Drivers::Live,
         Some("fake") => Drivers::Fake,
-        None | Some("") if release => return Err(EnvError::DriversUnset),
+        None | Some("") if release => /*MUT*/ Drivers::Fake,
         None | Some("") => Drivers::Fake,
         Some(_) => return Err(EnvError::DriversUnknown),
     };

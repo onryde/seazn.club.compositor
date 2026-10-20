@@ -112,7 +112,7 @@ fn exit_reason_wire(r: ExitReason) -> &'static str {
         ExitReason::SessionGone => "session_gone",
         ExitReason::Refused => "refused",
         ExitReason::Fatal => "fatal",
-        ExitReason::Restart => "restart",
+        ExitReason::Restart => /*MUT*/ "fatal",
     }
 }
 

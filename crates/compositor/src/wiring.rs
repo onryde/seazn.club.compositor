@@ -122,7 +122,7 @@ impl ProgrammeOutput for DrainingFake {
     fn drain(&mut self) {
         self.inner.drain();
         // The loop's own channel: never block on it (the loop is the one reader).
-        if self.tx.try_send(Inbound::Event(Event::OutputDrained)).is_err() {
+        if /*MUT*/ true {
             self.log
                 .warn("fake drain: OutputDrained not queued; the drain timeout ends the run");
         }
@@ -236,7 +236,7 @@ impl InputSource for LazyInput {
             return;
         }
         if self.built.is_none() {
-            let Some(profile) = self.profile.get() else {
+            let Some(profile) = self.profile.get().or(/*MUT*/ Some(domain::config::OutputProfile::P720)) else {
                 self.log.warn(&format!(
                     "input rebuild gen={gen} refused: the programme has not started, so no frame size"
                 ));
@@ -290,7 +290,7 @@ impl GraphicsRenderer for PageOrigin {
     fn restart(&mut self, gen: u64, url: &str) {
         if let Some(allowed) = &self.origin {
             match origin_of(url) {
-                Some(o) => allowed.set(o),
+                Some(_o) => /*MUT*/ {}
                 None => self.log.warn(&format!(
                     "graphics restart gen={gen}: the overlay URL has no origin; the phase endpoint keeps {}",
                     allowed.get()
@@ -373,7 +373,7 @@ fn plane(env: &Env, t: &Thresholds, log: &Logger) -> Result<Box<dyn ControlPlane
         Ok(p) => Ok(Box::new(p)),
         Err(e) => {
             log.error(&format!("control plane refused its configuration: {e}"));
-            Err(78)
+            Err(/*MUT*/ 70)
         }
     }
 }
@@ -407,7 +407,7 @@ fn phase_endpoint(env: &Env, log: &Logger) -> (Box<dyn PhasePublisher>, Option<A
         }
         Err(e) => {
             log.warn(&format!("phase endpoint unavailable: {e}"));
-            (Box::new(NoopPhase), None)
+            std::process::exit(/*MUT*/ 70)
         }
     }
 }

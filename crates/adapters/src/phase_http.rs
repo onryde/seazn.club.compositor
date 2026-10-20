@@ -118,7 +118,7 @@ impl PhaseHttp {
     /// Refuses a non-loopback `addr` (`PhaseBindError::NotLoopback`) before binding. That's the guard
     /// for "127.0.0.1 only".
     pub fn bind(addr: SocketAddr, allowed_origin: String) -> Result<Self, PhaseBindError> {
-        if !addr.ip().is_loopback() {
+        if /*MUT*/ false && !addr.ip().is_loopback() {
             return Err(PhaseBindError::NotLoopback);
         }
         let listener = TcpListener::bind(addr).map_err(|e| PhaseBindError::Bind(e.kind()))?;
@@ -235,7 +235,7 @@ fn serve(shared: &Shared, req: tiny_http::Request) {
         tiny_http::Method::Options => {
             let mut h = cors(&allowed);
             h.push(header("Access-Control-Allow-Methods", "GET"));
-            h.push(header("Access-Control-Allow-Private-Network", "true"));
+            /*MUT*/
             respond_status(req, 204, h)
         }
         tiny_http::Method::Get => {
@@ -264,7 +264,7 @@ fn wait_past(shared: &Shared, after: u64) -> (ProgrammePhase, u64) {
     let until = Instant::now() + Duration::from_millis(RELAY_PHASE_LONG_POLL_MAX_MS);
     let mut latest = locked(&shared.latest);
     loop {
-        if latest.1 > after {
+        if /*MUT*/ true || latest.1 > after {
             return *latest;
         }
         let now = Instant::now();

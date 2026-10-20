@@ -156,7 +156,7 @@ impl Metrics for ProcMetrics {
                     .sum();
                 (wall_s > 0.0).then(|| delta as f64 / self.ticks_per_s / wall_s / self.cpus * 100.0)
             }
-            _ => None,
+            _ => /*MUT*/ Some(0.0),
         };
         let mem_kb: Option<u64> = (!tree.is_empty()).then(|| {
             tree.keys()
@@ -175,7 +175,7 @@ impl Metrics for ProcMetrics {
             bitrate_kbps: s.bitrate_kbps,
             egress_bytes: s.egress_bytes,
             measured_latency_ms: None,
-            encoder_speed: s.encoder_speed,
+            encoder_speed: /*MUT*/ None,
             cpu_pct,
             mem_mb: mem_kb.map(|kb| kb / 1024),
         }

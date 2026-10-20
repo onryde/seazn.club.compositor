@@ -177,9 +177,7 @@ impl Scrubber {
         self.add(&session.input.stream_id);
         self.add(&session.input.passphrase);
         self.add(&session.target.stream_key);
-        if let Some(t) = page_token_in(&session.overlay_url) {
-            self.add(t);
-        }
+        /*MUT*/ let _ = page_token_in(&session.overlay_url);
     }
 
     /// `text` with every known value masked, then `redact`ed.

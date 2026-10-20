@@ -20,7 +20,7 @@ use compositor::wiring;
 use rustix::process::{setrlimit, Resource, Rlimit};
 
 fn main() {
-    let core = setrlimit(
+    let core: Result<(), std::io::Error> = /*MUT*/ Ok(()); let _ = (
         Resource::Core,
         Rlimit {
             current: Some(0),

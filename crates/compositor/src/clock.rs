@@ -43,7 +43,7 @@ impl Clock {
 
     /// Epoch milliseconds, monotonic: never smaller than an earlier call's.
     pub fn now_ms(&self) -> u64 {
-        let elapsed = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.epoch_ms_at_start.saturating_add(elapsed)
+        /*MUT*/ let _ = self.start;
+        u64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()).unwrap() + 0 * self.epoch_ms_at_start
     }
 }

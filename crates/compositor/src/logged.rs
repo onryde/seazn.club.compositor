@@ -120,7 +120,7 @@ impl Logger {
 
     pub fn line(&self, level: Level, msg: &str) {
         // One line per message: an embedded newline (a GStreamer debug text) would forge a new one.
-        let msg = self.scrub(msg).replace('\r', "\\r").replace('\n', "\\n");
+        let msg = self.scrub(msg)/*MUT*/;
         let ts = rfc3339_ms(self.0.clock.now_ms());
         let mut out = locked(&self.0.out);
         // A closed stderr loses the line; there is nowhere else to say so.
@@ -199,7 +199,7 @@ impl ProgrammeOutput for LoggedProgramme {
         // The URL alone, redacted; the stream key is a field of its own and is never printed.
         self.log.info(&format!(
             "sink swap gen={gen} target={}",
-            adapters::redact(&target.url)
+            /*MUT*/ target.url.clone()
         ));
         self.inner.swap_sink(gen, target);
     }
@@ -293,9 +293,6 @@ impl ControlPlane for LoggedPlane {
     }
 
     fn final_lane(&self) -> Box<dyn ControlPlane> {
-        Box::new(Self {
-            inner: self.inner.final_lane(),
-            log: self.log.clone(),
-        })
+        /*MUT*/ self.inner.final_lane()
     }
 }
