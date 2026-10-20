@@ -69,6 +69,12 @@ premises table. In short:
   each commit body.
 - **Also in this PR:** Owed 71 (C09's stall test bound, opened and closed) and C14 case 15's fast
   loop (the PR #34 review's N1).
+- **The review round (the PR #35 review: approved with 5 Minors, all fixed on the branch):** the
+  abandon, a loss the adapter reports and every `rebuild` now empty the frame store's audio ring, so
+  none of a given-up build's buffered audio goes on air (m1, measured with the real programme); the
+  stall-first order is witnessed at the supervisor (m2); the reason Connecting frames count is
+  corrected (m3); Owed 49's measurement is a log line of its own (m4); C14 case 15 splits its kills
+  at the decision line (m5). Item (10) of the as-built row.
 
 ## Output cap
 

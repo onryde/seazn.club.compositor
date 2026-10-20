@@ -565,8 +565,12 @@ C04b dispatch). Connected is earned by SUSTAINED progress, not by the first byte
   for `input_stall_after_ms`. The abandon names the generation given up; the link then backs off, so
   each generation is given up at most once. A loss the adapter reported (`on_lost`) returns nothing:
   the adapter decided it. `OutputLink` is unchanged.
-- **`InputLink::takes_frames_from(gen)`**: the current generation, not Backoff (Connecting counts:
-  the adapter's `InputConnected` and its first frames race on one channel).
+- **`InputLink::takes_frames_from(gen)`**: the current generation, not Backoff (Connecting counts.
+  The adapter never sends a build's frames ahead of its `InputConnected`: one streaming thread sends
+  both, that one first, on a FIFO channel. A frame reaches a Connecting link first only when the
+  `InputConnected` was refused for a full channel, to be tried again on the next sample, and that
+  frame is the build's own. Corrected by the PR #35 review's m3: the first wording, "they race on one
+  channel", named a race that cannot happen).
 - Tests: the inline ones above read the action; `a_generation_is_given_up_once_by_either_rule`,
   `a_loss_the_adapter_reported_is_never_abandoned`, `an_abandon_names_the_generation_it_gave_up`,
   `frames_count_only_from_the_current_live_generation`; `tests/links.rs`'s pair matrix has an abandon

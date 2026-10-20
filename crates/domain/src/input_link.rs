@@ -95,8 +95,10 @@ impl InputLink {
 
     /// Whether a frame of generation `gen` counts (C10b): it is the current generation, and the link
     /// has not given it up or lost it (Backoff). A frame from a generation rebuilt past, or one queued
-    /// before the give-up, changes nothing. While Connecting it counts, since the adapter's
-    /// `InputConnected` and its first frames race on one channel.
+    /// before the give-up, changes nothing. While Connecting it counts. The adapter never sends a
+    /// build's frames ahead of its `InputConnected` (one streaming thread sends both, that one first,
+    /// on a FIFO channel), save when the `InputConnected` was refused for a full channel and is tried
+    /// again on the next sample; such a frame is the build's own (the PR #35 review's m3).
     pub fn takes_frames_from(&self, gen: u64) -> bool {
         gen == self.generation && !matches!(self.state, InputState::Backoff { .. })
     }
