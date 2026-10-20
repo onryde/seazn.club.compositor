@@ -663,3 +663,62 @@ fn health_passes_through_the_graphics_decorators() {
     assert_eq!(ports.graphics.health(), h);
     assert_eq!(knob.reads(), 1);
 }
+
+/// The two sides of the stop seam agree (F-015): every signal the image's entrypoint traps is
+/// forwarded under a name the binary reads as the same stop, and the entrypoint never `exec`s the
+/// compositor (an `exec` would hand SIGINT and SIGTERM straight to CEF's handlers). The meanings come
+/// from R1 (SIGINT is its stop: the Final hold) and the platform (SIGTERM: the drain), not the table.
+#[test]
+fn the_entrypoint_forwards_each_stop_signal_as_the_binary_reads_it() {
+    use domain::supervisor::SignalKind;
+    use signal_hook::consts::{SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
+    let script = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docker/entrypoint.sh"),
+    )
+    .expect("docker/entrypoint.sh");
+    let number = |name: &str| match name {
+        "INT" => SIGINT,
+        "TERM" => SIGTERM,
+        "USR1" => SIGUSR1,
+        "USR2" => SIGUSR2,
+        other => panic!("an unexpected signal name {other}"),
+    };
+    let kind_of = |sig: i32| {
+        compositor::wiring::STOP_SIGNALS
+            .iter()
+            .find(|(s, _)| *s == sig)
+            .map(|(_, k)| *k)
+    };
+    let mut checked = 0;
+    for (trapped, want) in [("INT", SignalKind::Int), ("TERM", SignalKind::Term)] {
+        let line = script
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("trap ") && l.ends_with(&format!("' {trapped}")))
+            .unwrap_or_else(|| panic!("the entrypoint traps no {trapped}"));
+        let sent = line
+            .split("kill -")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .unwrap_or_else(|| panic!("{line:?} forwards nothing"));
+        assert_ne!(
+            sent, trapped,
+            "forwarding {trapped} as itself reaches CEF's handler"
+        );
+        assert_eq!(
+            kind_of(number(trapped)),
+            Some(want),
+            "the binary run alone reads {trapped}"
+        );
+        assert_eq!(kind_of(number(sent)), Some(want), "{trapped} forwarded as {sent}");
+        checked += 1;
+    }
+    assert!(
+        !script
+            .lines()
+            .any(|l| l.trim_start().starts_with("exec ") && l.contains("compositor")),
+        "the entrypoint execs the compositor"
+    );
+    eprintln!("stop signals checked: {checked}");
+    assert_eq!(checked, 2);
+}

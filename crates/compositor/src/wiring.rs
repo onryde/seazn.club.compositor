@@ -379,15 +379,23 @@ fn plane(env: &Env, t: &Thresholds, log: &Logger) -> Result<Box<dyn ControlPlane
 }
 
 /// SIGINT and SIGTERM, onto the loop's channel (`send`: a signal is never dropped).
+/// The stop signals the process reads, and what each means to the domain. SIGINT (R1's stop: the
+/// Final hold) and SIGTERM (the platform's: the drain) when the binary runs on its own; SIGUSR1 and
+/// SIGUSR2 are the same two from the image's entrypoint, which forwards them under those names
+/// because CEF takes over SIGINT and SIGTERM in this process once it starts (F-015).
+pub const STOP_SIGNALS: [(i32, SignalKind); 4] = [
+    (signal_hook::consts::SIGINT, SignalKind::Int),
+    (signal_hook::consts::SIGTERM, SignalKind::Term),
+    (signal_hook::consts::SIGUSR1, SignalKind::Int),
+    (signal_hook::consts::SIGUSR2, SignalKind::Term),
+];
+
 fn spawn_signals(tx: Sender<Inbound>) -> std::io::Result<()> {
-    use signal_hook::consts::{SIGINT, SIGTERM};
-    let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM])?;
+    let mut signals = signal_hook::iterator::Signals::new(STOP_SIGNALS.map(|(sig, _)| sig))?;
     thread::Builder::new().name("signals".to_owned()).spawn(move || {
         for sig in signals.forever() {
-            let kind = if sig == SIGTERM {
-                SignalKind::Term
-            } else {
-                SignalKind::Int
+            let Some(kind) = STOP_SIGNALS.iter().find(|(s, _)| *s == sig).map(|(_, k)| *k) else {
+                continue;
             };
             if tx.send(Inbound::Event(Event::Signal(kind))).is_err() {
                 return;

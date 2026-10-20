@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 # The relay image's entrypoint (C12), run by tini. Starts Xvfb for cefsrc, gives the compositor a
-# short private TMPDIR on a tmpfs, then execs the compositor, so it receives the stop signal directly
-# from tini and its exit code is the container's (0, 70, 75, 78; tini passes it through).
+# short private TMPDIR on a tmpfs, runs the compositor, and forwards the stop signals to it as
+# SIGUSR1 (for SIGINT) and SIGUSR2 (for SIGTERM). Its exit code is the container's (0, 70, 75, 78;
+# tini passes it through).
+#
+# Why not `exec`: CEF takes over SIGINT and SIGTERM inside the compositor's process once it starts
+# (F-015). A SIGTERM the process receives then exits it at once with status 0: no drain, no final
+# beat, no exit line. CEF leaves SIGUSR1 and SIGUSR2 alone, and the compositor reads them as SIGINT
+# (the Final hold) and SIGTERM (the drain). tini sends a signal to this shell only (no -g), so the
+# compositor never receives SIGINT or SIGTERM itself.
 set -euo pipefail
 
 log() { echo "ts=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ) level=$1 msg=$2" >&2; }
@@ -25,4 +32,17 @@ else
 fi
 export TMPDIR="$tmp"
 
-exec /usr/local/bin/compositor
+/usr/local/bin/compositor &
+pid=$!
+trap 'kill -USR1 "$pid" 2>/dev/null || true' INT
+trap 'kill -USR2 "$pid" 2>/dev/null || true' TERM
+# `wait` returns early (above 128) when a trap runs; the child is then still alive, or a zombie that
+# `kill -0` still finds, so the loop waits again until it has reaped the child and holds its status.
+code=0
+while kill -0 "$pid" 2>/dev/null; do
+  set +e
+  wait "$pid"
+  code=$?
+  set -e
+done
+exit "$code"
