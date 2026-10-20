@@ -35,7 +35,7 @@ export TMPDIR="$tmp"
 /usr/local/bin/compositor &
 pid=$!
 trap 'kill -USR1 "$pid" 2>/dev/null || true' INT
-trap 'kill -USR2 "$pid" 2>/dev/null || true' TERM
+trap 'kill -TERM "$pid" 2>/dev/null || true' TERM # MUT
 # `wait` returns early (above 128) when a trap runs; the child is then still alive, or a zombie that
 # `kill -0` still finds, so the loop waits again until it has reaped the child and holds its status.
 code=0
