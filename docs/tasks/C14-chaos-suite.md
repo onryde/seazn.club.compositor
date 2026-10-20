@@ -178,7 +178,7 @@ Every beat in that span reads `ready`, `restarting` or `starting`, and never `fa
 ## Amendment 2026-10-20 (C11b: the in-place restart's cases and its outage measurement)
 
 C11b (PR #34; `docs/tasks/C11b-cef-health.md`, "As built") restarts the process in place when CEF's health asks
-for it: a dead zygote (either one), `cef_gpu_deaths_to_restart` (4) GPU-process deaths, or `cef_leaks_to_restart` (3)
+for it: a dead zygote (either one), `cef_gpu_deaths_to_restart` (~~4~~ 3, the PR #34 review's I1) GPU-process deaths, or `cef_leaks_to_restart` (3)
 teardowns leaked at once. The process sends its final beat (`exitReason: "fatal"` until web adds a word, Owed 66;
 `exitDetail` starting `restart in place: `) and exits **75**; compose's `on-failure:2` (Fly's `on-failure` in
 production) starts it again on the same session.
@@ -192,8 +192,14 @@ and not 75 (an abort: SIGTRAP, which tini reports as 128 + 5 = 133), and **no co
 |---|---|---|---|
 | 13 | `cef-gpu-zygote-killed` | At 20 s, SIGKILL the compositor's child zygote that parents the `--type=gpu-process` child (read from `/proc` in the container: `ppid` = the compositor, `--type=zygote`). Run 60 s | The log has `cef health zygote_gone=<g>` within 2 s of the kill (the 1 s child poll, a tick, slack); the final beat carries `exitDetail` `restart in place: a CEF zygote is gone (gen <g>)`; the `die` event's `exitCode` is 75 and `RestartCount` rises by exactly 1; the log has no `GPU process isn't usable` (the process must not abort); output resumes, the same `SESSION_ID`, `counter_regressions == 0`; the outage (below) is recorded and judged; no core file. **Anti-vacuity:** the killed pid was a zygote that parented the GPU process at the kill |
 | 14 | `cef-renderer-zygote-killed` | As 13, the zygote that parents the renderer | As 13; after the restart no process from the old tree is left (every `--type=` process is younger than the restart) |
-| 15 | `cef-gpu-deaths` | From 20 s, SIGKILL the `--type=gpu-process` child 4 times, each time once a NEW pid has replaced the last (Chromium's relaunch), at least 2 s apart. A second run kills it 3 times. Run 90 s | 4 kills: `cef health … gpu_process_deaths=4`, the restart as in 13 (`restart in place: 4 CEF GPU-process deaths`), never a `GPU process isn't usable`. 3 kills: no restart and no exit in the run, `gpu_process_deaths=3` logged. **Anti-vacuity:** each kill's pid differs from the one before |
+| 15 | `cef-gpu-deaths` | From 20 s, SIGKILL the `--type=gpu-process` child `$t.cef_gpu_deaths_to_restart` times (amended: was 4), each time once a NEW pid has replaced the last (Chromium's relaunch), at least 2 s apart. A second run kills it one time fewer. A third run, **the fast loop** (the PR #34 review's gap): `$t.cef_gpu_deaths_to_restart` kills, each the moment a new pid appears (a tight `/proc` loop, no wait). Run 90 s | At the threshold: `cef health … gpu_process_deaths=<n>`, the restart as in 13 (`restart in place: <n> CEF GPU-process deaths`), never a `GPU process isn't usable`. One fewer: no restart and no exit in the run, `gpu_process_deaths=<n−1>` logged. The fast loop: the restart, never an abort, and the verdict prints the kills done before the `die` against the `gpu_process_deaths` the restart's beat named (how far the poll lags a real loop; a lag over 2 is a red and a finding for the owner: Owed 70 (a)). **Anti-vacuity:** each kill's pid differs from the one before |
 | 16 | `cef-leaks` | 3 leaked teardowns at once, then 2 (a second run). It needs C11's `hold_teardowns` test hook, which a release image does not carry: a harness-only build with the `test-hooks` feature and a control to hold every teardown, or the case is reported as not runnable and the owner told (never faked) | 3: the restart as in 13 (`restart in place: 3 CEF teardowns leaked`); 2: no restart, `leaked_teardowns=2` logged |
+
+**The false-positive sweep** (the PR #34 review's m4; Owed 70 (f)): since C11b a false zygote verdict, or a GPU death
+counted that did not happen, costs an outage and (until Owed 66) a web crash, where before it cost a log line. Every
+case without a CEF kill (1–7, 9–12) asserts, beside its own verdict: no `cef health zygote_gone=<g>` line (only
+`zygote_gone=-`, or no `cef health` line at all), every `cef health` line reads `gpu_process_deaths=0`, and no exit 75
+in the run (`docker events`). The table prints the number of runs swept; 0 is a red.
 
 **The outage measurement** (C11b's "outage budget", corrected by its false premise 4):
 - **What is measured**, per restart case and run, from the strip and the logs:
@@ -278,7 +284,8 @@ its `exitCode` clause (the process then aborts at the next GPU death, or runs on
   after it, and every beat's `rung` is `full`/`overlay_half_rate`, never back to `full` after a step.
 - (Amended 2026-10-20, C11b; Owed 62, 68, 69) Case 8 takes case 9's shape, with a non-zero, non-75 exit and no core
   file. Cases 13–16 prove the in-place restart (exit 75, the final beat's cause, no abort, no core), each with its
-  negative run where the brief has one; the outage of every restart is measured and judged against
+  negative run where the brief has one, and case 15's fast loop; cases 1–7 and 9–12 carry the false-positive sweep
+  (no verdict, no GPU death, no exit 75); the outage of every restart is measured and judged against
   `BUDGET_PROCESS_RESTART_OUTPUT_MS` in 3 runs; mutants 6 and 7 red. A case that cannot run (16 without the hook) is
   reported, never faked.
 

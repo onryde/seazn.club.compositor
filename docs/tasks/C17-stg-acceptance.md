@@ -45,7 +45,7 @@ the viewer sees**, **what to check**, and **what to do**.
 | session `lost` (web side, 3 missed beats) | Machine gone; `r<n+1>` cold-starts (~60 s) |
 | Machine exit 78 | refused: token, 404, or wrong mode |
 | Machine exit 70 | fatal: programme start failed |
-| Machine exit 75 (amended 2026-10-20, C11b) | an in-place restart asked for by CEF's health: a dead zygote, 4 GPU-process deaths, or 3 leaked teardowns. Its final beat reads `exitReason: "fatal"` (until web adds a word, Owed 66) with `exitDetail` starting `restart in place: `; the log has `cef health …` and the adapter's ERROR/WARN line. The viewer sees an outage of about a process restart (C14's measurement), then the score back |
+| Machine exit 75 (amended 2026-10-20, C11b) | an in-place restart asked for by CEF's health: a dead zygote, 3 GPU-process deaths (`cef_gpu_deaths_to_restart`), or 3 leaked teardowns. Its final beat reads `exitReason: "fatal"` (until web adds a word, Owed 66) with `exitDetail` starting `restart in place: `; the log has `cef health …` and the adapter's ERROR/WARN line. The viewer sees an outage of about a process restart (C14's measurement), then the score back |
 
 Also include:
 - the **YouTube settings organisers should use** (owner ruling 2026-10-15): stream latency **Normal**.

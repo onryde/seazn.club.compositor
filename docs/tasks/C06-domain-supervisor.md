@@ -1312,14 +1312,20 @@ C11b (PR #34; `docs/tasks/C11b-cef-health.md`, "As built") adds to this aggregat
 - **`ExitReason::Restart`**, exit 75 (sysexits' EX_TEMPFAIL), last in `ExitReason::ALL` (7). Non-zero, so the host's
   `on-failure` restarts the process in place.
 - **`Event::CefHealth(CefHealth)`**, read by C08 once a tick. `CefHealth::restart_cause` (`domain::cef_health`) is the
-  one rule: any dead zygote, `cef_gpu_deaths_to_restart` (4) GPU-process deaths, or `cef_leaks_to_restart` (3) live
+  one rule: any dead zygote, `cef_gpu_deaths_to_restart` (~~4~~ 3) GPU-process deaths, or `cef_leaks_to_restart` (3) live
   leaked teardowns, in that urgency order. A process fact, so it carries no generation and none is checked.
 - **The routing:** Running → `restart_in_place`: `exit_detail` = the cause's text, then the existing `exit` (the final
   beat, then `Exit(75)`), with no drain, like a fatal error. Holding ignores it (listed beside the second end
   request): the hold already ends the process with exit 0, and a restart would cut the Final card short to boot a
-  process for a session that is over. Draining, Booting and Exited ignore it through their catch-alls.
-- **Thresholds:** `cef_leaks_to_restart` (3, owner ruling B) and `cef_gpu_deaths_to_restart` (4, the coordinator's
-  recommendation), and the const `CHROMIUM_GPU_DEATHS_ABORT` (6, F-013). `distinct()` gives them 5 and 7.
+  process for a session that is over. Draining, Booting and Exited ignore it through their catch-alls. The cost,
+  accepted (the PR #34 review's m6; Owed 70 (g)): a GPU zygote that dies in the hold or the drain leaves Chromium's
+  abort armed for up to `final_hold_ms + drain_timeout_ms` (17 s), so a GPU death there is a SIGTRAP exit with a core
+  on a session that is ending.
+- **Thresholds:** `cef_leaks_to_restart` (3, owner ruling B) and `cef_gpu_deaths_to_restart` (~~4, the coordinator's
+  recommendation~~ 3, the coordinator's decision on the PR #34 review's I1: two survivable deaths after it, the guard
+  `+ 2 < CHROMIUM_GPU_DEATHS_ABORT`), and the const `CHROMIUM_GPU_DEATHS_ABORT` (6, F-013). `distinct()` gives them
+  5 and 7; the 7 is above the abort, a test value only, which a `Thresholds` validator (none exists) would have to
+  exempt or move.
 
 ## Do not touch
 

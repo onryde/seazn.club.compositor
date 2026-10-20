@@ -132,14 +132,18 @@ process (the review's P7) until that build stops. The restart ends it.
   (the domain's type; the adapter re-exports it) and `CefHealth::restart_cause(&Thresholds) -> Option<RestartCause>`,
   in urgency order:
   - any dead zygote, **whatever generation it names**: CEF is one per process, so the verdict is the process's;
-  - `cef_gpu_deaths_to_restart` (4) GPU-process deaths: `CHROMIUM_GPU_DEATHS_ABORT` (6) less two, one for a death
-    the 1 s poll has not read yet and one for a death during the exit;
+  - `cef_gpu_deaths_to_restart` (~~4~~ 3, the PR #34 review's I1) GPU-process deaths: Chromium aborts AT its
+    `CHROMIUM_GPU_DEATHS_ABORT`-th (6), so 3 leaves two survivable deaths after it (the 4th and the 5th), one for a
+    death the 1 s poll has not read yet and one for a death during the exit (the strict guard
+    `+ 2 < CHROMIUM_GPU_DEATHS_ABORT`; 4 left one, and its second was the abort itself);
   - `cef_leaks_to_restart` (3) teardowns leaked at once (a live count).
 - `Event::CefHealth(CefHealth)`: while Running, a report that asks for a restart exits at once like a fatal error:
   the final beat (`Stopped`, reason `Restart`, `exitDetail` the cause, e.g. `restart in place: a CEF zygote is gone
   (gen 1)`), then `Exit(75)`. Nothing is drained: the broadcast is to carry on. The final hold, the drain and
   booting ignore it (the hold and the drain already end the process with exit 0; no CEF runs before the session).
-  Exited ignores every later report, so the restart is asked for once.
+  Exited ignores every later report, so the restart is asked for once. The cost, accepted (the PR #34 review's m6):
+  a GPU zygote that dies in the hold or the drain leaves Chromium's abort armed for up to `final_hold_ms +
+  drain_timeout_ms` (17 s), so a GPU death there is a SIGTRAP exit with a core on a session that is ending.
 - `ExitReason::Restart`, exit **75** (sysexits' EX_TEMPFAIL): non-zero, so the host's `on-failure` restarts it in
   place; distinct from a crash's 70 and a refusal's 78.
 - **The wire, until web adds a word** (Owed 66): `Restart` goes out as `exitReason: "fatal"`, the one word whose
@@ -156,15 +160,19 @@ process (the review's P7) until that build stops. The restart ends it.
   zygote dies, out of `cef_children()`, alive) is no death; with its zygote dead the domain is already restarting.
   The orphan's memory is outside the PSS cap and its OOM adj is not re-graded, for the at most one poll and one tick
   until the restart; the Machine's stop ends it.
-- **Residuals:** a GPU process that lives under one poll (1 s) between two deaths is not seen (the two deaths of
-  headroom absorb one); a pid reused before the poll that would see it gone is no death (Owed 70).
+- **Residuals** (Owed 70, amended after the PR #34 review): a GPU process that lives under one poll (1 s) between two
+  deaths is not seen (one of the two survivable deaths after the threshold absorbs it; the other is for a death during
+  the exit); a pid reused before the poll that would see it gone is no death; a zygote that dies before the first
+  poll has seen it gives no verdict (for the renderers' zygote: no score for the session, nothing restarts); a false
+  zygote verdict now costs a restart, where it cost a log line (C14 sweeps for it); and the hold's abort window
+  above.
 
 **Tests:** domain `tests/cef_health.rs` (11; the sweep checks 1640 reports), the C06 matrix (+2 kinds, 182 pairs) and
 exit paths (+1, 9); app `tests/cef_health.rs` (7: each trigger through the real driver to one final beat and one
 `Exit(75)`, then no port call and no read), `run.rs` (+1: the final beat posts before `run()` returns 75); adapters:
 `gpu_check`'s unit sweep (32 polls), the contract sweep (+1 session, `fatal` and 75), and on the image
-`gpu_process_deaths_are_counted_from_real_kills` (4 kills in a child, each counted) and G4 in the GPU-zygote case (an orphan alive, out of the tree, no death; at least one orphan, or it fails).
-Mutants: 12 domain, 7 app, 8 adapters (4 on the image), all red, each at its own assertion.
+`gpu_process_deaths_are_counted_from_real_kills` (`cef_gpu_deaths_to_restart` kills in a child, each counted) and G4 in the GPU-zygote case (an orphan alive, out of the tree, no death; at least one orphan, or it fails).
+Mutants: 12 domain, 7 app, 8 adapters (4 on the image), all red, each at its own assertion; the PR #34 review round added 2 domain (I1's old `+ 2 <=` guard at 4, red at `the_gpu_restart_survives_an_unread_death_and_one_during_the_exit`; the hold restarting, red in the exit property, which now draws health reports, m7).
 
 **False premises found** (recorded in `docs/_INDEX.md`):
 1. "Rule out a stale gen" (What, Domain): the zygote verdict is the process's; a verdict naming an older page still
