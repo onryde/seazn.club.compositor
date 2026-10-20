@@ -525,8 +525,9 @@ pub(crate) struct GpuWatch {
 /// as for a zygote. That also covers the final C11 review's G4: a GPU process whose zygote died is
 /// reparented to pid 1 and leaves `cef_children()` while it lives on; it is no death (and with its
 /// zygote gone the domain is already restarting the process, whose end ends it). A death between
-/// two polls (a relaunched GPU process that lived under `CHILD_POLL_MS`) is not seen: the residual
-/// the restart's two deaths of headroom absorb (`cef_gpu_deaths_to_restart`).
+/// two polls (a relaunched GPU process that lived under `CHILD_POLL_MS`) is not seen. The threshold
+/// leaves two survivable deaths after it (`cef_gpu_deaths_to_restart`): one for such an unread
+/// death, and one for a death during the exit. A second unread death on top of those is the abort.
 pub(crate) fn gpu_check(w: &mut GpuWatch, kids: &[CefChild], alive: impl Fn(i32) -> bool) -> usize {
     let now: BTreeSet<i32> = kids
         .iter()

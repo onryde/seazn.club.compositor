@@ -1355,7 +1355,7 @@ fn a_gpu_process_death_after_its_zygotes_aborts_the_whole_process() {
 
 // Owed 61 (C11b): Chromium aborts the process at the 6th GPU-process death of its life (F-013), so
 // the adapter counts each one, from real kills: the GPU process killed `cef_gpu_deaths_to_restart`
-// times (two short of the abort), each counted once it is gone, and its relaunch killed next. It
+// times (under the abort, which is the 6th), each counted once it is gone, and its relaunch killed next. It
 // spends the process's GPU deaths, so it runs in a child of its own.
 #[test]
 fn gpu_process_deaths_are_counted_from_real_kills() {

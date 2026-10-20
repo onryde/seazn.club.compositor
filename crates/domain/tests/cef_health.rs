@@ -496,5 +496,7 @@ fn every_report_in_every_lifecycle_follows_the_rule() {
         restarts > 0 && ignored > 0 && under_distinct > 0,
         "a vacuous sweep"
     );
-    assert_eq!(checked, 5 * 4 * (6 * 7 + 5 * 8), "every report, once");
+    // 5 lifecycles, 4 verdicts; the defaults' leaks 0..=5 by GPU deaths 0..=5, the distinct ones'
+    // 0..=4 by 0..=7.
+    assert_eq!(checked, 5 * 4 * (6 * 6 + 5 * 8), "every report, once");
 }
