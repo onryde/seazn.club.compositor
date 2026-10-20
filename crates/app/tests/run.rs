@@ -11,11 +11,15 @@ use app::driver::Driver;
 use app::ports::{HeartbeatError, Inbound, Measured, SessionConfig, FINAL_BEAT_TIMEOUT_MS};
 use app::run::run;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use domain::cef_health::CefHealth;
 use domain::config::Thresholds;
 use domain::health::{ExitDetail, HealthReport};
 use domain::lifecycle::ExitReason;
 use domain::supervisor::{Desired, Event, SignalKind};
-use testkit::fakes::{ports, session_720p, Call, FakeProgramme, Log, PlaneCall, PlaneLog, ScriptedPlane};
+use testkit::fakes::{
+    ports, ports_with_cef, session_720p, Call, CefKnob, FakeProgramme, Log, PlaneCall, PlaneLog,
+    ScriptedPlane,
+};
 
 const FAR: u64 = 100_000_000;
 const SLOW: Duration = Duration::from_millis(300);
@@ -53,6 +57,17 @@ fn launch_with(
     programme_fails: Option<&str>,
     cap: Option<usize>,
 ) -> Rig {
+    launch_cef(plane, plane_log, programme_fails, cap, &CefKnob::default())
+}
+
+/// `launch_with`, with CEF's health read from `cef` (C11b).
+fn launch_cef(
+    plane: ScriptedPlane,
+    plane_log: PlaneLog,
+    programme_fails: Option<&str>,
+    cap: Option<usize>,
+    cef: &CefKnob,
+) -> Rig {
     let started = Instant::now();
     let clock = move || started.elapsed().as_millis() as u64;
     let (tx, rx) = match cap {
@@ -60,7 +75,7 @@ fn launch_with(
         None => unbounded(),
     };
     let log = Log::default();
-    let mut p = ports(&log, Measured::default());
+    let mut p = ports_with_cef(&log, Measured::default(), cef);
     p.control = Box::new(spawn(Box::new(plane), tx.clone()));
     if let Some(e) = programme_fails {
         p.programme = Box::new(FakeProgramme {
@@ -166,6 +181,29 @@ fn the_final_beat_is_posted_under_a_full_heartbeat_channel() {
     assert_eq!(
         finals(&ran.plane),
         vec![(ExitReason::Fatal, Some("x".to_owned()))]
+    );
+}
+
+/// C11b on the wall clock, behind a full slot: CEF's health asks for an in-place restart, and its
+/// final beat, naming the cause, posts before `run()` returns 75 (sysexits' EX_TEMPFAIL).
+#[test]
+fn an_in_place_restart_posts_its_final_beat_before_run_returns_75() {
+    let (plane, log) = fast_beating(Ok(Desired::Live));
+    let cef = CefKnob::default();
+    let rig = launch_cef(plane, log, None, None, &cef);
+    fill_the_periodic_slot(&rig);
+    cef.set(CefHealth {
+        unrecoverable: Some(1),
+        ..CefHealth::default()
+    });
+    let ran = finished(&rig, Duration::from_secs(5));
+    assert_eq!(ran.code, 75);
+    assert_eq!(
+        finals(&ran.plane),
+        vec![(
+            ExitReason::Restart,
+            Some("restart in place: a CEF zygote is gone (gen 1)".to_owned())
+        )]
     );
 }
 
