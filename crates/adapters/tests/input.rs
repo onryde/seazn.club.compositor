@@ -316,7 +316,21 @@ fn events_for(rx: &Receiver<Inbound>, window: Duration) -> Vec<Event> {
 }
 
 fn frames_in(events: &[Event]) -> usize {
-    events.iter().filter(|e| **e == Event::InputFrame).count()
+    events
+        .iter()
+        .filter(|e| matches!(e, Event::InputFrame { .. }))
+        .count()
+}
+
+/// The generation each frame carried (C10b).
+fn frame_gens(events: &[Event]) -> Vec<u64> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::InputFrame { gen } => Some(*gen),
+            _ => None,
+        })
+        .collect()
 }
 
 fn losses(events: &[Event]) -> Vec<(u64, LossReason)> {
@@ -420,6 +434,10 @@ fn connects_and_delivers_frames_with_its_generation() {
         assert!(connects(&second).is_empty(), "InputConnected once: {second:?}");
         assert_programme_shape(&frames, &out, "connected");
         assert_eq!(input.generation_of_last_frame(), Some(1));
+        assert!(
+            frame_gens(&second).iter().all(|&g| g == 1),
+            "every frame is gen 1's (C10b)"
+        );
         checked += 1;
     }
     assert_eq!(checked, 2);
@@ -1439,6 +1457,10 @@ fn the_generation_after_an_abandoned_one_connects() {
     assert!(frames_in(&second) >= FRAMES_IN_THE_FIRST_SECOND, "{second:?}");
     assert!(losses(&second).is_empty(), "{second:?}");
     assert_eq!(input.generation_of_last_frame(), Some(2));
+    assert!(
+        frame_gens(&second).iter().all(|&g| g == 2),
+        "every frame is gen 2's"
+    );
     assert_eq!(input.abandoned(), 1);
     finish(input);
 }

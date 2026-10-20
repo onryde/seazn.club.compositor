@@ -9,6 +9,7 @@
 use domain::config::Thresholds;
 use domain::input_link::LossReason;
 use domain::lifecycle::Lifecycle;
+use domain::programme::ProgrammePhase;
 use domain::supervisor::{Desired, Effect, Event, Supervisor};
 use domain::time::Ms;
 
@@ -37,8 +38,8 @@ fn booted() -> Supervisor {
 }
 
 /// A frame of input generation `gen`.
-fn frame(_gen: u64) -> Event {
-    Event::InputFrame
+fn frame(gen: u64) -> Event {
+    Event::InputFrame { gen }
 }
 
 /// The first tick at or after `at` on a grid of `step` from 0.
@@ -310,4 +311,81 @@ fn the_hold_and_the_drain_abandon_nothing() {
     }
     eprintln!("hold pairs checked: {checked}");
     assert_eq!(checked, STEPS.len() * 2);
+}
+
+/// Frames of a generation the domain gave up count for nothing (C10b: every report carries its
+/// generation): a late connect of gen 1 after its timeout, and its frames every millisecond of the
+/// back-off, each leave the supervisor exactly as it was. Frames from gen 2, once built and
+/// connected, take the programme Live; gen 1's, arriving then, are stale and change nothing either.
+#[test]
+fn frames_of_a_given_up_generation_count_for_nothing() {
+    let th = t();
+    let mut checked = 0;
+    for step in STEPS {
+        let mut r = Run::new(step);
+        let due = first_tick(th.input_connect_timeout_ms, step);
+        r.until(due, |_, _| vec![]);
+        assert_eq!(r.abandons(), vec![(due, 1)], "step {step}: setup");
+        let rebuild = r.builds().iter().find(|&&(_, g)| g == 2).map(|&(at, _)| at);
+        assert_eq!(rebuild, None, "step {step}: gen 1 is backing off");
+        // The late connect and its frames, between the abandon and the rebuild.
+        let mut now = due + 1;
+        let mut ignored = 0;
+        while now < due + th.input_backoff_base_ms {
+            for e in [Event::InputConnected { gen: 1 }, frame(1)] {
+                let d = r.s.decide(e.clone(), now);
+                assert_eq!(
+                    &d.next, &r.s,
+                    "step {step}: {e:?} at {now} changed the supervisor"
+                );
+                assert!(d.effects.is_empty(), "step {step}: {:?}", d.effects);
+                ignored += 1;
+            }
+            now += 1;
+        }
+        assert!(ignored >= 2, "step {step}: nothing checked");
+        assert_eq!(r.s.programme_phase(), ProgrammePhase::Waiting, "step {step}");
+        // Gen 2: built, connected, frames, Live; gen 1's frames meanwhile are stale.
+        r.until(first_tick(due + th.input_backoff_base_ms, step), |_, _| vec![]);
+        assert!(
+            r.builds().iter().any(|&(_, g)| g == 2),
+            "step {step}: gen 2 built"
+        );
+        let from = r.now;
+        let (mut stale, mut counted) = (0, 0);
+        r.until(from + th.resume_after_ms + 2 * step, |now, s| {
+            let d = s.decide(frame(1), now);
+            assert_eq!(
+                &d.next, s,
+                "step {step}: gen 1's frame at {now} changed the supervisor"
+            );
+            stale += 1;
+            assert_ne!(
+                &s.decide(frame(2), now).next,
+                s,
+                "step {step}: gen 2's frame at {now}"
+            );
+            counted += 1;
+            if now == from {
+                vec![Event::InputConnected { gen: 2 }, frame(2)]
+            } else {
+                vec![frame(2)]
+            }
+        });
+        assert!(stale > 0 && counted > 0);
+        // Live needs an unbroken run, so only a grid finer than `frozen_after_ms` can reach it.
+        if step <= th.frozen_after_ms {
+            assert_eq!(
+                r.s.programme_phase(),
+                ProgrammePhase::Live,
+                "step {step}: gen 2 went Live"
+            );
+        }
+        checked += ignored + stale + counted;
+    }
+    eprintln!(
+        "given-up and stale frames checked: {checked} over {} tick periods",
+        STEPS.len()
+    );
+    assert!(checked >= 4 * STEPS.len());
 }

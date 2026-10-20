@@ -443,7 +443,10 @@ fn the_final_beat_is_posted_with_the_inbound_channel_kept_full() {
     let h = thread::spawn(move || {
         let mut flooded = 0u64;
         while !flooding.load(Ordering::Relaxed) {
-            if flood.try_send(Inbound::Event(Event::InputFrame)).is_ok() {
+            if flood
+                .try_send(Inbound::Event(Event::InputFrame { gen: 1 }))
+                .is_ok()
+            {
                 flooded += 1;
             }
         }

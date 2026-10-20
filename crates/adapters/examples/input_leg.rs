@@ -138,7 +138,7 @@ fn main() {
         let ms = |i: Instant| i.duration_since(t0).as_millis();
         while let Ok(Inbound::Event(e)) = rx.try_recv() {
             match e {
-                Event::InputFrame => {
+                Event::InputFrame { .. } => {
                     frames_seen += 1;
                     if last_frame.is_none_or(|l: Instant| now.duration_since(l) > Duration::from_millis(500))
                     {

@@ -15,7 +15,7 @@
 //!
 //! **Events**, each tagged with the generation of the pipeline that sent it: the first decoded video
 //! sample sends `InputConnected { gen }` (F-002: "connected" is the first decoded frame, never the
-//! handshake); every video sample replaces the frame store's camera slot and sends `InputFrame`; every
+//! handshake); every video sample replaces the frame store's camera slot and sends `InputFrame { gen }`; every
 //! audio sample goes into the frame store's 400 ms ring; a bus error sends `InputLost { gen, Error }`
 //! and the video branch's EOS `InputLost { gen, Eos }`, once a generation. `InputFrame` and
 //! `InputConnected` are tried, never waited for, so a full inbound channel can never hold the camera
@@ -34,8 +34,8 @@
 //! **The gate.** One field holds the build whose samples and events may pass. It closes, before the
 //! call returns or the event is sent, on `rebuild` (for the old build), on `stop`, on the drop, and
 //! when this adapter reports a generation lost; a sample from a closed build is dropped and counted.
-//! `InputFrame` carries no generation, so the gate is what keeps a torn-down pipeline's late frames
-//! out of the slot and off the loop.
+//! The gate is what keeps a torn-down pipeline's late frames out of the slot; the generation each
+//! `InputFrame` carries (C10b) is what lets the domain ignore one already queued when the gate shut.
 //!
 //! **The domain's own losses close it too** (G1, the coordinator's ruling on PR #30). The domain gives
 //! a generation up by its stall rule or its connect timeout and tells the adapter nothing until it
@@ -633,7 +633,10 @@ impl GstInput {
                     {
                         c.connected = true;
                     }
-                    let delivered = shared.tx.try_send(Inbound::Event(Event::InputFrame)).is_ok();
+                    let delivered = shared
+                        .tx
+                        .try_send(Inbound::Event(Event::InputFrame { gen }))
+                        .is_ok();
                     drop(c);
                     drop(open);
                     note_frame(&shared, delivered);

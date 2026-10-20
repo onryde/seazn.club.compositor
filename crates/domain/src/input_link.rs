@@ -93,6 +93,14 @@ impl InputLink {
         self.generation
     }
 
+    /// Whether a frame of generation `gen` counts (C10b): it is the current generation, and the link
+    /// has not given it up or lost it (Backoff). A frame from a generation rebuilt past, or one queued
+    /// before the give-up, changes nothing. While Connecting it counts, since the adapter's
+    /// `InputConnected` and its first frames race on one channel.
+    pub fn takes_frames_from(&self, gen: u64) -> bool {
+        gen == self.generation && !matches!(self.state, InputState::Backoff { .. })
+    }
+
     /// The current generation's first decoded frame (C10 times "connected" to it, F-002). It counts
     /// only while Connecting: a second one while Running must not restart the stall clock.
     pub fn on_connected(&mut self, now: Ms, gen: u64) {
@@ -717,5 +725,43 @@ mod tests {
             Some(InputAction::Abandon { gen: 2 })
         );
         assert_eq!(l.on_tick(stall, &th), Some(InputAction::Rebuild { gen: 3 }));
+    }
+
+    // C10b: frames count only from the current generation while it is not given up or lost.
+    #[test]
+    fn frames_count_only_from_the_current_live_generation() {
+        let th = t();
+        let mut checked = 0;
+        let mut l = InputLink::new();
+        assert!(!l.takes_frames_from(0), "nothing built");
+        assert!(!l.takes_frames_from(1), "nothing built");
+        l.on_tick(0, &th);
+        for (gen, want) in [(0, false), (1, true), (2, false)] {
+            assert_eq!(l.takes_frames_from(gen), want, "connecting, gen {gen}");
+            checked += 1;
+        }
+        l.on_connected(10, 1);
+        for (gen, want) in [(0, false), (1, true), (2, false)] {
+            assert_eq!(l.takes_frames_from(gen), want, "running, gen {gen}");
+            checked += 1;
+        }
+        // Given up by the stall rule: none, the given-up generation included.
+        assert!(l.check_stall(10 + th.input_stall_after_ms, None, &th).is_some());
+        for gen in 0..=2 {
+            assert!(!l.takes_frames_from(gen), "given up, gen {gen}");
+            checked += 1;
+        }
+        // Rebuilt: the next generation's, never the given-up one's.
+        let at = next_build(&mut l, 10 + th.input_stall_after_ms, &th);
+        assert_eq!(l.generation(), 2, "rebuilt at {at}");
+        for (gen, want) in [(1, false), (2, true), (3, false)] {
+            assert_eq!(l.takes_frames_from(gen), want, "rebuilt, gen {gen}");
+            checked += 1;
+        }
+        // Lost as the adapter reported it: none.
+        l.on_lost(at + 1, 2, LossReason::Error, &th);
+        assert!(!l.takes_frames_from(2), "lost");
+        checked += 1;
+        assert_eq!(checked, 13);
     }
 }

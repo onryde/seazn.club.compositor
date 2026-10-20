@@ -362,7 +362,7 @@ fn camera_drop_repeats_then_slates_through_the_real_driver() {
     let mut d = boot(&log);
     let mut now = SESSION_AT;
     while now < 3_000 {
-        d.step(ev(Event::InputFrame), now);
+        d.step(frame(1), now);
         d.tick_due(now);
         now += 33;
     }
@@ -414,15 +414,18 @@ fn phase_is_published_on_change_only_with_a_rising_seq() {
     let t = th();
     let log = Log::default();
     let mut d = boot(&log);
-    let frame = OutputProfile::P720.frame_period_ms().round() as u64;
+    let period = OutputProfile::P720.frame_period_ms().round() as u64;
     // Spec §5's walk: frames until Live, a stop past frozen_after_ms then slate_after_ms, frames past
     // resume_after_ms, an Ending reply, then the hold and the drain.
     let stop = SESSION_AT + t.resume_after_ms + 1_000;
     let back = stop + t.slate_after_ms + 1_000;
     let ending = back + t.resume_after_ms + 500;
     let back_until = ending + 500;
-    let mut events = every(SESSION_AT, stop, frame, || ev(Event::InputFrame));
-    events.extend(every(back, back_until, frame, || ev(Event::InputFrame)));
+    // The camera connects first (C10b: frames of an input given up at its connect timeout count for
+    // nothing, and `back` is past it).
+    let mut events = vec![(SESSION_AT, ev(Event::InputConnected { gen: 1 }))];
+    events.extend(every(SESSION_AT, stop, period, || frame(1)));
+    events.extend(every(back, back_until, period, || frame(1)));
     events.push((ending, ev(Event::HeartbeatReply(Desired::Ending))));
     events.sort_by_key(|e| e.0);
     let end = ending + t.final_hold_ms + 1_000;
@@ -1018,9 +1021,9 @@ fn a_crash_hide_leaves_the_reload_loading_3_recycle() {
 fn a_hang_in_reconnecting_still_hides_and_restarts() {
     let t = th();
     let mut sim = Sim::new(t.clone(), session_720p());
-    let frame = OutputProfile::P720.frame_period_ms().round() as u64;
+    let period = OutputProfile::P720.frame_period_ms().round() as u64;
     let stop = SESSION_AT + t.resume_after_ms + 1_000;
-    let mut events = every(SESSION_AT, stop, frame, || ev(Event::InputFrame));
+    let mut events = every(SESSION_AT, stop, period, || frame(1));
     let p = page(1, 200, stop + t.slate_after_ms + 2_000);
     let last = last_beat(&p);
     events.extend(p);
@@ -1200,7 +1203,7 @@ fn an_inbound_tick_is_refused() {
     let log = Log::default();
     let mut d = boot(&log);
     d.tick_due(SESSION_AT);
-    for (at, f) in every(20, 1_500, 33, || ev(Event::InputFrame)) {
+    for (at, f) in every(20, 1_500, 33, || frame(1)) {
         d.step(f, at);
         d.tick_due(at);
     }
@@ -1339,7 +1342,7 @@ fn nothing_is_applied_after_exit_whatever_arrives() {
         ev(Event::CefReady { gen: 1 }),
         ev(Event::CefAlive { gen: 1 }),
         ev(Event::CefCrashed { gen: 1 }),
-        ev(Event::InputFrame),
+        frame(1),
         ev(Event::EncoderOverrun),
         ev(Event::HeartbeatReply(Desired::Ending)),
         ev(Event::HeartbeatRefused(HeartbeatRefusal::Gone)),
@@ -1387,7 +1390,7 @@ fn graphics_events_are_logged_by_name_as_they_are_decided() {
     }
     // Other events log nothing.
     let mark = log.len();
-    d.step(ev(Event::InputFrame), 30);
+    d.step(frame(1), 30);
     d.step(ev(Event::ScoreStale(true)), 31);
     assert!(log.calls_from(mark).iter().all(|c| !matches!(c, Call::Log(_))));
     eprintln!("graphics lines checked: {checked}");
@@ -1585,8 +1588,8 @@ fn nothing_skipped_or_dropped_logs_no_tally() {
 // ---------------------------------------------------------------------------------------------
 
 /// A frame of input generation `gen`.
-fn frame(_gen: u64) -> Inbound {
-    ev(Event::InputFrame)
+fn frame(gen: u64) -> Inbound {
+    ev(Event::InputFrame { gen })
 }
 
 fn abandons(log: &Log) -> Vec<u64> {
@@ -1731,4 +1734,54 @@ fn the_hold_abandons_nothing_through_the_driver() {
     }
     eprintln!("hold pairs checked: {checked}");
     assert_eq!(checked, 2);
+}
+
+/// Frames of a generation the domain gave up never reach the programme through the driver: gen 1's
+/// late connect and its frames, from its abandon to gen 2's build, leave every pushed frame a slate
+/// and the phase Waiting. Gen 2's frames, once it connects, put the camera on air. The back-off is
+/// overridden to three times `resume_after_ms`, so the late frames run long enough to go Live if
+/// they counted.
+#[test]
+fn a_given_up_generations_frames_never_reach_the_programme_through_the_driver() {
+    let t = Thresholds {
+        input_backoff_base_ms: 3 * th().resume_after_ms,
+        ..th()
+    };
+    let mut sim = Sim::new(t.clone(), session_720p());
+    let step = OutputProfile::P720.frame_period_ms().round() as u64;
+    let gave_up = sim.tick_until(SESSION_AT + t.input_connect_timeout_ms + step, abandoned(1));
+    let mark = sim.log.len();
+    let mut late = vec![(gave_up + 1, ev(Event::InputConnected { gen: 1 }))];
+    late.extend(every(
+        gave_up + 1,
+        gave_up + t.input_backoff_base_ms - 1,
+        step,
+        || frame(1),
+    ));
+    let sent = late.len();
+    sim.drive(gave_up + t.input_backoff_base_ms - 1, late);
+    let slates = sim
+        .log
+        .calls_from(mark)
+        .iter()
+        .filter(|c| matches!(c, Call::Push(_, f) if *f != FrameChoice::Slate(SlateKind::Waiting)))
+        .count();
+    eprintln!("given-up gen 1: {sent} events after its abandon at {gave_up}; non-Waiting pushes {slates}");
+    assert!(
+        sent as u64 * step > t.resume_after_ms + step,
+        "the late frames outrun resume_after_ms"
+    );
+    assert_eq!(slates, 0, "a given-up generation's frame reached the programme");
+    assert_eq!(sim.d.programme_phase(), ProgrammePhase::Waiting);
+    let r2 = sim.tick_until(gave_up + t.input_backoff_cap_ms, rebuilt(2));
+    let mut back = vec![(r2 + 1, ev(Event::InputConnected { gen: 2 }))];
+    back.extend(every(r2 + 1, r2 + t.resume_after_ms + 3 * step, step, || {
+        frame(2)
+    }));
+    sim.drive(r2 + t.resume_after_ms + 3 * step, back);
+    assert_eq!(
+        sim.d.programme_phase(),
+        ProgrammePhase::Live,
+        "gen 2's frames are counted"
+    );
 }

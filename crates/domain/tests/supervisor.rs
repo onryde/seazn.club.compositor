@@ -112,6 +112,8 @@ enum Kind {
     RefusedOther,
     InputConnected,
     InputFrame,
+    /// A frame of a generation not the current one (C10b): one already rebuilt past.
+    InputFrameStale,
     InputLost,
     OutputProgress,
     OutputError,
@@ -136,7 +138,7 @@ enum Kind {
     CefRestart,
 }
 
-const KINDS: [Kind; 26] = [
+const KINDS: [Kind; 27] = [
     Kind::Tick,
     Kind::BootstrapOk,
     Kind::BootstrapFailed,
@@ -144,6 +146,7 @@ const KINDS: [Kind; 26] = [
     Kind::RefusedOther,
     Kind::InputConnected,
     Kind::InputFrame,
+    Kind::InputFrameStale,
     Kind::InputLost,
     Kind::OutputProgress,
     Kind::OutputError,
@@ -177,7 +180,8 @@ fn kind_of(e: &Event) -> Kind {
             Kind::RefusedOther
         }
         Event::InputConnected { .. } => Kind::InputConnected,
-        Event::InputFrame => Kind::InputFrame,
+        // The stale kind is a frame too; `sample` checks it against this one.
+        Event::InputFrame { .. } => Kind::InputFrame,
         Event::InputLost { .. } => Kind::InputLost,
         Event::OutputProgress { .. } => Kind::OutputProgress,
         Event::OutputError { .. } => Kind::OutputError,
@@ -214,7 +218,15 @@ fn sample(kind: Kind, s: &Supervisor) -> Event {
         Kind::InputConnected => Event::InputConnected {
             gen: s.input_generation(),
         },
-        Kind::InputFrame => Event::InputFrame,
+        Kind::InputFrame => Event::InputFrame {
+            gen: s.input_generation(),
+        },
+        Kind::InputFrameStale => Event::InputFrame {
+            gen: match s.input_generation() {
+                0 => 1,
+                g => g - 1,
+            },
+        },
         Kind::InputLost => Event::InputLost {
             gen: s.input_generation(),
             reason: LossReason::Error,
@@ -251,7 +263,11 @@ fn sample(kind: Kind, s: &Supervisor) -> Event {
         Kind::CefHealthy => Event::CefHealth(CefHealth::default()),
         Kind::CefRestart => Event::CefHealth(ZYGOTE_GONE),
     };
-    assert_eq!(kind_of(&e), kind, "sample");
+    let base = match kind {
+        Kind::InputFrameStale => Kind::InputFrame,
+        k => k,
+    };
+    assert_eq!(kind_of(&e), base, "sample");
     e
 }
 
@@ -362,6 +378,8 @@ fn brief(st: Setup, k: Kind) -> Want {
         (S::Holding, K::CefRestart) | (S::Running | S::Holding, K::CefHealthy) => W::Ignored,
         // A second end request keeps the first hold's clock; an overrun changes nothing in the hold.
         (S::Holding, K::Ending | K::Int | K::EncoderOverrun) => W::Ignored,
+        // C10b: a frame of a generation not the current one counts for nothing.
+        (S::Running | S::Holding, K::InputFrameStale) => W::Ignored,
         (
             S::Running | S::Holding,
             K::BootstrapOk | K::BootstrapFailed | K::RefusedGone | K::RefusedOther | K::OutputDrained,

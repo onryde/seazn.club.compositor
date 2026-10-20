@@ -1033,7 +1033,9 @@ impl World {
                 self.decide(ev);
             }
             if self.camera {
-                self.decide(Event::InputFrame);
+                self.decide(Event::InputFrame {
+                    gen: self.s.input_generation(),
+                });
             }
             if self.sink_gen > 0 && self.now - self.last_progress >= 1_000 {
                 self.sink_total += bytes_per_second();

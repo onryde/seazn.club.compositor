@@ -100,7 +100,12 @@ pub enum Event {
     InputConnected {
         gen: u64,
     },
-    InputFrame,
+    /// A decoded camera frame of input generation `gen`. It counts toward the programme only while
+    /// the link takes frames from `gen` (C10b): the current generation, not given up or lost. So a
+    /// frame queued before an abandon, or one from a build already rebuilt past, changes nothing.
+    InputFrame {
+        gen: u64,
+    },
     InputLost {
         gen: u64,
         reason: LossReason,
@@ -384,6 +389,14 @@ impl Supervisor {
         }
     }
 
+    /// A frame counts only from the generation the link takes frames from (C10b).
+    fn on_input_frame(&mut self, now: Ms, gen: u64) {
+        if self.input.takes_frames_from(gen) {
+            let t = self.t.clone();
+            self.programme.on_frame(now, &t);
+        }
+    }
+
     fn running(&mut self, event: Event, now: Ms, fx: &mut Vec<Effect>) -> Option<FrameChoice> {
         let t = self.t.clone();
         match event {
@@ -414,7 +427,7 @@ impl Supervisor {
                 self.beat_if_due(now, fx);
                 return Some(choice);
             }
-            Event::InputFrame => self.programme.on_frame(now, &t),
+            Event::InputFrame { gen } => self.on_input_frame(now, gen),
             Event::InputConnected { gen } => self.input.on_connected(now, gen),
             Event::InputLost { gen, reason } => self.input.on_lost(now, gen, reason, &t),
             Event::OutputProgress { gen, total_bytes } => self.on_output_progress(now, gen, total_bytes),
@@ -472,7 +485,7 @@ impl Supervisor {
                 self.beat_if_due(now, fx);
                 return Some(choice);
             }
-            Event::InputFrame => self.programme.on_frame(now, &t),
+            Event::InputFrame { gen } => self.on_input_frame(now, gen),
             Event::InputConnected { gen } => self.input.on_connected(now, gen),
             Event::InputLost { gen, reason: r } => self.input.on_lost(now, gen, r, &t),
             Event::OutputProgress { gen, total_bytes } => self.on_output_progress(now, gen, total_bytes),
@@ -766,7 +779,7 @@ mod tests {
             return (s.decide(Event::Tick, 0).next, 0);
         }
         while now <= th.resume_after_ms + 100 {
-            s = s.decide(Event::InputFrame, now).next;
+            s = s.decide(Event::InputFrame { gen: 1 }, now).next;
             s = s.decide(Event::Tick, now).next;
             now += step;
         }
@@ -929,6 +942,9 @@ mod tests {
             BeatState::Starting,
             "Owed 38: the first bytes have not earned Connected"
         );
+        // The camera connects (C10b: an unconnected input is given up at its connect timeout, and its
+        // frames then count for nothing); its frames start once the output is on air.
+        s = s.decide(Event::InputConnected { gen: 1 }, 10).next;
         let (n, c, mut sent) = on_air(s, 10);
         s = n;
         // F5 option A: the slate is on air, so the session is playing; the camera shows as Waiting
@@ -941,7 +957,7 @@ mod tests {
         let mut now = c;
         while now < c + th.resume_after_ms + 100 {
             sent += 1_000;
-            s = s.decide(Event::InputFrame, now).next;
+            s = s.decide(Event::InputFrame { gen: 1 }, now).next;
             s = s.decide(progress(&s, sent), now).next;
             s = s.decide(Event::Tick, now).next;
             now += 33;
@@ -1056,7 +1072,7 @@ mod tests {
         let mut now = step;
         let run_for = 3 * th.input_stall_after_ms;
         while now <= run_for {
-            s = s.decide(Event::InputFrame, now).next;
+            s = s.decide(Event::InputFrame { gen: 1 }, now).next;
             let d = s.decide(Event::Tick, now);
             assert!(
                 !d.effects.contains(&Effect::RebuildInput { gen: 2 }),
@@ -1118,7 +1134,7 @@ mod tests {
             Event::Tick,
             Event::Fatal { detail: None },
             Event::HeartbeatRefused(HeartbeatRefusal::Gone),
-            Event::InputFrame,
+            Event::InputFrame { gen: 1 },
             Event::HeartbeatReply(Desired::Ending),
             Event::Signal(SignalKind::Int),
         ] {
@@ -1237,7 +1253,7 @@ mod tests {
             };
             while now < at + frames_for {
                 now += step;
-                s = s.decide(Event::InputFrame, now).next;
+                s = s.decide(Event::InputFrame { gen: 1 }, now).next;
                 s = check(&s, now);
             }
             let last = now;
@@ -1837,7 +1853,7 @@ mod tests {
         let mut live_at = None;
         while now < back + th.resume_after_ms + 3 * step {
             sent += 1_000;
-            s = s.decide(Event::InputFrame, now).next;
+            s = s.decide(Event::InputFrame { gen: 2 }, now).next;
             s = s.decide(progress(&s, sent), now).next;
             let d = s.decide(Event::Tick, now);
             if d.frame == Some(FrameChoice::Emit) {
@@ -1888,9 +1904,18 @@ mod tests {
             "restarted at {restarted}"
         );
         assert_eq!(s.programme_phase(), Reconnecting);
+        // The camera returns on the generation being built now (C10b: frames of the one given up
+        // count for nothing).
         let back = now;
+        let gen = s.input_generation();
+        assert_eq!(
+            s.health(now).input,
+            LinkStatus::Connecting,
+            "setup: gen {gen} connecting"
+        );
+        s = s.decide(Event::InputConnected { gen }, now).next;
         while now < back + th.resume_after_ms + 2 * step {
-            s = s.decide(Event::InputFrame, now).next;
+            s = s.decide(Event::InputFrame { gen }, now).next;
             s = s.decide(Event::Tick, now).next;
             now += step;
         }
