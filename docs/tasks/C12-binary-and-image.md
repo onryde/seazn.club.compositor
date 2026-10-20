@@ -686,7 +686,7 @@ image:
   | 6 | the private-network header dropped | `preflight_allows_private_network…` |
   | 7 | `wait_past` answers at once | `long_poll_waits_for_a_newer_seq…` |
   | 8 | `phase_endpoint`'s bind failure exits 70 | `phase_port_taken_still_runs_to_exit_zero` |
-  | 9 | no `setrlimit` in `main` | `the_compositor_runs_with_no_core_file_limit` |
+  | 9 | no `setrlimit` in `main` | `the_compositor_runs_with_no_core_file_limit` (now `the_compositor_runs_non_dumpable_with_a_one_byte_core_limit`) |
   | 10 | `Clock::now_ms` reads the wall per call | `now_ms_is_monotonic_across_a_wall_clock_step` |
   | 11 | `LazyInput` builds at 720p with no started profile | `lazy_input_is_built_once_from_the_started_profile` |
   | 12 | `PageOrigin` never moves the origin | `the_phase_endpoint_answers_the_overlay_urls_origin` |
@@ -702,11 +702,63 @@ image:
   | 22 | the swap line's URL unredacted | `logged_programme_logs_start_swap…`, `graphics_log_lines_exist_in_both_driver_modes` |
   | 23 | a 5th poll admitted | `fifth_concurrent_poll_is_refused_503` |
   | 24 | the first sample's CPU is `Some(0.0)` | `linux::first_sample_has_no_cpu` |
-  | 25 | `STOP_SIGNALS`' SIGUSR1 row reads SIGINT | `the_entrypoint_forwards_each_stop_signal…`, `sigint_holds_the_final_scene_then_drains` |
-  | 26 | the entrypoint forwards SIGTERM as SIGTERM | `the_entrypoint_forwards_each_stop_signal…` |
+  | 25 | `STOP_SIGNALS`' SIGUSR1 row reads SIGINT | `the_entrypoint_forwards_each_stop_signal…`, `sigint_holds_the_final_scene_then_drains` (killed on both, #39) |
+  | 26 | the entrypoint forwards SIGTERM as SIGTERM | `the_entrypoint_forwards_each_stop_signal…` (#40: killed on its parse precondition only, the marker on the trap line; re-run on #43, the review round) |
 - **The owner's rulings of 2026-10-20** change no C12 code: the exit-based restart stays (C14 measures its outage),
   leaked teardowns below 3 stay until the session ends, the outage target is 15 s, and web caps self-restarts at 6 a
   session.
+
+## Amendment 2026-10-20 (the PR #36 review, round 1: the exit, the core, the stop supervision)
+
+The review (Needs fixes: C1, I1–I3, m1–m9) and the coordinator's Owed 73 probe on a Fly Machine. `docs/_INDEX.md`'s
+decision row "C12 review round 1" holds the choices; `_FINDINGS.md` F-016 (Fly's signals), F-017 and F-018 the facts.
+
+- **`main` ends through `hard_exit::now`, never `std::process::exit`** (C1, F-017). libc's `exit(3)` ran libcef's and
+  GLib's exit handlers against the teardowns the adapters' drops start and never join: after a clean `exit code=0`
+  line, 1 of 6 live exits on the runner and 6 of 12 stops on a Fly Machine aborted 134 (`double free or corruption`).
+  `crates/hard-exit` (`_exit(2)` after flushing stderr) is the workspace's one sanctioned `unsafe`; its own test
+  shows it runs no `atexit` handler. An env failure exits through it too (78).
+- **No core under any `core_pattern`** (I1, F-018; supersedes "RLIMIT_CORE 0" in the amendment above and its "the
+  limit is ours either way"). A pipe ignores the limit, so 0 stopped nothing on the runner. In order, first in
+  `main`: the stop signals' handlers (`wiring::arm_signals`, m1), `PR_SET_DUMPABLE 0`, then RLIMIT_CORE 1 byte soft
+  and hard (`CORE_LIMIT_BYTES`), which CEF inherits (the dumpable flag does not survive `execve`; the kernel refuses
+  a piped core at exactly 1, and 1 is below a file core's ELF minimum). Fly's pattern is a file, where 0 already
+  held (measured); 1 there is the post-fix probe's to confirm. `the_compositor_runs_non_dumpable_with_a_one_byte_core_limit`
+  replaces `the_compositor_runs_with_no_core_file_limit`.
+- **`JOB_TOKEN` leaves the compositor's environment once parsed** (m2): edition 2021's `remove_var` is safe, and no
+  thread exists yet. Xvfb starts without it (`env -u`).
+- **The stop forwarding moved to `docker/supervise.sh`** (I2, m1, m6), sourced as the entrypoint's first command and
+  installed at `/usr/local/lib/seazn/supervise.sh`. It traps INT and TERM before Xvfb starts; a stop that arrives
+  before the compositor exists, or before both USR handlers show in its `/proc/<pid>/status`, is held and then
+  forwarded; the loop keeps the child's own status, also when the child dies of the forwarded signal; a set
+  `TINI_KILL_PROCESS_GROUP` exits 78 before anything runs. `scripts/supervise_test.py` drives it with a stub child
+  (check.yml, the image's bash, `--require-procfs`). The entrypoint sets core 1:1 on itself and tini (`prlimit`).
+- **`tini -s`** (m5): Fly runs tini as a child of `/fly/init`, and tini printed its warning on every boot.
+- **The probe** (`scripts/image_probe.py`, m3, m7, C1, I1): every process's core limit against the kernel's 1, the
+  compositor non-dumpable, `core_pattern` printed, all five session credentials against every command line and log,
+  `JOB_TOKEN` against Xvfb's and each CEF child's environment, a forced CEF-child abort and a forced compositor
+  abort (134, no `(core dumped)`), 32 live exits with CEF up at 720p and 1080p (24 stops), each exact with no abort
+  text, and a SIGTERM and a SIGINT 0.3 s into a boot. image.yml refuses `TINI_KILL_PROCESS_GROUP` in the image's env.
+- **BUILDINFO's `cef_dir`** names the extracted directory (m8). **m4:** "91a5123" was the merge ref's image tag;
+  the citations now name `c080c3f` and its runs. **m9:** mutant 26 is re-run with its marker on its own line.
+- **Owed 73's Fly plan** (I3) checks each stop's drain lines and the `signalled` beat before the exit line, not the
+  exit code alone (F-016's broken case also exited 0). The coordinator runs it; C1 stays open until it shows 0 aborts
+  (Owed 76).
+- **New hand mutants** (Owed 75), on throwaway draft PRs from this round's head:
+
+  | # | Mutant | Expected red | PR |
+  |---|---|---|---|
+  | 27 | `main` exits through `std::process::exit` | phase B: a 134 or abort text in some of 32 exits (probabilistic) | #41 |
+  | 28 | no `PR_SET_DUMPABLE` | the compositor's `/proc/<pid>` is not root-owned | #41 |
+  | 29 | `JOB_TOKEN` stays in the environment | each CEF child's environment check | #41 |
+  | 30 | `CORE_LIMIT_BYTES` 0 | the compositor's and each CEF child's limit; the CEF child's kernel refusal line | #42 |
+  | 31 | no `prlimit` in the entrypoint | tini's, bash's and Xvfb's limit | #42 |
+  | 32 | Xvfb keeps `JOB_TOKEN` | Xvfb's environment check | #42 |
+  | 33 | no arming wait in `supervise.sh` | "a stop before the child's handlers is held" | #43 |
+  | 34 | no pending flush | "a stop before the child exists is held" | #43 |
+  | 35 | `c080c3f`'s wait loop | "the child dies of the forwarded USR2" (survived on macOS bash 3.2 and 5.2) | #43 |
+  | 36 | no `TINI_KILL_PROCESS_GROUP` refusal | the refusal case (killed on the host) | #43 |
+  | — | `hard_exit::now` made `std::process::exit` | `hard-exit`'s `exit.rs` (killed on the host) | — |
 
 ## Do not touch
 

@@ -1355,10 +1355,10 @@ input and target on local ports nothing listens on. Each run waited for `cef rea
 
 | Run (image, entrypoint) | Signal and path | Exit status | Time to exit | The compositor's `exit code=` line | Final beat |
 |---|---|---|---|---|---|
-| `7da159f` (`exec` compositor) | `docker stop`: SIGTERM, tini → compositor | 0 | 0.1 s | absent; the log ends at `cef ready gen=1` | none (1 POST, periodic) |
-| `91a5123` (forwarding entrypoint) | `docker exec … kill -TERM <compositor>`, around tini | 0 | 0.2 s | absent | none (1 POST, periodic) |
-| `91a5123` | `docker kill -s INT`: tini → entrypoint → SIGUSR1 | 0 | 10.3 s | present | `signalled`, an earlier POST carrying `final` |
-| `91a5123` | `docker stop`: tini → entrypoint → SIGUSR2 | 0 | at once | present | `signalled`, no POST carrying `final` |
+| `7da159f`, run 39403770532 (`exec` compositor) | `docker stop`: SIGTERM, tini → compositor | 0 | 0.1 s | absent; the log ends at `cef ready gen=1` | none (1 POST, periodic) |
+| `c080c3f`, run 39407377806 (forwarding entrypoint) | `docker exec … kill -TERM <compositor>`, around tini | 0 | 0.2 s | absent | none (1 POST, periodic) |
+| `c080c3f` | `docker kill -s INT`: tini → entrypoint → SIGUSR1 | 0 | 10.3 s | present | `signalled`, an earlier POST carrying `final` |
+| `c080c3f` | `docker stop`: tini → entrypoint → SIGUSR2 | 0 | at once | present | `signalled`, no POST carrying `final` |
 
 - The compositor's `/proc/<pid>/status` once CEF was up: `SigCgt 0000000100014a03` (SIGHUP, SIGINT,
   SIGUSR1, SIGUSR2, SIGTERM, SIGCHLD and signal 33 caught), `SigIgn 0000000000001000` (SIGPIPE).
@@ -1370,8 +1370,63 @@ with status 0 at once, before the domain hears of it: no Final scene, no drain, 
 line. The caught HUP/INT/TERM set matches Chromium's shutdown handlers; the handler's owner was not
 traced further. So the image's entrypoint does not `exec` the compositor: it runs it as a child and
 forwards SIGINT as SIGUSR1 and SIGTERM as SIGUSR2, which the compositor reads as the same stops
-(`wiring::STOP_SIGNALS`), and tini (no `-g`) signals the entrypoint alone. On a Fly Machine, the
-platform's SIGINT and SIGTERM reaching tini is unmeasured (`docs/_INDEX.md` Owed 73).
+(`wiring::STOP_SIGNALS`), and tini (no `-g`) signals the entrypoint alone. Since the PR #36 review
+(I2, m1) that forwarding lives in `docker/supervise.sh`, sourced first, which also holds a stop that
+arrives before the compositor's handlers exist.
+
+**On a Fly Machine (MEASURED 2026-10-20, Machine `48e4533c564ed8`, image at `50c6643`, destroyed;
+the coordinator's Owed 73 probe):** PID 1 is `/fly/init`, which signals tini's pid only, in 12 of 12
+stops. Each stop drained and posted its final `signalled` beat (12 of 12); SIGINT held the Final
+scene for 10.018–10.032 s; SIGTERM reached the exit line in 7–22 ms. No stop had this finding's shape.
+**`fly machine stop` with no flag sends the Machine's `stop_config` signal (SIGTERM), not SIGINT** as
+flyctl's help says; `--signal SIGINT` sends SIGINT. Web names SIGINT itself, so its stop is unaffected;
+a person stopping a Machine by hand gets the drain, not the Final hold.
+
+## F-017: the process aborted AFTER a clean exit: libc's exit handlers raced CEF's threads (C12, 2026-10-20)
+
+**Where:** the relay image in live mode, CEF up, after `app::run::run` returned and the compositor
+logged `exit code=0` (or `exit code=75`'s path, unmeasured).
+
+| Where | Exits | Aborted after the exit line | glibc's text |
+|---|---|---|---|
+| image.yml, runs at `7da159f`–`50c6643` (the PR #36 review) | 6 live exits | 1 (run 39410132377 at `ff0fdf4`, a `docker stop`): container status 134, bash `Aborted (core dumped)` | `double free or corruption (!prev)` |
+| A Fly Machine at `50c6643` (the coordinator's Owed 73 probe) | 12 stops | 6: SIGTERM 5 of 8, SIGINT 1 of 4; exit 134 | `corrupted size vs. prev_size in fastbins`, `corrupted double-linked list`, `double free or corruption (!prev)` |
+| The same Machine | 2 deadline exits | 1, after its `deadline` beat: Fly's `on-failure` restarted the ended session's Machine in place (`requested_stop: false, restarting: true`), which booted past its deadline | `corrupted size vs. prev_size in fastbins` |
+
+- Every abort came after the drain, the final beat and the `exit code=0` line. A requested stop was
+  never restarted, even at 134; web's reader would still see 134.
+- **Cause (by mechanism, not traced to a frame):** `main` ended with `std::process::exit`, libc's
+  `exit(3)`, which runs every `atexit` handler and C++ static destructor (libcef's, GLib's) while the
+  teardowns that the adapters' drops started (each returns at once and joins nothing, by design:
+  C08 and C11 amendments of 2026-10-19) still run on CEF's and GStreamer's threads.
+- **Fix:** `main` ends through `hard_exit::now`, `_exit(2)` after flushing stderr: the kernel ends every
+  thread and runs no handler. The final beat is already sent (`run` returns after
+  `flush_final_beats`). `crates/hard-exit` is the workspace's one sanctioned `unsafe` (no safe binding
+  exists); its test shows `now` runs no `atexit` handler where `std::process::exit` does.
+- **Proof owed to CI:** image.yml's probe repeats 32 live exits with CEF up (24 stops, 4 deadlines,
+  4 dead zygotes, at 720p and 1080p) and requires every status exact with no abort text. The
+  coordinator re-runs the Fly probe after the fix.
+
+## F-018: RLIMIT_CORE 0 stops a core only for a FILE `core_pattern` (C12, 2026-10-20)
+
+- **The CI runner (GitHub ubuntu-24.04):** its `core_pattern` is a pipe to a crash helper. The kernel
+  ignores RLIMIT_CORE for a pipe (`fs/coredump.c` sets the limit to infinity, except the value 1, at
+  which it refuses the core: "RLIMIT_CORE is set to 1, aborting core"). F-017's abort there printed
+  `Aborted (core dumped)` from a compositor whose `/proc/<pid>/limits` read 0 0: a core holding the
+  job token, the page token and the stream key reached the helper (the PR #36 review's I1).
+- **A Fly Machine (MEASURED 2026-10-20, Machine `48e4533c564ed8`):** `core_pattern` is `core`, a file
+  in the cwd (`core_uses_pid 0`, `fs.suid_dumpable 0`, kernel 6.12.113-fly). The limit of 0 stopped
+  every core there: 6 compositor aborts printed `Aborted` with no `(core dumped)`; a control in the
+  same Machine dumped a 557 KB `core` with an unlimited limit and nothing with 0. Fly's own default is
+  soft 0, hard unlimited, on init, tini, bash and Xvfb. The rootfs is reset at every start, an
+  `on-failure` restart included, so no core or profile file outlives a boot there.
+- **So, as built:** the compositor is non-dumpable (`PR_SET_DUMPABLE 0`: no core of it under any
+  pattern), and its RLIMIT_CORE is 1 byte, soft and hard, which CEF's children inherit (the dumpable
+  flag resets at `execve`): refused for a pipe, and below the ELF minimum for a file. The entrypoint
+  sets 1:1 on itself and tini. The probe aborts a CEF child (the kernel's refusal line, on the runner's
+  pipe) and the compositor (134, no `(core dumped)`). Limit 1 under Fly's file pattern is the
+  coordinator's post-fix probe to confirm (Owed 73).
+
 
 ## Platform notes (Fly-specific; nothing inside the image depends on them)
 
