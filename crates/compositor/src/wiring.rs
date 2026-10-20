@@ -44,6 +44,7 @@ use domain::config::{OutputProfile, Thresholds};
 use domain::ladder::Rung;
 use domain::programme::{FrameChoice, ProgrammePhase};
 use domain::supervisor::{Event, SignalKind};
+use signal_hook::iterator::Signals;
 use testkit::fakes::{session_720p, CefKnob, FakeGraphics, FakeInput, FakeProgramme, Log, ScriptedPlane};
 
 use crate::clock::Clock;
@@ -378,7 +379,6 @@ fn plane(env: &Env, t: &Thresholds, log: &Logger) -> Result<Box<dyn ControlPlane
     }
 }
 
-/// SIGINT and SIGTERM, onto the loop's channel (`send`: a signal is never dropped).
 /// The stop signals the process reads, and what each means to the domain. SIGINT (R1's stop: the
 /// Final hold) and SIGTERM (the platform's: the drain) when the binary runs on its own; SIGUSR1 and
 /// SIGUSR2 are the same two from the image's entrypoint, which forwards them under those names
@@ -390,8 +390,16 @@ pub const STOP_SIGNALS: [(i32, SignalKind); 4] = [
     (signal_hook::consts::SIGUSR2, SignalKind::Term),
 ];
 
-fn spawn_signals(tx: Sender<Inbound>) -> std::io::Result<()> {
-    let mut signals = signal_hook::iterator::Signals::new(STOP_SIGNALS.map(|(sig, _)| sig))?;
+/// Installs the handlers for `STOP_SIGNALS`. `main` calls it first, before the environment is read
+/// (the PR #36 review's m1): from then on a stop is held in the returned set until `run` hands it to
+/// the loop, never left to the default action, which for SIGUSR1 and SIGUSR2 ends the process. The
+/// image's entrypoint forwards nothing until both USR handlers show in `/proc/<pid>/status`.
+pub fn arm_signals() -> std::io::Result<Signals> {
+    Signals::new(STOP_SIGNALS.map(|(sig, _)| sig))
+}
+
+/// The armed stop signals, onto the loop's channel (`send`: a signal is never dropped).
+fn spawn_signals(mut signals: Signals, tx: Sender<Inbound>) -> std::io::Result<()> {
     thread::Builder::new().name("signals".to_owned()).spawn(move || {
         for sig in signals.forever() {
             let Some(kind) = STOP_SIGNALS.iter().find(|(s, _)| *s == sig).map(|(_, k)| *k) else {
@@ -472,10 +480,10 @@ fn fake_media(env: &Env) -> Media {
 }
 
 /// Builds every port for `env`'s mode and runs the loop; the process's exit code.
-pub fn run(env: &Env, clock: &Arc<Clock>, log: &Logger) -> i32 {
+pub fn run(env: &Env, clock: &Arc<Clock>, log: &Logger, signals: Signals) -> i32 {
     let t = Thresholds::default();
     let (tx, rx): (Sender<Inbound>, Receiver<Inbound>) = bounded(INBOUND_CAPACITY);
-    if let Err(e) = spawn_signals(tx.clone()) {
+    if let Err(e) = spawn_signals(signals, tx.clone()) {
         log.error(&format!("signal handlers not installed: {e}"));
         return 70;
     }

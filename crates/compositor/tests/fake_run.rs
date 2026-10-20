@@ -723,13 +723,15 @@ fn a_job_token_with_a_cr_exits_78_and_never_prints_it() {
     assert_eq!(checked, 3);
 }
 
-/// RLIMIT_CORE 0 (Owed 68), set by the binary itself: the run starts from a raised soft limit (the
-/// precondition is checked, so the test cannot pass on an environment that already forbids cores),
-/// and `/proc/<pid>/limits` reads `0 0` once it runs. CEF's children inherit it (the image test reads
-/// one of theirs).
+/// No core of the compositor (Owed 68 and the PR #36 review's I1), set by the binary itself: the run
+/// starts from a raised soft limit as a non-root user (both preconditions checked, so the test cannot
+/// pass where cores are already off or every `/proc` entry is root's), and once it runs
+/// `/proc/<pid>/limits` reads `CORE_LIMIT_BYTES` soft and hard, and `/proc/<pid>` belongs to root,
+/// which is how the kernel shows a non-dumpable process. CEF's children inherit the limit, not the
+/// flag (the image test reads theirs and forces an abort).
 #[cfg(target_os = "linux")]
 #[test]
-fn the_compositor_runs_with_no_core_file_limit() {
+fn the_compositor_runs_non_dumpable_with_a_one_byte_core_limit() {
     let _s = serial();
     let raise = "ulimit -S -c unlimited 2>/dev/null || ulimit -S -c \"$(ulimit -H -c)\"";
     let pre = Command::new("sh")
@@ -770,7 +772,18 @@ fn the_compositor_runs_with_no_core_file_limit() {
         "compositor",
         "the pid is the compositor (sh exec'd it)"
     );
-    assert_eq!(core_line(&limits), vec!["0", "0"], "{limits}");
+    let want = compositor::CORE_LIMIT_BYTES.to_string();
+    assert_eq!(core_line(&limits), vec![want.clone(), want], "{limits}");
+    use std::os::unix::fs::MetadataExt;
+    let me = std::fs::metadata("/proc/self").expect("/proc/self").uid();
+    assert_ne!(me, 0, "precondition: run as root, every /proc entry is root's");
+    let owner = std::fs::metadata(format!("/proc/{}", run.pid()))
+        .expect("/proc/<pid>")
+        .uid();
+    assert_eq!(
+        owner, 0,
+        "the compositor is dumpable: /proc/<pid> belongs to uid {owner}"
+    );
     run.signal("TERM");
     let (code, _) = run.wait_exit(Duration::from_secs(15));
     assert_eq!(code, Some(0), "{}", run.stderr());

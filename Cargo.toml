@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/domain", "crates/app", "crates/adapters", "crates/testkit", "crates/compositor"]
+members = ["crates/domain", "crates/app", "crates/adapters", "crates/testkit", "crates/compositor", "crates/hard-exit"]
 
 [workspace.package]
 edition = "2021"
@@ -8,6 +8,10 @@ rust-version = "1.91"
 publish = false
 license = "UNLICENSED"
 
+# One sanctioned exception to `unsafe_code`, so nobody widens it later: `crates/hard-exit` (C12,
+# F-017) calls `libc::_exit` in `now`, the compositor's one way out of the process, and registers the
+# `atexit` handler its test needs. Its own `[lints]` table denies `unsafe` and allows it at those two
+# sites; every other crate inherits "forbid".
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"

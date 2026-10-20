@@ -23,8 +23,10 @@ crossbeam-channel = "0.5"
 signal-hook = "0.3"
 # RELAY_DEADLINE_AT (`Date.toISOString()`, RFC 3339) and the log lines' `ts=`.
 time = { version = "0.3", features = ["parsing"] }
-# RLIMIT_CORE 0 (Owed 68) without `unsafe`. Already in the lock through the adapters.
+# RLIMIT_CORE and PR_SET_DUMPABLE (Owed 68) without `unsafe`. Already in the lock through the adapters.
 rustix = { version = "1", default-features = false, features = ["std", "process"] }
+# `_exit(2)` at the end of `main` (F-017): the workspace's one sanctioned `unsafe`.
+hard-exit = { path = "../hard-exit" }
 
 [dev-dependencies]
 # fake_run.rs: the fake control plane the spawned binary talks to, and its phase endpoint client.

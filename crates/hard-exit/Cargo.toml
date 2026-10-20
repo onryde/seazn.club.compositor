@@ -1,0 +1,21 @@
+[package]
+name = "hard-exit"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The workspace's lints, with `unsafe_code` at "deny" instead of "forbid": this crate is the one
+# sanctioned exception (F-017; see the workspace Cargo.toml). Keep the rest in step with
+# `[workspace.lints]`.
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+dbg_macro = "deny"
+print_stdout = "deny"
+todo = "deny"
+
+[dependencies]
+libc = "0.2"

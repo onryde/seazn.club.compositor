@@ -18,3 +18,9 @@ pub const R1_STOP_GRACE_MS: u64 = 20_000;
 /// The headroom `config.rs`'s `drain_timeout_ms` doc line keeps inside the grace ("3 s"), for EOS to
 /// reach the sink and the process to exit.
 pub const EXIT_HEADROOM_MS: u64 = 3_000;
+
+/// RLIMIT_CORE, soft and hard, in bytes, set by `main` (Owed 68, reopened by the PR #36 review's
+/// I1): 1, the value at which the kernel refuses a core to a piped `core_pattern` ("RLIMIT_CORE is
+/// set to 1, aborting core", `fs/coredump.c`) and below the ELF minimum for a file one. CEF's
+/// children inherit it; the compositor itself is also made non-dumpable.
+pub const CORE_LIMIT_BYTES: u64 = 1;

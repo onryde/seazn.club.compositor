@@ -233,6 +233,7 @@ dependencies = [
  "app",
  "crossbeam-channel",
  "domain",
+ "hard-exit",
  "jsonschema",
  "rustix",
  "serde_json",
@@ -713,6 +714,13 @@ dependencies = [
  "gstreamer-sys",
  "libc",
  "system-deps",
+]
+
+[[package]]
+name = "hard-exit"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
