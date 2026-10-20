@@ -37,7 +37,8 @@ _sv_forward() {
   fi
 }
 trap '_sv_forward USR1' INT
-trap '_sv_forward USR2' TERM
+# MUT26
+trap '_sv_forward TERM' TERM
 
 # True once the child catches SIGUSR1 (10) and SIGUSR2 (12): bits 9 and 11 of SigCgt, 0xa00. With no
 # procfs (a host test on macOS), there is nothing to wait on.
