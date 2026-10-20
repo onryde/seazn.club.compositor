@@ -8,7 +8,7 @@ ports nothing listens on, so nothing leaves the host. Every session credential i
 Phase A, one container, once CEF's children exist:
 
   - `/proc/<pid>/limits` of tini, the entrypoint's bash, Xvfb, the compositor and every CEF child:
-    `Max core file size` is `CORE_LIMIT_BYTES` soft and hard (Owed 68, the PR #36 review's I1 and m2);
+    `Max core file size` is 1 byte soft and hard (the kernel's refusal value for a pipe) (Owed 68, the PR #36 review's I1 and m2);
     the compositor is non-dumpable (`/proc/<pid>` belongs to root); `core_pattern` is printed;
   - no session credential or token in any process's `/proc/<pid>/cmdline` (the review's m3);
   - TMPDIR: `/dev/shm/seazn`, mode 0700, owned by the relay user, on a tmpfs, with the CEF profile
@@ -196,7 +196,9 @@ def main():
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
     grace = lib_const("R1_STOP_GRACE_MS") / 1000
-    limit = str(lib_const("CORE_LIMIT_BYTES"))
+    # The kernel's value, not ours: at exactly 1 byte it refuses a core to a piped core_pattern
+    # (fs/coredump.c), and 1 is below the ELF minimum for a file one. Never read from the code under test.
+    limit = "1"
 
     def sample_shm():
         r = sh("docker", "exec", NAME, "df", "-k", "/dev/shm", check=False)

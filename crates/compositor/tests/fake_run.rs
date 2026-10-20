@@ -772,7 +772,9 @@ fn the_compositor_runs_non_dumpable_with_a_one_byte_core_limit() {
         "compositor",
         "the pid is the compositor (sh exec'd it)"
     );
-    let want = compositor::CORE_LIMIT_BYTES.to_string();
+    // The kernel's value, not the binary's constant: at exactly 1 byte it refuses a core to a piped
+    // core_pattern (fs/coredump.c), and 1 is below the ELF minimum for a file one.
+    let want = "1".to_owned();
     assert_eq!(core_line(&limits), vec![want.clone(), want], "{limits}");
     use std::os::unix::fs::MetadataExt;
     let me = std::fs::metadata("/proc/self").expect("/proc/self").uid();
