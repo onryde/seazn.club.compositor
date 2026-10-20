@@ -483,7 +483,7 @@ fn the_final_beat_under_a_410_is_gone() {
     let got = plane(&fake.url).heartbeat(&final_beat(ExitReason::Ended), &Measured::default());
     assert_eq!(got, Ok(Desired::Ending));
     eprintln!("final beats under a 410 checked: {checked}");
-    assert_eq!(checked, 6);
+    assert_eq!(checked, 7, "the six of C06 and C11b's restart");
 }
 
 #[test]

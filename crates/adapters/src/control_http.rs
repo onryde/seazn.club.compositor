@@ -100,6 +100,12 @@ fn phase_channel_wire(c: PhaseChannel) -> &'static str {
 }
 
 /// The snake_case of `ExitReason` (contract `heartbeat.exitReason`).
+///
+/// C11b: the contract has no word for an in-place restart yet (web's enum is strict, so a new word
+/// would refuse the final beat), and `fatal` is the one whose path web already runs as one: a
+/// crash below RUNNER_CRASH_CAP is only recorded, the Machine restarts in place and beats again on
+/// the same attempt (R2003b). It is counted as a crash until web adds the word (Owed 66); the beat's
+/// `exitDetail` names the restart.
 fn exit_reason_wire(r: ExitReason) -> &'static str {
     match r {
         ExitReason::Ended => "ended",
@@ -107,7 +113,7 @@ fn exit_reason_wire(r: ExitReason) -> &'static str {
         ExitReason::Signalled => "signalled",
         ExitReason::SessionGone => "session_gone",
         ExitReason::Refused => "refused",
-        ExitReason::Fatal => "fatal",
+        ExitReason::Fatal | ExitReason::Restart => "fatal",
     }
 }
 

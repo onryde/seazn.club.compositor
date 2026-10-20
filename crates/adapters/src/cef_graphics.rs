@@ -22,7 +22,8 @@
 //! relayed; a retired page's are logged and dropped. `CefCrashed` is sent once a build, from the first
 //! of: a bus error, cefsrc's "Render subprocess terminated" warning (its `OnRenderProcessTerminated`,
 //! which then reloads the page), or the memory cap. A dead GPU process is no crash: CEF recovers it
-//! and the page keeps painting (F-013).
+//! and the page keeps painting (F-013), but each is counted (`health()`): the 6th of the process's
+//! life aborts it.
 //!
 //! **The gate** (Owed 17; the 2026-10-18 amendment): one field, the build whose samples may reach the
 //! overlay slot. Only that build's own `seazn:ready` opens it, and a build reported crashed never
@@ -40,11 +41,12 @@
 //! UI thread, so the log handler only decides what closes a gate and queues the rest (`NoteQueue`:
 //! bounded, and never dropping a crash or a ready); this adapter's dispatcher thread relays them.
 //!
-//! **Health** (owner ruling 2026-10-19 "B"; C11b acts on it): `health()` reports what the domain's
-//! events cannot say yet: either of CEF's zygotes gone, which ends CEF for the process (Owed 56:
-//! the renderers' zygote's death fails the next build at once; the GPU process's zygote's death
-//! turns the next GPU-process death into Chromium's FATAL abort of the whole process, the PR #32
-//! confirm pass's N1), and the leaked teardowns.
+//! **Health** (owner ruling 2026-10-19 "B"): `health()` (the port's) reports what the domain's
+//! events cannot say: either of CEF's zygotes gone, which ends CEF for the process (Owed 56: the
+//! renderers' zygote's death fails the next build at once; the GPU process's zygote's death turns
+//! the next GPU-process death into Chromium's FATAL abort of the whole process, the PR #32 confirm
+//! pass's N1), the leaked teardowns, and the GPU-process deaths (Owed 61: Chromium aborts the
+//! process at the 6th). It only counts: the domain decides the in-place restart (C11b).
 //!
 //! **The log handler** (F-013). To receive console lines this adapter raises the `cefconsole`
 //! threshold to INFO (and `cefsrc`'s to WARNING), never lowering one; GStreamer's default handler
@@ -506,10 +508,56 @@ pub(crate) fn zygote_check(
     w.dead
 }
 
-/// The process's verdict: `Some(gen)` once a CEF zygote is gone (the newest build's generation
-/// then).
-fn unrecoverable() -> MutexGuard<'static, (ZygoteWatch, Option<u64>)> {
-    static WATCH: OnceLock<Mutex<(ZygoteWatch, Option<u64>)>> = OnceLock::new();
+/// What the child polls have seen of CEF's GPU processes (Owed 61; process-wide like the zygotes).
+#[derive(Debug, Default)]
+pub(crate) struct GpuWatch {
+    /// GPU-process pids seen and not yet seen gone.
+    live: BTreeSet<i32>,
+    /// GPU-process deaths seen so far: a count over the process's life, never reset.
+    deaths: usize,
+}
+
+/// One poll's new GPU-process deaths (C11b). F-013 (CEF 139; probe GR, 2 of 2, and the final C11
+/// review's FD): Chromium relaunches a dead GPU process, and aborts the whole process at the 6th
+/// death of its life, so the adapter counts them and the domain restarts the process short of it.
+///
+/// A GPU process missing from one poll's list counts only once `alive` says its process is gone,
+/// as for a zygote. That also covers the final C11 review's G4: a GPU process whose zygote died is
+/// reparented to pid 1 and leaves `cef_children()` while it lives on; it is no death (and with its
+/// zygote gone the domain is already restarting the process, whose end ends it). A death between
+/// two polls (a relaunched GPU process that lived under `CHILD_POLL_MS`) is not seen: the residual
+/// the restart's two deaths of headroom absorb (`cef_gpu_deaths_to_restart`).
+pub(crate) fn gpu_check(w: &mut GpuWatch, kids: &[CefChild], alive: impl Fn(i32) -> bool) -> usize {
+    let now: BTreeSet<i32> = kids
+        .iter()
+        .filter(|k| k.kind == "gpu-process")
+        .map(|k| k.pid)
+        .collect();
+    let gone: Vec<i32> = w
+        .live
+        .iter()
+        .copied()
+        .filter(|p| !now.contains(p) && !alive(*p))
+        .collect();
+    for p in &gone {
+        w.live.remove(p);
+    }
+    w.live.extend(now);
+    w.deaths += gone.len();
+    gone.len()
+}
+
+/// The process's view of CEF: the zygotes, the verdict (`Some(gen)` once a CEF zygote is gone, the
+/// newest build's generation then), and the GPU processes.
+#[derive(Debug, Default)]
+struct CefWatch {
+    zygotes: ZygoteWatch,
+    verdict: Option<u64>,
+    gpu: GpuWatch,
+}
+
+fn cef_watch() -> MutexGuard<'static, CefWatch> {
+    static WATCH: OnceLock<Mutex<CefWatch>> = OnceLock::new();
     locked(WATCH.get_or_init(Mutex::default))
 }
 
@@ -1029,20 +1077,13 @@ pub enum ReaperPath {
     Killed { pids: Vec<i32> },
 }
 
-/// What the adapter knows that the domain's events cannot say yet (owner ruling 2026-10-19 "B";
-/// C11b decides the in-place restart from it). Read with `CefGraphics::health`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CefHealth {
-    /// `Some(gen)`: a CEF zygote is gone (Owed 56; `gen` is the newest build's generation when it
-    /// was seen). The renderers' zygote: CEF can start no renderer again in this process, and a
-    /// live page keeps painting from its orphaned renderer, out of reach of the guardrails and the
-    /// reaper. The GPU process's zygote: the next GPU-process death aborts the whole process
-    /// (Chromium's FATAL, SIGTRAP; N1). Either way only a restart in place recovers (C11b).
-    pub unrecoverable: Option<u64>,
-    /// Retired builds whose teardown had not returned `TEARDOWN_LEAK_AFTER_MS` after the reaper's
-    /// kill and still has not (Owed 55): each holds a thread, a pipeline and a renderer.
-    pub leaked_teardowns: usize,
-}
+/// What the adapter knows that the domain's events cannot say (owner ruling 2026-10-19 "B"): the
+/// domain's own type, so the domain alone decides the in-place restart from it (C11b,
+/// `CefHealth::restart_cause`). Read with `GraphicsRenderer::health`. A renderers' zygote's death
+/// also leaves a live page painting from its orphaned renderer, out of reach of the guardrails and
+/// the reaper; a leaked teardown is one whose `set_state(NULL)` had not returned
+/// `TEARDOWN_LEAK_AFTER_MS` after the reaper's kill and still has not.
+pub use domain::cef_health::CefHealth;
 
 /// Test hook: a sample about to be written waits here until released (`CefGraphics::hold_next_write`).
 #[cfg(feature = "test-hooks")]
@@ -1429,14 +1470,6 @@ impl CefGraphics {
     /// Notes the dispatcher's queue dropped (`NoteQueue`).
     pub fn notes_dropped(&self) -> u64 {
         locked(&self.shared.notes).dropped
-    }
-
-    /// What the domain's events cannot say yet: a dead zygote and leaked teardowns (C11b).
-    pub fn health(&self) -> CefHealth {
-        CefHealth {
-            unrecoverable: unrecoverable().1,
-            leaked_teardowns: self.shared.leaked.load(Ordering::SeqCst),
-        }
     }
 
     /// The process's private CEF profile directory (`None`: not made yet, or it could not be made,
@@ -1933,11 +1966,27 @@ fn poll_children(shared: &Shared) {
         }
         *locked(&shared.last_guard) = g;
         {
-            let mut watch = unrecoverable();
-            if zygote_check(&mut watch.0, &kids, std::process::id() as i32, pid_alive) {
-                let newest = locked(&shared.builds).last_key_value().map(|(_, (gen, _))| *gen);
-                watch.1 = Some(newest.unwrap_or(0));
-                drop(watch);
+            let mut watch = cef_watch();
+            let died = gpu_check(&mut watch.gpu, &kids, pid_alive);
+            let deaths = watch.gpu.deaths;
+            let zygote = zygote_check(&mut watch.zygotes, &kids, std::process::id() as i32, pid_alive);
+            let newest = if died > 0 || zygote {
+                locked(&shared.builds).last_key_value().map(|(_, (gen, _))| *gen)
+            } else {
+                None
+            };
+            if zygote {
+                watch.verdict = Some(newest.unwrap_or(0));
+            }
+            drop(watch);
+            if died > 0 {
+                shared.log(&format!(
+                    "WARN gen={}: {died} CEF GPU process(es) gone, {deaths} in this process; Chromium \
+                     aborts it at the 6th (Owed 61)",
+                    newest.unwrap_or(0)
+                ));
+            }
+            if zygote {
                 shared.log(&format!(
                     "ERROR gen={}: a CEF zygote is gone; no renderer may start again, and the next \
                      GPU-process death aborts this process (Owed 56: restart in place)",
@@ -1994,6 +2043,17 @@ impl GraphicsRenderer for CefGraphics {
 
     fn stop(&mut self) {
         self.retire_current();
+    }
+
+    /// Counters only: the process's CEF watch (under its lock, held by a poll for a list's checks)
+    /// and the leak gauge (C11b).
+    fn health(&self) -> CefHealth {
+        let watch = cef_watch();
+        CefHealth {
+            unrecoverable: watch.verdict,
+            leaked_teardowns: self.shared.leaked.load(Ordering::SeqCst),
+            gpu_process_deaths: watch.gpu.deaths,
+        }
     }
 }
 
@@ -2384,6 +2444,81 @@ mod tests {
         assert!(!zygote_check(&mut w, &tree(true, true), 1544, |_| false));
         checked += 2;
         eprintln!("polls checked: {checked}");
+    }
+
+    // Owed 61 (F-013): every GPU-process death of the process's life, counted once, never decayed;
+    // a GPU process missing from a list while it lives (a failed cmdline read, or the final C11
+    // review's G4: reparented to pid 1 once its zygote died) is no death until it is gone.
+    #[test]
+    fn every_gpu_process_death_is_counted_once_for_the_life_of_the_process() {
+        let gpu = |pid: i32| kid(pid, 1556, "gpu-process", None);
+        let others = || {
+            vec![
+                kid(1556, 1544, "zygote", None),
+                kid(1622, 1557, "renderer", Some(5)),
+            ]
+        };
+        let with = |pids: &[i32]| {
+            let mut k = others();
+            k.extend(pids.iter().map(|p| gpu(*p)));
+            k
+        };
+        let dead = |_: i32| false;
+        let mut polls = 0;
+        // The empty case: none seen, nothing counted, however many polls.
+        let mut w = GpuWatch::default();
+        for _ in 0..3 {
+            assert_eq!(gpu_check(&mut w, &others(), dead), 0);
+            assert_eq!(gpu_check(&mut w, &[], dead), 0);
+            polls += 2;
+        }
+        assert_eq!(w.deaths, 0);
+        // Six deaths, each relaunched under a new pid: counted one by one to 6 (a count, not a rate:
+        // the polls are what the clock is here, and none decays it).
+        let mut w = GpuWatch::default();
+        assert_eq!(gpu_check(&mut w, &with(&[2000]), dead), 0);
+        polls += 1;
+        for k in 1..=6 {
+            let next = 2000 + k;
+            assert_eq!(gpu_check(&mut w, &with(&[next]), dead), 1, "death {k}");
+            assert_eq!(gpu_check(&mut w, &with(&[next]), dead), 0, "death {k} again");
+            assert_eq!(w.deaths, k as usize);
+            polls += 2;
+        }
+        // Gone with no relaunch yet, then the relaunch: one death.
+        let mut w = GpuWatch::default();
+        assert_eq!(gpu_check(&mut w, &with(&[3000]), dead), 0);
+        assert_eq!(gpu_check(&mut w, &others(), dead), 1);
+        assert_eq!(gpu_check(&mut w, &others(), dead), 0);
+        assert_eq!(gpu_check(&mut w, &with(&[3001]), dead), 0);
+        assert_eq!(w.deaths, 1);
+        polls += 4;
+        // Two gone in one poll: two.
+        let mut w = GpuWatch::default();
+        assert_eq!(gpu_check(&mut w, &with(&[4000, 4001]), dead), 0);
+        assert_eq!(gpu_check(&mut w, &with(&[4002]), dead), 2);
+        assert_eq!(w.deaths, 2);
+        polls += 2;
+        // Missing while alive (G4's orphan, or a failed read): no death, for as long as it lives;
+        // then its death counts.
+        let mut w = GpuWatch::default();
+        assert_eq!(gpu_check(&mut w, &with(&[5000]), dead), 0);
+        for _ in 0..3 {
+            assert_eq!(gpu_check(&mut w, &others(), |p| p == 5000), 0);
+            polls += 1;
+        }
+        assert_eq!(w.deaths, 0);
+        assert_eq!(gpu_check(&mut w, &others(), dead), 1);
+        assert_eq!(w.deaths, 1);
+        polls += 2;
+        // Another kind's death is no GPU-process death.
+        let mut w = GpuWatch::default();
+        assert_eq!(gpu_check(&mut w, &with(&[6000]), dead), 0);
+        assert_eq!(gpu_check(&mut w, &[gpu(6000)], dead), 0);
+        assert_eq!(w.deaths, 0);
+        polls += 2;
+        eprintln!("GPU polls checked: {polls}");
+        assert_eq!(polls, 32);
     }
 
     fn page_note(build: u64, signal: PageSignal) -> Note {

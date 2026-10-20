@@ -2,6 +2,7 @@
 //! must decode into our types. Expected values come from the vendored files, never from our code.
 use adapters::control_http::{heartbeat_wire, parse_session, programme_phase_wire};
 use app::ports::{FetchError, Measured};
+use domain::cef_health::CefHealth;
 use domain::config::{OutputProfile, Thresholds};
 use domain::health::{
     BeatState, ExitDetail, ExitInfo, GraphicsStatus, HealthReport, LinkStatus, PhaseChannel,
@@ -1148,13 +1149,24 @@ fn sessions() -> Vec<(&'static str, World)> {
         detail: Some(ExitDetail::new(fatal_detail())),
     });
     out.push(("fatal-in-drain", w));
+
+    // C11b: CEF's health asks for an in-place restart while live.
+    let mut w = World::new();
+    w.boot(1_000, far);
+    w.run_until(2_000);
+    w.decide(Event::CefHealth(CefHealth {
+        unrecoverable: Some(1),
+        ..CefHealth::default()
+    }));
+    out.push(("restart", w));
     out
 }
 
 /// How each sweep session must end: its final beat's `exitReason` and the process exit code. Both come
 /// from the contract's own `exitReason` description: ended, deadline, signalled and session_gone exit
-/// 0; refused exits 78; fatal exits 70.
-const SESSION_ENDS: [(&str, &str, i32); 10] = [
+/// 0; refused exits 78; fatal exits 70. C11b's in-place restart exits 75 (EX_TEMPFAIL) and goes on
+/// the wire as `fatal` until the contract has a word for it (Owed 66).
+const SESSION_ENDS: [(&str, &str, i32); 11] = [
     ("ended", "ended", 0),
     ("deadline", "deadline", 0),
     ("sigint", "signalled", 0),
@@ -1165,6 +1177,7 @@ const SESSION_ENDS: [(&str, &str, i32); 10] = [
     ("wrong-mode", "refused", 78),
     ("fatal", "fatal", 70),
     ("fatal-in-drain", "fatal", 70),
+    ("restart", "fatal", 75),
 ];
 
 #[test]
