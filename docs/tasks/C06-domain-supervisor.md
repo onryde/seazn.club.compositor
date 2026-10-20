@@ -769,6 +769,10 @@ gets 410 and exits 0. That sequence is tested here.
   `tests/supervisor.rs` (161 pairs, 7 exit paths, 48 ladder sessions) and the 2 properties at 512
   cases pass, every count failing at 0. `a_recycle_due_in_the_hold_keeps_the_final_card_shown`
   passes. 73 mutants: 72 red, 1 argued equivalent (the commit body lists each one).
+- (Amended 2026-10-20, C11b; Owed 55, 56, 61) `Event::CefHealth` restarts in place from Running only: the final beat
+  (`Restart`, its cause as `exitDetail`), then `Exit(75)`; the hold, the drain, booting and Exited ignore it. The pair
+  matrix has 26 kinds (182 pairs) and the exit-path test 9 paths, `Restart` among them; `tests/cef_health.rs` sweeps
+  every lifecycle against the reports around each threshold (1640, 0 fails).
 
 ## Final heartbeat with the exit reason (owner ruling 2026-10-15)
 
@@ -1301,6 +1305,21 @@ decisions, as built:
   (`every_exit_but_a_heartbeat_410_is_preceded_by_a_final_beat_with_its_reason`).
 - **Mutants:** 101 (the 73 re-run after the edits, stale rows re-pinned, plus 28 new), 100 red, 1
   argued equivalent (B6, unchanged).
+
+## Amendment 2026-10-20 (C11b: the in-place restart)
+
+C11b (PR #C11B; `docs/tasks/C11b-cef-health.md`, "As built") adds to this aggregate:
+- **`ExitReason::Restart`**, exit 75 (sysexits' EX_TEMPFAIL), last in `ExitReason::ALL` (7). Non-zero, so the host's
+  `on-failure` restarts the process in place.
+- **`Event::CefHealth(CefHealth)`**, read by C08 once a tick. `CefHealth::restart_cause` (`domain::cef_health`) is the
+  one rule: any dead zygote, `cef_gpu_deaths_to_restart` (4) GPU-process deaths, or `cef_leaks_to_restart` (3) live
+  leaked teardowns, in that urgency order. A process fact, so it carries no generation and none is checked.
+- **The routing:** Running → `restart_in_place`: `exit_detail` = the cause's text, then the existing `exit` (the final
+  beat, then `Exit(75)`), with no drain, like a fatal error. Holding ignores it (listed beside the second end
+  request): the hold already ends the process with exit 0, and a restart would cut the Final card short to boot a
+  process for a session that is over. Draining, Booting and Exited ignore it through their catch-alls.
+- **Thresholds:** `cef_leaks_to_restart` (3, owner ruling B) and `cef_gpu_deaths_to_restart` (4, the coordinator's
+  recommendation), and the const `CHROMIUM_GPU_DEATHS_ABORT` (6, F-013). `distinct()` gives them 5 and 7.
 
 ## Do not touch
 

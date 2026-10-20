@@ -175,6 +175,53 @@ Every beat in that span reads `ready`, `restarting` or `starting`, and never `fa
 
 **Acceptance (this amendment):** 12 cases, each with an anti-vacuity clause, and 5 mutants red.
 
+## Amendment 2026-10-20 (C11b: the in-place restart's cases and its outage measurement)
+
+C11b (PR #C11B; `docs/tasks/C11b-cef-health.md`, "As built") restarts the process in place when CEF's health asks
+for it: a dead zygote (either one), `cef_gpu_deaths_to_restart` (4) GPU-process deaths, or `cef_leaks_to_restart` (3)
+teardowns leaked at once. The process sends its final beat (`exitReason: "fatal"` until web adds a word, Owed 66;
+`exitDetail` starting `restart in place: `) and exits **75**; compose's `on-failure:2` (Fly's `on-failure` in
+production) starts it again on the same session.
+
+**Case 8 (`cef-killed`)** takes case 9's shape (Owed 62, unchanged), plus: the `die` event's `exitCode` is non-zero
+and not 75 (an abort: SIGTRAP, which tini reports as 128 + 5 = 133), and **no core file** lands (Owed 68).
+
+**Cases 13–16, the in-place restart** (every number from `thresholds.json`; each a fresh compose up):
+
+| # | File | Script | Verdict (`.jq`) |
+|---|---|---|---|
+| 13 | `cef-gpu-zygote-killed` | At 20 s, SIGKILL the compositor's child zygote that parents the `--type=gpu-process` child (read from `/proc` in the container: `ppid` = the compositor, `--type=zygote`). Run 60 s | The log has `cef health zygote_gone=<g>` within 2 s of the kill (the 1 s child poll, a tick, slack); the final beat carries `exitDetail` `restart in place: a CEF zygote is gone (gen <g>)`; the `die` event's `exitCode` is 75 and `RestartCount` rises by exactly 1; the log has no `GPU process isn't usable` (the process must not abort); output resumes, the same `SESSION_ID`, `counter_regressions == 0`; the outage (below) is recorded and judged; no core file. **Anti-vacuity:** the killed pid was a zygote that parented the GPU process at the kill |
+| 14 | `cef-renderer-zygote-killed` | As 13, the zygote that parents the renderer | As 13; after the restart no process from the old tree is left (every `--type=` process is younger than the restart) |
+| 15 | `cef-gpu-deaths` | From 20 s, SIGKILL the `--type=gpu-process` child 4 times, each time once a NEW pid has replaced the last (Chromium's relaunch), at least 2 s apart. A second run kills it 3 times. Run 90 s | 4 kills: `cef health … gpu_process_deaths=4`, the restart as in 13 (`restart in place: 4 CEF GPU-process deaths`), never a `GPU process isn't usable`. 3 kills: no restart and no exit in the run, `gpu_process_deaths=3` logged. **Anti-vacuity:** each kill's pid differs from the one before |
+| 16 | `cef-leaks` | 3 leaked teardowns at once, then 2 (a second run). It needs C11's `hold_teardowns` test hook, which a release image does not carry: a harness-only build with the `test-hooks` feature and a control to hold every teardown, or the case is reported as not runnable and the owner told (never faked) | 3: the restart as in 13 (`restart in place: 3 CEF teardowns leaked`); 2: no restart, `leaked_teardowns=2` logged |
+
+**The outage measurement** (C11b's "outage budget", corrected by its false premise 4):
+- **What is measured**, per restart case and run, from the strip and the logs:
+  - the outage: the last programme packet before the exit to the first after the restart (the strip's counter gap,
+    `output_outages[]`);
+  - its parts: the decision (the `cef health` line) to the `die` event (the final beat's flush, bounded by C08's
+    `FINAL_BEAT_TIMEOUT_MS`), the `die` to the container's `start`, and the `start` to the first programme packet
+    (bootstrap, pipelines, the first sink connect).
+- **The budget** is `BUDGET_PROCESS_RESTART_OUTPUT_MS` (15 s), which is `OUTPUT_GAP_BUDGET_MS`: YouTube kept the
+  organiser's broadcast through a 15 s gap and split it into a new broadcast after a 30 s one (F-004 addendum). The
+  60–90 s auto-stop ends the broadcast outright, but the split comes first, so 15 s binds. Three runs of each case;
+  the verdict judges the worst.
+- **Compose is not Fly.** Compose's restart is not F-007's Fly restart (exit to started 1.4–1.5 s, the Machine
+  rebooted). The live number is C17's (a C11b restart on a stg Machine, read like row 12); this suite's number bounds
+  the compositor's own part.
+- **The fallback condition** (the coordinator's decision in the stub, narrowed by the final C11 review's G3): if a
+  case's worst outage is over 15 s here, or on Fly in C17, the measurement goes to the owner as a finding (the budget
+  and the `.jq` never move). The fallback "stay on air without the overlay" may be put to the owner **only for case
+  14's trigger and case 16's** (the renderers' zygote; the leaks). For case 13's (the GPU zygote) and case 15's (the
+  GPU deaths) there is no safe fallback: the process stays armed to abort (off air at the kernel's moment, with a
+  core), so the restart stays whatever it costs. Building the fallback would be a domain change (the restart causes
+  split into the abort-armed and the degraded), C11b's code, not this suite's.
+
+**Mutants (Step 5):** 6. In a scratch build, make `restart_cause` return `None` for a zygote: expected red, case 13 on
+its `exitCode` clause (the process then aborts at the next GPU death, or runs on with a dead CEF). 7. Set
+`cef_gpu_deaths_to_restart` to 6 in the scratch build: expected red, case 15 (the abort comes first). As with mutant
+1, the verdict reads the committed `harness/thresholds.json`.
+
 ## Files
 
 - Create: `harness/cases/{camera-stop,camera-flap,reader-kicked,dest-disconnect,dest-stall,cpu-starved,score-down,cef-killed,process-killed,input-impaired}.{sh,jq}`
@@ -229,6 +276,11 @@ Every beat in that span reads `ready`, `restarting` or `starting`, and never `fa
   from `thresholds.json`.
 - (Amended 2026-10-18, Owed 20) Case 6 asserts the score stays on air through the stress and
   after it, and every beat's `rung` is `full`/`overlay_half_rate`, never back to `full` after a step.
+- (Amended 2026-10-20, C11b; Owed 62, 68, 69) Case 8 takes case 9's shape, with a non-zero, non-75 exit and no core
+  file. Cases 13–16 prove the in-place restart (exit 75, the final beat's cause, no abort, no core), each with its
+  negative run where the brief has one; the outage of every restart is measured and judged against
+  `BUDGET_PROCESS_RESTART_OUTPUT_MS` in 3 runs; mutants 6 and 7 red. A case that cannot run (16 without the hook) is
+  reported, never faked.
 
 ## Do not touch
 

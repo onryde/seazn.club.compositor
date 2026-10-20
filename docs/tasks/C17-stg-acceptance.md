@@ -45,6 +45,7 @@ the viewer sees**, **what to check**, and **what to do**.
 | session `lost` (web side, 3 missed beats) | Machine gone; `r<n+1>` cold-starts (~60 s) |
 | Machine exit 78 | refused: token, 404, or wrong mode |
 | Machine exit 70 | fatal: programme start failed |
+| Machine exit 75 (amended 2026-10-20, C11b) | an in-place restart asked for by CEF's health: a dead zygote, 4 GPU-process deaths, or 3 leaked teardowns. Its final beat reads `exitReason: "fatal"` (until web adds a word, Owed 66) with `exitDetail` starting `restart in place: `; the log has `cef health …` and the adapter's ERROR/WARN line. The viewer sees an outage of about a process restart (C14's measurement), then the score back |
 
 Also include:
 - the **YouTube settings organisers should use** (owner ruling 2026-10-15): stream latency **Normal**.
@@ -225,6 +226,12 @@ yet merged.
   third. The GET bodies are recorded (redacted).
 - (Amended 2026-10-18, Owed 21) Both G1 legs pass on stg, with R2005 and #974 confirmed on the stg
   web commit and the CSP in force. Without R2005 on stg, C17 is not accepted.
+- (Amended 2026-10-20, C11b; Owed 66, 67, 69) The runbook has the exit-75 entry. One in-place restart on a stg
+  Machine (the GPU process's zygote killed by pid through `fly machine exec`, as C14 case 13 does in the harness): the
+  final beat's `exitDetail` names the restart, Fly restarts the Machine in place, the same session beats again on
+  the same attempt, and the outage (the last programme packet to the first, from YouTube's ingest or the C13 reader)
+  is recorded against C14's 15 s. Until Owed 66 lands, the restart is counted by row 12's crash cap: say so in the
+  row, and never run row 12 and this row in one session (Owed 67).
 
 ## Amendment 2026-10-15 (overlay templates spec)
 
