@@ -12,10 +12,12 @@ license = "UNLICENSED"
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"
 
-# One sanctioned exception to `print_stdout`, so nobody weakens this rule later: `crates/harness` (C13)
-# prints its reports to stdout, so its `lib.rs` and each bin start with
-# `#![allow(clippy::print_stdout)] // harness tools report on stdout by design (C13)`.
-# Every other crate logs to stderr.
+# Two sanctioned exceptions to `print_stdout`, so nobody weakens this rule later:
+# 1. `crates/harness` (C13) prints its reports to stdout, so its `lib.rs` and each bin start with
+#    `#![allow(clippy::print_stdout)] // harness tools report on stdout by design (C13)`.
+# 2. `crates/compositor/examples/smoke_budget.rs` (C12) prints one integer, the image smoke's budget, for
+#    image.yml: `#![allow(clippy::print_stdout)] // prints the smoke budget for image.yml (C12 Step 8)`.
+# Every other crate and target logs to stderr.
 [workspace.lints.clippy]
 dbg_macro = "deny"
 print_stdout = "deny"
