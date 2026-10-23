@@ -10,19 +10,18 @@
 //!   --stream-id read:cam --stream-key dest
 //! ```
 //!
-//! Before it listens it parses the rewritten session with C07's own parser
-//! (`adapters::control_http::parse_session`) and checks the parsed id is `SESSION_ID`: a rewrite the
-//! compositor would refuse stops here (exit 78), not as a confusing compositor exit later.
+//! Before it listens it runs `harness::control::self_check` on the rewritten session (C07's own
+//! parser, then the id check). A rewrite the compositor would refuse stops here (exit 78), not as a
+//! confusing compositor exit later.
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::LineWriter;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use adapters::control_http::parse_session;
 use adapters::redact::Scrubber;
 use harness::clock::now_ms;
-use harness::control::{rewrite_session, serve, Fake, RewriteMap, ScriptedTimeline};
+use harness::control::{rewrite_session, self_check, serve, Fake, RewriteMap, ScriptedTimeline};
 use serde_json::Value;
 
 const FLAGS: [&str; 10] = [
@@ -85,12 +84,8 @@ fn run() -> Result<(), (u8, String)> {
     };
     let fixture = json_file(&a["--fixture"]).map_err(with(66))?;
     let session = rewrite_session(&fixture, &session_id, &map).map_err(with(78))?;
-    // The self-check: C07's parser, and C07 M3's id check (case-insensitive, as the compositor's).
-    let parsed =
-        parse_session(&session).map_err(|e| (78, format!("the rewritten session does not parse: {e:?}")))?;
-    if !parsed.session_id.eq_ignore_ascii_case(&session_id) {
-        return Err((78, "the rewritten session's id is not SESSION_ID".into()));
-    }
+    // The self-check (`harness::control::self_check`): C07's parser and C07 M3's id check.
+    let (width, height) = self_check(&session, &session_id).map_err(with(78))?;
     let timeline = ScriptedTimeline::parse(&json_file(&a["--score"]).map_err(with(66))?).map_err(with(78))?;
     let page = std::fs::read(&a["--page"]).map_err(|e| (66, format!("{}: {e}", a["--page"])))?;
     let beats = OpenOptions::new()
@@ -112,7 +107,7 @@ fn run() -> Result<(), (u8, String)> {
     let server = tiny_http::Server::http(a["--listen"].as_str()).map_err(|e| (69, format!("listen: {e}")))?;
     println!(
         "fake-control: listening on {}; the session parses (composed, {}x{}); {events} score events, waiting for the timeline start",
-        a["--listen"], parsed.output.width, parsed.output.height
+        a["--listen"], width, height
     );
     serve(Arc::new(fake), Arc::new(server), 4, now_ms);
     Err((70, "the server stopped".into()))

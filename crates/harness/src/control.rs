@@ -471,6 +471,21 @@ pub fn serve(fake: Arc<Fake>, server: Arc<tiny_http::Server>, threads: usize, no
     }
 }
 
+/// fake-control's start-up self-check, before it listens. It runs C07's own parser
+/// (`adapters::control_http::parse_session`) on the rewritten session, then C07 M3's id check
+/// (case-insensitive, as the compositor's). A rewrite the compositor would refuse stops here
+/// (fake-control exits 78), not as a confusing compositor exit later. On success it returns the
+/// output size.
+#[cfg(feature = "media")]
+pub fn self_check(session: &Value, session_id: &str) -> Result<(u32, u32), String> {
+    let parsed = adapters::control_http::parse_session(session)
+        .map_err(|e| format!("the rewritten session does not parse: {e:?}"))?;
+    if !parsed.session_id.eq_ignore_ascii_case(session_id) {
+        return Err("the rewritten session's id is not SESSION_ID".into());
+    }
+    Ok((parsed.output.width, parsed.output.height))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,5 +800,31 @@ mod tests {
         let t = ScriptedTimeline::parse(&serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap())
             .unwrap();
         assert_eq!(t.events.len(), 20, "the brief's scripted 20-event timeline");
+    }
+
+    /// The self-check passes the rewrite fake-control serves, and refuses what the compositor would:
+    /// a session whose `overlayUrl` lost its `delay=` (C07: it must appear exactly once and match
+    /// `overlayDelayMs`), and a session id that is not SESSION_ID.
+    #[cfg(feature = "media")]
+    #[test]
+    fn the_self_check_refuses_a_session_the_compositor_would_refuse() {
+        let sid = "11111111-2222-4333-8444-555555555555";
+        let s = rewrite_session(&fixture(), sid, &map()).unwrap();
+        assert_eq!(self_check(&s, sid), Ok((1280, 720)));
+        assert_eq!(
+            self_check(&s, &sid.to_uppercase()),
+            Ok((1280, 720)),
+            "the id check ignores case"
+        );
+        let mut no_delay = s.clone();
+        let url = no_delay["overlayUrl"]
+            .as_str()
+            .unwrap()
+            .replace("delay=3100", "pace=3100");
+        no_delay["overlayUrl"] = Value::String(url);
+        let e = self_check(&no_delay, sid).unwrap_err();
+        assert!(e.contains("does not parse"), "{e}");
+        let e = self_check(&s, "99999999-2222-4333-8444-555555555555").unwrap_err();
+        assert!(e.contains("not SESSION_ID"), "{e}");
     }
 }
