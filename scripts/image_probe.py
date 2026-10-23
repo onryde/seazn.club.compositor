@@ -9,7 +9,11 @@ Phase A, one container, once CEF's children exist:
 
   - `/proc/<pid>/limits` of tini, the entrypoint's bash, Xvfb, the compositor and every CEF child:
     `Max core file size` is 1 byte soft and hard (the kernel's refusal value for a pipe) (Owed 68, the PR #36 review's I1 and m2);
-    the compositor is non-dumpable (`/proc/<pid>` belongs to root); `core_pattern` is printed;
+    the compositor is non-dumpable (its `/proc/<pid>/status` belongs to root, the entrypoint's bash's
+    to the image user; the image user cannot read its environment, and can read the shell's);
+    `core_pattern` is printed;
+  - the environments, read with CAP_SYS_PTRACE (`docker exec --privileged`; unreadable is a failure):
+    no JOB_TOKEN in Xvfb's or any CEF child's (the review's m2);
   - no session credential or token in any process's `/proc/<pid>/cmdline` (the review's m3);
   - TMPDIR: `/dev/shm/seazn`, mode 0700, owned by the relay user, on a tmpfs, with the CEF profile
     inside (Owed 58); no GST_CEF_LOG_SEVERITY or GST_DEBUG in the image or the compositor (Owed 52);
@@ -270,18 +274,43 @@ def main():
             check(r[2:] == (limit, limit), f"{r[1]} pid {r[0]}: core limit {r[2]} {r[3]}, want {limit} {limit}")
         check(len(held) >= 5, f"core limits checked: {len(held)}")
         pid = comp[0][0] if comp else 0
-        owner = in_container(f"stat -c %u /proc/{pid}").strip() if pid else ""
-        check(owner == "0", f"the compositor is non-dumpable (/proc/{pid} owned by uid {owner!r})")
+        # Non-dumpable: the kernel hands a non-dumpable process's /proc files to root (`task_dump_owner`;
+        # the /proc/<pid> directory itself keeps the process's euid either way, so it witnesses
+        # nothing). The entrypoint's bash is the control: dumpable, so its files stay the image user's.
+        me = in_container("id -u").strip()
+        shells = [r_ for r_ in rows if r_[1] == "bash"]
+        control = in_container(f"stat -c %u /proc/{shells[0][0]}/status").strip() if shells else ""
+        check(me not in ("", "0") and control == me,
+              f"the control: the entrypoint's bash owns its /proc files (uid {control!r}, the image user {me!r})")
+        owner = in_container(f"stat -c %u /proc/{pid}/status").strip() if pid else ""
+        check(owner == "0", f"the compositor is non-dumpable (/proc/{pid}/status owned by uid {owner!r})")
+
+        def environ(pid_, privileged=True):
+            """`(readable, lines)` of /proc/<pid>/environ. Reading another process's environment needs
+            ptrace access: the same uid and a dumpable target, or CAP_SYS_PTRACE, which Docker's default
+            set lacks even for root; `--privileged` grants it to this probe's exec only. An unreadable
+            environment is reported as such, never as a clean one."""
+            r_ = sh("docker", "exec", *(["--privileged", "-u", "0"] if privileged else []), NAME,
+                    "sh", "-c", f"tr '\\0' '\\n' < /proc/{pid_}/environ", check=False)
+            lines_ = r_.stdout.splitlines()
+            return r_.returncode == 0 and len(lines_) > 0, lines_
+
+        # The image user cannot read the non-dumpable compositor's environment (it holds JOB_TOKEN from
+        # the exec), and can read its dumpable shell's: the pair witnesses PR_SET_DUMPABLE from outside.
+        mine, _ = environ(pid, privileged=False) if pid else (True, [])
+        check(not mine, "the image user cannot read the compositor's environment (non-dumpable)")
+        shell_env, _ = environ(shells[0][0], privileged=False) if shells else (False, [])
+        check(shell_env, "the image user reads its own dumpable shell's environment (the control)")
         pattern = Path("/proc/sys/kernel/core_pattern").read_text().strip()
         print(f"core_pattern (the host's, shared with the container): {pattern!r}")
         argv = cmdlines()
         leaked = [(p_, a_) for p_, (_, a_) in argv.items() if any(x in a_ for x in SECRETS)]
         check(len(argv) >= 5 and not leaked, f"no credential in any of {len(argv)} command lines: {leaked}")
-        r = sh("docker", "exec", "-u", "0", NAME, "sh", "-c", f"tr '\\0' '\\n' < /proc/{pid}/environ", check=False)
-        env = r.stdout.splitlines() if pid and r.returncode == 0 else []
+        readable, env = environ(pid) if pid else (False, [])
+        check(readable, f"the compositor's environment is readable with CAP_SYS_PTRACE ({len(env)} lines)")
         check("TMPDIR=/dev/shm/seazn" in env, "the compositor's TMPDIR is /dev/shm/seazn")
         for bad in ("GST_CEF_LOG_SEVERITY", "GST_DEBUG", "TINI_KILL_PROCESS_GROUP"):
-            check(len(env) > 0 and not any(l.startswith(bad + "=") for l in env), f"no {bad} in its environment")
+            check(readable and not any(l.startswith(bad + "=") for l in env), f"no {bad} in its environment")
         st = in_container("stat -c '%a %U' /dev/shm/seazn; stat -f -c %T /dev/shm/seazn; ls -A /dev/shm/seazn").split("\n")
         check(st[0] == "700 relay", f"TMPDIR mode and owner: {st[0]!r}")
         check(st[1] == "tmpfs", f"TMPDIR filesystem: {st[1]!r}")
@@ -289,11 +318,15 @@ def main():
         # The job token stays with the compositor (which removes it from its environment once parsed,
         # so CEF's children start without it) and leaves Xvfb out (the PR #36 review's m2).
         tokenless = [r_ for r_ in rows if r_[1] == "Xvfb" or r_ in cef]
+        read_ok = 0
         for r_ in tokenless:
-            e_ = sh("docker", "exec", "-u", "0", NAME, "sh", "-c", f"tr '\\0' '\\n' < /proc/{r_[0]}/environ", check=False)
-            check(e_.returncode == 0 and TOKEN not in e_.stdout and "JOB_TOKEN=" not in e_.stdout,
+            readable, e_ = environ(r_[0])
+            check(readable, f"{r_[1]} pid {r_[0]}: its environment is readable ({len(e_)} lines)")
+            read_ok += 1 if readable else 0
+            check(readable and not any(TOKEN in l or l.startswith("JOB_TOKEN=") for l in e_),
                   f"{r_[1]} pid {r_[0]}: no JOB_TOKEN in its environment")
-        check(len(tokenless) >= 2, f"environments checked for the token: {len(tokenless)}")
+        check(read_ok >= 2 and read_ok == len(tokenless),
+              f"environments read for the token: {read_ok} of {len(tokenless)}")
         image_env = sh("docker", "inspect", "-f", "{{json .Config.Env}}", a.image).stdout
         for bad in ("GST_CEF_LOG_SEVERITY", "GST_DEBUG", "TINI_KILL_PROCESS_GROUP"):
             check(f'"{bad}=' not in image_env, f"the image sets no {bad}")

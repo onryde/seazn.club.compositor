@@ -726,8 +726,8 @@ fn a_job_token_with_a_cr_exits_78_and_never_prints_it() {
 /// No core of the compositor (Owed 68 and the PR #36 review's I1), set by the binary itself: the run
 /// starts from a raised soft limit as a non-root user (both preconditions checked, so the test cannot
 /// pass where cores are already off or every `/proc` entry is root's), and once it runs
-/// `/proc/<pid>/limits` reads `CORE_LIMIT_BYTES` soft and hard, and `/proc/<pid>` belongs to root,
-/// which is how the kernel shows a non-dumpable process. CEF's children inherit the limit, not the
+/// `/proc/<pid>/limits` reads 1 byte soft and hard, and `/proc/<pid>/status` belongs to root, which is
+/// how the kernel shows a non-dumpable process (its files, not its directory). CEF's children inherit the limit, not the
 /// flag (the image test reads theirs and forces an abort).
 #[cfg(target_os = "linux")]
 #[test]
@@ -777,14 +777,19 @@ fn the_compositor_runs_non_dumpable_with_a_one_byte_core_limit() {
     let want = "1".to_owned();
     assert_eq!(core_line(&limits), vec![want.clone(), want], "{limits}");
     use std::os::unix::fs::MetadataExt;
-    let me = std::fs::metadata("/proc/self").expect("/proc/self").uid();
+    // The kernel hands a non-dumpable process's /proc FILES to root (`task_dump_owner`); the
+    // /proc/<pid> directory keeps the euid either way (the first image probe read it, and read 10001).
+    // This test's own status file is the control: dumpable, so it stays this uid's.
+    let me = std::fs::metadata("/proc/self/status")
+        .expect("/proc/self/status")
+        .uid();
     assert_ne!(me, 0, "precondition: run as root, every /proc entry is root's");
-    let owner = std::fs::metadata(format!("/proc/{}", run.pid()))
-        .expect("/proc/<pid>")
+    let owner = std::fs::metadata(format!("/proc/{}/status", run.pid()))
+        .expect("/proc/<pid>/status")
         .uid();
     assert_eq!(
         owner, 0,
-        "the compositor is dumpable: /proc/<pid> belongs to uid {owner}"
+        "the compositor is dumpable: /proc/<pid>/status belongs to uid {owner}"
     );
     run.signal("TERM");
     let (code, _) = run.wait_exit(Duration::from_secs(15));
