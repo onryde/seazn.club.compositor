@@ -8,7 +8,7 @@ them. The stub writes every signal it catches to a file. The cases (the PR #36 r
 
   - no stop: the child's own 75 passes through;
   - INT reaches the child as USR1, TERM as USR2, and the exit is the child's own status after them;
-  - INT then TERM, and INT three times;
+  - INT then TERM (the child sees USR1, then USR2), and INT three times;
   - the child dies of the forwarded signal itself: the exit is 128 + SIGUSR2, never the shell's
     own 143 (the c080c3f loop's bug: it stopped waiting once `kill -0` lost the child);
   - a stop before the child exists, and one before its handlers are installed, are held and then
@@ -22,9 +22,11 @@ them. The stub writes every signal it catches to a file. The cases (the PR #36 r
     own signal table; any other exit (75, 0, 70, 78) has no such line. The waiter's `wait` prints no
     job report of its own, as the trapping shell's did before F-019, so this line is the operator's
     only sign of the abort;
-  - N races: the child exits 75 by itself 0.30 s after it starts and an INT lands within 15 ms of
-    that; every exit
-    is 75 (the round-1 loop, which `wait`ed in the trapping shell, lost 2 of 150 on bash 5.2.21).
+  - N races: the child exits 75 by itself 0.30 s after it starts and an INT lands just after that;
+    every exit is 75. Every lost status the runner's bash 5.2.21 has shown had its INT in the 1 ms
+    after the child's exit (4 of 4 printed, at 0.301 s: mutants 35 and 37, PR #45), so 4 races in 5
+    draw the INT from +0 to +3 ms after the child's 0.30 s and the rest from 0.30 +- 0.015 s, for
+    timing drift (the PR #36 final review's m1). The tally prints each draw's share.
 
 Usage: supervise_test.py [--script docker/supervise.sh] [--bash PATH ...] [--races N] [--require-procfs]
 """
@@ -83,7 +85,7 @@ def cases():
         ("the child's stdout is not the status pipe", False, dict(STUB_MODE="chatty", DELAY="0.3", CODE="75"), 0, {}, [], 75, []),
         ("INT reaches the child as USR1", False, dict(STUB_MODE="onsig", AFTER="0.3", CODE="0"), 0, {}, [(0.3, I)], 0, ["USR1"]),
         ("TERM reaches the child as USR2", False, dict(STUB_MODE="onsig", AFTER="0.3", CODE="70"), 0, {}, [(0.3, T)], 70, ["USR2"]),
-        ("INT then TERM", False, dict(STUB_MODE="onsig", AFTER="0.6", CODE="75"), 0, {}, [(0.3, I), (0.4, T)], 75, ["USR1"]),
+        ("INT then TERM", False, dict(STUB_MODE="onsig", AFTER="0.6", CODE="75"), 0, {}, [(0.3, I), (0.4, T)], 75, ["USR1", "USR2"]),
         ("INT three times", False, dict(STUB_MODE="onsig", AFTER="0.6", CODE="0"), 0, {}, [(0.3, I), (0.35, I), (0.4, I)], 0, ["USR1"]),
         ("the child dies of the forwarded USR2", False, dict(STUB_MODE="disarm", AFTER="3", CODE="0"), 0, {}, [(0.3, I), (0.6, T)], USR2_DEATH, ["USR1"]),
         ("a stop before the child exists is held", True, dict(STUB_MODE="onsig", AFTER="0.1", CODE="0"), 0.5, {}, [(0.2, I)], 0, ["USR1"]),
@@ -192,17 +194,23 @@ def main():
                     if not ok:
                         failures.append(f"bash {ver}: {name}")
                         break
-            tally, odd = {}, []
-            for _ in range(a.races):
-                at = 0.30 + random.uniform(-0.015, 0.015)
+            # 4 in 5 in the bin every observed loss landed in, +0 to +3 ms after the child's exit.
+            tally, near, wide, odd = {}, {}, {}, []
+            for i in range(a.races):
+                if i % 5 == 4:
+                    at, share = 0.30 + random.uniform(-0.015, 0.015), wide
+                else:
+                    at, share = 0.30 + random.uniform(0.0, 0.003), near
                 code, seen, err, _ = run(bash, wrapper(d, script, stub, 0), dict(STUB_MODE="selfexit", DELAY="0.3", CODE="75"), [(at, I)], anchor=True)
                 tally[code] = tally.get(code, 0) + 1
-                if code != 75 and len(odd) < 3:
-                    odd.append(f"exit {code} with INT at {at:.3f} s, child saw {seen}, stderr {err.strip()!r}")
+                share[code] = share.get(code, 0) + 1
+                if code != 75 and len(odd) < 5:
+                    odd.append(f"exit {code} with INT at {at:.4f} s, child saw {seen}, stderr {err.strip()!r}")
             for o in odd:
                 print(f"     {o}")
             ok = a.races > 0 and tally == {75: a.races}
-            print(f"{'ok  ' if ok else 'FAIL'} bash {ver}: {a.races} races (the child exits 75 0.30 s after its start, INT at 0.30 +- 0.015 s): {tally}")
+            print(f"{'ok  ' if ok else 'FAIL'} bash {ver}: {a.races} races (the child exits 75 0.30 s after its start; "
+                  f"INT at 0.300 to 0.303 s: {near}, at 0.30 +- 0.015 s: {wide}): {tally}")
             checked += 1
             if not ok:
                 failures.append(f"bash {ver}: races {tally}")

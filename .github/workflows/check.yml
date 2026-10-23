@@ -60,9 +60,12 @@ jobs:
           exit "$fail"
       # docker/supervise.sh, the image's stop forwarding (F-016), with a stub child under the image's
       # bash (Ubuntu 24.04's): the PR #36 review's I2 and m1. --require-procfs: the held-stop cases
-      # need /proc, so a skip is a failure here. 500 races (about 3 minutes): round 1's supervision
-      # lost the child's status in 2 of 150 here; at that rate 500 clean races happen by luck about
-      # once in 800 runs. Last, and after a red above too, so neither hides the other.
+      # need /proc, so a skip is a failure here. 500 races (about 4 minutes), 400 of them with the INT
+      # +0 to +3 ms after the child's exit, where every lost status printed so far landed (F-019).
+      # Measured at the old +-15 ms draw: round 1's supervision (mutant 37) lost 2 of 150, then 1 of
+      # 500 (PR #45), so 500 clean races came by luck in about 1 run in 3 to 1 in 10 (not "1 in 800");
+      # c080c3f's loop (mutant 35) lost 5 of 500. The new draw's rate is the round-3 mutant PR's to
+      # measure (Owed 75). Last, and after a red above too, so neither hides the other.
       - name: Entrypoint stop supervision
         if: ${{ !cancelled() }}
         run: python3 -I scripts/supervise_test.py --bash /bin/bash --require-procfs --races 500
