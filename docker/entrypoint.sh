@@ -20,7 +20,7 @@ prlimit --pid "$$" --core=1:1 2>/dev/null || log warn "core limit 1 not set on t
 prlimit --pid "$PPID" --core=1:1 2>/dev/null || log warn "core limit 1 not set on tini (pid $PPID)"
 
 # Xvfb needs no token (the PR #36 review's m2).
-env -u JOB_TOKEN Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp >/dev/null 2>&1 &
+Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp >/dev/null 2>&1 &
 for _ in $(seq 1 50); do [ -e /tmp/.X11-unix/X99 ] && break; sleep 0.1; done
 [ -e /tmp/.X11-unix/X99 ] || { log error "Xvfb did not start"; exit 70; }
 
