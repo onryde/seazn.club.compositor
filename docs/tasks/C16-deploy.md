@@ -96,6 +96,9 @@ config is the app itself. `fly/stg.toml` and `fly/prod.toml` record app name, or
 - (Amended 2026-10-18, Owed 22) `docker/CEF_STEP0_PASS` is seeded. `check-cef-bump.sh` runs in
   `check.yml` and first in all three deploy workflows. The C17 runbook has the "CEF bump" entry,
   and mutants 3 and 4 went red, so 4 mutants are red in all.
+- (Amended 2026-10-23, the PR #47 review's I-1) No deploy workflow reads or writes
+  `ghcr.io/onryde/seazn-relay-cache` (no `cache-from`, no `cache-to`, no `build-contexts` naming it),
+  `check-workflows.sh` refuses the name in all three, and mutant 5 went red, so 5 mutants are red in all.
 
 ## Amendment 2026-10-18 (a CEF bump is gated on C11 Step 0)
 
@@ -134,6 +137,25 @@ that a **required, enforced step**, not a note.
 - **New mutants:**
   3. Change `docker/GSTCEF_COMMIT` without touching the record. Expected: `check-cef-bump.sh` red.
   4. Delete the gate step from `promote.yml`. Expected: `check-workflows.sh` red.
+
+## Amendment 2026-10-23 (the CI build cache is untrusted for shipping)
+
+The PR #47 review's I-1 (compositor `_INDEX.md` decision log, "CI: CEF layer from GHCR"). image.yml's
+`cache` job writes BuildKit's layer cache to `ghcr.io/onryde/seazn-relay-cache:cef-<key>`, and any
+repository writer can write that tag: a `workflow_dispatch` runs the dispatched ref's copy of
+image.yml, and a same-repository PR's own copy can ask for `packages: write`. BuildKit serves a
+cached layer without rebuilding it, so whatever manifest sits at the tag becomes the image's layers.
+
+- **The rule.** The deploy builds (`deploy-stg.yml`, `deploy-prod.yml`) build every layer from source
+  or from a cache only a protected path writes. They never name `seazn-relay-cache`: no `cache-from`,
+  no `cache-to`, no `build-contexts`. `promote.yml` builds nothing, and is checked anyway. A shared
+  cache for deploys, if ever wanted, is a new cache written only from a protected environment, and it
+  needs its own decision row.
+- **The gate.** `check-workflows.sh` gains a fifth static grep: `seazn-relay-cache` appears in no
+  deploy or promote workflow.
+- **New mutant:**
+  5. Add `cache-from: type=registry,ref=ghcr.io/onryde/seazn-relay-cache:cef-x` to `deploy-stg.yml`.
+     Expected: `check-workflows.sh` red.
 
 ## Do not touch
 
