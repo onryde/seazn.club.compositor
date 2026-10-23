@@ -25,7 +25,8 @@ use crate::inputs::{Beat, Emit, Timeline};
 pub const RUNGS: [&str; 2] = ["full", "overlay_half_rate"];
 /// A PTS step longer than this many frame periods is a gap (one frame missing or more).
 pub const PTS_GAP_PERIODS: f64 = 1.5;
-/// A wall gap between two segments longer than this many frame periods is an outage.
+/// A wall gap between two segments longer than this many frame periods is an outage; a wall step
+/// back as long, an overlap.
 pub const OUTAGE_PERIODS: f64 = 3.0;
 /// The wall window `latency_windows_ms` reports a p50 for (the brief: 10 s).
 pub const LATENCY_WINDOW_MS: f64 = 10_000.0;
@@ -105,6 +106,15 @@ pub struct SegmentFact {
 pub struct Outage {
     pub from_wall_ms: i64,
     pub to_wall_ms: i64,
+}
+
+/// A segment named before the previous one's frames end: by name and PTS, the recording runs
+/// backwards for `overlap_ms`. Every frame time in either segment is suspect by up to that much (a
+/// latency, a slate's span), so the report says so instead of folding it away.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SegmentOverlap {
+    pub file: String,
+    pub overlap_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -245,6 +255,7 @@ pub struct Report {
     pub pts_gaps: Vec<PtsGap>,
     pub segments: Vec<SegmentFact>,
     pub output_outages: Vec<Outage>,
+    pub segment_overlaps: Vec<SegmentOverlap>,
     pub camera: Camera,
     pub overlay: Overlay,
     pub audio: Audio,
@@ -325,6 +336,7 @@ pub fn analyze(input: &Inputs, settings: &Settings) -> Report {
     let mut pts_gaps = Vec::new();
     let mut seg_facts = Vec::new();
     let mut outages = Vec::new();
+    let mut overlaps = Vec::new();
     let mut last_wall: Option<f64> = None;
     for s in &segments {
         seg_facts.push(SegmentFact {
@@ -338,6 +350,11 @@ pub fn analyze(input: &Inputs, settings: &Settings) -> Report {
                 outages.push(Outage {
                     from_wall_ms: round(from),
                     to_wall_ms: round(to),
+                });
+            } else if from - to > OUTAGE_PERIODS * period {
+                overlaps.push(SegmentOverlap {
+                    file: s.file.clone(),
+                    overlap_ms: round(from - to),
                 });
             }
         }
@@ -384,6 +401,7 @@ pub fn analyze(input: &Inputs, settings: &Settings) -> Report {
         pts_gaps,
         segments: seg_facts,
         output_outages: outages,
+        segment_overlaps: overlaps,
         camera,
         overlay,
         audio,
@@ -774,6 +792,7 @@ mod tests {
         let r = analyze(&inputs(vec![]), &settings());
         assert_eq!((r.frames, r.duration_ms, r.camera.strip_frames), (0, 0, 0));
         assert!(r.pts_gaps.is_empty() && r.output_outages.is_empty() && r.checker_failures.is_empty());
+        assert!(r.segment_overlaps.is_empty());
         assert_eq!(r.camera.latency_ms, Percentiles::default());
         let v = serde_json::to_value(&r).unwrap();
         for k in [
@@ -783,6 +802,7 @@ mod tests {
             "pts_gaps",
             "segments",
             "output_outages",
+            "segment_overlaps",
             "camera",
             "overlay",
             "audio",
@@ -934,6 +954,32 @@ mod tests {
         );
         assert!(r.pts_gaps.is_empty());
         assert_eq!(r.frames, 90);
+    }
+
+    #[test]
+    fn a_segment_starting_before_the_last_one_ends_is_an_overlap_and_a_roll_is_not() {
+        // Segment 1 is 30 frames from 0 (it ends at 1 000). Segment 2 rolls on at 1 000. Segment 3 is
+        // named 250 ms before segment 2's end (2 000), as smoke run 39979756278's first segment was
+        // named 2 s before its frames ended.
+        let s1 = seg(0, strip_frames(1, 30));
+        let s2 = seg(1_000, strip_frames(31, 30));
+        let s3 = seg(1_750, strip_frames(61, 30));
+        let r = analyze(&inputs(vec![s1, s2, s3]), &settings());
+        assert_eq!(r.segment_overlaps.len(), 1, "{:?}", r.segment_overlaps);
+        let o = &r.segment_overlaps[0];
+        assert_eq!(o.file, "live/dest/1750.mp4");
+        assert!((o.overlap_ms - 250).abs() <= 2, "{o:?}");
+        assert!(r.output_outages.is_empty(), "{:?}", r.output_outages);
+        // The mirror: the same three as rolls only.
+        let rolls = analyze(
+            &inputs(vec![
+                seg(0, strip_frames(1, 30)),
+                seg(1_000, strip_frames(31, 30)),
+                seg(2_000, strip_frames(61, 30)),
+            ]),
+            &settings(),
+        );
+        assert!(rolls.segment_overlaps.is_empty(), "{:?}", rolls.segment_overlaps);
     }
 
     #[test]

@@ -187,7 +187,8 @@ if [ ! -f "$OUT/report.json" ]; then
   exit 1
 fi
 jq '{frames, duration_ms, fps_mean, pts_gaps: (.pts_gaps | length), segments: (.segments | length),
-     output_outages: (.output_outages | length), strip_frames: .camera.strip_frames,
+     output_outages: (.output_outages | length), segment_overlaps: .segment_overlaps,
+     strip_frames: .camera.strip_frames,
      slate_frames: .camera.slate_frames, regressions: .camera.counter_regressions,
      latency_ms: .camera.latency_ms, score_changes: (.overlay.score_index_changes | length),
      av_offset_ms: .audio.av_offset_ms, beats: .heartbeats.count, rungs: .heartbeats.rungs,
