@@ -36,6 +36,7 @@ use serde_json::Value;
 
 use crate::audio::AudioFacts;
 use crate::inputs::{Beat, Emit, Timeline};
+use crate::logfacts::LogFacts;
 
 /// The rungs the contract carries (Owed 20: `Full → OverlayHalfRate`, and the bottom holds).
 pub const RUNGS: [&str; 2] = ["full", "overlay_half_rate"];
@@ -76,6 +77,10 @@ pub const FREEZE_MIN_REPEATS: u64 = 3;
 pub const RESUME_SPAN_WITHIN_MS: i64 = 10_000;
 /// A crash logged this long before the beat that still read `ready` counts for the next beat.
 pub const CRASH_SLACK_MS: i64 = 1_000;
+/// Two consecutive counters the programme showed whose emits are further apart than this many camera
+/// periods are a content gap (`camera.content_gaps`, C14): camera time the programme never carried.
+/// Cadence skips one or two counters (Owed 81), so three periods is the first that is not cadence.
+pub const CONTENT_GAP_PERIODS: f64 = 3.0;
 
 /// One decoded programme frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +115,8 @@ pub struct Inputs {
     pub crashes_ms: Vec<i64>,
     /// When the case asked the run to end (run-case.sh's `run.json`), epoch ms.
     pub end_request_ms: Option<i64>,
+    /// The compositor log's facts (`logfacts`), carried into the report for the cases (C14).
+    pub log: LogFacts,
 }
 
 /// The analysis's settings: the camera's frame rate, and the programme threshold it measures
@@ -153,6 +160,30 @@ pub struct Outage {
     /// - `between`: across a segment boundary;
     /// - `tail`: from the last frame to the end request.
     pub kind: &'static str,
+    /// The last camera counter shown before the outage and the first after it (C14); `None` where
+    /// that side has no strip frame.
+    pub counter_before: Option<u32>,
+    pub counter_after: Option<u32>,
+    /// The camera time between those two counters' emits (`emit.jsonl`): what the programme skipped
+    /// across the outage. `None` when either counter is missing or was never emitted.
+    pub counter_gap_ms: Option<i64>,
+    /// `counter_gap_ms` less the outage's wall span: the C14 brief's case 4 measure of the programme
+    /// lost beyond the outage itself.
+    pub lost_ms: Option<i64>,
+}
+
+impl Outage {
+    fn new(from_wall_ms: i64, to_wall_ms: i64, kind: &'static str) -> Self {
+        Self {
+            from_wall_ms,
+            to_wall_ms,
+            kind,
+            counter_before: None,
+            counter_after: None,
+            counter_gap_ms: None,
+            lost_ms: None,
+        }
+    }
 }
 
 /// A segment whose frames, read by name and PTS, run `overlap_ms` past the next segment's start (a
@@ -207,6 +238,30 @@ pub struct Resume {
     /// the camera resumes, or when no strip frame follows that span.
     pub first_shown_counter: Option<u32>,
     pub suppressed_ms: Option<i64>,
+    /// When the camera's first frame after the gap was emitted (`emit.jsonl`).
+    pub first_emitted_wall_ms: i64,
+    /// The covering slate span's first frame (recording wall), and the highest counter shown before
+    /// it with the wall of its first showing: "the last pre-pause frame" (C14 case 1).
+    pub slate_from_ms: Option<i64>,
+    pub last_shown_counter: Option<u32>,
+    pub last_shown_wall_ms: Option<i64>,
+    /// The first strip frame after the covering span (recording wall).
+    pub first_shown_wall_ms: Option<i64>,
+}
+
+/// Two consecutive counters the programme showed, further apart in emit time than
+/// [`CONTENT_GAP_PERIODS`] (C14): the camera time between them never reached the programme.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ContentGap {
+    pub from_counter: u32,
+    pub to_counter: u32,
+    pub from_emit_ms: i64,
+    pub to_emit_ms: i64,
+    /// `to_emit_ms - from_emit_ms`.
+    pub gap_ms: i64,
+    /// The last frame that showed `from_counter` and the first that showed `to_counter`.
+    pub from_shown_ms: i64,
+    pub to_shown_ms: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
@@ -234,6 +289,7 @@ pub struct Camera {
     pub counter_regressions: u64,
     pub cadence: Cadence,
     pub resumes: Vec<Resume>,
+    pub content_gaps: Vec<ContentGap>,
     pub latency_ms: Percentiles,
     /// How many counters the latency was measured on.
     pub latency_samples: u64,
@@ -254,6 +310,30 @@ pub struct Overlay {
     pub future_dated: u64,
     /// Frames whose score strip read.
     pub frames_read: u64,
+    /// Frames whose strip did not read: no overlay on air (C14: a hidden overlay is transparent).
+    pub absent_frames: u64,
+    /// The strip's runs, in order: each a stretch of frames showing one index, or none (`index:
+    /// null`, no overlay).
+    pub runs: Vec<OverlayRun>,
+    /// How late each change with a due time reached the recording (`frame_wall_ms - due_wall_ms`):
+    /// the page-to-recording delay a case reads a log time against.
+    pub change_lag_ms: Lag,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct OverlayRun {
+    pub from_ms: i64,
+    /// The last frame's wall plus one period.
+    pub to_ms: i64,
+    pub frames: u64,
+    pub index: Option<u16>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct Lag {
+    pub p50: i64,
+    pub max: i64,
+    pub n: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
@@ -287,6 +367,17 @@ pub struct Heartbeats {
     pub fields_seen: BTreeMap<String, u64>,
     pub last: Value,
     pub rungs: Vec<String>,
+    /// Every beat, in receipt order (C14 judges beats in windows).
+    pub series: Vec<BeatRec>,
+    /// The rungs in receipt order with repeats folded: `["full", "overlay_half_rate"]` steps once,
+    /// and a `full` after it is a step back up the cases refuse (Owed 20).
+    pub rung_sequence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct BeatRec {
+    pub received_ms: i64,
+    pub body: Value,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -331,6 +422,11 @@ pub struct Report {
     pub heartbeats: Heartbeats,
     pub graphics: Graphics,
     pub inputs: InputFacts,
+    /// The compositor log's facts (C14; `logfacts`).
+    pub log: LogFacts,
+    /// Every frame as `[wall_ms, counter, score]` (null where a strip did not read), in recording
+    /// order: what a case's windowed verdict counts (C14).
+    pub frames_table: Vec<(i64, Option<u32>, Option<u16>)>,
     /// Why the checker itself fails the run (any rung outside [`RUNGS`]); empty on a run it accepts.
     pub checker_failures: Vec<String>,
 }
@@ -472,21 +568,17 @@ pub fn analyze(input: &Inputs, settings: &Settings) -> Report {
         let next_first = datings[kb].wall(b.frames[0].pts_ns);
         let gap = next_first - (prev_end + period);
         if gap > threshold {
-            outages.push(Outage {
-                from_wall_ms: round(prev_end + period),
-                to_wall_ms: round(next_first),
-                kind: "between",
-            });
+            outages.push(Outage::new(
+                round(prev_end + period),
+                round(next_first),
+                "between",
+            ));
         } else if -gap > threshold {
             let content_gap = content_gap_ms(a, b, period, settings.camera_period_ms);
             let end = next_first - content_gap.unwrap_or(0.0) - period;
             datings[ka].anchor = Some((end, last_ns));
             if content_gap.is_some_and(|g| g > threshold) {
-                outages.push(Outage {
-                    from_wall_ms: round(end + period),
-                    to_wall_ms: round(next_first),
-                    kind: "between",
-                });
+                outages.push(Outage::new(round(end + period), round(next_first), "between"));
             }
             overlaps.push(SegmentOverlap {
                 file: a.file.clone(),
@@ -532,23 +624,33 @@ pub fn analyze(input: &Inputs, settings: &Settings) -> Report {
     // The run's edges (PR #48 review, Gap Hunt): an output that starts late or dies early.
     if let (Some(first), Some(live)) = (frames.first(), first_live_ms(&input.beats)) {
         if first.wall - live as f64 > threshold {
-            outages.push(Outage {
-                from_wall_ms: live,
-                to_wall_ms: round(first.wall),
-                kind: "head",
-            });
+            outages.push(Outage::new(live, round(first.wall), "head"));
         }
     }
     if let (Some(last), Some(end)) = (frames.last(), input.end_request_ms) {
         if end as f64 - (last.wall + period) > threshold {
-            outages.push(Outage {
-                from_wall_ms: round(last.wall + period),
-                to_wall_ms: end,
-                kind: "tail",
-            });
+            outages.push(Outage::new(round(last.wall + period), end, "tail"));
         }
     }
     outages.sort_by_key(|o| o.from_wall_ms);
+    let emitted: BTreeMap<u32, i64> = input.emit.iter().map(|e| (e.counter, e.wall_ms)).collect();
+    for o in &mut outages {
+        o.counter_before = frames
+            .iter()
+            .rev()
+            .filter(|f| f.wall < o.from_wall_ms as f64)
+            .find_map(|f| f.counter);
+        o.counter_after = frames
+            .iter()
+            .filter(|f| f.wall >= o.to_wall_ms as f64 - 0.5)
+            .find_map(|f| f.counter);
+        if let (Some(b), Some(a)) = (o.counter_before, o.counter_after) {
+            if let (Some(eb), Some(ea)) = (emitted.get(&b), emitted.get(&a)) {
+                o.counter_gap_ms = Some(ea - eb);
+                o.lost_ms = Some(ea - eb - (o.to_wall_ms - o.from_wall_ms));
+            }
+        }
+    }
     // The recorded content's length (every segment's PTS span), so a re-dated backlog shortens
     // nothing; the frame rate over it.
     let duration_ms = round(content_ms);
@@ -559,7 +661,7 @@ pub fn analyze(input: &Inputs, settings: &Settings) -> Report {
     };
 
     let camera = camera(&frames, period, input, settings);
-    let overlay = overlay(&frames, &input.timeline);
+    let overlay = overlay(&frames, &input.timeline, period);
     let audio = audio(&segments, &datings, &frames);
     let (heartbeats, checker_failures) = heartbeats(&input.beats);
     let graphics = graphics(&input.beats, &input.crashes_ms);
@@ -593,6 +695,11 @@ pub fn analyze(input: &Inputs, settings: &Settings) -> Report {
             beats_truncated: input.beats_truncated,
             end_request_ms: input.end_request_ms,
         },
+        log: input.log.clone(),
+        frames_table: frames
+            .iter()
+            .map(|f| (round(f.wall), f.counter, f.score))
+            .collect(),
         checker_failures,
     }
 }
@@ -742,7 +849,15 @@ fn camera(frames: &[Frame], period: f64, input: &Inputs, settings: &Settings) ->
         let covering = all_spans
             .iter()
             .find(|(s, _)| s.from_ms >= w[0].wall_ms && s.from_ms <= w[1].wall_ms + RESUME_SPAN_WITHIN_MS);
-        let shown = covering.and_then(|(_, after)| frames[*after..].iter().find_map(|f| f.counter));
+        let first = covering.and_then(|(_, after)| frames[*after..].iter().find(|f| f.counter.is_some()));
+        let shown = first.and_then(|f| f.counter);
+        // The highest counter shown before the span, at its first showing.
+        let before = covering.and_then(|(s, after)| {
+            let start = after - s.frames as usize;
+            let top = frames[..start].iter().filter_map(|f| f.counter).max()?;
+            let at = frames[..start].iter().find(|f| f.counter == Some(top))?;
+            Some((top, round(at.wall)))
+        });
         resumes.push(Resume {
             gap_from_wall_ms: w[0].wall_ms,
             gap_ms: gap,
@@ -750,7 +865,41 @@ fn camera(frames: &[Frame], period: f64, input: &Inputs, settings: &Settings) ->
             first_shown_counter: shown,
             suppressed_ms: shown
                 .map(|s| round((f64::from(s) - f64::from(w[1].counter)) * settings.camera_period_ms)),
+            first_emitted_wall_ms: w[1].wall_ms,
+            slate_from_ms: covering.map(|(s, _)| s.from_ms),
+            last_shown_counter: before.map(|b| b.0),
+            last_shown_wall_ms: before.map(|b| b.1),
+            first_shown_wall_ms: first.map(|f| round(f.wall)),
         });
+    }
+
+    // Content gaps: consecutive distinct counters shown, far apart in emit time.
+    let mut content_gaps = Vec::new();
+    let mut prev: Option<(u32, f64)> = None;
+    for f in frames {
+        let Some(c) = f.counter else { continue };
+        match prev {
+            Some((p, _)) if c == p => prev = Some((c, f.wall)),
+            Some((p, p_wall)) if c > p => {
+                if let (Some(&ep), Some(&ec)) = (emitted.get(&p), emitted.get(&c)) {
+                    if (ec - ep) as f64 > CONTENT_GAP_PERIODS * settings.camera_period_ms {
+                        content_gaps.push(ContentGap {
+                            from_counter: p,
+                            to_counter: c,
+                            from_emit_ms: ep,
+                            to_emit_ms: ec,
+                            gap_ms: ec - ep,
+                            from_shown_ms: round(p_wall),
+                            to_shown_ms: round(f.wall),
+                        });
+                    }
+                }
+                prev = Some((c, f.wall));
+            }
+            // A regression (counted above) moves nothing; the first counter starts the walk.
+            Some(_) => {}
+            None => prev = Some((c, f.wall)),
+        }
     }
 
     Camera {
@@ -763,13 +912,14 @@ fn camera(frames: &[Frame], period: f64, input: &Inputs, settings: &Settings) ->
         counter_regressions: regressions,
         cadence,
         resumes,
+        content_gaps,
         latency_samples: lat.len() as u64,
         latency_ms: percentiles(lat.into_iter().map(|(_, l)| l).collect()),
         latency_windows_ms: windows,
     }
 }
 
-fn overlay(frames: &[Frame], timeline: &Timeline) -> Overlay {
+fn overlay(frames: &[Frame], timeline: &Timeline, period: f64) -> Overlay {
     let mut changes = Vec::new();
     // Each change's exact wall time (the report rounds it; the late count must not).
     let mut change_walls = Vec::new();
@@ -801,11 +951,40 @@ fn overlay(frames: &[Frame], timeline: &Timeline) -> Overlay {
         })
         .max()
         .unwrap_or(0);
+    let mut lags: Vec<i64> = changes
+        .iter()
+        .zip(&change_walls)
+        .filter_map(|(c, &shown)| Some(round(shown - c.due_wall_ms? as f64)))
+        .collect();
+    lags.sort_unstable();
+    let change_lag_ms = Lag {
+        p50: percentile(&lags, 50),
+        max: lags.last().copied().unwrap_or(0),
+        n: lags.len() as u64,
+    };
+    let mut runs: Vec<OverlayRun> = Vec::new();
+    for f in frames {
+        match runs.last_mut() {
+            Some(r) if r.index == f.score => {
+                r.frames += 1;
+                r.to_ms = round(f.wall + period);
+            }
+            _ => runs.push(OverlayRun {
+                from_ms: round(f.wall),
+                to_ms: round(f.wall + period),
+                frames: 1,
+                index: f.score,
+            }),
+        }
+    }
     Overlay {
         score_index_changes: changes,
         late_frames_max,
         future_dated,
         frames_read,
+        absent_frames: frames.len() as u64 - frames_read,
+        runs,
+        change_lag_ms,
     }
 }
 
@@ -903,6 +1082,23 @@ fn heartbeats(beats: &[Beat]) -> (Heartbeats, Vec<String>) {
             .last()
             .map_or_else(|| Value::Object(Default::default()), |b| b.body.clone()),
         rungs: rungs.into_iter().collect(),
+        series: beats
+            .iter()
+            .map(|b| BeatRec {
+                received_ms: b.received_ms,
+                body: b.body.clone(),
+            })
+            .collect(),
+        rung_sequence: {
+            let mut seq: Vec<String> = Vec::new();
+            for r in beats.iter().filter_map(|b| b.body.get("rung")) {
+                let r = r.as_str().map_or_else(|| r.to_string(), str::to_owned);
+                if seq.last() != Some(&r) {
+                    seq.push(r);
+                }
+            }
+            seq
+        },
     };
     (hb, failures)
 }
@@ -972,6 +1168,7 @@ mod tests {
             timeline: timeline(),
             crashes_ms: vec![],
             end_request_ms: None,
+            log: LogFacts::default(),
         }
     }
 
@@ -1484,5 +1681,214 @@ mod tests {
             (59, 30)
         );
         assert_eq!(r.camera.latency_windows_ms.len(), 1);
+    }
+
+    // C14: an outage carries the counters either side, the camera time they span (from the emit
+    // log) and what was lost beyond the outage's own wall span.
+    #[test]
+    fn an_outage_carries_its_counters_and_the_programme_lost() {
+        // Segment A: counters 1..=30 from wall 1 000. The camera emits counter c at 1 000 + 40 c
+        // (a 25 fps camera, so the emit times differ from any frame-period product). Segment B, named
+        // 4 000 ms later than A's end, shows 200.. onward.
+        let a = strip_frames(1, 30);
+        let b = strip_frames(200, 30);
+        let mut i = inputs(vec![seg(1_000, a), seg(5_000, b)]);
+        i.emit = (1..=260u32)
+            .map(|c| Emit {
+                counter: c,
+                wall_ms: 1_000 + 40 * i64::from(c),
+            })
+            .collect();
+        let r = analyze(&i, &settings());
+        assert_eq!(r.output_outages.len(), 1, "{:?}", r.output_outages);
+        let o = &r.output_outages[0];
+        // A's last frame is frame 29 at 1 000 + 29 periods (1 966.7); the outage starts a period
+        // later, at 2 000, and ends at B's first frame, 5 000: 3 000 ms of wall.
+        assert_eq!((o.from_wall_ms, o.to_wall_ms), (2_000, 5_000));
+        assert_eq!((o.counter_before, o.counter_after), (Some(30), Some(200)));
+        // Emits 30 -> 200: 170 counters at 40 ms, 6 800 ms; lost beyond the wall span: 3 800 ms.
+        assert_eq!(o.counter_gap_ms, Some(6_800));
+        assert_eq!(o.lost_ms, Some(3_800));
+        // With no emit log the gap is unknown, never guessed from frame periods.
+        i.emit.clear();
+        let r = analyze(&i, &settings());
+        assert_eq!(r.output_outages[0].counter_gap_ms, None);
+        assert_eq!(r.output_outages[0].lost_ms, None);
+        assert_eq!(r.output_outages[0].counter_before, Some(30));
+    }
+
+    #[test]
+    fn a_content_gap_is_a_jump_in_emit_time_and_cadence_is_not() {
+        // Shown: 1..=10, then 12 (one counter skipped: cadence), then 50..=60 (37 skipped).
+        let shown: Vec<u32> = (1..=10).chain([12]).chain(50..=60).collect();
+        let f: Vec<FrameRec> = shown
+            .iter()
+            .enumerate()
+            .map(|(k, &c)| FrameRec {
+                pts_ns: k as u64 * P_NS,
+                counter: Some(c),
+                score: None,
+            })
+            .collect();
+        let mut i = inputs(vec![seg(2_000, f)]);
+        // A 30 fps camera: counter c emitted at c thirtieths of a second.
+        i.emit = (1..=60u32)
+            .map(|c| Emit {
+                counter: c,
+                wall_ms: (f64::from(c) * 1000.0 / 30.0).round() as i64,
+            })
+            .collect();
+        let r = analyze(&i, &settings());
+        assert_eq!(r.camera.content_gaps.len(), 1, "{:?}", r.camera.content_gaps);
+        let g = &r.camera.content_gaps[0];
+        assert_eq!((g.from_counter, g.to_counter), (12, 50));
+        // 12 at 400 ms, 50 at 1 666.7 ms: 38 counters, 1 267 ms.
+        assert_eq!((g.from_emit_ms, g.to_emit_ms, g.gap_ms), (400, 1_667, 1_267));
+        // Frame 10 (counter 12) and frame 11 (counter 50), one period apart, from 2 000.
+        assert_eq!((g.from_shown_ms, g.to_shown_ms), (2_333, 2_367));
+        // A step of exactly 3 camera periods (counters 1 -> 4 at 33.3 ms) is not yet a gap.
+        let edge: Vec<FrameRec> = [1u32, 4]
+            .iter()
+            .enumerate()
+            .map(|(k, &c)| FrameRec {
+                pts_ns: k as u64 * P_NS,
+                counter: Some(c),
+                score: None,
+            })
+            .collect();
+        let mut j = inputs(vec![seg(0, edge)]);
+        j.emit = (1..=4u32)
+            .map(|c| Emit {
+                counter: c,
+                wall_ms: (f64::from(c) * 1000.0 / 30.0).round() as i64,
+            })
+            .collect();
+        assert!(analyze(&j, &settings()).camera.content_gaps.is_empty());
+        eprintln!("content gaps checked: 2 recordings");
+    }
+
+    #[test]
+    fn the_overlay_strip_runs_count_the_frames_with_no_overlay() {
+        let scores = [Some(1u16), Some(1), Some(1), None, None, Some(2), Some(2), None];
+        let f: Vec<FrameRec> = scores
+            .iter()
+            .enumerate()
+            .map(|(k, &score)| FrameRec {
+                pts_ns: k as u64 * P_NS,
+                counter: Some(k as u32 + 1),
+                score,
+            })
+            .collect();
+        let r = analyze(&inputs(vec![seg(3_000, f)]), &settings());
+        let runs: Vec<(Option<u16>, u64)> = r.overlay.runs.iter().map(|x| (x.index, x.frames)).collect();
+        assert_eq!(runs, vec![(Some(1), 3), (None, 2), (Some(2), 2), (None, 1)]);
+        assert_eq!((r.overlay.frames_read, r.overlay.absent_frames), (5, 3));
+        // Each run ends a period after its last frame: the first holds frames 0..=2, to 3 000 + 100.
+        assert_eq!(
+            (r.overlay.runs[0].from_ms, r.overlay.runs[0].to_ms),
+            (3_000, 3_100)
+        );
+        // The frame table carries every frame, in order.
+        assert_eq!(r.frames_table.len(), scores.len());
+        assert_eq!(r.frames_table[3], (3_100, Some(4), None));
+        assert_eq!(r.frames_table[5], (3_167, Some(6), Some(2)));
+    }
+
+    #[test]
+    fn a_score_change_reports_how_late_it_reached_the_recording() {
+        // timeline(): index 1 due at 1 010 + 3 100 = 4 110, index 2 at 4 010 + 3 100 = 7 110. The
+        // recording starts at 4 000 and shows index 1 from frame 6 (4 200), index 2 from frame 96.
+        let f: Vec<FrameRec> = (0..120u64)
+            .map(|k| FrameRec {
+                pts_ns: k * P_NS,
+                counter: Some(k as u32 + 1),
+                score: Some(if k < 6 {
+                    0
+                } else if k < 96 {
+                    1
+                } else {
+                    2
+                }),
+            })
+            .collect();
+        let r = analyze(&inputs(vec![seg(4_000, f)]), &settings());
+        // 4 200 - 4 110 = 90; frame 96 is 4 000 + 3 200 = 7 200, 7 200 - 7 110 = 90.
+        assert_eq!(
+            r.overlay.change_lag_ms,
+            Lag {
+                p50: 90,
+                max: 90,
+                n: 2
+            }
+        );
+    }
+
+    #[test]
+    fn the_beats_keep_their_order_and_a_step_back_up_shows_in_the_rung_sequence() {
+        let mut i = inputs(vec![]);
+        i.beats = vec![
+            beat(1_000, json!({"rung": "full", "graphics": "ready"})),
+            beat(6_000, json!({"rung": "full"})),
+            beat(11_000, json!({"rung": "overlay_half_rate"})),
+            beat(16_000, json!({"rung": "overlay_half_rate"})),
+            beat(21_000, json!({"rung": "full"})),
+        ];
+        let r = analyze(&i, &settings());
+        assert_eq!(
+            r.heartbeats.rung_sequence,
+            vec!["full", "overlay_half_rate", "full"],
+            "a full after the step is kept, so a case can refuse it"
+        );
+        assert_eq!(r.heartbeats.series.len(), 5);
+        assert_eq!(r.heartbeats.series[2].received_ms, 11_000);
+        assert_eq!(r.heartbeats.series[0].body["graphics"], "ready");
+        // The set, as C13 reports it, cannot see the order.
+        assert_eq!(r.heartbeats.rungs, vec!["full", "overlay_half_rate"]);
+        // No beats: an empty series and sequence.
+        let r = analyze(&inputs(vec![]), &settings());
+        assert!(r.heartbeats.series.is_empty() && r.heartbeats.rung_sequence.is_empty());
+    }
+
+    #[test]
+    fn a_resume_reports_the_wall_times_of_its_edges() {
+        // As `a_resume_names_…`: emits 1..=30 at 33 c, then 151.. at 5 000 + 33 c. The recording,
+        // named 500: 1..=30 (frames 0..=29), a 20-frame slate (frames 30..=49), then 160.. (50..).
+        let mut i = inputs(vec![]);
+        i.emit = (1..=30)
+            .map(|c| Emit {
+                counter: c,
+                wall_ms: i64::from(c) * 33,
+            })
+            .chain((151..=200).map(|c| Emit {
+                counter: c,
+                wall_ms: 5_000 + i64::from(c) * 33,
+            }))
+            .collect();
+        let mut f = Vec::new();
+        for (k, c) in (1..=30)
+            .map(Some)
+            .chain((0..20).map(|_| None))
+            .chain((160..=200).map(Some))
+            .enumerate()
+        {
+            f.push(FrameRec {
+                pts_ns: k as u64 * P_NS,
+                counter: c,
+                score: None,
+            });
+        }
+        i.segments = vec![seg(500, f)];
+        let r = analyze(&i, &settings());
+        let res = &r.camera.resumes[0];
+        assert_eq!(res.first_emitted_wall_ms, 5_000 + 151 * 33);
+        // Frame 29 (counter 30) at 500 + 966.7; the slate from frame 30, 1 500; counter 160 at
+        // frame 50, 500 + 1 666.7.
+        assert_eq!(res.last_shown_counter, Some(30));
+        assert_eq!(res.last_shown_wall_ms, Some(1_467));
+        assert_eq!(res.slate_from_ms, Some(1_500));
+        assert_eq!(res.first_shown_wall_ms, Some(2_167));
+        // The gap from 30 to 160 is a content gap too.
+        assert_eq!(r.camera.content_gaps.len(), 1);
+        assert_eq!(r.camera.content_gaps[0].gap_ms, (5_000 + 160 * 33) - 30 * 33);
     }
 }

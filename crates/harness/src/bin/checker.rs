@@ -19,6 +19,7 @@ use std::process::ExitCode;
 
 use harness::checker::{analyze, Inputs, Settings};
 use harness::inputs::{crash_times, read_beats, read_emit, read_timeline};
+use harness::logfacts::log_facts;
 use harness::media;
 
 const FLAGS: [&str; 7] = [
@@ -73,6 +74,7 @@ fn run() -> Result<bool, String> {
         timeline,
         crashes_ms: crash_times(&log),
         end_request_ms,
+        log: log_facts(&log),
     };
     let report = analyze(
         &inputs,
