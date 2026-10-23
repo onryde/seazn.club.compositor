@@ -1713,8 +1713,8 @@ INT and TERM also `wait`ed on the compositor, and re-waited after each trap.
   2026-10-23 (GitHub's release API); the digest is Docker Hub's for the tag (its tag API, read
   2026-10-23, pushed 2026-10-08T21:50:03Z).
 - **Read from the tag's own files** (2026-10-23): its `mediamtx.yml` and its OpenAPI document.
-  **Not run by C13's implementer:** no local Docker (owner ruling 2026-10-23); harness.yml's first
-  smoke run on PR C13 is the first run of the image.
+  **Not run by C13's implementer:** no local Docker (owner ruling 2026-10-23). The image first ran
+  in harness.yml on PR #48 (harness run 39979756278, green); the facts measured there are below.
 - **The API paths a case uses** (the brief's `/v3/srtconns/...` do not exist at this tag):
   - `GET /v3/srt/conns/list`, then `POST /v3/srt/conns/kick/{id}` for the reader (C14 case 3,
     `reader-kicked`); `GET /v3/srt/conns/get/{id}`; the RTMP twins are `/v3/rtmp/conns/list`,
@@ -1737,6 +1737,13 @@ INT and TERM also `wait`ed on the compositor, and re-waited after each trap.
     keyframe after it), `recordDeleteAfter` (default 1 day; `0s` disables).
   - `useAbsoluteTimestamp: false` by default: a segment's name is the wall clock when it started,
     in the container's time zone (the harness sets `TZ=UTC`; the checker reads names as UTC).
+    **Measured (harness run 39979756278, ffprobe on the uploaded recordings):** "when it started"
+    is when the segment's FIRST SAMPLE ARRIVED. Each segment's PTS restarts near 0 (video first PTS
+    0.000 to 0.021 s, audio 0.000). The first segment after the compositor connected held 352 frames
+    over 11.70 s of PTS, but was named only 9.71 s before the second: its first frames arrived as a
+    backlog. So name plus PTS runs a connect's first segment past the next segment's name, and the
+    checker re-dates such a segment from the next one (`_INDEX.md`, decision row "C13 CI round 2"
+    (2); Owed 80).
   - The protocol switches at this tag: `rtsp`, `rtmp`, `hls`, `webrtc`, `srt` and `moq` (MoQ is
     on by default; the harness turns every one off but `rtmp` and `srt`). An unknown key fails the
     start.
