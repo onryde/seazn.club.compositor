@@ -56,9 +56,9 @@ pub fn segment_start_us(file_name: &str) -> Option<i64> {
     epoch_us([date[0], date[1], date[2]], [rest[0], rest[1], rest[2]], micros)
 }
 
-/// The epoch milliseconds of a compositor log line's `ts=2026-10-23T12:00:00.123Z`, or `None`.
-pub fn log_ts_ms(line: &str) -> Option<i64> {
-    let ts = line.strip_prefix("ts=")?.split(' ').next()?;
+/// The epoch milliseconds of an RFC 3339 UTC stamp, `2026-10-23T12:00:00.123Z` (up to nine
+/// fractional digits, as `docker logs --timestamps` writes them), or `None`.
+pub fn rfc3339_utc_ms(ts: &str) -> Option<i64> {
     let ts = ts.strip_suffix('Z')?;
     let (date, clock) = ts.split_once('T')?;
     let date: Vec<&str> = date.split('-').collect();
@@ -72,8 +72,14 @@ pub fn log_ts_ms(line: &str) -> Option<i64> {
     while padded.len() < 6 {
         padded.push('0');
     }
+    num(&padded)?;
     let micros = u64::from(num(&padded[..6])?);
     epoch_us([date[0], date[1], date[2]], [hms[0], hms[1], hms[2]], micros).map(|us| us.div_euclid(1_000))
+}
+
+/// The epoch milliseconds of a compositor log line's `ts=2026-10-23T12:00:00.123Z`, or `None`.
+pub fn log_ts_ms(line: &str) -> Option<i64> {
+    rfc3339_utc_ms(line.strip_prefix("ts=")?.split(' ').next()?)
 }
 
 #[cfg(test)]
@@ -132,5 +138,22 @@ mod tests {
             None,
             "not UTC"
         );
+    }
+
+    #[test]
+    fn docker_stamps_read_with_nanoseconds() {
+        let base = (OCT_23_2026_S + 12 * 3_600) * 1_000;
+        assert_eq!(rfc3339_utc_ms("2026-10-23T12:00:00.123456789Z"), Some(base + 123));
+        assert_eq!(rfc3339_utc_ms("2026-10-23T12:00:00.9Z"), Some(base + 900));
+        assert_eq!(rfc3339_utc_ms("2026-10-23T12:00:00Z"), Some(base));
+        for bad in [
+            "2026-10-23T12:00:00.1234567890Z",
+            "2026-10-23T12:00:00.12x4Z",
+            "2026-10-23T12:00:00.Z",
+            "2026-10-23 12:00:00Z",
+            "",
+        ] {
+            assert_eq!(rfc3339_utc_ms(bad), None, "{bad:?}");
+        }
     }
 }

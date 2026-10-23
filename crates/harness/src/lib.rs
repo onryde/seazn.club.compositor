@@ -9,6 +9,7 @@
 //! - [`camera`]: fake-camera's controls and schedule;
 //! - [`control`]: fake-control's routes (the session, the heartbeats, the score feed, the page);
 //! - [`inputs`] and [`checker`]: the checker's inputs and its analysis;
+//! - [`logfacts`]: the compositor log's facts (C14), parsed into the report;
 //! - [`media`] (feature `media`): everything that runs GStreamer;
 //! - [`thresholds`]: `harness/thresholds.json`, the numbers C14's verdicts read (`$t`).
 //!
@@ -20,6 +21,7 @@ pub mod checker;
 pub mod clock;
 pub mod control;
 pub mod inputs;
+pub mod logfacts;
 #[cfg(feature = "media")]
 pub mod media;
 pub mod score;
