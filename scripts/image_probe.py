@@ -34,7 +34,9 @@ cycles of 8 alternating 720p and 1080p (the review's m7): 4 `docker stop` (SIGTE
 drain), 2 `docker kill -s INT` (R1's stop: the Final hold, inside R1's grace), the session's deadline
 (the hold) and a killed CEF zygote (C11b's in-place restart, 75): 24 stops in all. Every exit status is exact, with its own `exit
 code=` line, the right last POST, and no abort text (a double free after the exit line was status
-134 once in six such exits before `hard_exit::now`). `/dev/shm`'s peak use is printed.
+134 once in six such exits before `hard_exit::now`). Of the zygote kills, the 2nd and 3rd of each 4
+come at once after the ready (the window each ready's listing closed) and the others after two
+child polls (the restart alone). `/dev/shm`'s peak use is printed.
 
 Then a SIGTERM and a SIGINT 0.3 s into a container's boot (the review's m1): held by the entrypoint
 until the compositor's handlers exist, then the compositor's own exit 0.
@@ -88,6 +90,8 @@ CONTROLS = ("DISPLAY", "SESSION_ID", "CEF_SUBPROCESS_PATH")
 posts = []
 fetches = []
 ROOT_LIB = ROOT / "crates/compositor/src/lib.rs"
+# The CEF adapter: `CHILD_POLL_MS`, the child poll's period, is read from it.
+CEF_LIB = ROOT / "crates/adapters/src/cef_graphics.rs"
 
 
 def session(port, fixture):
@@ -186,11 +190,12 @@ def cmdlines():
     return rows
 
 
-def lib_const(name):
-    """A constant from its one authority in this repo, `crates/compositor/src/lib.rs`."""
-    m = re.search(rf"pub const {name}: u64 = ([0-9_]+);", ROOT_LIB.read_text())
+def lib_const(name, path=ROOT_LIB):
+    """A `u64` constant from its one authority in this repo, `path` (by default
+    `crates/compositor/src/lib.rs`)."""
+    m = re.search(rf"pub const {name}: u64 = ([0-9_]+);", path.read_text())
     if not m:
-        raise SystemExit(f"{name} not found in crates/compositor/src/lib.rs")
+        raise SystemExit(f"{name} not found in {path.relative_to(ROOT)}")
     return int(m.group(1).replace("_", ""))
 
 
@@ -252,6 +257,7 @@ def main():
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
     grace = lib_const("R1_STOP_GRACE_MS") / 1000
+    child_poll = lib_const("CHILD_POLL_MS", CEF_LIB) / 1000
     # The kernel's value, not ours: at exactly 1 byte it refuses a core to a piped core_pattern
     # (fs/coredump.c), and 1 is below the ELF minimum for a file one. Never read from the code under test.
     limit = "1"
@@ -290,15 +296,21 @@ def main():
         sample_shm()
         return ready
 
+    def running():
+        return sh("docker", "inspect", "-f", "{{.State.Running}}", NAME).stdout.strip() == "true"
+
     def wait_exit(limit_s):
+        """(seconds waited, the exit status, the logs). The status reads `running` when the container
+        outlived `limit_s`: `docker inspect`'s ExitCode of a running container is 0, which would pass
+        for a clean exit (image run 40015873298)."""
         t0 = time.time()
         while time.time() - t0 < limit_s:
-            if sh("docker", "inspect", "-f", "{{.State.Running}}", NAME).stdout.strip() != "true":
+            if not running():
                 break
             sample_shm()
             time.sleep(0.2)
         took = time.time() - t0
-        code = sh("docker", "inspect", "-f", "{{.State.ExitCode}}", NAME).stdout.strip()
+        code = "running" if running() else sh("docker", "inspect", "-f", "{{.State.ExitCode}}", NAME).stdout.strip()
         logs = sh("docker", "logs", NAME).stderr
         kept.append(logs)
         sh("docker", "rm", "-f", NAME, check=False)
@@ -447,7 +459,7 @@ def main():
         kinds = [term, sigint, term, ("the deadline", "0", "deadline", True), term,
                  ("a killed CEF zygote", "75", "restart", False), term, sigint]
         hold = 10
-        exits = stops = 0
+        exits = stops = zygote_kills = 0
         for i in range(a.exits):
             kind, want, reason, final = kinds[i % len(kinds)]
             fixture = P1080 if (i // len(kinds)) % 2 else P720
@@ -472,8 +484,22 @@ def main():
                 cpid = compositor_pid()
                 zyg = [p_ for p_, (pp, a_) in cmdlines().items() if pp == cpid and "--type=zygote" in a_]
                 check(len(zyg) >= 1, f"{what}: a zygote of the compositor ({zyg})")
+                # Kills 2 and 3 of each 4 come at once after the ready, inside the window the watch was
+                # blind in before each ready listed the zygotes (image run 40015873298: that run's fastest
+                # ready-to-stop gaps, on other exits, were 0.100-0.157 s, so its kill most likely came
+                # before the 2nd poll). Kills 1 and 4 wait out two child polls, so they prove the restart
+                # alone. In 32 exits: 14 and 22 at once, 6 and 30 after the wait (both at both profiles).
+                immediate = zygote_kills % 4 in (1, 2)
+                zygote_kills += 1
+                what += ", at once after the ready" if immediate else ", after two child polls"
+                if not immediate:
+                    time.sleep(2 * child_poll)
                 for z in zyg[:1]:
-                    sh("docker", "exec", NAME, "kill", "-KILL", str(z), check=False)
+                    pp, argv = cmdlines().get(z, (0, ""))
+                    check(cpid > 0 and pp == cpid and "--type=zygote" in argv,
+                          f"{what}: {z} is still a zygote of the compositor at the kill (parent {pp})")
+                    kill = sh("docker", "exec", NAME, "kill", "-KILL", str(z), check=False)
+                    check(kill.returncode == 0, f"{what}: kill -KILL {z} returned {kill.returncode}")
                 took, code, logs = wait_exit(30)
             last = posts[-1] if posts else {}
             ok = check(code == want, f"{what}: exit status {code}, want {want} ({took:.1f} s)")

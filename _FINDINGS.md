@@ -1248,7 +1248,7 @@ echo "RUN $RUN done"
   - **The first's death orphans its GPU process** (the final C11 review's FS2, FS3 and G4, 2026-10-20; C11b's image test, 3 runs): the GPU process is reparented to pid 1 and leaves the compositor's tree, so the PSS cap, the OOM grading and the GPU-death count no longer see it, and it lives on. Its death then aborts the process even with graphics stopped (FS3, 2 of 2), while a retry build after the stop reaches ready (FS2). So staying on air without the overlay leaves the abort armed (G3); C11b restarts in place instead, within a poll and a tick of the verdict.
   - The second parents the renderers and a utility process. Killed alone, the current renderer is orphaned: it leaves the compositor's process tree (so the guardrails, the claims and the reaper lose it) and keeps painting and beating, and the next build gets `CefCrashed` at once, with 0 samples.
   - The review's P7: with the zygotes dead, the current build's renderer killed gave no `CefCrashed` within 3 s (2 of 2 runs), and CEF's browser side burned about 1.0–1.3 cores in the compositor process while a build existed.
-  - So the adapter's verdict (`health().unrecoverable`, Owed 56) is **any** zygote gone, from the child poll (since the confirm pass; the fix loop decided on the renderers' zygote, or every zygote, only); a zygote missing from one poll's list counts only once its process is gone (or a zombie).
+  - So the adapter's verdict (`health().unrecoverable`, Owed 56) is **any** zygote gone, from the child poll (since the confirm pass; the fix loop decided on the renderers' zygote, or every zygote, only); a zygote missing from one poll's list counts only once its process is gone (or a zombie). Since 2026-10-23 each ready lists the zygotes too, so the watch has them before anyone hears of the ready (F-022).
 - **Chromium's abort** (the PR #32 confirm pass, 2026-10-19; reviewer's probes CF, CG, CH, then the implementer's PK and GR, each case in a process of its own). The process logs `FATAL:content/browser/gpu/gpu_data_manager_impl_private.cc:415] GPU process isn't usable. Goodbye.` and dies of SIGTRAP (wait status 133: signal 5, core). In production that process is the compositor: the programme goes off air with it, and the exit reads as a crash to Fly (`max_retries` 2) and to R2003b.
   - The GPU zygote killed, then the GPU process: the abort, 3 of 3 (CG; pinned by `a_gpu_process_death_after_its_zygotes_aborts_the_whole_process`). The control, the GPU process killed with its zygote alive: relaunched under the same zygote, the page kept beating and gen 2 reached ready (CH).
   - Both zygotes killed during CEF's start, before a poll saw a renderer: the abort (CF).
@@ -1751,3 +1751,21 @@ INT and TERM also `wait`ed on the compositor, and re-waited after each trap.
     image in MediaMTX's network namespace, which is how the input leg is impaired at its sender.
 - **Changes:** the C13 brief's kick paths are a false premise (`_INDEX.md`); C14 uses the paths
   above.
+
+## F-022: the zygote watch's first listing came after the ready (image run 40015873298, 2026-10-23)
+
+- **Measured** (the coordinator's diagnosis of image run 40015873298 and the image.yml runs since
+  2026-10-20: 11 completed the probe's 32-exit sweep, 44 zygote kills): the child poll starts at gen 1's
+  restart, before CEF forks a zygote, so its first list holds none; it lists every `CHILD_POLL_MS`
+  (1 s), so the zygotes were first listed by the 2nd poll, at about restart + 1.01 s, while
+  `cef ready gen=1` came at about restart + 0.72 s. 43 of 43 passing kills got the verdict at
+  restart + 2.017 to 2.036 s (the 3rd poll). The one that failed (exit 6 of 32) got none: 15
+  `cef alive gen=1` beats over the next 30 s, no "a CEF zygote is gone", no `cef health` line, no exit
+  line. Its run's probe was the fastest measured (its ready-to-stop gaps were the 4 shortest of 128,
+  0.100 to 0.157 s; the median 0.188 s), so its kill most likely landed before the 2nd poll.
+- **`docker inspect -f {{.State.ExitCode}}` of a running container prints 0**: the probe read
+  "exit status 0 (30.2 s)" for a container that never exited.
+- **So:** a watch that learns its baseline from a periodic poll is blind from the moment the process
+  exists to the first poll that lists it. The adapter now lists at every ready too (the decision log's
+  "Zygote watch at ready"); what is left is a zygote that dies between CEF's start and the first
+  ready (Owed 70 (e)).
