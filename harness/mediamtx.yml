@@ -1,0 +1,53 @@
+# MediaMTX for the harness (C13): the fake Cloudflare (owner ruling 2026-10-14). Pinned in
+# compose.yml (bluenviron/mediamtx:1.21.2 by digest; _FINDINGS.md F-021, which also pins the API
+# paths a case uses). Every key here exists in the tag's own mediamtx.yml; MediaMTX refuses an
+# unknown one at start.
+#
+# - path `cam`: fake-camera publishes (`publish:cam`), the compositor reads (`read:cam`), both over
+#   SRT with one passphrase, set from the run's random HARNESS_SRT_PASSPHRASE through the
+#   environment (compose.yml: MTX_PATHS_CAM_SRTREADPASSPHRASE and ...SRTPUBLISHPASSPHRASE), never
+#   in this file or in argv;
+# - path `live/dest`: the compositor publishes its programme over RTMP (`target.url` +
+#   `streamKey`), and MediaMTX records it as fMP4 segments named by their wall-clock start (UTC:
+#   the container's TZ), which the checker reads (`clock::segment_start_us`).
+logLevel: info
+logDestinations: [stdout]
+
+# The API is on for the cases (a reader kick, C14) and reachable only inside the compose network:
+# compose publishes no port. The default config allows it from localhost only.
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+      - action: read
+      - action: api
+api: true
+apiAddress: :9997
+
+metrics: false
+pprof: false
+playback: false
+rtsp: false
+hls: false
+webrtc: false
+moq: false
+rtmp: true
+rtmpAddress: :1935
+srt: true
+srtAddress: :8890
+
+paths:
+  cam:
+    source: publisher
+  live/dest:
+    source: publisher
+    record: true
+    recordPath: /rec/%path/%Y-%m-%d_%H-%M-%S-%f
+    recordFormat: fmp4
+    recordPartDuration: 1s
+    recordSegmentDuration: 10s
+    # Never delete: the checker reads every segment after the run.
+    recordDeleteAfter: 0s

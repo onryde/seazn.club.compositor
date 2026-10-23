@@ -3,7 +3,9 @@
 # Plain OCI, nothing host-specific inside (ADR 0007). Build context = the repo root:
 #   docker build --build-arg GSTCEF_COMMIT="$(cat docker/GSTCEF_COMMIT)" -f docker/Dockerfile .
 # Stages: gst-base (the runtime libraries), cef-build (gstcefsrc + CEF), rust-build (the binary),
-# cef-test (rust-build plus the plugin: image.yml runs C11's graphics tests there), and the runtime.
+# cef-test (rust-build plus the plugin: image.yml runs C11's graphics tests there), harness-build
+# and harness (C13's fakes and checker, `--target harness`; test tooling the runtime never
+# carries), and the runtime, last and unnamed, so a build with no target is the relay image.
 #
 # Never set GST_CEF_LOG_SEVERITY or GST_DEBUG here (Owed 52, F-013): the first overrides the
 # element's log-severity=disable and CEF then writes every console line, the job token included, to
@@ -61,6 +63,21 @@ COPY --from=cef-build /src/gstcefsrc/build/Release /opt/gstcef
 ENV GST_PLUGIN_PATH=/opt/gstcef DISPLAY=:99
 RUN useradd --uid 10001 --create-home tester && chown -R 10001:10001 /src /opt/cargo
 USER tester
+
+# The harness (C13, harness/compose.yml): fake-camera, fake-control and the checker on the same
+# GStreamer as the runtime, plus tc (netem.sh's sidecars) and curl (the cases' controls). No CEF:
+# the harness only feeds and reads the relay image.
+FROM rust-build AS harness-build
+RUN cargo build --release --locked -p harness --bins \
+ && install -m 0755 target/release/fake-camera target/release/fake-control target/release/checker /usr/local/bin/
+
+FROM gst-base AS harness
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=harness-build /usr/local/bin/fake-camera /usr/local/bin/fake-control /usr/local/bin/checker /usr/local/bin/
+RUN for e in appsrc x264enc h264parse mpegtsmux srtsink audioconvert voaacenc aacparse queue filesrc \
+      decodebin qtdemux avdec_h264 avdec_aac videoconvert audioresample appsink fakesink; do \
+      gst-inspect-1.0 "$e" >/dev/null 2>&1 || { echo "missing element $e"; exit 1; }; done
 
 FROM gst-base
 COPY --from=cef-build /src/gstcefsrc/build/Release /opt/gstcef

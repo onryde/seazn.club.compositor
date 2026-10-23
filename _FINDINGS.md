@@ -1705,3 +1705,49 @@ INT and TERM also `wait`ed on the compositor, and re-waited after each trap.
   probe requires every live CEF process to descend from a recorded exec. A file nothing rewrites (Xvfb's,
   a bash's, and the compositor's, whose in-process CEF browser sets no title: 24 lines on Fly) is its
   exec-time environment, read as before, now with a control.
+
+## F-021: MediaMTX, the harness's fake Cloudflare and destination: the pin and its API (C13, 2026-10-23)
+
+- **The pin:** `bluenviron/mediamtx:1.21.2@sha256:c7540465f868a02652118bea5a0daab12a29ac0f6cb8485abd535939ecddf886`
+  (`harness/compose.yml`). Tag `v1.21.2`, released 2026-10-08T21:42:39Z, the latest release on
+  2026-10-23 (GitHub's release API); the digest is Docker Hub's for the tag (its tag API, read
+  2026-10-23, pushed 2026-10-08T21:50:03Z).
+- **Read from the tag's own files** (2026-10-23): its `mediamtx.yml` and its OpenAPI document.
+  **Not run by C13's implementer:** no local Docker (owner ruling 2026-10-23). The image first ran
+  in harness.yml on PR #48 (harness run 39979756278, green); the facts measured there are below.
+- **The API paths a case uses** (the brief's `/v3/srtconns/...` do not exist at this tag):
+  - `GET /v3/srt/conns/list`, then `POST /v3/srt/conns/kick/{id}` for the reader (C14 case 3,
+    `reader-kicked`); `GET /v3/srt/conns/get/{id}`; the RTMP twins are `/v3/rtmp/conns/list`,
+    `/v3/rtmp/conns/get/{id}` and `/v3/rtmp/conns/kick/{id}`; also `GET /v3/paths/list` and
+    `GET /v3/recordings/list`.
+  - An `SRTConn` carries `id`, `created`, `remoteAddr`, `state`, `path`, `query`, `user` and the
+    SRT statistics (`msRTT`, `packetsReceivedLoss`, `packetsRetrans`, `mbpsReceiveRate`, …). The
+    compositor's reader is the connection whose `remoteAddr` is 172.28.0.10 and whose `path` is
+    `cam`.
+- **Config facts that bind the harness** (`harness/mediamtx.yml`):
+  - `api` is off by default, and the default users allow the API from localhost only, so the
+    harness's single `any` user carries `action: api` (the API is reachable only inside the compose
+    network: no port is published).
+  - The SRT passphrases are per path: `srtReadPassphrase` and `srtPublishPassphrase`, set from the
+    environment (`MTX_PATHS_CAM_SRTREADPASSPHRASE`, `MTX_PATHS_CAM_SRTPUBLISHPASSPHRASE`), so the
+    run's random value is in no file and no argv.
+  - Recording: `record`, `recordPath` (variables `%path %Y %m %d %H %M %S %f`, `%f` in
+    microseconds, plus `%z` and `%s`), `recordFormat` (`fmp4` or `mpegts`), `recordPartDuration`
+    (default 1 s, the loss on a crash), `recordSegmentDuration` (a minimum: a segment ends at a
+    keyframe after it), `recordDeleteAfter` (default 1 day; `0s` disables).
+  - `useAbsoluteTimestamp: false` by default: a segment's name is the wall clock when it started,
+    in the container's time zone (the harness sets `TZ=UTC`; the checker reads names as UTC).
+    **Measured (harness run 39979756278, ffprobe on the uploaded recordings):** "when it started"
+    is when the segment's FIRST SAMPLE ARRIVED. Each segment's PTS restarts near 0 (video first PTS
+    0.000 to 0.021 s, audio 0.000). The first segment after the compositor connected held 352 frames
+    over 11.70 s of PTS, but was named only 9.71 s before the second: its first frames arrived as a
+    backlog. So name plus PTS runs a connect's first segment past the next segment's name, and the
+    checker re-dates such a segment from the next one (`_INDEX.md`, decision row "C13 CI round 2"
+    (2); Owed 80).
+  - The protocol switches at this tag: `rtsp`, `rtmp`, `hls`, `webrtc`, `srt` and `moq` (MoQ is
+    on by default; the harness turns every one off but `rtmp` and `srt`). An unknown key fails the
+    start.
+  - The image is `scratch`-based: no shell and no `tc`. `netem-in` is a sidecar from the harness
+    image in MediaMTX's network namespace, which is how the input leg is impaired at its sender.
+- **Changes:** the C13 brief's kick paths are a false premise (`_INDEX.md`); C14 uses the paths
+  above.

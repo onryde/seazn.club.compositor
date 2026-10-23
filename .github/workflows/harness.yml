@@ -1,0 +1,150 @@
+name: harness
+# The harness (C13): build the relay image and the harness image from docker/Dockerfile, run one
+# case of harness/run-case.sh against them (the smoke case on a pull request), and upload out/ once
+# run-case.sh's secrets scan says it is clean.
+# This is the only place the compose stack runs (owner ruling 2026-10-23: no local Docker). The
+# builds read image.yml's caches (GHCR when warm, else GitHub's) and write neither.
+# Dispatchable, so a throwaway mutant branch can run a case too.
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "harness/**"
+      - "docker/**"
+      - "contracts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/cef-cache-key.sh"
+      - "scripts/cef-cache-holds-tree.sh"
+      - ".github/workflows/harness.yml"
+  workflow_dispatch:
+    inputs:
+      case:
+        description: "The case to run: harness/cases/<case>.sh"
+        required: true
+        default: smoke
+permissions: { contents: read }
+concurrency:
+  group: harness-${{ github.event_name }}-${{ github.ref }}
+  # A pull request's newer push replaces its older run; a dispatched run is never cancelled.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  harness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    # Read only: this workflow never writes a cache or the registry.
+    permissions: { contents: read, packages: read }
+    defaults:
+      # `bash -eo pipefail`: the implicit default has no pipefail (check.yml's note).
+      run: { shell: bash }
+    env:
+      RELAY_IMAGE: seazn-relay:${{ github.sha }}
+      HARNESS_IMAGE: seazn-harness:${{ github.sha }}
+      CASE: ${{ inputs.case || 'smoke' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The case name
+        run: |
+          if ! [[ "$CASE" =~ ^[a-z0-9-]+$ ]] || [ ! -f "harness/cases/$CASE.sh" ]; then
+            echo "::error::no case '$CASE' in harness/cases"
+            exit 1
+          fi
+          echo "case: $CASE"
+      # CEF's build tree and two images do not fit the runner's free disk otherwise (image.yml).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: gstcefsrc pin (F-001)
+        id: pin
+        run: |
+          commit=$(tr -d '[:space:]' < docker/GSTCEF_COMMIT)
+          if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::docker/GSTCEF_COMMIT is not a 40-hex commit: '$commit'"
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      # image.yml's GHCR build cache (decision log "CI: CEF layer from GHCR"), chosen as image.yml's
+      # image job chooses it. Warm (a tag whose manifest holds the cef-build tree): GHCR alone, never
+      # beside GitHub's cache (image.yml's note: BuildKit's importers race). Cold: GitHub's cache as
+      # well. A failed login reads as a cold cache. Nothing here writes either cache.
+      - name: Log in to GHCR (read)
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build cache (GHCR, read)
+        id: cache
+        run: |
+          ref=
+          if key=$(scripts/cef-cache-key.sh 2> "$RUNNER_TEMP/cache-key.err"); then
+            ref="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/seazn-relay-cache:cef-$key"
+          else
+            echo "::warning::no cache key, so a cold cache: $(head -c 300 "$RUNNER_TEMP/cache-key.err")"
+          fi
+          if [ -n "$ref" ] \
+            && docker buildx imagetools inspect --raw "$ref" > "$RUNNER_TEMP/cache.json" 2> "$RUNNER_TEMP/cache-probe.err" \
+            && scripts/cef-cache-holds-tree.sh "$RUNNER_TEMP/cache.json" 2>> "$RUNNER_TEMP/cache-probe.err"; then
+            state=warm; from="type=registry,ref=$ref"
+          else
+            state=cold
+            [ -z "$ref" ] || echo "cache probe: $(head -c 300 "$RUNNER_TEMP/cache-probe.err" 2> /dev/null)"
+            from="type=gha"
+            [ -z "$ref" ] || from="type=registry,ref=$ref"$'\n'"type=gha"
+          fi
+          echo "build cache: ${ref:-none} ($state)"
+          { echo "from<<EOF"; echo "$from"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+      - name: Build the relay image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          tags: ${{ env.RELAY_IMAGE }}
+          load: true
+          push: false
+          cache-from: ${{ steps.cache.outputs.from }}
+      - name: Build the harness image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: harness
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          tags: ${{ env.HARNESS_IMAGE }}
+          load: true
+          push: false
+          cache-from: ${{ steps.cache.outputs.from }}
+      # netem.sh's qdiscs and filter: loaded on the host kernel, which every container shares.
+      - name: Kernel modules for netem
+        run: |
+          sudo modprobe -a sch_prio sch_netem cls_u32 || echo "modprobe failed: netem.sh's check will say whether tc works"
+          lsmod | grep -E '^(sch_prio|sch_netem|cls_u32)' || true
+      # run-case.sh keeps its own console in harness/out/<case>/console.log, and its EXIT trap scans
+      # every file there for the run's credentials, early exits too (secrets.json).
+      - name: Run the case
+        run: harness/run-case.sh "$CASE"
+      # Nothing is uploaded unless that scan ran, read at least one file, and found no credential.
+      - name: Leak gate
+        id: leaks
+        if: always()
+        run: |
+          f="harness/out/$CASE/secrets.json"
+          if [ -f "$f" ] && jq -e '.scanned > 0 and .leaks == 0' "$f" > /dev/null; then
+            echo "secrets scan: $(jq -c . "$f")"
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::no clean secrets scan ($( [ -f "$f" ] && jq -c . "$f" || echo "no $f" )): out/ is not uploaded"
+            exit 1
+          fi
+      - name: Out
+        if: always() && steps.leaks.outputs.ok == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-${{ env.CASE }}
+          path: harness/out/
+          if-no-files-found: error
+          retention-days: 14
