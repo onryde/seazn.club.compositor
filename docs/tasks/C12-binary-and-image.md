@@ -249,7 +249,9 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
        contains the number.
   5. Print the image size, and fail above 2.5 GB (CEF is large; the cap stops bloat creep).
 
-  Push is C16's job; this workflow never pushes.
+  Push is C16's job; ~~this workflow never pushes.~~ this workflow never pushes an image (amended
+  2026-10-23: its `cache` job writes BuildKit's layer cache, never a runnable image, to GHCR on a push
+  to main or a manual run; `_INDEX.md` decision log, "CI: CEF layer from GHCR").
 
 - [ ] **Step 9: Mutate once each.**
   1. Make unset `COMPOSITOR_DRIVERS` default to fake in release. Expected red:
