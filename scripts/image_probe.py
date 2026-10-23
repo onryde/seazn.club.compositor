@@ -9,11 +9,11 @@ Phase A, one container, once CEF's children exist:
 
   - `/proc/<pid>/limits` of tini, the entrypoint's bash, Xvfb, the compositor and every CEF child:
     `Max core file size` is 1 byte soft and hard (the kernel's refusal value for a pipe) (Owed 68, the PR #36 review's I1 and m2);
-    the compositor is non-dumpable (its `/proc/<pid>/status` belongs to root, the entrypoint's bash's
-    to the image user; the image user cannot read its environment, and can read the shell's);
-    `core_pattern` is printed;
-  - the environments, read with CAP_SYS_PTRACE (`docker exec --privileged`; unreadable is a failure):
-    no JOB_TOKEN in Xvfb's or any CEF child's (the review's m2);
+    the compositor is non-dumpable (its `/proc/<pid>/status` belongs to root, while its parent's, the
+    waiter's, a dumpable bash, belongs to the image user; the image user cannot read the compositor's
+    environment, and can read the waiter's); `core_pattern` is printed;
+  - Xvfb's environment, read with CAP_SYS_PTRACE (`docker exec --privileged`): SESSION_ID in it (the
+    control: a real environment was read) and no JOB_TOKEN (the review's m2);
   - no session credential or token in any process's `/proc/<pid>/cmdline` (the review's m3);
   - TMPDIR: `/dev/shm/seazn`, mode 0700, owned by the relay user, on a tmpfs, with the CEF profile
     inside (Owed 58); no GST_CEF_LOG_SEVERITY or GST_DEBUG in the image or the compositor (Owed 52);
@@ -21,6 +21,13 @@ Phase A, one container, once CEF's children exist:
     the kernel log's "RLIMIT_CORE … set to 1" line names its pid); then of the compositor itself:
     exit 134, the entrypoint's one `level=error msg=the compositor was killed by SIGABRT (status 134)`
     line (the waiter's `wait` prints no job report of its own since F-019), and no `core dumped`.
+
+The CEF children's environment, at exec (the PR #36 final review's I-1), in one dedicated container:
+Chromium rewrites a child's `/proc/<pid>/environ` for its process title (F-020), so that file
+witnesses nothing. `scripts/cef_env_witness.sh`, bind-mounted (never in the image) and named by
+gstcefsrc's GST_CEF_SUBPROCESS_PATH, records for each child CEF execs whether JOB_TOKEN and three
+controls are set, then execs the real gstcefsubprocess. Checked: it ran (N > 0), every live CEF
+process came through it (itself or its zygote), each control is set N of N, JOB_TOKEN unset N of N.
 
 Phase B, `--exits` containers (32 by default; F-017, the review's C1): a live exit with CEF up, in
 cycles of 8 alternating 720p and 1080p (the review's m7): 4 `docker stop` (SIGTERM through tini: the
@@ -71,6 +78,12 @@ ABORT = re.compile(r"double free|corruption|Aborted|core dumped|Segmentation fau
 ABRT_LINE = f"level=error msg={KILLED} {signal.SIGABRT.name} (status {128 + signal.SIGABRT})"
 NAME = "relay-probe"
 CORE_LINE = "Max core file size"
+# The exec-time witness (test only): where the one witness container mounts it, the directory its
+# records go to (read from the script, its one authority) and the controls it must see set.
+WITNESS = ROOT / "scripts/cef_env_witness.sh"
+WITNESS_AT = "/probe/cef-env-witness.sh"
+WITNESS_DIR = re.search(r"^dir=(/\S+)$", WITNESS.read_text(), re.M).group(1)
+CONTROLS = ("DISPLAY", "SESSION_ID", "CEF_SUBPROCESS_PATH")
 
 posts = []
 fetches = []
@@ -181,6 +194,39 @@ def lib_const(name):
     return int(m.group(1).replace("_", ""))
 
 
+def exec_witness(table, tree, raw):
+    """The verdicts on `cef_env_witness.sh`'s records, as `[(ok, what)]`. `table` is `procs()`, `tree`
+    `cmdlines()` and `raw` the records' text, read after both (a process that shows as gstcef* has
+    exec'd, so its record was written first)."""
+    recs = {}
+    for line in raw.splitlines():
+        f = dict(kv.split("=", 1) for kv in line.split() if "=" in kv)
+        if f.get("pid", "").isdigit():
+            recs[int(f["pid"])] = f
+    n = len(recs)
+    print("the witness's records (pid, type):", sorted((p, f.get("type")) for p, f in recs.items()))
+    out = [(n > 0, f"the witness ran for each CEF exec: {n} record(s)")]
+    # Every live CEF process came through the witness: an exec'd child of the compositor, or a fork of
+    # one (a zygote's renderer or GPU process), whose exec ancestor holds a record.
+    comp = next((r[0] for r in table if r[1] == "compositor"), 0)
+    live = [r[0] for r in table if r[1].startswith("gstcef") and r[0] in tree]
+    covered = 0
+    for p in live:
+        q, hops = p, 0
+        while q in tree and tree[q][0] != comp and hops < 8:
+            q, hops = tree[q][0], hops + 1
+        covered += 1 if comp and q in recs and tree.get(q, (0, ""))[0] == comp else 0
+    out.append((len(live) >= 1 and covered == len(live),
+                f"every live CEF process came through the witness (itself or its zygote): {covered} of {len(live)}"))
+    for k in CONTROLS:
+        got = sum(1 for f in recs.values() if f.get(k) == "set")
+        out.append((n > 0 and got == n, f"the control {k} is set at each CEF child's exec: {got} of {n}"))
+    clean = sum(1 for f in recs.values() if f.get("JOB_TOKEN") == "unset")
+    out.append((n > 0 and clean == n, f"no JOB_TOKEN at any CEF child's exec: {clean} of {n}"))
+    out.append((not any(x in raw for x in SECRETS), "the witness's records carry no credential"))
+    return out
+
+
 def kernel_log():
     r = sh("sudo", "-n", "dmesg", check=False)
     return r.stdout if r.returncode == 0 else None
@@ -218,14 +264,14 @@ def main():
             shm_peak[0] = max(shm_peak[0], used)
             shm_peak[1] = size
 
-    def start(fixture, deadline_in=600):
+    def start(fixture, deadline_in=600, extra=()):
         posts.clear()
         fetches.clear()
         Handler.sess = session(port, fixture)
         deadline = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + deadline_in))
         sh("docker", "rm", "-f", NAME, check=False)
         sh(
-            "docker", "run", "-d", "--name", NAME, "--network", "host",
+            "docker", "run", "-d", "--name", NAME, "--network", "host", *extra,
             "-e", f"SESSION_ID={Handler.sess['sessionId']}", "-e", f"JOB_TOKEN={TOKEN}",
             "-e", f"APP_URL=http://127.0.0.1:{port}", "-e", f"RELAY_DEADLINE_AT={deadline}",
             a.image,
@@ -280,14 +326,21 @@ def main():
             check(r[2:] == (limit, limit), f"{r[1]} pid {r[0]}: core limit {r[2]} {r[3]}, want {limit} {limit}")
         check(len(held) >= 5, f"core limits checked: {len(held)}")
         pid = comp[0][0] if comp else 0
+        argv = cmdlines()
         # Non-dumpable: the kernel hands a non-dumpable process's /proc files to root (`task_dump_owner`;
         # the /proc/<pid> directory itself keeps the process's euid either way, so it witnesses
-        # nothing). The entrypoint's bash is the control: dumpable, so its files stay the image user's.
+        # nothing). The control is the compositor's parent, `supervise`'s waiter subshell, found by ppid
+        # (the first bash in /proc's glob order is the waiter or the entrypoint, by the pids' digits:
+        # "20" sorts before "7"): a dumpable bash, so its files stay the image user's (the PR #36 final
+        # review's m6).
         me = in_container("id -u").strip()
-        shells = [r_ for r_ in rows if r_[1] == "bash"]
-        control = in_container(f"stat -c %u /proc/{shells[0][0]}/status").strip() if shells else ""
+        waiter = argv.get(pid, (0, ""))[0] if pid else 0
+        waiter_comm = next((r_[1] for r_ in rows if r_[0] == waiter), "")
+        check(waiter > 1 and waiter_comm == "bash",
+              f"the compositor's parent is the waiter, a bash (pid {waiter}, {waiter_comm!r})")
+        control = in_container(f"stat -c %u /proc/{waiter}/status").strip() if waiter > 1 else ""
         check(me not in ("", "0") and control == me,
-              f"the control: the entrypoint's bash owns its /proc files (uid {control!r}, the image user {me!r})")
+              f"the control: the waiter (pid {waiter}) owns its /proc files (uid {control!r}, the image user {me!r})")
         owner = in_container(f"stat -c %u /proc/{pid}/status").strip() if pid else ""
         check(owner == "0", f"the compositor is non-dumpable (/proc/{pid}/status owned by uid {owner!r})")
 
@@ -302,14 +355,13 @@ def main():
             return r_.returncode == 0 and len(lines_) > 0, lines_
 
         # The image user cannot read the non-dumpable compositor's environment (it holds JOB_TOKEN from
-        # the exec), and can read its dumpable shell's: the pair witnesses PR_SET_DUMPABLE from outside.
+        # the exec), and can read the dumpable waiter's: the pair witnesses PR_SET_DUMPABLE from outside.
         mine, _ = environ(pid, privileged=False) if pid else (True, [])
         check(not mine, "the image user cannot read the compositor's environment (non-dumpable)")
-        shell_env, _ = environ(shells[0][0], privileged=False) if shells else (False, [])
-        check(shell_env, "the image user reads its own dumpable shell's environment (the control)")
+        waiter_env, _ = environ(waiter, privileged=False) if waiter > 1 else (False, [])
+        check(waiter_env, "the image user reads the dumpable waiter's environment (the control)")
         pattern = Path("/proc/sys/kernel/core_pattern").read_text().strip()
         print(f"core_pattern (the host's, shared with the container): {pattern!r}")
-        argv = cmdlines()
         leaked = [(p_, a_) for p_, (_, a_) in argv.items() if any(x in a_ for x in SECRETS)]
         check(len(argv) >= 5 and not leaked, f"no credential in any of {len(argv)} command lines: {leaked}")
         readable, env = environ(pid) if pid else (False, [])
@@ -321,18 +373,19 @@ def main():
         check(st[0] == "700 relay", f"TMPDIR mode and owner: {st[0]!r}")
         check(st[1] == "tmpfs", f"TMPDIR filesystem: {st[1]!r}")
         check(any(x.strip() for x in st[2:]), f"the CEF profile is under TMPDIR: {st[2:]}")
-        # The job token stays with the compositor (which removes it from its environment once parsed,
-        # so CEF's children start without it) and leaves Xvfb out (the PR #36 review's m2).
-        tokenless = [r_ for r_ in rows if r_[1] == "Xvfb" or r_ in cef]
-        read_ok = 0
-        for r_ in tokenless:
+        # Xvfb starts without the job token (`env -u`, the PR #36 review's m2). Its environment file is
+        # its own (no process title rewrites it), and SESSION_ID, passed to the container beside
+        # JOB_TOKEN, is the control: present, so the read saw a real environment, not padding. A CEF
+        # child's file is rewritten by Chromium (F-020), so the children are witnessed at exec instead
+        # (below, the PR #36 final review's I-1).
+        xvfb = [r_ for r_ in rows if r_[1] == "Xvfb"]
+        check(len(xvfb) == 1, f"one Xvfb ({len(xvfb)})")
+        for r_ in xvfb:
             readable, e_ = environ(r_[0])
-            check(readable, f"{r_[1]} pid {r_[0]}: its environment is readable ({len(e_)} lines)")
-            read_ok += 1 if readable else 0
-            check(readable and not any(TOKEN in l or l.startswith("JOB_TOKEN=") for l in e_),
-                  f"{r_[1]} pid {r_[0]}: no JOB_TOKEN in its environment")
-        check(read_ok >= 2 and read_ok == len(tokenless),
-              f"environments read for the token: {read_ok} of {len(tokenless)}")
+            seen = readable and any(l.startswith("SESSION_ID=") for l in e_)
+            check(seen, f"Xvfb pid {r_[0]}: its environment is read, the control SESSION_ID in it ({len(e_)} lines)")
+            check(seen and not any(TOKEN in l or l.startswith("JOB_TOKEN=") for l in e_),
+                  f"Xvfb pid {r_[0]}: no JOB_TOKEN in its environment")
         image_env = sh("docker", "inspect", "-f", "{{json .Config.Env}}", a.image).stdout
         for bad in ("GST_CEF_LOG_SEVERITY", "GST_DEBUG", "TINI_KILL_PROCESS_GROUP"):
             check(f'"{bad}=' not in image_env, f"the image sets no {bad}")
@@ -372,6 +425,19 @@ def main():
                   f"the entrypoint reports the abort once: {ABRT_LINE!r} (seen {logs.count(KILLED)})")
             check("core dumped" not in logs, "no core of the compositor")
             print(f"kernel refusal lines for the compositor: {before} -> {refusals('compositor')}")
+
+        # ---- the CEF children's environment, witnessed at exec (the PR #36 final review's I-1) ----
+        # One dedicated container: gstcefsrc execs every CEF child through the bind-mounted witness,
+        # which records whether JOB_TOKEN and each control is set, then execs the real subprocess.
+        start(P720, extra=("-v", f"{WITNESS}:{WITNESS_AT}:ro", "-e", f"GST_CEF_SUBPROCESS_PATH={WITNESS_AT}"))
+        table = procs()
+        tree = cmdlines()
+        # Read last: a process that shows as gstcef* has exec'd, so its record was written before.
+        raw = in_container(f"cat {WITNESS_DIR}/* 2>/dev/null || true")
+        for ok, what in exec_witness(table, tree, raw):
+            check(ok, what)
+        kept.append(sh("docker", "logs", NAME).stderr)
+        sh("docker", "rm", "-f", NAME, check=False)
 
         # ---- phase B: live exits with CEF up, each kind at both profiles ----
         term = ("SIGTERM (docker stop)", "0", "signalled", False)
