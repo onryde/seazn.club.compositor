@@ -1,7 +1,8 @@
 name: harness
 # The harness (C13): build the relay image and the harness image from docker/Dockerfile, run one
 # case of harness/run-case.sh against them (the smoke case on a pull request), and upload out/.
-# This is the only place the compose stack runs (owner ruling 2026-10-23: no local Docker).
+# This is the only place the compose stack runs (owner ruling 2026-10-23: no local Docker). The
+# builds read image.yml's caches (GHCR when warm, else GitHub's) and write neither.
 # Dispatchable, so a throwaway mutant branch can run a case too.
 on:
   pull_request:
@@ -12,6 +13,8 @@ on:
       - "contracts/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "scripts/cef-cache-key.sh"
+      - "scripts/cef-cache-holds-tree.sh"
       - ".github/workflows/harness.yml"
   workflow_dispatch:
     inputs:
@@ -28,6 +31,8 @@ jobs:
   harness:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    # Read only: this workflow never writes a cache or the registry.
+    permissions: { contents: read, packages: read }
     defaults:
       # `bash -eo pipefail`: the implicit default has no pipefail (check.yml's note).
       run: { shell: bash }
@@ -59,7 +64,38 @@ jobs:
           fi
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
-      # image.yml's build, reading its cache (image.yml writes it; this workflow never does).
+      # image.yml's GHCR build cache (decision log "CI: CEF layer from GHCR"), chosen as image.yml's
+      # image job chooses it. Warm (a tag whose manifest holds the cef-build tree): GHCR alone, never
+      # beside GitHub's cache (image.yml's note: BuildKit's importers race). Cold: GitHub's cache as
+      # well. A failed login reads as a cold cache. Nothing here writes either cache.
+      - name: Log in to GHCR (read)
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build cache (GHCR, read)
+        id: cache
+        run: |
+          ref=
+          if key=$(scripts/cef-cache-key.sh 2> "$RUNNER_TEMP/cache-key.err"); then
+            ref="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/seazn-relay-cache:cef-$key"
+          else
+            echo "::warning::no cache key, so a cold cache: $(head -c 300 "$RUNNER_TEMP/cache-key.err")"
+          fi
+          if [ -n "$ref" ] \
+            && docker buildx imagetools inspect --raw "$ref" > "$RUNNER_TEMP/cache.json" 2> "$RUNNER_TEMP/cache-probe.err" \
+            && scripts/cef-cache-holds-tree.sh "$RUNNER_TEMP/cache.json" 2>> "$RUNNER_TEMP/cache-probe.err"; then
+            state=warm; from="type=registry,ref=$ref"
+          else
+            state=cold
+            [ -z "$ref" ] || echo "cache probe: $(head -c 300 "$RUNNER_TEMP/cache-probe.err" 2> /dev/null)"
+            from="type=gha"
+            [ -z "$ref" ] || from="type=registry,ref=$ref"$'\n'"type=gha"
+          fi
+          echo "build cache: ${ref:-none} ($state)"
+          { echo "from<<EOF"; echo "$from"; echo "EOF"; } >> "$GITHUB_OUTPUT"
       - name: Build the relay image
         uses: docker/build-push-action@v6
         with:
@@ -69,7 +105,7 @@ jobs:
           tags: ${{ env.RELAY_IMAGE }}
           load: true
           push: false
-          cache-from: type=gha
+          cache-from: ${{ steps.cache.outputs.from }}
       - name: Build the harness image
         uses: docker/build-push-action@v6
         with:
@@ -80,7 +116,7 @@ jobs:
           tags: ${{ env.HARNESS_IMAGE }}
           load: true
           push: false
-          cache-from: type=gha
+          cache-from: ${{ steps.cache.outputs.from }}
       # netem.sh's qdiscs and filter: loaded on the host kernel, which every container shares.
       - name: Kernel modules for netem
         run: |
