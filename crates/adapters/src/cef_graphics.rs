@@ -470,18 +470,19 @@ fn guard(kids: &[CefChild], counts: impl Fn(&CefChild) -> bool) -> Guarded {
 /// What the child polls have seen of CEF's zygotes (process-wide: CEF is one per process).
 #[derive(Debug, Default)]
 pub(crate) struct ZygoteWatch {
-    /// Every zygote pid seen (a child of this process).
+    /// Every zygote pid listed (a child of this process).
     seen: BTreeSet<i32>,
     /// Decided: CEF can start no renderer again in this process.
     dead: bool,
 }
 
-/// One poll's verdict, true the first time any zygote seen is gone. F-013 (CEF 139): one zygote
-/// parents the renderers, and its death makes every later build fail at once (its orphaned renderer
-/// keeps painting, out of this process's tree). The other parents the GPU process: its death looks
-/// harmless while that GPU process lives, but the next GPU-process death is Chromium's FATAL "GPU
-/// process isn't usable. Goodbye." and the whole process dies of SIGTRAP (the PR #32 confirm
-/// pass's N1, 3/3). Either way C11b's in-place restart must come first, on its own terms.
+/// One listing's verdict (a child poll's or a ready's), true the first time any zygote seen is gone.
+/// F-013 (CEF 139): one zygote parents the renderers, and its death makes every later build fail at
+/// once (its orphaned renderer keeps painting, out of this process's tree). The other parents the
+/// GPU process: its death looks harmless while that GPU process lives, but the next GPU-process
+/// death is Chromium's FATAL "GPU process isn't usable. Goodbye." and the whole process dies of
+/// SIGTRAP (the PR #32 confirm pass's N1, 3/3). Either way C11b's in-place restart must come first,
+/// on its own terms.
 ///
 /// A zygote missing from one poll's list counts only once `alive` says its process is gone: a
 /// command line read that failed once must not end CEF for the process. A zygote is a child of
@@ -557,9 +558,93 @@ struct CefWatch {
     gpu: GpuWatch,
 }
 
-fn cef_watch() -> MutexGuard<'static, CefWatch> {
-    static WATCH: OnceLock<Mutex<CefWatch>> = OnceLock::new();
-    locked(WATCH.get_or_init(Mutex::default))
+/// The process's one CEF watch, held by every adapter's `Shared` (CEF is one per process).
+fn cef_watch() -> Arc<Mutex<CefWatch>> {
+    static WATCH: OnceLock<Arc<Mutex<CefWatch>>> = OnceLock::new();
+    Arc::clone(WATCH.get_or_init(Arc::default))
+}
+
+/// The process tree the CEF watch reads: this process's `/proc` in production (`ProcTree::live`), a
+/// fake in a unit test.
+struct ProcTree {
+    /// This process's CEF children (`cef_children`).
+    list: Box<dyn Fn() -> Vec<CefChild> + Send + Sync>,
+    /// Whether a pid's process exists and is not a zombie (`pid_alive`).
+    alive: Box<dyn Fn(i32) -> bool + Send + Sync>,
+    /// This process: a zygote is its child (`zygote_check`).
+    root: i32,
+}
+
+impl ProcTree {
+    fn live() -> Self {
+        Self {
+            list: Box::new(cef_children),
+            alive: Box::new(pid_alive),
+            root: std::process::id() as i32,
+        }
+    }
+}
+
+/// One listing read into the zygote watch: `Some(gen)` when it decides the verdict, which it
+/// publishes with `gen`, the newest build's generation then (once for the process).
+fn read_zygotes(shared: &Shared, watch: &mut CefWatch, kids: &[CefChild]) -> Option<u64> {
+    if !zygote_check(&mut watch.zygotes, kids, shared.tree.root, &*shared.tree.alive) {
+        return None;
+    }
+    let gen = shared.newest_gen().unwrap_or(0);
+    watch.verdict = Some(gen);
+    Some(gen)
+}
+
+fn log_zygote_gone(shared: &Shared, gen: u64) {
+    shared.log(&format!(
+        "ERROR gen={gen}: a CEF zygote is gone; no renderer may start again, and the next GPU-process \
+         death aborts this process (Owed 56: restart in place)"
+    ));
+}
+
+/// A ready's listing, read into the zygote watch before the ready is logged or relayed (image run
+/// 40015873298: 1 of 44 probe kills). The child poll starts with the first build, before CEF has
+/// forked a zygote, and lists every `CHILD_POLL_MS`, so the zygotes were first listed by its 2nd
+/// poll, about 1 s in, while the page readied at about 0.72 s; a zygote killed in between was never
+/// seen, so never missed (no verdict: Chromium's abort at the next GPU-process death, or a failed
+/// next build). A ready means a renderer runs, so both zygotes exist (F-013), and this listing comes
+/// before anything that hears of it can act on it.
+///
+/// Fewer than two zygotes in it is no verdict: two is F-013's measurement of CEF 139, not a
+/// contract (a CEF with another count would restart every session at its first ready), and a zygote
+/// never listed has no pid for `alive` to confirm gone, so a failed command-line read would read as
+/// a death. A zygote that dies between CEF's start and the first ready stays unseen.
+///
+/// The GPU-process count is the poll's alone: a list applied after a newer one can put a dead GPU
+/// process back among the live, and count its death twice.
+fn watch_ready(shared: &Shared) {
+    let kids = (shared.tree.list)();
+    let verdict = read_zygotes(shared, &mut locked(&shared.watch), &kids);
+    if let Some(gen) = verdict {
+        log_zygote_gone(shared, gen);
+    }
+}
+
+/// The child poll's listing read into the CEF watch, under one hold of its lock: the GPU-process
+/// deaths and the zygotes, each logged once the lock is let go.
+fn watch_poll(shared: &Shared, kids: &[CefChild]) {
+    let mut watch = locked(&shared.watch);
+    let died = gpu_check(&mut watch.gpu, kids, &*shared.tree.alive);
+    let deaths = watch.gpu.deaths;
+    let verdict = read_zygotes(shared, &mut watch, kids);
+    let newest = if died > 0 { shared.newest_gen() } else { None };
+    drop(watch);
+    if died > 0 {
+        shared.log(&format!(
+            "WARN gen={}: {died} CEF GPU process(es) gone, {deaths} in this process; Chromium aborts it \
+             at the 6th (Owed 61)",
+            newest.unwrap_or(0)
+        ));
+    }
+    if let Some(gen) = verdict {
+        log_zygote_gone(shared, gen);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1169,10 +1254,18 @@ struct Shared {
     builds: Mutex<BTreeMap<u64, (u64, Arc<SampleStats>)>>,
     reports: Mutex<BTreeMap<u64, ReaperPath>>,
     last_guard: Mutex<Guarded>,
+    /// What the child poll and each ready list (`ProcTree::live` in production).
+    tree: ProcTree,
+    /// The process's CEF watch (`cef_watch`).
+    watch: Arc<Mutex<CefWatch>>,
     #[cfg(feature = "test-hooks")]
     teardown_hold: Mutex<bool>,
     #[cfg(feature = "test-hooks")]
     teardown_cv: Condvar,
+    #[cfg(feature = "test-hooks")]
+    poll_hold: Mutex<bool>,
+    #[cfg(feature = "test-hooks")]
+    poll_cv: Condvar,
     #[cfg(feature = "test-hooks")]
     kill_after_ms: AtomicU64,
     #[cfg(feature = "test-hooks")]
@@ -1259,6 +1352,26 @@ impl Shared {
             .filter(|(_, (g, _))| *g == gen)
             .map(|(b, _)| *b)
             .collect()
+    }
+
+    /// The newest build's generation.
+    fn newest_gen(&self) -> Option<u64> {
+        locked(&self.builds).last_key_value().map(|(_, (gen, _))| *gen)
+    }
+
+    /// Test hook (`hold_polls`): the child poll waits here before each listing while the hold is on
+    /// (at most 60 s, or until the adapter is dropped).
+    #[cfg(feature = "test-hooks")]
+    fn wait_poll_hold(&self) {
+        let end = Instant::now() + Duration::from_secs(60);
+        let mut held = locked(&self.poll_hold);
+        while *held && Instant::now() < end && !self.retired.load(Ordering::SeqCst) {
+            held = self
+                .poll_cv
+                .wait_timeout(held, Duration::from_millis(100))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
     }
 }
 
@@ -1381,10 +1494,16 @@ impl CefGraphics {
             builds: Mutex::new(BTreeMap::new()),
             reports: Mutex::new(BTreeMap::new()),
             last_guard: Mutex::new(Guarded::default()),
+            tree: ProcTree::live(),
+            watch: cef_watch(),
             #[cfg(feature = "test-hooks")]
             teardown_hold: Mutex::new(false),
             #[cfg(feature = "test-hooks")]
             teardown_cv: Condvar::new(),
+            #[cfg(feature = "test-hooks")]
+            poll_hold: Mutex::new(false),
+            #[cfg(feature = "test-hooks")]
+            poll_cv: Condvar::new(),
             #[cfg(feature = "test-hooks")]
             kill_after_ms: AtomicU64::new(REAPER_KILL_AFTER_MS),
             #[cfg(feature = "test-hooks")]
@@ -1538,6 +1657,15 @@ impl CefGraphics {
     pub fn hold_teardowns(&self, on: bool) {
         *locked(&self.shared.teardown_hold) = on;
         self.shared.teardown_cv.notify_all();
+    }
+
+    /// Test hook: while on, the child poll waits before each listing (at most 60 s), so the only
+    /// listings CEF's watch gets are the ones at each ready. Set it before the first `restart`, or
+    /// that restart's first poll has already listed. Off lets the poll go.
+    #[cfg(feature = "test-hooks")]
+    pub fn hold_polls(&self, on: bool) {
+        *locked(&self.shared.poll_hold) = on;
+        self.shared.poll_cv.notify_all();
     }
 
     /// Test hook: the reaper's wait before its kill (default `REAPER_KILL_AFTER_MS`).
@@ -1857,6 +1985,7 @@ fn dispatch(shared: &Shared) {
                 text,
             } => match &signal {
                 PageSignal::Ready => {
+                    watch_ready(shared);
                     let opened = {
                         let mut g = locked(&shared.gate);
                         let current = g.current.is_some_and(|(b, _)| b == build);
@@ -1939,7 +2068,9 @@ fn poll_children(shared: &Shared) {
     let mut failures_logged = false;
     let mut ambiguity_logged = false;
     while !shared.retired.load(Ordering::SeqCst) {
-        let kids = cef_children();
+        #[cfg(feature = "test-hooks")]
+        shared.wait_poll_hold();
+        let kids = (shared.tree.list)();
         if claim(&kids) && !ambiguity_logged {
             ambiguity_logged = true;
             shared.log(
@@ -1966,35 +2097,7 @@ fn poll_children(shared: &Shared) {
             ));
         }
         *locked(&shared.last_guard) = g;
-        {
-            let mut watch = cef_watch();
-            let died = gpu_check(&mut watch.gpu, &kids, pid_alive);
-            let deaths = watch.gpu.deaths;
-            let zygote = zygote_check(&mut watch.zygotes, &kids, std::process::id() as i32, pid_alive);
-            let newest = if died > 0 || zygote {
-                locked(&shared.builds).last_key_value().map(|(_, (gen, _))| *gen)
-            } else {
-                None
-            };
-            if zygote {
-                watch.verdict = Some(newest.unwrap_or(0));
-            }
-            drop(watch);
-            if died > 0 {
-                shared.log(&format!(
-                    "WARN gen={}: {died} CEF GPU process(es) gone, {deaths} in this process; Chromium \
-                     aborts it at the 6th (Owed 61)",
-                    newest.unwrap_or(0)
-                ));
-            }
-            if zygote {
-                shared.log(&format!(
-                    "ERROR gen={}: a CEF zygote is gone; no renderer may start again, and the next \
-                     GPU-process death aborts this process (Owed 56: restart in place)",
-                    newest.unwrap_or(0)
-                ));
-            }
-        }
+        watch_poll(shared, &kids);
         let cap = shared.rss_cap_mb.load(Ordering::SeqCst);
         if let Some((build, gen)) = current {
             if g.pss_counted_mb > cap && shared.decide_crash(build) {
@@ -2049,7 +2152,7 @@ impl GraphicsRenderer for CefGraphics {
     /// Counters only: the process's CEF watch (under its lock, held by a poll for a list's checks)
     /// and the leak gauge (C11b).
     fn health(&self) -> CefHealth {
-        let watch = cef_watch();
+        let watch = locked(&self.shared.watch);
         CefHealth {
             unrecoverable: watch.verdict,
             leaked_teardowns: self.shared.leaked.load(Ordering::SeqCst),
@@ -2610,10 +2713,10 @@ mod tests {
 
     // PR #32 review m7: `with_log` once the dispatcher holds the shared state (after the first
     // `restart`) used to be a silent no-op.
-    #[test]
-    fn with_log_swaps_the_sink_after_the_threads_hold_the_state() {
-        let (tx, _rx) = crossbeam_channel::bounded(8);
-        let shared = Arc::new(Shared {
+    /// An adapter's shared state with no CEF behind it: `tree` is what its watch lists, and the watch
+    /// is its own (not the process's).
+    fn unit_shared(tx: Sender<Inbound>, tree: ProcTree) -> Arc<Shared> {
+        Arc::new(Shared {
             inst: u64::MAX,
             tx,
             frames: FrameStore::default(),
@@ -2630,34 +2733,167 @@ mod tests {
             builds: Mutex::new(BTreeMap::new()),
             reports: Mutex::new(BTreeMap::new()),
             last_guard: Mutex::new(Guarded::default()),
+            tree,
+            watch: Arc::default(),
             #[cfg(feature = "test-hooks")]
             teardown_hold: Mutex::new(false),
             #[cfg(feature = "test-hooks")]
             teardown_cv: Condvar::new(),
+            #[cfg(feature = "test-hooks")]
+            poll_hold: Mutex::new(false),
+            #[cfg(feature = "test-hooks")]
+            poll_cv: Condvar::new(),
             #[cfg(feature = "test-hooks")]
             kill_after_ms: AtomicU64::new(REAPER_KILL_AFTER_MS),
             #[cfg(feature = "test-hooks")]
             write_hold: Arc::default(),
             #[cfg(feature = "test-hooks")]
             js_signals: AtomicBool::new(false),
-        });
-        locked(&shared.scrubber).add("unitSECRETmadeup0042");
-        // The dispatcher's clone.
-        let dispatcher = Arc::clone(&shared);
-        let g = CefGraphics {
+        })
+    }
+
+    /// An adapter over `shared` that never started a thread or a build (its drop retires `shared`).
+    fn unit_adapter(shared: Arc<Shared>) -> CefGraphics {
+        CefGraphics {
             shared,
             fps: 30,
             current: None,
             builds: 0,
             threads: true,
             _lease: ProfileLease { held: false },
-        };
+        }
+    }
+
+    #[test]
+    fn with_log_swaps_the_sink_after_the_threads_hold_the_state() {
+        let (tx, _rx) = crossbeam_channel::bounded(8);
+        let shared = unit_shared(tx, ProcTree::live());
+        locked(&shared.scrubber).add("unitSECRETmadeup0042");
+        // The dispatcher's clone.
+        let dispatcher = Arc::clone(&shared);
+        let g = unit_adapter(shared);
         let got: Arc<Mutex<Vec<String>>> = Arc::default();
         let sink = Arc::clone(&got);
         let g = g.with_log(Arc::new(move |l: &str| locked(&sink).push(l.to_owned())));
         dispatcher.log("after the swap unitSECRETmadeup0042");
         drop(g);
         assert_eq!(*locked(&got), vec!["after the swap ****".to_owned()]);
+    }
+
+    // The zygote watch's blind window (image run 40015873298, 1 of 44 probe kills). The child poll
+    // starts with gen 1's restart, before CEF has forked a zygote, then lists every `CHILD_POLL_MS`:
+    // the zygotes were first listed by the 2nd poll (restart + ~1.01 s), while the page readied at
+    // about restart + 0.72 s. A zygote killed in between was never seen, so never missed: no verdict,
+    // no in-place restart, then Chromium's abort (133) at the next GPU-process death, or `CefCrashed`
+    // at the next build (F-013). The ready lists the children before anyone hears of it. Either
+    // zygote; the control (no kill); a second ready after the verdict; a ready that lists nothing.
+    #[test]
+    fn a_zygote_killed_between_the_ready_and_the_next_poll_restarts_the_process() {
+        use domain::cef_health::RestartCause;
+        use domain::config::Thresholds;
+        const ROOT: i32 = 1544;
+        // F-013's tree (CEF 139): the GPU process's zygote, and the renderers'.
+        let started = || {
+            vec![
+                kid(1556, ROOT, "zygote", None),
+                kid(1578, 1556, "gpu-process", None),
+                kid(1557, ROOT, "zygote", None),
+                kid(1589, 1557, "utility", None),
+                kid(1622, 1557, "renderer", Some(5)),
+            ]
+        };
+        let event = |rx: &crossbeam_channel::Receiver<Inbound>| match rx.try_recv() {
+            Ok(Inbound::Event(e)) => Some(e),
+            _ => None,
+        };
+        // (case, CEF's children appear, the zygote killed and the child its death orphans: reparented
+        // to pid 1, out of this process's tree, alive)
+        let cases = [
+            ("the GPU process's zygote", true, Some((1556, 1578))),
+            ("the renderers' zygote", true, Some((1557, 1622))),
+            ("no kill", true, None),
+            ("nothing listed", false, None),
+        ];
+        let mut checked = 0;
+        for (case, cef, kill) in cases {
+            let listed: Arc<Mutex<Vec<CefChild>>> = Arc::default();
+            let dead: Arc<Mutex<BTreeSet<i32>>> = Arc::default();
+            // At each listing: how many events the domain could already read.
+            let heard: Arc<Mutex<Vec<usize>>> = Arc::default();
+            let (tx, rx) = crossbeam_channel::bounded(8);
+            let tree = ProcTree {
+                list: Box::new({
+                    let (listed, heard, rx) = (Arc::clone(&listed), Arc::clone(&heard), rx.clone());
+                    move || {
+                        locked(&heard).push(rx.len());
+                        locked(&listed).clone()
+                    }
+                }),
+                alive: Box::new({
+                    let dead = Arc::clone(&dead);
+                    move |p| !locked(&dead).contains(&p)
+                }),
+                root: ROOT,
+            };
+            let g = unit_adapter(unit_shared(tx, tree));
+            let shared = Arc::clone(&g.shared);
+            let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+            *locked(&shared.log) = {
+                let lines = Arc::clone(&lines);
+                Arc::new(move |l: &str| locked(&lines).push(l.to_owned()))
+            };
+            let errors = || {
+                locked(&lines)
+                    .iter()
+                    .filter(|l| l.starts_with("ERROR gen=1: a CEF zygote is gone"))
+                    .count()
+            };
+            // The dispatcher returns once its queue is empty.
+            shared.retired.store(true, Ordering::SeqCst);
+            // Gen 1's restart: its build is the newest, and the first poll finds no CEF child yet.
+            locked(&shared.builds).insert(1, (1, Arc::default()));
+            locked(&shared.gate).current = Some((1, 1));
+            watch_poll(&shared, &(shared.tree.list)());
+            // CEF forks its zygotes and the page readies, well before the next poll.
+            if cef {
+                *locked(&listed) = started();
+            }
+            shared.push(page_note(1, PageSignal::Ready));
+            dispatch(&shared);
+            assert_eq!(event(&rx), Some(Event::CefReady { gen: 1 }), "{case}");
+            // The kill, at once (the probe's came 0.100–0.157 s after the ready).
+            if let Some((zygote, orphan)) = kill {
+                locked(&dead).insert(zygote);
+                locked(&listed).retain(|k| k.pid != zygote && k.pid != orphan);
+            }
+            // The poll that first listed the zygotes before this fix.
+            watch_poll(&shared, &(shared.tree.list)());
+            let h = g.health();
+            let cause = h.restart_cause(&Thresholds::default());
+            if kill.is_some() {
+                assert_eq!(h.unrecoverable, Some(1), "{case}: {h:?}");
+                assert_eq!(cause, Some(RestartCause::ZygoteGone { gen: 1 }), "{case}");
+                assert_eq!(errors(), 1, "{case}: {:?}", locked(&lines));
+            } else {
+                assert_eq!(h, CefHealth::default(), "{case}");
+                assert_eq!(cause, None, "{case}");
+                assert_eq!(errors(), 0, "{case}: {:?}", locked(&lines));
+            }
+            // Three listings: the two polls and the ready's, made before its event was sent.
+            assert_eq!(*locked(&heard), vec![0, 0, 0], "{case}");
+            // A second ready (gen 2's): listed too; the verdict stands, decided and logged once.
+            locked(&shared.builds).insert(2, (2, Arc::default()));
+            locked(&shared.gate).current = Some((2, 2));
+            shared.push(page_note(2, PageSignal::Ready));
+            dispatch(&shared);
+            assert_eq!(event(&rx), Some(Event::CefReady { gen: 2 }), "{case}");
+            assert_eq!(g.health(), h, "{case}: the second ready");
+            assert_eq!(errors(), usize::from(kill.is_some()), "{case}: the second ready");
+            assert_eq!(locked(&heard).len(), 4, "{case}: the second ready lists");
+            checked += 1;
+        }
+        eprintln!("cases checked: {checked}");
+        assert_eq!(checked, cases.len());
     }
 
     // Owed 55: a teardown is counted leaked once, and counted down if it returns after all, in
