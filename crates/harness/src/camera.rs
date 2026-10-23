@@ -422,7 +422,10 @@ mod tests {
 
     #[test]
     fn the_snow_is_uniform_blocks_above_a_black_guard() {
-        let mut checked = 0;
+        // The measured block, not the constant (decision row "C13 CI round 2" (1)): 16 px held the
+        // strip through both generations at 4 000 kbps, and 8 px did not.
+        const MEASURED_BLOCK: u32 = 16;
+        let (mut checked, mut pairs, mut differ) = (0u64, 0u64, 0u64);
         for (w, h) in [(1280u32, 720u32), (1920, 1080), (642, 360)] {
             let l = Layout::i420(w, h);
             let f = frame(&l, Pattern::Snow, 99);
@@ -431,17 +434,29 @@ mod tests {
             let px = |x: u32, y: u32| f[y as usize * l.y_stride + x as usize];
             for y in 0..noisy {
                 for x in 0..w {
-                    let (bx, by) = (x - x % SNOW_BLOCK, y - y % SNOW_BLOCK);
+                    let (bx, by) = (x - x % MEASURED_BLOCK, y - y % MEASURED_BLOCK);
                     assert_eq!(px(x, y), px(bx, by), "{w}x{h}: ({x}, {y}) is its block's value");
                     checked += 1;
+                }
+            }
+            // And no larger: each block draws its own value, so neighbours almost never match
+            // (two draws over 220 levels). A 32 px block would make half the pairs match.
+            for by in (0..noisy).step_by(MEASURED_BLOCK as usize) {
+                for bx in (MEASURED_BLOCK..w).step_by(MEASURED_BLOCK as usize) {
+                    pairs += 1;
+                    differ += u64::from(px(bx, by) != px(bx - MEASURED_BLOCK, by));
                 }
             }
             for y in noisy..h - cell {
                 assert!((0..w).all(|x| px(x, y) == strip::BLACK), "{w}x{h}: guard row {y}");
             }
         }
-        eprintln!("snow pixels checked: {checked}");
-        assert!(checked > 0);
+        eprintln!("snow pixels checked: {checked}; neighbouring blocks: {differ} of {pairs} differ");
+        assert!(checked > 0 && pairs > 0);
+        assert!(
+            differ * 100 >= pairs * 95,
+            "{differ} of {pairs} neighbouring blocks differ"
+        );
     }
 
     #[test]

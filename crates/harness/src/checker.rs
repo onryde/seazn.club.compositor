@@ -1170,6 +1170,27 @@ mod tests {
         assert!(r.output_outages.is_empty(), "{:?}", r.output_outages);
         // Re-dated: the content's 90 frames span 3 000 ms; the wall time never runs backwards.
         assert_eq!(r.duration_ms, 3_000);
+        // Re-dated, not just reported: a slate on segment 2's last 5 frames (25..=29) is dated back
+        // from segment 3's name (its last frame one period before 1 750, so its first at
+        // 1 750 - 5 periods = 1 583), not forward from segment 2's (1 000 + 25 periods = 1 833).
+        let mut f2 = strip_frames(31, 30);
+        for f in &mut f2[25..] {
+            f.counter = None;
+        }
+        let slated = analyze(
+            &inputs(vec![
+                seg(0, strip_frames(1, 30)),
+                seg(1_000, f2),
+                seg(1_750, strip_frames(61, 30)),
+            ]),
+            &settings(),
+        );
+        assert_eq!(slated.segment_overlaps.len(), 1, "{:?}", slated.segment_overlaps);
+        assert_eq!(slated.segment_overlaps[0].content_gap_ms, Some(0));
+        assert_eq!(slated.camera.slates.len(), 1, "{:?}", slated.camera.slates);
+        let span = &slated.camera.slates[0];
+        assert_eq!(span.frames, 5, "{span:?}");
+        assert!((span.from_ms - 1_583).abs() <= 2, "{span:?}");
         // The mirror: the same three as rolls only.
         let rolls = analyze(
             &inputs(vec![
