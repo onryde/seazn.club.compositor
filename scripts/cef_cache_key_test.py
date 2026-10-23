@@ -29,11 +29,16 @@ cache config) is 1 GB or more, in either manifest shape; anything else, or no ma
 
 image.yml: the `cache` job's "Write the build cache" builds what "Build the image" and "Build the
 cef-test stage" read (the same context, file and build args; the same target as "Build the image"),
-or every warm read would miss (the review's m4).
+or every warm read would miss (the review's m4). And the `image` job's guards, evaluated (owner,
+2026-10-23, relayed: "cut measure runs after build steps"): on a push and a PR (`measure` empty) every
+step of the full list below runs; a timing run (`ghcr`, `gha`) runs it through "Build the cef-test
+stage" and no further; a fill dispatch skips the job. The full list is the C12 image job's steps
+plus the cache's two, written here, not read from the file.
 
 Each sweep prints how many cases it checked, and a sweep that checked none is a failure.
 
 Usage: cef_cache_key_test.py [--script scripts/cef-cache-key.sh] [--tree scripts/cef-cache-holds-tree.sh]
+                             [--workflow .github/workflows/image.yml]
 """
 
 import argparse
@@ -106,10 +111,57 @@ def step_with(text, name):
     return keys
 
 
+FULL_IMAGE_STEPS = [
+    "actions/checkout@v4", "Free disk space", "gstcefsrc pin (F-001)", "docker/setup-buildx-action@v3",
+    "Log in to GHCR (read)", "Build cache (GHCR, read)", "Build the image", "Build the cef-test stage",
+    "Plugin check", "Runs as non-root, with no CEF log override", "C11's graphics tests beside cefsrc",
+    "Smoke budget", "60 s fake smoke", "Exit 75 smoke (C11b, a dead CEF zygote)",
+    "Live-mode probe (no core, TMPDIR, 32 live exits)", "Image size", "Logs",
+]
+LAST_BUILD_STEP = "Build the cef-test stage"
+
+
+def image_job(text):
+    """The `image` job's `if:`, its TIMING env expression, and its steps as (name, if) pairs."""
+    lines = text.splitlines()
+    start = lines.index("  image:")
+    end = next(i for i in range(start + 1, len(lines)) if re.fullmatch(r"  [a-z][\w-]*:", lines[i]))
+    job_if, timing, steps = None, None, []
+    for l in lines[start + 1:end]:
+        if m := re.fullmatch(r"    if: (.+)", l):
+            job_if = m.group(1).strip()
+        elif m := re.fullmatch(r"      TIMING: (.+)", l):
+            timing = m.group(1).strip()
+        elif m := re.fullmatch(r"      - (?:name|uses): (.+)", l):
+            steps.append([m.group(1).strip(), None])
+        elif (m := re.fullmatch(r"        if: (.+)", l)) and steps:
+            steps[-1][1] = m.group(1).strip()
+    return job_if, timing, steps
+
+
+def term(t, ctx):
+    """One comparison of the few forms image.yml uses; anything else is refused (extend it here)."""
+    t = t.strip()
+    if t == "always()":
+        return True
+    m = re.fullmatch(r"(github\.event_name|inputs\.measure|env\.TIMING) (==|!=) '([^']*)'", t)
+    if not m:
+        raise ValueError(f"an expression this test cannot evaluate: {t!r}")
+    v = ctx[m.group(1)]
+    return (v == m.group(3)) if m.group(2) == "==" else (v != m.group(3))
+
+
+def evaluate(expr, ctx):
+    """`a || b` of `c && d` terms (no parentheses), as GitHub evaluates them."""
+    expr = re.sub(r"^\$\{\{\s*(.*?)\s*\}\}$", r"\1", expr.strip())
+    return any(all(term(t, ctx) for t in part.split("&&")) for part in expr.split("||"))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--script", default=str(ROOT / "scripts" / "cef-cache-key.sh"))
     ap.add_argument("--tree", default=str(ROOT / "scripts" / "cef-cache-holds-tree.sh"))
+    ap.add_argument("--workflow", default=str(WORKFLOW), help="image.yml, or a mutant copy of it")
     a = ap.parse_args()
     script, tree = Path(a.script).resolve(), Path(a.tree).resolve()
     failures = []
@@ -316,7 +368,7 @@ def main():
         print(f"cache manifests checked: {len(manifests)}")
 
     # image.yml: the writer builds what the readers read.
-    text = WORKFLOW.read_text()
+    text = Path(a.workflow).read_text()
     steps = {n: step_with(text, n) for n in ("Build the image", "Build the cef-test stage", "Write the build cache")}
     check(all(v is not None for v in steps.values()), f"image.yml has each build step once ({list(steps)})")
     if all(v is not None for v in steps.values()):
@@ -329,6 +381,34 @@ def main():
             check(same, f"\"{reader}\" reads what the writer builds: context, file, build args ({r} vs {w})")
         check(steps["Build the image"].get("target") == w.get("target"),
               f"the writer builds \"Build the image\"'s target ({w.get('target')} vs {steps['Build the image'].get('target')})")
+
+    # image.yml: the image job's guards, evaluated for each event.
+    try:
+        job_if, timing, steps = image_job(text)
+        names = [n for n, _ in steps]
+        check(names == FULL_IMAGE_STEPS, f"the image job's steps are the full list, in order ({names})")
+        check(timing is not None, "the image job defines TIMING")
+        cases = [("push", ""), ("pull_request", ""), ("workflow_dispatch", "ghcr"), ("workflow_dispatch", "gha"),
+                 ("workflow_dispatch", "fill")]
+        evaluated = 0
+        for event, measure in cases:
+            ctx = {"github.event_name": event, "inputs.measure": measure}
+            runs_job = evaluate(job_if or "always()", ctx)
+            ctx["env.TIMING"] = "true" if timing and evaluate(timing, ctx) else "false"
+            ran = [n for n, cond in steps if cond is None or evaluate(cond, ctx)] if runs_job else []
+            evaluated += len(steps)
+            if measure == "":
+                want = FULL_IMAGE_STEPS
+            elif measure in ("ghcr", "gha"):
+                want = FULL_IMAGE_STEPS[:FULL_IMAGE_STEPS.index(LAST_BUILD_STEP) + 1]
+            else:
+                want = []
+            check(ran == want, f"{event}, measure '{measure}': {len(ran)} of {len(steps)} steps run, "
+                               f"as owed ({len(want)}){'' if ran == want else f': ran {ran}'}")
+        print(f"image job guards evaluated: {evaluated} (step, event) pairs")
+        check(evaluated > 0, "the guard sweep evaluated at least one step")
+    except ValueError as e:
+        check(False, f"the image job's guards: {e}")
 
     if failures:
         print(f"{len(failures)} failure(s)", file=sys.stderr)

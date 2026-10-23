@@ -17,9 +17,10 @@ on:
     inputs:
       measure:
         description: >-
-          fill: write the cache from this ref, then run as usual. ghcr or gha: a timing run for the
-          decision row's table: no write; it waits for a fill to land, rebuilds rust-build as a new
-          commit would, and reads GHCR alone or GitHub's cache alone (the old path).
+          fill: write and check the cache from this ref (the cache job alone). ghcr or gha: a timing
+          run for the decision row's table: no write; it waits for a fill to land, rebuilds rust-build
+          as a new commit would, reads GHCR alone or GitHub's cache alone (the old path), and ends after
+          the two build steps.
         type: choice
         options: [fill, ghcr, gha]
         default: fill
@@ -32,6 +33,9 @@ concurrency:
 permissions: { contents: read }
 jobs:
   image:
+    # A fill dispatch writes and checks the cache in the `cache` job alone (owner, 2026-10-23, relayed:
+    # "cut measure runs after build steps"); every push, PR and timing run has this job.
+    if: github.event_name != 'workflow_dispatch' || inputs.measure != 'fill'
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     # Read only, on every event: this job never writes the registry.
@@ -45,6 +49,10 @@ jobs:
       # The fake runs' dummy job facts: a token that is no secret, so the log check means something.
       DUMMY_TOKEN: dummy-job-token-not-a-secret-4c1e
       DUMMY_SID: 3f8a2c1e-7b4d-4e9a-9c2f-5d6e7f8a9b0c
+      # A timing run ends after "Build the cef-test stage": every later step carries
+      # `if: env.TIMING != 'true'`, which holds on every push and PR (inputs.measure is empty there);
+      # scripts/cef_cache_key_test.py checks that the full list still runs then.
+      TIMING: ${{ inputs.measure == 'ghcr' || inputs.measure == 'gha' }}
     steps:
       - uses: actions/checkout@v4
       # CEF's build tree and two images do not fit the runner's free disk otherwise.
@@ -145,8 +153,10 @@ jobs:
           push: false
           cache-from: ${{ steps.cache.outputs.from }}
       - name: Plugin check
+        if: env.TIMING != 'true'
         run: docker run --rm --entrypoint gst-inspect-1.0 "$IMAGE" cefsrc > /dev/null
       - name: Runs as non-root, with no CEF log override
+        if: env.TIMING != 'true'
         run: |
           user=$(docker inspect -f '{{.Config.User}}' "$IMAGE")
           uid=$(docker run --rm --entrypoint id "$IMAGE" -u)
@@ -164,6 +174,7 @@ jobs:
             exit 1
           fi
       - name: C11's graphics tests beside cefsrc
+        if: env.TIMING != 'true'
         run: |
           docker volume create relay-target > /dev/null
           docker run --rm -v relay-target:/src/target "$TEST_IMAGE" bash -c '
@@ -179,6 +190,7 @@ jobs:
             exit 1
           fi
       - name: Smoke budget
+        if: env.TIMING != 'true'
         id: budget
         run: |
           budget=$(docker run --rm -v relay-target:/src/target "$TEST_IMAGE" \
@@ -190,6 +202,7 @@ jobs:
           echo "smoke budget: $budget ms"
           echo "ms=$budget" >> "$GITHUB_OUTPUT"
       - name: 60 s fake smoke
+        if: env.TIMING != 'true'
         env:
           BUDGET_MS: ${{ steps.budget.outputs.ms }}
         run: |
@@ -208,6 +221,7 @@ jobs:
           grep -q 'msg=exit code=0' smoke.log
           if grep -qF "$DUMMY_TOKEN" smoke.log; then echo "::error::the token reached stderr"; exit 1; fi
       - name: Exit 75 smoke (C11b, a dead CEF zygote)
+        if: env.TIMING != 'true'
         run: |
           deadline=$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%S.000Z)
           set +e
@@ -227,9 +241,11 @@ jobs:
       # before hard_exit::now, 1 in 6 such exits aborted after their exit line here, and 6 of 12
       # stops on a Fly Machine). About 8 minutes.
       - name: Live-mode probe (no core, TMPDIR, 32 live exits)
+        if: env.TIMING != 'true'
         timeout-minutes: 25
         run: python3 -I scripts/image_probe.py "$IMAGE" --keep-log probe.log --exits 32
       - name: Image size
+        if: env.TIMING != 'true'
         run: |
           bytes=$(docker image inspect -f '{{.Size}}' "$IMAGE")
           echo "image size: $bytes bytes ($(( bytes / 1048576 )) MiB)"
@@ -239,7 +255,7 @@ jobs:
             exit 1
           fi
       - name: Logs
-        if: always()
+        if: always() && env.TIMING != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: image-logs
