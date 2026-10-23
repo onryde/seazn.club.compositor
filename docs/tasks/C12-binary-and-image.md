@@ -274,11 +274,20 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
 - (Amended 2026-10-15) The phase endpoint tests pass, and `final_hold_and_drain_fit_inside_r1_stop_grace`
   is green against the ruled 20 s grace (D15). It is never ignored or weakened to get there.
 - The image runs as non-root.
-- (Amended 2026-10-20, C11b) Exit 75 reaches the process's exit status in the fake-mode smoke, its last POST `fatal`
-  with a `restart in place: ` `exitDetail`; the `cef health` line is in
+- (Amended 2026-10-20, C11b) Exit 75 reaches the process's exit status in the fake-mode smoke, its last POST ~~`fatal`~~
+  `restart` (amended 2026-10-20, Owed 66: web's #1000, contract re-vendored at `dec7b95d9`) with a `restart in place: `
+  `exitDetail`; the `cef health` line is in
   `graphics_log_lines_exist_in_both_driver_modes`, once per mode.
-- (Amended 2026-10-20, Owed 68) RLIMIT_CORE is 0 for the compositor and its CEF children, read from
-  `/proc/<pid>/limits` in the image test.
+- (Amended 2026-10-20, Owed 68) RLIMIT_CORE is ~~0~~ 1 byte, soft and hard (amended 2026-10-23, the PR #36 final
+  review's m4: the round-1 amendment below superseded 0; the probe demands 1, and Fly measured 1 1 at `341ae7a`, Owed 76)
+  for the compositor and its CEF children, read from `/proc/<pid>/limits` in the image test.
+- (Amended 2026-10-23, Owed 73, the PR #36 final review's I-1) No `JOB_TOKEN` at any CEF child's exec, witnessed by
+  `scripts/cef_env_witness.sh` in the probe's one witness container (never in the image): it ran (N > 0), every live
+  CEF process came through it, `DISPLAY`, `SESSION_ID` and `CEF_SUBPROCESS_PATH` set N of N, `JOB_TOKEN` unset N of N.
+  Mutant 29 (`remove_var` deleted) goes red on it (#46, Owed 75). Xvfb's environment check carries
+  the control `SESSION_ID`.
+- (Amended 2026-10-23, the PR #36 final review's m1) `supervise_test.py`'s 500 races draw 400 INTs from +0 to +3 ms
+  after the child's exit and 100 from ±15 ms; mutant 37 (round 1's trapped `wait`) goes red on the races 3 runs of 3.
 
 
 ## Final heartbeat with the exit reason (owner ruling 2026-10-15)
@@ -626,6 +635,175 @@ image:
   `setrlimit(RLIMIT_CORE, 0, 0)` first thing in `main` (or `ulimit -c 0` in the entrypoint before `exec`). An image
   test reads `/proc/<compositor pid>/limits` and a CEF child's: `Max core file size 0 0`. Fly's own `core_pattern`
   and RLIMIT_CORE are unmeasured, so the limit is ours either way.
+
+## Amendment 2026-10-20 (C12 as built; Owed 66's compositor follow-up; the owner's rulings)
+
+`docs/_INDEX.md` decision rows "C12, as built" and "Owner rulings 2026-10-20" hold the detail.
+
+- **Exit 75's final beat says `restart`** (Owed 66, compositor follow-up). Web's #1000 (`dec7b95d9`) added the word to
+  the strict beat enum; the contract is re-vendored at that commit (`relay-job.v1.json` sha `e6568677…a06a23`, plus
+  `heartbeat-final-restart.json`), `exit_reason_wire` maps `ExitReason::Restart` to `restart`, and the contract sweep's
+  `restart` row and `the_final_beat_under_a_410_is_gone` moved with it. The exit-75 smoke asserts the vendored
+  fixture's `state`, `exitReason` and `exitDetail` on the last POST.
+- **The inbound channel** (C08 amendment: "record the choice in this brief"): bounded at 1 024
+  (`wiring::INBOUND_CAPACITY`), never drop-oldest. The control worker and the signal thread `send` (blocking), so no
+  worker result is lost; every adapter and the fake drain `try_send` (each counts or logs a drop), so the loop never
+  blocks on its own channel.
+- **"fake-control" is this task's own server**, in `tests/fake_run.rs` (tiny_http): C13's harness is not built. The
+  fake mode takes three knobs, read only when `COMPOSITOR_DRIVERS=fake`: `COMPOSITOR_FAKE_CONTROL=http` (the real
+  `HttpControlPlane` against `APP_URL`; the scripted plane otherwise), `COMPOSITOR_FAKE_START_FAIL=<text>` and
+  `COMPOSITOR_FAKE_ZYGOTE_GONE=1`.
+- **`GstInput` is built lazily** (false premise): its frame size is the session's profile, so `LazyInput` builds it
+  at the first rebuild after a successful `start` and refuses an earlier rebuild with a warn line.
+- **The phase endpoint's origin is the page's** (F-009; the PR #20 review's M6, option (ii) taken per page): it starts
+  as APP_URL's origin and moves to the overlay URL's origin before each graphics restart (`PageOrigin`).
+- **`R1_STOP_GRACE_MS` and `EXIT_HEADROOM_MS` live in `crates/compositor/src/lib.rs`**, not `main.rs`: a test cannot
+  import from a binary.
+- **The Dockerfile follows F-001 and the C00 spike**, not this brief's sketch: the runtime and build library lists,
+  `strip` of `libcef.so`, the pin in `docker/GSTCEF_COMMIT` (image.yml reads it; a trailing `# from F-001` on the
+  `ARG` line would be part of the instruction), a `cef-test` stage running C11's tests as uid 10001, and a
+  `gst-inspect-1.0` check of every element factory the adapters make.
+- **The image test of Owed 58 and 68** is `scripts/image_probe.py`: live-mode runs against a fake control plane on
+  the runner, reading `/proc/<pid>/limits` of the compositor and every CEF child, `TMPDIR` (`/dev/shm/seazn`, 0700,
+  tmpfs, the CEF profile inside) and the environment (no `GST_CEF_LOG_SEVERITY`, no `GST_DEBUG`), then three stops,
+  one container each: `docker kill -s INT` (the Final hold, exit 0 inside R1's grace, an earlier POST carrying
+  `final`, the last POST `signalled`), `docker stop` (the drain, exit 0, the last POST `signalled`, no `final`), and a
+  measurement of a SIGTERM sent straight to the compositor; no token in any log.
+- **The entrypoint does not `exec` the compositor** (false premise; F-016, medium). Once CEF starts in the process,
+  a SIGINT or SIGTERM it receives exits it with status 0 at once: no Final scene, no drain, no final beat (image.yml's
+  first probe: `docker stop` exited in 0.1 s with one periodic POST). The entrypoint runs the compositor as its child
+  and forwards SIGINT as SIGUSR1 and SIGTERM as SIGUSR2, which CEF leaves alone; `wiring::STOP_SIGNALS` reads both
+  pairs (the binary run alone keeps SIGINT and SIGTERM), and the child's own exit status is the entrypoint's.
+  `the_entrypoint_forwards_each_stop_signal_as_the_binary_reads_it` pins the two sides against each other; the fake-run
+  stop tests drive each signal by both names.
+- **The hand mutants ran on a real runner** (Owed 75): the owner stopped local VMs on 2026-10-20 (relayed by the
+  coordinator), so each batch ran in check.yml (ubuntu-24.04, GStreamer) on a throwaway draft PR from PR #36's head
+  (#37: 19 mutants, #38: 5; expected-red sets disjoint), each closed and deleted once read. **23 of 24 killed; 22 is
+  equivalent:** `Logger` scrubs every line through `Scrubber::scrub`, which ends in `redact`, so the swap line's own
+  `redact` is a second guard nothing can kill alone. Mutant 16 was also witnessed before the wire fix. Mutants 25
+  (`STOP_SIGNALS` reads SIGUSR1 as nothing) and 26 (the entrypoint forwards SIGTERM as itself) are on draft PRs #39 and
+  #40, not yet read. The list (expected red in brackets):
+
+  | # | Mutant | Expected red |
+  |---|---|---|
+  | 1 | unset `COMPOSITOR_DRIVERS` defaults to fake in release (`env.rs`) | `drivers_unset_refuses_in_release…` |
+  | 2 | `EnvError::Missing` carries the token (a leaked `format!`) | `missing_each_required_key_is_refused_naming_the_key` |
+  | 3 | `encoder_speed: None` in `ProcMetrics::sample` | `copies_every_stats_field_into_measured` |
+  | 4 | the `NotLoopback` guard off (`if false && …`) | `binds_loopback_only` |
+  | 5 | `Access-Control-Allow-Origin: *` | `serves_the_published_phase…`, `preflight_allows_private_network…` |
+  | 6 | the private-network header dropped | `preflight_allows_private_network…` |
+  | 7 | `wait_past` answers at once | `long_poll_waits_for_a_newer_seq…` |
+  | 8 | `phase_endpoint`'s bind failure exits 70 | `phase_port_taken_still_runs_to_exit_zero` |
+  | 9 | no `setrlimit` in `main` | `the_compositor_runs_with_no_core_file_limit` (now `the_compositor_runs_non_dumpable_with_a_one_byte_core_limit`) |
+  | 10 | `Clock::now_ms` reads the wall per call | `now_ms_is_monotonic_across_a_wall_clock_step` |
+  | 11 | `LazyInput` builds at 720p with no started profile | `lazy_input_is_built_once_from_the_started_profile` |
+  | 12 | `PageOrigin` never moves the origin | `the_phase_endpoint_answers_the_overlay_urls_origin` |
+  | 13 | `LoggedPlane::final_lane` returns the inner lane | `a_failed_final_beat_is_logged_scrubbed_on_the_final_lane` |
+  | 14 | the plane's refusal exits 70 | `a_job_token_with_a_cr_exits_78_and_never_prints_it` |
+  | 15 | `LoggedPlane` never learns the session | `start_failure_exits_70_with_the_detail_scrubbed_of_a_bare_key` |
+  | 16 | `Restart` on the wire as `fatal` | `the_restart_beat_is_the_vendored_restart_fixture`, `the_final_beat_under_a_410_is_gone`, `a_dead_zygote_exits_75_posting_restart` (witnessed) |
+  | 17 | `DrainingFake` never queues `OutputDrained` | `fake_mode_drain_reports_output_drained`, `fake_run_exits_zero_through_the_drain…` |
+  | 18 | no CR/LF escape in `Logger::line` | `log_lines_are_rfc3339_ms_one_per_message_and_masked` |
+  | 19 | `add_session` drops the page token | `add_session_learns_all_four_credentials` |
+  | 20 | an empty value is not missing | `missing_each_required_key…` |
+  | 21 | `ProfileTap` records a failed start | `lazy_input_is_built_once_from_the_started_profile` |
+  | 22 | the swap line's URL unredacted | `logged_programme_logs_start_swap…`, `graphics_log_lines_exist_in_both_driver_modes` |
+  | 23 | a 5th poll admitted | `fifth_concurrent_poll_is_refused_503` |
+  | 24 | the first sample's CPU is `Some(0.0)` | `linux::first_sample_has_no_cpu` |
+  | 25 | `STOP_SIGNALS`' SIGUSR1 row reads SIGINT | `the_entrypoint_forwards_each_stop_signal…`, `sigint_holds_the_final_scene_then_drains` (killed on both, #39) |
+  | 26 | the entrypoint forwards SIGTERM as SIGTERM | `the_entrypoint_forwards_each_stop_signal…` (#40: killed on its parse precondition only, the marker on the trap line; re-run on #43, the review round) |
+- **The owner's rulings of 2026-10-20** change no C12 code: the exit-based restart stays (C14 measures its outage),
+  leaked teardowns below 3 stay until the session ends, the outage target is 15 s, and web caps self-restarts at 6 a
+  session.
+
+## Amendment 2026-10-20 (the PR #36 review, round 1: the exit, the core, the stop supervision)
+
+The review (Needs fixes: C1, I1–I3, m1–m9) and the coordinator's Owed 73 probe on a Fly Machine. `docs/_INDEX.md`'s
+decision row "C12 review round 1" holds the choices; `_FINDINGS.md` F-016 (Fly's signals), F-017 and F-018 the facts.
+
+- **`main` ends through `hard_exit::now`, never `std::process::exit`** (C1, F-017). libc's `exit(3)` ran libcef's and
+  GLib's exit handlers against the teardowns the adapters' drops start and never join: after a clean `exit code=0`
+  line, 1 of 6 live exits on the runner and 6 of 12 stops on a Fly Machine aborted 134 (`double free or corruption`).
+  `crates/hard-exit` (`_exit(2)` after flushing stderr) is the workspace's one sanctioned `unsafe`; its own test
+  shows it runs no `atexit` handler. An env failure exits through it too (78).
+- **No core under any `core_pattern`** (I1, F-018; supersedes "RLIMIT_CORE 0" in the amendment above and its "the
+  limit is ours either way"). A pipe ignores the limit, so 0 stopped nothing on the runner. In order, first in
+  `main`: the stop signals' handlers (`wiring::arm_signals`, m1), `PR_SET_DUMPABLE 0`, then RLIMIT_CORE 1 byte soft
+  and hard (`CORE_LIMIT_BYTES`), which CEF inherits (the dumpable flag does not survive `execve`; the kernel refuses
+  a piped core at exactly 1, and 1 is below a file core's ELF minimum). Fly's pattern is a file, where 0 already
+  held (measured); 1 there is the post-fix probe's to confirm. `the_compositor_runs_non_dumpable_with_a_one_byte_core_limit`
+  replaces `the_compositor_runs_with_no_core_file_limit`.
+- **`JOB_TOKEN` leaves the compositor's environment once parsed** (m2): edition 2021's `remove_var` is safe, and no
+  thread exists yet. Xvfb starts without it (`env -u`).
+- **The stop forwarding moved to `docker/supervise.sh`** (I2, m1, m6), sourced as the entrypoint's first command and
+  installed at `/usr/local/lib/seazn/supervise.sh`. It traps INT and TERM before Xvfb starts; a stop that arrives
+  before the compositor exists, or before both USR handlers show in its `/proc/<pid>/status`, is held and then
+  forwarded; the loop keeps the child's own status, also when the child dies of the forwarded signal; a set
+  `TINI_KILL_PROCESS_GROUP` exits 78 before anything runs. `scripts/supervise_test.py` drives it with a stub child
+  (check.yml, the image's bash, `--require-procfs`). The entrypoint sets core 1:1 on itself and tini (`prlimit`).
+- **`tini -s`** (m5): Fly runs tini as a child of `/fly/init`, and tini printed its warning on every boot.
+- **The probe** (`scripts/image_probe.py`, m3, m7, C1, I1): every process's core limit against the kernel's 1, the
+  compositor non-dumpable, `core_pattern` printed, all five session credentials against every command line and log,
+  `JOB_TOKEN` against Xvfb's and each CEF child's environment, a forced CEF-child abort and a forced compositor
+  abort (134, no `(core dumped)`), 32 live exits with CEF up at 720p and 1080p (24 stops), each exact with no abort
+  text, and a SIGTERM and a SIGINT 0.3 s into a boot. image.yml refuses `TINI_KILL_PROCESS_GROUP` in the image's env.
+- **BUILDINFO's `cef_dir`** names the extracted directory (m8). **m4:** "91a5123" was the merge ref's image tag;
+  the citations now name `c080c3f` and its runs. **m9:** mutant 26 is re-run with its marker on its own line.
+- **Owed 73's Fly plan** (I3) checks each stop's drain lines and the `signalled` beat before the exit line, not the
+  exit code alone (F-016's broken case also exited 0). The coordinator runs it; C1 stays open until it shows 0 aborts
+  (Owed 76).
+- **New hand mutants** (Owed 75), on throwaway draft PRs from this round's head:
+
+  | # | Mutant | Expected red | PR |
+  |---|---|---|---|
+  | 27 | `main` exits through `std::process::exit` | phase B: a 134 or abort text in some of 32 exits (probabilistic) | #41 |
+  | 28 | no `PR_SET_DUMPABLE` | the compositor's `/proc/<pid>` is not root-owned | #41 |
+  | 29 | `JOB_TOKEN` stays in the environment | ~~each CEF child's environment check~~ (it SURVIVED that, F-020) the exec-time witness: "no JOB_TOKEN at any CEF child's exec" (amended 2026-10-23) | #41, #44, #46 |
+  | 30 | `CORE_LIMIT_BYTES` 0 | the compositor's and each CEF child's limit; the CEF child's kernel refusal line | #42 |
+  | 31 | no `prlimit` in the entrypoint | tini's, bash's and Xvfb's limit | #42 |
+  | 32 | Xvfb keeps `JOB_TOKEN` | Xvfb's environment check | #42 |
+  | 33 | no arming wait in `supervise.sh` | "a stop before the child's handlers is held" | #43 |
+  | 34 | no pending flush | "a stop before the child exists is held" | #43 |
+  | 35 | `c080c3f`'s wait loop | "the child dies of the forwarded USR2" (survived on macOS bash 3.2 and 5.2) | #43 |
+  | 36 | no `TINI_KILL_PROCESS_GROUP` refusal | the refusal case (killed on the host) | #43 |
+  | — | `hard_exit::now` made `std::process::exit` | `hard-exit`'s `exit.rs` (killed on the host) | — |
+- **Round 1's CI reds at `6b077fb`, fixed 2026-10-23** (`docs/_INDEX.md`'s row of that date; F-019):
+  `supervise` now runs the compositor under a waiter subshell that writes its pid and exit status to files in a private
+  `/tmp` directory, and never `wait`s on it from the trapping shell (2 of 150 races lost the status on the runner). The
+  probe and the binary test stat `/proc/<pid>/status`, not the directory (which keeps the euid), each against a dumpable
+  control; the probe reads environments with `docker exec --privileged` (CAP_SYS_PTRACE, which Docker's default set
+  lacks) and fails an unreadable one. check.yml's supervision step runs 500 races, last.
+
+## Amendment 2026-10-23 (the PR #36 final review: the CEF children's environment at exec, the race draw)
+
+The final review at `341ae7a` (Needs fixes: I-1, m1–m8) and the coordinator's Owed 76 Fly probe at the same head.
+`docs/_INDEX.md`'s decision row "C12 final review fixes" holds the choices; `_FINDINGS.md` F-020 the fact.
+
+- **The CEF children's `JOB_TOKEN` check is witnessed at exec** (I-1, F-020). Chromium rewrites a child's
+  `/proc/<pid>/environ` for its process title, so the old check passed with mutant 29 (`remove_var` deleted) in place.
+  The probe now runs one dedicated container with `scripts/cef_env_witness.sh` bind-mounted and gstcefsrc's
+  `GST_CEF_SUBPROCESS_PATH` pointing at it (the knob exists at the F-001 pin: gstcefsrc.cc lines 852-856). For every
+  child CEF execs, the witness records whether `JOB_TOKEN`, `DISPLAY`, `SESSION_ID` and `CEF_SUBPROCESS_PATH` are set
+  (never a value), then execs the real gstcefsubprocess. The probe requires N > 0 records, every live CEF process
+  descended from a recorded exec (the zygotes' forks included), the three controls set N of N and `JOB_TOKEN` unset N
+  of N. The witness is never in the image (no Dockerfile change). Xvfb's environment check now needs the control
+  `SESSION_ID` in the file, so padding cannot pass it.
+- **The races** (m1): 400 of the 500 INTs land +0 to +3 ms after the child's exit (every printed loss was at 0.301 s),
+  100 at ±15 ms; the tally prints both shares. The "about once in 800 runs" text was wrong: at the old draw mutant 37
+  lost 1 of 500, so a clean 500 came by luck in about 1 run in 3 to 1 in 10.
+- **m6:** the probe's dumpable control is the compositor's parent, the waiter, found by ppid (it was the first bash in
+  `/proc`'s glob order, which is the waiter or the entrypoint by the pids' digits). **m7:** "INT then TERM" asserts that
+  the child saw USR1 then USR2 (a forward-once mutant passed it before; killed on the host now). **m4:** the acceptance
+  line above reads 1 byte, not 0. **m2, m3:** Owed 75 records #44 and #45, and the late-trap stimulus's 143 as
+  intermittent. **m5:** a residual, Owed 77. **m8** (`supervise` is single-use; unreachable, the entrypoint calls it
+  once): not changed in this round.
+- **Round-3 mutants** (Owed 75), on one throwaway draft PR from this round's head:
+
+  | # | Mutant | Expected red | PR |
+  |---|---|---|---|
+  | 29 | `remove_var(JOB_TOKEN)` deleted | "no JOB_TOKEN at any CEF child's exec", and no other probe line | #46 |
+  | 37 | round 1's `supervise` (the trapped `wait`), the killed-by line kept | the races, in each of 3 runs | #46 |
+  | 35 | `c080c3f`'s loop, the killed-by line kept | the races, once | #46 |
 
 ## Do not touch
 

@@ -1,0 +1,165 @@
+name: image
+# The relay image (C12 Step 8): build it, check its plugins, run C11's graphics tests beside a real
+# cefsrc, smoke the binary in fake mode (exit 0, and C11b's exit 75), probe one live-mode run, and cap
+# the size. This workflow never pushes an image: pushing is C16's job.
+on:
+  push: { branches: [main] }
+  pull_request: {}
+permissions: { contents: read }
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    defaults:
+      # `bash -eo pipefail`: the implicit default has no pipefail (check.yml's note).
+      run: { shell: bash }
+    env:
+      IMAGE: seazn-relay:${{ github.sha }}
+      TEST_IMAGE: seazn-relay-cef-test:${{ github.sha }}
+      # The fake runs' dummy job facts: a token that is no secret, so the log check means something.
+      DUMMY_TOKEN: dummy-job-token-not-a-secret-4c1e
+      DUMMY_SID: 3f8a2c1e-7b4d-4e9a-9c2f-5d6e7f8a9b0c
+    steps:
+      - uses: actions/checkout@v4
+      # CEF's build tree and two images do not fit the runner's free disk otherwise.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: gstcefsrc pin (F-001)
+        id: pin
+        run: |
+          commit=$(tr -d '[:space:]' < docker/GSTCEF_COMMIT)
+          if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::docker/GSTCEF_COMMIT is not a 40-hex commit: '$commit'"
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          tags: ${{ env.IMAGE }}
+          load: true
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build the cef-test stage
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: cef-test
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          tags: ${{ env.TEST_IMAGE }}
+          load: true
+          push: false
+          cache-from: type=gha
+      - name: Plugin check
+        run: docker run --rm --entrypoint gst-inspect-1.0 "$IMAGE" cefsrc > /dev/null
+      - name: Runs as non-root, with no CEF log override
+        run: |
+          user=$(docker inspect -f '{{.Config.User}}' "$IMAGE")
+          uid=$(docker run --rm --entrypoint id "$IMAGE" -u)
+          echo "image user: $user, uid $uid"
+          [ "$user" = "relay" ] && [ "$uid" = "10001" ]
+          env=$(docker inspect -f '{{json .Config.Env}}' "$IMAGE")
+          echo "image env: $env"
+          if grep -Eq '"(GST_CEF_LOG_SEVERITY|GST_DEBUG)=' <<<"$env"; then
+            echo "::error::the image sets GST_CEF_LOG_SEVERITY or GST_DEBUG (Owed 52)"
+            exit 1
+          fi
+          # tini would signal the compositor directly, around supervise.sh (F-016; PR #36 review m6).
+          if grep -Eq '"TINI_KILL_PROCESS_GROUP=' <<<"$env"; then
+            echo "::error::the image sets TINI_KILL_PROCESS_GROUP"
+            exit 1
+          fi
+      - name: C11's graphics tests beside cefsrc
+        run: |
+          docker volume create relay-target > /dev/null
+          docker run --rm -v relay-target:/src/target "$TEST_IMAGE" bash -c '
+            Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp > /dev/null 2>&1 &
+            for _ in $(seq 1 50); do [ -e /tmp/.X11-unix/X99 ] && break; sleep 0.1; done
+            cargo test --locked -p adapters --features cef --test graphics -- --test-threads=1 --show-output
+          ' 2>&1 | tee graphics.log
+          passed=$({ grep -Eo 'test result: ok\. [0-9]+ passed' graphics.log || true; } | awk '{s+=$4} END {print s+0}')
+          echo "graphics tests passed: $passed"
+          # The brief's floor (C11's eight, amended 2026-10-15); the file holds more.
+          if [ "$passed" -lt 8 ]; then
+            echo "::error::$passed graphics tests passed, fewer than 8"
+            exit 1
+          fi
+      - name: Smoke budget
+        id: budget
+        run: |
+          budget=$(docker run --rm -v relay-target:/src/target "$TEST_IMAGE" \
+            cargo run -q --locked -p compositor --example smoke_budget)
+          if ! [[ "$budget" =~ ^[0-9]+$ ]]; then
+            echo "::error::smoke_budget printed '$budget', not a number"
+            exit 1
+          fi
+          echo "smoke budget: $budget ms"
+          echo "ms=$budget" >> "$GITHUB_OUTPUT"
+      - name: 60 s fake smoke
+        env:
+          BUDGET_MS: ${{ steps.budget.outputs.ms }}
+        run: |
+          deadline=$(date -u -d '+60 seconds' +%Y-%m-%dT%H:%M:%S.000Z)
+          set +e
+          timeout "$(( (BUDGET_MS + 999) / 1000 ))s" docker run --rm --name relay-smoke \
+            -e COMPOSITOR_DRIVERS=fake -e SESSION_ID="$DUMMY_SID" -e JOB_TOKEN="$DUMMY_TOKEN" \
+            -e APP_URL=https://app.example -e RELAY_DEADLINE_AT="$deadline" "$IMAGE" 2> smoke.log
+          code=$?
+          set -e
+          docker rm -f relay-smoke > /dev/null 2>&1 || true
+          cat smoke.log
+          echo "smoke exit: $code"
+          [ "$code" -eq 0 ]
+          grep -q 'msg=programme started' smoke.log
+          grep -q 'msg=exit code=0' smoke.log
+          if grep -qF "$DUMMY_TOKEN" smoke.log; then echo "::error::the token reached stderr"; exit 1; fi
+      - name: Exit 75 smoke (C11b, a dead CEF zygote)
+        run: |
+          deadline=$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%S.000Z)
+          set +e
+          timeout 60s docker run --rm --name relay-smoke-75 \
+            -e COMPOSITOR_DRIVERS=fake -e COMPOSITOR_FAKE_ZYGOTE_GONE=1 -e SESSION_ID="$DUMMY_SID" \
+            -e JOB_TOKEN="$DUMMY_TOKEN" -e APP_URL=https://app.example -e RELAY_DEADLINE_AT="$deadline" \
+            "$IMAGE" 2> smoke75.log
+          code=$?
+          set -e
+          docker rm -f relay-smoke-75 > /dev/null 2>&1 || true
+          cat smoke75.log
+          echo "exit-75 smoke exit: $code"
+          [ "$code" -eq 75 ]
+          grep -q 'msg=cef health zygote_gone=1 ' smoke75.log
+          grep -q 'msg=exit code=75' smoke75.log
+      # Phase B repeats a live exit with CEF up 32 times, 24 of them stops, at both profiles (F-017:
+      # before hard_exit::now, 1 in 6 such exits aborted after their exit line here, and 6 of 12
+      # stops on a Fly Machine). About 8 minutes.
+      - name: Live-mode probe (no core, TMPDIR, 32 live exits)
+        timeout-minutes: 25
+        run: python3 -I scripts/image_probe.py "$IMAGE" --keep-log probe.log --exits 32
+      - name: Image size
+        run: |
+          bytes=$(docker image inspect -f '{{.Size}}' "$IMAGE")
+          echo "image size: $bytes bytes ($(( bytes / 1048576 )) MiB)"
+          cap=$(( 2500 * 1000 * 1000 ))
+          if [ "$bytes" -gt "$cap" ]; then
+            echo "::error::the image is $bytes bytes, over the 2.5 GB cap"
+            exit 1
+          fi
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-logs
+          path: |
+            graphics.log
+            smoke.log
+            smoke75.log
+            probe.log
+          if-no-files-found: ignore

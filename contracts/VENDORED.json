@@ -1,10 +1,11 @@
 {
   "source": "onryde/seazn.club",
-  "commit": "eb6538a79df10b08ec2590ce042f2178111d0ed4",
+  "commit": "dec7b95d902f7767b3a6bca991ef08ae366e43ec",
   "files": {
-    "fixtures/relay-job.v1/README.md": "728a8970c14c35d1195372416350df96cbe2f17b75372515157043365e0c0389",
+    "fixtures/relay-job.v1/README.md": "9dd7097b93a1bfd3a67775136acfcc04393cccdb2475bc182b3b8fa5bcf3096d",
     "fixtures/relay-job.v1/heartbeat-final-fatal.json": "7cd633faeae7fa27cdaca24c2423bd8334f80d8bddafbc84aeb67f6221d8305e",
     "fixtures/relay-job.v1/heartbeat-final-hold.json": "904dbedaa116b4f2cedc3197d41cdb1964627132abe93595b24486062e42af1f",
+    "fixtures/relay-job.v1/heartbeat-final-restart.json": "e919b31569bcca8532d2e155a55862d579a314bf15fd17df85399e80787198a1",
     "fixtures/relay-job.v1/heartbeat-full.json": "870ec10ce292dad3e22aa5ec8143afcede475eb202b711df9bff404fc306f7bc",
     "fixtures/relay-job.v1/heartbeat-invalid-exit-reason.json": "f36021429de6d0bcd6a8f727de961195b340f2505938c2eeb80710542b14ac97",
     "fixtures/relay-job.v1/heartbeat-invalid-exit-while-playing.json": "2fb1943e5358d0bb6354b7a08d9ee0da7946a9dbb1f115ef4b4210b5378018c9",
@@ -22,6 +23,6 @@
     "fixtures/relay-job.v1/session-passthrough.json": "6e26aaaec3701ee50f08efb3044c1fd7192efd130e188c839ac7bbfb016d9f27",
     "fixtures/relay-job.v1/session-refused-delay-absent.json": "175099704a276cbecaf60f0381b100edda842487627203542f79342815267e15",
     "fixtures/relay-job.v1/session-refused-delay-mismatch.json": "3f45d9bba1866f4ef9060bcbcc21e9e5e901380089236616cf983fc052422c0f",
-    "relay-job.v1.json": "fc99d44899ee543cfe36c48902573501f815d68b4ec7c2e4bbb50d096608dc50"
+    "relay-job.v1.json": "e656867729c9a0a05476ab85501dc61255db6a8826d75c74c195c34ff7f06a23"
   }
 }

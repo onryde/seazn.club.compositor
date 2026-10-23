@@ -458,12 +458,29 @@ fn heartbeat_410_is_gone_and_other_refusals_are_transport() {
     eprintln!("heartbeat statuses checked: {}", table.len());
 }
 
+/// The word each reason posts: the contract's `exitReason` description, word for word ("ended,
+/// deadline, signalled and session_gone exit 0; refused exits 78; fatal exits 70; restart exits 75";
+/// Owed 66 added the last, vendored at dec7b95d9). Exhaustive, so a new reason fails to compile here.
+fn contract_exit_word(r: ExitReason) -> &'static str {
+    match r {
+        ExitReason::Ended => "ended",
+        ExitReason::Deadline => "deadline",
+        ExitReason::Signalled => "signalled",
+        ExitReason::SessionGone => "session_gone",
+        ExitReason::Refused => "refused",
+        ExitReason::Fatal => "fatal",
+        ExitReason::Restart => "restart",
+    }
+}
+
 /// The final beat's result is classified like any other beat's (C07 amendment; Owed 29): a 410 is
 /// `Gone` (C08 maps it to `HeartbeatRefused(Gone)`: a drain is cut short, Exited ignores it), a 404 a
-/// transport error, a 200 its reply.
+/// transport error, a 200 its reply. Each reason posts its own contract word (Owed 66: the restart
+/// posts `restart`, no longer `fatal`).
 #[test]
 fn the_final_beat_under_a_410_is_gone() {
     let mut checked = 0;
+    let mut words: Vec<String> = Vec::new();
     for reason in ExitReason::ALL {
         let fake = serve(vec![Reply::Status(410, refused("SESSION_ENDED"))]);
         assert_eq!(
@@ -473,9 +490,21 @@ fn the_final_beat_under_a_410_is_gone() {
         );
         let posted: Value = serde_json::from_str(&fake.next().body).unwrap();
         assert_eq!(posted["state"], "stopped");
-        assert!(posted["exitReason"].is_string(), "{posted}");
+        assert_eq!(
+            posted["exitReason"],
+            contract_exit_word(reason),
+            "{reason:?}: {posted}"
+        );
+        words.push(posted["exitReason"].as_str().unwrap().to_owned());
         checked += 1;
     }
+    words.sort();
+    words.dedup();
+    assert_eq!(
+        words.len(),
+        ExitReason::ALL.len(),
+        "one word per reason: {words:?}"
+    );
     let fake = serve(vec![Reply::Status(404, refused("NOT_FOUND"))]);
     let got = plane(&fake.url).heartbeat(&final_beat(ExitReason::Ended), &Measured::default());
     assert!(matches!(got, Err(HeartbeatError::Transport(_))), "{got:?}");

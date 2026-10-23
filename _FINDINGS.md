@@ -1347,6 +1347,92 @@ echo "RUN $RUN done"
 - **Not started:** starting one on the stg pad needs a staff login, which this session does not hold.
 - **The brief:** "if it isn't in progress, refuse the run rather than skip the check". Neither leg ran: no template leg and no scene leg. Owed 21 stays open (updated there).
 
+## F-016: CEF takes over SIGINT and SIGTERM in the compositor's process (C12, 2026-10-20)
+
+**Where:** image.yml on PR #36 (GitHub's ubuntu-24.04 runner, Docker), the relay image in live mode
+(`scripts/image_probe.py`): a fake control plane on the runner, C11's harness page as the overlay, and
+input and target on local ports nothing listens on. Each run waited for `cef ready gen=1`.
+
+| Run (image, entrypoint) | Signal and path | Exit status | Time to exit | The compositor's `exit code=` line | Final beat |
+|---|---|---|---|---|---|
+| `7da159f`, run 39403770532 (`exec` compositor) | `docker stop`: SIGTERM, tini → compositor | 0 | 0.1 s | absent; the log ends at `cef ready gen=1` | none (1 POST, periodic) |
+| `c080c3f`, run 39407377806 (forwarding entrypoint) | `docker exec … kill -TERM <compositor>`, around tini | 0 | 0.2 s | absent | none (1 POST, periodic) |
+| `c080c3f` | `docker kill -s INT`: tini → entrypoint → SIGUSR1 | 0 | 10.3 s | present | `signalled`, an earlier POST carrying `final` |
+| `c080c3f` | `docker stop`: tini → entrypoint → SIGUSR2 | 0 | at once | present | `signalled`, no POST carrying `final` |
+
+- The compositor's `/proc/<pid>/status` once CEF was up: `SigCgt 0000000100014a03` (SIGHUP, SIGINT,
+  SIGUSR1, SIGUSR2, SIGTERM, SIGCHLD and signal 33 caught), `SigIgn 0000000000001000` (SIGPIPE).
+- In the binary run alone with no CEF (`tests/fake_run.rs`, check.yml), SIGTERM and SIGINT reach the
+  domain: the drain in 12 ms and the hold in 10.04 s, each with its final beat.
+
+**Verdict:** once CEF starts in the process, a SIGINT or SIGTERM delivered to the compositor ends it
+with status 0 at once, before the domain hears of it: no Final scene, no drain, no final beat, no exit
+line. The caught HUP/INT/TERM set matches Chromium's shutdown handlers; the handler's owner was not
+traced further. So the image's entrypoint does not `exec` the compositor: it runs it as a child and
+forwards SIGINT as SIGUSR1 and SIGTERM as SIGUSR2, which the compositor reads as the same stops
+(`wiring::STOP_SIGNALS`), and tini (no `-g`) signals the entrypoint alone. Since the PR #36 review
+(I2, m1) that forwarding lives in `docker/supervise.sh`, sourced first, which also holds a stop that
+arrives before the compositor's handlers exist.
+
+**On a Fly Machine (MEASURED 2026-10-20, Machine `48e4533c564ed8`, image at `50c6643`, destroyed;
+the coordinator's Owed 73 probe):** PID 1 is `/fly/init`, which signals tini's pid only, in 12 of 12
+stops. Each stop drained and posted its final `signalled` beat (12 of 12); SIGINT held the Final
+scene for 10.018–10.032 s; SIGTERM reached the exit line in 7–22 ms. No stop had this finding's shape.
+**`fly machine stop` with no flag sends the Machine's `stop_config` signal (SIGTERM), not SIGINT** as
+flyctl's help says; `--signal SIGINT` sends SIGINT. Web names SIGINT itself, so its stop is unaffected;
+a person stopping a Machine by hand gets the drain, not the Final hold.
+
+## F-017: the process aborted AFTER a clean exit: libc's exit handlers raced CEF's threads (C12, 2026-10-20)
+
+**Where:** the relay image in live mode, CEF up, after `app::run::run` returned and the compositor
+logged `exit code=0` (or `exit code=75`'s path, unmeasured).
+
+| Where | Exits | Aborted after the exit line | glibc's text |
+|---|---|---|---|
+| image.yml, runs at `7da159f`–`50c6643` (the PR #36 review) | 6 live exits | 1 (run 39410132377 at `ff0fdf4`, a `docker stop`): container status 134, bash `Aborted (core dumped)` | `double free or corruption (!prev)` |
+| A Fly Machine at `50c6643` (the coordinator's Owed 73 probe) | 12 stops | 6: SIGTERM 5 of 8, SIGINT 1 of 4; exit 134 | `corrupted size vs. prev_size in fastbins`, `corrupted double-linked list`, `double free or corruption (!prev)` |
+| The same Machine | 2 deadline exits | 1, after its `deadline` beat: Fly's `on-failure` restarted the ended session's Machine in place (`requested_stop: false, restarting: true`), which booted past its deadline | `corrupted size vs. prev_size in fastbins` |
+
+- Every abort came after the drain, the final beat and the `exit code=0` line. A requested stop was
+  never restarted, even at 134; web's reader would still see 134.
+- **Cause (by mechanism, not traced to a frame):** `main` ended with `std::process::exit`, libc's
+  `exit(3)`, which runs every `atexit` handler and C++ static destructor (libcef's, GLib's) while the
+  teardowns that the adapters' drops started (each returns at once and joins nothing, by design:
+  C08 and C11 amendments of 2026-10-19) still run on CEF's and GStreamer's threads.
+- **Fix:** `main` ends through `hard_exit::now`, `_exit(2)` after flushing stderr: the kernel ends every
+  thread and runs no handler. The final beat is already sent (`run` returns after
+  `flush_final_beats`). `crates/hard-exit` is the workspace's one sanctioned `unsafe` (no safe binding
+  exists); its test shows `now` runs no `atexit` handler where `std::process::exit` does.
+- **Proof owed to CI:** image.yml's probe repeats 32 live exits with CEF up (24 stops, 4 deadlines,
+  4 dead zygotes, at 720p and 1080p) and requires every status exact with no abort text. The
+  coordinator re-runs the Fly probe after the fix.
+
+## F-018: RLIMIT_CORE 0 stops a core only for a FILE `core_pattern` (C12, 2026-10-20)
+
+- **The CI runner (GitHub ubuntu-24.04):** its `core_pattern` is a pipe to a crash helper. The kernel
+  ignores RLIMIT_CORE for a pipe (`fs/coredump.c` sets the limit to infinity, except the value 1, at
+  which it refuses the core: "RLIMIT_CORE is set to 1, aborting core"). F-017's abort there printed
+  `Aborted (core dumped)` from a compositor whose `/proc/<pid>/limits` read 0 0: a core holding the
+  job token, the page token and the stream key reached the helper (the PR #36 review's I1).
+- **A Fly Machine (MEASURED 2026-10-20, Machine `48e4533c564ed8`):** `core_pattern` is `core`, a file
+  in the cwd (`core_uses_pid 0`, `fs.suid_dumpable 0`, kernel 6.12.113-fly). The limit of 0 stopped
+  every core there: 6 compositor aborts printed `Aborted` with no `(core dumped)`; a control in the
+  same Machine dumped a 557 KB `core` with an unlimited limit and nothing with 0. Fly's own default is
+  soft 0, hard unlimited, on init, tini, bash and Xvfb. The rootfs is reset at every start, an
+  `on-failure` restart included, so no core or profile file outlives a boot there.
+- **So, as built:** the compositor is non-dumpable (`PR_SET_DUMPABLE 0`: no core of it under any
+  pattern), and its RLIMIT_CORE is 1 byte, soft and hard, which CEF's children inherit (the dumpable
+  flag resets at `execve`): refused for a pipe, and below the ELF minimum for a file. The entrypoint
+  sets 1:1 on itself and tini. The probe aborts a CEF child (the kernel's refusal line, on the runner's
+  pipe) and the compositor (134, no `(core dumped)`). ~~Limit 1 under Fly's file pattern is the
+  coordinator's post-fix probe to confirm (Owed 73).~~ **MEASURED 2026-10-23** (the coordinator's Owed 76
+  probe at `341ae7a`, Machine `8ed9e19b166048`, kernel 6.12.114-fly, destroyed): the limit reads 1 1 on
+  tini, both bashes, Xvfb, the compositor and all 6 CEF children; the compositor's `/proc/<pid>/status`
+  is root's; no core after a forced compositor abort or a forced CEF-child abort (none in the cwd,
+  `/tmp`, `/` or `/dev/shm`); a dumpable control at limit 1 left no file, and at unlimited a 442 368-byte
+  `core`.
+
+
 ## Platform notes (Fly-specific; nothing inside the image depends on them)
 
 - **CPU:** performance-4x reports AMD EPYC with 4 vCPU.
@@ -1566,3 +1652,56 @@ Polls: 284 (interval 200 ms for M1/M3, 1 s for M2). HTTP non-200: 0.
 | 18:17:56.960 | 1 | True | 108 | 1417 |  |
 | 18:23:29.415 | 1 | True | 113 | 1400 | starting |
 
+## F-019: a stop's trap can cost bash the child's exit status (C12, 2026-10-23)
+
+**Where:** `docker/supervise.sh` as built in PR #36's review round 1 (`6b077fb`): the shell that traps
+INT and TERM also `wait`ed on the compositor, and re-waited after each trap.
+
+- **Measured:** check.yml run 39420277627, bash 5.2.21 on ubuntu-24.04. 150 races, where the stub child
+  exits 75 by itself at 0.30 s and an INT lands at 0.30 ± 0.015 s, gave `{75: 148, 130: 1, 255: 1}`.
+  130 is `wait`'s own status when a trap interrupts it (128 + SIGINT); it was kept because the re-wait
+  answered 127, so bash had reaped the child and dropped its status. The 255 is a status the child
+  never had. The same 150 races passed on macOS bash 3.2.57 and 5.2.21, so the host is no witness.
+- **What it costs:** a stop that lands as the compositor ends on its own (a deadline or C11b's 75
+  within milliseconds of a SIGTERM) makes the entrypoint exit 130 or 255. Fly reads a non-zero exit as
+  a failure and restarts an ended session (F-017's consequence), or a 75 reads as a crash.
+- **Fix:** the compositor runs under a waiter, a subshell that has no traps (a subshell resets them)
+  and that tini never signals. The waiter writes the compositor's pid, then its status, each to a file
+  in a private `/tmp` directory. The trapping shell reads a pipe that carries no data until the
+  waiter ends, then reads the status file. Data cannot go through the pipe: on a macOS host, bash
+  3.2.57's `read` dropped the byte it was reading when a trap ran (a `status=75.` line lost its `.` in
+  1 of 200 races).
+- **Guard:** `scripts/supervise_test.py`'s race, with each race timed from the child's own start.
+  check.yml runs 500 races. A new case pins that the child's stdout reaches the wrapper's, never the
+  waiter's pipe. ~~at round 1's measured rate, 500 clean races happen by luck about once in 800 runs~~
+  (wrong, corrected 2026-10-23 by the PR #36 final review's m1): mutant 37, round 1's design exactly,
+  lost 1 of 500 at the same ±15 ms draw (PR #45, check run 39931935374), so with round 1's 2 of 150 it
+  is 3 of 650, and 500 clean races came by luck in about 1 run in 3 to 1 in 10. Mutant 35 (c080c3f's
+  loop) lost 5 of 500. **Every printed loss had its INT at 0.301 s** (4 of 4), the 1 ms after the
+  child's own exit, where the ±15 ms draw puts about 1 race in 30. So 400 of the 500 races now draw the
+  INT from +0 to +3 ms after the exit, and 100 keep ±15 ms for timing drift; the tally prints each
+  share. Measured on the round-3 mutant PR #46 (Owed 75): 37 lost 16, 15 and 14 races of 500 (3 of 3
+  runs red), 35 lost 32 of 500.
+
+## F-020: a CEF child's `/proc/<pid>/environ` shows its process title, not its environment (C12, 2026-10-23)
+
+- **Measured on the runner:** image run 39931930126 (PR #44, mutant 29: `remove_var` deleted, so the
+  compositor's live environment kept `JOB_TOKEN`) reported all 6 CEF children "no JOB_TOKEN in its
+  environment". Their files read 2 to 509 "lines" of NUL padding, against the compositor's 15 (the
+  PR #36 final review's I-1). The probe's "readable, more than 0 lines" guard counted the padding.
+- **Measured on Fly** (the coordinator's Owed 76 probe at `341ae7a`): the two zygotes' and the
+  NetworkService child's files are 754 or 785 bytes of NUL only; the other three hold only title text
+  (one non-empty line each, none starting with `/opt/gstcef`). The old guard counted NUL padding as lines, so on
+  Fly it would have passed all 6 vacuously, exactly as on the runner.
+- **Cause (by mechanism, not traced to a frame):** a Chromium child sets its process title from its
+  command line, which reuses the argv and environ area; `/proc/<pid>/environ` reads that area.
+- **So:** no read of a CEF child's `/proc/<pid>/environ` witnesses its environment. The probe now
+  witnesses it at exec, in one dedicated container: `scripts/cef_env_witness.sh` (test only, bind-mounted,
+  never in the image), named by gstcefsrc's `GST_CEF_SUBPROCESS_PATH` (gstcefsrc.cc at the F-001 pin,
+  lines 852-856, which then puts the real gstcefsubprocess in `CEF_SUBPROCESS_PATH`; the C00 spike's
+  `cef-nice.sh` used the same knob), records for each child CEF execs whether `JOB_TOKEN` and three
+  controls (`DISPLAY`, `SESSION_ID`, `CEF_SUBPROCESS_PATH`) are set, then execs the real subprocess. A
+  zygote's forks (the renderer, the GPU process) keep the environment the zygote was exec'd with, and the
+  probe requires every live CEF process to descend from a recorded exec. A file nothing rewrites (Xvfb's,
+  a bash's, and the compositor's, whose in-process CEF browser sets no title: 24 lines on Fly) is its
+  exec-time environment, read as before, now with a control.

@@ -5,6 +5,8 @@ pub mod frame_store;
 pub mod gst_input;
 pub mod gst_output;
 pub mod gst_programme;
+pub mod metrics_proc;
+pub mod phase_http;
 pub mod redact;
 pub mod slate;
 pub mod stats;

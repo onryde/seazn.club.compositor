@@ -22,6 +22,8 @@ C11's do-not-touch list includes the domain and app crates.
 - **Owed 55, a teardown that never returns:** each one leaks a thread, a pipeline and a live renderer
   (about 22–38 MB PSS, the PR #32 review's P6). The compositor **warns, counts the leaks, lets the
   2-hour scheduled restart clear them, and requests an early in-place restart once 3 have leaked**.
+  (No 2-hour process restart exists: false premise (2) below, answered by the owner on 2026-10-20: fewer than 3
+  leaks stay until the session ends, and none is added.)
 
 C11 reports both as signals of their own and acts on neither:
 
@@ -181,6 +183,9 @@ Mutants: 12 domain, 7 app, 8 adapters (4 on the image), all red, each at its own
    `cef_recycle_every_ms` recycles the PAGE (a new build in the same process). No scheduled process restart exists,
    and a leaked teardown is a blocked thread only the process's exit frees. So fewer than 3 leaks stay until the
    session ends (or a restart for another cause). Reported to the coordinator (owner question).
+   **Answered 2026-10-20 (owner, in chat, relayed by the coordinator; `docs/_INDEX.md` decision row "Owner rulings
+   2026-10-20"):** accepted as built. One or two leaked teardowns stay live until the session ends; no process-level
+   2-hour restart is added; the in-place restart stays at 3 leaks (`cef_leaks_to_restart`).
 3. "C11b must give this exit a code or `exitDetail` of its own, so neither charges nor alarms it" (exit accounting):
    no compositor-side value can. Web's crash tally counts any final `fatal` beat and any non-zero exit but 78 that Fly
    restarts (R2003b `crashExitSeen`), and Fly charges every non-zero exit to `max_retries`. Web needs a change

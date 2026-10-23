@@ -1,0 +1,14 @@
+# The image build's context (docker/Dockerfile, C12): the workspace, its contracts and the harness
+# pages the cef-test stage loads. Nothing built, nothing that only documents.
+.git
+.github
+.claude
+target
+docs
+spike
+harness/out
+**/__pycache__
+**/core
+*.md
+!crates/**/*.md
+!contracts/**/*.md

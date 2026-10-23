@@ -25,6 +25,8 @@
 //! `Scrubber` masks the values the plane knows, by value, and then applies `redact`.
 use std::fmt;
 
+use app::ports::SessionConfig;
+
 /// Rule 1's markers, matched against the ASCII-lowercased text.
 const LIVE_PATHS: [&str; 4] = ["/live/", "/live2/", "%2flive%2f", "%2flive2%2f"];
 const SRT_SECRET_KEYS: [&str; 2] = ["streamid", "passphrase"];
@@ -167,6 +169,19 @@ impl Scrubber {
         self.values.sort_by_key(|v| std::cmp::Reverse(v.len()));
     }
 
+    /// Learn a session's four credentials (C12, lifted from C07's `HttpControlPlane::learn`, which
+    /// calls this too): the SRT stream id and passphrase, the RTMPS stream key, and the page token in
+    /// `overlay_url`'s query (`st=`; the contract's `pageToken`, not a `SessionConfig` field). One
+    /// list for the plane and the binary's log, so they cannot drift.
+    pub fn add_session(&mut self, session: &SessionConfig) {
+        self.add(&session.input.stream_id);
+        self.add(&session.input.passphrase);
+        self.add(&session.target.stream_key);
+        if let Some(t) = page_token_in(&session.overlay_url) {
+            self.add(t);
+        }
+    }
+
     /// `text` with every known value masked, then `redact`ed.
     pub fn scrub(&self, text: &str) -> String {
         let mut out = text.to_owned();
@@ -183,6 +198,12 @@ impl fmt::Debug for Scrubber {
             .field("values", &self.values.len())
             .finish()
     }
+}
+
+/// The page token in `overlayUrl`'s query (`st=`), the fourth credential a session carries.
+fn page_token_in(overlay_url: &str) -> Option<&str> {
+    let (_, query) = overlay_url.split_once('?')?;
+    query.split('&').find_map(|kv| kv.strip_prefix("st="))
 }
 
 /// RFC 3986 percent-encoding of every byte outside the unreserved set, with this hex alphabet. C10's
@@ -494,5 +515,53 @@ mod tests {
         // libtest captures this on a pass; CI prints it with --show-output (AGENTS.md §5).
         eprintln!("redaction carriers checked: {checked}");
         assert_eq!(checked, 8 * 4 * 4, "anti-vacuity: every carrier × prose × tail");
+    }
+
+    /// C12's lifted list: each of a session's four credentials, planted BARE (no `/live/`, no `?`,
+    /// no `streamid=`, so `redact` alone cannot see it), is masked once `add_session` learned it, and a
+    /// text naming none of them comes back unchanged (the positive pair: nothing else is masked).
+    #[test]
+    fn add_session_learns_all_four_credentials() {
+        use app::ports::{InputSpec, SessionConfig, TargetSpec};
+        use domain::config::OutputProfile;
+        let session = SessionConfig {
+            session_id: "sid-not-a-secret".into(),
+            fixture_id: None,
+            input: InputSpec {
+                url: "srt://h:778".into(),
+                stream_id: "PLANTED-STREAM-ID-11".into(),
+                passphrase: "PLANTED-PASSPHRASE-22".into(),
+            },
+            target: TargetSpec {
+                url: "rtmps://h:443/live/".into(),
+                stream_key: "PLANTED-STREAM-KEY-33".into(),
+            },
+            output: OutputProfile::P720,
+            heartbeat_interval_ms: 5_000,
+            overlay_url: "https://h/overlay/fixtures/f?sid=s&st=PLANTED-PAGE-TOKEN-44&delay=3100".into(),
+            overlay_delay_ms: 3_100,
+        };
+        let before = Scrubber::default();
+        let mut s = Scrubber::default();
+        s.add_session(&session);
+        let mut checked = 0;
+        for secret in [
+            "PLANTED-STREAM-ID-11",
+            "PLANTED-PASSPHRASE-22",
+            "PLANTED-STREAM-KEY-33",
+            "PLANTED-PAGE-TOKEN-44",
+        ] {
+            let text = format!("push failed: '{secret}' refused");
+            assert!(
+                before.scrub(&text).contains(secret),
+                "redact alone keeps it: the plant is bare"
+            );
+            assert!(!s.scrub(&text).contains(secret), "{secret} survived add_session");
+            checked += 1;
+        }
+        let plain = "push failed: 'sid-not-a-secret' refused";
+        assert_eq!(s.scrub(plain), plain, "nothing else is masked");
+        eprintln!("session credentials checked: {checked}");
+        assert_eq!(checked, 4);
     }
 }

@@ -18,9 +18,10 @@ use std::path::{Path, PathBuf};
 
 /// `docs/_INDEX.md` Owed 24: web's own pin of `docs/contracts/relay-job.v1.json`, copied from
 /// `seazn.club` `apps/web/src/server/api-v1/__tests__/relay-contract.test.ts` (`SHA256`, at
-/// eb6538a79, the #980 merge). A contract bump moves web's constant and this one together; a
-/// vendored file that hashes otherwise drifted from the contract web enforces.
-const WEB_PINNED_CONTRACT_SHA256: &str = "fc99d44899ee543cfe36c48902573501f815d68b4ec7c2e4bbb50d096608dc50";
+/// dec7b95d9, the #1000 merge: the `restart` exit word, Owed 66). A contract bump moves web's
+/// constant and this one together; a vendored file that hashes otherwise drifted from the contract
+/// web enforces.
+const WEB_PINNED_CONTRACT_SHA256: &str = "e656867729c9a0a05476ab85501dc61255db6a8826d75c74c195c34ff7f06a23";
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts")
@@ -1167,11 +1168,9 @@ fn sessions() -> Vec<(&'static str, World)> {
 }
 
 /// How each sweep session must end: its final beat's `exitReason` and the process exit code. Every row
-/// but the last comes from the contract's own `exitReason` description: ended, deadline, signalled and
-/// session_gone exit 0; refused exits 78; fatal exits 70. The `restart` row does NOT: C11b's in-place
-/// restart exits 75 (EX_TEMPFAIL) and goes on the wire as `fatal` until the contract has a word for it
-/// and its description says "restart exits 75" (Owed 66), so for now it breaks the description's
-/// "fatal exits 70". No web code reads 70: `crashExitSeen` reads "non-zero and not 78".
+/// comes from the contract's own `exitReason` description: ended, deadline, signalled and
+/// session_gone exit 0; refused exits 78; fatal exits 70; restart exits 75 (Owed 66, vendored at
+/// dec7b95d9; before it the `restart` row went as `fatal` with 75, against the description).
 const SESSION_ENDS: [(&str, &str, i32); 11] = [
     ("ended", "ended", 0),
     ("deadline", "deadline", 0),
@@ -1183,7 +1182,7 @@ const SESSION_ENDS: [(&str, &str, i32); 11] = [
     ("wrong-mode", "refused", 78),
     ("fatal", "fatal", 70),
     ("fatal-in-drain", "fatal", 70),
-    ("restart", "fatal", 75),
+    ("restart", "restart", 75),
 ];
 
 #[test]
@@ -1307,5 +1306,30 @@ fn every_heartbeat_we_can_emit_validates_against_the_contract() {
             "no exit beat carried {r}: {exit_reasons:?}"
         );
     }
-    assert_eq!(declared.len(), 6, "the six exit reasons");
+    assert_eq!(declared.len(), 7, "the six exit reasons and C11b's restart");
+}
+
+/// Owed 66: the vendored `heartbeat-final-restart.json` is the final beat of an in-place restart, and
+/// the beat the restart path sends (the sweep's `restart` session, a dead zygote of generation 1) is
+/// that fixture in its exit keys: `stopped`, `restart` and the domain's own detail.
+#[test]
+fn the_restart_beat_is_the_vendored_restart_fixture() {
+    let v = schema_def("heartbeat");
+    let want = fixture("heartbeat-final-restart.json");
+    assert!(violations(&v, &want).is_empty(), "the fixture validates");
+    let (_, w) = sessions()
+        .into_iter()
+        .find(|(n, _)| *n == "restart")
+        .expect("the sweep's restart session");
+    let last = w.beats.last().expect("a final beat");
+    let wire = heartbeat_wire(last, &Measured::default());
+    let mut checked = 0;
+    for key in ["state", "exitReason", "exitDetail"] {
+        assert_eq!(wire[key], want[key], "{key}: {wire} against {want}");
+        checked += 1;
+    }
+    assert_eq!(w.exit, Some(75), "EX_TEMPFAIL");
+    assert!(violations(&v, &wire).is_empty(), "{wire}");
+    eprintln!("restart fixture keys checked: {checked}");
+    assert_eq!(checked, 3);
 }

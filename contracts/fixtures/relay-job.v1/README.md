@@ -57,6 +57,9 @@ stored beat, never a `null` and never a `0`.
   the bound under which any text fits. `heartbeat-invalid-exit-reason` names a reason outside the
   vocabulary. The server records both fields with the beat, scrubbed again, and does nothing else with
   them.
+- `heartbeat-final-restart` is the final beat of an in-place restart (compositor C11b): `exitReason: "restart"`
+  and an `exitDetail` of the form `restart in place: <cause>`. The process then exits 75 and the host restarts it on
+  the same Machine; the server records the beat and does not count it as a crash.
 - `heartbeat-full` carries `phaseChannel: "web"`, the fallback. `heartbeat-final-hold` is a beat
   during the final hold (compositor C06): `programmePhase: "final"` on the primary channel,
   `phaseChannel: "loopback"`. `heartbeat-invalid-phase-channel` is a one-field edit of it, refused on
