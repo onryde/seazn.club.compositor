@@ -11,8 +11,10 @@
 #    hold (`final_hold_ms`) and the drain (`drain_timeout_ms`) run after the request, and the
 #    request only reaches the compositor on its next beat (plan amendment, Owed 5);
 # 4. saves the logs, brings the stack down, and runs the checker on what MediaMTX recorded;
-# 5. checks that no credential reached any log or output file;
-# 6. exits with the case's own verdict (`case_verdict`, `jq` over out/<case>/report.json).
+# 5. runs the case's own verdict (`case_verdict`, `jq` over out/<case>/report.json);
+# 6. on EVERY exit, early ones too (the EXIT trap): checks that no credential reached any file in
+#    out/<case>, its own console (out/<case>/console.log) among them, and writes the scan's counts
+#    to out/<case>/secrets.json. harness.yml uploads out/ only when that file says 0 leaks.
 #
 # A case file defines `case_drive` and `case_verdict`, and may set CASE_DEADLINE_S, CAMERA_SIZE,
 # CAMERA_PATTERN and CHECKER_RECORDINGS. Its verdict calls `require <name> <jq filter>` (on
@@ -89,6 +91,11 @@ rm -rf "$OUT"
 mkdir -p "$OUT/rec" "$CHECKER_RECORDINGS"
 : >"$OUT/emit.jsonl"
 : >"$OUT/heartbeats.jsonl"
+# The console, kept beside the outputs so the secrets scan reads it too (fds 3 and 4 keep the
+# originals, so the EXIT trap can close tee's pipe and wait for its last line before scanning).
+exec 3>&1 4>&2
+exec > >(tee -a "$OUT/console.log") 2>&1
+console_pid=$!
 
 RELAY_DEADLINE_AT="$(python3 -I -c 'import datetime,sys; print((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$CASE_DEADLINE_S")"
 export RELAY_DEADLINE_AT
@@ -114,7 +121,63 @@ teardown() {
     stack_up=0
   fi
 }
-trap teardown EXIT
+
+# No credential in any file the run produced. The values go to grep on a pipe, never in argv.
+# Files a short run never wrote are skipped, not read as clean: the count of files scanned is
+# what secrets.json reports, and 0 is a failure.
+present() { local f; for f in "$@"; do [ -f "$OUT/$f" ] && printf '%s\n' "$OUT/$f"; done; return 0; }
+leaks=0
+scanned=0
+scan_secrets() {
+  local name f files=()
+  scanned="$(find "$OUT" -type f ! -name secrets.json | wc -l | tr -d ' ')"
+  for name in JOB_TOKEN HARNESS_SRT_PASSPHRASE; do
+    if printf '%s\n' "${!name}" | grep -rqF -f - "$OUT"; then
+      log "FAIL $name appears in out/$CASE"
+      leaks=$((leaks + 1))
+    fi
+  done
+  # The page token: the compositor scrubs it from its log, and nothing else logs a query.
+  mapfile -t files < <(present compositor.log services.log checker.log console.log)
+  if [ "${#files[@]}" -gt 0 ] && printf '%s\n' "$PAGE_TOKEN" | grep -qF -f - "${files[@]}"; then
+    log "FAIL the page token appears in a log"
+    leaks=$((leaks + 1))
+  fi
+  # SESSION_ID: never in the harness's own files. The compositor's log is reported, not judged,
+  # and so is the console, which tails that log when the run never goes live.
+  for f in services.log checker.log emit.jsonl heartbeats.jsonl timeline.json run.json report.json; do
+    [ -f "$OUT/$f" ] || continue
+    if printf '%s\n' "$SESSION_ID" | grep -qF -f - "$OUT/$f"; then
+      log "FAIL SESSION_ID appears in $f"
+      leaks=$((leaks + 1))
+    fi
+  done
+  local sid_lines=0
+  if [ -f "$OUT/compositor.log" ]; then
+    sid_lines="$(printf '%s\n' "$SESSION_ID" | grep -cF -f - "$OUT/compositor.log" || true)"
+  fi
+  log "secrets checked: $scanned files, $leaks leaks (SESSION_ID on $sid_lines compositor log lines, reported only)"
+  if [ "$scanned" -eq 0 ]; then
+    log "FAIL no file was scanned for secrets"
+  fi
+  jq -n --argjson scanned "$scanned" --argjson leaks "$leaks" '{scanned: $scanned, leaks: $leaks}' \
+    >"$OUT/secrets.json"
+}
+
+# Every exit, early ones too: the logs, the stack down, then the scan over a flushed console.
+on_exit() {
+  local rc=$?
+  set +e
+  teardown
+  exec 1>&3 2>&4 3>&- 4>&-
+  wait "$console_pid" 2>/dev/null
+  scan_secrets
+  if [ "$leaks" -gt 0 ] || [ "$scanned" -eq 0 ]; then
+    [ "$rc" -ne 0 ] || rc=1
+  fi
+  exit "$rc"
+}
+trap on_exit EXIT
 
 log "up: relay $RELAY_IMAGE, harness $HARNESS_IMAGE, deadline $RELAY_DEADLINE_AT"
 stack_up=1
@@ -190,37 +253,10 @@ jq '{frames, duration_ms, fps_mean, pts_gaps: (.pts_gaps | length), segments: (.
      output_outages: (.output_outages | length), segment_overlaps: .segment_overlaps,
      strip_frames: .camera.strip_frames,
      slate_frames: .camera.slate_frames, regressions: .camera.counter_regressions,
-     latency_ms: .camera.latency_ms, score_changes: (.overlay.score_index_changes | length),
+     latency_ms: .camera.latency_ms, cadence: .camera.cadence,
+     score_changes: (.overlay.score_index_changes | length),
      av_offset_ms: .audio.av_offset_ms, beats: .heartbeats.count, rungs: .heartbeats.rungs,
      restarts_without_crash: .graphics.restarts_without_crash, checker_failures}' "$OUT/report.json"
-
-# No credential in any file the run produced. The values go to grep on a pipe, never in argv.
-leaks=0
-scanned="$(find "$OUT" -type f | wc -l | tr -d ' ')"
-for name in JOB_TOKEN HARNESS_SRT_PASSPHRASE; do
-  if printf '%s\n' "${!name}" | grep -rqF -f - "$OUT"; then
-    log "FAIL $name appears in out/$CASE"
-    leaks=$((leaks + 1))
-  fi
-done
-# The page token: the compositor scrubs it from its log, and nothing else logs a query.
-if printf '%s\n' "$PAGE_TOKEN" | grep -qF -f - "$OUT/compositor.log" "$OUT/services.log" "$OUT/checker.log"; then
-  log "FAIL the page token appears in a log"
-  leaks=$((leaks + 1))
-fi
-# SESSION_ID: never in the harness's own files; the compositor's log is reported, not judged.
-for f in services.log checker.log emit.jsonl heartbeats.jsonl timeline.json run.json report.json; do
-  if printf '%s\n' "$SESSION_ID" | grep -qF -f - "$OUT/$f"; then
-    log "FAIL SESSION_ID appears in $f"
-    leaks=$((leaks + 1))
-  fi
-done
-sid_lines="$(printf '%s\n' "$SESSION_ID" | grep -cF -f - "$OUT/compositor.log" || true)"
-log "secrets checked: $scanned files, $leaks leaks (SESSION_ID on $sid_lines compositor log lines, reported only)"
-if [ "$scanned" -eq 0 ]; then
-  log "FAIL no file was scanned for secrets"
-  exit 1
-fi
 
 # The case's verdict.
 echo "verdict ($CASE):"
@@ -229,12 +265,9 @@ if [ "$CASE_CHECKS" -le 0 ] || [ "$checks_run" -ne "$CASE_CHECKS" ]; then
   echo "FAIL the verdict ran $checks_run checks, the case declares $CASE_CHECKS"
   failures=$((failures + 1))
 fi
-if [ "$leaks" -gt 0 ]; then
-  failures=$((failures + 1))
-fi
 if [ "$checker_exit" -ne 0 ]; then
   echo "FAIL the checker exited $checker_exit"
   failures=$((failures + 1))
 fi
-log "$checks_run checks, $failures failures"
-[ "$failures" -eq 0 ]
+log "$checks_run checks, $failures failures (the secrets scan follows, at exit)"
+[ "$failures" -eq 0 ] || exit 1

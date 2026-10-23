@@ -1,6 +1,7 @@
 name: harness
 # The harness (C13): build the relay image and the harness image from docker/Dockerfile, run one
-# case of harness/run-case.sh against them (the smoke case on a pull request), and upload out/.
+# case of harness/run-case.sh against them (the smoke case on a pull request), and upload out/ once
+# run-case.sh's secrets scan says it is clean.
 # This is the only place the compose stack runs (owner ruling 2026-10-23: no local Docker). The
 # builds read image.yml's caches (GHCR when warm, else GitHub's) and write neither.
 # Dispatchable, so a throwaway mutant branch can run a case too.
@@ -122,15 +123,28 @@ jobs:
         run: |
           sudo modprobe -a sch_prio sch_netem cls_u32 || echo "modprobe failed: netem.sh's check will say whether tc works"
           lsmod | grep -E '^(sch_prio|sch_netem|cls_u32)' || true
+      # run-case.sh keeps its own console in harness/out/<case>/console.log, and its EXIT trap scans
+      # every file there for the run's credentials, early exits too (secrets.json).
       - name: Run the case
-        run: harness/run-case.sh "$CASE" 2>&1 | tee "harness-$CASE.log"
-      - name: Out
+        run: harness/run-case.sh "$CASE"
+      # Nothing is uploaded unless that scan ran, read at least one file, and found no credential.
+      - name: Leak gate
+        id: leaks
         if: always()
+        run: |
+          f="harness/out/$CASE/secrets.json"
+          if [ -f "$f" ] && jq -e '.scanned > 0 and .leaks == 0' "$f" > /dev/null; then
+            echo "secrets scan: $(jq -c . "$f")"
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::no clean secrets scan ($( [ -f "$f" ] && jq -c . "$f" || echo "no $f" )): out/ is not uploaded"
+            exit 1
+          fi
+      - name: Out
+        if: always() && steps.leaks.outputs.ok == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: harness-${{ env.CASE }}
-          path: |
-            harness/out/
-            harness-${{ env.CASE }}.log
-          if-no-files-found: ignore
+          path: harness/out/
+          if-no-files-found: error
           retention-days: 14
