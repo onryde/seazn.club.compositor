@@ -1,15 +1,28 @@
 name: image
 # The relay image (C12 Step 8): build it, check its plugins, run C11's graphics tests beside a real
 # cefsrc, smoke the binary in fake mode (exit 0, and C11b's exit 75), probe one live-mode run, and cap
-# the size. This workflow never pushes an image: pushing is C16's job.
+# the size. This workflow never pushes an image: pushing is C16's job. The one thing it pushes is
+# BuildKit's layer cache (decision log "CI: CEF layer from GHCR"): the `cache` job, on a push to main
+# or a manual run only, writes every stage's layers and the cache manifest, never a runnable image, to
+# ghcr.io/<owner>/seazn-relay-cache:cef-<key> (the key: scripts/cef-cache-key.sh). `image` reads it on
+# every run, with a read-only token; a cache that is missing or unreadable is a miss, never a failure.
 on:
   push: { branches: [main] }
   pull_request: {}
+  # A manual run fills the cache from a branch. Two on one ref queue (below), so dispatching twice
+  # fills it, then reads it.
+  workflow_dispatch: {}
+# Manual runs on one ref run one at a time, in order; every other run has a group of its own.
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && format('image-dispatch-{0}', github.ref) || format('image-{0}', github.run_id) }}
+  cancel-in-progress: false
 permissions: { contents: read }
 jobs:
   image:
     runs-on: ubuntu-24.04
     timeout-minutes: 75
+    # Read only, on every event: this job never writes the registry.
+    permissions: { contents: read, packages: read }
     defaults:
       # `bash -eo pipefail`: the implicit default has no pipefail (check.yml's note).
       run: { shell: bash }
@@ -36,6 +49,35 @@ jobs:
           fi
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
+      # The GHCR build cache, which the `cache` job writes. A failed login is a cold cache too.
+      - name: Log in to GHCR (read)
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build cache (GHCR, read)
+        id: cache
+        run: |
+          key=$(scripts/cef-cache-key.sh)
+          ref="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/seazn-relay-cache:cef-$key"
+          # Warm: GHCR alone. Cold (nothing at this key yet, or unreadable): GitHub's cache as well, read
+          # and written as before, so the run falls back instead of failing. Never both on a warm run:
+          # BuildKit merges its importers' records concurrently and the first to answer serves a layer
+          # they share (solver/combinedcache.go, Records), which could pull the CEF tree from GitHub's.
+          if docker buildx imagetools inspect --raw "$ref" > /dev/null 2> "$RUNNER_TEMP/cache-probe.err"; then
+            state=warm
+            from="type=registry,ref=$ref"
+            to=
+          else
+            state=cold
+            echo "cache probe: $(head -c 300 "$RUNNER_TEMP/cache-probe.err")"
+            from="type=registry,ref=$ref"$'\n'"type=gha"
+            to="type=gha,mode=max"
+          fi
+          echo "build cache: $ref ($state)"
+          { echo "from<<EOF"; echo "$from"; echo "EOF"; echo "to=$to"; } >> "$GITHUB_OUTPUT"
       - name: Build the image
         uses: docker/build-push-action@v6
         with:
@@ -45,8 +87,8 @@ jobs:
           tags: ${{ env.IMAGE }}
           load: true
           push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: ${{ steps.cache.outputs.from }}
+          cache-to: ${{ steps.cache.outputs.to }}
       - name: Build the cef-test stage
         uses: docker/build-push-action@v6
         with:
@@ -57,7 +99,7 @@ jobs:
           tags: ${{ env.TEST_IMAGE }}
           load: true
           push: false
-          cache-from: type=gha
+          cache-from: ${{ steps.cache.outputs.from }}
       - name: Plugin check
         run: docker run --rm --entrypoint gst-inspect-1.0 "$IMAGE" cefsrc > /dev/null
       - name: Runs as non-root, with no CEF log override
@@ -163,3 +205,81 @@ jobs:
             smoke75.log
             probe.log
           if-no-files-found: ignore
+
+  # Writes the build cache `image` reads: BuildKit's cache manifest and every stage's layers (mode=max:
+  # the cef-build tree that the cef-test stage pulls is an intermediate layer), never a runnable image
+  # (output cacheonly). Only on a push to main and a manual run (which needs write access to the
+  # repository); never on a pull request, so a PR's token is never a writer.
+  cache:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions: { contents: read, packages: write }
+    defaults:
+      run: { shell: bash }
+    steps:
+      - uses: actions/checkout@v4
+        # No token left in .git/config (.dockerignore drops .git too): nothing this job pushes can carry it.
+        with: { persist-credentials: false }
+      # A cold key builds CEF from source, as `image` does.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: gstcefsrc pin (F-001)
+        id: pin
+        run: |
+          commit=$(tr -d '[:space:]' < docker/GSTCEF_COMMIT)
+          if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::docker/GSTCEF_COMMIT is not a 40-hex commit: '$commit'"
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR (write)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build cache (GHCR, write)
+        id: cache
+        run: |
+          key=$(scripts/cef-cache-key.sh)
+          ref="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/seazn-relay-cache:cef-$key"
+          echo "build cache: $ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      # `image`'s own "Build the image" (the same context, file, build args and target), so these are the
+      # cache keys it looks up. GitHub's cache is read too, for a key's first fill.
+      - name: Write the build cache
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          outputs: type=cacheonly
+          cache-from: |
+            type=registry,ref=${{ steps.cache.outputs.ref }}
+            type=gha
+          cache-to: type=registry,ref=${{ steps.cache.outputs.ref }},mode=max
+      # The write landed, and it holds the cef-build tree (1.86 GB at CEF 139): a cache without it sends
+      # every cef-test build back to a CEF rebuild. A slimmer cef-build stage lowers this floor.
+      - name: The cache holds the CEF tree
+        env:
+          REF: ${{ steps.cache.outputs.ref }}
+        run: |
+          index="$RUNNER_TEMP/cache-index.json"
+          docker buildx imagetools inspect --raw "$REF" > "$index"
+          summary=$(jq -r '((.manifests // []) + (.layers // []))
+            | map(select((.mediaType // "") | test("cacheconfig") | not) | .size)
+            | "\(length) \(max // 0)"' "$index")
+          read -r blobs largest <<< "$summary"
+          echo "cache $REF: $blobs layers, the largest $largest bytes"
+          if [ "$blobs" -le 0 ]; then
+            echo "::error::the cache at $REF lists no layers"
+            exit 1
+          fi
+          if [ "$largest" -lt 1000000000 ]; then
+            echo "::error::the cache at $REF has no layer of 1 GB or more: the cef-build tree is missing"
+            exit 1
+          fi
