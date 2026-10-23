@@ -276,7 +276,9 @@ jobs:
   # nothing; C16's deploy builds never read this cache (C16 brief, amendment 2026-10-23).
   # Actions pinned by commit (the review's m7): this job holds a write token.
   cache:
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.measure == 'fill')
+    # `inputs` is empty on a push and a pull request, so `inputs.measure == 'fill'` is a fill dispatch alone;
+    # no parentheses, so scripts/cef_cache_key_test.py evaluates this guard per event (confirm pass c-2).
+    if: github.event_name == 'push' || inputs.measure == 'fill'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions: { contents: read, packages: write }

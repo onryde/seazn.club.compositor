@@ -139,6 +139,17 @@ def image_job(text):
     return job_if, timing, steps
 
 
+def own_if(text, name):
+    """A job's own `if:` (None when it has none; refused when the job is not there exactly once)."""
+    lines = text.splitlines()
+    if lines.count(f"  {name}:") != 1:
+        raise ValueError(f"the {name} job is not in image.yml exactly once")
+    start = lines.index(f"  {name}:")
+    end = next((i for i in range(start + 1, len(lines)) if re.fullmatch(r"  [a-z][\w-]*:", lines[i])), len(lines))
+    found = [m.group(1).strip() for l in lines[start + 1:end] if (m := re.fullmatch(r"    if: (.+)", l))]
+    return found[0] if found else None
+
+
 def term(t, ctx):
     """One comparison of the few forms image.yml uses; anything else is refused (extend it here)."""
     t = t.strip()
@@ -409,6 +420,25 @@ def main():
         check(evaluated > 0, "the guard sweep evaluated at least one step")
     except ValueError as e:
         check(False, f"the image job's guards: {e}")
+
+    # image.yml: the cache job holds `packages: write`, so its guard decides who gets a write token:
+    # a push to main and a fill dispatch, never a pull request or a timing run (the confirm pass's c-2).
+    try:
+        cache_if = own_if(text, "cache")
+        check(cache_if is not None, "the cache job has its own if:")
+        writes, judged = [], 0
+        for event, measure in cases:
+            ran = evaluate(cache_if or "always()", {"github.event_name": event, "inputs.measure": measure})
+            want = event == "push" or (event == "workflow_dispatch" and measure == "fill")
+            judged += 1
+            if ran:
+                writes.append(f"{event}/{measure or '-'}")
+            check(ran == want, f"{event}, measure '{measure}': the cache job {'runs' if ran else 'is skipped'}, "
+                               f"as owed ({'runs' if want else 'skipped'})")
+        print(f"cache job guard evaluated: {judged} events; it writes on {writes}")
+        check(judged == len(cases) and judged > 0, "the cache job's guard was evaluated for every event")
+    except ValueError as e:
+        check(False, f"the cache job's guard: {e}")
 
     if failures:
         print(f"{len(failures)} failure(s)", file=sys.stderr)
