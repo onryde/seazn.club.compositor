@@ -2,6 +2,14 @@ name: check
 on:
   push: { branches: [main] }
   pull_request: {}
+  # A proof run only: `apt_blackhole` points every mirror in the runner's list at an address nothing
+  # answers, so the GStreamer step must fail on its own bound, with its own error.
+  workflow_dispatch:
+    inputs:
+      apt_blackhole:
+        description: "Blackhole the apt mirrors (the GStreamer step must fail inside its bound)"
+        type: boolean
+        default: false
 permissions: { contents: read }
 jobs:
   check:
@@ -23,10 +31,21 @@ jobs:
         run: |
           python3 -I scripts/cef_cache_key_test.py
           python3 -I scripts/cache_timing.py --self-test
+      # scripts/apt-install.sh: the retries, the per-attempt bounds and the mirror fallback, under fakes.
+      - name: apt install script
+        run: python3 -I scripts/apt_install_test.py
+      - name: Blackhole the apt mirrors (dispatch only)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.apt_blackhole }}
+        run: |
+          hosts=$(awk -F/ '/^https?:/ {print $3}' /etc/apt/apt-mirrors.txt | sort -u | tr '\n' ' ')
+          echo "10.255.255.1 $hosts" | sudo tee -a /etc/hosts
       # The programme and output pipelines (C09) build against GStreamer and test against its
       # plugins: x264enc (ugly), flvmux/rtmp2sink/pngdec (good/bad), avdec_* (libav, decode-back only).
+      # A trickling mirror once held this step for 22 to 25 minutes and the job's bound cancelled the
+      # run (decision log, 2026-10-23); the script fails on its own inside 10 (worst case 490 s).
       - name: GStreamer
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
+        timeout-minutes: 10
+        run: scripts/apt-install.sh libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
       - uses: dtolnay/rust-toolchain@master
         with: { toolchain: "1.91.0", components: "rustfmt, clippy" }
       - uses: Swatinem/rust-cache@v2
