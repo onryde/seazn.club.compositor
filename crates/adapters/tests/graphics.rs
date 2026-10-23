@@ -1311,6 +1311,78 @@ fn a_dead_zygote_either_one_is_reported() {
     assert_eq!(checked.len(), 3);
 }
 
+// The zygote watch's baseline (image run 40015873298, 1 of 44 probe kills): the ready lists CEF's
+// children, so a zygote killed before any child poll has listed one is still reported. The poll is
+// held from the first restart, so the ready's listing is the watch's only one before the kill; then
+// it is let go. The GPU process's zygote, the one the probe kills. Killing a zygote can end CEF, so
+// it runs in a child process of its own.
+#[test]
+fn a_zygote_killed_before_any_poll_listed_it_is_reported() {
+    let _s = serial();
+    let name = "a_zygote_killed_before_any_poll_listed_it_is_reported";
+    if std::env::var_os("C11_CHILD").is_some() {
+        return zygote_at_ready_case();
+    }
+    let out = rerun_in_child(name, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let reached: Vec<&str> = stderr.lines().filter(|l| l.starts_with("ready child:")).collect();
+    assert!(
+        out.status.success(),
+        "the child failed ({:?}):\n{stderr}",
+        out.status
+    );
+    assert_eq!(reached.len(), 1, "{stderr}");
+    eprintln!("{}", reached[0]);
+}
+
+fn zygote_at_ready_case() {
+    let mut r = rig();
+    r.g.hold_polls(true);
+    r.g.restart(1, &page(""));
+    events_until(&r.rx, load_timeout(), ready(1));
+    assert_eq!(r.g.polls(), 0, "a child poll ran under the hold");
+    let me = std::process::id() as i32;
+    let kids = cef_children();
+    let renderer = kids
+        .iter()
+        .find(|k| k.kind == "renderer")
+        .expect("a renderer at the ready")
+        .clone();
+    let zygotes: Vec<i32> = kids
+        .iter()
+        .filter(|k| k.kind == "zygote" && k.ppid == me)
+        .map(|k| k.pid)
+        .collect();
+    let gpu: Vec<i32> = zygotes.iter().copied().filter(|z| *z != renderer.ppid).collect();
+    assert!(
+        zygotes.contains(&renderer.ppid) && gpu.len() == 1,
+        "not F-013's two zygotes: {kids:?}"
+    );
+    let _ = Command::new("kill").args(["-KILL", &gpu[0].to_string()]).status();
+    assert!(
+        wait_for(hang_bound(), || !alive(gpu[0])),
+        "zygote {} outlived SIGKILL",
+        gpu[0]
+    );
+    // Nothing has listed since the kill.
+    assert_eq!(r.g.polls(), 0, "a child poll ran under the hold");
+    assert_eq!(r.g.health().unrecoverable, None);
+    r.g.hold_polls(false);
+    assert!(
+        wait_for(hang_bound(), || r.g.health().unrecoverable.is_some()),
+        "the zygote killed before any poll was not reported: {:?}",
+        r.g.health()
+    );
+    assert_eq!(r.g.health().unrecoverable, Some(1));
+    assert!(alive(renderer.ppid), "the renderers' zygote died too");
+    eprintln!(
+        "ready child: GPU zygote {} killed with 0 polls run, {:?}",
+        gpu[0],
+        r.g.health()
+    );
+    r.g.stop();
+}
+
 // The PR #32 confirm pass's N1, pinned: why the GPU process's zygote's death is the verdict. With
 // that zygote dead, the next GPU-process death is Chromium's FATAL "GPU process isn't usable.
 // Goodbye." and the whole process dies of SIGTRAP: in production, the compositor, off air. The
