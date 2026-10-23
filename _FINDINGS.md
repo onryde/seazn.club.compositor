@@ -1680,8 +1680,8 @@ INT and TERM also `wait`ed on the compositor, and re-waited after each trap.
   loop) lost 5 of 500. **Every printed loss had its INT at 0.301 s** (4 of 4), the 1 ms after the
   child's own exit, where the ±15 ms draw puts about 1 race in 30. So 400 of the 500 races now draw the
   INT from +0 to +3 ms after the exit, and 100 keep ±15 ms for timing drift; the tally prints each
-  share. The new draw's kill rate is measured on the round-3 mutant PR #46 (Owed 75: 37 three times,
-  35 once), not assumed.
+  share. Measured on the round-3 mutant PR #46 (Owed 75): 37 lost 16, 15 and 14 races of 500 (3 of 3
+  runs red), 35 lost 32 of 500.
 
 ## F-020: a CEF child's `/proc/<pid>/environ` shows its process title, not its environment (C12, 2026-10-23)
 
@@ -1691,8 +1691,8 @@ INT and TERM also `wait`ed on the compositor, and re-waited after each trap.
   PR #36 final review's I-1). The probe's "readable, more than 0 lines" guard counted the padding.
 - **Measured on Fly** (the coordinator's Owed 76 probe at `341ae7a`): the two zygotes' and the
   NetworkService child's files are 754 or 785 bytes of NUL only; the other three hold only title text
-  (one non-empty line each, none starting with `/opt/gstcef`). On Fly the old guard would have failed
-  3 of 6.
+  (one non-empty line each, none starting with `/opt/gstcef`). The old guard counted NUL padding as lines, so on
+  Fly it would have passed all 6 vacuously, exactly as on the runner.
 - **Cause (by mechanism, not traced to a frame):** a Chromium child sets its process title from its
   command line, which reuses the argv and environ area; `/proc/<pid>/environ` reads that area.
 - **So:** no read of a CEF child's `/proc/<pid>/environ` witnesses its environment. The probe now
