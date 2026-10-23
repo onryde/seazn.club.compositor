@@ -63,3 +63,7 @@ required-features = ["media"]
 [[test]]
 name = "checker"
 required-features = ["media"]
+
+[[test]]
+name = "fake_control"
+required-features = ["media"]
