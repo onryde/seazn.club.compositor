@@ -724,6 +724,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness"
+version = "0.1.0"
+dependencies = [
+ "adapters",
+ "domain",
+ "gstreamer",
+ "gstreamer-app",
+ "gstreamer-video",
+ "serde",
+ "serde_json",
+ "time",
+ "tiny_http",
+ "ureq",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

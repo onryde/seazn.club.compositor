@@ -10,6 +10,16 @@
          emitting buffers (F-001: it emits only on paint).
      The centre (960,540) stays transparent.
 
+     Served at the session fixture's own path, /overlay/fixtures/<id> (C13: fake-control serves it
+     there, since the harness's session rewrite keeps the fixture's path), it also draws the SCORE
+     STRIP the checker reads (crates/harness/src/score.rs): 16 opaque cells of 24x24 at the top
+     right (x 1536..1920, y 0), black or white, the current score index (u16, most significant bit
+     first). The index is that of the latest event of /score.json whose `at + delay` is not after
+     the page's clock (`delay` is the URL's `delay=`, the session's overlayDelayMs); 0 before the
+     first. The page polls /score.json every second and keeps the last good answer while the feed is
+     down (503). Loaded anywhere else (C11's graphics tests from file:// and from
+     /overlay-test.html, image.yml's probe) it draws no strip and fetches nothing.
+
      What it says, on F-001's console channel (console.info, read from the `cefconsole` log
      category; never window.gstSendMsg, whose js-signal mode hangs start() and set_state(NULL)):
        - `seazn:ready`, 500 ms after load (`ready_after_ms=N` moves it);
@@ -46,6 +56,7 @@
   #square { left: 0; top: 0; width: 100px; height: 100px; background: #0000ff; }
   #white50 { left: 100px; top: 300px; width: 200px; height: 100px; background: rgba(255, 255, 255, 0.5); }
   #strip { left: 200px; top: 0; width: 1500px; height: 60px; font: bold 48px/60px monospace; color: #ff0; }
+  .cell { position: absolute; top: 0; width: 24px; height: 24px; background: #000; z-index: 10; }
 </style>
 </head>
 <body>
@@ -92,6 +103,49 @@
         busy(revive);
       }, num("crash_after_ms", 500));
     }
+  }
+
+  // The score strip (C13), at the fixture's path only.
+  if (location.pathname.startsWith("/overlay/fixtures/")) {
+    const delay = num("delay", 0);
+    const cells = [];
+    for (let k = 0; k < 16; k++) {
+      const c = document.createElement("div");
+      c.className = "cell";
+      c.style.left = (1536 + 24 * k) + "px";
+      document.body.appendChild(c);
+      cells.push(c);
+    }
+    let events = [];
+    let shown = -1;
+    function paint() {
+      const now = Date.now();
+      let index = 0;
+      for (const e of events) {
+        if (e.at + delay <= now && e.index > index) index = e.index;
+      }
+      if (index !== shown) {
+        for (let k = 0; k < 16; k++) {
+          cells[k].style.background = (index >> (15 - k)) & 1 ? "#fff" : "#000";
+        }
+        shown = index;
+      }
+    }
+    async function poll() {
+      try {
+        const r = await fetch("/score.json", { cache: "no-store" });
+        if (r.ok) {
+          const body = await r.json();
+          if (Array.isArray(body.events)) events = body.events;
+        }
+      } catch (e) {
+        // Keep the last good answer.
+      }
+    }
+    paint();
+    poll();
+    setInterval(poll, 1000);
+    setInterval(paint, 50);
   }
 
   if (q.get("noready") !== "1") {

@@ -1,0 +1,65 @@
+[package]
+name = "harness"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# The harness (C13): fakes of everything around the relay image, and the reference checker. Test
+# tooling only: no crate of the compositor depends on it, and the relay image never carries it.
+#
+# `media` (on by default) is GStreamer, and the adapters crate for C07's own session parser: the
+# camera's encoder, the checker's decoder, fake-control's start-up self-check and the two tests that
+# run frames through x264. Without it the crate keeps the parts that need no GStreamer (the strips,
+# the audio scan, the analysis, fake-control's routes), so they build and test on a host with no
+# GStreamer: `cargo test -p harness --no-default-features`.
+[features]
+default = ["media"]
+media = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:adapters"]
+
+[dependencies]
+# `Thresholds::default()`, the one authority for the programme's slate threshold and the final hold
+# (AGENTS.md §4). Only `domain::config` is read, never a state machine.
+domain = { path = "../domain" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# fake-control's routes and fake-camera's control port: blocking, no async runtime (as C12's
+# loopback endpoint).
+tiny_http = "0.12"
+gstreamer = { version = "0.24", features = ["v1_24"], optional = true }
+gstreamer-app = { version = "0.24", features = ["v1_24"], optional = true }
+gstreamer-video = { version = "0.24", features = ["v1_24"], optional = true }
+# C07's `control_http::parse_session` (fake-control's self-check uses the compositor's own rules) and
+# `redact` (every URL fake-control logs).
+adapters = { path = "../adapters", optional = true }
+
+[dev-dependencies]
+ureq = { version = "2", default-features = false }
+# The checker test names its fixture segments from an epoch with a second, independent clock.
+time = { version = "0.3", features = ["formatting", "macros"] }
+
+[[bin]]
+name = "fake-camera"
+path = "src/bin/fake-camera.rs"
+required-features = ["media"]
+
+[[bin]]
+name = "fake-control"
+path = "src/bin/fake-control.rs"
+required-features = ["media"]
+
+[[bin]]
+name = "checker"
+path = "src/bin/checker.rs"
+required-features = ["media"]
+
+[[test]]
+name = "strip"
+required-features = ["media"]
+
+[[test]]
+name = "checker"
+required-features = ["media"]
