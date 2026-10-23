@@ -759,6 +759,12 @@ decision row "C12 review round 1" holds the choices; `_FINDINGS.md` F-016 (Fly's
   | 35 | `c080c3f`'s wait loop | "the child dies of the forwarded USR2" (survived on macOS bash 3.2 and 5.2) | #43 |
   | 36 | no `TINI_KILL_PROCESS_GROUP` refusal | the refusal case (killed on the host) | #43 |
   | — | `hard_exit::now` made `std::process::exit` | `hard-exit`'s `exit.rs` (killed on the host) | — |
+- **Round 1's CI reds at `6b077fb`, fixed 2026-10-23** (`docs/_INDEX.md`'s row of that date; F-019):
+  `supervise` now runs the compositor under a waiter subshell that writes its pid and exit status to files in a private
+  `/tmp` directory, and never `wait`s on it from the trapping shell (2 of 150 races lost the status on the runner). The
+  probe and the binary test stat `/proc/<pid>/status`, not the directory (which keeps the euid), each against a dumpable
+  control; the probe reads environments with `docker exec --privileged` (CAP_SYS_PTRACE, which Docker's default set
+  lacks) and fails an unreadable one. check.yml's supervision step runs 500 races, last.
 
 ## Do not touch
 

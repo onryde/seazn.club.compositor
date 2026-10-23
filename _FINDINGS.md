@@ -1647,3 +1647,26 @@ Polls: 284 (interval 200 ms for M1/M3, 1 s for M2). HTTP non-200: 0.
 | 18:17:56.960 | 1 | True | 108 | 1417 |  |
 | 18:23:29.415 | 1 | True | 113 | 1400 | starting |
 
+## F-019: a stop's trap can cost bash the child's exit status (C12, 2026-10-23)
+
+**Where:** `docker/supervise.sh` as built in PR #36's review round 1 (`6b077fb`): the shell that traps
+INT and TERM also `wait`ed on the compositor, and re-waited after each trap.
+
+- **Measured:** check.yml run 39420277627, bash 5.2.21 on ubuntu-24.04. 150 races, where the stub child
+  exits 75 by itself at 0.30 s and an INT lands at 0.30 ± 0.015 s, gave `{75: 148, 130: 1, 255: 1}`.
+  130 is `wait`'s own status when a trap interrupts it (128 + SIGINT); it was kept because the re-wait
+  answered 127, so bash had reaped the child and dropped its status. The 255 is a status the child
+  never had. The same 150 races passed on macOS bash 3.2.57 and 5.2.21, so the host is no witness.
+- **What it costs:** a stop that lands as the compositor ends on its own (a deadline or C11b's 75
+  within milliseconds of a SIGTERM) makes the entrypoint exit 130 or 255. Fly reads a non-zero exit as
+  a failure and restarts an ended session (F-017's consequence), or a 75 reads as a crash.
+- **Fix:** the compositor runs under a waiter, a subshell that has no traps (a subshell resets them)
+  and that tini never signals. The waiter writes the compositor's pid, then its status, each to a file
+  in a private `/tmp` directory. The trapping shell reads a pipe that carries no data until the
+  waiter ends, then reads the status file. Data cannot go through the pipe: on a macOS host, bash
+  3.2.57's `read` dropped the byte it was reading when a trap ran (a `status=75.` line lost its `.` in
+  1 of 200 races).
+- **Guard:** `scripts/supervise_test.py`'s race, with each race timed from the child's own start.
+  check.yml runs 500 races; at round 1's measured rate, 500 clean races happen by luck about once in
+  800 runs. A new case pins that the child's stdout reaches the wrapper's, never the waiter's pipe.
+
