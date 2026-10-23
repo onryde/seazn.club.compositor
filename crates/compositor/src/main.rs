@@ -66,7 +66,7 @@ fn main() {
     // The plane has the token now (`env`). CEF's children start from this process's environment and
     // need none of it (the PR #36 review's m2). No thread runs yet (the signal handlers, the clock and
     // the logger start none), so removing it is sound; edition 2021 keeps `remove_var` safe.
-    std::env::remove_var(env::JOB_TOKEN);
+    /*MUT29*/
     if let Err(e) = std::fs::write("/proc/self/oom_score_adj", "-900") {
         log.warn(&format!("oom_score_adj -900 not set: {}", e.kind()));
     }
