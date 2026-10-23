@@ -1424,8 +1424,13 @@ logged `exit code=0` (or `exit code=75`'s path, unmeasured).
   pattern), and its RLIMIT_CORE is 1 byte, soft and hard, which CEF's children inherit (the dumpable
   flag resets at `execve`): refused for a pipe, and below the ELF minimum for a file. The entrypoint
   sets 1:1 on itself and tini. The probe aborts a CEF child (the kernel's refusal line, on the runner's
-  pipe) and the compositor (134, no `(core dumped)`). Limit 1 under Fly's file pattern is the
-  coordinator's post-fix probe to confirm (Owed 73).
+  pipe) and the compositor (134, no `(core dumped)`). ~~Limit 1 under Fly's file pattern is the
+  coordinator's post-fix probe to confirm (Owed 73).~~ **MEASURED 2026-10-23** (the coordinator's Owed 76
+  probe at `341ae7a`, Machine `8ed9e19b166048`, kernel 6.12.114-fly, destroyed): the limit reads 1 1 on
+  tini, both bashes, Xvfb, the compositor and all 6 CEF children; the compositor's `/proc/<pid>/status`
+  is root's; no core after a forced compositor abort or a forced CEF-child abort (none in the cwd,
+  `/tmp`, `/` or `/dev/shm`); a dumpable control at limit 1 left no file, and at unlimited a 442 368-byte
+  `core`.
 
 
 ## Platform notes (Fly-specific; nothing inside the image depends on them)
@@ -1667,6 +1672,36 @@ INT and TERM also `wait`ed on the compositor, and re-waited after each trap.
   3.2.57's `read` dropped the byte it was reading when a trap ran (a `status=75.` line lost its `.` in
   1 of 200 races).
 - **Guard:** `scripts/supervise_test.py`'s race, with each race timed from the child's own start.
-  check.yml runs 500 races; at round 1's measured rate, 500 clean races happen by luck about once in
-  800 runs. A new case pins that the child's stdout reaches the wrapper's, never the waiter's pipe.
+  check.yml runs 500 races. A new case pins that the child's stdout reaches the wrapper's, never the
+  waiter's pipe. ~~at round 1's measured rate, 500 clean races happen by luck about once in 800 runs~~
+  (wrong, corrected 2026-10-23 by the PR #36 final review's m1): mutant 37, round 1's design exactly,
+  lost 1 of 500 at the same ±15 ms draw (PR #45, check run 39931935374), so with round 1's 2 of 150 it
+  is 3 of 650, and 500 clean races came by luck in about 1 run in 3 to 1 in 10. Mutant 35 (c080c3f's
+  loop) lost 5 of 500. **Every printed loss had its INT at 0.301 s** (4 of 4), the 1 ms after the
+  child's own exit, where the ±15 ms draw puts about 1 race in 30. So 400 of the 500 races now draw the
+  INT from +0 to +3 ms after the exit, and 100 keep ±15 ms for timing drift; the tally prints each
+  share. The new draw's kill rate is measured on the round-3 mutant PR #46 (Owed 75: 37 three times,
+  35 once), not assumed.
 
+## F-020: a CEF child's `/proc/<pid>/environ` shows its process title, not its environment (C12, 2026-10-23)
+
+- **Measured on the runner:** image run 39931930126 (PR #44, mutant 29: `remove_var` deleted, so the
+  compositor's live environment kept `JOB_TOKEN`) reported all 6 CEF children "no JOB_TOKEN in its
+  environment". Their files read 2 to 509 "lines" of NUL padding, against the compositor's 15 (the
+  PR #36 final review's I-1). The probe's "readable, more than 0 lines" guard counted the padding.
+- **Measured on Fly** (the coordinator's Owed 76 probe at `341ae7a`): the two zygotes' and the
+  NetworkService child's files are 754 or 785 bytes of NUL only; the other three hold only title text
+  (one non-empty line each, none starting with `/opt/gstcef`). On Fly the old guard would have failed
+  3 of 6.
+- **Cause (by mechanism, not traced to a frame):** a Chromium child sets its process title from its
+  command line, which reuses the argv and environ area; `/proc/<pid>/environ` reads that area.
+- **So:** no read of a CEF child's `/proc/<pid>/environ` witnesses its environment. The probe now
+  witnesses it at exec, in one dedicated container: `scripts/cef_env_witness.sh` (test only, bind-mounted,
+  never in the image), named by gstcefsrc's `GST_CEF_SUBPROCESS_PATH` (gstcefsrc.cc at the F-001 pin,
+  lines 852-856, which then puts the real gstcefsubprocess in `CEF_SUBPROCESS_PATH`; the C00 spike's
+  `cef-nice.sh` used the same knob), records for each child CEF execs whether `JOB_TOKEN` and three
+  controls (`DISPLAY`, `SESSION_ID`, `CEF_SUBPROCESS_PATH`) are set, then execs the real subprocess. A
+  zygote's forks (the renderer, the GPU process) keep the environment the zygote was exec'd with, and the
+  probe requires every live CEF process to descend from a recorded exec. A file nothing rewrites (Xvfb's,
+  a bash's, and the compositor's, whose in-process CEF browser sets no title: 24 lines on Fly) is its
+  exec-time environment, read as before, now with a control.

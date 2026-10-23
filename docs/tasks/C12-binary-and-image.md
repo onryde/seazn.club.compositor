@@ -278,8 +278,16 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
   `restart` (amended 2026-10-20, Owed 66: web's #1000, contract re-vendored at `dec7b95d9`) with a `restart in place: `
   `exitDetail`; the `cef health` line is in
   `graphics_log_lines_exist_in_both_driver_modes`, once per mode.
-- (Amended 2026-10-20, Owed 68) RLIMIT_CORE is 0 for the compositor and its CEF children, read from
-  `/proc/<pid>/limits` in the image test.
+- (Amended 2026-10-20, Owed 68) RLIMIT_CORE is ~~0~~ 1 byte, soft and hard (amended 2026-10-23, the PR #36 final
+  review's m4: the round-1 amendment below superseded 0; the probe demands 1, and Fly measured 1 1 at `341ae7a`, Owed 76)
+  for the compositor and its CEF children, read from `/proc/<pid>/limits` in the image test.
+- (Amended 2026-10-23, Owed 73, the PR #36 final review's I-1) No `JOB_TOKEN` at any CEF child's exec, witnessed by
+  `scripts/cef_env_witness.sh` in the probe's one witness container (never in the image): it ran (N > 0), every live
+  CEF process came through it, `DISPLAY`, `SESSION_ID` and `CEF_SUBPROCESS_PATH` set N of N, `JOB_TOKEN` unset N of N.
+  Mutant 29 (`remove_var` deleted) goes red on it (#46, Owed 75). Xvfb's environment check carries
+  the control `SESSION_ID`.
+- (Amended 2026-10-23, the PR #36 final review's m1) `supervise_test.py`'s 500 races draw 400 INTs from +0 to +3 ms
+  after the child's exit and 100 from ±15 ms; mutant 37 (round 1's trapped `wait`) goes red on the races 3 runs of 3.
 
 
 ## Final heartbeat with the exit reason (owner ruling 2026-10-15)
@@ -750,7 +758,7 @@ decision row "C12 review round 1" holds the choices; `_FINDINGS.md` F-016 (Fly's
   |---|---|---|---|
   | 27 | `main` exits through `std::process::exit` | phase B: a 134 or abort text in some of 32 exits (probabilistic) | #41 |
   | 28 | no `PR_SET_DUMPABLE` | the compositor's `/proc/<pid>` is not root-owned | #41 |
-  | 29 | `JOB_TOKEN` stays in the environment | each CEF child's environment check | #41 |
+  | 29 | `JOB_TOKEN` stays in the environment | ~~each CEF child's environment check~~ (it SURVIVED that, F-020) the exec-time witness: "no JOB_TOKEN at any CEF child's exec" (amended 2026-10-23) | #41, #44, #46 |
   | 30 | `CORE_LIMIT_BYTES` 0 | the compositor's and each CEF child's limit; the CEF child's kernel refusal line | #42 |
   | 31 | no `prlimit` in the entrypoint | tini's, bash's and Xvfb's limit | #42 |
   | 32 | Xvfb keeps `JOB_TOKEN` | Xvfb's environment check | #42 |
@@ -765,6 +773,37 @@ decision row "C12 review round 1" holds the choices; `_FINDINGS.md` F-016 (Fly's
   probe and the binary test stat `/proc/<pid>/status`, not the directory (which keeps the euid), each against a dumpable
   control; the probe reads environments with `docker exec --privileged` (CAP_SYS_PTRACE, which Docker's default set
   lacks) and fails an unreadable one. check.yml's supervision step runs 500 races, last.
+
+## Amendment 2026-10-23 (the PR #36 final review: the CEF children's environment at exec, the race draw)
+
+The final review at `341ae7a` (Needs fixes: I-1, m1–m8) and the coordinator's Owed 76 Fly probe at the same head.
+`docs/_INDEX.md`'s decision row "C12 final review fixes" holds the choices; `_FINDINGS.md` F-020 the fact.
+
+- **The CEF children's `JOB_TOKEN` check is witnessed at exec** (I-1, F-020). Chromium rewrites a child's
+  `/proc/<pid>/environ` for its process title, so the old check passed with mutant 29 (`remove_var` deleted) in place.
+  The probe now runs one dedicated container with `scripts/cef_env_witness.sh` bind-mounted and gstcefsrc's
+  `GST_CEF_SUBPROCESS_PATH` pointing at it (the knob exists at the F-001 pin: gstcefsrc.cc lines 852-856). For every
+  child CEF execs, the witness records whether `JOB_TOKEN`, `DISPLAY`, `SESSION_ID` and `CEF_SUBPROCESS_PATH` are set
+  (never a value), then execs the real gstcefsubprocess. The probe requires N > 0 records, every live CEF process
+  descended from a recorded exec (the zygotes' forks included), the three controls set N of N and `JOB_TOKEN` unset N
+  of N. The witness is never in the image (no Dockerfile change). Xvfb's environment check now needs the control
+  `SESSION_ID` in the file, so padding cannot pass it.
+- **The races** (m1): 400 of the 500 INTs land +0 to +3 ms after the child's exit (every printed loss was at 0.301 s),
+  100 at ±15 ms; the tally prints both shares. The "about once in 800 runs" text was wrong: at the old draw mutant 37
+  lost 1 of 500, so a clean 500 came by luck in about 1 run in 3 to 1 in 10.
+- **m6:** the probe's dumpable control is the compositor's parent, the waiter, found by ppid (it was the first bash in
+  `/proc`'s glob order, which is the waiter or the entrypoint by the pids' digits). **m7:** "INT then TERM" asserts that
+  the child saw USR1 then USR2 (a forward-once mutant passed it before; killed on the host now). **m4:** the acceptance
+  line above reads 1 byte, not 0. **m2, m3:** Owed 75 records #44 and #45, and the late-trap stimulus's 143 as
+  intermittent. **m5:** a residual, Owed 77. **m8** (`supervise` is single-use; unreachable, the entrypoint calls it
+  once): not changed in this round.
+- **Round-3 mutants** (Owed 75), on one throwaway draft PR from this round's head:
+
+  | # | Mutant | Expected red | PR |
+  |---|---|---|---|
+  | 29 | `remove_var(JOB_TOKEN)` deleted | "no JOB_TOKEN at any CEF child's exec", and no other probe line | #46 |
+  | 37 | round 1's `supervise` (the trapped `wait`), the killed-by line kept | the races, in each of 3 runs | #46 |
+  | 35 | `c080c3f`'s loop, the killed-by line kept | the races, once | #46 |
 
 ## Do not touch
 
