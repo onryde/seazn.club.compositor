@@ -108,22 +108,27 @@ fn beats(t0: i64, rungs: &[&str]) -> Vec<Beat> {
         .collect()
 }
 
-fn write(dir: &Path, swap: bool) -> (i64, i64) {
+fn write(dir: &Path, swap: bool, audio_delay: u32) -> (i64, i64) {
     let l = Layout::i420(1280, 720);
     let (t1, n1) = at(0);
     let (t2, n2) = at(4_500);
     let rec = dir.join("live").join("dest");
     std::fs::create_dir_all(&rec).unwrap();
-    common::write_mp4(&rec.join(n1), &l, &segment_1());
-    common::write_mp4(&rec.join(n2), &l, &segment_2(swap));
+    common::write_mp4(&rec.join(n1), &l, &segment_1(), audio_delay);
+    common::write_mp4(&rec.join(n2), &l, &segment_2(swap), audio_delay);
     (t1, t2)
 }
 
 fn run(name: &str, swap: bool, rungs: &[&str]) -> Report {
+    run_delayed(name, swap, rungs, 0)
+}
+
+/// `run`, with the fixture's audio `audio_delay` samples behind its picture.
+fn run_delayed(name: &str, swap: bool, rungs: &[&str], audio_delay: u32) -> Report {
     common::init();
     let dir: PathBuf = std::env::temp_dir().join(format!("harness-checker-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let (t1, t2) = write(&dir, swap);
+    let (t1, t2) = write(&dir, swap, audio_delay);
     let segments = scan_recordings(&dir).unwrap();
     let inputs = Inputs {
         segments,
@@ -200,10 +205,12 @@ fn two_recorded_segments_give_the_fixtures_outage_freeze_slate_and_latency() {
         r.camera.latency_ms
     );
 
-    // Bursts on counters 30, 90, 120 and 150 pair; the freeze's (60) does not.
+    // Bursts on counters 30, 90, 120 and 150 pair; the freeze's (60) does not. The fixture stamps
+    // audio and picture alike, so its offset is 0, and the checker (with the camera's AAC delay taken
+    // out) reads 0 within 5 ms.
     assert_eq!(r.audio.onsets, 5, "{:?}", r.audio);
     assert_eq!(r.audio.av_offset_ms.pairs, 4, "{:?}", r.audio);
-    assert!(r.audio.av_offset_ms.max_abs <= 50, "{:?}", r.audio.av_offset_ms);
+    assert!(r.audio.av_offset_ms.max_abs <= 5, "{:?}", r.audio.av_offset_ms);
     assert!(r.audio.silent_gaps.is_empty(), "{:?}", r.audio.silent_gaps);
 
     assert_eq!(
@@ -211,6 +218,19 @@ fn two_recorded_segments_give_the_fixtures_outage_freeze_slate_and_latency() {
         vec!["full".to_owned(), "overlay_half_rate".to_owned()]
     );
     assert!(r.checker_failures.is_empty(), "{:?}", r.checker_failures);
+}
+
+/// The calibration's check against a known answer: the same fixture with its audio 1 200 samples
+/// (25 ms) behind the picture reads +25 ms within 5. The zero case alone could not tell a correct
+/// calibration from one fitted to it.
+#[test]
+fn a_known_audio_delay_reads_as_that_offset() {
+    let r = run_delayed("delay", false, &["full"], 1_200);
+    let av = &r.audio.av_offset_ms;
+    eprintln!("delayed fixture: {av:?}");
+    assert_eq!(av.pairs, 4, "{:?}", r.audio);
+    assert!((av.p50 - 25).abs() <= 5, "{av:?}");
+    assert!((av.max_abs - 25).abs() <= 5, "{av:?}");
 }
 
 #[test]

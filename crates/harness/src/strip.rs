@@ -107,23 +107,32 @@ pub fn draw_cells(p: &mut PlaneMut<'_>, x0: u32, y0: u32, cell: u32, n: u32, bit
     }
 }
 
-/// Reads `n` cells of side `cell` from `(x0, y0)` as bits, most significant first, or `None` when any
-/// cell is out of the plane, too small to sample, or neither clearly dark nor clearly light.
-pub fn read_cells(p: &Plane<'_>, x0: u32, y0: u32, cell: u32, n: u32) -> Option<u64> {
+/// The mean luma of each of `n` cells' centres (the middle half in each direction), or `None` when a
+/// cell is out of the plane or too small to sample.
+pub fn cell_means(p: &Plane<'_>, x0: u32, y0: u32, cell: u32, n: u32) -> Option<Vec<u32>> {
     if cell < 4 || n == 0 || n > 64 || x0 + n * cell > p.width || y0 + cell > p.height {
         return None;
     }
     let (lo, hi) = (cell / 4, cell - cell / 4);
+    (0..n)
+        .map(|i| {
+            let cx = x0 + i * cell;
+            let mut sum = 0u32;
+            for row in (y0 + lo)..(y0 + hi) {
+                let start = row as usize * p.stride + (cx + lo) as usize;
+                let end = row as usize * p.stride + (cx + hi) as usize;
+                sum += p.data.get(start..end)?.iter().map(|&b| u32::from(b)).sum::<u32>();
+            }
+            Some(sum / ((hi - lo) * (hi - lo)))
+        })
+        .collect()
+}
+
+/// Reads `n` cells of side `cell` from `(x0, y0)` as bits, most significant first, or `None` when any
+/// cell is out of the plane, too small to sample, or neither clearly dark nor clearly light.
+pub fn read_cells(p: &Plane<'_>, x0: u32, y0: u32, cell: u32, n: u32) -> Option<u64> {
     let mut bits = 0u64;
-    for i in 0..n {
-        let cx = x0 + i * cell;
-        let mut sum = 0u32;
-        for row in (y0 + lo)..(y0 + hi) {
-            let start = row as usize * p.stride + (cx + lo) as usize;
-            let end = row as usize * p.stride + (cx + hi) as usize;
-            sum += p.data.get(start..end)?.iter().map(|&b| u32::from(b)).sum::<u32>();
-        }
-        let mean = sum / ((hi - lo) * (hi - lo));
+    for mean in cell_means(p, x0, y0, cell, n)? {
         let bit = if mean < DARK_BELOW {
             0
         } else if mean > LIGHT_ABOVE {
@@ -134,6 +143,12 @@ pub fn read_cells(p: &Plane<'_>, x0: u32, y0: u32, cell: u32, n: u32) -> Option<
         bits = (bits << 1) | bit;
     }
     Some(bits)
+}
+
+/// The camera strip's 48 cell means (for a failure's diagnosis: [`cell_means`]).
+pub fn strip_cell_means(y: &Plane<'_>) -> Option<Vec<u32>> {
+    let cell = cell_size(y.height);
+    cell_means(y, 0, y.height.checked_sub(cell)?, cell, CELLS)
 }
 
 /// The strip's 48 bits for `counter`: the counter, then its checksum.

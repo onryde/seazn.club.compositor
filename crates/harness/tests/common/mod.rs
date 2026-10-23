@@ -75,6 +75,46 @@ fn wait_eos(pipeline: &gst::Pipeline, what: &str) {
     pipeline.set_state(gst::State::Null).expect("null");
 }
 
+/// One decoded frame of a round trip.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Decoded {
+    /// Frames since the first decoded PTS.
+    pub index: u64,
+    pub strip: Option<u32>,
+    /// The strip's cell means, for a failure's message ([`explain`]).
+    pub cells: Option<Vec<u32>>,
+}
+
+/// A strip reading's diagnosis: the bits `want` should show, then what each cell read as (`0`, `1`,
+/// or `?` for neither, a wrong `0` as `O` and a wrong `1` as `I`), then the cell means.
+pub fn explain(want: Option<u32>, cells: &Option<Vec<u32>>) -> String {
+    let Some(means) = cells else {
+        return "cells: unreadable".into();
+    };
+    let want_bits = want.map(strip::bits);
+    let read: String = means
+        .iter()
+        .enumerate()
+        .map(|(k, &m)| {
+            let r = if m < strip::DARK_BELOW {
+                '0'
+            } else if m > strip::LIGHT_ABOVE {
+                '1'
+            } else {
+                '?'
+            };
+            let wrong = want_bits.is_some_and(|b| r != if (b >> (47 - k)) & 1 == 1 { '1' } else { '0' });
+            match (wrong, r) {
+                (true, '0') => 'O',
+                (true, '1') => 'I',
+                _ => r,
+            }
+        })
+        .collect();
+    let want_s = want_bits.map_or_else(|| "none".to_owned(), |b| format!("{b:048b}"));
+    format!("want {want_s}\nread {read}\nmeans {means:?}")
+}
+
 /// Encodes `pictures` (I420, `l`'s layout) with the camera's x264 settings, decodes them with
 /// avdec_h264, scales to `out` when given, and returns each decoded frame's strip reading in PTS
 /// order with its PTS index. The count is the caller's to check (a lost frame is a failure).
@@ -83,11 +123,7 @@ fn wait_eos(pipeline: &gst::Pipeline, what: &str) {
 /// by 1 000 hours (GstVideoEncoder's minimum PTS, so a DTS never goes negative), which read as
 /// index 108 000 001 for frame 0 on CI (run 39979756301). A lost first frame still fails the caller,
 /// whose expected reading for frame 0 is that picture's own counter.
-pub fn x264_round_trip(
-    l: &Layout,
-    out: Option<(u32, u32)>,
-    pictures: Vec<Vec<u8>>,
-) -> Vec<(u64, Option<u32>)> {
+pub fn x264_round_trip(l: &Layout, out: Option<(u32, u32)>, pictures: Vec<Vec<u8>>) -> Vec<Decoded> {
     let pipeline = gst::Pipeline::new();
     let src = appsrc(&media::i420_caps(l.width, l.height).expect("caps"));
     let (enc, parse, dec, convert) = (
@@ -135,17 +171,25 @@ pub fn x264_round_trip(
             width: info.width(),
             height: info.height(),
         };
-        decoded.push((b.pts().expect("pts").nseconds(), strip::read(&y)));
+        decoded.push((
+            b.pts().expect("pts").nseconds(),
+            strip::read(&y),
+            strip::strip_cell_means(&y),
+        ));
         if decoded.len() as u64 == n {
             break;
         }
     }
     pusher.join().expect("pusher");
     wait_eos(&pipeline, "x264 round trip");
-    let first = decoded.iter().map(|(pts, _)| *pts).min().unwrap_or(0);
-    let mut read: Vec<(u64, Option<u32>)> = decoded
+    let first = decoded.iter().map(|(pts, _, _)| *pts).min().unwrap_or(0);
+    let mut read: Vec<Decoded> = decoded
         .into_iter()
-        .map(|(pts, got)| ((pts - first + FRAME_NS / 2) / FRAME_NS, got))
+        .map(|(pts, strip, cells)| Decoded {
+            index: (pts - first + FRAME_NS / 2) / FRAME_NS,
+            strip,
+            cells,
+        })
         .collect();
     read.sort_unstable();
     read
@@ -159,9 +203,22 @@ pub struct SegFrame {
     pub audio_counter: u32,
 }
 
+/// The camera's samples for frame `counter`, delayed by `delay` samples (under one frame): the tail of
+/// the frame before, then the head of this one. The audio then really is `delay` behind the picture.
+pub fn delayed_samples(counter: u32, delay: u32) -> Vec<i16> {
+    assert!(delay < audio::SAMPLES_PER_FRAME, "a delay under one frame");
+    if delay == 0 {
+        return audio::frame_samples(counter);
+    }
+    let before = audio::frame_samples(counter.saturating_sub(1));
+    let this = audio::frame_samples(counter);
+    let cut = (audio::SAMPLES_PER_FRAME - delay) as usize;
+    before[cut..].iter().chain(&this[..cut]).copied().collect()
+}
+
 /// Writes `frames` as a fragmented MP4 (mp4mux, 1 s fragments, as MediaMTX's fMP4 recording) with
-/// H.264 and AAC, PTS from 0 at 30 fps.
-pub fn write_mp4(path: &Path, l: &Layout, frames: &[SegFrame]) {
+/// H.264 and AAC, PTS from 0 at 30 fps; the audio `audio_delay` samples behind the picture.
+pub fn write_mp4(path: &Path, l: &Layout, frames: &[SegFrame], audio_delay: u32) {
     let pipeline = gst::Pipeline::new();
     let v = appsrc(&media::i420_caps(l.width, l.height).expect("caps"));
     let a = appsrc(&media::audio_caps());
@@ -197,7 +254,7 @@ pub fn write_mp4(path: &Path, l: &Layout, frames: &[SegFrame]) {
             None => slate(l, 128),
         };
         v.push_buffer(stamp(picture, i as u64)).expect("video push");
-        let pcm: Vec<u8> = audio::frame_samples(f.audio_counter)
+        let pcm: Vec<u8> = delayed_samples(f.audio_counter, audio_delay)
             .iter()
             .flat_map(|s| s.to_le_bytes())
             .collect();

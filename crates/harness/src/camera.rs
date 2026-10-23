@@ -90,7 +90,9 @@ pub fn parse_command(method: &str, url: &str) -> Result<Command, String> {
 pub enum Pattern {
     /// A moving ball: motion for the encoder, a mostly black picture.
     Ball,
-    /// Noise in every pixel (the 2026-10-18 amendment, for C15's cost legs).
+    /// Noise in 16×16 blocks on the macroblock grid, new every frame, over a one-cell black guard
+    /// above the strip (the 2026-10-18 amendment, for C15's cost legs; [`SNOW_BLOCK`] says why it is
+    /// not per-pixel).
     Snow,
 }
 
@@ -141,13 +143,30 @@ impl Layout {
 }
 
 /// The ball's side: a sixth of the height, so it moves well clear of the strip.
+/// The snow's block side.
+///
+/// The amendment's "videotestsrc pattern=snow under the strip, which stays readable" is false at the
+/// camera's 4 Mbps. Noise in every pixel starves x264 at every I-frame: the rate control's VBV goes
+/// into emergency, and the strip at the frame's bottom comes out as flat grey. That happened in CI
+/// run 39984287910, at frame 1020, the first snow keyframe. It reproduced locally through libx264 at
+/// the camera's settings with sliced threads (as `tune=zerolatency` sets them) and again through a
+/// second generation at the programme's settings.
+///
+/// Blocks of 16 on the macroblock grid, each new every frame, still defeat motion search and leave a
+/// residual in every macroblock. With [`SNOW_GUARD_CELLS`], the strip read back on every frame
+/// through both generations at 4 Mbps, and at 2 Mbps (twice the margin). Blocks of 8 failed at
+/// 4 Mbps.
+pub const SNOW_BLOCK: u32 = 16;
+/// Black rows above the strip, in cells: the snow never shares a macroblock row with the strip's top.
+pub const SNOW_GUARD_CELLS: u32 = 1;
+
 fn ball_side(h: u32) -> u32 {
     h / 6
 }
 
 /// Frame `counter`'s picture: the pattern, then the strip (counter 0 is refused by `strip::draw`).
-/// The ball is a white square moving 8 px a frame along the picture's middle third; the snow is new
-/// noise in every luma sample of every frame, seeded by the counter, so no two frames repeat.
+/// The ball is a white square moving 8 px a frame along the picture's middle third. The snow is new
+/// noise in every [`SNOW_BLOCK`] block of every frame, seeded by the counter, so no two frames repeat.
 pub fn frame(l: &Layout, pattern: Pattern, counter: u32) -> Vec<u8> {
     let mut data = vec![0u8; l.size];
     let (luma, chroma) = data.split_at_mut(l.u_offset);
@@ -166,16 +185,18 @@ pub fn frame(l: &Layout, pattern: Pattern, counter: u32) -> Vec<u8> {
             y.fill(x, l.height / 3, side, side, strip::WHITE);
         }
         Pattern::Snow => {
-            // xorshift32, one draw per four samples.
+            y.fill(0, 0, l.width, l.height, strip::BLACK);
+            let guard = (1 + SNOW_GUARD_CELLS) * strip::cell_size(l.height);
+            let noisy = l.height.saturating_sub(guard);
+            // xorshift32, one draw per block.
             let mut state = counter.wrapping_mul(0x9E37_79B9) | 1;
-            for row in 0..l.height as usize {
-                for px in y.data[row * l.y_stride..row * l.y_stride + l.width as usize].chunks_mut(4) {
+            for by in (0..noisy).step_by(SNOW_BLOCK as usize) {
+                for bx in (0..l.width).step_by(SNOW_BLOCK as usize) {
                     state ^= state << 13;
                     state ^= state >> 17;
                     state ^= state << 5;
-                    for (i, p) in px.iter_mut().enumerate() {
-                        *p = strip::BLACK + ((state >> (8 * i)) as u8 % (strip::WHITE - strip::BLACK + 1));
-                    }
+                    let v = strip::BLACK + (state as u8 % (strip::WHITE - strip::BLACK + 1));
+                    y.fill(bx, by, SNOW_BLOCK, SNOW_BLOCK.min(noisy - by), v);
                 }
             }
         }
@@ -397,6 +418,30 @@ mod tests {
         }
         eprintln!("camera frames checked: {checked}");
         assert_eq!(checked, 4 * 2 * 8);
+    }
+
+    #[test]
+    fn the_snow_is_uniform_blocks_above_a_black_guard() {
+        let mut checked = 0;
+        for (w, h) in [(1280u32, 720u32), (1920, 1080), (642, 360)] {
+            let l = Layout::i420(w, h);
+            let f = frame(&l, Pattern::Snow, 99);
+            let cell = strip::cell_size(h);
+            let noisy = h - 2 * cell;
+            let px = |x: u32, y: u32| f[y as usize * l.y_stride + x as usize];
+            for y in 0..noisy {
+                for x in 0..w {
+                    let (bx, by) = (x - x % SNOW_BLOCK, y - y % SNOW_BLOCK);
+                    assert_eq!(px(x, y), px(bx, by), "{w}x{h}: ({x}, {y}) is its block's value");
+                    checked += 1;
+                }
+            }
+            for y in noisy..h - cell {
+                assert!((0..w).all(|x| px(x, y) == strip::BLACK), "{w}x{h}: guard row {y}");
+            }
+        }
+        eprintln!("snow pixels checked: {checked}");
+        assert!(checked > 0);
     }
 
     #[test]
