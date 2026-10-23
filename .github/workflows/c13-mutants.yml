@@ -1,0 +1,389 @@
+name: c13-mutants
+# DO NOT MERGE. C13's Step 7 mutants (and the review's), one job each. Every job runs its suite once unmutated (the
+# baseline: green, with its counts), applies exactly one mutant by an exact-text replace that must
+# match once, and then REQUIRES that mutant's own failure. A run that fails for any other reason
+# (a build error, the stack not starting) is not a kill and fails the job.
+on:
+  pull_request: {}
+  workflow_dispatch: {}
+permissions: { contents: read }
+jobs:
+  m1-strip-read-accepts-slates:
+    # Mutant 1: `strip::read` stops refusing a strip whose checksum fails (or counter 0), so a slate
+    # reads as a counter. Required: tests/strip.rs reds on a slate frame (indexes 1100..1129).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v4
+      # Bounded, with retries: an apt mirror stall timed check.yml out twice in a week.
+      - name: GStreamer
+        timeout-minutes: 20
+        run: |
+          for attempt in 1 2 3; do
+            if sudo timeout 300 apt-get update -o Acquire::Retries=3 \
+              && sudo timeout 600 apt-get install -y --no-install-recommends -o Acquire::Retries=3 libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed"; sleep 15
+          done
+          exit 1
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.91.0" }
+      - uses: Swatinem/rust-cache@v2
+      - name: Baseline (unmutated tests/strip.rs is green)
+        run: |
+          cargo test -p harness --test strip --no-fail-fast -- --show-output 2>&1 | tee base.log
+          grep -F "strips checked: 1130" base.log
+          grep -E "test result: ok\. 4 passed; 0 failed" base.log
+      - name: Apply mutant 1
+        run: |
+          python3 -I - <<'PY'
+          import pathlib
+          p = pathlib.Path("crates/harness/src/strip.rs")
+          s = p.read_text()
+          old = "(counter != 0 && checksum(counter) == sum).then_some(counter)"
+          new = "{ let _ = sum; Some(counter) /*MUT1*/ }"
+          assert s.count(old) == 1, f"mutant 1's text occurs {s.count(old)} times"
+          p.write_text(s.replace(old, new))
+          print("mutant 1 applied")
+          PY
+          grep -F "/*MUT1*/" crates/harness/src/strip.rs
+      - name: Mutant 1 must red tests/strip.rs on a slate
+        run: |
+          set +e
+          cargo test -p harness --test strip --no-fail-fast 2>&1 | tee m1.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "cargo test exit: $code"
+          fail=0
+          if [ "$code" -eq 0 ]; then echo "::error::mutant 1 SURVIVED (tests/strip.rs green)"; fail=1; fi
+          if ! grep -F "test random_counters_read_back_through_x264_and_avdec_h264_and_slates_read_none ... FAILED" m1.log; then
+            echo "::error::the slate test did not fail"; fail=1
+          fi
+          if ! grep -E "failed: frame 11[0-2][0-9] \(slate\):$" m1.log; then
+            echo "::error::the failure is not on a slate frame (1100..1129)"; fail=1
+          fi
+          if ! grep -E "^ +right: None$" m1.log; then
+            echo "::error::the failing frame was not expected to read as no strip"; fail=1
+          fi
+          if grep -E "^error(\[E[0-9]+\])?:" m1.log; then
+            echo "::error::the mutant did not compile: not a kill"; fail=1
+          fi
+          [ "$fail" -eq 0 ] && echo "mutant 1 KILLED by its own failure"
+          exit "$fail"
+
+  m4-fake-control-skips-its-self-check:
+    # Mutant 4 (confirm pass m3): fake-control's main stops calling `self_check`, so a session the
+    # compositor would refuse is served. Required: tests/fake_control.rs reds on the refused session
+    # with the binary still running (`left: None`, `right: Some(78)`), not on a build error.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v4
+      # Bounded, with retries: an apt mirror stall timed check.yml out twice in a week.
+      - name: GStreamer
+        timeout-minutes: 20
+        run: |
+          for attempt in 1 2 3; do
+            if sudo timeout 300 apt-get update -o Acquire::Retries=3 \
+              && sudo timeout 600 apt-get install -y --no-install-recommends -o Acquire::Retries=3 libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed"; sleep 15
+          done
+          exit 1
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.91.0" }
+      - uses: Swatinem/rust-cache@v2
+      - name: Baseline (unmutated tests/fake_control.rs is green)
+        run: |
+          cargo test -p harness --test fake_control --no-fail-fast -- --show-output 2>&1 | tee base4.log
+          grep -E "test result: ok\. 1 passed; 0 failed" base4.log
+          grep -F "refused session: " base4.log
+      - name: Apply mutant 4
+        run: |
+          python3 -I - <<'PY'
+          import pathlib
+          p = pathlib.Path("crates/harness/src/bin/fake-control.rs")
+          s = p.read_text()
+          old = "    let (width, height) = self_check(&session, &session_id).map_err(with(78))?;"
+          new = "    let _ = self_check; let (width, height) = (1280u32, 720u32); /*MUT4*/"
+          assert s.count(old) == 1, f"mutant 4's text occurs {s.count(old)} times"
+          p.write_text(s.replace(old, new))
+          print("mutant 4 applied")
+          PY
+          grep -F "/*MUT4*/" crates/harness/src/bin/fake-control.rs
+      - name: Mutant 4 must red tests/fake_control.rs on the refused session
+        run: |
+          set +e
+          cargo test -p harness --test fake_control --no-fail-fast 2>&1 | tee m4.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "cargo test exit: $code"
+          fail=0
+          if [ "$code" -eq 0 ]; then echo "::error::mutant 4 SURVIVED (tests/fake_control.rs green)"; fail=1; fi
+          if ! grep -F "test a_session_the_compositor_would_refuse_stops_fake_control_before_it_listens ... FAILED" m4.log; then
+            echo "::error::the self-check test did not fail"; fail=1
+          fi
+          if ! grep -E "^ +left: None$" m4.log || ! grep -E "^ +right: Some\(78\)$" m4.log; then
+            echo "::error::the failure is not the refused session still running (None vs Some(78))"; fail=1
+          fi
+          if grep -E "^error(\[E[0-9]+\])?:" m4.log; then
+            echo "::error::the mutant did not compile: not a kill"; fail=1
+          fi
+          [ "$fail" -eq 0 ] && echo "mutant 4 KILLED by its own failure"
+          exit "$fail"
+
+  m2-checker-reads-no-recordings:
+    # Mutant 2: the smoke case points the checker at an empty directory instead of MediaMTX's
+    # recordings. Required: the verdict FAILs on `frames`, the report says 0 frames, and run-case.sh
+    # exits non-zero; while the stack itself ran (heartbeats and the clean exit still PASS), so the
+    # red is the mutant's and not a stack that never started.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions: { contents: read, packages: read }
+    defaults: { run: { shell: bash } }
+    env:
+      RELAY_IMAGE: seazn-relay:${{ github.sha }}
+      HARNESS_IMAGE: seazn-harness:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: gstcefsrc pin (F-001)
+        id: pin
+        run: |
+          commit=$(tr -d '[:space:]' < docker/GSTCEF_COMMIT)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad GSTCEF_COMMIT"; exit 1; }
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      # harness.yml's cache read: GHCR when warm, else GitHub's; nothing here writes either.
+      - name: Log in to GHCR (read)
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build cache (GHCR, read)
+        id: cache
+        run: |
+          ref=
+          if key=$(scripts/cef-cache-key.sh 2> "$RUNNER_TEMP/cache-key.err"); then
+            ref="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/seazn-relay-cache:cef-$key"
+          fi
+          if [ -n "$ref" ] \
+            && docker buildx imagetools inspect --raw "$ref" > "$RUNNER_TEMP/cache.json" 2> /dev/null \
+            && scripts/cef-cache-holds-tree.sh "$RUNNER_TEMP/cache.json" 2> /dev/null; then
+            from="type=registry,ref=$ref"; state=warm
+          else
+            from="type=gha"; state=cold
+            [ -z "$ref" ] || from="type=registry,ref=$ref"$'\n'"type=gha"
+          fi
+          echo "build cache: ${ref:-none} ($state)"
+          { echo "from<<EOF"; echo "$from"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+      - name: Build the relay image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          tags: ${{ env.RELAY_IMAGE }}
+          load: true
+          push: false
+          cache-from: ${{ steps.cache.outputs.from }}
+      - name: Build the harness image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: harness
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          tags: ${{ env.HARNESS_IMAGE }}
+          load: true
+          push: false
+          cache-from: ${{ steps.cache.outputs.from }}
+      - name: Kernel modules for netem
+        run: sudo modprobe -a sch_prio sch_netem cls_u32 || echo "modprobe failed"
+      - name: Apply mutant 2
+        run: |
+          python3 -I - <<'PY'
+          import pathlib
+          p = pathlib.Path("harness/cases/smoke.sh")
+          s = p.read_text()
+          old = "CASE_LIVE_S=60\n"
+          new = 'CASE_LIVE_S=60\nCHECKER_RECORDINGS="$OUT/no-recordings" # MUT2\n'
+          assert s.count(old) == 1, f"mutant 2's text occurs {s.count(old)} times"
+          p.write_text(s.replace(old, new))
+          print("mutant 2 applied")
+          PY
+          grep -F "# MUT2" harness/cases/smoke.sh
+      - name: Mutant 2 must FAIL the verdict on frames
+        run: |
+          set +e
+          harness/run-case.sh smoke 2>&1 | tee m2.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "run-case exit: $code"
+          fail=0
+          if [ "$code" -eq 0 ]; then echo "::error::mutant 2 SURVIVED (run-case.sh exited 0)"; fail=1; fi
+          if ! grep -E "^FAIL frames \(" m2.log; then echo "::error::the verdict did not FAIL frames"; fail=1; fi
+          if ! jq -e '.frames == 0' harness/out/smoke/report.json; then
+            echo "::error::the report does not say 0 frames"; fail=1
+          fi
+          for control in "PASS heartbeats" "PASS compositor_exit"; do
+            if ! grep -Fx "$control" m2.log; then
+              echo "::error::control '$control' missing: the stack did not run, so this is not a kill"; fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] && echo "mutant 2 KILLED by its own failure"
+          exit "$fail"
+      # harness.yml's Leak gate: out/ (its console.log is m2.log) is uploaded only after a clean scan.
+      - name: Leak gate
+        id: leaks
+        if: always()
+        run: |
+          f=harness/out/smoke/secrets.json
+          if [ -f "$f" ] && jq -e '.scanned > 0 and .leaks == 0' "$f" > /dev/null; then
+            echo "secrets scan: $(jq -c . "$f")"; echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::no clean secrets scan: out/ is not uploaded"; exit 1
+          fi
+      - name: Out
+        if: always() && steps.leaks.outputs.ok == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: c13-m2-out
+          path: harness/out/
+          if-no-files-found: error
+          retention-days: 7
+
+  m3-strip-read-reads-nothing:
+    # Mutant 3 (CI round 1, the coordinator's question 5: can smoke pass with a strip reader that
+    # fails?): `strip::read` returns None for every frame, in the harness image's checker only (the
+    # relay image is built unmutated first). Required: the verdict FAILs camera_strips and the
+    # report says 0 strip frames, while frames, heartbeats and the clean exit still PASS.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions: { contents: read, packages: read }
+    defaults: { run: { shell: bash } }
+    env:
+      RELAY_IMAGE: seazn-relay:${{ github.sha }}
+      HARNESS_IMAGE: seazn-harness:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: gstcefsrc pin (F-001)
+        id: pin
+        run: |
+          commit=$(tr -d '[:space:]' < docker/GSTCEF_COMMIT)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad GSTCEF_COMMIT"; exit 1; }
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      # harness.yml's cache read: GHCR when warm, else GitHub's; nothing here writes either.
+      - name: Log in to GHCR (read)
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build cache (GHCR, read)
+        id: cache
+        run: |
+          ref=
+          if key=$(scripts/cef-cache-key.sh 2> "$RUNNER_TEMP/cache-key.err"); then
+            ref="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/seazn-relay-cache:cef-$key"
+          fi
+          if [ -n "$ref" ] \
+            && docker buildx imagetools inspect --raw "$ref" > "$RUNNER_TEMP/cache.json" 2> /dev/null \
+            && scripts/cef-cache-holds-tree.sh "$RUNNER_TEMP/cache.json" 2> /dev/null; then
+            from="type=registry,ref=$ref"; state=warm
+          else
+            from="type=gha"; state=cold
+            [ -z "$ref" ] || from="type=registry,ref=$ref"$'\n'"type=gha"
+          fi
+          echo "build cache: ${ref:-none} ($state)"
+          { echo "from<<EOF"; echo "$from"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+      - name: Build the relay image (unmutated)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          tags: ${{ env.RELAY_IMAGE }}
+          load: true
+          push: false
+          cache-from: ${{ steps.cache.outputs.from }}
+      - name: Apply mutant 3
+        run: |
+          python3 -I - <<'PY'
+          import pathlib
+          p = pathlib.Path("crates/harness/src/strip.rs")
+          s = p.read_text()
+          old = "(counter != 0 && checksum(counter) == sum).then_some(counter)"
+          new = "{ let _ = (counter, sum); None /*MUT3*/ }"
+          assert s.count(old) == 1, f"mutant 3's text occurs {s.count(old)} times"
+          p.write_text(s.replace(old, new))
+          print("mutant 3 applied")
+          PY
+          grep -F "/*MUT3*/" crates/harness/src/strip.rs
+      - name: Build the harness image (mutated)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: harness
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          tags: ${{ env.HARNESS_IMAGE }}
+          load: true
+          push: false
+          cache-from: ${{ steps.cache.outputs.from }}
+      - name: Kernel modules for netem
+        run: sudo modprobe -a sch_prio sch_netem cls_u32 || echo "modprobe failed"
+      - name: Mutant 3 must FAIL the verdict on camera_strips
+        run: |
+          set +e
+          harness/run-case.sh smoke 2>&1 | tee m3.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "run-case exit: $code"
+          fail=0
+          if [ "$code" -eq 0 ]; then echo "::error::mutant 3 SURVIVED (run-case.sh exited 0)"; fail=1; fi
+          if ! grep -E "^FAIL camera_strips \(" m3.log; then echo "::error::the verdict did not FAIL camera_strips"; fail=1; fi
+          if ! jq -e '.camera.strip_frames == 0' harness/out/smoke/report.json; then
+            echo "::error::the report does not say 0 strip frames"; fail=1
+          fi
+          for control in "PASS frames" "PASS heartbeats" "PASS compositor_exit"; do
+            if ! grep -Fx "$control" m3.log; then
+              echo "::error::control '$control' missing: the stack did not run, so this is not a kill"; fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] && echo "mutant 3 KILLED by its own failure"
+          exit "$fail"
+      # harness.yml's Leak gate: out/ (its console.log is m3.log) is uploaded only after a clean scan.
+      - name: Leak gate
+        id: leaks
+        if: always()
+        run: |
+          f=harness/out/smoke/secrets.json
+          if [ -f "$f" ] && jq -e '.scanned > 0 and .leaks == 0' "$f" > /dev/null; then
+            echo "secrets scan: $(jq -c . "$f")"; echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::no clean secrets scan: out/ is not uploaded"; exit 1
+          fi
+      - name: Out
+        if: always() && steps.leaks.outputs.ok == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: c13-m3-out
+          path: harness/out/
+          if-no-files-found: error
+          retention-days: 7
