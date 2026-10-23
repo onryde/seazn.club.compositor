@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! fake-camera --emit /out/emit.jsonl --listen 0.0.0.0:7001 --srt-host mediamtx --srt-port 8890 \
-//!   --stream-id publish:cam [--size 1280x720] [--pattern ball|snow] [--latency-ms 200]
+//!   --stream-id publish:cam [--size 1280x720] [--pattern ball|snow|noise] [--latency-ms 200]
 //! ```
 //!
 //! The SRT passphrase is `HARNESS_SRT_PASSPHRASE` (environment, never argv). A failed build (MediaMTX

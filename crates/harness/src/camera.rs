@@ -91,9 +91,16 @@ pub enum Pattern {
     /// A moving ball: motion for the encoder, a mostly black picture.
     Ball,
     /// Noise in 16×16 blocks on the macroblock grid, new every frame, over a one-cell black guard
-    /// above the strip (the 2026-10-18 amendment, for C15's cost legs; [`SNOW_BLOCK`] says why it is
-    /// not per-pixel).
+    /// above the strip (the 2026-10-18 amendment; [`SNOW_BLOCK`] says why it is not per-pixel). The
+    /// strip reads through x264 on it. It is the harness's snow.
     Snow,
+    /// Per-pixel noise up to the strip (`--pattern noise`): `videotestsrc pattern=snow`'s picture
+    /// and the pre-round-2 snow. It is kept for C15's cost legs only. At 4 Mbps, x264 crushes the
+    /// strip at its I-frames, so a run on it cannot gate on `camera_strips`. On the reviewer's host,
+    /// libx264 encoded block snow slower than this noise: 6.5 s against 4.0 s at 720p and
+    /// 4 000 kbps, and 9.2 s against 5.2 s at 1080p and 6 000 kbps. So neither is the worst case by
+    /// assumption. C15 measures both on the production guest and uses the heavier.
+    Noise,
 }
 
 impl Pattern {
@@ -101,7 +108,8 @@ impl Pattern {
         match s {
             "ball" => Ok(Self::Ball),
             "snow" => Ok(Self::Snow),
-            other => Err(format!("--pattern {other}: ball or snow")),
+            "noise" => Ok(Self::Noise),
+            other => Err(format!("--pattern {other}: ball, snow or noise")),
         }
     }
 }
@@ -142,7 +150,6 @@ impl Layout {
     }
 }
 
-/// The ball's side: a sixth of the height, so it moves well clear of the strip.
 /// The snow's block side.
 ///
 /// The amendment's "videotestsrc pattern=snow under the strip, which stays readable" is false at the
@@ -160,6 +167,7 @@ pub const SNOW_BLOCK: u32 = 16;
 /// Black rows above the strip, in cells: the snow never shares a macroblock row with the strip's top.
 pub const SNOW_GUARD_CELLS: u32 = 1;
 
+/// The ball's side: a sixth of the height, so it moves well clear of the strip.
 fn ball_side(h: u32) -> u32 {
     h / 6
 }
@@ -200,9 +208,23 @@ pub fn frame(l: &Layout, pattern: Pattern, counter: u32) -> Vec<u8> {
                 }
             }
         }
+        Pattern::Noise => {
+            // xorshift32, one draw per four samples, every row (the strip is drawn over it).
+            let mut state = counter.wrapping_mul(0x9E37_79B9) | 1;
+            for row in 0..l.height as usize {
+                for px in y.data[row * l.y_stride..row * l.y_stride + l.width as usize].chunks_mut(4) {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    for (i, p) in px.iter_mut().enumerate() {
+                        *p = strip::BLACK + ((state >> (8 * i)) as u8 % (strip::WHITE - strip::BLACK + 1));
+                    }
+                }
+            }
+        }
     }
     strip::draw(&mut y, counter);
-    // Both patterns are grey: neutral chroma everywhere (row padding included), so nothing tints
+    // Every pattern is grey: neutral chroma everywhere (row padding included), so nothing tints
     // the strip.
     chroma.fill(128);
     data
@@ -376,8 +398,9 @@ mod tests {
     }
 
     #[test]
-    fn patterns_are_ball_and_snow() {
+    fn patterns_are_ball_snow_and_noise() {
         assert_eq!(Pattern::parse("snow"), Ok(Pattern::Snow));
+        assert_eq!(Pattern::parse("noise"), Ok(Pattern::Noise));
         assert_eq!(Pattern::parse("ball"), Ok(Pattern::Ball));
         assert!(Pattern::parse("smpte").is_err());
     }
@@ -396,11 +419,11 @@ mod tests {
     }
 
     #[test]
-    fn every_drawn_frame_reads_back_its_counter_on_both_patterns() {
+    fn every_drawn_frame_reads_back_its_counter_on_every_pattern() {
         let mut checked = 0;
         for (w, h) in [(1280u32, 720u32), (640, 360), (1920, 1080), (642, 360)] {
             let l = Layout::i420(w, h);
-            for pattern in [Pattern::Ball, Pattern::Snow] {
+            for pattern in [Pattern::Ball, Pattern::Snow, Pattern::Noise] {
                 for counter in [1u32, 2, 29, 30, 31, 1_000, 123_456, u32::MAX] {
                     let data = frame(&l, pattern, counter);
                     assert_eq!(data.len(), l.size);
@@ -417,7 +440,7 @@ mod tests {
             }
         }
         eprintln!("camera frames checked: {checked}");
-        assert_eq!(checked, 4 * 2 * 8);
+        assert_eq!(checked, 4 * 3 * 8, "4 sizes, 3 patterns, 8 counters");
     }
 
     #[test]
@@ -463,7 +486,7 @@ mod tests {
     fn the_ball_moves_and_the_snow_changes_every_frame() {
         let l = Layout::i420(1280, 720);
         let above_strip = l.y_stride * (720 - strip::cell_size(720) as usize);
-        for pattern in [Pattern::Ball, Pattern::Snow] {
+        for pattern in [Pattern::Ball, Pattern::Snow, Pattern::Noise] {
             let (a, b) = (frame(&l, pattern, 10), frame(&l, pattern, 11));
             assert_ne!(
                 a[..above_strip],
@@ -482,5 +505,23 @@ mod tests {
             .iter()
             .all(|&p| p == strip::BLACK || p == strip::WHITE));
         assert!(ball[..above_strip].contains(&strip::WHITE), "the ball is drawn");
+        // Noise is per-pixel, over the luma range, up to the strip: neighbouring pixels almost never
+        // match (two draws over 220 levels), unlike the snow's 16 px blocks.
+        let noise = frame(&l, Pattern::Noise, 7);
+        let row_above_strip = 720 - strip::cell_size(720) as usize - 1;
+        let (mut pairs, mut differ) = (0u64, 0u64);
+        for row in [0usize, 360, row_above_strip] {
+            let r = &noise[row * l.y_stride..row * l.y_stride + 1280];
+            for w in r.windows(2) {
+                pairs += 1;
+                differ += u64::from(w[0] != w[1]);
+            }
+        }
+        eprintln!("noise: {differ} of {pairs} neighbouring pixels differ");
+        assert!(pairs > 0 && differ * 100 >= pairs * 95, "{differ} of {pairs}");
+        let (lo, hi) = noise[..above_strip]
+            .iter()
+            .fold((255u8, 0u8), |(lo, hi), &p| (lo.min(p), hi.max(p)));
+        assert_eq!((lo, hi), (strip::BLACK, strip::WHITE));
     }
 }
