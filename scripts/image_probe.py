@@ -34,7 +34,9 @@ cycles of 8 alternating 720p and 1080p (the review's m7): 4 `docker stop` (SIGTE
 drain), 2 `docker kill -s INT` (R1's stop: the Final hold, inside R1's grace), the session's deadline
 (the hold) and a killed CEF zygote (C11b's in-place restart, 75): 24 stops in all. Every exit status is exact, with its own `exit
 code=` line, the right last POST, and no abort text (a double free after the exit line was status
-134 once in six such exits before `hard_exit::now`). `/dev/shm`'s peak use is printed.
+134 once in six such exits before `hard_exit::now`). Of the zygote kills, the 2nd and 3rd of each 4
+come at once after the ready (the window each ready's listing closed) and the others after two
+child polls (the restart alone). `/dev/shm`'s peak use is printed.
 
 Then a SIGTERM and a SIGINT 0.3 s into a container's boot (the review's m1): held by the entrypoint
 until the compositor's handlers exist, then the compositor's own exit 0.
@@ -457,7 +459,7 @@ def main():
         kinds = [term, sigint, term, ("the deadline", "0", "deadline", True), term,
                  ("a killed CEF zygote", "75", "restart", False), term, sigint]
         hold = 10
-        exits = stops = 0
+        exits = stops = zygote_kills = 0
         for i in range(a.exits):
             kind, want, reason, final = kinds[i % len(kinds)]
             fixture = P1080 if (i // len(kinds)) % 2 else P720
@@ -482,10 +484,16 @@ def main():
                 cpid = compositor_pid()
                 zyg = [p_ for p_, (pp, a_) in cmdlines().items() if pp == cpid and "--type=zygote" in a_]
                 check(len(zyg) >= 1, f"{what}: a zygote of the compositor ({zyg})")
-                # The kill waits out two child polls after the ready (image run 40015873298: one kill
-                # 0.100-0.157 s after it came before any poll had listed a zygote, and was never seen),
-                # so this case proves the restart, not the watch's first listing (the graphics tests do).
-                time.sleep(2 * child_poll)
+                # Kills 2 and 3 of each 4 come at once after the ready, inside the window the watch was
+                # blind in before each ready listed the zygotes (image run 40015873298: that run's fastest
+                # ready-to-stop gaps, on other exits, were 0.100-0.157 s, so its kill most likely came
+                # before the 2nd poll). Kills 1 and 4 wait out two child polls, so they prove the restart
+                # alone. In 32 exits: 14 and 22 at once, 6 and 30 after the wait (both at both profiles).
+                immediate = zygote_kills % 4 in (1, 2)
+                zygote_kills += 1
+                what += ", at once after the ready" if immediate else ", after two child polls"
+                if not immediate:
+                    time.sleep(2 * child_poll)
                 for z in zyg[:1]:
                     pp, argv = cmdlines().get(z, (0, ""))
                     check(cpid > 0 and pp == cpid and "--type=zygote" in argv,
