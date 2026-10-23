@@ -2787,8 +2787,10 @@ mod tests {
     // no in-place restart, then Chromium's abort (133) at the next GPU-process death, or `CefCrashed`
     // at the next build (F-013). The ready lists the children before anyone hears of it. Either
     // zygote; the control (no kill); a second ready after the verdict; a ready that lists nothing.
+    // This pins the adapter's verdict and the domain's cause; the supervisor's exit 75 on that cause
+    // is the domain's and app's tests (C11b).
     #[test]
-    fn a_zygote_killed_between_the_ready_and_the_next_poll_restarts_the_process() {
+    fn a_zygote_killed_between_the_ready_and_the_next_poll_is_the_restart_cause() {
         use domain::cef_health::RestartCause;
         use domain::config::Thresholds;
         const ROOT: i32 = 1544;
@@ -2842,11 +2844,15 @@ mod tests {
                 let lines = Arc::clone(&lines);
                 Arc::new(move |l: &str| locked(&lines).push(l.to_owned()))
             };
+            // Every verdict line, whatever generation it names (a duplicate at gen 2 counts too).
             let errors = || {
-                locked(&lines)
+                let all: Vec<String> = locked(&lines)
                     .iter()
-                    .filter(|l| l.starts_with("ERROR gen=1: a CEF zygote is gone"))
-                    .count()
+                    .filter(|l| l.contains("a CEF zygote is gone"))
+                    .cloned()
+                    .collect();
+                assert!(all.iter().all(|l| l.starts_with("ERROR gen=1:")), "{all:?}");
+                all.len()
             };
             // The dispatcher returns once its queue is empty.
             shared.retired.store(true, Ordering::SeqCst);
@@ -2861,7 +2867,8 @@ mod tests {
             shared.push(page_note(1, PageSignal::Ready));
             dispatch(&shared);
             assert_eq!(event(&rx), Some(Event::CefReady { gen: 1 }), "{case}");
-            // The kill, at once (the probe's came 0.100–0.157 s after the ready).
+            // The kill, at once. In run 40015873298 the probe's fastest ready-to-stop gaps (on other
+            // exits) were 0.100–0.157 s; its kill most likely came before the 2nd poll.
             if let Some((zygote, orphan)) = kill {
                 locked(&dead).insert(zygote);
                 locked(&listed).retain(|k| k.pid != zygote && k.pid != orphan);
@@ -2890,6 +2897,99 @@ mod tests {
             assert_eq!(g.health(), h, "{case}: the second ready");
             assert_eq!(errors(), usize::from(kill.is_some()), "{case}: the second ready");
             assert_eq!(locked(&heard).len(), 4, "{case}: the second ready lists");
+            checked += 1;
+        }
+        eprintln!("cases checked: {checked}");
+        assert_eq!(checked, cases.len());
+    }
+
+    // The verdict decided by a ready's own listing (the PR #51 review's m1): a poll has listed the
+    // zygotes, one dies, and a ready (gen 2's) comes before the next poll: a rebuild's after the GPU
+    // process's zygote (F-013: the next build still signalled ready), or one already queued when the
+    // renderers' zygote died. The ready decides: the verdict names the newest generation, its ERROR
+    // line is logged once and before the ready is sent, and the next poll neither logs it again nor
+    // stamps it anew. Either zygote.
+    #[test]
+    fn a_zygote_death_a_ready_lists_first_is_decided_and_logged_by_the_ready() {
+        use domain::cef_health::RestartCause;
+        use domain::config::Thresholds;
+        const ROOT: i32 = 1544;
+        let started = || {
+            vec![
+                kid(1556, ROOT, "zygote", None),
+                kid(1578, 1556, "gpu-process", None),
+                kid(1557, ROOT, "zygote", None),
+                kid(1589, 1557, "utility", None),
+                kid(1622, 1557, "renderer", Some(5)),
+            ]
+        };
+        let cases = [
+            ("the GPU process's zygote", 1556, 1578),
+            ("the renderers' zygote", 1557, 1622),
+        ];
+        let mut checked = 0;
+        for (case, zygote, orphan) in cases {
+            let listed = Arc::new(Mutex::new(started()));
+            let dead: Arc<Mutex<BTreeSet<i32>>> = Arc::default();
+            let (tx, rx) = crossbeam_channel::bounded(8);
+            let tree = ProcTree {
+                list: Box::new({
+                    let listed = Arc::clone(&listed);
+                    move || locked(&listed).clone()
+                }),
+                alive: Box::new({
+                    let dead = Arc::clone(&dead);
+                    move |p| !locked(&dead).contains(&p)
+                }),
+                root: ROOT,
+            };
+            let g = unit_adapter(unit_shared(tx, tree));
+            let shared = Arc::clone(&g.shared);
+            // Each line, with how many events the domain could already read when it was logged.
+            let lines: Arc<Mutex<Vec<(usize, String)>>> = Arc::default();
+            *locked(&shared.log) = {
+                let (lines, rx) = (Arc::clone(&lines), rx.clone());
+                Arc::new(move |l: &str| locked(&lines).push((rx.len(), l.to_owned())))
+            };
+            let verdicts = || -> Vec<(usize, String)> {
+                locked(&lines)
+                    .iter()
+                    .filter(|(_, l)| l.contains("a CEF zygote is gone"))
+                    .cloned()
+                    .collect()
+            };
+            shared.retired.store(true, Ordering::SeqCst);
+            locked(&shared.builds).insert(1, (1, Arc::default()));
+            locked(&shared.gate).current = Some((1, 1));
+            // A poll lists both zygotes: healthy.
+            watch_poll(&shared, &(shared.tree.list)());
+            assert_eq!(g.health(), CefHealth::default(), "{case}");
+            // The zygote dies; gen 2's build readies before the next poll.
+            locked(&dead).insert(zygote);
+            locked(&listed).retain(|k| k.pid != zygote && k.pid != orphan);
+            locked(&shared.builds).insert(2, (2, Arc::default()));
+            locked(&shared.gate).current = Some((2, 2));
+            shared.push(page_note(2, PageSignal::Ready));
+            dispatch(&shared);
+            let h = g.health();
+            assert_eq!(h.unrecoverable, Some(2), "{case}: decided by the ready: {h:?}");
+            assert_eq!(
+                h.restart_cause(&Thresholds::default()),
+                Some(RestartCause::ZygoteGone { gen: 2 }),
+                "{case}"
+            );
+            let v = verdicts();
+            assert_eq!(v.len(), 1, "{case}: {:?}", locked(&lines));
+            assert!(v[0].1.starts_with("ERROR gen=2:"), "{case}: {v:?}");
+            assert_eq!(v[0].0, 0, "{case}: logged after the ready was sent");
+            match rx.try_recv() {
+                Ok(Inbound::Event(e)) => assert_eq!(e, Event::CefReady { gen: 2 }, "{case}"),
+                other => panic!("{case}: no ready relayed: {other:?}"),
+            }
+            // The next poll: no second line, no new stamp.
+            watch_poll(&shared, &(shared.tree.list)());
+            assert_eq!(g.health(), h, "{case}: the next poll");
+            assert_eq!(verdicts().len(), 1, "{case}: the next poll");
             checked += 1;
         }
         eprintln!("cases checked: {checked}");
