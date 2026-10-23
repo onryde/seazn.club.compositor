@@ -51,9 +51,17 @@ pub const AV_PAIR_WITHIN_MS: f64 = 500.0;
 /// The fake camera's own AAC generation (voaacenc): its encoder delay, which the recording carries
 /// unsignalled (no edit list in MPEG-TS or in MediaMTX's fMP4).
 ///
-/// Measured with the checker's own decode on `tests/checker.rs`'s fixture, whose true offset is 0:
-/// +33 ms on both pairs (CI run 39979756301), which is 1 600 samples at 48 kHz. The fixture's
-/// shifted case checks it against a known offset.
+/// The value is the library's declared delay, not a measurement: vo-aacenc's encoder delay is
+/// 1 600 samples (FFmpeg's wrapper of the same library declares `#define ENC_DELAY 1600` and sets
+/// `initial_padding` from it: `libavcodec/libvo-aacenc.c:31` and `:64` at tag n2.8). At 48 kHz that
+/// is 33.3 ms. The checker's decode agrees: it read +33 ms on both pairs of `tests/checker.rs`'s
+/// 0-offset fixture (CI run 39979756301), and that fixture's shifted case (1 200 samples, 25 ms)
+/// reads its own offset after the subtraction.
+///
+/// At 30 fps, 1 600 samples is also exactly one frame. So no 30 fps fixture can tell this delay from
+/// a one-frame pairing error in the checker. Only a fixture at another frame rate could, and the
+/// fixtures are frame-locked (`audio::SAMPLES_PER_FRAME`, `media::FRAME_NS`). The declared value
+/// is therefore the authority.
 ///
 /// It is subtracted from every pair, so `av_offset_ms` is the programme's offset with the harness's
 /// camera taken out. The compositor's own encoder delay stays in, because the viewer hears it too.
@@ -1298,9 +1306,10 @@ mod tests {
 
     #[test]
     fn short_repeats_are_cadence_and_only_a_held_counter_is_a_freeze() {
-        // Counters 1..=10 with 5 shown twice (one repeat), 7 skipped (emitted, never shown), and 9
-        // held on 4 frames (three repeats: a freeze). 20 is never emitted, so 19 -> 21 skips nothing.
-        let counters = [1, 2, 3, 4, 5, 5, 6, 8, 9, 9, 9, 9, 10, 19, 21];
+        // Counters 1..=10 with 3 shown three times (two repeats, one short of a freeze), 5 twice
+        // (one repeat), 7 skipped (emitted, never shown), and 9 held on 4 frames (three repeats: a
+        // freeze). 20 is never emitted, so 19 -> 21 skips nothing.
+        let counters = [1, 2, 3, 3, 3, 4, 5, 5, 6, 8, 9, 9, 9, 9, 10, 19, 21];
         let f: Vec<FrameRec> = counters
             .iter()
             .enumerate()
@@ -1331,8 +1340,8 @@ mod tests {
         assert_eq!(
             r.camera.cadence,
             Cadence {
-                pairs: 14,
-                repeated_frames: 4,
+                pairs: 16,
+                repeated_frames: 6,
                 skipped_counters: 9,
                 skip_events: 2,
             }
