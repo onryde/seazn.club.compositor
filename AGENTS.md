@@ -170,8 +170,19 @@ and a mutation proving the new form still bites.
   test) missing its own `test <name> ... ok` line. A guard renamed in code is renamed in that step too. The job runs under
   an explicit `shell: bash`, which is what gives it `pipefail`. Never remove it (see
   `docs/_RULES.md`).
-- Harness (C13): the image under `docker compose` with fakes, MediaMTX standing in for Cloudflare.
-  Its commands are added here when C13 lands; until then there is no harness.
+- Harness (C13): the relay image under `docker compose` (`harness/compose.yml`) with fakes,
+  MediaMTX (pinned, F-021) standing in for Cloudflare and for the destination.
+  - Pure parts, on any host: `cargo test -p harness --no-default-features` (strips, tone scan,
+    analysis, fake-control's routes). The media tests (`--test strip`, `--test checker`) need
+    GStreamer with x264, libav and the bad plugins, as check.yml installs.
+  - A case: `RELAY_IMAGE=<relay image> HARNESS_IMAGE=<the Dockerfile's harness target>
+    harness/run-case.sh smoke`. It writes `harness/out/<case>/` (report.json, run.json, the logs,
+    the recordings) and exits with the case's verdict. A case is `harness/cases/<case>.sh`
+    (`case_drive`, `case_verdict`, `CASE_CHECKS`); impairment is `harness/netem.sh in|out`,
+    and `netem.sh check` must pass before a case claims a fault was applied.
+  - The stack runs only on CI (`.github/workflows/harness.yml`, on pull requests touching
+    `crates/`, `harness/`, `docker/` or `contracts/`, and by `workflow_dispatch` with a case name);
+    never locally (owner ruling 2026-10-23). Credentials are random per run and never in argv.
 - `GST_DEBUG=3` for pipeline issues. `GST_DEBUG=cefconsole:4` shows the overlay page's console,
   which is where readiness arrives (`seazn:ready`, F-001).
 - Media stack: GStreamer 1.24 (Ubuntu 24.04) through gstreamer-rs 0.24; `gstcefsrc` built from

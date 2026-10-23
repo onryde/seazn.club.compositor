@@ -7,10 +7,13 @@
 //!   `heartbeats.jsonl` and answers `{"ok":true,"data":{"desiredState":…}}`.
 //! - Both check the bearer against `JOB_TOKEN` first (401), then the session id (404), as web does.
 //! - `POST /control/desired?state=ending|live`, `POST /control/score-down?ms=N`,
-//!   `GET /control/timeline` (the whole score timeline, absolute, for the checker) and
-//!   `GET /control/state`.
+//!   `POST /control/timeline-start` (anchors the scripted timeline at now, once: run-case.sh calls
+//!   it when the programme goes live, so a slow cold start cannot use the timeline up before the
+//!   recording shows it), `GET /control/timeline` (the whole score timeline, absolute, for the
+//!   checker; 409 before the start) and `GET /control/state`.
 //! - `GET /score.json`: the events that have happened by now (a live score feed reveals an event
-//!   when it happens), or 503 while the feed is down. The page polls it every second.
+//!   when it happens; none before the start), or 503 while the feed is down. The page polls it
+//!   every second.
 //! - `GET /overlay-test.html` and `GET /overlay/fixtures/{id}`: the harness page (the rewrite keeps
 //!   the fixture's path, so the compositor asks for the second).
 //!
@@ -207,6 +210,8 @@ impl Answer {
 #[derive(Debug)]
 struct State {
     desired: &'static str,
+    /// The timeline's anchor, once started.
+    start_ms: Option<i64>,
     score_down_until_ms: i64,
     beats: u64,
     beats_refused: u64,
@@ -220,7 +225,6 @@ pub struct Fake {
     session: Value,
     page: Vec<u8>,
     timeline: ScriptedTimeline,
-    start_ms: i64,
     delay_ms: i64,
     beats_out: Mutex<Box<dyn Write + Send>>,
     state: Mutex<State>,
@@ -228,10 +232,7 @@ pub struct Fake {
 
 impl fmt::Debug for Fake {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Fake")
-            .field("start_ms", &self.start_ms)
-            .field("delay_ms", &self.delay_ms)
-            .finish()
+        f.debug_struct("Fake").field("delay_ms", &self.delay_ms).finish()
     }
 }
 
@@ -243,13 +244,14 @@ fn query_map(url: &str) -> BTreeMap<&str, &str> {
 }
 
 impl Fake {
-    /// `session` is the rewritten session; its `overlayDelayMs` is the timeline's delay.
+    /// `session` is the rewritten session; its `overlayDelayMs` is the timeline's delay. `start_ms`
+    /// anchors the timeline now; `None` waits for `POST /control/timeline-start`.
     pub fn new(
         token: String,
         session: Value,
         page: Vec<u8>,
         timeline: ScriptedTimeline,
-        start_ms: i64,
+        start_ms: Option<i64>,
         beats_out: Box<dyn Write + Send>,
     ) -> Result<Self, String> {
         if token.is_empty() {
@@ -266,11 +268,11 @@ impl Fake {
             session,
             page,
             timeline,
-            start_ms,
             delay_ms,
             beats_out: Mutex::new(beats_out),
             state: Mutex::new(State {
                 desired: "live",
+                start_ms,
                 score_down_until_ms: 0,
                 beats: 0,
                 beats_refused: 0,
@@ -283,10 +285,12 @@ impl Fake {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The whole timeline, absolute (`GET /control/timeline`; the checker's `--timeline`).
-    pub fn timeline_json(&self) -> Value {
-        json!({"start_wall_ms": self.start_ms, "delay_ms": self.delay_ms,
-               "events": self.timeline.events_json(self.start_ms, None)})
+    /// The whole timeline, absolute (`GET /control/timeline`; the checker's `--timeline`), once
+    /// started.
+    pub fn timeline_json(&self) -> Option<Value> {
+        let start = self.state().start_ms?;
+        Some(json!({"start_wall_ms": start, "delay_ms": self.delay_ms,
+               "events": self.timeline.events_json(start, None)}))
     }
 
     fn relay(
@@ -368,7 +372,18 @@ impl Fake {
                 }
                 _ => bad("ms must be a positive integer"),
             },
-            ("GET", "/control/timeline") => Answer::json(200, &self.timeline_json()),
+            ("POST", "/control/timeline-start") => {
+                let mut st = self.state();
+                if st.start_ms.is_some() {
+                    return Answer::json(409, &json!({"ok": false, "code": "ALREADY_STARTED"}));
+                }
+                st.start_ms = Some(now_ms);
+                Answer::json(200, &json!({"start_wall_ms": now_ms}))
+            }
+            ("GET", "/control/timeline") => match self.timeline_json() {
+                Some(t) => Answer::json(200, &t),
+                None => Answer::json(409, &json!({"ok": false, "code": "NOT_STARTED"})),
+            },
             ("GET", "/control/state") => {
                 let st = self.state();
                 Answer::json(
@@ -378,13 +393,14 @@ impl Fake {
                 )
             }
             ("GET", "/score.json") => {
-                if now_ms < self.state().score_down_until_ms {
+                let st = self.state();
+                if now_ms < st.score_down_until_ms {
                     return Answer::json(503, &json!({"ok": false, "code": "SCORE_FEED_DOWN"}));
                 }
-                Answer::json(
-                    200,
-                    &json!({"start_wall_ms": self.start_ms, "events": self.timeline.events_json(self.start_ms, Some(now_ms))}),
-                )
+                let events = st
+                    .start_ms
+                    .map_or_else(Vec::new, |s| self.timeline.events_json(s, Some(now_ms)));
+                Answer::json(200, &json!({"start_wall_ms": st.start_ms, "events": events}))
             }
             ("GET", "/overlay-test.html") => self.page(),
             ("GET", p) if p.starts_with("/overlay/fixtures/") => self.page(),
@@ -537,6 +553,10 @@ mod tests {
     }
 
     fn fake(out: Arc<Mutex<Vec<u8>>>) -> Fake {
+        fake_from(out, Some(1_000))
+    }
+
+    fn fake_from(out: Arc<Mutex<Vec<u8>>>, start: Option<i64>) -> Fake {
         struct Shared(Arc<Mutex<Vec<u8>>>);
         impl Write for Shared {
             fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
@@ -555,7 +575,7 @@ mod tests {
             s,
             b"<html>".to_vec(),
             t,
-            1_000,
+            start,
             Box::new(Shared(out)),
         )
         .unwrap()
@@ -694,11 +714,39 @@ mod tests {
             f.handle("POST", "/control/score-down?ms=0", None, b"", 0).status,
             400
         );
-        let t = crate::inputs::parse_timeline(&f.timeline_json()).unwrap();
+        let t = crate::inputs::parse_timeline(&f.timeline_json().unwrap()).unwrap();
         assert_eq!(
             (t.start_wall_ms, t.delay_ms, t.events.clone()),
             (1_000, 3_100, vec![(1, 4_000), (2, 7_000)])
         );
+    }
+
+    #[test]
+    fn the_timeline_starts_once_on_request_and_shows_nothing_before() {
+        let f = fake_from(Arc::new(Mutex::new(Vec::new())), None);
+        let feed = |now: i64| -> Value {
+            serde_json::from_slice(&f.handle("GET", "/score.json", None, b"", now).body).unwrap()
+        };
+        assert_eq!(feed(50_000)["events"], json!([]), "no events before the start");
+        assert_eq!(f.handle("GET", "/control/timeline", None, b"", 0).status, 409);
+        assert!(f.timeline_json().is_none());
+        assert_eq!(
+            f.handle("POST", "/control/timeline-start", None, b"", 2_000)
+                .status,
+            200
+        );
+        assert_eq!(
+            f.handle("POST", "/control/timeline-start", None, b"", 2_500)
+                .status,
+            409,
+            "a second start would move the times the checker reads"
+        );
+        // Anchored at 2 000: events at 5 000 and 8 000.
+        assert_eq!(feed(4_999)["events"].as_array().map(Vec::len), Some(0));
+        assert_eq!(feed(5_000)["events"], json!([{"index": 1, "at": 5_000}]));
+        let t = f.handle("GET", "/control/timeline", None, b"", 0);
+        let t = crate::inputs::parse_timeline(&serde_json::from_slice(&t.body).unwrap()).unwrap();
+        assert_eq!((t.start_wall_ms, t.events), (2_000, vec![(1, 5_000), (2, 8_000)]));
     }
 
     #[test]

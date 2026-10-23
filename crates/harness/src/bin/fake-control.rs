@@ -99,19 +99,19 @@ fn run() -> Result<(), (u8, String)> {
         .open(&a["--beats"])
         .map_err(|e| (73, format!("{}: {e}", a["--beats"])))?;
     let events = timeline.events.len();
-    let start = now_ms();
+    // The timeline waits for `POST /control/timeline-start` (run-case.sh, once the programme is live).
     let fake = Fake::new(
         token,
         session,
         page,
         timeline,
-        start,
+        None,
         Box::new(LineWriter::new(beats)),
     )
     .map_err(with(78))?;
     let server = tiny_http::Server::http(a["--listen"].as_str()).map_err(|e| (69, format!("listen: {e}")))?;
     println!(
-        "fake-control: listening on {}; the session parses (composed, {}x{}); {events} score events from {start}",
+        "fake-control: listening on {}; the session parses (composed, {}x{}); {events} score events, waiting for the timeline start",
         a["--listen"], parsed.output.width, parsed.output.height
     );
     serve(Arc::new(fake), Arc::new(server), 4, now_ms);

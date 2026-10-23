@@ -1,0 +1,142 @@
+# The harness stack (C13): the real relay image against fakes of everything around it. Run it
+# through harness/run-case.sh, which sets every variable below; never `up` it by hand with real
+# credentials. Nothing here publishes a port to the host.
+#
+# Variables (run-case.sh exports them; secrets are random per run and never in argv):
+#   RELAY_IMAGE, HARNESS_IMAGE        the images under test (image.yml's build; the Dockerfile's
+#                                     `harness` stage)
+#   HARNESS_OUT                       out/<case>: emit.jsonl, heartbeats.jsonl, rec/ (recordings)
+#   HARNESS_UID, HARNESS_GID          the files in HARNESS_OUT belong to the runner's user
+#   SESSION_ID, JOB_TOKEN             the compositor's and fake-control's (random per run)
+#   HARNESS_SRT_PASSPHRASE            MediaMTX's camera path, fake-camera and the rewritten session
+#   RELAY_DEADLINE_AT                 the case's deadline (RFC 3339)
+#   CAMERA_SIZE, CAMERA_PATTERN       fake-camera's picture (defaults 1280x720, ball)
+name: seazn-harness
+
+networks:
+  harness:
+    ipam:
+      config:
+        # netem-in's filter matches the compositor's fixed address (C13 brief, Step 4).
+        - subnet: 172.28.0.0/24
+
+services:
+  mediamtx:
+    # F-021: the tag and its digest, 2026-10-23.
+    image: bluenviron/mediamtx:1.21.2@sha256:c7540465f868a02652118bea5a0daab12a29ac0f6cb8485abd535939ecddf886
+    user: "${HARNESS_UID:?}:${HARNESS_GID:?}"
+    networks:
+      harness:
+        ipv4_address: 172.28.0.20
+    environment:
+      TZ: UTC
+      MTX_PATHS_CAM_SRTREADPASSPHRASE: ${HARNESS_SRT_PASSPHRASE:?}
+      MTX_PATHS_CAM_SRTPUBLISHPASSPHRASE: ${HARNESS_SRT_PASSPHRASE:?}
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+      - ${HARNESS_OUT:?}/rec:/rec
+
+  fake-camera:
+    image: ${HARNESS_IMAGE:?}
+    init: true
+    user: "${HARNESS_UID:?}:${HARNESS_GID:?}"
+    networks:
+      harness:
+        ipv4_address: 172.28.0.30
+    depends_on: [mediamtx]
+    environment:
+      HARNESS_SRT_PASSPHRASE: ${HARNESS_SRT_PASSPHRASE:?}
+      # GStreamer's registry cache, for an image user with no home.
+      XDG_CACHE_HOME: /tmp
+    command:
+      - fake-camera
+      - --emit
+      - /out/emit.jsonl
+      - --listen
+      - 0.0.0.0:7001
+      - --srt-host
+      - mediamtx
+      - --srt-port
+      - "8890"
+      - --stream-id
+      - publish:cam
+      - --size
+      - ${CAMERA_SIZE:-1280x720}
+      - --pattern
+      - ${CAMERA_PATTERN:-ball}
+    volumes:
+      - ${HARNESS_OUT:?}:/out
+
+  fake-control:
+    image: ${HARNESS_IMAGE:?}
+    init: true
+    user: "${HARNESS_UID:?}:${HARNESS_GID:?}"
+    networks:
+      harness:
+        ipv4_address: 172.28.0.40
+    environment:
+      JOB_TOKEN: ${JOB_TOKEN:?}
+      SESSION_ID: ${SESSION_ID:?}
+      HARNESS_SRT_PASSPHRASE: ${HARNESS_SRT_PASSPHRASE:?}
+    command:
+      - fake-control
+      - --fixture
+      - /harness/contracts/session-composed-720p.json
+      - --page
+      - /harness/pages/overlay-test.html
+      - --score
+      - /harness/pages/score.json
+      - --beats
+      - /out/heartbeats.jsonl
+      - --listen
+      - 0.0.0.0:7000
+      - --input-origin
+      - srt://mediamtx:8890
+      - --target-origin
+      - rtmp://mediamtx:1935
+      - --overlay-origin
+      - http://fake-control:7000
+      - --stream-id
+      - read:cam
+      - --stream-key
+      - dest
+    volumes:
+      - ../contracts/fixtures/relay-job.v1:/harness/contracts:ro
+      - ./pages:/harness/pages:ro
+      - ${HARNESS_OUT:?}:/out
+
+  compositor:
+    image: ${RELAY_IMAGE:?}
+    networks:
+      harness:
+        ipv4_address: 172.28.0.10
+    depends_on: [mediamtx, fake-camera, fake-control]
+    # Emulates the Machine's `restart: on-failure` with max_retries 2 (F-007, Owed 73).
+    restart: on-failure:2
+    cpus: 4
+    mem_limit: 8g
+    # The Machine's /dev/shm is a 3.88 GiB tmpfs (Owed 73 (c)); Docker's default is 64 MiB.
+    shm_size: 2gb
+    environment:
+      COMPOSITOR_DRIVERS: live
+      APP_URL: http://fake-control:7000
+      SESSION_ID: ${SESSION_ID:?}
+      JOB_TOKEN: ${JOB_TOKEN:?}
+      RELAY_DEADLINE_AT: ${RELAY_DEADLINE_AT:?}
+
+  # tc acts on egress only, so each leg is impaired at its sender (C13 brief, Step 4; netem.sh).
+  netem-out:
+    image: ${HARNESS_IMAGE:?}
+    init: true
+    network_mode: "service:compositor"
+    cap_add: [NET_ADMIN]
+    depends_on: [compositor]
+    command: [sleep, infinity]
+
+  netem-in:
+    image: ${HARNESS_IMAGE:?}
+    init: true
+    network_mode: "service:mediamtx"
+    cap_add: [NET_ADMIN]
+    depends_on: [mediamtx]
+    command: [sleep, infinity]
