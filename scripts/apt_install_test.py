@@ -30,7 +30,14 @@ at once). The mirror list is the runner image's three lines; the slow runs' logs
     in check.yml, less 90 s for the offline install (measured 20 to 34 s, five normal runs of
     2026-10-23); each fetch bound is at least 4x the slowest normal fetch (14 s, run 39977135072),
     and each update bound at least 4x the slowest normal update (10 s, run 39936996163);
-  - check.yml's GStreamer step runs this script and carries a step-level timeout-minutes.
+  - check.yml's GStreamer step runs this script and carries a step-level timeout-minutes;
+  - when the script gives up it writes `<phase> <exit>` to $APT_INSTALL_RESULT, and only then;
+  - check.yml's two dispatch-only blackhole steps (the PR #50 confirm pass, n1 and n2): their `if:`
+    evaluated by this file for push, pull_request and each dispatch mode, and true only for a
+    dispatch of `all` or `azure` (an empty input does nothing); their `run:` blocks run here against
+    a fixture mirror list and hosts file: an empty or unknown mode refused, with the hosts file
+    untouched; `all` blackholes every listed host and `azure` only azure; the verdict passes `all`
+    only on a failure the script itself reported, inside 510 s, and `azure` only on a success.
 
 Each sweep prints how many cases it checked, counting only runs of the script that printed
 anything, and a sweep that checked none is a failure; the number of checks made is printed too.
@@ -60,8 +67,8 @@ OPTIONS = ("Acquire::Retries", "Acquire::http::Timeout", "Acquire::https::Timeou
 MAIN_FLAGS = ("-y", "--no-install-recommends")
 CASES = ("happy path", "fetch fails once", "every fetch times out", "every fetch errs",
          "update fails once", "every update fails", "no mirror list", "only azure listed", "no packages")
-# A clean run makes 66 (PR #50 round 2); fewer means a case stopped early.
-CHECKS_FLOOR = 60
+# A clean run makes 108 (PR #50 confirm-pass fixes); fewer means a case stopped early.
+CHECKS_FLOOR = 95
 # The runner image's own apt settings, /etc/apt/apt.conf.d/zz-retries (runner-images
 # images/ubuntu/scripts/build/configure-apt.sh, tag ubuntu24/20261012.334, x64): the script may
 # not be looser, or apt leaves a silent mirror later than it does on main.
@@ -123,6 +130,7 @@ exit "$code"
 """
 
 failures = []
+last_result = [None]
 checks = []
 ran = []
 every_call = []
@@ -168,12 +176,15 @@ def run(case, script, bindir, codes, mirrors=MIRRORS, packages=PACKAGES):
                 f.write(mirrors)
         log = os.path.join(d, "calls.log")
         open(log, "w").close()
+        result = os.path.join(d, "result")
         env = {"PATH": bindir + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"),
-               "FAKE_LOG": log, "FAKE_DIR": d, "APT_MIRRORS": mirror_file, "LC_ALL": "C"}
+               "FAKE_LOG": log, "FAKE_DIR": d, "APT_MIRRORS": mirror_file, "LC_ALL": "C",
+               "APT_INSTALL_RESULT": result}
         p = subprocess.run([script] + packages, env=env, capture_output=True, text=True, timeout=60)
         with open(log) as f:
             calls = f.read().splitlines()
         every_call.extend(calls)
+        last_result[0] = open(result).read() if os.path.exists(result) else None
         if (p.stdout + p.stderr).strip():
             ran.append(case)
         after = None
@@ -256,6 +267,219 @@ def step_block(workflow, name):
     return None
 
 
+TOKEN = re.compile(r"\s*(?:(&&|\|\||==|!=|!|\(|\))|'([^']*)'|([A-Za-z_][\w.\-]*))")
+
+
+def evaluate(expr, ctx):
+    """Evaluates the subset of GitHub's expression language the dispatch steps use: string literals,
+    context names, `cancelled()`, `!`, `==`, `!=`, `&&`, `||` and parentheses. A name this file does
+    not know is an error, never a guess."""
+    expr = expr.strip()
+    if expr.startswith("${{") and expr.endswith("}}"):
+        expr = expr[3:-2]
+    toks, pos = [], 0
+    while expr[pos:].strip():
+        m = TOKEN.match(expr, pos)
+        if not m:
+            raise ValueError(f"cannot read {expr[pos:]!r}")
+        toks.append(("op", m.group(1)) if m.group(1) else ("str", m.group(2)) if m.group(2) is not None
+                    else ("name", m.group(3)))
+        pos = m.end()
+    i = [0]
+
+    def peek():
+        return toks[i[0]] if i[0] < len(toks) else (None, None)
+
+    def take():
+        t = peek()
+        i[0] += 1
+        return t
+
+    def primary():
+        kind, v = take()
+        if (kind, v) == ("op", "("):
+            r = disj()
+            if take() != ("op", ")"):
+                raise ValueError("unbalanced (")
+            return r
+        if kind == "str":
+            return v
+        if kind == "name":
+            if peek() == ("op", "("):
+                take()
+                if take() != ("op", ")"):
+                    raise ValueError(f"{v}( takes no arguments here")
+                if v not in ctx["functions"]:
+                    raise ValueError(f"unknown function {v}()")
+                return ctx["functions"][v]
+            if v not in ctx["names"]:
+                raise ValueError(f"unknown name {v}")
+            return ctx["names"][v]
+        raise ValueError(f"unexpected {v!r}")
+
+    def comparison():
+        left = primary()
+        if peek() in (("op", "=="), ("op", "!=")):
+            op = take()[1]
+            right = primary()
+            same = str(left).lower() == str(right).lower()
+            return same if op == "==" else not same
+        return left
+
+    def negation():
+        if peek() == ("op", "!"):
+            take()
+            return not truthy(negation())
+        return comparison()
+
+    def conj():
+        r = negation()
+        while peek() == ("op", "&&"):
+            take()
+            r2 = negation()
+            r = r2 if truthy(r) else r
+        return r
+
+    def disj():
+        r = conj()
+        while peek() == ("op", "||"):
+            take()
+            r2 = conj()
+            r = r if truthy(r) else r2
+        return r
+
+    def truthy(v):
+        return bool(v) if not isinstance(v, str) else v != ""
+
+    r = disj()
+    if i[0] != len(toks):
+        raise ValueError(f"trailing {toks[i[0]:]!r}")
+    return truthy(r)
+
+
+def step_field(block, field):
+    """A one-line `field:` of a step block, or the lines of its `field: |` body, dedented."""
+    for n, line in enumerate(block):
+        m = re.match(rf"^(\s*)(?:- )?{field}:\s*(.*)$", line)
+        if not m:
+            continue
+        if m.group(2) != "|":
+            return m.group(2)
+        body = []
+        indent = None
+        for nxt in block[n + 1:]:
+            if nxt.strip() == "":
+                body.append("")
+                continue
+            lead = len(nxt) - len(nxt.lstrip())
+            if lead <= len(m.group(1)):
+                break
+            indent = lead if indent is None else min(indent, lead)
+            body.append(nxt)
+        return "\n".join(x[indent:] for x in body) + "\n"
+    return None
+
+
+def run_block(body, bindir, env):
+    """Runs a step's `run:` body as Actions does with `shell: bash` (`bash -eo pipefail`)."""
+    full = {"PATH": bindir + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C"}
+    full.update(env)
+    p = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", body], env=full,
+                       capture_output=True, text=True, timeout=60)
+    return p.returncode, p.stdout + p.stderr
+
+
+def dispatch_steps(workflow, bindir):
+    """check.yml's dispatch-only blackhole steps: when they run, and what their bodies do."""
+    names = ("Blackhole the apt mirrors (dispatch only)", "The blackhole's verdict (dispatch only)")
+    # The last two are outside the choice list (GitHub refuses them today): the `if:` must still match
+    # each mode by name, never "anything but none".
+    contexts = [("push", ""), ("pull_request", ""), ("workflow_dispatch", "none"),
+                ("workflow_dispatch", "all"), ("workflow_dispatch", "azure"),
+                ("workflow_dispatch", ""), ("workflow_dispatch", "true")]
+    blocks = {n: step_block(workflow, n) for n in names}
+    evaluated = 0
+    for n, block in blocks.items():
+        check(block is not None, f"check.yml has the step '{n}'")
+        cond = step_field(block or [], "if")
+        check(cond is not None, f"'{n}' carries an if:")
+        if cond is None:
+            continue
+        for event, mode in contexts:
+            ctx = {"names": {"github.event_name": event, "inputs.apt_blackhole": mode},
+                   "functions": {"cancelled": False, "always": True, "success": True, "failure": False}}
+            try:
+                got = evaluate(cond, ctx)
+            except ValueError as e:
+                check(False, f"'{n}': if: is readable ({e})")
+                continue
+            evaluated += 1
+            want = event == "workflow_dispatch" and mode in ("all", "azure")
+            check(got == want, f"'{n}' runs on {event} with apt_blackhole={mode!r}: {want} (got {got})")
+    print(f"dispatch-step conditions evaluated: {evaluated}")
+    check(evaluated == len(names) * len(contexts), "every dispatch-step condition evaluated in every context")
+
+    gst = step_block(workflow, "GStreamer") or []
+    result_env = step_field(gst, "env") or ""
+    check("APT_INSTALL_RESULT" in result_env and "runner.temp" in result_env and "apt-install-result" in result_env,
+          "the GStreamer step hands the script APT_INSTALL_RESULT under runner.temp")
+
+    hole = step_field(blocks[names[0]] or [], "run")
+    verdict = step_field(blocks[names[1]] or [], "run")
+    check(hole is not None and verdict is not None, "both dispatch steps have a run: body")
+    if hole is None or verdict is None:
+        return
+    check(verdict.count("apt-install-result") == 1, "the verdict reads the script's apt-install-result")
+    bodies = 0
+    with tempfile.TemporaryDirectory() as d:
+        mirrors = os.path.join(d, "apt-mirrors.txt")
+        hosts = os.path.join(d, "hosts")
+        with open(mirrors, "w") as f:
+            f.write(MIRRORS)
+        hole_body = hole.replace("/etc/apt/apt-mirrors.txt", mirrors).replace("/etc/hosts", hosts)
+        verdict_body = verdict.replace("/etc/apt/apt-mirrors.txt", mirrors)
+        check(hole_body.count(mirrors) >= 1 and hole_body.count(hosts) == 1 and verdict_body.count(mirrors) >= 1,
+              "the dispatch bodies name the runner's mirror list and hosts file (and nothing else is touched here)")
+        for mode, want in (("", None), ("bogus", None), ("none", None),
+                           ("all", "10.255.255.1 archive.ubuntu.com azure.archive.ubuntu.com security.ubuntu.com"),
+                           ("azure", "10.255.255.1 azure.archive.ubuntu.com")):
+            with open(hosts, "w") as f:
+                f.write("127.0.0.1 localhost\n")
+            t0 = os.path.join(d, "apt-blackhole-t0")
+            if os.path.exists(t0):
+                os.remove(t0)
+            rc, out = run_block(hole_body, bindir, {"MODE": mode, "RUNNER_TEMP": d})
+            bodies += 1
+            added = open(hosts).read().splitlines()[1:]
+            if want is None:
+                check(rc != 0 and "::error::" in out and not added and not os.path.exists(t0),
+                      f"blackhole with MODE={mode!r}: refused with an error, the hosts file untouched (got {rc}, {added})")
+            else:
+                check(rc == 0 and [x.strip() for x in added] == [want] and os.path.exists(t0),
+                      f"blackhole with MODE={mode!r}: exactly '{want}' added (got {rc}, {added})")
+        now = int(__import__("time").time())
+        result = os.path.join(d, "apt-install-result")
+        for mode, outcome, age, gave_up, want in (
+                ("all", "failure", 100, "download 100", 0), ("all", "failure", 100, None, 1),
+                ("all", "failure", 600, "download 124", 1), ("all", "success", 100, None, 1),
+                ("azure", "success", 100, None, 0), ("azure", "failure", 100, "download 124", 1),
+                ("", "failure", 100, "download 100", 1), ("bogus", "success", 100, None, 1)):
+            with open(os.path.join(d, "apt-blackhole-t0"), "w") as f:
+                f.write(f"{now - age}\n")
+            if gave_up is None:
+                if os.path.exists(result):
+                    os.remove(result)
+            else:
+                with open(result, "w") as f:
+                    f.write(gave_up + "\n")
+            rc, out = run_block(verdict_body, bindir, {"MODE": mode, "OUTCOME": outcome, "RUNNER_TEMP": d})
+            bodies += 1
+            check((rc == 0) == (want == 0) and (rc == 0 or "::error::" in out),
+                  f"verdict MODE={mode!r} OUTCOME={outcome} after {age} s, gave up: {gave_up}: exit {'0' if want == 0 else 'non-zero'} (got {rc})")
+    print(f"dispatch-step bodies run: {bodies}")
+    check(bodies == 13, "every dispatch-step body case ran")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--script", default=os.path.join(ROOT, "scripts", "apt-install.sh"))
@@ -305,6 +529,7 @@ def sweep(a, script, bindir):
           "happy path: apt's effective network settings logged once, with the same -o options")
     check(after == MIRRORS, "happy path: the mirror list untouched")
     check("::warning::" not in out and "::error::" not in out, "happy path: no warning, no error")
+    check(last_result[0] is None, "happy path: no give-up result written")
     happy = ph
 
     # apt's own settings leave a silent mirror inside one update attempt. The blackhole run spaced
@@ -340,6 +565,7 @@ def sweep(a, script, bindir):
     check(ph == ["update", "fetch", "fetch", "install"], f"fetch fails once: fetched twice, installed once (got {ph})")
     check(out.count("::warning::") == 1 and "::error::" not in out, "fetch fails once: one warning, no error")
     check(after == WITHOUT_AZURE, "fetch fails once: azure dropped, the other two lines kept in order")
+    check(last_result[0] is None, "fetch fails once: no give-up result written (it did not give up)")
 
     # Every fetch fails: over its bound, or with apt's own error.
     fetch_fail_calls = None
@@ -354,6 +580,7 @@ def sweep(a, script, bindir):
         check(len(errors) == 1 and f"exit {code}" in errors[0], f"{case}: one ::error::, naming exit {code}")
         check(out.count("::warning::") == fetches, f"{case}: one warning per failed attempt")
         check(after == WITHOUT_AZURE, f"{case}: the list after the last failure equals the list after the first")
+        check(last_result[0] == f"download {code}\n", f"{case}: the give-up result reads 'download {code}' (got {last_result[0]!r})")
         if code == 124:
             fetch_fail_calls = calls
 
@@ -372,6 +599,7 @@ def sweep(a, script, bindir):
     check(ph == ["update"] * updates and 2 <= updates <= 5,
           f"every update fails: only updates, a bounded number, more than one (got {ph})")
     check(out.count("::error::") == 1, "every update fails: one ::error::")
+    check(last_result[0] == "index update 124\n", f"every update fails: the give-up result reads 'index update 124' (got {last_result[0]!r})")
     update_fail_calls = calls
 
     # No mirror list; a list holding only azure.
@@ -420,6 +648,8 @@ def sweep(a, script, bindir):
               f"less {INSTALL_ALLOWANCE_S} s for the install")
         check(0 < worst <= step_s - INSTALL_ALLOWANCE_S,
               "the script fails on its own, with its own ::error::, before the step's bound")
+
+    dispatch_steps(a.workflow, bindir)
 
     print(f"checks made: {len(checks)}")
     check(len(checks) >= CHECKS_FLOOR, f"at least {CHECKS_FLOOR} checks made")

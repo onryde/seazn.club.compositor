@@ -21,6 +21,8 @@
 # room for the install (20 to 34 s).
 #
 # Usage: scripts/apt-install.sh <package>...
+# APT_INSTALL_RESULT, if set, is a file that receives `<phase> <exit>` when the script gives up (and
+# only then), so a caller can tell the script's own failure from a crash.
 set -euo pipefail
 
 if [ "$#" -eq 0 ]; then
@@ -72,6 +74,9 @@ attempt() {
     echo "::warning::apt $what: attempt $i of $tries failed after $((SECONDS - start)) s (exit $rc; 124 is its ${bound} s bound)"
     if [ "$i" -ge "$tries" ]; then
       echo "::error::apt $what failed $tries times (last exit $rc: 124 is over the ${bound} s bound, 100 is apt's own error, in the log above)"
+      if [ -n "${APT_INSTALL_RESULT:-}" ]; then
+        echo "$what $rc" > "$APT_INSTALL_RESULT"
+      fi
       return 1
     fi
     fall_back

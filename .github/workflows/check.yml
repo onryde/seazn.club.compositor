@@ -37,11 +37,17 @@ jobs:
       # Dispatch only, a proof (PR #50): `all` points every mirror in the runner's list at an address
       # nothing answers, and the GStreamer step must fail on the script's own bound; `azure` points only
       # the first mirror there, and the step must pass from the next one. The verdict step checks both.
+      # Each mode is matched by name, in the `if:` and in the body: on push and pull_request the input
+      # is empty, and an empty or unknown mode must do nothing (scripts/apt_install_test.py).
       - name: Blackhole the apt mirrors (dispatch only)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.apt_blackhole != 'none' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && (inputs.apt_blackhole == 'all' || inputs.apt_blackhole == 'azure') }}
         env: { MODE: "${{ inputs.apt_blackhole }}" }
         run: |
-          if [ "$MODE" = all ]; then pattern='^https?://'; else pattern='^https?://azure[.]archive[.]ubuntu[.]com/'; fi
+          case "$MODE" in
+            all) pattern='^https?://' ;;
+            azure) pattern='^https?://azure[.]archive[.]ubuntu[.]com/' ;;
+            *) echo "::error::no blackhole mode '$MODE' (all or azure)"; exit 1 ;;
+          esac
           hosts=$({ grep -E "$pattern" /etc/apt/apt-mirrors.txt || true; } | awk -F/ '{print $3}' | sort -u | tr '\n' ' ')
           if [ -z "$hosts" ]; then
             echo "::error::no $MODE host to blackhole in /etc/apt/apt-mirrors.txt"
@@ -56,23 +62,30 @@ jobs:
       - name: GStreamer
         id: gst
         timeout-minutes: 10
+        # Where the script writes `<phase> <exit>` when it gives up: the verdict's proof that the
+        # failure was the script's own, not a crash.
+        env: { APT_INSTALL_RESULT: "${{ runner.temp }}/apt-install-result" }
         run: scripts/apt-install.sh libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
       # 510 s: the script's worst case (490 s) plus 20, inside the step's 600; past it, the step's own
-      # timeout did the work, and the script's bound is unproven.
+      # timeout did the work, and the script's bound is unproven. `all` passes only on a failure the
+      # script itself reported (its give-up result), so a crash before the bound is not a pass.
       - name: The blackhole's verdict (dispatch only)
-        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.apt_blackhole != 'none' }}
+        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && (inputs.apt_blackhole == 'all' || inputs.apt_blackhole == 'azure') }}
         env: { MODE: "${{ inputs.apt_blackhole }}", OUTCOME: "${{ steps.gst.outcome }}" }
         run: |
           took=$(( $(date +%s) - $(cat "$RUNNER_TEMP/apt-blackhole-t0") ))
-          echo "mode $MODE: the GStreamer step's outcome is $OUTCOME, $took s after the blackhole; the mirror list now:"
+          gave_up=$(cat "$RUNNER_TEMP/apt-install-result" 2> /dev/null || true)
+          echo "mode $MODE: the GStreamer step's outcome is $OUTCOME, $took s after the blackhole; the script gave up: '${gave_up:-no}'; the mirror list now:"
           cat /etc/apt/apt-mirrors.txt
-          if [ "$MODE" = all ]; then
-            if [ "$OUTCOME" = failure ] && [ "$took" -lt 510 ]; then exit 0; fi
-            echo "::error::every mirror dead: the step must fail on the script's own bound, under 510 s"
-          else
-            if [ "$OUTCOME" = success ]; then exit 0; fi
-            echo "::error::azure dead: the step must pass from the next mirror"
-          fi
+          case "$MODE" in
+            all)
+              if [ "$OUTCOME" = failure ] && [ -n "$gave_up" ] && [ "$took" -lt 510 ]; then exit 0; fi
+              echo "::error::every mirror dead: the step must fail on the script's own give-up, under 510 s" ;;
+            azure)
+              if [ "$OUTCOME" = success ]; then exit 0; fi
+              echo "::error::azure dead: the step must pass from the next mirror" ;;
+            *) echo "::error::no blackhole mode '$MODE' (all or azure)" ;;
+          esac
           exit 1
       - uses: dtolnay/rust-toolchain@master
         with: { toolchain: "1.91.0", components: "rustfmt, clippy" }
