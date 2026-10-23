@@ -4,14 +4,19 @@
 //! from the checker.
 //!
 //! The fixture, at 30 fps from T0 = 2026-10-23 12:00:00 UTC:
-//! - segment 1 (90 frames, 3.0 s): counters 1..=30; counter 31 on 21 frames (a 20-frame freeze);
-//!   10 mid-grey slate frames; counters 62..=90;
+//! - segment 1 (90 frames, 3.0 s): counters 11..=40; counter 41 on 21 frames (a 20-frame freeze);
+//!   10 mid-grey slate frames; counters 72..=100;
 //! - a 1.5 s outage;
-//! - segment 2 (60 frames) from T0 + 4.5 s: counters 91..=150.
+//! - segment 2 (60 frames) from T0 + 4.5 s: counters 101..=160.
 //!
 //! The camera emitted each counter 700 ms before its first showing; the audio is the camera's tone
-//! by frame index, so its bursts fall on counters 30, 90, 120 and 150 (60's burst falls in the
-//! slate and pairs with nothing).
+//! by frame counter, so its bursts fall on counters 30, 90, 120 and 150. The burst on 60 falls in
+//! the freeze, where the picture still shows 41, so it pairs with nothing.
+//!
+//! The counters start at 11, not 1, so that no burst sits near the end of a segment. Each fixture
+//! segment is its own AAC encode, and an AAC encode loses its tail: CI run 39979756301 decoded
+//! 238 592 of 240 000 samples. A first version started at 1, which put bursts on the last frames
+//! (90 and 150), and neither burst survived.
 mod common;
 
 use std::path::{Path, PathBuf};
@@ -39,16 +44,21 @@ fn at(ms: i64) -> (i64, String) {
     ((t.unix_timestamp_nanos() / 1_000_000) as i64, name)
 }
 
+/// Segment 1's first counter (the module comment: why not 1).
+const FIRST: u32 = 11;
+/// The counter the freeze holds: frame 30's, shown on frames 30..=50.
+const FROZEN: u32 = FIRST + 30;
+
 fn segment_1() -> Vec<SegFrame> {
     (0..90u32)
         .map(|i| SegFrame {
             strip: match i {
-                0..30 => Some(i + 1),
-                30..51 => Some(31),
+                0..30 => Some(i + FIRST),
+                30..51 => Some(FROZEN),
                 51..61 => None,
-                _ => Some(i + 1),
+                _ => Some(i + FIRST),
             },
-            audio_counter: i + 1,
+            audio_counter: i + FIRST,
         })
         .collect()
 }
@@ -56,12 +66,12 @@ fn segment_1() -> Vec<SegFrame> {
 fn segment_2(swap: bool) -> Vec<SegFrame> {
     let mut f: Vec<SegFrame> = (0..60u32)
         .map(|j| SegFrame {
-            strip: Some(91 + j),
-            audio_counter: 91 + j,
+            strip: Some(FIRST + 90 + j),
+            audio_counter: FIRST + 90 + j,
         })
         .collect();
     if swap {
-        // Counter 101 shown before 100: one regression.
+        // Counter 111 shown before 110: one regression.
         f.swap(9, 10);
     }
     f
@@ -161,7 +171,7 @@ fn two_recorded_segments_give_the_fixtures_outage_freeze_slate_and_latency() {
     assert_eq!(r.camera.freezes.len(), 1, "{:?}", r.camera.freezes);
     assert_eq!(
         (r.camera.freezes[0].frames, r.camera.freezes[0].counter),
-        (20, 31)
+        (20, FROZEN)
     );
     assert_eq!(
         r.camera.slates.iter().map(|s| s.frames).collect::<Vec<_>>(),
@@ -177,7 +187,7 @@ fn two_recorded_segments_give_the_fixtures_outage_freeze_slate_and_latency() {
     );
     assert_eq!(r.camera.counter_regressions, 0);
 
-    // 120 counters first shown (1..=31, 62..=150), each 700 ms after its emit.
+    // 120 counters first shown (11..=41, 72..=160), each 700 ms after its emit.
     assert_eq!(r.camera.latency_samples, 120);
     assert!(
         (r.camera.latency_ms.p50 - LATENCY_MS).abs() <= 2,
@@ -190,7 +200,7 @@ fn two_recorded_segments_give_the_fixtures_outage_freeze_slate_and_latency() {
         r.camera.latency_ms
     );
 
-    // Bursts on counters 30, 90, 120 and 150 pair; the slate's (60) does not.
+    // Bursts on counters 30, 90, 120 and 150 pair; the freeze's (60) does not.
     assert_eq!(r.audio.onsets, 5, "{:?}", r.audio);
     assert_eq!(r.audio.av_offset_ms.pairs, 4, "{:?}", r.audio);
     assert!(r.audio.av_offset_ms.max_abs <= 50, "{:?}", r.audio.av_offset_ms);

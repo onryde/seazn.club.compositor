@@ -78,6 +78,11 @@ fn wait_eos(pipeline: &gst::Pipeline, what: &str) {
 /// Encodes `pictures` (I420, `l`'s layout) with the camera's x264 settings, decodes them with
 /// avdec_h264, scales to `out` when given, and returns each decoded frame's strip reading in PTS
 /// order with its PTS index. The count is the caller's to check (a lost frame is a failure).
+///
+/// The index counts from the first decoded PTS, not from 0: x264enc offsets every output timestamp
+/// by 1 000 hours (GstVideoEncoder's minimum PTS, so a DTS never goes negative), which read as
+/// index 108 000 001 for frame 0 on CI (run 39979756301). A lost first frame still fails the caller,
+/// whose expected reading for frame 0 is that picture's own counter.
 pub fn x264_round_trip(
     l: &Layout,
     out: Option<(u32, u32)>,
@@ -118,7 +123,7 @@ pub fn x264_round_trip(
         }
         src.end_of_stream().expect("eos");
     });
-    let mut read = Vec::new();
+    let mut decoded = Vec::new();
     while let Ok(sample) = sink.pull_sample() {
         let b = sample.buffer().expect("buffer");
         let info = gstreamer_video::VideoInfo::from_caps(sample.caps().expect("caps")).expect("info");
@@ -130,14 +135,18 @@ pub fn x264_round_trip(
             width: info.width(),
             height: info.height(),
         };
-        let pts = b.pts().expect("pts").nseconds();
-        read.push(((pts + FRAME_NS / 2) / FRAME_NS, strip::read(&y)));
-        if read.len() as u64 == n {
+        decoded.push((b.pts().expect("pts").nseconds(), strip::read(&y)));
+        if decoded.len() as u64 == n {
             break;
         }
     }
     pusher.join().expect("pusher");
     wait_eos(&pipeline, "x264 round trip");
+    let first = decoded.iter().map(|(pts, _)| *pts).min().unwrap_or(0);
+    let mut read: Vec<(u64, Option<u32>)> = decoded
+        .into_iter()
+        .map(|(pts, got)| ((pts - first + FRAME_NS / 2) / FRAME_NS, got))
+        .collect();
     read.sort_unstable();
     read
 }
