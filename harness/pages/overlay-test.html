@@ -21,6 +21,16 @@
      down (503). Loaded anywhere else (C11's graphics tests from file:// and from
      /overlay-test.html, image.yml's probe) it draws no strip and fetches nothing.
 
+     At the fixture's path it also polls /page-control.json (C14), which fake-control serves:
+       - `hang: true`, once, after `POST /control/page-hang` (case 11, cef-hung): the page
+         console.warns `hang starts` and blocks in `while (true) {}`, as crash=1 does. A query
+         switch cannot reach this page: the session's overlayUrl is the vendored fixture's, and
+         fake-control refuses a rewrite that changes its query;
+       - `stale_after_ms` (the budget, spec §6 page side) and `poll_ms`: the score-stale rule the
+         real page keeps (R2005's line form). After `stale_after_ms` with no good /score.json answer
+         the page logs `seazn:score-stale=true` once, and `seazn:score-stale=false` on the next good
+         answer (case 7, score-down). Until fake-control has answered, no stale line is logged.
+
      What it says, on F-001's console channel (console.info, read from the `cefconsole` log
      category; never window.gstSendMsg, whose js-signal mode hangs start() and set_state(NULL)):
        - `seazn:ready`, 500 ms after load (`ready_after_ms=N` moves it);
@@ -119,6 +129,10 @@
     }
     let events = [];
     let shown = -1;
+    let pollMs = 1000;
+    let staleAfter = null;
+    let lastGood = Date.now();
+    let stale = false;
     function paint() {
       const now = Date.now();
       let index = 0;
@@ -134,19 +148,53 @@
       }
     }
     async function poll() {
+      let good = false;
       try {
         const r = await fetch("/score.json", { cache: "no-store" });
         if (r.ok) {
           const body = await r.json();
-          if (Array.isArray(body.events)) events = body.events;
+          if (Array.isArray(body.events)) {
+            events = body.events;
+            good = true;
+          }
         }
       } catch (e) {
         // Keep the last good answer.
       }
+      const now = Date.now();
+      if (good) {
+        lastGood = now;
+        if (stale) {
+          stale = false;
+          console.info("seazn:score-stale=false");
+        }
+      } else if (!stale && staleAfter !== null && now - lastGood >= staleAfter) {
+        stale = true;
+        console.info("seazn:score-stale=true");
+      }
+    }
+    async function pageControl() {
+      try {
+        const r = await fetch("/page-control.json", { cache: "no-store" });
+        if (!r.ok) return;
+        const c = await r.json();
+        if (typeof c.stale_after_ms === "number") staleAfter = c.stale_after_ms;
+        if (typeof c.poll_ms === "number" && c.poll_ms > 0) pollMs = c.poll_ms;
+        if (c.hang === true) {
+          console.warn("hang starts");
+          busy(null);
+        }
+      } catch (e) {
+        // fake-control is down: no hang, and the stale rule keeps its last numbers.
+      }
+    }
+    async function loop() {
+      await pageControl();
+      await poll();
+      setTimeout(loop, pollMs);
     }
     paint();
-    poll();
-    setInterval(poll, 1000);
+    loop();
     setInterval(paint, 50);
   }
 

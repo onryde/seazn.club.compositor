@@ -10,7 +10,11 @@
 //!   `POST /control/timeline-start` (anchors the scripted timeline at now, once: run-case.sh calls
 //!   it when the programme goes live, so a slow cold start cannot use the timeline up before the
 //!   recording shows it), `GET /control/timeline` (the whole score timeline, absolute, for the
-//!   checker; 409 before the start) and `GET /control/state`.
+//!   checker; 409 before the start) and `GET /control/state` (with the refusals by cause: another
+//!   session's id, a wrong bearer, a score answer refused while down).
+//! - C14: `POST /control/page-hang` arms the page's hang once (409 after), and
+//!   `GET /page-control.json` serves it to the first poll after (`{"hang":true}` once), with the
+//!   page's stale rule (`stale_after_ms`, `poll_ms`: the budgets, `thresholds`).
 //! - `GET /score.json`: the events that have happened by now (a live score feed reveals an event
 //!   when it happens; none before the start), or 503 while the feed is down. The page polls it
 //!   every second.
@@ -25,6 +29,8 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::{json, Value};
+
+use crate::thresholds::{BUDGET_SCORE_STALE_AFTER_MS, HARNESS_PAGE_POLL_MS};
 
 /// The relay routes' prefix (R1, `seazn.club`'s internal relay API).
 pub const SESSIONS: &str = "/api/internal/relay/sessions/";
@@ -216,6 +222,17 @@ struct State {
     beats: u64,
     beats_refused: u64,
     fetches: u64,
+    /// Relay requests with the right bearer for another session id (404): a restarted compositor
+    /// that lost its session would show here (C14 cases 8, 9, 13-15).
+    other_session: u64,
+    /// Relay requests with no bearer or a wrong one (401).
+    unauthorized: u64,
+    /// `/score.json` answers refused while the feed was down (503; C14 case 7's witness).
+    score_refused: u64,
+    /// C14 case 11: the page hang, armed by `POST /control/page-hang` and served to the first
+    /// `/page-control.json` poll after it, once.
+    page_hang_armed: bool,
+    page_hang_served_ms: Option<i64>,
 }
 
 /// fake-control's routes and state.
@@ -277,6 +294,11 @@ impl Fake {
                 beats: 0,
                 beats_refused: 0,
                 fetches: 0,
+                other_session: 0,
+                unauthorized: 0,
+                score_refused: 0,
+                page_hang_armed: false,
+                page_hang_served_ms: None,
             }),
         })
     }
@@ -302,11 +324,13 @@ impl Fake {
         now_ms: i64,
     ) -> Answer {
         if authorization != Some(format!("Bearer {}", self.token).as_str()) {
+            self.state().unauthorized += 1;
             return Answer::json(401, &json!({"ok": false, "code": "UNAUTHORIZED"}));
         }
         let rest = &path[SESSIONS.len()..];
         let (sid, tail) = rest.split_once('/').unwrap_or((rest, ""));
         if sid != self.session_id {
+            self.state().other_session += 1;
             return Answer::json(404, &json!({"ok": false, "code": "NOT_FOUND"}));
         }
         match (method, tail) {
@@ -389,12 +413,39 @@ impl Fake {
                 Answer::json(
                     200,
                     &json!({"desiredState": st.desired, "beats": st.beats, "beats_refused": st.beats_refused,
-                            "session_fetches": st.fetches, "score_down_until_ms": st.score_down_until_ms}),
+                            "session_fetches": st.fetches, "score_down_until_ms": st.score_down_until_ms,
+                            "other_session_requests": st.other_session,
+                            "unauthorized_requests": st.unauthorized, "score_refused": st.score_refused,
+                            "page_hang_armed": st.page_hang_armed,
+                            "page_hang_served_ms": st.page_hang_served_ms}),
+                )
+            }
+            ("POST", "/control/page-hang") => {
+                let mut st = self.state();
+                if st.page_hang_armed || st.page_hang_served_ms.is_some() {
+                    return Answer::json(409, &json!({"ok": false, "code": "ALREADY_ARMED"}));
+                }
+                st.page_hang_armed = true;
+                Answer::json(200, &json!({"page_hang_armed": true}))
+            }
+            // The page's own controls (C14): the hang, once, and its stale rule's numbers, which are
+            // the budgets' (spec §6, page side), never a literal in the page.
+            ("GET", "/page-control.json") => {
+                let mut st = self.state();
+                let hang = std::mem::take(&mut st.page_hang_armed);
+                if hang {
+                    st.page_hang_served_ms = Some(now_ms);
+                }
+                Answer::json(
+                    200,
+                    &json!({"hang": hang, "stale_after_ms": BUDGET_SCORE_STALE_AFTER_MS,
+                            "poll_ms": HARNESS_PAGE_POLL_MS}),
                 )
             }
             ("GET", "/score.json") => {
-                let st = self.state();
+                let mut st = self.state();
                 if now_ms < st.score_down_until_ms {
+                    st.score_refused += 1;
                     return Answer::json(503, &json!({"ok": false, "code": "SCORE_FEED_DOWN"}));
                 }
                 let events = st
@@ -794,12 +845,148 @@ mod tests {
         }
     }
 
+    /// C14: the scripted timeline covers the longest case. Every case file's `CASE_LIVE_S` is read
+    /// (the live drive after the timeline's start), and the last event comes no earlier than the
+    /// longest, so a case's score changes never run out before its verdict window does.
     #[test]
-    fn the_committed_score_json_is_twenty_events() {
+    fn the_committed_score_json_outlasts_every_case() {
         let p = concat!(env!("CARGO_MANIFEST_DIR"), "/../../harness/pages/score.json");
         let t = ScriptedTimeline::parse(&serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap())
             .unwrap();
-        assert_eq!(t.events.len(), 20, "the brief's scripted 20-event timeline");
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../harness/cases");
+        let mut longest = 0_i64;
+        let mut cases = 0;
+        for e in std::fs::read_dir(dir).unwrap() {
+            let path = e.unwrap().path();
+            if path.extension().and_then(|x| x.to_str()) != Some("sh") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for line in text.lines() {
+                if let Some(v) = line.trim().strip_prefix("CASE_LIVE_S=") {
+                    let s: i64 = v
+                        .trim_matches('"')
+                        .parse()
+                        .unwrap_or_else(|_| panic!("{path:?}: {line}"));
+                    longest = longest.max(s);
+                    cases += 1;
+                }
+            }
+        }
+        println!(
+            "score.json: {} events, the last at {} ms; {cases} CASE_LIVE_S lines, the longest {longest} s",
+            t.events.len(),
+            t.events.last().unwrap().1
+        );
+        assert!(cases >= 1, "no case file sets CASE_LIVE_S: nothing was checked");
+        assert!(
+            t.events.last().unwrap().1 >= longest * 1_000,
+            "score.json ends at {} ms, before the longest case ({longest} s)",
+            t.events.last().unwrap().1
+        );
+    }
+
+    #[test]
+    fn the_page_hang_is_armed_once_and_served_to_one_poll() {
+        let f = fake(Arc::new(Mutex::new(Vec::new())));
+        let poll = |now: i64| -> Value {
+            let a = f.handle("GET", "/page-control.json", None, b"", now);
+            assert_eq!(a.status, 200);
+            serde_json::from_slice(&a.body).unwrap()
+        };
+        let state = || -> Value {
+            serde_json::from_slice(&f.handle("GET", "/control/state", None, b"", 0).body).unwrap()
+        };
+        let v = poll(10);
+        assert_eq!(v["hang"], false);
+        // The page's stale rule and its poll come from the budgets (spec §6, page side).
+        assert_eq!(
+            v["stale_after_ms"].as_u64(),
+            Some(crate::thresholds::BUDGET_SCORE_STALE_AFTER_MS)
+        );
+        assert_eq!(
+            v["poll_ms"].as_u64(),
+            Some(crate::thresholds::HARNESS_PAGE_POLL_MS)
+        );
+        assert_eq!(state()["page_hang_served_ms"], Value::Null);
+        assert_eq!(f.handle("POST", "/control/page-hang", None, b"", 20).status, 200);
+        assert_eq!(state()["page_hang_armed"], true);
+        assert_eq!(poll(30)["hang"], true, "the first poll after arming hangs");
+        assert_eq!(
+            poll(40)["hang"],
+            false,
+            "one-shot: the next page (generation g+1) is spared"
+        );
+        assert_eq!(
+            (
+                state()["page_hang_armed"].clone(),
+                state()["page_hang_served_ms"].as_i64()
+            ),
+            (json!(false), Some(30))
+        );
+        assert_eq!(
+            f.handle("POST", "/control/page-hang", None, b"", 50).status,
+            409,
+            "one hang per run"
+        );
+        assert_eq!(poll(60)["hang"], false);
+    }
+
+    #[test]
+    fn refused_requests_are_counted_by_cause() {
+        let f = fake(Arc::new(Mutex::new(Vec::new())));
+        let state = || -> Value {
+            serde_json::from_slice(&f.handle("GET", "/control/state", None, b"", 0).body).unwrap()
+        };
+        assert_eq!(
+            (
+                state()["other_session_requests"].as_u64(),
+                state()["unauthorized_requests"].as_u64(),
+                state()["score_refused"].as_u64()
+            ),
+            (Some(0), Some(0), Some(0))
+        );
+        assert_eq!(
+            f.handle("GET", &format!("{SESSIONS}sid-2"), Some("Bearer tok"), b"", 0)
+                .status,
+            404
+        );
+        assert_eq!(
+            f.handle(
+                "POST",
+                &format!("{SESSIONS}sid-2/heartbeat"),
+                Some("Bearer tok"),
+                b"{}",
+                0
+            )
+            .status,
+            404
+        );
+        assert_eq!(
+            f.handle("GET", &format!("{SESSIONS}sid-1"), Some("Bearer no"), b"", 0)
+                .status,
+            401
+        );
+        assert_eq!(
+            f.handle("GET", &format!("{SESSIONS}sid-1"), Some("Bearer tok"), b"", 0)
+                .status,
+            200
+        );
+        f.handle("POST", "/control/score-down?ms=1000", None, b"", 5_000);
+        for now in [5_000, 5_500, 6_000] {
+            f.handle("GET", "/score.json", None, b"", now);
+        }
+        let s = state();
+        assert_eq!(
+            (
+                s["other_session_requests"].as_u64(),
+                s["unauthorized_requests"].as_u64(),
+                s["session_fetches"].as_u64(),
+                s["score_refused"].as_u64()
+            ),
+            (Some(2), Some(1), Some(1), Some(2)),
+            "{s}"
+        );
     }
 
     /// The self-check passes the rewrite fake-control serves, and refuses what the compositor would:
