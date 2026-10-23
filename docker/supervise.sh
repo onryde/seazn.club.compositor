@@ -1,8 +1,8 @@
 # shellcheck shell=bash
 # The relay image's stop supervision (C12; F-016, and the PR #36 review's I2, m1 and m6). Sourced by
 # the entrypoint as its first command, so its traps exist before anything else runs, then
-# `supervise <command…>` runs the compositor as this shell's child and returns the child's own exit
-# status. `scripts/supervise_test.py` drives this file with a stub child (check.yml).
+# `supervise <command…>` runs the compositor under a waiter subshell and returns the compositor's own
+# exit status, which the waiter writes to a private file under /tmp. `scripts/supervise_test.py` drives this file with a stub child (check.yml).
 #
 # - CEF takes over SIGINT and SIGTERM inside the compositor's process once it starts (F-016): a raw
 #   one exits it at once with status 0, with no drain and no final beat. So the stops are forwarded
@@ -49,12 +49,45 @@ _sv_armed_now() {
   (( (16#$cgt & 0xa00) == 0xa00 ))
 }
 
-# supervise <command…>: runs it as this shell's child and returns its own exit status.
+# supervise <command…>: runs it and returns its own exit status.
+#
+# The command runs under a waiter: a subshell that writes the command's pid, then its exit status,
+# each to a file in a private directory, and holds a pipe this shell reads until its end. This shell
+# never `wait`s on the command: when a stop's trap interrupts `wait` just as the child ends, bash can
+# lose the child's status (bash 5.2.21 on the CI runner: 2 of 150 races returned 130 and 255 for the
+# child's own 75). The waiter has none of these traps (a subshell resets them) and tini signals only
+# this shell, so nothing interrupts the waiter's `wait`. Nothing travels through the pipe, so nothing
+# can be lost from it either: bash 3.2's `read` drops the byte it is reading when a trap runs (a
+# status of 75 lost its terminator on a macOS host), and an empty pipe has no byte to drop.
 supervise() {
-  "$@" &
-  _sv_pid=$!
+  local dir
+  if ! dir=$(mktemp -d /tmp/seazn-supervise.XXXXXX); then
+    log error "no private directory for the compositor's exit status"
+    return 70
+  fi
+  exec 8>&1
+  exec 9< <(
+    set +e
+    "$@" >&8 8>&- &
+    echo "$!" >"$dir/pid.new" && mv "$dir/pid.new" "$dir/pid"
+    wait "$!"
+    echo "$?" >"$dir/status.new" && mv "$dir/status.new" "$dir/status"
+  )
+  exec 8>&-
   local i
-  # Up to 10 s for the handlers; a child that exits first ends the wait.
+  # Up to 10 s for the pid, then for the handlers; a child that exits first ends the wait.
+  for ((i = 0; i < 200; i++)); do
+    [ -e "$dir/pid" ] && break
+    sleep 0.05
+  done
+  _sv_pid=
+  if [ -e "$dir/pid" ]; then IFS= read -r _sv_pid <"$dir/pid" || true; fi
+  if ! [[ $_sv_pid =~ ^[0-9]+$ ]]; then
+    log error "the compositor's waiter gave no pid"
+    exec 9<&-
+    rm -rf "$dir"
+    return 70
+  fi
   for ((i = 0; i < 200; i++)); do
     _sv_armed_now && break
     kill -0 "$_sv_pid" 2>/dev/null || break
@@ -66,19 +99,21 @@ supervise() {
     kill -"$s" "$_sv_pid" 2>/dev/null || true
   done
   _sv_pending=
-  # `wait` returns early (above 128) when a trap runs during it, with the child still running or
-  # not yet reported, so it waits again for the child's own status. A 127 on that second wait means
-  # the first one had already returned the child's status (a stop landed just as it ended): keep it.
-  local code= rc
+  # The pipe's end is the waiter's: its write end is the waiter's stdout alone (the command's is
+  # fd 8's copy). A stop's trap runs during the read, which then reads on.
+  local line
   while :; do
     _sv_forwarded=
-    set +e
-    wait "$_sv_pid"
-    rc=$?
-    set -e
-    if [ "$rc" -eq 127 ] && [ -n "$code" ]; then break; fi
-    code=$rc
+    if IFS= read -r line <&9; then continue; fi
     [ -n "$_sv_forwarded" ] || break
   done
+  exec 9<&-
+  local code=
+  if [ -e "$dir/status" ]; then IFS= read -r code <"$dir/status" || true; fi
+  rm -rf "$dir"
+  if ! [[ $code =~ ^[0-9]+$ ]]; then
+    log error "the compositor's waiter ended without its exit status"
+    return 70
+  fi
   return "$code"
 }

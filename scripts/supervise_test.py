@@ -15,8 +15,10 @@ them. The stub writes every signal it catches to a file. The cases (the PR #36 r
     delivered (these need procfs: on a host without it they are skipped, and `--require-procfs`
     turns a skip into a failure);
   - TINI_KILL_PROCESS_GROUP set: exit 78, and the child never starts;
-  - N races: the child exits 75 by itself at 0.30 s and an INT lands within 15 ms of it; every exit
-    is 75.
+  - the child's stdout reaches the wrapper's stdout, never the pipe that carries its pid and status;
+  - N races: the child exits 75 by itself 0.30 s after it starts and an INT lands within 15 ms of
+    that; every exit
+    is 75 (the round-1 loop, which `wait`ed in the trapping shell, lost 2 of 150 on bash 5.2.21).
 
 Usage: supervise_test.py [--script docker/supervise.sh] [--bash PATH ...] [--races N] [--require-procfs]
 """
@@ -33,13 +35,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 STUB = r"""#!/usr/bin/env bash
-# The stand-in compositor. STUB_MODE: selfexit | onsig | late | disarm.
+# The stand-in compositor. STUB_MODE: selfexit | chatty | onsig | late | disarm.
 echo started >> "$STUB_OUT"
 got=
 on() { got=$1; echo "$1" >> "$STUB_OUT"; }
 arm() { trap 'on USR1' USR1; trap 'on USR2' USR2; }
 case "$STUB_MODE" in
   selfexit) arm; sleep "$DELAY"; exit "$CODE" ;;
+  # Writes number lines to its stdout, which must reach the wrapper's stdout, never the waiter's pipe.
+  chatty) arm; echo 4242; echo 99; sleep "$DELAY"; exit "$CODE" ;;
   onsig) arm ;;
   late) sleep "$LATE"; arm ;;
   # Catches USR1, then lets USR2 take its default action: the next USR2 ends it inside the kernel,
@@ -59,6 +63,7 @@ def cases():
     """(name, needs procfs, stub env, wrapper pre-sleep, extra env, [(at s, signal)], exit, first seen)."""
     return [
         ("no stop: the child's own 75", False, dict(STUB_MODE="selfexit", DELAY="0.3", CODE="75"), 0, {}, [], 75, []),
+        ("the child's stdout is not the status pipe", False, dict(STUB_MODE="chatty", DELAY="0.3", CODE="75"), 0, {}, [], 75, []),
         ("INT reaches the child as USR1", False, dict(STUB_MODE="onsig", AFTER="0.3", CODE="0"), 0, {}, [(0.3, I)], 0, ["USR1"]),
         ("TERM reaches the child as USR2", False, dict(STUB_MODE="onsig", AFTER="0.3", CODE="70"), 0, {}, [(0.3, T)], 70, ["USR2"]),
         ("INT then TERM", False, dict(STUB_MODE="onsig", AFTER="0.6", CODE="75"), 0, {}, [(0.3, I), (0.4, T)], 75, ["USR1"]),
@@ -81,12 +86,19 @@ def wrapper(d, script, stub, pre):
     return p
 
 
-def run(bash, wrap, env, sigs, limit=15):
+def run(bash, wrap, env, sigs, limit=15, anchor=False):
+    """Signal times count from the wrapper's start, or with `anchor` from the stub's own start (its
+    "started" line), so a race lands at the child's real exit on a loaded host too."""
     out = Path(tempfile.mktemp(prefix="stub-out-", dir=wrap.parent))
     e = {k: v for k, v in os.environ.items() if k != "TINI_KILL_PROCESS_GROUP"}
     e.update(env, STUB_OUT=str(out))
-    p = subprocess.Popen([bash, str(wrap)], env=e, start_new_session=True, stderr=subprocess.PIPE, text=True)
+    p = subprocess.Popen([bash, str(wrap)], env=e, start_new_session=True, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True)
     t0 = time.monotonic()
+    if anchor:
+        while time.monotonic() - t0 < limit and not (out.exists() and "started" in out.read_text()):
+            time.sleep(0.001)
+        t0 = time.monotonic()
     for at, s in sigs:
         d = t0 + at - time.monotonic()
         if d > 0:
@@ -102,10 +114,11 @@ def run(bash, wrap, env, sigs, limit=15):
         p.wait()
         code = "TIMEOUT"
     err = p.stderr.read()
+    stdout = p.stdout.read()
     lines = out.read_text().split() if out.exists() else []
     if out.exists():
         out.unlink()
-    return code, lines, err
+    return code, lines, err, stdout
 
 
 def main():
@@ -135,9 +148,11 @@ def main():
                 # before its `kill -0`, a race.
                 reps = 20 if "dies of" in name else 1
                 for rep in range(reps):
-                    code, lines, err = run(bash, wrapper(d, script, stub, pre), {**env, **extra}, sigs)
+                    code, lines, err, stdout = run(bash, wrapper(d, script, stub, pre), {**env, **extra}, sigs)
                     seen = [l for l in lines if l != "started"]
                     ok = code == want
+                    if env.get("STUB_MODE") == "chatty":
+                        ok = ok and stdout.split() == ["4242", "99"]
                     if first is None:
                         ok = ok and lines == []
                     else:
@@ -149,13 +164,17 @@ def main():
                     if not ok:
                         failures.append(f"bash {ver}: {name}")
                         break
-            tally = {}
+            tally, odd = {}, []
             for _ in range(a.races):
                 at = 0.30 + random.uniform(-0.015, 0.015)
-                code, _, _ = run(bash, wrapper(d, script, stub, 0), dict(STUB_MODE="selfexit", DELAY="0.3", CODE="75"), [(at, I)])
+                code, seen, err, _ = run(bash, wrapper(d, script, stub, 0), dict(STUB_MODE="selfexit", DELAY="0.3", CODE="75"), [(at, I)], anchor=True)
                 tally[code] = tally.get(code, 0) + 1
+                if code != 75 and len(odd) < 3:
+                    odd.append(f"exit {code} with INT at {at:.3f} s, child saw {seen}, stderr {err.strip()!r}")
+            for o in odd:
+                print(f"     {o}")
             ok = a.races > 0 and tally == {75: a.races}
-            print(f"{'ok  ' if ok else 'FAIL'} bash {ver}: {a.races} races (the child exits 75 at 0.30 s, INT at 0.30 +- 0.015 s): {tally}")
+            print(f"{'ok  ' if ok else 'FAIL'} bash {ver}: {a.races} races (the child exits 75 0.30 s after its start, INT at 0.30 +- 0.015 s): {tally}")
             checked += 1
             if not ok:
                 failures.append(f"bash {ver}: races {tally}")
