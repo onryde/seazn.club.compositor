@@ -2,18 +2,25 @@
 """Tests scripts/apt-install.sh, check.yml's GStreamer install (decision log "CI: apt bounded on a
 trickling mirror", 2026-10-23). Stdlib only; run with `python3 -I` (check.yml).
 
-Fakes on PATH stand in for sudo (runs its arguments), timeout (logs its bound, runs the rest),
-apt-get (logs its arguments and exits with the next code planned for its phase) and sleep (logs,
-returns at once). The mirror list is the runner image's three lines; the slow runs' logs size it
+Fakes on PATH stand in for sudo (runs its arguments as "root"), timeout (logs its bound, runs the
+rest), apt-get (refuses unless "root"; logs its arguments and exits with the next code planned for
+its phase), apt-config (logs), tee (refuses the mirror list unless "root") and sleep (logs, returns
+at once). The mirror list is the runner image's three lines; the slow runs' logs size it
 ("Get:1 file:/etc/apt/apt-mirrors.txt Mirrorlist [144 B]"), and the fixture is checked against that.
 
-  - the happy path: update, then a --download-only fetch, then the install, in that order; the two
-    network phases each under a timeout and the install under none; every apt-get call carries the
-    short network options; the mirror list untouched; no warning;
+  - the happy path: update, then a --download-only fetch, then a --no-download install, in that
+    order; the fetch's arguments less --download-only equal the install's less --no-download, and
+    carry main's `-y --no-install-recommends`; the two network phases each under a timeout with a
+    kill grace, and the install under none; every apt-get call under sudo, with the same network
+    settings; apt's effective settings logged; the mirror list untouched; no warning;
+  - apt's own settings (retries R, timeout T) no looser than the runner image's zz-retries (1, 15 s),
+    and leaving a silent mirror for the next one inside one update attempt, even if every try waits its full timeout: (R + 1) x T + (2^R - 1) s of retry
+    delay (1, 2, 4 ... s, as the blackhole run's log spaces them) under the update bound;
   - a fetch that fails once (124, over its bound) then passes: one warning, azure dropped from the
     list (the other two lines kept, in order), the fetch run twice, the install once;
-  - every fetch fails: one ::error::, a non-zero exit, the install never run, the fetch run a bounded
-    number of times, and the list after the last failure equal to the list after the first;
+  - every fetch fails: one ::error:: naming the last exit (124, or apt's own 100), a non-zero exit,
+    the install never run, the fetch run a bounded number of times, and the list after the last
+    failure equal to the list after the first;
   - an update that fails once then passes: azure dropped before the fetch; every update fails: the
     fetch and the install never run;
   - no mirror list, a list holding only azure: the retry still runs, and the list is never emptied;
@@ -25,7 +32,8 @@ returns at once). The mirror list is the runner image's three lines; the slow ru
     and each update bound at least 4x the slowest normal update (10 s, run 39936996163);
   - check.yml's GStreamer step runs this script and carries a step-level timeout-minutes.
 
-Each sweep prints how many cases it checked, and a sweep that checked none is a failure.
+Each sweep prints how many cases it checked, counting only runs of the script that printed
+anything, and a sweep that checked none is a failure; the number of checks made is printed too.
 
 Usage: apt_install_test.py [--script scripts/apt-install.sh] [--workflow .github/workflows/check.yml]
 """
@@ -33,6 +41,7 @@ Usage: apt_install_test.py [--script scripts/apt-install.sh] [--workflow .github
 import argparse
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -47,12 +56,33 @@ MIRRORS = (
 WITHOUT_AZURE = MIRRORS.split("\n", 1)[1]
 PACKAGES = ["libgstreamer1.0-dev", "gstreamer1.0-libav"]
 OPTIONS = ("Acquire::Retries", "Acquire::http::Timeout", "Acquire::https::Timeout")
+# check.yml's GStreamer step before PR #50: `apt-get install -y --no-install-recommends <packages>`.
+MAIN_FLAGS = ("-y", "--no-install-recommends")
+CASES = ("happy path", "fetch fails once", "every fetch times out", "every fetch errs",
+         "update fails once", "every update fails", "no mirror list", "only azure listed", "no packages")
+# A clean run makes 66 (PR #50 round 2); fewer means a case stopped early.
+CHECKS_FLOOR = 60
+# The runner image's own apt settings, /etc/apt/apt.conf.d/zz-retries (runner-images
+# images/ubuntu/scripts/build/configure-apt.sh, tag ubuntu24/20261012.334, x64): the script may
+# not be looser, or apt leaves a silent mirror later than it does on main.
+IMAGE_RETRIES = 1
+IMAGE_TIMEOUT_S = 15
 # Measured on the normal runs of 2026-10-23 (docs/_INDEX.md, the decision row).
 SLOWEST_FETCH_S = 14
 SLOWEST_UPDATE_S = 10
 INSTALL_ALLOWANCE_S = 90
 
-FAKE_SUDO = '#!/bin/sh\nexec "$@"\n'
+FAKE_SUDO = '#!/bin/sh\nFAKE_ROOT=1 exec "$@"\n'
+FAKE_CONFIG = '#!/bin/sh\nprintf "apt-config %s\\n" "$*" >> "$FAKE_LOG"\n'
+FAKE_TEE = """#!/bin/sh
+for a in "$@"; do
+  if [ "$a" = "$APT_MIRRORS" ] && [ "${FAKE_ROOT:-}" != 1 ]; then
+    echo "tee: $a: Permission denied" >&2
+    exit 1
+  fi
+done
+exec REAL_TEE "$@"
+"""
 FAKE_SLEEP = '#!/bin/sh\nprintf "sleep %s\\n" "$*" >> "$FAKE_LOG"\n'
 FAKE_TIMEOUT = """#!/bin/sh
 opts=""
@@ -68,6 +98,10 @@ shift
 exec "$@"
 """
 FAKE_APT = """#!/bin/sh
+if [ "${FAKE_ROOT:-}" != 1 ]; then
+  printf "unprivileged apt-get %s\\n" "$*" >> "$FAKE_LOG"
+  exit 100
+fi
 printf "apt-get %s\\n" "$*" >> "$FAKE_LOG"
 case " $* " in
   *" update "*) phase=update ;;
@@ -89,10 +123,14 @@ exit "$code"
 """
 
 failures = []
+checks = []
+ran = []
+every_call = []
 
 
 def check(ok, what):
     print(("ok   " if ok else "FAIL ") + what)
+    checks.append(what)
     if not ok:
         failures.append(what)
 
@@ -105,17 +143,21 @@ def seconds(text):
 
 
 def write_fakes(bindir):
+    real_tee = shutil.which("tee")
+    if real_tee is None:
+        raise SystemExit("apt_install_test: no tee on PATH")
     for name, body in (("sudo", FAKE_SUDO), ("sleep", FAKE_SLEEP), ("timeout", FAKE_TIMEOUT),
-                       ("apt-get", FAKE_APT)):
+                       ("apt-get", FAKE_APT), ("apt-config", FAKE_CONFIG),
+                       ("tee", FAKE_TEE.replace("REAL_TEE", real_tee))):
         path = os.path.join(bindir, name)
         with open(path, "w") as f:
             f.write(body)
         os.chmod(path, stat.S_IRWXU)
 
 
-def run(script, bindir, codes, mirrors=MIRRORS, packages=PACKAGES):
+def run(case, script, bindir, codes, mirrors=MIRRORS, packages=PACKAGES):
     """Runs the script under the fakes in `bindir`, with its own state and mirror list. Returns
-    (exit code, output, calls, mirror list after)."""
+    (exit code, output, calls, mirror list after). A run that printed nothing is not counted."""
     with tempfile.TemporaryDirectory() as d:
         for phase, plan in codes.items():
             with open(os.path.join(d, phase + ".codes"), "w") as f:
@@ -131,6 +173,9 @@ def run(script, bindir, codes, mirrors=MIRRORS, packages=PACKAGES):
         p = subprocess.run([script] + packages, env=env, capture_output=True, text=True, timeout=60)
         with open(log) as f:
             calls = f.read().splitlines()
+        every_call.extend(calls)
+        if (p.stdout + p.stderr).strip():
+            ran.append(case)
         after = None
         if os.path.exists(mirror_file):
             with open(mirror_file) as f:
@@ -183,7 +228,10 @@ def worst_case(calls, phase):
                 continue
             s, k = bound_of(b)
             total += s + k
-    first = next(i for i, c in enumerate(calls) if c.startswith("apt-get ") and phases([c])[0][0] == phase)
+    first = next((i for i, c in enumerate(calls) if c.startswith("apt-get ") and phases([c])[0][0] == phase), None)
+    check(first is not None, f"the all-fail {phase} run made a {phase} attempt")
+    if first is None:
+        return 0
     for i, c in enumerate(calls):
         if c.startswith("sleep "):
             check(i > first, f"a pause in the all-fail {phase} run follows a {phase} attempt")
@@ -225,78 +273,99 @@ def main():
 
 def sweep(a, script, bindir):
     check(len(MIRRORS.encode()) == 144, "the mirror-list fixture is 144 bytes, as the runner logs size it")
-    cases = 0
 
     # The happy path.
-    rc, out, calls, after = run(script, bindir, {})
-    cases += 1
+    rc, out, calls, after = run("happy path", script, bindir, {})
     ph = phases(calls)
     check(rc == 0, f"happy path: exit 0 (got {rc})")
     check([p for p, _, _ in ph] == ["update", "fetch", "install"],
           f"happy path: update, fetch, install, in that order (got {[p for p, _, _ in ph]})")
     check(all(b is not None for p, _, b in ph if p != "install"), "happy path: update and fetch each under a timeout")
-    check(all(b is None for p, _, b in ph if p == "install"), "happy path: the offline install under no timeout")
+    check(all(b is None for p, _, b in ph if p == "install"), "happy path: the install under no timeout")
     for p, args, _ in ph:
         opts = options_of(args)
         check(all(k in opts for k in OPTIONS), f"happy path: {p} carries {', '.join(OPTIONS)}")
         check(all(x in args for x in PACKAGES) == (p != "update"), f"happy path: {p} names the packages iff it installs")
+    check(len({tuple(sorted(options_of(args).items())) for _, args, _ in ph}) == 1,
+          "happy path: every apt-get call carries the same network settings")
+    fetch_args = next((args for p, args, _ in ph if p == "fetch"), None)
+    install_args = next((args for p, args, _ in ph if p == "install"), None)
+    if fetch_args is not None and install_args is not None:
+        check("--no-download" in install_args and "--download-only" not in install_args,
+              "happy path: the install is --no-download (offline: a missing .deb fails at once)")
+        check([x for x in fetch_args if x != "--download-only"] == [x for x in install_args if x != "--no-download"],
+              "happy path: the fetch's arguments less --download-only equal the install's less --no-download")
+        check(all(f in install_args for f in MAIN_FLAGS), f"happy path: the install carries main's {' '.join(MAIN_FLAGS)}")
+    else:
+        check(False, "happy path: both a fetch and an install ran")
+    first_opts = options_of(ph[0][1]) if ph else {}
+    dumps = [c for c in calls if c.startswith("apt-config ")]
+    check(len(dumps) == 1 and "dump" in dumps[0].split()
+          and options_of(dumps[0].split()[1:]) == first_opts,
+          "happy path: apt's effective network settings logged once, with the same -o options")
     check(after == MIRRORS, "happy path: the mirror list untouched")
     check("::warning::" not in out and "::error::" not in out, "happy path: no warning, no error")
     happy = ph
 
-    # The short network options: a silent connection is cut and retried well inside one attempt.
+    # apt's own settings leave a silent mirror inside one update attempt. The blackhole run spaced
+    # the retries 1, 2, 4 ... s apart; count a full timeout for every try, to be safe.
+    update_bound = None
     fetch_bound = None
     for p, args, b in happy:
         if b is None:
             continue
+        if p == "update":
+            update_bound = bound_of(b)[0]
+            check(update_bound >= 4 * SLOWEST_UPDATE_S,
+                  f"the update bound ({update_bound} s) is at least 4x the slowest normal update")
         if p == "fetch":
             fetch_bound = bound_of(b)[0]
-            opts = options_of(args)
-            for k in ("Acquire::http::Timeout", "Acquire::https::Timeout"):
-                v = opts.get(k, "")
-                check(v.isdigit() and 0 < int(v) * 4 <= fetch_bound,
-                      f"{k}={v} is at most a quarter of the fetch's {fetch_bound} s bound")
-            r = opts.get("Acquire::Retries", "")
-            check(r.isdigit() and int(r) >= 3, f"Acquire::Retries={r} retries a failed file at least 3 times")
-        if p == "update":
-            ub = bound_of(b)[0]
-            check(ub >= 4 * SLOWEST_UPDATE_S, f"the update bound ({ub} s) is at least 4x the slowest normal update")
     check(fetch_bound is not None and fetch_bound >= 4 * SLOWEST_FETCH_S,
           f"the fetch bound ({fetch_bound} s) is at least 4x the slowest normal fetch ({SLOWEST_FETCH_S} s)")
+    r = first_opts.get("Acquire::Retries", "")
+    ts = [first_opts.get(k, "") for k in ("Acquire::http::Timeout", "Acquire::https::Timeout")]
+    if r.isdigit() and all(t.isdigit() and int(t) > 0 for t in ts) and update_bound:
+        check(int(r) <= IMAGE_RETRIES and all(int(t) <= IMAGE_TIMEOUT_S for t in ts),
+              f"Retries={r} and Timeouts={'/'.join(ts)} are no looser than the image's ({IMAGE_RETRIES}, {IMAGE_TIMEOUT_S} s)")
+        leave = (int(r) + 1) * max(int(t) for t in ts) + (2 ** int(r) - 1)
+        print(f"apt leaves a silent mirror after at most {leave} s (Retries={r}, Timeouts={'/'.join(ts)})")
+        check(leave < update_bound, f"... which is under the {update_bound} s update bound")
+    else:
+        check(False, f"Retries and both Timeouts are whole seconds (got {r!r}, {ts!r})")
 
     # A fetch over its bound once, then through.
-    rc, out, calls, after = run(script, bindir, {"fetch": [124, 0]})
-    cases += 1
+    rc, out, calls, after = run("fetch fails once", script, bindir, {"fetch": [124, 0]})
     ph = [p for p, _, _ in phases(calls)]
     check(rc == 0, f"fetch fails once: exit 0 (got {rc})")
     check(ph == ["update", "fetch", "fetch", "install"], f"fetch fails once: fetched twice, installed once (got {ph})")
     check(out.count("::warning::") == 1 and "::error::" not in out, "fetch fails once: one warning, no error")
     check(after == WITHOUT_AZURE, "fetch fails once: azure dropped, the other two lines kept in order")
 
-    # Every fetch fails.
-    rc, out, calls, after = run(script, bindir, {"fetch": [124] * 50})
-    cases += 1
-    ph = [p for p, _, _ in phases(calls)]
-    fetches = ph.count("fetch")
-    check(rc != 0, f"every fetch fails: a non-zero exit (got {rc})")
-    check("install" not in ph, "every fetch fails: the install never runs")
-    check(2 <= fetches <= 5, f"every fetch fails: fetched a bounded number of times, more than once (got {fetches})")
-    check(out.count("::error::") == 1, "every fetch fails: one ::error::")
-    check(out.count("::warning::") == fetches, "every fetch fails: one warning per failed attempt")
-    check(after == WITHOUT_AZURE, "every fetch fails: the list after the last failure equals the list after the first")
-    fetch_fail_calls = calls
+    # Every fetch fails: over its bound, or with apt's own error.
+    fetch_fail_calls = None
+    for case, code in (("every fetch times out", 124), ("every fetch errs", 100)):
+        rc, out, calls, after = run(case, script, bindir, {"fetch": [code] * 50})
+        ph = [p for p, _, _ in phases(calls)]
+        fetches = ph.count("fetch")
+        errors = [line for line in out.splitlines() if line.startswith("::error::")]
+        check(rc != 0, f"{case}: a non-zero exit (got {rc})")
+        check("install" not in ph, f"{case}: the install never runs")
+        check(2 <= fetches <= 5, f"{case}: fetched a bounded number of times, more than once (got {fetches})")
+        check(len(errors) == 1 and f"exit {code}" in errors[0], f"{case}: one ::error::, naming exit {code}")
+        check(out.count("::warning::") == fetches, f"{case}: one warning per failed attempt")
+        check(after == WITHOUT_AZURE, f"{case}: the list after the last failure equals the list after the first")
+        if code == 124:
+            fetch_fail_calls = calls
 
     # An update that fails once, then passes: the fetch already reads the fallback list.
-    rc, out, calls, after = run(script, bindir, {"update": [100, 0]})
-    cases += 1
+    rc, out, calls, after = run("update fails once", script, bindir, {"update": [100, 0]})
     ph = [p for p, _, _ in phases(calls)]
     check(rc == 0 and ph == ["update", "update", "fetch", "install"],
           f"update fails once: updated twice, then fetch and install (got {rc}, {ph})")
     check(after == WITHOUT_AZURE, "update fails once: azure dropped")
 
     # Every update fails.
-    rc, out, calls, after = run(script, bindir, {"update": [124] * 50})
-    cases += 1
+    rc, out, calls, after = run("every update fails", script, bindir, {"update": [124] * 50})
     ph = [p for p, _, _ in phases(calls)]
     updates = ph.count("update")
     check(rc != 0, f"every update fails: a non-zero exit (got {rc})")
@@ -306,25 +375,31 @@ def sweep(a, script, bindir):
     update_fail_calls = calls
 
     # No mirror list; a list holding only azure.
-    rc, out, calls, after = run(script, bindir, {"fetch": [124, 0]}, mirrors=None)
-    cases += 1
+    rc, out, calls, after = run("no mirror list", script, bindir, {"fetch": [124, 0]}, mirrors=None)
     check(rc == 0 and [p for p, _, _ in phases(calls)].count("fetch") == 2,
           "no mirror list: the fetch is still retried, and passes")
     check(after is None, "no mirror list: none is written")
     only_azure = MIRRORS.split("\n", 1)[0] + "\n"
-    rc, out, calls, after = run(script, bindir, {"fetch": [124, 0]}, mirrors=only_azure)
-    cases += 1
+    rc, out, calls, after = run("only azure listed", script, bindir, {"fetch": [124, 0]}, mirrors=only_azure)
     check(rc == 0 and [p for p, _, _ in phases(calls)].count("fetch") == 2,
           "only azure listed: the fetch is still retried, and passes")
     check(after == only_azure, "only azure listed: the list is kept, never emptied")
 
     # No packages.
-    rc, out, calls, after = run(script, bindir, {}, packages=[])
-    cases += 1
-    check(rc != 0 and not any(c.startswith("apt-get") for c in calls), f"no packages: refused, nothing run (got {rc})")
+    rc, out, calls, after = run("no packages", script, bindir, {}, packages=[])
+    check(rc != 0 and not any("apt-get" in c for c in calls), f"no packages: refused, nothing run (got {rc})")
 
-    print(f"script cases checked: {cases}")
-    check(cases >= 8, "the script sweep checked every case")
+    # Across every run: apt-get only ever under sudo, and every bounded attempt with a kill grace (a
+    # hung apt-get that ignores the TERM is still killed inside the worst case below).
+    check(not any(c.startswith("unprivileged apt-get") for c in every_call), "every apt-get call ran under sudo")
+    bounded = [c for c in every_call if c.startswith("timeout")]
+    graced = [c for c in bounded if bound_of(c)[1] > 0]
+    print(f"bounded attempts checked: {len(bounded)}, with a kill grace: {len(graced)}")
+    check(len(bounded) > 0 and len(graced) == len(bounded), "every bounded attempt carries a kill grace")
+
+    cases = len(ran)
+    print(f"script cases checked: {cases} ({', '.join(ran)})")
+    check(cases > 0 and ran == list(CASES), "the script sweep ran every case, each printing something")
 
     # The bound. Worst case: every update but the last fails, the last runs to its bound, and every
     # fetch fails. The all-fail update run holds every update attempt's bound and pause; the all-fail
@@ -346,6 +421,8 @@ def sweep(a, script, bindir):
         check(0 < worst <= step_s - INSTALL_ALLOWANCE_S,
               "the script fails on its own, with its own ::error::, before the step's bound")
 
+    print(f"checks made: {len(checks)}")
+    check(len(checks) >= CHECKS_FLOOR, f"at least {CHECKS_FLOOR} checks made")
     print(f"failures: {len(failures)}")
     return 1 if failures else 0
 

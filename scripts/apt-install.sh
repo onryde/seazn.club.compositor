@@ -8,13 +8,17 @@
 # the run before cargo test. apt moves to the mirror list's next entry only on an error, and a
 # trickle is not one; apt's Timeout bounds only silence.
 #
-# So: short network timeouts and retries for each file; each network phase is an attempt under a
-# wall-clock bound; after a failed attempt, azure is dropped from the runner's mirror list, so later
-# attempts fetch from the list's next entry (archive.ubuntu.com). The packages are fetched with
-# --download-only, which a kill cannot leave half installed (dpkg never runs), and are then
-# installed from the local cache. A finished .deb stays in /var/cache/apt/archives, so a retry does
-# not fetch it again. Worst case over the network phases: 2 x (45 + 5) + 5 + 3 x (120 + 5) + 2 x 5
-# = 490 s, inside the GStreamer step's 10-minute bound with room for the install (20 to 34 s).
+# So: each network phase is an attempt under a wall-clock bound, and after a failed attempt azure is
+# dropped from the runner's mirror list, so later attempts fetch from the list's next entry
+# (archive.ubuntu.com). apt's own per-file settings are the runner image's (its zz-retries: one
+# retry, a 15 s timeout), pinned here, so apt leaves a silent mirror for the next well inside one
+# update attempt (one timeout, then a retry 1 s later, as PR #50's blackhole run spaced them).
+# The packages are fetched with --download-only, which a kill cannot leave half installed (dpkg never
+# runs), and then installed with --no-download from the local cache, with the same arguments, so a
+# missing .deb fails at once instead of going back to the network. A finished .deb stays in
+# /var/cache/apt/archives, so a retry does not fetch it again. Worst case over the network phases:
+# 2 x (45 + 5) + 5 + 3 x (120 + 5) + 2 x 5 = 490 s, inside the GStreamer step's 10-minute bound with
+# room for the install (20 to 34 s).
 #
 # Usage: scripts/apt-install.sh <package>...
 set -euo pipefail
@@ -25,8 +29,12 @@ if [ "$#" -eq 0 ]; then
 fi
 
 mirrors=${APT_MIRRORS:-/etc/apt/apt-mirrors.txt}
-opts=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+opts=(-o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15)
+install=(install -y --no-install-recommends)
 
+echo "apt-install: apt's network settings:"
+apt-config "${opts[@]}" dump Acquire::Retries Acquire::http::Timeout Acquire::https::Timeout \
+  || echo "apt-install: apt-config dump failed (exit $?)"
 if [ -f "$mirrors" ]; then
   echo "apt-install: mirror list $mirrors:"
   cat "$mirrors"
@@ -63,7 +71,7 @@ attempt() {
     fi
     echo "::warning::apt $what: attempt $i of $tries failed after $((SECONDS - start)) s (exit $rc; 124 is its ${bound} s bound)"
     if [ "$i" -ge "$tries" ]; then
-      echo "::error::apt $what failed $tries times: a mirror is down or trickling (docs/_INDEX.md, 2026-10-23)"
+      echo "::error::apt $what failed $tries times (last exit $rc: 124 is over the ${bound} s bound, 100 is apt's own error, in the log above)"
       return 1
     fi
     fall_back
@@ -73,7 +81,5 @@ attempt() {
 }
 
 attempt "index update" 2 45 update
-attempt "download" 3 120 install -y --no-install-recommends --download-only "$@"
-# Offline now: every package is in the cache. A kill could leave dpkg half done, so the only bound
-# here is the step's own.
-sudo apt-get "${opts[@]}" install -y --no-install-recommends "$@"
+attempt "download" 3 120 "${install[@]}" --download-only "$@"
+sudo apt-get "${opts[@]}" "${install[@]}" --no-download "$@"
