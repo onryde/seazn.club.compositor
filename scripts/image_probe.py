@@ -19,7 +19,8 @@ Phase A, one container, once CEF's children exist:
     inside (Owed 58); no GST_CEF_LOG_SEVERITY or GST_DEBUG in the image or the compositor (Owed 52);
   - a forced abort of a CEF child (SIGABRT): the kernel refuses its core (for a piped core_pattern,
     the kernel log's "RLIMIT_CORE … set to 1" line names its pid); then of the compositor itself:
-    exit 134, and the entrypoint's bash reports `Aborted` without `(core dumped)`.
+    exit 134, the entrypoint's one `level=error msg=the compositor was killed by SIGABRT (status 134)`
+    line (the waiter's `wait` prints no job report of its own since F-019), and no `core dumped`.
 
 Phase B, `--exits` containers (32 by default; F-017, the review's C1): a live exit with CEF up, in
 cycles of 8 alternating 720p and 1080p (the review's m7): 4 `docker stop` (SIGTERM through tini: the
@@ -42,6 +43,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -60,9 +62,13 @@ STREAM_KEY = "probe-stream-key-not-a-secret-5e1b"
 STREAM_ID = "probe-stream-id-not-a-secret-9c4d"
 PASSPHRASE = "probe-passphrase-not-a-secret-3a7f"
 SECRETS = (TOKEN, PAGE_TOKEN, STREAM_KEY, STREAM_ID, PASSPHRASE)
-# What a process that died abnormally leaves in the container's log (glibc, bash's job report).
+# What a process that died abnormally leaves in the container's log (glibc, bash's job report, and
+# `supervise`'s own report of the compositor's signal death, which the waiter's `wait` does not print).
+KILLED = "the compositor was killed by"
 ABORT = re.compile(r"double free|corruption|Aborted|core dumped|Segmentation fault|malloc\(\)|free\(\)|"
-                   r"stack smashing|Illegal instruction|Trace/breakpoint trap|Killed")
+                   r"stack smashing|Illegal instruction|Trace/breakpoint trap|Killed|" + KILLED)
+# `supervise.sh`'s report of the compositor's SIGABRT, from Python's signal table, never the script.
+ABRT_LINE = f"level=error msg={KILLED} {signal.SIGABRT.name} (status {128 + signal.SIGABRT})"
 NAME = "relay-probe"
 CORE_LINE = "Max core file size"
 
@@ -362,7 +368,8 @@ def main():
             sh("docker", "exec", NAME, "kill", "-ABRT", str(pid), check=False)
             took, code, logs = wait_exit(15)
             check(code == "134", f"the compositor's abort exits 134 (got {code})")
-            check("Aborted" in logs, "the entrypoint reports the abort")
+            check(logs.count(ABRT_LINE) == 1 and logs.count(KILLED) == 1,
+                  f"the entrypoint reports the abort once: {ABRT_LINE!r} (seen {logs.count(KILLED)})")
             check("core dumped" not in logs, "no core of the compositor")
             print(f"kernel refusal lines for the compositor: {before} -> {refusals('compositor')}")
 

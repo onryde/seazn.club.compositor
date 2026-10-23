@@ -115,5 +115,12 @@ supervise() {
     log error "the compositor's waiter ended without its exit status"
     return 70
   fi
+  # A signal's death is 128 + its number (bash's convention; the compositor's own exits are 0, 70,
+  # 75 and 78). The waiter's `wait` may print no job report of its own (the image's bash in a
+  # process substitution prints none), so this line is the operator's one sign of it.
+  local sig
+  if ((code > 128)) && sig=$(kill -l "$code" 2>/dev/null); then
+    log error "the compositor was killed by SIG${sig#SIG} (status $code)"
+  fi
   return "$code"
 }
