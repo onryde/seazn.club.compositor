@@ -94,6 +94,9 @@ The job's `timeout-minutes` is `minutes + 40`, well under GitHub's 360.
 ## Acceptance
 
 - `test-verdict.sh` is 1 green / 4 red, with reasons.
+- (Amended 2026-10-23, C13 CI round 2) The cost legs' camera ran once with `--pattern snow` and
+  once with `--pattern noise` on the production guest. Both numbers are pasted, and the heavier
+  pattern is the one the legs used.
 - The 30-min rehearsal is green.
 - The 3-hour run is green, with numbers pasted.
 - Both Machines are destroyed afterwards. Run `flyctl machine list -a seazn-relay-soak` and show it's
@@ -137,6 +140,12 @@ sweep").
 - **Snow.** The camera is `videotestsrc pattern=snow`, F-005's worst-case all-real-bits encode, at
   the session's bitrate (720p 4 000 kbps, 1080p 6 000 kbps: `OutputProfile::P720`/`P1080` in `crates/domain/src/config.rs`; F-005 ran its snow diagnostic at only 2 500 kbps). The fake-camera gains a
   `--pattern snow` mode for this. It keeps the strip if the checker reads it.
+  **Amended 2026-10-23 (C13 CI round 2; see the amendment below):** ~~`videotestsrc pattern=snow`,
+  F-005's worst-case all-real-bits encode~~. C13's `--pattern snow` is 16×16 block noise above a
+  black guard cell, because per-pixel noise crushes the strip at x264's I-frames. Per-pixel noise
+  is `--pattern noise`. Block snow is not F-005's picture, and it is not cheaper: the reviewer's
+  host libx264 took longer on it. So F-005's figure is not comparable to either. Run both once on
+  the production guest and use the heavier.
 - **Each leg runs at least 10 minutes** (brief default; F-005 ran 290 s), sampled every 1 s from
   +15 s, by F-005's method. The sample covers the whole Machine (`/proc/stat`) and the process tree,
   plus the heartbeats' `encoderSpeed`, `droppedFrames` and `rung`.
@@ -223,6 +232,23 @@ reads green.
 - The 3 h soak ran on the real `bar`/cricket page, and criterion 5's replacement checks (a)–(d)
   all passed.
 - `test-verdict.sh` is 1 green / 5 red, with reasons.
+
+## Amendment 2026-10-23 (C13 CI round 2: the camera's snow is not F-005's)
+
+- **What changed.** C13's per-pixel snow crushed the strip at x264's I-frames at 4 Mbps (mutant
+  run 39984287910, frame 1 020, the first snow keyframe). So `--pattern snow` is now one noise value
+  per 16×16 block on the macroblock grid, above a one-cell black guard over the strip, and the strip
+  reads on it. The per-pixel picture (`videotestsrc pattern=snow`'s, F-005's) is kept as
+  `--pattern noise`. The strip does not survive noise's I-frames, so a leg on `noise` cannot gate on
+  `camera_strips`.
+- **Why the cost legs must measure both.** The two pictures do not cost the same. On the PR #48
+  reviewer's host, libx264 was slower on block snow than on per-pixel noise: 6.5 s against 4.0 s at
+  720p and 4 000 kbps, and 9.2 s against 5.2 s at 1080p and 6 000 kbps. So F-005's snow figure is
+  comparable to neither. Neither is the worst case by assumption either: the host is not the
+  production guest.
+- **The leg.** Run one cost leg per profile with each pattern on the production guest, and record
+  both numbers in the F-entry. The legs and the size rule then use the heavier pattern. On the
+  `noise` run, the strip facts (`camera_strips`, latency) are reported, not judged.
 
 ## Do not touch
 
