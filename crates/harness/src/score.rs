@@ -8,6 +8,11 @@
 //! cells are `24 × width / 1920` wide (16 px at 720p, from `x = 1024`). The cells read with the
 //! camera strip's rule (`strip::read_cells`); there is no checksum, so a reading is a fact about
 //! the frame, and the checker only reports changes of index.
+//!
+//! **The cells carry the index plus one.** Index 0 (no event yet) would otherwise be 16 black
+//! cells, which is what a black slate shows there with no overlay on it (PR #48 review: luma 18
+//! measured). A hidden overlay over a black slate would then read as "index 0 shown". So an
+//! all-black strip reads as no strip, like the camera's counter 0. The largest index is 65 534.
 use crate::strip::{draw_cells, read_cells, Plane, PlaneMut};
 
 /// Cells in the score strip.
@@ -27,16 +32,28 @@ pub fn x0(width: u32) -> u32 {
     width - CELLS * cell_size(width)
 }
 
-/// The score index a frame's top-right cells show, or `None` when any cell does not read.
+/// The largest index the strip carries (it draws the index plus one in 16 bits).
+pub const MAX_INDEX: u16 = u16::MAX - 1;
+
+/// The score index a frame's top-right cells show, or `None` when any cell does not read or all
+/// read black (no overlay: the module comment).
 pub fn read(y: &Plane<'_>) -> Option<u16> {
     let cell = cell_size(y.width);
-    read_cells(y, x0(y.width), 0, cell, CELLS).map(|b| b as u16)
+    let drawn = read_cells(y, x0(y.width), 0, cell, CELLS)? as u16;
+    drawn.checked_sub(1)
 }
 
 /// Draws `index` the way the page does (the checker's test fixtures stand in for the page).
+///
+/// # Panics
+/// On an index above [`MAX_INDEX`].
 pub fn draw(y: &mut PlaneMut<'_>, index: u16) {
+    assert!(
+        index <= MAX_INDEX,
+        "score index {index} is above the strip's {MAX_INDEX}"
+    );
     let cell = cell_size(y.width);
-    draw_cells(y, x0(y.width), 0, cell, CELLS, u64::from(index));
+    draw_cells(y, x0(y.width), 0, cell, CELLS, u64::from(index) + 1);
 }
 
 #[cfg(test)]
@@ -54,7 +71,7 @@ mod tests {
     fn indexes_round_trip_and_grey_does_not_read() {
         let mut checked = 0;
         for (w, h) in [(1280u32, 720u32), (1920, 1080)] {
-            for index in [0u16, 1, 2, 19, 20, 0x8000, u16::MAX] {
+            for index in [0u16, 1, 2, 19, 20, 0x8000, MAX_INDEX] {
                 let mut data = vec![70u8; (w * h) as usize];
                 let mut p = PlaneMut {
                     data: &mut data,
@@ -66,16 +83,20 @@ mod tests {
                 assert_eq!(read(&p.as_plane()), Some(index), "{w}x{h} index {index}");
                 checked += 1;
             }
-            let data = vec![128u8; (w * h) as usize];
-            assert_eq!(
-                read(&Plane {
-                    data: &data,
-                    stride: w as usize,
-                    width: w,
-                    height: h
-                }),
-                None
-            );
+            // Grey does not read, and neither does black: a black slate with no overlay on it.
+            for slate in [128u8, 16, 18] {
+                let data = vec![slate; (w * h) as usize];
+                assert_eq!(
+                    read(&Plane {
+                        data: &data,
+                        stride: w as usize,
+                        width: w,
+                        height: h
+                    }),
+                    None,
+                    "{w}x{h}: a slate of luma {slate}"
+                );
+            }
         }
         eprintln!("score strips checked: {checked}");
         assert!(checked > 0);

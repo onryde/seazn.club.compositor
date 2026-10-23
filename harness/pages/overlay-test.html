@@ -13,9 +13,10 @@
      Served at the session fixture's own path, /overlay/fixtures/<id> (C13: fake-control serves it
      there, since the harness's session rewrite keeps the fixture's path), it also draws the SCORE
      STRIP the checker reads (crates/harness/src/score.rs): 16 opaque cells of 24x24 at the top
-     right (x 1536..1920, y 0), black or white, the current score index (u16, most significant bit
-     first). The index is that of the latest event of /score.json whose `at + delay` is not after
-     the page's clock (`delay` is the URL's `delay=`, the session's overlayDelayMs); 0 before the
+     right (x 1536..1920, y 0), black or white, the current score index PLUS ONE (u16, most
+     significant bit first), so that index 0 never draws as 16 black cells, which a black slate also
+     shows. The index is that of the latest event of /score.json whose `at + delay` is not after the
+     page's clock (`delay` is the URL's `delay=`, the session's overlayDelayMs); 0 before the
      first. The page polls /score.json every second and keeps the last good answer while the feed is
      down (503). Loaded anywhere else (C11's graphics tests from file:// and from
      /overlay-test.html, image.yml's probe) it draws no strip and fetches nothing.
@@ -125,8 +126,9 @@
         if (e.at + delay <= now && e.index > index) index = e.index;
       }
       if (index !== shown) {
+        const drawn = Math.min(index, 0xfffe) + 1;
         for (let k = 0; k < 16; k++) {
-          cells[k].style.background = (index >> (15 - k)) & 1 ? "#fff" : "#000";
+          cells[k].style.background = (drawn >> (15 - k)) & 1 ? "#fff" : "#000";
         }
         shown = index;
       }
