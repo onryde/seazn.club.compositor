@@ -88,6 +88,8 @@ CONTROLS = ("DISPLAY", "SESSION_ID", "CEF_SUBPROCESS_PATH")
 posts = []
 fetches = []
 ROOT_LIB = ROOT / "crates/compositor/src/lib.rs"
+# The CEF adapter: `CHILD_POLL_MS`, the child poll's period, is read from it.
+CEF_LIB = ROOT / "crates/adapters/src/cef_graphics.rs"
 
 
 def session(port, fixture):
@@ -186,11 +188,12 @@ def cmdlines():
     return rows
 
 
-def lib_const(name):
-    """A constant from its one authority in this repo, `crates/compositor/src/lib.rs`."""
-    m = re.search(rf"pub const {name}: u64 = ([0-9_]+);", ROOT_LIB.read_text())
+def lib_const(name, path=ROOT_LIB):
+    """A `u64` constant from its one authority in this repo, `path` (by default
+    `crates/compositor/src/lib.rs`)."""
+    m = re.search(rf"pub const {name}: u64 = ([0-9_]+);", path.read_text())
     if not m:
-        raise SystemExit(f"{name} not found in crates/compositor/src/lib.rs")
+        raise SystemExit(f"{name} not found in {path.relative_to(ROOT)}")
     return int(m.group(1).replace("_", ""))
 
 
@@ -252,6 +255,7 @@ def main():
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
     grace = lib_const("R1_STOP_GRACE_MS") / 1000
+    child_poll = lib_const("CHILD_POLL_MS", CEF_LIB) / 1000
     # The kernel's value, not ours: at exactly 1 byte it refuses a core to a piped core_pattern
     # (fs/coredump.c), and 1 is below the ELF minimum for a file one. Never read from the code under test.
     limit = "1"
@@ -290,15 +294,21 @@ def main():
         sample_shm()
         return ready
 
+    def running():
+        return sh("docker", "inspect", "-f", "{{.State.Running}}", NAME).stdout.strip() == "true"
+
     def wait_exit(limit_s):
+        """(seconds waited, the exit status, the logs). The status reads `running` when the container
+        outlived `limit_s`: `docker inspect`'s ExitCode of a running container is 0, which would pass
+        for a clean exit (image run 40015873298)."""
         t0 = time.time()
         while time.time() - t0 < limit_s:
-            if sh("docker", "inspect", "-f", "{{.State.Running}}", NAME).stdout.strip() != "true":
+            if not running():
                 break
             sample_shm()
             time.sleep(0.2)
         took = time.time() - t0
-        code = sh("docker", "inspect", "-f", "{{.State.ExitCode}}", NAME).stdout.strip()
+        code = "running" if running() else sh("docker", "inspect", "-f", "{{.State.ExitCode}}", NAME).stdout.strip()
         logs = sh("docker", "logs", NAME).stderr
         kept.append(logs)
         sh("docker", "rm", "-f", NAME, check=False)
@@ -472,8 +482,16 @@ def main():
                 cpid = compositor_pid()
                 zyg = [p_ for p_, (pp, a_) in cmdlines().items() if pp == cpid and "--type=zygote" in a_]
                 check(len(zyg) >= 1, f"{what}: a zygote of the compositor ({zyg})")
+                # The kill waits out two child polls after the ready (image run 40015873298: one kill
+                # 0.100-0.157 s after it came before any poll had listed a zygote, and was never seen),
+                # so this case proves the restart, not the watch's first listing (the graphics tests do).
+                time.sleep(2 * child_poll)
                 for z in zyg[:1]:
-                    sh("docker", "exec", NAME, "kill", "-KILL", str(z), check=False)
+                    pp, argv = cmdlines().get(z, (0, ""))
+                    check(cpid > 0 and pp == cpid and "--type=zygote" in argv,
+                          f"{what}: {z} is still a zygote of the compositor at the kill (parent {pp})")
+                    kill = sh("docker", "exec", NAME, "kill", "-KILL", str(z), check=False)
+                    check(kill.returncode == 0, f"{what}: kill -KILL {z} returned {kill.returncode}")
                 took, code, logs = wait_exit(30)
             last = posts[-1] if posts else {}
             ok = check(code == want, f"{what}: exit status {code}, want {want} ({took:.1f} s)")
