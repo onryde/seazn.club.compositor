@@ -731,7 +731,6 @@ impl ProgrammeOutput for GstProgramme {
             note_push(res, 2, &mut r.failing, &mut self.push_errors, &self.shared);
             audio_gap = false;
         }
-        self.shared.stats.on_push();
     }
 
     fn swap_sink(&mut self, gen: u64, target: &TargetSpec) {

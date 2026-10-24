@@ -4,7 +4,7 @@
 //!
 //! | Field | Definition | `None` until |
 //! |---|---|---|
-//! | `fps` | frames `push()`ed in the last complete 1 s window | 1 s of pushes |
+//! | `encoded_frames` | video frames that left the encoder, this session (`BeatRate` turns them into the beat's `fps`, Owed 86) | the first encoded frame |
 //! | `bitrate_kbps` | bytes SENT by the current sink in the last complete 1 s window × 8 / 1000 | one complete window of the current sink's polls |
 //! | `egress_bytes` | bytes sent, cumulative across every sink generation | a poll that reads a total above 0 |
 //! | `encoder_speed` | encoded video PTS advance in the last complete 1 s window ÷ the window's wall time | 1 s of encoder output |
@@ -14,19 +14,26 @@
 //! acknowledged bytes: CF Input B sends no RTMP acknowledgements (F-005; `docs/_INDEX.md` Owed 13).
 //!
 //! **Windows.** A field's windows are 1 s long and start at its first measurement. Each window's value
-//! is the change of a cumulative quantity (pushes, bytes, encoded PTS) from the last reading at or
+//! is the change of a cumulative quantity (bytes, encoded PTS) from the last reading at or
 //! before its start to the last reading at or before its end. A window with no reading changes
 //! nothing, so a stopped encoder reads 0, a measured fact, not an absent one.
+//!
+//! **The beat's `fps`** is not a 1 s window: it is `BeatRate`'s, the frames that left the encoder
+//! over the beat window, which `ProcMetrics` reads once a beat (Owed 86).
 use std::fmt;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
+
+use domain::config::OUTPUT_FPS_MIN_WINDOW_MS;
 
 /// A window's length (the field definitions above: "the last complete 1 s window").
 pub const STATS_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct StatsSnapshot {
-    pub fps: Option<f64>,
+    /// Video frames that left the encoder, this session (Owed 86): what the beat's `fps` is read
+    /// from (`BeatRate`).
+    pub encoded_frames: Option<u64>,
     pub bitrate_kbps: Option<u32>,
     pub egress_bytes: Option<u64>,
     pub encoder_speed: Option<f64>,
@@ -39,7 +46,8 @@ pub struct StatsSnapshot {
 /// recommendation, approved by the owner 2026-10-24; `docs/_INDEX.md` Owed 81 (i); PR #59's
 /// stage-by-stage finding). The slot holds only the newest frame (`FrameStore`), and each tick shows
 /// whatever it holds, so frames that arrive in a burst between two ticks are overwritten unseen and
-/// nothing else counts them: `fps` counts ticks and `droppedFrames` the ladder's overruns.
+/// nothing else counts them: `fps` counts the frames out of the encoder (one a tick when the encoder
+/// keeps up, Owed 86) and `droppedFrames` the ladder's overruns.
 ///
 /// Fed once a tick with `written`, the frames the slot has taken so far. A tick that puts the camera
 /// on air (`Emit`, `Repeat`) shows the newest of the frames written since the tick before it and
@@ -88,8 +96,8 @@ pub struct Stats {
 
 #[derive(Default)]
 struct Inner {
-    pushes: u64,
-    fps: Windowed,
+    /// Video frames out of the encoder (`None` before the first).
+    encoded_frames: Option<u64>,
     /// The bytes every earlier sink sent (each sink counts from 0).
     egress_before_sink: u64,
     /// The current sink's latest total.
@@ -109,12 +117,8 @@ fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Stats {
-    /// One frame pushed into the programme.
-    pub fn on_push(&self) {
-        self.on_push_at(Instant::now());
-    }
-
-    /// One encoded video frame left the encoder with this running-time PTS.
+    /// One encoded video frame left the encoder with this running-time PTS. It counts in
+    /// `encoded_frames` (the beat's `fps`, Owed 86) and moves `encoder_speed`.
     pub fn on_encoded_video(&self, pts: Duration) {
         self.on_encoded_video_at(Instant::now(), pts);
     }
@@ -158,16 +162,9 @@ impl Stats {
         locked(&self.inner).camera.on_tick(written, camera_on_air);
     }
 
-    pub(crate) fn on_push_at(&self, now: Instant) {
-        let mut s = locked(&self.inner);
-        s.pushes += 1;
-        let pushes = s.pushes as f64;
-        // The first push opens the first window and counts in it.
-        s.fps.record(now, pushes, 0.0);
-    }
-
     pub(crate) fn on_encoded_video_at(&self, now: Instant, pts: Duration) {
         let mut s = locked(&self.inner);
+        *s.encoded_frames.get_or_insert(0) += 1;
         let pts = pts.as_secs_f64();
         s.encoder.record(now, pts, pts);
     }
@@ -192,7 +189,7 @@ impl Stats {
     pub(crate) fn snapshot_at(&self, now: Instant) -> StatsSnapshot {
         let s = locked(&self.inner);
         StatsSnapshot {
-            fps: s.fps.last_complete(now),
+            encoded_frames: s.encoded_frames,
             bitrate_kbps: s
                 .bitrate
                 .last_complete(now)
@@ -231,7 +228,7 @@ struct Windowed {
 
 impl Windowed {
     /// A reading of `value` at `now`. `before_first` is the quantity just before the first reading
-    /// (0 pushes before the first push; the first PTS itself for the encoder).
+    /// (the first reading itself, for the sink's bytes and for the encoder's PTS).
     fn record(&mut self, now: Instant, value: f64, before_first: f64) {
         let Some(origin) = self.origin else {
             self.origin = Some(now);
@@ -272,6 +269,57 @@ fn window_of(origin: Instant, now: Instant) -> u64 {
     (since.as_nanos() / STATS_WINDOW.as_nanos()) as u64
 }
 
+/// The programme's REAL output rate over the beat window (Owed 86; the owner's "Ok", 2026-10-24, in
+/// chat, relayed by the coordinator, to the coordinator's recommendation that the beat report the
+/// frames actually pushed out over the beat window, never the profile's nominal `fps`). Read once a
+/// beat (`ProcMetrics::sample`, the heartbeat's only caller) from `encoded_frames`: the video frames
+/// that left the encoder since the last reading, over the wall time since it.
+///
+/// It replaced the frames `push()`ed into the programme in the last 1 s window (C09), which read
+/// 29–31 while C14 case 6's starved windows carried 11.5 and 24.7 fps (F-024): a push is a tick, and
+/// the driver runs late ticks back to back, so pushes keep the tick grid's pace whatever reaches the
+/// encoder (where the starved frames went is unverified, Owed 86).
+///
+/// - **No reading** until a window has both ends: a sample with no total (nothing encoded) is none,
+///   and the first total only opens the window (the window before it held the encoder's start).
+/// - **A beat inside the minimum window** (`OUTPUT_FPS_MIN_WINDOW_MS` after the last reading: the
+///   hold's first beat, the drain's) repeats the last reading and keeps the window open.
+/// - **A total lower than the window's start** (the counter only grows, so a fault) is no reading,
+///   and the window opens again at it; so is a total that vanished.
+/// - A window with no frame reads a measured 0.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BeatRate {
+    /// The window's start: its instant and the total then.
+    mark: Option<(Instant, u64)>,
+    /// The last reading.
+    last: Option<f64>,
+}
+
+impl BeatRate {
+    /// One beat's sample at `now`, `encoded` the session's `encoded_frames`.
+    pub fn sample(&mut self, now: Instant, encoded: Option<u64>) -> Option<f64> {
+        let Some(total) = encoded else {
+            *self = Self::default();
+            return None;
+        };
+        let Some((at, from)) = self.mark.filter(|&(_, from)| total >= from) else {
+            *self = Self {
+                mark: Some((now, total)),
+                last: None,
+            };
+            return None;
+        };
+        let window = now.saturating_duration_since(at);
+        if window < Duration::from_millis(OUTPUT_FPS_MIN_WINDOW_MS) {
+            return self.last;
+        }
+        let fps = (total - from) as f64 / window.as_secs_f64();
+        self.mark = Some((now, total));
+        self.last = Some(fps);
+        self.last
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,24 +335,113 @@ mod tests {
         assert_eq!(s.snapshot_at(Instant::now()), StatsSnapshot::default());
     }
 
-    // 30 pushes in the first second read as 30 only once that second is complete.
+    // ---- the real output rate (Owed 86) ----
+
+    // Every video frame out of the encoder counts, and nothing does before the first.
     #[test]
-    fn fps_is_the_last_complete_window_and_none_before_one() {
+    fn encoded_frames_count_every_frame_out_of_the_encoder_and_none_before_one() {
         let s = Stats::default();
         let t0 = Instant::now();
-        for i in 0..30u64 {
-            s.on_push_at(t0 + ms(i * 33));
+        assert_eq!(s.snapshot_at(t0).encoded_frames, None, "nothing encoded yet");
+        for i in 0..45u64 {
+            s.on_encoded_video_at(t0 + ms(i * 33), ms(i * 33));
         }
-        assert_eq!(s.snapshot_at(t0 + ms(990)).fps, None, "no window complete yet");
-        assert_eq!(s.snapshot_at(t0 + ms(1_000)).fps, Some(30.0));
-        // The second window holds 10 pushes; while it runs, the first is still the answer.
-        for i in 0..10u64 {
-            s.on_push_at(t0 + ms(1_000 + i * 33));
+        assert_eq!(s.snapshot_at(t0 + ms(2_000)).encoded_frames, Some(45));
+        // A frame whose PTS does not advance is still a frame that left the encoder.
+        s.on_encoded_video_at(t0 + ms(2_000), ms(44 * 33));
+        assert_eq!(s.snapshot_at(t0 + ms(2_000)).encoded_frames, Some(46));
+    }
+
+    /// The beats' instants: beat `k` is `k` beats of `every` ms after `t0`.
+    fn beats(t0: Instant, every: u64) -> impl Fn(u64) -> Instant {
+        move |k| t0 + ms(k * every)
+    }
+
+    // The empty case: no total (nothing encoded) is no reading, and the first total opens the window
+    // without one: the window before it held the encoder's start, not its rate.
+    #[test]
+    fn a_beat_rate_reads_nothing_until_a_window_has_both_ends() {
+        let mut r = BeatRate::default();
+        let at = beats(Instant::now(), 5_000);
+        assert_eq!(r.sample(at(0), None), None, "nothing encoded");
+        assert_eq!(r.sample(at(1), None), None, "still nothing encoded");
+        assert_eq!(r.sample(at(2), Some(140)), None, "the window opens here");
+        assert_eq!(r.sample(at(3), Some(290)), Some(30.0), "150 frames over 5 s");
+    }
+
+    // The window is the beat's: the frames since the last reading over the wall time since it. A
+    // starved beat (F-024's dispatch run carried about 11.5 fps) reads what it carried, an empty one
+    // (no frame at all) reads a measured 0, twice, and a recovery reads the rate again.
+    #[test]
+    fn a_beat_rate_is_the_frames_over_the_beat_window() {
+        let mut r = BeatRate::default();
+        let at = beats(Instant::now(), 5_000);
+        let mut total = 1_000;
+        assert_eq!(r.sample(at(0), Some(total)), None);
+        let mut checked = 0;
+        for (k, frames, want) in [
+            (1, 150, 30.0),
+            (2, 57, 11.4),
+            (3, 0, 0.0),
+            (4, 0, 0.0),
+            (5, 149, 29.8),
+            (6, 151, 30.2),
+        ] {
+            total += frames;
+            let got = r.sample(at(k), Some(total)).expect("a reading");
+            assert!(
+                (got - want).abs() < 1e-9,
+                "beat {k}: {frames} frames read {got}, want {want}"
+            );
+            checked += 1;
         }
-        assert_eq!(s.snapshot_at(t0 + ms(1_500)).fps, Some(30.0));
-        assert_eq!(s.snapshot_at(t0 + ms(2_000)).fps, Some(10.0));
-        // A whole second with no push is a measured 0.
-        assert_eq!(s.snapshot_at(t0 + ms(3_100)).fps, Some(0.0));
+        assert_eq!(checked, 6);
+    }
+
+    // A beat sooner than the minimum window after the last reading (the hold's first beat, the
+    // drain's) repeats that reading and keeps the window open, so the next beat reads over all of it.
+    // A beat at the same instant is the same. At the minimum itself the window closes.
+    #[test]
+    fn a_beat_inside_the_minimum_window_repeats_the_last_reading() {
+        let min = OUTPUT_FPS_MIN_WINDOW_MS;
+        let t0 = Instant::now();
+        let mut r = BeatRate::default();
+        assert_eq!(r.sample(t0, Some(0)), None);
+        // Before any reading, a short window has nothing to repeat.
+        assert_eq!(r.sample(t0 + ms(min / 2), Some(15)), None);
+        assert_eq!(r.sample(t0 + ms(5_000), Some(150)), Some(30.0));
+        // 1 frame in 40 ms would read 25; 0 frames in 0 ms is no rate at all.
+        assert_eq!(r.sample(t0 + ms(5_040), Some(151)), Some(30.0), "40 ms on");
+        assert_eq!(
+            r.sample(t0 + ms(5_040), Some(151)),
+            Some(30.0),
+            "the same instant"
+        );
+        assert_eq!(
+            r.sample(t0 + ms(5_000 + min - 1), Some(160)),
+            Some(30.0),
+            "1 ms short"
+        );
+        // The window that stayed open: 60 frames from 5 000 ms to 7 000 ms.
+        assert_eq!(r.sample(t0 + ms(7_000), Some(210)), Some(30.0));
+        // Exactly the minimum: 24 frames in 1 s.
+        assert_eq!(r.sample(t0 + ms(7_000 + min), Some(234)), Some(24.0));
+    }
+
+    // A total lower than the window's start is no newer count (the counter only grows, so only a
+    // fault reaches it): no reading, and the window opens again at it. A total that vanishes (nothing
+    // encoded, again) is no reading either, and the next one opens a window.
+    #[test]
+    fn a_lower_or_vanished_total_reopens_the_window_without_a_reading() {
+        let mut r = BeatRate::default();
+        let at = beats(Instant::now(), 5_000);
+        assert_eq!(r.sample(at(0), Some(500)), None);
+        assert_eq!(r.sample(at(1), Some(650)), Some(30.0));
+        assert_eq!(r.sample(at(2), Some(10)), None, "lower than 650");
+        assert_eq!(r.sample(at(3), Some(160)), Some(30.0), "counted from 10");
+        assert_eq!(r.sample(at(4), None), None, "the total vanished");
+        assert_eq!(r.sample(at(5), Some(1_000)), None, "the window opens again");
+        assert_eq!(r.sample(at(6), Some(1_075)), Some(15.0));
     }
 
     #[test]

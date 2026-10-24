@@ -8,10 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adapters::control_http::DECLARED_PROFILES;
+use adapters::metrics_proc::ProcMetrics;
 use adapters::phase_http::{origin_of, AllowedOrigin, PhaseHttp};
+use adapters::stats::Stats;
 use app::driver::Driver;
 use app::ports::{
-    ControlPlane, GraphicsRenderer, HeartbeatError, Inbound, InputSource, Measured, ProgrammeOutput,
+    ControlPlane, ControlRequest, GraphicsRenderer, HeartbeatError, Inbound, InputSource, Measured,
+    ProgrammeOutput,
 };
 use compositor::clock::Clock;
 use compositor::env::Drivers;
@@ -792,5 +795,109 @@ fn the_entrypoint_forwards_each_stop_signal_as_the_binary_reads_it() {
         "the entrypoint execs the compositor"
     );
     eprintln!("stop signals checked: {checked}");
+    assert_eq!(checked, 2);
+}
+
+/// Owed 86, the seam end to end: a real `Stats` (fed as the programme's encoder sink feeds it, one
+/// call a video frame), the real `ProcMetrics` (what `run` hands the driver), and the real driver over
+/// `assemble`'s ports and the stderr log sink. A beat's `output fps` line names the rate the beat
+/// itself carries; a starved window raises the alarm on the log and a healthy one clears it. The
+/// sampler reads the wall clock and the driver a manual one, so the windows are real sleeps, and each
+/// expected rate is the test's frame count over the window its own clock brackets.
+#[test]
+fn the_real_output_fps_reaches_the_log_and_the_beat_through_the_real_sampler() {
+    use std::time::Instant;
+    let calls = Log::default();
+    let (log, buf) = logger();
+    let (tx, _rx): (Sender<Inbound>, Receiver<Inbound>) = bounded(64);
+    let stats = Arc::new(Stats::default());
+    let mut parts = fake_parts(&calls, &CefKnob::default());
+    parts.metrics = Box::new(ProcMetrics::new(Arc::clone(&stats)));
+    let ports = assemble(Drivers::Live, parts, &log, &tx, None);
+    let mut d = Driver::new(Thresholds::default(), ports, FAR, 0);
+    let profile = session_720p().output;
+    assert_eq!(d.tick_due(0), None);
+    assert_eq!(d.step(Inbound::Session(session_720p()), SESSION_AT), None);
+    let beat_fps = |from: usize| -> Vec<Option<f64>> {
+        calls
+            .calls_from(from)
+            .iter()
+            .filter_map(|c| match c {
+                Call::Control(ControlRequest::Heartbeat(_, m)) => Some(m.fps),
+                _ => None,
+            })
+            .collect()
+    };
+    // Ticks to the next beat on the manual clock; the sampler's instants around it, and its `fps`.
+    let next_beat = |d: &mut Driver| {
+        let mark = calls.len();
+        let before = Instant::now();
+        loop {
+            let at = d.next_tick_at();
+            assert!(at < FAR, "no beat");
+            assert_eq!(d.tick_due(at), None);
+            let sent = beat_fps(mark);
+            if !sent.is_empty() {
+                assert_eq!(sent.len(), 1, "one beat");
+                return (before, sent[0], Instant::now());
+            }
+        }
+    };
+    let lines = || {
+        buf.messages()
+            .into_iter()
+            .filter(|l| l.starts_with("output fps") || l.starts_with("output starvation"))
+            .collect::<Vec<_>>()
+    };
+    let mut pts = Duration::ZERO;
+    let mut encode = |n: u64| {
+        for _ in 0..n {
+            stats.on_encoded_video(pts);
+            pts += Duration::from_millis(33);
+        }
+    };
+    let (_, fps, _) = next_beat(&mut d);
+    assert_eq!(fps, None, "nothing encoded yet");
+    encode(1);
+    let (mut before, fps, mut after) = next_beat(&mut d);
+    assert_eq!(fps, None, "the first total opens the window");
+    assert!(lines().is_empty(), "no reading, no line: {:?}", lines());
+    // A window well past the 1 s minimum; a starved one (a sixth of the floor's frames), then a
+    // healthy one (twice the profile's rate, so a slow runner's longer window still clears).
+    let wait = Duration::from_millis(1_300);
+    let floor_frames = (profile.fps_floor() * wait.as_secs_f64()) as u64;
+    let healthy_frames = 2 * u64::from(profile.fps) * wait.as_millis() as u64 / 1_000;
+    let mut want = Vec::new();
+    let mut checked = 0;
+    for (frames, alarm) in [(floor_frames / 6, "raised"), (healthy_frames, "cleared")] {
+        encode(frames);
+        std::thread::sleep(wait);
+        let (b, fps, a) = next_beat(&mut d);
+        let fps = fps.expect("a window past the minimum");
+        let (lo, hi) = (
+            frames as f64 / (a - before).as_secs_f64(),
+            frames as f64 / (b - after).as_secs_f64(),
+        );
+        eprintln!("{frames} frames: the beat carried {fps:.3} fps ({lo:.3}..{hi:.3})");
+        assert!((lo..=hi).contains(&fps), "{frames} frames read {fps}");
+        want.push(format!(
+            "output fps beat={fps:.2} floor={:.2}",
+            profile.fps_floor()
+        ));
+        want.push(match alarm {
+            "raised" => format!(
+                "output starvation alarm raised fps={fps:.2} floor={:.2}",
+                profile.fps_floor()
+            ),
+            _ => format!(
+                "output starvation alarm cleared fps={fps:.2} recovered={:.2}",
+                profile.fps_recovered()
+            ),
+        });
+        assert_eq!(lines(), want, "after the {alarm} beat");
+        (before, after) = (b, a);
+        checked += 1;
+    }
+    eprintln!("output fps beats checked through the real sampler: {checked}");
     assert_eq!(checked, 2);
 }
