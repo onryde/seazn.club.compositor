@@ -636,8 +636,8 @@ fn each_owed_signature_holds_on_its_causes_evidence_and_not_without_it() {
 /// once; since its ruling a red with it is as unexplained as any other.
 fn ci_rule() -> Value {
     json!({"swaps_before": 0, "swap_gen": 2, "reason": "error", "reasons_paired": true,
-        "error_ms": 1_000_005_660_i64, "error_to_swap_ms": 515, "error_from_cut_ms": 5660, "from_cut_ms": 6175,
-        "from_growth_ms": 1497, "detect_ms": 982, "bound_ms": 5533.333333333333})
+        "error_ms": 1_000_005_660_i64, "error_to_swap_ms": 515, "error_from_cut_ms": 5660,
+        "from_cut_ms": 6175, "from_growth_ms": 1497, "detect_ms": 982, "bound_ms": 5533.333333333333})
 }
 
 /// A red table names each failed check's Owed row when that row's signature holds in the run, and

@@ -1112,7 +1112,10 @@ mod tests {
         let e = c + quiet + 1;
         o.on_error(e, 1, &th);
         assert!(
-            matches!(o.state(), OutputState::Backoff { attempt: 1, until } if until == e + th.output_backoff_base_ms),
+            matches!(
+                o.state(),
+                OutputState::Backoff { attempt: 1, until } if until == e + th.output_backoff_base_ms
+            ),
             "{:?}",
             o.state()
         );

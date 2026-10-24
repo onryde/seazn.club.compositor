@@ -191,8 +191,8 @@ fn assert_in_order(lines: &[String], want: &[String], what: &str) -> usize {
 
 /// Owed 87: each `sink swap gen=<g> target=…` line (the decorator's) has the driver's
 /// `sink swap reason=<r> gen=<g>` before it and after the previous swap, `<r>` one of the domain's
-/// three words (Owed 87 retired `stall`), and the first swap's reason is `first`; there is no other `sink swap` line. Returns
-/// the swaps checked.
+/// three words (Owed 87 retired `stall`), and the first swap's reason is `first`; there is no other
+/// `sink swap` line. Returns the swaps checked.
 fn assert_each_swap_has_its_reason(lines: &[String], what: &str) -> usize {
     let mut pending: Option<(String, String)> = None;
     let mut checked = 0;
