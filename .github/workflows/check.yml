@@ -126,6 +126,13 @@ jobs:
             fi
           done
           exit "$fail"
+      # docker/xvfb.sh, the image's X server start (Owed 85, F-025), with a stub Xvfb under the image's
+      # bash: an earlier life's lock and socket removed first, ready on Xvfb's own word (-displayfd), an
+      # Xvfb that exits first refused at once. About 15 s. The real Xvfb across real in-place restarts is
+      # image.yml's restart probe. Before the supervision step, and after a red above too.
+      - name: Entrypoint X server start
+        if: ${{ !cancelled() }}
+        run: python3 -I scripts/xvfb_start_test.py --bash /bin/bash
       # docker/supervise.sh, the image's stop forwarding (F-016), with a stub child under the image's
       # bash (Ubuntu 24.04's): the PR #36 review's I2 and m1. --require-procfs: the held-stop cases
       # need /proc, so a skip is a failure here. 500 races (about 4 minutes), 400 of them with the INT
