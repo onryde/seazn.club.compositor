@@ -468,6 +468,72 @@ The coordinator's fix-round-3 dispatch. Each red was read from its artifacts fir
 - cef-killed, cef-gpu-zygote-killed, cef-renderer-zygote-killed and cef-gpu-deaths-threshold,
   wherever the restarted CEF does not come back (85).
 
+## Amendment 2026-10-24, fix round 4 (the re-review of 8b71aef)
+
+The coordinator's fix-round-4 dispatch. Harness only; every new guard mutated once (27 mutants,
+all killed, each by its intended sim).
+
+**Case 11 (`detect_ms`): judged on the log, the strip against the log (I-1).**
+- This amends the 2026-10-18 bound (strip − last alive ≤ `cef_hang_after_ms` + one frame period),
+  which had no term for the strip's dating (false premise row).
+- The product's rule: the hide comes at the first tick at or after `cef_hang_after_ms` past the
+  last alive. So `hide − alive` (both log lines) must lie in [`cef_hang_after_ms` − 1 period,
+  + 2 periods]: the rule's one period, and one more each way for two docker stamps and a late tick.
+- The strip's first overlay-less frame must lie within BUDGET_FRAME_TO_ENCODER_MS of the logged
+  hide, either way: a strip time is a MediaMTX segment name (±17 ms of arrival jitter, F-021)
+  plus the frame's offset.
+- A beat late is +2 000 ms, so both still red any meaningful mutant (m4 among them).
+
+**Wave gate 3 counts whole first attempts only (I-2, m-7).** A selection of legs or a re-run attempt
+is green for what it ran and says it never counts. The table prints the attempt, the head and the
+leg count.
+
+**Owed tags by evidence (I-3).** chaos.json's `owed_signatures` gives each Owed row a jq predicate
+over the leg's verdict.json. A failed check is tagged with a row only when that row's signature
+holds in the run. Otherwise it reads `NOT OWED: Owed <r>'s signature absent`.
+
+**Case 6: a quota, not a burn (I-4).** This amends the 2026-10-18 amendment's burn (and round 1's
+16 workers).
+- The drive reads the container's cgroup CPU time at 15 s and 20 s, and sets `docker update
+  --cpus` to 0.75 of that demand from 20 s for 40 s. Then it puts the quota back.
+- `stress_ran`: the quota was under the demand, held 40 s, and restored.
+- `starvation_applied`, a drive witness: the window under the fps floor, a beat under
+  `encoder_speed_realtime_min`, or an overrun counted. A starvation nothing felt is the harness's
+  own red, and `ladder_moved` passes only on a starved window.
+- The share is a drive parameter. Whether the ladder's one rung below full can hold the clock
+  against it is unmeasured, so the owner sets it (Owed 86).
+
+**Cases 4, 5 and 12: the clear's phase is printed (I-5).** `clear_phase` gives the last sink swap
+at or before the clear, and whether a connect was pending then (under
+OUTPUT_CONNECT_TIMEOUT_MS). It is not driven. Wave gate 3 still needs a burst-phase run among its
+three, or a driven phase.
+
+**Minors.**
+- m-1: case 15 one-fewer's `overlay_back` (vacuous: it passed on the held frame) is replaced by
+  `scheduled_changes_shown` after the last kill.
+- m-2: `overlay_back` is timed from the restart outage's last packet, and searched after the
+  container's start. Searching after the outage's end instead would read an old-process frame as
+  new wherever the outage ends before the start, so that half is not applied.
+- m-3: a report with no `output_errors` reads cause "unknown", a red.
+- m-4: Owed 84 (c) records why case 4's `lost_ms` reads 29 800 (the checker's double count). The
+  measure's fix is owed before wave gate 3.
+- m-5: case 14's `old_tree_gone` cannot see an orphan of the old tree. A restarted container is a
+  new pid namespace, so it fails only without a restart, which `died_in_place` and
+  `restarted_once` judge too. It stays as the sample's anchoring check.
+- m-6: an owed row whose `_INDEX` line carries CLOSED fails chaos_table.
+
+**Mutants.** m10 is added: case 6's `docker update` replaced by `true`. `starvation_applied` must
+red, and `stress_ran` must pass.
+
+**Expected reds:**
+- cef-leaks ×2 (Owed 82, NOT RUNNABLE);
+- dest-disconnect (84 where the clear lands in a pending connect; NOT OWED otherwise);
+- dest-stall and dest-trickle (87, and 84 by phase);
+- cpu-starved (86 when starved; the drive's own red otherwise);
+- cef-gpu-deaths-fast ×3 (70 (a));
+- cef-killed, the two zygote cases and cef-gpu-deaths-threshold, wherever graphics gave up after
+  the restart (85).
+
 ## Files
 
 - Create: `harness/cases/{camera-stop,camera-flap,reader-kicked,dest-disconnect,dest-stall,cpu-starved,score-down,cef-killed,process-killed,input-impaired}.{sh,jq}` (amended 2026-10-24: all 16, cases 11–16 too, as `.sh` files with `require` lines over `harness/cases/lib.jq`; and `harness/chaos.json`, the legs)
