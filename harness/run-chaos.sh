@@ -13,13 +13,18 @@
 #       counts toward the gate only when every selected leg PASSED. Exits 1 on any FAIL, ERROR or
 #       MISSING, on an empty selection, on a sweep that some leg calling it did not run, and on any
 #       NOT RUNNABLE leg: an unrun leg is never green (the PR #52 review's I6; case 16's are
-#       Owed 82, which only the owner's ruling closes).
+#       Owed 82, which only the owner's ruling closes). Only a whole manifest's run, on its first
+#       attempt (GITHUB_RUN_ATTEMPT 1), with every leg PASS, counts: a selection or a re-run is
+#       green for what it ran and says it never counts (the re-review's I-2 and m-7).
 #
 # A FAIL row names, beside each failed check, the docs/_INDEX.md Owed row chaos.json's `owed` puts
-# behind it for that leg, or NOT OWED; under the table, the red legs every failed check of which is
-# owed, the reds no Owed row explains, and the title of each row named (C14 fix round 3, item 4).
-# That is reading aid only: an owed red is as red as any other, and the exit status and the gate
-# line never read it.
+# behind it for that leg (a row, or a list tried in order), or NOT OWED; under the table, the red
+# legs every failed check of which is owed, the reds no Owed row explains, and the title of each row
+# named (C14 fix round 3, item 4). A row is named only when its signature (`owed_signatures`, a jq
+# predicate over the leg's verdict.json) holds in that run: the evidence of the row's own cause,
+# not the check's name (the re-review's I-3). A listed check whose rows' signatures are all absent
+# reads `NOT OWED: Owed <r>'s signature absent`, and counts as unexplained. That is reading aid
+# only: an owed red is as red as any other, and the exit status and the gate line never read it.
 #
 # The table only reads what each run judged. It never re-judges: run-case.sh's verdict is the one
 # authority, and `CASE_REJUDGE=1 harness/run-case.sh <case>` re-judges a downloaded out/<run>.
@@ -49,10 +54,25 @@ legs() {
     '($want | split(",") | map(gsub("^ +| +$"; ""))) as $w | [$all[] | select(.leg as $n | any($w[]; . == $n))]'
 }
 
-# The `owed` map of a leg (<case>[-<variant>]) in chaos.json: {check: Owed row}, or {}.
+# The `owed` map of a leg (<case>[-<variant>]) in chaos.json, each value a list: {check: [Owed
+# row, ...]}, or {}.
 owed_of() {
   jq -c --arg leg "$1" '[.legs[] | select((.case + (if (.variant // "") == "" then "" else "-" + .variant end)) == $leg)
-    | .owed // {}] | first // {}' "$MANIFEST"
+    | .owed // {}] | first // {} | map_values(if type == "array" then . else [.] end)' "$MANIFEST"
+}
+
+# Whether each Owed row the failed checks of <verdict.json> name has its signature in that verdict:
+# {row: true|false}. A row with no signature, or one whose filter errs, is false: absent evidence is
+# never a cause.
+signatures_held() {
+  local f="$1" owed="$2" held='{}' r sig h
+  while IFS= read -r r; do
+    sig="$(jq -r --arg r "$r" '.owed_signatures[$r] // ""' "$MANIFEST")"
+    h=false
+    if [ -n "$sig" ] && jq -e "$sig" "$f" >/dev/null 2>&1; then h=true; fi
+    held="$(jq -c --arg r "$r" --argjson h "$h" '. + {($r): $h}' <<<"$held")"
+  done < <(jq -r --argjson o "$owed" '[.failed[] | $o[.] // empty | .[]] | unique | .[]' "$f")
+  printf '%s\n' "$held"
 }
 
 # The arguments after the first, joined by it; "none" when there are none.
@@ -68,7 +88,7 @@ join_by() {
 
 table() {
   local dir="$1" want="${2:-all}" selected n=0 red=0 not_runnable=0 swept=0 sweeps=0 passed=0
-  local leg name case_ f status key measured row owed unowed unrun=() owed_reds=() unowed_reds=() rows_named=()
+  local leg name case_ f status key measured row owed held tagged unowed unrun=() owed_reds=() unowed_reds=() rows_named=()
   selected="$(legs "$want")"
   echo "| leg | verdict | checks | key | measured |"
   echo "|---|---|---|---|---|"
@@ -104,13 +124,17 @@ table() {
       fail)
         red=$((red + 1))
         owed="$(owed_of "$(jq -r .leg <<<"$leg")")"
-        echo "| $name | FAIL | $row | ${key:--} | failed: $(jq -r --argjson o "$owed" '.failed
-          | map(. as $c | if $o[$c] then "\($c) (Owed \($o[$c]))" else "\($c) (NOT OWED)" end) | join(", ")' "$f") |"
-        unowed="$(jq -r --argjson o "$owed" '[.failed[] | select($o[.] == null)]
-          | if . == [] then "" else join(", ") end' "$f")"
-        if [ "$(jq '.failed | length' "$f")" -eq 0 ]; then unowed="no failed check named"; fi
+        held="$(signatures_held "$f" "$owed")"
+        # Each failed check's row: the first of its rows whose signature held, or none.
+        tagged="$(jq -c --argjson o "$owed" --argjson h "$held" '[.failed[] | . as $c | ($o[$c] // []) as $rows
+          | {check: $c, rows: $rows, row: ([$rows[] | select($h[.] == true)] | first)}]' "$f")"
+        echo "| $name | FAIL | $row | ${key:--} | failed: $(jq -r 'map(if .row != null then "\(.check) (Owed \(.row))"
+          elif .rows == [] then "\(.check) (NOT OWED)"
+          else "\(.check) (NOT OWED: \(.rows | map("Owed \(.)'"'"'s") | join(" and ")) signature absent)" end) | join(", ")' <<<"$tagged") |"
+        unowed="$(jq -r 'map(select(.row == null) | .check) | if . == [] then "" else join(", ") end' <<<"$tagged")"
+        if [ "$(jq 'length' <<<"$tagged")" -eq 0 ]; then unowed="no failed check named"; fi
         if [ -n "$unowed" ]; then unowed_reds+=("$name ($unowed)"); else owed_reds+=("$name"); fi
-        while IFS= read -r r; do rows_named+=("$r"); done < <(jq -r --argjson o "$owed" '.failed[] | $o[.] // empty' "$f")
+        while IFS= read -r r; do rows_named+=("$r"); done < <(jq -r '.[] | .row // empty' <<<"$tagged")
         ;;
       *)
         red=$((red + 1))
@@ -157,7 +181,22 @@ table() {
     ok=0
   fi
   [ "$red" -eq 0 ] || ok=0
+  # Which run this is (the re-review's m-7): a re-run attempt reads like a fresh run otherwise, and
+  # the gate's three-run ledger has nothing to audit.
+  local total attempt="${GITHUB_RUN_ATTEMPT:-}" head="${CHAOS_HEAD_SHA:-${GITHUB_SHA:-}}"
+  total="$(legs all | jq length)"
+  echo "run: attempt ${attempt:-none (not a CI run)}, head ${head:-unknown}, legs $n of $total"
   if [ "$ok" -eq 1 ] && [ "$not_runnable" -eq 0 ]; then
+    # Only a whole first attempt counts (the re-review's I-2 and m-7): a selection of legs, or a
+    # re-run of failed jobs, is green for what it ran and never a gate run.
+    if [ "$n" -ne "$total" ]; then
+      echo "WAVE GATE 3: a partial run ($n of $total legs) never counts ($passed of $n legs PASS)"
+      return 0
+    fi
+    if [ "$attempt" != 1 ]; then
+      echo "WAVE GATE 3: attempt ${attempt:-none} never counts: only a run's first attempt does ($passed of $n legs PASS)"
+      return 0
+    fi
     echo "WAVE GATE 3: this run counts ($passed of $n legs PASS)"
     return 0
   fi

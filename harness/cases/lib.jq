@@ -12,6 +12,7 @@ def mark_at($n): (mark($n) | first | .at_ms);
 def mark_value($n): (mark($n) | first | .value);
 # $a - $b, or null when either is missing: a printed measure shows what it can of a red world.
 def less($a; $b): if $a == null or $b == null then null else $a - $b end;
+def abs: if . < 0 then 0 - . else . end;
 
 # docker events (die, start, restart, kill, oom, stop) of the compositor's container, in time order.
 def compositor_events: [$run.events[] | select(.service == "compositor")] | sort_by(.at_ms);
@@ -57,19 +58,23 @@ def index_regressions: [.overlay.runs[] | select(.index != null) | .index] as $i
 # generation g logged no error before it; else it is the error path's ("output_error"), and
 # `error_to_swap_ms` shows the back-off between them. Mutant 9 (the stall threshold at 20 s) swaps
 # just as fast on dest-trickle, through rtmp2sink's own 5 s socket timeout: only the cause tells
-# them apart.
+# them apart. A report with no `output_errors` field (one checked before fix round 3, re-judged with
+# CASE_REJUDGE) reads cause "unknown", never "stall": the cause is read, not assumed (the
+# re-review's m-3).
 def stall_swap($cut):
   ([beats[] | select(.received_ms <= $cut)] | last | .body.sinkSwaps) as $s0
   | ([beats[] | select(.received_ms > $cut and (.body.sinkSwaps // -1) > $s0)] | first) as $swap_beat
   | ([.log.sink_swaps[] | select(.at_ms > $cut)] | first) as $sw
   | ($sw.at_ms) as $swap
-  | (if $sw == null then [] else [(.log.output_errors // [])[] | select(.gen == $sw.gen - 1 and .at_ms < $swap)] end) as $err
+  | (.log.output_errors) as $errors
+  | (if $sw == null or $errors == null then [] else [$errors[] | select(.gen == $sw.gen - 1 and .at_ms < $swap)] end) as $err
   | (if $swap == null then [] else [beats[] | select(.received_ms < $swap)] end) as $b
   | ([range(1; $b | length) | select(($b[.].body.egressBytes // 0) > ($b[. - 1].body.egressBytes // 0))
       | $b[.].received_ms] | last) as $grow
   | {swaps_before: $s0, swap_ms: $swap, swap_gen: ($sw.gen // null), swap_beat_ms: ($swap_beat.received_ms // null),
      last_growth_ms: $grow,
-     cause: (if $sw == null then null elif ($err | length) > 0 then "output_error" else "stall" end),
+     cause: (if $sw == null then null elif $errors == null then "unknown" elif ($err | length) > 0 then "output_error"
+       else "stall" end),
      error_to_swap_ms: (if ($err | length) > 0 then $swap - ($err | first | .at_ms) else null end),
      from_cut_ms: (if $swap == null then null else $swap - $cut end),
      from_growth_ms: (if $swap == null or $grow == null then null else $swap - $grow end),

@@ -15,8 +15,9 @@
 # table prints the worst). The restart evidence of Owed 19 is the new process's own `cef ready`
 # after the start, the first beat after that ready reads graphics ready, and every beat after the
 # kill reads ready, restarting or starting; and the overlay is back on air within
-# BUDGET_PROCESS_RESTART_OUTPUT_MS of the die (`require_overlay_back`, fix round 3). Anti-vacuity: the kill's targets (printed before it
-# kills) name at least one CEF child, and its status, when the exec lived to print it, is 0.
+# BUDGET_PROCESS_RESTART_OUTPUT_MS of the output's last packet (`require_overlay_back`, fix rounds 3
+# and 4). Anti-vacuity: the kill's targets (printed before it kills) name at least one CEF child, and
+# its status, when the exec lived to print it, is 0.
 
 CASE_LIVE_S=70
 CASE_KEY=outage_ms
@@ -27,7 +28,7 @@ case_drive() {
   at_s "$CASE_LIVE_S"
 }
 
-CASE_CHECKS=18
+CASE_CHECKS=19
 case_verdict() {
   # Anti-vacuity: the kill reached CEF's children, and the container died.
   require kill_applied '(mark_value("kill") | (.killed | length) >= 1) and (mark("kill_rc") | all(.value.rc == 0))' \

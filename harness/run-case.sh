@@ -129,7 +129,7 @@ mark() {
 # Each JSON line of in_compositor's output as a mark, stamped with the line's own time (the
 # container's clock is this host's): an `at_ms` line (a kill's targets, printed before it kills; a
 # tree line; a loop's kill) is a mark of <name>, a `rc_at_ms` line (a kill's status, after it) one
-# of <name>_rc, and a `done_at_ms` line (a loop's or a burn's end) one of <name>_done. Prints them.
+# of <name>_rc, and a `done_at_ms` line (a loop's end) one of <name>_done. Prints them.
 mark_lines() {
   local name="$1" line kind_at
   while IFS= read -r line; do
@@ -143,14 +143,16 @@ mark_lines() {
     esac
   done
 }
-# Sleeps until <seconds> after the case's drive started.
-at_s() {
-  local target=$((DRIVE_START_MS + $1 * 1000)) n
+# Sleeps until <ms> on this host's wall clock.
+until_ms() {
+  local n
   n=$(now_ms)
-  if [ "$n" -lt "$target" ]; then
-    sleep "$(awk -v d=$((target - n)) 'BEGIN { printf "%.3f", d / 1000 }')"
+  if [ "$n" -lt "$1" ]; then
+    sleep "$(awk -v d=$(($1 - n)) 'BEGIN { printf "%.3f", d / 1000 }')"
   fi
 }
+# Sleeps until <seconds> after the case's drive started.
+at_s() { until_ms $((DRIVE_START_MS + $1 * 1000)); }
 
 checks_run=0
 failures=0
@@ -235,8 +237,20 @@ require_restart_outage() {
     "{outage_ms: (restart_outage($die; $start) | .to_wall_ms - .from_wall_ms), budget: \$t.budget_process_restart_output_ms}"
 }
 
-# The output's checks after a fault cleared at mark "clear" (cases 4, 5 and 12). 4 checks.
+# The output's checks after a fault cleared at mark "clear" (cases 4, 5 and 12), and the clear's
+# phase against the last `sink swap` at or before it (the re-review's I-5; Owed 84): a sink built
+# less than OUTPUT_CONNECT_TIMEOUT_MS before the clear was still connecting when the path came back,
+# so it connects after the clear with the fault's backlog, which is the burst Owed 84 names; a clear
+# after that connect timed out builds a fresh sink and never takes that path. `connect_pending` is
+# printed so a green run says which path it took, and it is Owed 84's signature in chaos.json.
+# 5 checks.
 require_output_recovers() {
+  measure clear_phase '([.log.sink_swaps[] | select(.at_ms <= mark_at("clear"))] | last) as $sw
+    | (if $sw == null or mark_at("clear") == null then null else mark_at("clear") - $sw.at_ms end) as $ago
+    | {swap_gen: ($sw.gen // null), swap_to_clear_ms: $ago,
+       swaps_in_fault: ([.log.sink_swaps[] | select(.at_ms > mark_at("cut") and .at_ms <= mark_at("clear"))] | length),
+       connect_pending: ($ago != null and $ago < $t.output_connect_timeout_ms),
+       connect_timeout_ms: $t.output_connect_timeout_ms}'
   require outage_spans_fault '[.output_outages[] | select(.to_wall_ms > mark_at("cut") and .from_wall_ms < mark_at("clear"))] | length >= 1' \
     '[.output_outages[] | {from_wall_ms, to_wall_ms}]'
   require output_reconnect 'outage_across(mark_at("clear")) as $o | $o != null and $o.from_wall_ms <= mark_at("clear")
@@ -250,29 +264,37 @@ require_output_recovers() {
       or .from_wall_ms > mark_at("clear") + $t.budget_output_reconnect_ms)] == []'
 }
 
-# The overlay is back on air (C14 fix round 3, item 3: the coordinator's decision; spec §9.4 "CEF
-# killed: overlay back", and §6's process-crash target "output back ≤15 s", whose overlay is part of
-# that output): the first recorded frame after <after> (a jq expression) whose score strip reads
-# comes at most BUDGET_PROCESS_RESTART_OUTPUT_MS after <from> (a jq expression). A restart passes its
-# container's `start` as <after> (no frame of the old process is read after it) and its die as
-# <from>. With no <after>, every frame would be "after" it, so it is required; a missing <from> or no
-# frame back fails the subtraction, which is a FAIL. Owed 85's restarts, whose CEF never starts, red
-# here. 1 check.
+# The overlay is back on air after a process restart (C14 fix round 3, item 3: the coordinator's
+# decision; spec §9.4 "CEF killed: overlay back", and §6's process-crash target "output back
+# ≤15 s", whose overlay is part of that output): the first recorded frame after the container's
+# <start> whose score strip reads comes at most BUDGET_PROCESS_RESTART_OUTPUT_MS after the restart's
+# outage began (`restart_outage(<die>; <start>)`, its last packet). <die> and <start> are jq
+# expressions. The budget is timed from that packet, as spec §6's "output back" is (the re-review's
+# m-2: timed from the die it was up to the final beat's flush looser). The search stays after
+# <start>, not after the outage's end as m-2 also proposed: where the outage spans the start no
+# frame lies between the two, so the forms agree, and where it ends before the start (a frame dated
+# between the die and the start, which only the old process can have made) the outage's end would
+# read that frame as the new process's. No outage, or no frame back, is a FAIL. Owed 85's restarts,
+# whose CEF never starts, red here. Its signature is measured beside it:
+# `graphics_failed_after_start`, the `overlay hidden reason=failed` lines after <start> (graphics
+# gave up after CEF_FAIL_COUNT builds; the re-review's I-3). 2 checks.
 require_overlay_back() {
-  local from="$1" after="$2"
-  require overlay_back "($from) as \$from | ($after) as \$after
-    | ([.frames_table[] | select(.[0] > \$after and .[2] != null)] | first | .[0]) as \$back
-    | \$after != null and (\$back - \$from) <= \$t.budget_process_restart_output_ms" \
-    "($from) as \$from | ($after) as \$after
-    | {back_ms: less([.frames_table[] | select(.[0] > \$after and .[2] != null)] | first | .[0]; \$from),
-       budget: \$t.budget_process_restart_output_ms}"
+  local die="$1" start="$2"
+  measure graphics_failed_after_start "($start) as \$s
+    | if \$s == null then null else [.log.overlay_hidden[] | select(.reason == \"failed\" and .at_ms > \$s)] | length end"
+  require overlay_back "restart_outage($die; $start) as \$o | ($start) as \$s
+    | (if \$s == null then null else [.frames_table[] | select(.[0] > \$s and .[2] != null)] | first | .[0] end) as \$back
+    | \$o != null and \$back != null and (\$back - \$o.from_wall_ms) <= \$t.budget_process_restart_output_ms" \
+    "restart_outage($die; $start) as \$o | ($start) as \$s
+    | {back_ms: less(if \$s == null then null else [.frames_table[] | select(.[0] > \$s and .[2] != null)] | first | .[0] end;
+         \$o.from_wall_ms), budget: \$t.budget_process_restart_output_ms}"
 }
 
 # C11b's in-place restart after <after> (a jq expression): the final beat says why, with
 # `exitReason` "restart" (Owed 66, closed: web's word; the brief's "fatal" is a false premise) and
 # `exitDetail` equal to <detail> (a jq string expression, the domain's `RestartCause::detail`), the
 # container dies 75 once and compose starts it again, Chromium never aborts, and the overlay is back
-# (`require_overlay_back`, from the die). 5 checks.
+# (`require_overlay_back`, over the restart's outage). 6 checks.
 require_in_place_restart() {
   local after="$1" detail="$2"
   require final_beat_detail "($detail) as \$want

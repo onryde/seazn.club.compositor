@@ -142,6 +142,7 @@ impl FakeProc {
             .arg(repo().join("harness/in-container.sh"))
             .args(args)
             .env("IN_CONTAINER_PROC", &self.dir)
+            .env("IN_CONTAINER_CGROUP", self.dir.join("cgroup"))
             .output()
             .expect("in-container.sh runs");
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -410,24 +411,59 @@ fn gpu_loop_ends_when_the_compositor_is_gone() {
     assert!(!t.p.was_killed(t.gpu));
 }
 
+/// Case 6's demand reading (fix round 4, the re-review's I-4): the cgroup's CPU time, from cgroup
+/// v2's cpu.stat or v1's cpuacct.usage (ns, printed in µs), and a failure when neither reads.
 #[test]
-fn burn_runs_its_workers_for_its_time_and_stops() {
-    let p = FakeProc::new("burn");
-    let started = Instant::now();
-    let (out, lines) = p.run(&["burn", "3", "1"]);
-    let took = started.elapsed();
+fn cpu_usage_reads_the_cgroups_cpu_time_from_v2_or_v1_and_fails_on_neither() {
+    let p = FakeProc::new("cpu-usage-v2");
+    let cg = p.dir.join("cgroup");
+    std::fs::create_dir_all(&cg).unwrap();
+    std::fs::write(
+        cg.join("cpu.stat"),
+        "usage_usec 81234567\nuser_usec 60000000\nsystem_usec 21234567\nnr_periods 0\n",
+    )
+    .unwrap();
+    let before = wall_ms();
+    let (out, lines) = p.run(&["cpu-usage"]);
     assert!(out.status.success());
-    assert!(took < Duration::from_secs(6), "the burn ran {took:?}");
-    assert_eq!(lines.len(), 2, "{lines:?}");
-    assert_eq!(lines[0]["workers"].as_u64(), Some(3));
-    assert_eq!(lines[0]["seconds"].as_u64(), Some(1));
-    assert!(lines[0]["at_ms"].as_i64().is_some());
-    assert_eq!(lines[1]["workers"].as_u64(), Some(3));
-    assert!(
-        lines[1]["elapsed_ms"].as_i64().is_some_and(|e| e >= 1_000),
-        "{lines:?}"
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(
+        lines[0]["usage_usec"].as_u64(),
+        Some(81_234_567),
+        "usage_usec, not user_usec"
     );
-    assert!(lines[1]["done_at_ms"].as_i64().is_some());
+    assert!(lines[0]["sample_ms"]
+        .as_i64()
+        .is_some_and(|t| t >= before && t <= wall_ms()));
+    assert!(lines[0].get("at_ms").is_none(), "a reading is no mark");
+
+    let p = FakeProc::new("cpu-usage-v1");
+    let cg = p.dir.join("cgroup/cpuacct");
+    std::fs::create_dir_all(&cg).unwrap();
+    std::fs::write(cg.join("cpuacct.usage"), "81234567890\n").unwrap();
+    let (out, lines) = p.run(&["cpu-usage"]);
+    assert!(out.status.success());
+    assert_eq!(lines[0]["usage_usec"].as_u64(), Some(81_234_567), "ns to µs");
+
+    let mut checked = 2;
+    for (tag, file, text) in [
+        ("cpu-usage-none", None, ""),
+        ("cpu-usage-nofield", Some("cpu.stat"), "user_usec 5\n"),
+        ("cpu-usage-garbage", Some("cpuacct/cpuacct.usage"), "lots\n"),
+    ] {
+        let p = FakeProc::new(tag);
+        if let Some(f) = file {
+            let path = p.dir.join("cgroup").join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let (out, lines) = p.run(&["cpu-usage"]);
+        assert!(!out.status.success(), "{tag}");
+        assert!(lines[0]["error"].as_str().is_some(), "{tag}: {lines:?}");
+        assert!(lines[0].get("usage_usec").is_none(), "{tag}");
+        checked += 1;
+    }
+    assert_eq!(checked, 5);
 }
 
 #[test]
