@@ -141,8 +141,15 @@ rc=0
 t_start=$(date +%s)
 COST_PROC="$T/0" COST_CLK_TCK=100 "$BASH5" "$IN" sample 3 >"$W/cadence.jsonl" 2>"$W/cadence.err" || rc=$?
 took=$(($(date +%s) - t_start))
-expect "sample on the real clock: 3 lines, each 900 to 1100 ms apart, zero cores on an unchanging tree" "$W/cadence.jsonl" \
-  'length == 3 and all(.dt_ms >= 900 and .dt_ms <= 1100 and .machine == 0 and .tree == 0)'
+# The reads keep to the first read's whole seconds (a late one is followed by a shorter wait, never
+# a drift), so each line's time is the first line's plus a whole number of seconds, within 250 ms
+# (a loaded runner's jitter; the 600 ms of a missed second would fail).
+if jq -e -s 'length >= 2 and length <= 3 and all(.machine == 0 and .tree == 0 and .dt_ms > 0)
+    and (.[0].t_ms as $f | to_entries | all(((.value.t_ms - $f) - .key * 1000) | fabs <= 250))' "$W/cadence.jsonl" >/dev/null 2>&1; then
+  pass "sample on the real clock: $(jq -s length "$W/cadence.jsonl") lines a second apart on the first read's grid (dt $(jq -s -c 'map(.dt_ms)' "$W/cadence.jsonl") ms), zero cores on an unchanging tree"
+else
+  fail "sample on the real clock: the cadence" "$(jq -s -c 'map({t_ms, dt_ms, machine, tree})' "$W/cadence.jsonl" 2>/dev/null)"
+fi
 [ "$rc" -eq 0 ] && [ "$took" -ge 2 ] && [ "$took" -le 5 ] && pass "sample 3: exit 0 after about 3 s ($took s)" \
   || fail "sample 3" "exit $rc after $took s: $(head -c 300 "$W/cadence.err")"
 rc=0
