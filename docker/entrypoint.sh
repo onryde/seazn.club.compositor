@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # The relay image's entrypoint (C12), run by tini. Sources the stop supervision first (its traps must
 # exist before anything else runs), takes cores off for this shell and tini, starts Xvfb for cefsrc
-# (xvfb.sh: an earlier life's lock and socket removed, then Xvfb's own ready word), gives the
-# compositor a short private TMPDIR on a tmpfs, then runs the compositor under `supervise`. Its exit
-# code is the compositor's own (0, 70, 75, 78; tini passes it through).
+# (xvfb.sh: no X lock, and Xvfb's own ready word), gives the compositor a short private TMPDIR on a
+# tmpfs, then runs the compositor under `supervise`. Its exit code is the compositor's own (0, 70,
+# 75, 78; tini passes it through).
 #
 # Why not `exec`: CEF takes over SIGINT and SIGTERM inside the compositor's process once it starts
 # (F-016). A SIGTERM the process receives then exits it at once with status 0: no drain, no final
@@ -22,8 +22,9 @@ set -euo pipefail
 prlimit --pid "$$" --core=1:1 2>/dev/null || log warn "core limit 1 not set on the entrypoint"
 prlimit --pid "$PPID" --core=1:1 2>/dev/null || log warn "core limit 1 not set on tini (pid $PPID)"
 
-# Owed 85 (F-025): a restart in place keeps /tmp, so the old wait for the socket file passed on the
-# previous Xvfb's socket while the new Xvfb had refused the previous one's lock. See xvfb.sh.
+# Owed 85 (F-025): a restart in place keeps /tmp. Started the old way, the new Xvfb refused the
+# previous one's lock while the old wait for the socket file passed on the previous one's socket.
+# xvfb.sh starts it with `-displayfd`: no lock, and ready on Xvfb's own word.
 start_xvfb 99 /tmp || exit 70
 
 # Owed 58: the CEF profile lives under TMPDIR (it holds the page URL and token in clear, F-014), so
