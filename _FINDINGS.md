@@ -2054,95 +2054,138 @@ C14's F-024 (PR #52, branch `feat/c14-chaos`) records the fast loop's headline. 
   40 ms, the review's figure): about 30 to 80 ms from the decision to `exit code=75`. The 21 legs
   measured 14.1 ms at the most.
 
-## F-029: Owed 81's judder is made at the fake camera's mux; the compositor passes it on 1:1 (harness runs 40089108946, 40089107461 and 40090232700, 2026-10-24)
+## F-029: Owed 81's judder starts at the fake camera's mux, and the compositor passes it on 1:1; the real path's exposure is unmeasured (harness runs 40089108946, 40089107461 and 40090232700, 2026-10-24)
 
 Owed 81 (C13 CI round 2): on a clean smoke run about a quarter of the programme's frames repeat the
 camera frame before and about as many camera frames are never shown, while every beat reads
 `fps 30.0` and `droppedFrames 0`. Branch `inv/owed81-frames` (PR #59) adds probes to the harness
 only (no product crate changed) and reads one run stage by stage with `scripts/cadence_stages.py`.
+Revised 2026-10-24 by the PR #59 review (needs fixes, I-1 to I-5 and m-1 to m-8): the first version
+named one cause, claimed a one-line fix and read as settled.
 
-- **The probes** (harness only): `fake-camera --wire` stamps every PES that starts in a buffer the
-  camera's mux hands `srtsink` (a pad probe on the sink, read by `harness::wire`; the PTS maps to the
-  counter from each build's first push); `input-tap`, a second reader of MediaMTX's camera path
-  built as `adapters::gst_input` builds the compositor's input (`srtsrc` latency 1000, `tsdemux`,
-  leaky 1 s queue, `h264parse`, `avdec_h264`, I420 1280x720, an appsink that never syncs, two
-  samples, drop), stamps every decoded frame with its strip; `fake-camera --audio off` and
+- **Verdict: PLAUSIBLE HARNESS ARTEFACT.** Where it starts is close to proven: the fake camera's
+  mux, measured stage by stage, then passed on 1:1. The mechanism is two holds in that mux: the
+  audio-wait hold, proven frame by frame at alignment 1 (5 409 of 5 410), and the alignment-7 hold,
+  consistent with the rate but not predicted frame by frame. No run has removed both holds, so the
+  fix is unproven, and what the product shows on a real Cloudflare input is not measured: that is
+  the open half of Owed 81. The counter (`camera.cadence`) is right, and so are the beats for what
+  they count. This is not "viewers see no judder".
+- **The probes** (harness only, outside the production image): `fake-camera --wire` stamps every
+  PES that starts in a buffer the camera's mux hands `srtsink` (a pad probe on the sink, read by
+  `harness::wire`; the PTS maps to the counter from each build's first push); `input-tap`, a second
+  reader of MediaMTX's camera path built as `adapters::gst_input` builds the compositor's input
+  (`srtsrc` latency 1000, `tsdemux`, leaky 1 s queue, `h264parse`, `avdec_h264`, I420 1280x720, an
+  appsink that never syncs, two samples, drop), stamps every decoded frame with its strip (compose's
+  `probe` profile: the smoke and owed81 cases only); `fake-camera --audio off` and
   `--ts-alignment 1..7` are the controls (cases `owed81-noaudio`, `owed81-align1`).
-- **Stage by stage, one run each** (`cadence_stages.py`; "bunched": arrived under 10 ms after the
-  frame before; "sampled repeats": a 30 fps latest-frame tick swept over 66 phases, min / median /
-  max of the pairs; "fit": programme frames that equal the latest input-tap frame at a regular 30 fps
-  tick, one offset per 10 s segment):
+- **Stage by stage, one run each** (every number below is printed by `cadence_stages.py OUT_DIR`;
+  "bunched": arrived under 10 ms after the frame before; "sampled repeats": a 30 fps latest-frame
+  tick swept over 66 phases, min / median / max; "held": whole periods from push to sent; "fit":
+  programme frames that equal the latest frame of a series at a regular 30 fps tick, one offset per
+  10 s segment):
 
-  | Stage | Smoke with the probes (run 40089108946, PR #59 at `ec34aad`, 17 of 17 checks) | Audio off (dispatch 40089107461, `owed81-noaudio`, 5 of 5) |
-  |---|---|---|
-  | push (`emit.jsonl`) | 2 426 frames, 0 missing, gaps 33/34 ms, 0 bunched; sampled repeats median 0 (one knife-edge phase on the whole-ms stamps) | 2 440, 0 missing, 0 bunched; median 0 |
-  | sent (`wire.jsonl`) | 2 425 video PES + 3 790 audio, 0 missing, 0 bad buffers; **641 bunched (26 %)**; sampled repeats 608 / 625 / 823 of 2 364 | 2 437 video PES, 0 audio; **1 547 bunched (65 %)**; 1 508 / 1 508 / 1 515 of 2 376 |
-  | input (`tap.jsonl`) | 2 351 decoded, 0 missing, 587 bunched; 567 / 573 / 1 021 of 2 288 | 2 368, 0 missing, 1 501 bunched; 1 188 / 1 460 / 1 481 of 2 305 |
-  | shown (recordings) | 498 repeats of 1 994 pairs (25.0 %), 499 skipped counters in 445 skips; PTS steps 33/34 ms only; the checker's `camera.cadence` 499 / 499 / 445 | 1 263 of 1 990 (63 %), 1 258 skipped in 689; 33/34 ms only; the checker 1 266 / 1 265 |
-  | fit, shown against input | **2 001 of 2 001 (100 %)** | **1 997 of 1 997 (100 %)** |
+  | Stage | Smoke with the probes (run 40089108946, PR #59 at `ec34aad`, 17 of 17 checks) | Audio off (dispatch 40089107461, `owed81-noaudio`, 5 of 5) | Alignment 1 (dispatch 40090232700, `owed81-align1`, red: never live) |
+  |---|---|---|---|
+  | push (`emit.jsonl`) | 2 426 frames, 0 missing, gaps 33/34 ms, 0 bunched; sampled repeats median 0 (a knife-edge phase on the whole-ms stamps) | 2 440, 0 missing, 0 bunched; median 0 | 5 411, 0 missing, 0 bunched; median 0 |
+  | sent (`wire.jsonl`) | 2 425 video PES + 3 790 audio, 0 bad buffers; **641 of 2 424 gaps bunched (26.4 %)**; sampled repeats 608 / 625 / 823 of 2 364 | 2 437 video PES, 0 audio; **1 547 of 2 436 (63.5 %)**; 1 508 / 1 508 / 1 515 of 2 376 | 5 410 video PES + 8 454 audio; **2 029 of 5 409 (37.5 %)**; 83 / 2 005 / 2 005 of 5 347 |
+  | held, push to sent (periods: frames) | 0: 421, 1: 1 701, 2: 303; residues 2, 4, 6, 9, 11, 13 (mod 16) held 100 %, the others 65 to 81 % | 0: 661, 1: 842, 2: 715, 3: 219; every residue 66 to 78 % (no 16-frame structure) | 0: 3 381, 1: 2 029; residues 2, 4, 6, 9, 11, 13 held 100 %, the others 0 %; the audio-wait rule agrees on **5 409 of 5 410** |
+  | input (`tap.jsonl`) | 2 351 decoded, 0 missing, 587 bunched; 567 / 573 / 1 021 of 2 288 | 2 368, 0 missing, 1 501 bunched; 1 188 / 1 460 / 1 481 of 2 305 | **0 frames** (the tool: FAIL) |
+  | input(c) − sent(c + 2) | median 1 211 ms; 2 092 of 2 351 within 20 ms (89.0 %) | 1 211 ms; 2 063 of 2 368 (87.1 %) | none |
+  | shown (recordings) | 498 repeats of 1 994 pairs (25.0 %), 499 skipped counters in 445 skips; PTS steps 33/34 ms only; the checker's `camera.cadence` 499 / 499 / 445 | 1 263 of 1 990 (63.5 %), 1 258 skipped in 689; 33/34 ms only; the checker 1 266 / 1 265 | 0 pairs, slates only (the tool: FAIL) |
+  | fit against input | **2 001 of 2 001 (100 %)** | **1 997 of 1 997 (100 %)** | none |
+  | fit's contrasts: push / ideal 30 fps / sent / sent(c + 2) | 70.3 / 70.3 / 47.1 / 83.8 % | 37.4 / 38.8 / 35.9 / 71.0 % | none |
 
-  The five earlier smoke runs, read from their recordings with an independent ffmpeg decode that
-  agrees with the checker within 2 (harness runs 40065135397, 40078150465, 40084630169,
-  40085739088, 40087096979): 496 to 797 repeats of about 1 990 pairs (25 to 40 %), skipped counters
-  about equal to the repeats, push steps 33/34 ms with nothing missing, recording PTS steps 33/34 ms.
+  The contrasts are what make the 100 % a finding: the programme is not what a smooth camera would
+  give, nor what the mux sent, but exactly what the input received. The review's own controls add
+  that an input jittered by ±12 ms still fits 99.7 to 99.9 %, so the fit cannot see a jitter under
+  about 12 ms. The five earlier smoke runs, read from their recordings with an independent ffmpeg
+  decode that agrees with the checker within 2 (harness runs 40065135397, 40078150465,
+  40084630169, 40085739088, 40087096979): 496 to 797 repeats of about 1 990 pairs (25 to 40 %),
+  inside the input stage's own phase sweep (567 to 1 021 of 2 288, 25 to 45 %): the run-to-run
+  spread is the tick's phase against the arrivals.
 - **Where it starts: between push and sent, in the camera's mux.** The camera pushes on time and the
-  encoder's output is per frame (x264 `ultrafast`, `zerolatency`, no B-frames). What reaches
-  `srtsink` is held back by whole frame periods: sent minus push was 0, 1 and 2 periods for 497,
-  1 678 and 250 frames on the smoke run and 0 to 3 periods (661, 842, 715, 219) with the audio off;
-  the smoke run's buffers carried one or two video PES starts (1 325 and 550). The mux holds a
-  frame for two reasons, and each control isolates one (corrected 2026-10-24 by the alignment-1
-  run, below; this entry first named the first reason alone):
-  - **The alignment.** `mpegtsmux alignment=7` (media.rs, C10's 1 316-byte SRT payload):
-    `gst_base_ts_mux_push_packets` (gstbasetsmux.c, GStreamer 1.24.2) returns without pushing
-    while fewer than `alignment` packets are pending, and forces the rest only at EOS. The ball
-    picture's P-frames are two or three TS packets, so a frame's last packets wait for later ones to
-    fill the buffer of seven. The audio-off control shows it alone (one pad, so no wait for another
-    pad): 65 % bunched, worse than with audio (26 %), whose packets fill the buffers sooner.
-  - **The wait for the audio.** GstBaseTsMux gives `GstAggregator` no `get_next_time`, so the
-    aggregator waits until every pad holds a buffer, then muxes the earliest. A video frame
-    therefore leaves only once an AAC frame stamped at or after it is queued, and the camera pushes
-    each frame's 1 600 samples after its video, against AAC frames of 1 024. The alignment-1 run
-    shows it alone: 2 029 of 5 410 video PES bunched (37.5 %), every frame held 0 or 1 period by a
-    pattern that repeats every 32 frames (1 600 and 1 024 samples; 5 409 of 5 410 frames at their
-    residue's value), and the rule above predicts 5 183 of the 5 410 holds (95.8 %). The same
-    32-frame period is the one the earlier runs' skips locked to (best shift 0 against the camera
-    counter on all five).
-- **Nothing after the mux adds to it.** MediaMTX 1.21.2 flushes after every access unit
-  (internal/protocols/mpegts/from_stream.go, `bw.Flush()` after each `WriteH264` /
-  `WriteMPEG4Audio`), so it holds no partial buffer. Its reader and the compositor's `tsdemux` each
-  complete a video PES only at the next payload start (the PES is unbounded), so every frame reaches
-  the input about two frames late: input(c) minus sent(c + 2) was within 20 ms of a constant
-  1 204 ms (the two SRT latencies, 200 and 1 000) for 89 % of the smoke run's frames. That is a
-  constant delay, not judder: the input stage keeps the sent stage's bunching (587 against 641), and
-  the input-tap's arrivals predict every programme frame (the fit, 100 % on both runs). The mixer and
-  the output therefore add nothing: each tick shows the camera slot's latest frame, as designed. The
-  recorder adds nothing (PTS steps 33/34 ms), and the reader is right (two decodes agree).
+  encoder's output is per frame (x264 `ultrafast`, `zerolatency`, no B-frames); what reaches
+  `srtsink` is held back by whole frame periods (the held row). The mux holds a frame for two
+  reasons, and each control shows one alone:
+  - **The wait for the audio** (alignment 1 shows it alone). GstBaseTsMux gives `GstAggregator` no
+    `get_next_time` (gstbasetsmux.c, GStreamer 1.24.2), so the aggregator waits until every pad
+    holds a buffer, then muxes the earliest. A video frame n (counted from the build's first)
+    therefore leaves only once an AAC frame stamped at or after it is encoded: frame
+    k = ceil(1 600 n / 1 024), which needs 1 024 (k + 1) samples, when the camera has pushed
+    1 600 (n + 1). That holds n exactly when 9 n mod 16 is 1 to 6: n = 2, 4, 6, 9, 11 and 13 of
+    every 16 (lcm(1 600, 1 024) = 25 600 samples, 16 frames), 6 of 16 = 37.5 %, the alignment-1
+    run's share, and the rule agrees with 5 409 of its 5 410 frames. The smoke holds the same six
+    residues every time (100 %).
+  - **The alignment** (the audio-off control shows it alone: one pad, so no wait for another).
+    `mpegtsmux alignment=7` (media.rs, C10's 1 316-byte SRT payload): `gst_base_ts_mux_push_packets`
+    returns without pushing while fewer than `alignment` packets are pending and forces the rest
+    only at EOS. The ball picture's P-frames are about two TS packets (CI's wire test: 266 packets
+    for 90 video-only frames, two a P-frame after the IDRs), so a frame starts in a buffer of seven
+    shared with the frame before about 1 − p/7 of the time (64 to 71 % for p of 2 to 2.5 packets),
+    against the 63.5 % measured. The probe logs PES starts, not packets per
+    buffer, so this hold is not predicted frame by frame.
+  - **Both, on the smoke.** With audio there are about 6 packets a frame period (546 in 90 frames
+    at alignment 1), so a buffer of seven fills in about 1.2 periods, and most frames are held
+    exactly one (1 701 of 2 425): a uniform hold bunches nothing, which is why the smoke bunches
+    less (26.4 %) than either control. Its residues off the audio rule are held 65 to 81 % by the
+    alignment; the combined hold has no frame-level model.
+  - **Pattern-dependent.** Only `ball` at 720p was measured. Snow and noise frames carry hundreds
+    of packets, so the alignment hold should vanish there and the audio wait alone remain: about
+    37.5 % bunched at sent, more than ball's 26.4 % (a prediction; C15 runs snow and noise).
+- **After the mux: a constant delay and no net judder.** MediaMTX 1.21.2 re-muxes per reader and
+  flushes after every access unit (internal/protocols/mpegts/from_stream.go, `bw.Flush()` after
+  each write; the writer is a `bufio.Writer` of the SRT payload size, internal/servers/srt/conn.go),
+  so it holds no partial buffer. Its reader and the compositor's `tsdemux` each complete a video PES
+  only at the next payload start (the PES is unbounded), so frames reach the input about two frames
+  late: input(c) − sent(c + 2) within 20 ms of a constant 1 211 ms (the two SRT latencies, 200 and
+  1 000, and that wait) for 89.0 % of the smoke's frames, not all of them. The programme fits
+  sent(c + 2) for 83.8 % (smoke) and 71.0 % (audio off) against 100 % for input, so 16 to 29 % of
+  the programme's choices are set after the mux, in the SRT legs and MediaMTX; in aggregate the path
+  removes repeats (sampled medians: sent 625, input 573; shown 498). The mixer and the output add
+  nothing: each tick shows the camera slot's latest frame, as designed. The recorder adds nothing
+  (PTS steps 33/34 ms), and the reader is right (two decodes agree).
+- **The alignment-1 run lost the video, and that is a harness fault, not a compositor finding.**
+  Push was clean (5 411 frames, 0 bunched) and the mux sent every frame, but `input-tap` decoded 0
+  frames and the compositor rebuilt its input 14 times, each generation abandoned by the domain
+  after about 5 s with only audio flushed, so it never went live. The compositor never received an
+  alignment-1 TS: MediaMTX re-muxes per reader (above). An alignment-1 TS from this camera decodes
+  (CI's `the_wire_probe_sees_every_frame_the_camera_sends_with_and_without_audio` reads all 90
+  strips from one). And MediaMTX writes no H264 to a reader until it has seen a random-access
+  access unit, and logs nothing while it waits (from_stream.go, the `idrPresent` check before the
+  first `WriteH264`). So MediaMTX never got a whole IDR from the camera's 188-byte SRT messages (an
+  IDR is 30 to 80 of them), in its ingest or on the SRT leg; why was not read. The discriminator is
+  the publisher's `packetsReceivedLoss` and `packetsReceivedDrop` in MediaMTX's
+  `/v3/srt/conns/list` on an alignment-1 run. Alignment 1 is not a usable default; compose keeps 7.
 - **The beats are blind, not wrong.** `droppedFrames` counts the ladder's overruns before the encoder
   and `fps` is the encoder's output rate; both are true here. Neither sees the camera's cadence: the
   camera slot is latest-frame only (`adapters::gst_input`'s appsink, max 2, drop), and the driver
   ticks at `origin + ceil(i * 1000 / 30)` ms whatever the slot holds, so a camera frame replaced
   before a tick, or a tick that finds the same frame, is counted nowhere.
-- **Product exposure (estimated, not measured).** The compositor has no input de-jitter: a camera
-  frame is shown at the first tick after it is decoded. So any arrival jitter at the input becomes
-  repeats and skips, whatever its source. On Cloudflare's SRT playback F-002 measured AU arrival gaps
-  of p50 33.28, p90 40.44, p99 64.36, max 69.55 ms from a 30 fps source, read at the same
-  `srtsrc` → `tsdemux` → `h264parse` shape. That is far smoother than this harness's camera, but not
-  smooth, and what it costs on screen has not been measured.
-- **The alignment-1 run** (dispatch 40090232700, case `owed81-align1`, at the pre-rebase head
-  `7d77141`; red: "no live heartbeat within 180 s"). Push was clean again (5 411 frames, 0
-  bunched); sent was not (above: 2 029 of 5 410 bunched). And no reader decoded a video frame:
-  `input-tap` wrote 0 frames, and the compositor rebuilt its input 14 times, each generation
-  abandoned by the domain after about 5 s with only audio flushed, so it never went live and there
-  is no shown stage. MediaMTX took the publish (2 tracks, H264 and AAC) and logged nothing else.
-  Why video stopped at 188-byte SRT messages was not read; alignment 1 is not a usable default.
-- **Verdict: HARNESS ARTEFACT.** The judder Owed 81 measured is made by the fake camera's own mux,
-  and the compositor shows it faithfully; the counter (`camera.cadence`) is right, and so are the
-  beats for what they count. **The fix to the harness is not one line, and is unproven:** alignment
-  1 removes neither hold that matters here and loses the video. A fix must keep the 1 316-byte
-  payload and stop both holds, for instance by pushing each frame's audio ahead of its video (so an
-  AAC frame stamped after the video is always queued), with this probe run again to show what the
-  alignment then still holds. Compose keeps alignment 7, and a cadence gate for C14 and C15 waits
-  for that fix.
+- **The real path (phone → Cloudflare → compositor): judder of unknown size.** This exact mechanism
+  is the fake camera's: the compositor reads Cloudflare's re-mux, not the phone's mux (F-002's
+  RTMPS-in, SRT-out run shows Cloudflare re-muxes). The amplifier is the product's, though: no input
+  de-jitter, a latest-frame tick, and each video PES complete only at the next one's start, so any
+  arrival jitter at the input becomes repeats and skips 1:1. How much there is has not been
+  measured. F-002's Cloudflare arrival gaps (p50 33.28, p90 40.44, p99 64.36, max 69.55 ms) came
+  from a 30 fps x264 feed over RTMPS from a datacentre machine, not a phone over SRT, and report no
+  low tail: against their mean (30.12 fps), those percentiles allow anywhere from about 0 to about
+  18 % of frames bunched near 0 ms (the review's bound), and the p99 alone puts at least about 1 % of
+  frames a period late, each a repeat plus a skip. Its upper tail is smoother than this harness's
+  input (the smoke's input stage: p90 69.58, p99 99.11 ms). The real path adds clock drift too: the phone's clock against
+  the Fly Machine's sweeps the tick's phase, which one host clock cannot show and the tool's phase
+  sweep can. A measurement owes the raw arrivals kept, so `sample()` can be run on them.
+- **The fix to the harness: not known yet, and not one line.** Each hold needs its own:
+  - **The audio wait:** the audio must lead its video by at least 384 samples (8 ms) beyond the
+    frame's own 1 600, for instance frame n + 1's samples, with their true PTS, pushed one push
+    early. The rule above holds 6 of 16 frames at a lead of 0, one (n = 9) up to a lead of 383
+    samples, and none from 384. Pushing a frame's audio before its own video leaves the lead at 0
+    (the audio is already queued when the video arrives; AAC encodes faster than x264), so it
+    removes no hold: this entry's first example fix was exactly that, and is withdrawn.
+  - **The alignment:** still unaddressed. A candidate (the review's): merge each push's packets
+    into one buffer before the sink, since `srtsink` 1.24.2 splits a buffer into messages of at most
+    the payload size (gstsrtobject.c's send loop). It meets F-012's measurement that a buffer over
+    1 316 bytes at the mux's default alignment never arrived, so it is unmeasured and doubtful.
+  Then the same probe run again; a cadence gate for C14 and C15 waits for it.
 - **For the owner (product, not done here):** (i) a beat counter of camera frames replaced unshown
   and ticks that repeat a frame (small: a sequence number on the camera slot, read at each tick),
   so a judder on a real input is visible in the beats at all; (ii) a PTS-paced input buffer of one
