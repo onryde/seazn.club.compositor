@@ -1,0 +1,49 @@
+name: soak
+# The dispatch anchor for C15's soak (docs/tasks/C15-soak.md). GitHub dispatches a workflow_dispatch
+# workflow only when a file of that name exists on the default branch. Until C15's PR lands, this
+# file is that anchor: the soak itself lives on its branch and is dispatched from there, with the
+# branch's own soak.yml.
+#
+#   gh workflow run soak.yml --ref feat/c15-soak -f minutes=30 -f sha=<40-hex head>
+#
+# Dispatched on main, it launches nothing. It skips with a warning when FLY_API_TOKEN_SOAK is
+# empty, and otherwise fails, saying where the soak is. C15's PR replaces this file.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "The commit to soak, 40 hex. Empty: the ref's head."
+        required: false
+        default: ""
+      minutes:
+        description: "The Machines' run in minutes (185 = the 3 h soak)"
+        required: true
+        default: "185"
+      page:
+        description: "test (PLUMBING ONLY) or real"
+        type: choice
+        options: [test, real]
+        default: test
+      camera:
+        description: "fake-camera's picture"
+        type: choice
+        options: [ball, snow, noise]
+        default: ball
+permissions: { contents: read }
+defaults:
+  run: { shell: bash }
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: The Fly token
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
+        run: |
+          if [ -z "$FLY_API_TOKEN" ]; then
+            echo "::warning::FLY_API_TOKEN_SOAK unset — soak skipped"
+            exit 0
+          fi
+          echo "::error::the soak is not on this ref yet: dispatch it from C15's branch (gh workflow run soak.yml --ref feat/c15-soak ...)"
+          exit 1
