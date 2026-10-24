@@ -298,9 +298,8 @@ mod tests {
     }
 
     // Constant against constant: checked by the compiler (clippy refuses a runtime assert on
-    // constants), so a change that breaks one fails the build.
-    // The restart budget is no looser than YouTube's split (F-004).
-    const _: () = assert!(BUDGET_PROCESS_RESTART_OUTPUT_MS <= OUTPUT_GAP_BUDGET_MS);
+    // constants), so a change that breaks one fails the build. (The restart budget IS the domain's
+    // OUTPUT_GAP_BUDGET_MS, by definition above: no assert can add to that; the PR #52 review's m7.)
     // The final beat's flush fits inside the restart budget with room for a boot.
     const _: () = assert!(app::ports::FINAL_BEAT_TIMEOUT_MS < BUDGET_PROCESS_RESTART_OUTPUT_MS);
     // The page polls more often than its stale rule fires.
@@ -338,5 +337,134 @@ mod tests {
         // 29.5 fps over a 10 s window is 295 frames against 300: at most five missing.
         let f = f64::from(OutputProfile::P720.fps);
         assert!(BUDGET_FPS_MEAN_MIN < f && BUDGET_FPS_MEAN_MIN > f * ENCODER_SPEED_REALTIME_MIN);
+    }
+
+    /// The numbers a budget's source states: every occurrence in `text` of `pre`, a number, then
+    /// `post`, times `unit`.
+    fn stated(text: &str, pre: &str, post: &str, unit: f64) -> Vec<f64> {
+        let mut found = Vec::new();
+        let mut from = 0;
+        while let Some(i) = text[from..].find(pre) {
+            let at = from + i + pre.len();
+            let n: String = text[at..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if !n.is_empty() && text[at + n.len()..].starts_with(post) {
+                found.push(n.parse::<f64>().expect("a number") * unit);
+            }
+            from = at;
+        }
+        found
+    }
+
+    // The PR #52 review's m7: a budget edited and then regenerated passed every drift test, because
+    // only the restart budget was pinned (to the domain's OUTPUT_GAP_BUDGET_MS). The domain declares
+    // no const for the others (Owed 83), so each is pinned to the sentence it was taken from: the
+    // spec §6 text, or the C14 brief's where the spec has none. A budget changed without its source
+    // reds here, and so does a source changed without its budget.
+    #[test]
+    fn every_budget_is_the_number_its_source_states() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |p: &str| std::fs::read_to_string(root.join(p)).unwrap_or_else(|e| panic!("{p}: {e}"));
+        let spec = read("docs/specs/2026-10-14-r2-compositor-design.md");
+        let brief = read("docs/tasks/C14-chaos-suite.md");
+        let ms = |v: u64| v as f64;
+        let rows: [(&str, &str, &str, f64, f64); 11] = [
+            (
+                &spec,
+                "input frame→encoder ≤",
+                " ms",
+                1.0,
+                ms(BUDGET_FRAME_TO_ENCODER_MS),
+            ),
+            (
+                &spec,
+                "slate after camera loss ≤",
+                " s",
+                1000.0,
+                ms(BUDGET_SLATE_AFTER_LOSS_MS),
+            ),
+            (
+                &spec,
+                "return to live ≤",
+                " s",
+                1000.0,
+                ms(BUDGET_RETURN_TO_LIVE_MS),
+            ),
+            (
+                &spec,
+                "output reconnect ≤",
+                " s",
+                1000.0,
+                ms(BUDGET_OUTPUT_RECONNECT_MS),
+            ),
+            (
+                &spec,
+                "≤",
+                " s of programme lost",
+                1000.0,
+                ms(BUDGET_OUTPUT_LOST_MAX_MS),
+            ),
+            (
+                &spec,
+                "Real time within ",
+                " s",
+                1000.0,
+                ms(BUDGET_LADDER_REALTIME_MS),
+            ),
+            (
+                &spec,
+                "Output back ≤",
+                " s",
+                1000.0,
+                ms(BUDGET_PROCESS_RESTART_OUTPUT_MS),
+            ),
+            (&spec, "A/V within ±", " ms", 1.0, ms(BUDGET_AV_OFFSET_MS)),
+            (
+                &spec,
+                "signals `scoreStale` after ",
+                " s",
+                1000.0,
+                ms(BUDGET_SCORE_STALE_AFTER_MS),
+            ),
+            (
+                &brief,
+                "`fps_mean` over the window stays ≥ ",
+                " (the clock holds)",
+                1.0,
+                BUDGET_FPS_MEAN_MIN,
+            ),
+            (
+                &brief,
+                "`cef health zygote_gone=<g>` within ",
+                " s of the kill",
+                1000.0,
+                ms(BUDGET_ZYGOTE_VERDICT_MS),
+            ),
+        ];
+        let mut checked = 0;
+        for (text, pre, post, unit, budget) in rows {
+            let found = stated(text, pre, post, unit);
+            assert!(!found.is_empty(), "no `{pre}<n>{post}` in its source");
+            for n in &found {
+                assert!(
+                    (n - budget).abs() < 1e-9,
+                    "`{pre}<n>{post}`: the source says {n}, the budget is {budget} (both in the budget's unit)"
+                );
+                checked += 1;
+            }
+        }
+        eprintln!("budget statements checked: {checked}");
+        assert!(checked >= rows.len());
+    }
+
+    #[test]
+    fn a_stated_number_is_read_with_its_unit_and_only_between_its_words() {
+        let t = "a ≤1.2 s; b ≤3 ms; c ≤x s; ≤2 s of programme lost";
+        assert_eq!(stated(t, "a ≤", " s", 1000.0), [1200.0]);
+        assert_eq!(stated(t, "b ≤", " s", 1000.0), Vec::<f64>::new(), "ms is not s");
+        assert_eq!(stated(t, "c ≤", " s", 1000.0), Vec::<f64>::new());
+        assert_eq!(stated(t, "≤", " s of programme lost", 1000.0), [2000.0]);
     }
 }
