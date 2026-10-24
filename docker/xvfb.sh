@@ -31,28 +31,13 @@ start_xvfb() {
   # Bash 5's clock in microseconds, whatever the locale's decimal point (empty before bash 5).
   t0=${EPOCHREALTIME:-}
   t0=${t0//[!0-9]/}
-  # Xvfb needs no token (the PR #36 review's m2).
-  env -u JOB_TOKEN Xvfb ":$display" -screen 0 1920x1080x24 -nolisten tcp -displayfd 3 \
-    3>"$ready" >/dev/null 2>&1 &
-  xpid=$!
-  # Up to 5 s, as before Owed 85. `read` succeeds on a whole line only: Xvfb writes the number, then
-  # the newline.
-  for ((i = 0; i < 50; i++)); do
-    if IFS= read -r line <"$ready"; then break; fi
-    kill -0 "$xpid" 2>/dev/null || break
-    sleep 0.1
-  done
-  # A number without its newline is no answer yet.
-  IFS= read -r line <"$ready" || line=
+  # MUTANT (Owed 85 review I1): the -displayfd half reverted, i.e. the pre-fix start: no -displayfd,
+  # the socket-file wait. Never to merge.
+  env -u JOB_TOKEN Xvfb ":$display" -screen 0 1920x1080x24 -nolisten tcp >/dev/null 2>&1 &
+  for _ in $(seq 1 50); do [ -e "$dir/.X11-unix/X$display" ] && break; sleep 0.1; done
   rm -f "$ready"
-  if [ "$line" = "$display" ]; then
-    now=${EPOCHREALTIME:-}
-    now=${now//[!0-9]/}
-    if [ -n "$t0" ] && [ -n "$now" ]; then
-      log info "Xvfb ready after $(((now - t0) / 1000)) ms"
-    else
-      log info "Xvfb ready"
-    fi
+  if [ -e "$dir/.X11-unix/X$display" ]; then
+    log info "Xvfb ready"
     return 0
   fi
   if [ -n "$line" ]; then
