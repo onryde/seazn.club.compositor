@@ -5,11 +5,13 @@
 //! |---|---|
 //! | `cpu_pct` | `utime + stime` of this process and every descendant (`/proc/<pid>/stat`), the delta since the last sample ÷ the wall delta ÷ the CPUs this process may use × 100 |
 //! | `mem_mb` | the sum of `VmRSS` over the same tree (`/proc/<pid>/status`) |
-//! | `fps`, `bitrate_kbps`, `egress_bytes`, `encoder_speed` | `Stats::snapshot()`, unchanged: a `None` there stays absent on the wire |
+//! | `fps` | the programme's REAL output rate (Owed 86): the video frames that left the encoder since the last sample, over the wall time since it (`BeatRate`, fed `Stats::snapshot()`'s `encoded_frames`), never the profile's nominal rate; absent until a window has both ends |
+//! | `bitrate_kbps`, `egress_bytes`, `encoder_speed` | `Stats::snapshot()`, unchanged: a `None` there stays absent on the wire |
 //! | `camera_frames_replaced` | `Stats::snapshot()`, unchanged; logged by the driver, never on the wire (Owed 90) |
 //! | `measured_latency_ms` | never: it needs SEI (F-003), so it is omitted, never 0 |
 //!
-//! The first sample has no CPU delta yet, so its `cpu_pct` is `None`. A process is keyed by its pid
+//! The driver samples once a beat (`Effect::SendHeartbeat`, the only caller), so "since the last
+//! sample" is the beat window. The first sample has no CPU delta yet, so its `cpu_pct` is `None`. A process is keyed by its pid
 //! AND its start time, so a pid reused between two samples is a new process, never a delta against
 //! the old one. A descendant that started since the last sample counts all of its ticks (it ran only
 //! since then); one that ended in between is lost, which only ever under-reads. A CEF process
@@ -22,7 +24,7 @@ use std::time::Instant;
 
 use app::ports::{Measured, Metrics};
 
-use crate::stats::Stats;
+use crate::stats::{BeatRate, Stats};
 
 /// A process's identity across samples: its pid and its start time (clock ticks since boot).
 type ProcKey = (u32, u64);
@@ -103,6 +105,8 @@ pub struct ProcMetrics {
     ticks_per_s: f64,
     cpus: f64,
     last: Option<(Instant, BTreeMap<ProcKey, u64>)>,
+    /// The beat's real output rate (Owed 86).
+    rate: BeatRate,
 }
 
 impl fmt::Debug for ProcMetrics {
@@ -112,6 +116,7 @@ impl fmt::Debug for ProcMetrics {
             .field("ticks_per_s", &self.ticks_per_s)
             .field("cpus", &self.cpus)
             .field("sampled", &self.last.is_some())
+            .field("rate", &self.rate)
             .finish_non_exhaustive()
     }
 }
@@ -125,6 +130,7 @@ impl ProcMetrics {
             ticks_per_s: clock_ticks_per_second(),
             cpus: std::thread::available_parallelism().map_or(1.0, |n| n.get() as f64),
             last: None,
+            rate: BeatRate::default(),
         }
     }
 }
@@ -172,7 +178,7 @@ impl Metrics for ProcMetrics {
         self.last = (!ticks.is_empty()).then_some((now, ticks));
         let s = self.stats.snapshot();
         Measured {
-            fps: s.fps,
+            fps: self.rate.sample(now, s.encoded_frames),
             bitrate_kbps: s.bitrate_kbps,
             egress_bytes: s.egress_bytes,
             measured_latency_ms: None,

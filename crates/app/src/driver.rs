@@ -27,6 +27,14 @@
 //!   `camera_frames_replaced` writes `camera frames replaced beat=<n> total=<n>`, where `beat` is the
 //!   rise since the last beat's sample (the final beat included). It stands in for a
 //!   beat field the contract does not have yet (Owed 90); a sample without it writes nothing.
+//! - **The real output rate** (Owed 86): each beat's metrics sample that carries `fps` (the frames
+//!   that left the encoder over the beat window, a finite rate) writes `output fps beat=<fps>
+//!   floor=<floor>`, the floor being the session profile's (`OutputProfile::fps_floor`), and hands it
+//!   to `domain::starvation`'s alarm: `output starvation alarm raised fps=<fps> floor=<floor>` on the
+//!   beat that falls below the floor, `output starvation alarm cleared fps=<fps> recovered=<level>`
+//!   on the first beat at or above the recovery level after it. A beat with no session (a refused
+//!   bootstrap's final beat) has no profile and writes neither. The beat itself carries the same
+//!   `fps`. The ladder is not told: its only input stays the encoder queue's overruns.
 //! - **CEF's health** (C11b) is read from the graphics port once per `tick_due` that ran a tick, after
 //!   its ticks, and handed to `decide` every time (the domain decides the in-place restart, never the
 //!   driver), with one line when it changes (`cef health zygote_gone=<gen|-> leaked_teardowns=<n>
@@ -42,6 +50,7 @@ use domain::health::ExitDetail;
 use domain::lifecycle::{ExitReason, Lifecycle};
 use domain::output_link::SwapReason;
 use domain::programme::ProgrammePhase;
+use domain::starvation::{Alarm, StarvationAlarm};
 use domain::supervisor::{Decision, Effect, Event, Refusal, Supervisor};
 
 use crate::ports::{ControlRequest, Inbound, Ports, SessionConfig, FINAL_BEAT_TIMEOUT_MS};
@@ -119,6 +128,8 @@ pub struct Driver {
     drops: Tally,
     /// The camera-frames-replaced total of the last beat's sample (Owed 81 (i)).
     replaced_at_beat: u64,
+    /// The real output rate's starvation alarm (Owed 86).
+    starvation: StarvationAlarm,
     phase: ProgrammePhase,
     phase_seq: u64,
     /// CEF's health as last read (C11b): its line is written when it changes.
@@ -142,6 +153,7 @@ impl Driver {
             skips: Tally::default(),
             drops: Tally::default(),
             replaced_at_beat: 0,
+            starvation: StarvationAlarm::default(),
             phase: ProgrammePhase::Waiting,
             phase_seq: 0,
             cef: CefHealth::default(),
@@ -351,6 +363,21 @@ impl Driver {
                     self.replaced_at_beat = total;
                     p.log
                         .info(&format!("camera frames replaced beat={beat} total={total}"));
+                }
+                let reading = m.fps.filter(|f| f.is_finite());
+                if let (Some(fps), Some(cfg)) = (reading, &self.session) {
+                    let floor = cfg.output.fps_floor();
+                    p.log.info(&format!("output fps beat={fps:.2} floor={floor:.2}"));
+                    match self.starvation.on_reading(fps, &cfg.output) {
+                        Some(Alarm::Raised) => p.log.info(&format!(
+                            "output starvation alarm raised fps={fps:.2} floor={floor:.2}"
+                        )),
+                        Some(Alarm::Cleared) => p.log.info(&format!(
+                            "output starvation alarm cleared fps={fps:.2} recovered={:.2}",
+                            cfg.output.fps_recovered()
+                        )),
+                        None => {}
+                    }
                 }
                 p.control.request(ControlRequest::Heartbeat(h, m));
                 let dropped = p.control.dropped();

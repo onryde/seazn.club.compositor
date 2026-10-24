@@ -17,11 +17,12 @@ use adapters::gst_output::{
     ENCODED_RING_MAX_ENTRIES, ENCODED_RING_SPAN, OUTPUT_PROGRESS_POLL_MS, OUTPUT_QUEUE_BYTES,
 };
 use adapters::gst_programme::{GstProgramme, OVERLAY_SIZE};
+use adapters::metrics_proc::ProcMetrics;
 #[path = "support/rtmp.rs"]
 mod rtmp;
 use adapters::slate::{logo_box, Slate, LOGO_PNG, SLATE_BACKDROP_RGB};
 use adapters::stats::StatsSnapshot;
-use app::ports::{Inbound, ProgrammeOutput, TargetSpec};
+use app::ports::{Inbound, Metrics, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::Receiver;
 use domain::config::{OutputProfile, Thresholds, ENCODER_SPEED_REALTIME_MIN};
 use domain::ladder::Rung;
@@ -914,14 +915,55 @@ fn stats_are_absent_before_anything_is_measured() {
     assert_eq!(p.stats().snapshot(), StatsSnapshot::default());
 }
 
+/// Owed 86, the producer: the encoder's sink counts every video frame it hands on, and the count
+/// is the frames the output actually carries, read back from the file by an independent decoder.
 #[test]
-fn stats_fps_counts_pushes_per_second() {
+fn stats_encoded_frames_are_the_frames_the_output_carries() {
+    let _s = serial();
+    let dir = Tmp::new("encoded");
+    let (mut p, rx, _f, _l) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    pace(&mut p, 0..90, FrameChoice::Slate(SlateKind::Waiting));
+    drain_and_wait(&mut p, &rx);
+    let d = decode(&dir.file("a.flv"));
+    eprintln!("frames decoded from the output: {}", d.frames.len());
+    assert_eq!(d.frames.len(), 90, "the file's frames");
+    assert_eq!(
+        p.stats().snapshot().encoded_frames,
+        Some(90),
+        "the counter against the file"
+    );
+}
+
+/// Owed 86, the producer through the beat's sampler: over a real-pace window the programme's real
+/// output rate holds the starvation floor, a window in which nothing is pushed (the encoder starved
+/// of frames, as F-024's CPU starvation starved it of time) reads under it, and real pace again holds
+/// it. The band is the profile's: at least the floor, and no further above the profile's rate than
+/// the floor is below it. The pushes are the programme's; the reading is never a tick count.
+#[test]
+fn the_beats_fps_is_the_programmes_real_output_rate_and_falls_when_starved() {
     let _s = serial();
     let (mut p, _rx, _f, _l) = programme();
-    pace(&mut p, 0..66, FrameChoice::Slate(SlateKind::Waiting));
-    let fps = p.stats().snapshot().fps.expect("a complete window");
-    let want = f64::from(P720.fps);
-    assert!((fps - want).abs() <= 1.0, "fps {fps}, want {want} ± 1");
+    let mut m = ProcMetrics::new(p.stats());
+    let fps = u64::from(P720.fps);
+    let (floor, rate) = (P720.fps_floor(), f64::from(P720.fps));
+    let band = floor..=rate + (rate - floor);
+    pace(&mut p, 0..fps, FrameChoice::Slate(SlateKind::Waiting));
+    assert!(
+        p.stats().snapshot().encoded_frames.is_some(),
+        "the encoder has started"
+    );
+    assert_eq!(m.sample().fps, None, "the window opens");
+    pace(&mut p, fps..3 * fps, FrameChoice::Slate(SlateKind::Waiting));
+    let healthy = m.sample().fps.expect("a 2 s window");
+    thread::sleep(Duration::from_millis(1_500));
+    let starved = m.sample().fps.expect("a 1.5 s window");
+    pace(&mut p, 3 * fps..5 * fps, FrameChoice::Slate(SlateKind::Waiting));
+    let resumed = m.sample().fps.expect("a 2 s window");
+    eprintln!("beat fps: {healthy:.3} → starved {starved:.3} → resumed {resumed:.3}");
+    assert!(band.contains(&healthy), "real pace {healthy}, band {band:?}");
+    assert!(starved < floor, "starved {starved}, floor {floor}");
+    assert!(band.contains(&resumed), "resumed {resumed}, band {band:?}");
 }
 
 #[test]

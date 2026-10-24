@@ -178,6 +178,10 @@ pub enum HeartbeatError {
 /// Values measured by adapters (absent ⇒ None ⇒ omitted on the wire, never sent as 0).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Measured {
+    /// The programme's REAL output rate (Owed 86): the video frames that left the encoder over the
+    /// beat window, per second, never the profile's nominal `fps`. The driver logs it once a beat
+    /// against the profile's floor and feeds the starvation alarm (`domain::starvation`); the
+    /// heartbeat carries it as `fps`.
     pub fps: Option<f64>,
     pub bitrate_kbps: Option<u32>,
     pub egress_bytes: Option<u64>,

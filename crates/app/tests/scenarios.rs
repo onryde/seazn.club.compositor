@@ -1631,6 +1631,183 @@ fn camera_frames_replaced_is_logged_once_a_beat_with_the_beats_rise() {
     assert_eq!(want.len(), script.len() + 1);
 }
 
+/// A `Metrics` whose `fps` (the real output rate, Owed 86) the test sets between beats.
+struct ScriptedFps(Arc<Mutex<Option<f64>>>);
+
+impl Metrics for ScriptedFps {
+    fn sample(&mut self) -> Measured {
+        Measured {
+            fps: *self.0.lock().unwrap_or_else(PoisonError::into_inner),
+            ..metrics()
+        }
+    }
+}
+
+/// F-024 (Owed 86): what C14 case 6's starved windows carried, the dispatch run and the PR run.
+const F024_STARVED_FPS: [f64; 2] = [11.5, 24.7];
+
+/// The lines a beat that reads `fps` writes, against the session profile's own levels (never a
+/// number typed here): the reading and the floor, then the alarm's change, if any.
+type AlarmLine = fn(f64, &OutputProfile) -> String;
+
+fn fps_line(fps: f64, p: &OutputProfile) -> String {
+    format!("output fps beat={fps:.2} floor={:.2}", p.fps_floor())
+}
+fn raised_line(fps: f64, p: &OutputProfile) -> String {
+    format!(
+        "output starvation alarm raised fps={fps:.2} floor={:.2}",
+        p.fps_floor()
+    )
+}
+fn cleared_line(fps: f64, p: &OutputProfile) -> String {
+    format!(
+        "output starvation alarm cleared fps={fps:.2} recovered={:.2}",
+        p.fps_recovered()
+    )
+}
+
+/// Owed 86: every beat whose metrics sample carries the real output rate writes `output fps
+/// beat=<fps> floor=<floor>`; a beat below the floor raises the starvation alarm once
+/// (`output starvation alarm raised …`), a starved beat after it repeats nothing, a beat between the
+/// floor and the recovery level keeps it raised, and the recovery level clears it (`… cleared …`);
+/// then a second starvation raises it again, and the drain's final beat is judged too. A beat with
+/// no reading, or one that is not a measurement, writes nothing. The beat that is sent carries the
+/// same rate the line names (the heartbeat's `fps`, never the profile's). The ladder is untouched.
+#[test]
+fn the_real_output_fps_is_logged_each_beat_and_starvation_raises_then_clears_the_alarm() {
+    let log = Log::default();
+    let fps = Arc::new(Mutex::new(None));
+    let set = |n: Option<f64>| *fps.lock().unwrap_or_else(PoisonError::into_inner) = n;
+    let mut p = ports(&log, metrics());
+    p.metrics = Box::new(ScriptedFps(Arc::clone(&fps)));
+    let mut d = Driver::new(th(), p, FAR, 0);
+    assert_eq!(d.tick_due(0), None);
+    let session = session_720p();
+    let profile = session.output;
+    assert_eq!(d.step(Inbound::Session(session), SESSION_AT), None);
+    let is_beat = |c: &Call| matches!(c, Call::Control(ControlRequest::Heartbeat(..)));
+    let sent = |calls: &[Call]| -> Vec<Option<f64>> {
+        calls
+            .iter()
+            .filter_map(|c| match c {
+                Call::Control(ControlRequest::Heartbeat(_, m)) => Some(m.fps),
+                _ => None,
+            })
+            .collect()
+    };
+    let next_beat = |d: &mut Driver| {
+        let mark = log.len();
+        loop {
+            let at = d.next_tick_at();
+            assert!(at < FAR, "no beat");
+            assert_eq!(d.tick_due(at), None);
+            let calls = log.calls_from(mark);
+            if calls.iter().any(is_beat) {
+                return (at, sent(&calls));
+            }
+        }
+    };
+    let lines = || {
+        let mut l = lines_starting(&log, "output fps");
+        l.extend(lines_starting(&log, "output starvation"));
+        l.sort();
+        l
+    };
+    let (band, recovered) = (
+        (profile.fps_floor() + profile.fps_recovered()) / 2.0,
+        profile.fps_recovered(),
+    );
+    let healthy = f64::from(profile.fps);
+    let (mut at, first) = next_beat(&mut d);
+    assert_eq!(first, vec![None]);
+    assert!(lines().is_empty(), "not measured: no line");
+    // (the reading, the alarm's change on that beat)
+    let script: [(Option<f64>, Option<AlarmLine>); 10] = [
+        (Some(healthy), None),
+        (Some(F024_STARVED_FPS[0]), Some(raised_line)),
+        (Some(F024_STARVED_FPS[1]), None),
+        (Some(profile.fps_floor()), None),
+        (Some(band), None),
+        (Some(recovered), Some(cleared_line)),
+        (Some(band), None),
+        (None, None),
+        (Some(f64::NAN), None),
+        (Some(0.0), Some(raised_line)),
+    ];
+    let mut want = Vec::new();
+    let mut raises = 0;
+    for (reading, change) in script {
+        set(reading);
+        let (beat_at, carried) = next_beat(&mut d);
+        at = beat_at;
+        if let Some(r) = reading.filter(|r| r.is_finite()) {
+            want.push(fps_line(r, &profile));
+            if let Some(line) = change {
+                want.push(line(r, &profile));
+                raises += usize::from(r < profile.fps_floor());
+            }
+        }
+        want.sort();
+        assert_eq!(lines(), want, "the beat at {at}, reading {reading:?}");
+        assert_eq!(carried.len(), 1, "one beat");
+        assert_eq!(
+            carried[0].map(f64::to_bits),
+            reading.map(f64::to_bits),
+            "the beat carries the reading itself"
+        );
+    }
+    assert_eq!(raises, 2, "two starvations");
+    // The drain's final beat is judged as well: a recovery clears the alarm on it.
+    set(Some(healthy));
+    let beats_before = log.count(is_beat);
+    assert_eq!(d.step(ev(Event::Signal(SignalKind::Term)), at + 1), None);
+    assert_eq!(d.step(ev(Event::OutputDrained), at + 2), Some(0));
+    assert_eq!(log.count(is_beat) - beats_before, 1, "the drain's final beat");
+    want.push(fps_line(healthy, &profile));
+    want.push(cleared_line(healthy, &profile));
+    want.sort();
+    assert_eq!(lines(), want, "the final beat's lines");
+    assert_eq!(
+        log.count(|c| matches!(c, Call::StepDown(_))),
+        0,
+        "no ladder change"
+    );
+    eprintln!("output fps lines checked: {}", want.len());
+    assert_eq!(
+        want.len(),
+        8 + 3 + 2,
+        "8 readings, 3 alarm changes, the final beat's 2"
+    );
+}
+
+/// Owed 86: a beat with a reading but no session (a refused bootstrap's final beat) has no profile
+/// to judge it against, so it writes no line and raises nothing; the beat still carries the rate.
+#[test]
+fn a_beat_before_any_session_writes_no_output_fps_line() {
+    let log = Log::default();
+    let mut p = ports(&log, metrics());
+    p.metrics = Box::new(ScriptedFps(Arc::new(Mutex::new(Some(F024_STARVED_FPS[0])))));
+    let mut d = Driver::new(th(), p, FAR, 0);
+    assert_eq!(d.tick_due(0), None);
+    let code = d.step(ev(Event::BootstrapRefused(Refusal::Gone)), 5);
+    assert!(code.is_some(), "a refused bootstrap exits");
+    let beats: Vec<Option<f64>> = log
+        .calls_from(0)
+        .iter()
+        .filter_map(|c| match c {
+            Call::Control(ControlRequest::Heartbeat(_, m)) => Some(m.fps),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        beats,
+        vec![Some(F024_STARVED_FPS[0])],
+        "the final beat, as sampled"
+    );
+    assert!(lines_starting(&log, "output fps").is_empty());
+    assert!(lines_starting(&log, "output starvation").is_empty());
+}
+
 /// The empty case: a run that skipped no tick and dropped no beat logs neither line, at the exit
 /// included.
 #[test]

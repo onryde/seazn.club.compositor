@@ -90,11 +90,13 @@ fn proc_tests_need_linux() {
     eprintln!("skipped: not linux");
 }
 
+/// Every `Stats` field but `encoded_frames` reaches `Measured` unchanged; `encoded_frames` is read
+/// through `BeatRate` into `fps` (Owed 86), and one sample is no window, so the first `fps` is absent.
 #[test]
 fn copies_every_stats_field_into_measured() {
     let stats = Arc::new(Stats::default());
     let set = StatsSnapshot {
-        fps: Some(29.5),
+        encoded_frames: Some(9_000),
         bitrate_kbps: Some(3_987),
         egress_bytes: Some(123_456_789),
         encoder_speed: Some(0.97),
@@ -102,7 +104,7 @@ fn copies_every_stats_field_into_measured() {
     };
     stats.force_snapshot(set);
     let got = ProcMetrics::new(Arc::clone(&stats)).sample();
-    assert_eq!(got.fps, set.fps);
+    assert_eq!(got.fps, None, "one sample opens the window and reads nothing");
     assert_eq!(got.bitrate_kbps, set.bitrate_kbps);
     assert_eq!(got.egress_bytes, set.egress_bytes);
     assert_eq!(got.encoder_speed, set.encoder_speed);
@@ -119,6 +121,57 @@ fn copies_every_stats_field_into_measured() {
         (None, None, None, None, None),
         "a field C09 reports as None stays absent"
     );
+}
+
+/// Owed 86, the seam from the counter to the beat: frames counted by a real `Stats` (the call the
+/// programme's encoder sink makes for every video frame) come out of the real sampler as the beat's
+/// `fps`, the frames since the last sample over the wall time since it. The window's length is
+/// bracketed by the test's own clock reads around each sample, so the expected rate is the test's
+/// frame count over that bracket, never the sampler's arithmetic. Then the empty window: no frame
+/// for a whole window is a measured 0, the starved beat the alarm is for; then the rate again.
+#[test]
+fn the_beats_fps_is_the_frames_out_of_the_encoder_over_the_beat_window() {
+    use std::time::{Duration, Instant};
+    let stats = Arc::new(Stats::default());
+    let mut m = ProcMetrics::new(Arc::clone(&stats));
+    assert_eq!(m.sample().fps, None, "nothing encoded");
+    let mut pts = Duration::ZERO;
+    let mut encode = |n: u32| {
+        for _ in 0..n {
+            stats.on_encoded_video(pts);
+            pts += Duration::from_millis(33);
+        }
+    };
+    encode(1);
+    let sampled = |m: &mut ProcMetrics| {
+        let before = Instant::now();
+        let fps = m.sample().fps;
+        (before, fps, Instant::now())
+    };
+    let (mut before, fps, mut after) = sampled(&mut m);
+    assert_eq!(fps, None, "the first total opens the window");
+    // A window comfortably past the 1 s minimum (OUTPUT_FPS_MIN_WINDOW_MS) on a loaded runner.
+    let wait = Duration::from_millis(1_300);
+    let mut checked = 0;
+    for frames in [40u32, 0, 39] {
+        encode(frames);
+        std::thread::sleep(wait);
+        let (b, fps, a) = sampled(&mut m);
+        let fps = fps.expect("a window of at least the minimum");
+        let (shortest, longest) = ((b - after).as_secs_f64(), (a - before).as_secs_f64());
+        let (lo, hi) = (f64::from(frames) / longest, f64::from(frames) / shortest);
+        eprintln!("{frames} frames over {shortest:.3}..{longest:.3} s read {fps:.3} fps");
+        assert!(
+            (lo..=hi).contains(&fps),
+            "{frames} frames: {fps} outside {lo}..{hi}"
+        );
+        if frames == 0 {
+            assert_eq!(fps, 0.0, "an empty window is a measured 0");
+        }
+        (before, after) = (b, a);
+        checked += 1;
+    }
+    assert_eq!(checked, 3);
 }
 
 /// proc(5)'s layout, with a command name that holds spaces and a `)` (fields read after the last).
