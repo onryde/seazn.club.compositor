@@ -7,6 +7,8 @@ Every leg first runs its target tests on the unmutated head, and each must pass.
 - the red-baseline leg puts back main's gst_output.rs and gst_programme.rs (the code before the fix)
   and runs the four Owed 84 legs: each must FAIL, with the expected panic text.
 """
+import os
+import re
 import subprocess
 import sys
 
@@ -62,8 +64,10 @@ RED = [
 
 def run(name):
     cmd = ["cargo", "test", "-p", "adapters", "--test", "programme_output", "--", "--exact", name, "--nocapture"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    out = r.stdout + r.stderr
+    env = dict(os.environ, CARGO_TERM_COLOR="never")
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    # Actions colours cargo's status words (`Running` arrives wrapped in escape codes).
+    out = re.sub(r"\x1b\[[0-9;]*m", "", r.stdout + r.stderr)
     built = "Running tests/programme_output.rs" in out and "running 1 test" in out
     ok = f"test {name} ... ok" in out
     failed = f"test {name} ... FAILED" in out
