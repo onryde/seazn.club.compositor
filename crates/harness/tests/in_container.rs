@@ -45,8 +45,22 @@ fn bash() -> String {
 /// A pid directory with nothing in it: a process gone between the listing and the read.
 const VANISHED: &str = "1";
 
-/// The boot time the fake `/proc/stat` declares, in s.
+/// The boot time the fake `/proc/stat` declares, in s. The script must NOT use it (fix round 3):
+/// btime is whole seconds, fixed at boot, and read 173 to 1 080 ms early against docker's events in
+/// CI, so every process of a restarted container looked older than the restart.
 const BTIME_S: i64 = 1_792_800_000;
+
+/// The fake `/proc/uptime` (s, two decimals as the kernel prints it): the boot instant is this
+/// host's wall clock at the read, less this.
+const UPTIME: &str = "4321.57";
+const UPTIME_MS: i64 = 4_321_570;
+
+fn wall_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
 
 /// A renamed renderer, as Chromium's setproctitle leaves it: one space-joined string, NUL-padded to
 /// the original argv's length (the flags are CEF 139's renderer flags; the values are made up).
@@ -91,6 +105,7 @@ impl FakeProc {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("stat"), format!("cpu  1 2 3 4\nbtime {BTIME_S}\n")).unwrap();
+        std::fs::write(dir.join("uptime"), format!("{UPTIME} 17000.02\n")).unwrap();
         // The vanished pid: "1" sorts before every real pid in the script's glob.
         std::fs::create_dir_all(dir.join(VANISHED)).unwrap();
         Self { dir, procs: vec![] }
@@ -220,7 +235,9 @@ fn pids(v: &Value) -> Vec<u32> {
 #[test]
 fn the_tree_reads_each_process_type_from_both_cmdline_shapes() {
     let t = tree("tree");
+    let before = wall_ms();
     let (out, lines) = t.p.run(&["tree"]);
+    let after = wall_ms();
     assert!(out.status.success());
     let clk: i64 = String::from_utf8_lossy(&Command::new("getconf").arg("CLK_TCK").output().unwrap().stdout)
         .trim()
@@ -242,13 +259,20 @@ fn the_tree_reads_each_process_type_from_both_cmdline_shapes() {
             .find(|l| l["pid"].as_u64() == Some(u64::from(pid)))
             .unwrap_or_else(|| panic!("pid {pid} is not listed"));
         assert_eq!(l["type"].as_str(), ty, "pid {pid}");
-        assert_eq!(
-            l["start_ms"].as_i64(),
-            Some(BTIME_S * 1000 + ticks * 1000 / clk),
-            "pid {pid}"
+        // On the wall clock docker's events use: the boot instant read at the run (its wall clock
+        // less the uptime), plus the process's start ticks. The uptime's 10 ms is its resolution.
+        let start = l["start_ms"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("pid {pid}: no start_ms"));
+        let from = before - UPTIME_MS + ticks * 1000 / clk - 10;
+        let to = after - UPTIME_MS + ticks * 1000 / clk;
+        assert!(
+            (from..=to).contains(&start),
+            "pid {pid}: start_ms {start} is not in {from}..={to} (btime's would be {})",
+            BTIME_S * 1000 + ticks * 1000 / clk
         );
         assert!(
-            l["at_ms"].as_i64().is_some_and(|a| a > BTIME_S * 1000),
+            l["at_ms"].as_i64().is_some_and(|a| (before..=after).contains(&a)),
             "pid {pid}"
         );
         checked += 1;
