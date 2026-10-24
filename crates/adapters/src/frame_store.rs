@@ -3,6 +3,8 @@
 //! slot, and the programme pipeline (C09) reads all three once per tick. Every slot is bounded: a
 //! video slot holds one sample (the newest replaces it), and the audio ring holds at most 400 ms and
 //! drops the oldest bytes (plan, Global Constraints: "audio 400 ms … leaky, dropping the oldest").
+//! The camera slot also counts the frames written to it, so the programme can tell how many a tick
+//! passed over (`Stats::on_camera_tick`, Owed 81 (i)).
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,13 +30,22 @@ pub struct FrameStore {
 
 #[derive(Default)]
 struct Inner {
-    camera: Mutex<Option<gst::Sample>>,
+    camera: Mutex<Camera>,
     overlay: Mutex<Option<gst::Sample>>,
     audio: Mutex<VecDeque<u8>>,
     /// Audio pushes refused because they were not whole S16LE stereo frames.
     audio_refused: AtomicU64,
     /// The ring's real bytes handed out by `take_audio*` (the padding is not counted).
     audio_taken: AtomicU64,
+}
+
+/// The camera slot: the newest frame, and how many frames the slot has taken (a plain count under
+/// the slot's lock, so a reader gets the frame and the count of the same write, and the per-frame
+/// cost is one add).
+#[derive(Default)]
+struct Camera {
+    sample: Option<gst::Sample>,
+    written: u64,
 }
 
 /// A slot's lock, taken even if a writer panicked while holding it: the slot holds plain data, so
@@ -45,11 +56,25 @@ fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl FrameStore {
     pub fn set_camera(&self, s: gst::Sample) {
-        *locked(&self.inner.camera) = Some(s);
+        let mut slot = locked(&self.inner.camera);
+        slot.sample = Some(s);
+        slot.written += 1;
     }
 
     pub fn camera(&self) -> Option<gst::Sample> {
-        locked(&self.inner.camera).clone()
+        locked(&self.inner.camera).sample.clone()
+    }
+
+    /// The newest camera frame and the frames the slot has taken so far, read under one lock: the
+    /// count includes the frame returned.
+    pub fn camera_frame(&self) -> (Option<gst::Sample>, u64) {
+        let slot = locked(&self.inner.camera);
+        (slot.sample.clone(), slot.written)
+    }
+
+    /// The frames the camera slot has taken so far (a slate tick reads it without the frame).
+    pub fn camera_written(&self) -> u64 {
+        locked(&self.inner.camera).written
     }
 
     pub fn set_overlay(&self, s: gst::Sample) {
@@ -134,7 +159,7 @@ impl FrameStore {
 impl fmt::Debug for FrameStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FrameStore")
-            .field("camera", &locked(&self.inner.camera).is_some())
+            .field("camera", &locked(&self.inner.camera).sample.is_some())
             .field("overlay", &locked(&self.inner.overlay).is_some())
             .field("audio_bytes", &self.audio_level())
             .finish()

@@ -16,6 +16,8 @@
 //! ring, and any part the ring lacks is low-level pink noise, never digital zero (F-004). On rung
 //! `OverlayHalfRate` the overlay is pushed on even indices only, each push covering two periods, so
 //! the compositor keeps it on air for the odd ones (owner, 2026-10-18: no rung takes the score off).
+//! Every tick hands the camera slot's write count to `Stats::on_camera_tick`, which counts the camera
+//! frames no tick put on air (`camera_frames_replaced`, Owed 81 (i)).
 //!
 //! **Never blocks** the loop: the appsrcs leak the oldest buffer when full, and nothing here waits
 //! on a pipeline. Teardown goes to reaper threads.
@@ -667,10 +669,13 @@ impl ProgrammeOutput for GstProgramme {
         let (pts, next) = (at(index), at(index + 1));
         let period = next - pts;
 
-        // The base layer.
+        // The base layer. The camera slot's count goes to the stats on every tick, a slate's too, so
+        // a camera tick counts only the frames since the tick before it (Owed 81 (i)).
         let camera = match choice {
             FrameChoice::Emit | FrameChoice::Repeat => {
-                let fitted = self.frames.camera().and_then(|s| r.camera_fit.fit(&s));
+                let (sample, written) = self.frames.camera_frame();
+                self.shared.stats.on_camera_tick(written, true);
+                let fitted = sample.and_then(|s| r.camera_fit.fit(&s));
                 if fitted.is_none() {
                     self.camera_missing += 1;
                     if let Some(shape) = r.camera_fit.take_refusal() {
@@ -681,7 +686,12 @@ impl ProgrammeOutput for GstProgramme {
                 }
                 fitted
             }
-            FrameChoice::Slate(_) => None,
+            FrameChoice::Slate(_) => {
+                self.shared
+                    .stats
+                    .on_camera_tick(self.frames.camera_written(), false);
+                None
+            }
         };
         let base = match (camera, choice) {
             (Some(b), _) => b,
