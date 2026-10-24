@@ -1503,6 +1503,90 @@ fn gpu_deaths_case() {
     r.g.stop();
 }
 
+// Owed 70 (a), from real kills: a GPU crash loop faster than one child poll (F-026: C14's fast loop
+// killed each relaunch 69 to 88 ms after the kill before, and the 1 s poll counted 1 or 2 of 5). The GPU
+// process is killed, then each relaunch `LOOP_LIFE_MS` after this test first lists it, never waiting
+// for a poll to list it: `cef_gpu_deaths_to_restart` deaths, under the abort (the 6th). The GPU watch
+// counts each one between polls: within half a poll, once. It spends the process's GPU deaths, so it
+// runs in a child of its own.
+#[test]
+fn a_gpu_crash_loop_faster_than_a_poll_is_counted_from_real_kills() {
+    let _s = serial();
+    let name = "a_gpu_crash_loop_faster_than_a_poll_is_counted_from_real_kills";
+    if std::env::var_os("C11_CHILD").is_some() {
+        return gpu_loop_case();
+    }
+    let out = rerun_in_child(name, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let reached: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.starts_with("gpu loop child:"))
+        .collect();
+    assert!(
+        out.status.success(),
+        "the child failed ({:?}):\n{stderr}",
+        out.status
+    );
+    assert_eq!(reached.len(), 1, "{stderr}");
+    eprintln!("{}", reached[0]);
+}
+
+fn gpu_loop_case() {
+    // About half of F-026's 69 to 88 ms between kills, and 8 `GPU_WATCH_MS` steps.
+    const LOOP_LIFE_MS: u64 = 40;
+    let n = Thresholds::default().cef_gpu_deaths_to_restart;
+    assert!(n < CHROMIUM_GPU_DEATHS_ABORT, "the child would abort");
+    let mut r = rig();
+    r.g.restart(1, &page(""));
+    events_until(&r.rx, load_timeout(), ready(1));
+    assert!(two_polls(&r.g), "the child poll stopped");
+    assert_eq!(
+        r.g.health(),
+        CefHealth::default(),
+        "healthy before the first kill"
+    );
+    let (started, polls_before) = (Instant::now(), r.g.polls());
+    let mut killed: Vec<i32> = Vec::new();
+    for k in 1..=n {
+        // The GPU process now: the first one (the polls above listed it), then each relaunch, looked
+        // for every 2 ms so its life is about `LOOP_LIFE_MS`.
+        let end = Instant::now() + hang_bound();
+        let pid = loop {
+            let now = cef_children()
+                .iter()
+                .find(|c| c.kind == "gpu-process" && !killed.contains(&c.pid))
+                .map(|c| c.pid);
+            match now {
+                Some(p) => break p,
+                None if Instant::now() < end => thread::sleep(Duration::from_millis(2)),
+                None => panic!("death {k}: no GPU process"),
+            }
+        };
+        if k > 1 {
+            thread::sleep(Duration::from_millis(LOOP_LIFE_MS));
+        }
+        let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).status();
+        killed.push(pid);
+        assert!(
+            wait_for(Duration::from_millis(CHILD_POLL_MS / 2), || r
+                .g
+                .health()
+                .gpu_process_deaths
+                >= k),
+            "death {k} (pid {pid}) was not counted in half a poll: {:?}",
+            r.g.health()
+        );
+        assert_eq!(r.g.health().gpu_process_deaths, k, "death {k}: counted once");
+    }
+    let took = started.elapsed().as_millis();
+    let polls = r.g.polls() - polls_before;
+    let h = r.g.health();
+    assert_eq!(h.gpu_process_deaths, n, "{h:?}");
+    assert_eq!(h.unrecoverable, None, "the zygotes live: {h:?}");
+    eprintln!("gpu loop child: {n} GPU processes killed {killed:?} in {took} ms, {polls} child polls, {h:?}");
+    r.g.stop();
+}
+
 /// `C11_ZYGOTE`, in a zygote test's child.
 fn zygote_child_case() -> Option<String> {
     std::env::var_os("C11_CHILD")?;

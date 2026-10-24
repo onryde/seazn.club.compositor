@@ -68,7 +68,10 @@
 //! command line carries Chromium's `--type=`): nice `CEF_NICE` on each of its threads (Linux nice is
 //! per thread; the zygote's carries over to the renderers it forks), `oom_score_adj` by kind (the
 //! renderer first, the zygote last: `oom_score_adj_for`), and the PSS sum against the cap, counting
-//! no other build's renderer.
+//! no other build's renderer. Between two polls the same thread runs the GPU watch every
+//! `GPU_WATCH_MS` (Owed 70 (a)): one `stat` read per known GPU process, and a listing only while a
+//! death waits for its relaunch, so a GPU process that lives under one poll is still counted
+//! (F-026: a crash loop's 5 deaths in 288 to 337 ms read as 1 or 2 at the 1 s poll).
 //!
 //! **Renderer attribution** (F-013). The reaper kills one build's renderers only. A renderer's
 //! `--renderer-client-id` survives CEF's reload of a crashed page, so each client id is claimed by
@@ -101,6 +104,22 @@ use crate::redact::Scrubber;
 pub const REAPER_KILL_AFTER_MS: u64 = 3_000;
 /// The brief's 1 s poll of CEF's child processes.
 pub const CHILD_POLL_MS: u64 = 1_000;
+/// Owed 70 (a): the GPU watch's step between two child polls. Each step checks that the GPU
+/// processes already listed are still alive, and while a death waits for its relaunch it lists
+/// CEF's children. F-026 (C14 case 15's fast loop; 9 legs of runs 40051995233, 40056474269 and
+/// 40056388445): Chromium relaunched each killed GPU process and the loop killed it again 69 to 88 ms
+/// later, so 5 kills took 288 to 337 ms and the 1 s poll counted 1 or 2. The loop kills a pid only
+/// after a whole walk of `/proc` has listed it (`harness/in-container.sh`), so each of those GPU
+/// processes lived at least one walk: an estimated 10 to 19 ms, two or more steps (F-026 says how
+/// the estimate is made; the walk itself was not timed).
+pub const GPU_WATCH_MS: u64 = 5;
+/// Owed 70 (a): how long after a GPU-process death the watch keeps listing every `GPU_WATCH_MS` for
+/// its relaunch. F-013's probe GR gave each relaunch 2 s, and every relaunch came within it. After
+/// that, the child poll's own listing finds a late relaunch.
+pub const GPU_RELAUNCH_WAIT_MS: u64 = 2_000;
+/// `GPU_RELAUNCH_WAIT_MS` counted in listings: the watch lists once per step, and each listing
+/// that finds no GPU process uses one.
+const GPU_RELAUNCH_LISTINGS: usize = (GPU_RELAUNCH_WAIT_MS / GPU_WATCH_MS) as usize;
 /// Spec §6: CEF runs under nice 10.
 pub const CEF_NICE: i32 = 10;
 /// Spec §6's OOM order: CEF's children go first (C12's encoder writes −900), and among them the
@@ -509,26 +528,41 @@ pub(crate) fn zygote_check(
     w.dead
 }
 
-/// What the child polls have seen of CEF's GPU processes (Owed 61; process-wide like the zygotes).
+/// What the child poll thread has seen of CEF's GPU processes (Owed 61; process-wide like the
+/// zygotes), from its polls and from the GPU watch's steps between them (Owed 70 (a)).
 #[derive(Debug, Default)]
 pub(crate) struct GpuWatch {
     /// GPU-process pids seen and not yet seen gone.
     live: BTreeSet<i32>,
     /// GPU-process deaths seen so far: a count over the process's life, never reset.
     deaths: usize,
+    /// Listings left while a death waits for its relaunch (Owed 70 (a)): `GPU_RELAUNCH_LISTINGS`
+    /// at each death, one fewer for each listing after it that finds no GPU process.
+    relaunch_listings: usize,
 }
 
-/// One poll's new GPU-process deaths (C11b). F-013 (CEF 139; probe GR, 2 of 2, and the final C11
+impl GpuWatch {
+    /// A death waits for its relaunch: no GPU process is known, and the wait is not over.
+    fn awaits_relaunch(&self) -> bool {
+        self.live.is_empty() && self.relaunch_listings > 0
+    }
+}
+
+/// One listing's new GPU-process deaths (C11b). F-013 (CEF 139; probe GR, 2 of 2, and the final C11
 /// review's FD): Chromium relaunches a dead GPU process, and aborts the whole process at the 6th
 /// death of its life, so the adapter counts them and the domain restarts the process short of it.
 ///
-/// A GPU process missing from one poll's list counts only once `alive` says its process is gone,
-/// as for a zygote. That also covers the final C11 review's G4: a GPU process whose zygote died is
+/// A GPU process missing from one listing counts only once `alive` says its process is gone, as
+/// for a zygote. That also covers the final C11 review's G4: a GPU process whose zygote died is
 /// reparented to pid 1 and leaves `cef_children()` while it lives on; it is no death (and with its
-/// zygote gone the domain is already restarting the process, whose end ends it). A death between
-/// two polls (a relaunched GPU process that lived under `CHILD_POLL_MS`) is not seen. The threshold
-/// leaves two survivable deaths after it (`cef_gpu_deaths_to_restart`): one for such an unread
-/// death, and one for a death during the exit. A second unread death on top of those is the abort.
+/// zygote gone the domain is already restarting the process, whose end ends it).
+///
+/// A GPU process no listing saw is not counted (Owed 70 (a)). Between child polls the GPU watch
+/// (`gpu_step`) lists at every `GPU_WATCH_MS` step while a death waits for its relaunch, so what
+/// goes unseen is a relaunch that is born and dies between two such steps, under `GPU_WATCH_MS`
+/// (before the watch, it was any relaunch that lived under `CHILD_POLL_MS`: F-026's fast loop
+/// counted 1 or 2 of 5). The threshold still leaves two survivable deaths after it
+/// (`cef_gpu_deaths_to_restart`): one for such an unseen death, and one for a death during the exit.
 pub(crate) fn gpu_check(w: &mut GpuWatch, kids: &[CefChild], alive: impl Fn(i32) -> bool) -> usize {
     let now: BTreeSet<i32> = kids
         .iter()
@@ -546,7 +580,51 @@ pub(crate) fn gpu_check(w: &mut GpuWatch, kids: &[CefChild], alive: impl Fn(i32)
     }
     w.live.extend(now);
     w.deaths += gone.len();
+    if !gone.is_empty() {
+        w.relaunch_listings = GPU_RELAUNCH_LISTINGS;
+    } else if w.live.is_empty() {
+        w.relaunch_listings = w.relaunch_listings.saturating_sub(1);
+    }
     gone.len()
+}
+
+/// One step of the GPU watch between two child polls (Owed 70 (a); F-026): CEF's children are
+/// listed only when a GPU process seen before is no longer `alive`, or while a death waits for its
+/// relaunch (`GpuWatch::awaits_relaunch`). Any other step costs one `stat` read per known GPU
+/// process. Each death is then counted at the first step after it, and each relaunch is listed at
+/// the first step after its birth. Only the child poll's thread runs it, between its own polls, so
+/// no listing is ever applied after a newer one (which could count a death twice). True when it
+/// listed.
+fn gpu_step(shared: &Shared) -> bool {
+    let (live, waiting) = {
+        let w = locked(&shared.watch);
+        (
+            w.gpu.live.iter().copied().collect::<Vec<i32>>(),
+            w.gpu.awaits_relaunch(),
+        )
+    };
+    if !waiting && live.iter().all(|p| (shared.tree.alive)(*p)) {
+        return false;
+    }
+    let kids = (shared.tree.list)();
+    let mut watch = locked(&shared.watch);
+    let died = gpu_check(&mut watch.gpu, &kids, &*shared.tree.alive);
+    let deaths = watch.gpu.deaths;
+    drop(watch);
+    log_gpu_gone(shared, died, deaths);
+    true
+}
+
+/// One WARN line for a listing that saw `died` GPU processes gone (none for 0).
+fn log_gpu_gone(shared: &Shared, died: usize, deaths: usize) {
+    if died == 0 {
+        return;
+    }
+    shared.log(&format!(
+        "WARN gen={}: {died} CEF GPU process(es) gone, {deaths} in this process; Chromium aborts it \
+         at the 6th (Owed 61)",
+        shared.newest_gen().unwrap_or(0)
+    ));
 }
 
 /// The process's view of CEF: the zygotes, the verdict (`Some(gen)` once a CEF zygote is gone, the
@@ -616,8 +694,9 @@ fn log_zygote_gone(shared: &Shared, gen: u64) {
 /// never listed has no pid for `alive` to confirm gone, so a failed command-line read would read as
 /// a death. A zygote that dies between CEF's start and the first ready stays unseen.
 ///
-/// The GPU-process count is the poll's alone: a list applied after a newer one can put a dead GPU
-/// process back among the live, and count its death twice.
+/// The GPU-process count belongs to the child poll thread alone (its polls, and the GPU watch's
+/// steps between them): a list applied after a newer one can put a dead GPU process back among the
+/// live, and count its death twice.
 fn watch_ready(shared: &Shared) {
     let kids = (shared.tree.list)();
     let verdict = read_zygotes(shared, &mut locked(&shared.watch), &kids);
@@ -633,15 +712,8 @@ fn watch_poll(shared: &Shared, kids: &[CefChild]) {
     let died = gpu_check(&mut watch.gpu, kids, &*shared.tree.alive);
     let deaths = watch.gpu.deaths;
     let verdict = read_zygotes(shared, &mut watch, kids);
-    let newest = if died > 0 { shared.newest_gen() } else { None };
     drop(watch);
-    if died > 0 {
-        shared.log(&format!(
-            "WARN gen={}: {died} CEF GPU process(es) gone, {deaths} in this process; Chromium aborts it \
-             at the 6th (Owed 61)",
-            newest.unwrap_or(0)
-        ));
-    }
+    log_gpu_gone(shared, died, deaths);
     if let Some(gen) = verdict {
         log_zygote_gone(shared, gen);
     }
@@ -2063,13 +2135,20 @@ fn clip(text: &str) -> String {
     }
 }
 
-/// The child poll: guardrails, renderer claims and the memory cap, every `CHILD_POLL_MS`.
+/// The child poll: guardrails, renderer claims and the memory cap, every `CHILD_POLL_MS`; between
+/// two polls, the GPU watch's step every `GPU_WATCH_MS` (`gpu_step`, Owed 70 (a)).
 fn poll_children(shared: &Shared) {
     let mut failures_logged = false;
     let mut ambiguity_logged = false;
+    let mut next_poll = Instant::now();
     while !shared.retired.load(Ordering::SeqCst) {
         #[cfg(feature = "test-hooks")]
         shared.wait_poll_hold();
+        if Instant::now() < next_poll {
+            gpu_step(shared);
+            thread::sleep(Duration::from_millis(GPU_WATCH_MS));
+            continue;
+        }
         let kids = (shared.tree.list)();
         if claim(&kids) && !ambiguity_logged {
             ambiguity_logged = true;
@@ -2111,7 +2190,8 @@ fn poll_children(shared: &Shared) {
             }
         }
         shared.polls.fetch_add(1, Ordering::SeqCst);
-        thread::sleep(Duration::from_millis(CHILD_POLL_MS));
+        next_poll = Instant::now() + Duration::from_millis(CHILD_POLL_MS);
+        thread::sleep(Duration::from_millis(GPU_WATCH_MS));
     }
 }
 
@@ -2623,6 +2703,405 @@ mod tests {
         polls += 2;
         eprintln!("GPU polls checked: {polls}");
         assert_eq!(polls, 32);
+    }
+
+    /// A fake CEF process table on a fake clock (Owed 70 (a)): the two zygotes (children of
+    /// `FAKE_ROOT`) and the GPU processes (children of the GPU zygote), each listed and alive from its
+    /// birth until its death. The pids are above the kernel's PID_MAX_LIMIT (2^22), so a child poll's
+    /// guardrails over them touch no real process.
+    #[derive(Debug, Default)]
+    struct FakeCef {
+        /// The clock, in ms.
+        now: u64,
+        /// (pid, born, died) for each GPU process.
+        gpus: Vec<(i32, u64, Option<u64>)>,
+        /// (pid, from): a GPU process reparented out of the tree from then on (G4): still alive while
+        /// it lives, never listed.
+        orphans: Vec<(i32, u64)>,
+        /// Listings so far.
+        listings: usize,
+    }
+
+    const FAKE_ROOT: i32 = 90_000_000;
+    const FAKE_GPU_ZYGOTE: i32 = FAKE_ROOT + 12;
+    const FAKE_RENDERER_ZYGOTE: i32 = FAKE_ROOT + 13;
+
+    impl FakeCef {
+        fn with(gpus: Vec<(i32, u64, Option<u64>)>) -> Arc<Mutex<Self>> {
+            Arc::new(Mutex::new(Self {
+                gpus,
+                ..Self::default()
+            }))
+        }
+
+        fn lives(&self, born: u64, died: Option<u64>) -> bool {
+            born <= self.now && died.is_none_or(|d| self.now < d)
+        }
+
+        fn list(&mut self) -> Vec<CefChild> {
+            self.listings += 1;
+            let mut kids = vec![
+                kid(FAKE_GPU_ZYGOTE, FAKE_ROOT, "zygote", None),
+                kid(FAKE_RENDERER_ZYGOTE, FAKE_ROOT, "zygote", None),
+            ];
+            for &(pid, born, died) in &self.gpus {
+                let orphaned = self.orphans.iter().any(|&(p, from)| p == pid && from <= self.now);
+                if self.lives(born, died) && !orphaned {
+                    kids.push(kid(pid, FAKE_GPU_ZYGOTE, "gpu-process", None));
+                }
+            }
+            kids
+        }
+
+        fn alive(&self, pid: i32) -> bool {
+            pid == FAKE_GPU_ZYGOTE
+                || pid == FAKE_RENDERER_ZYGOTE
+                || self
+                    .gpus
+                    .iter()
+                    .any(|&(p, born, died)| p == pid && self.lives(born, died))
+        }
+
+        /// The GPU-process deaths so far: the kernel's count, which the adapter's must equal.
+        fn deaths(&self) -> usize {
+            self.gpus
+                .iter()
+                .filter(|(_, _, d)| d.is_some_and(|d| d <= self.now))
+                .count()
+        }
+    }
+
+    fn fake_tree(cef: &Arc<Mutex<FakeCef>>) -> ProcTree {
+        ProcTree {
+            list: Box::new({
+                let cef = Arc::clone(cef);
+                move || locked(&cef).list()
+            }),
+            alive: Box::new({
+                let cef = Arc::clone(cef);
+                move |p| locked(&cef).alive(p)
+            }),
+            root: FAKE_ROOT,
+        }
+    }
+
+    /// GPU process 0, born at 0 and killed at `first`; then each relaunch born `relaunch` ms after
+    /// the death before it and killed `life` ms after its birth: `deaths` deaths in all, and the last
+    /// relaunch lives on.
+    fn crash_loop(first: u64, relaunch: u64, life: u64, deaths: usize) -> Vec<(i32, u64, Option<u64>)> {
+        let mut gpus = vec![(FAKE_ROOT + 100, 0, Some(first))];
+        let mut died = first;
+        for k in 1..=deaths {
+            let born = died + relaunch;
+            let end = (k < deaths).then_some(born + life);
+            gpus.push((FAKE_ROOT + 100 + k as i32, born, end));
+            died = end.unwrap_or(died);
+        }
+        gpus
+    }
+
+    /// The child poll thread's order of work on the fake clock, from `from` to `to` ms: a child
+    /// poll's watch (`watch_poll`) every `CHILD_POLL_MS`, and the GPU watch's step (`gpu_step`) every
+    /// `GPU_WATCH_MS` between (an instant's work takes no time here). `each` runs after every
+    /// instant, with it.
+    fn drive(shared: &Shared, cef: &Mutex<FakeCef>, from: u64, to: u64, mut each: impl FnMut(u64)) {
+        let mut at = from;
+        while at <= to {
+            locked(cef).now = at;
+            if at.is_multiple_of(CHILD_POLL_MS) {
+                watch_poll(shared, &(shared.tree.list)());
+            } else {
+                gpu_step(shared);
+            }
+            each(at);
+            at += GPU_WATCH_MS;
+        }
+    }
+
+    // Owed 70 (a), F-026 (C14 case 15's fast loop, 9 legs): Chromium relaunched each killed GPU
+    // process, and the loop killed it again 69 to 88 ms later, so its 5 kills fell between two child
+    // polls; the 1 s poll counted 1 or 2 and nothing restarted. The GPU watch counts each death at the
+    // step it happens, so the adapter's count is the kernel's at every step, and the restart cause
+    // comes at exactly `cef_gpu_deaths_to_restart`, never at one fewer. C14's three loops: the fast
+    // one (`CHROMIUM_GPU_DEATHS_ABORT` - 1 deaths), the threshold one (kills 2 s apart) and the
+    // one-fewer one. Each starts between two polls, after a GPU process has lived for seconds.
+    #[test]
+    fn a_gpu_crash_loop_faster_than_a_poll_is_counted_death_by_death() {
+        use domain::cef_health::RestartCause;
+        use domain::config::{Thresholds, CHROMIUM_GPU_DEATHS_ABORT};
+        let t = Thresholds::default();
+        let n = t.cef_gpu_deaths_to_restart;
+        // (case, first kill, relaunch, life, deaths), in ms.
+        let cases = [
+            ("fast", 2_500, 20, 60, CHROMIUM_GPU_DEATHS_ABORT - 1),
+            ("threshold", 2_500, 80, 2_000, n),
+            ("one fewer", 2_500, 80, 2_000, n - 1),
+        ];
+        let (mut steps, mut at_one_fewer, mut at_threshold) = (0, 0, 0);
+        for (case, first, relaunch, life, deaths) in cases {
+            let cef = FakeCef::with(crash_loop(first, relaunch, life, deaths));
+            let (tx, _rx) = crossbeam_channel::bounded(8);
+            let g = unit_adapter(unit_shared(tx, fake_tree(&cef)));
+            let shared = Arc::clone(&g.shared);
+            let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+            *locked(&shared.log) = {
+                let lines = Arc::clone(&lines);
+                Arc::new(move |l: &str| locked(&lines).push(l.to_owned()))
+            };
+            let end = first + (relaunch + life) * deaths as u64 + 2 * CHILD_POLL_MS;
+            drive(&shared, &cef, 0, end, |at| {
+                let truth = locked(&cef).deaths();
+                let h = g.health();
+                assert_eq!(h.gpu_process_deaths, truth, "{case}, at {at} ms: {h:?}");
+                let want = (truth >= n).then_some(RestartCause::GpuProcessDeaths { count: truth });
+                assert_eq!(h.restart_cause(&t), want, "{case}, at {at} ms");
+                at_one_fewer += usize::from(truth + 1 == n);
+                at_threshold += usize::from(truth == n);
+                steps += 1;
+            });
+            assert_eq!(g.health().gpu_process_deaths, deaths, "{case}");
+            // One WARN line per death, each seen alone, with the running count.
+            let warned: Vec<String> = locked(&lines)
+                .iter()
+                .filter(|l| l.contains("GPU process(es) gone"))
+                .cloned()
+                .collect();
+            let want: Vec<String> = (1..=deaths)
+                .map(|k| format!("WARN gen=0: 1 CEF GPU process(es) gone, {k} in this process"))
+                .collect();
+            let got: Vec<String> = warned
+                .iter()
+                .map(|l| l.split(';').next().unwrap_or("").to_owned())
+                .collect();
+            assert_eq!(got, want, "{case}");
+        }
+        eprintln!("steps checked: {steps}, at one fewer: {at_one_fewer}, at the threshold: {at_threshold}");
+        assert!(steps > 0 && at_one_fewer > 0 && at_threshold > 0);
+    }
+
+    // Owed 70 (a), the watch's cost: between two child polls it lists CEF's children only while a
+    // death waits for its relaunch: until a listing finds the relaunch, and for at most
+    // `GPU_RELAUNCH_WAIT_MS` of steps. Every other step only reads whether the GPU processes it knows
+    // are alive. Five cases: no CEF child ever (the empty case); a GPU process that lives on; a death
+    // relaunched 80 ms later (inside F-026's 69 to 88 ms), after which the listing stops; a death
+    // with no relaunch, then a late relaunch that a poll finds and that dies too; G4's orphan (out of
+    // the tree, alive), then its death.
+    #[test]
+    fn the_gpu_watch_lists_only_while_a_death_waits_for_its_relaunch() {
+        let gpu = FAKE_ROOT + 100;
+        let next = FAKE_ROOT + 101;
+        let wait = GPU_RELAUNCH_WAIT_MS;
+        // (case, the GPU processes, the orphans, the deaths, the instants between which every step
+        // lists (both included), the end), in ms.
+        type Case = (
+            &'static str,
+            Vec<(i32, u64, Option<u64>)>,
+            Vec<(i32, u64)>,
+            Vec<u64>,
+            Vec<(u64, u64)>,
+            u64,
+        );
+        let cases: [Case; 5] = [
+            ("no CEF child", vec![], vec![], vec![], vec![], 4_000),
+            (
+                "a GPU process that lives on",
+                vec![(gpu, 0, None)],
+                vec![],
+                vec![],
+                vec![],
+                4_000,
+            ),
+            (
+                "a death relaunched 80 ms later",
+                vec![(gpu, 0, Some(2_500)), (next, 2_580, None)],
+                vec![],
+                vec![2_500],
+                vec![(2_500, 2_580)],
+                4_000,
+            ),
+            (
+                "no relaunch, then a late one",
+                vec![(gpu, 0, Some(2_500)), (next, 5_500, Some(6_200))],
+                vec![],
+                vec![2_500, 6_200],
+                vec![(2_500, 2_500 + wait), (6_200, 6_200 + wait)],
+                9_500,
+            ),
+            (
+                "G4's orphan",
+                vec![(gpu, 0, Some(3_500))],
+                vec![(gpu, 2_500)],
+                vec![3_500],
+                vec![(3_500, 3_500 + wait)],
+                6_500,
+            ),
+        ];
+        let (mut instants, mut steps_listing, mut want_steps_listing) = (0, 0, 0);
+        for (case, gpus, orphans, deaths, lists, end) in cases {
+            let cef = FakeCef::with(gpus);
+            locked(&cef).orphans = orphans;
+            let (tx, _rx) = crossbeam_channel::bounded(8);
+            let g = unit_adapter(unit_shared(tx, fake_tree(&cef)));
+            let shared = Arc::clone(&g.shared);
+            let waits = |at: u64| lists.iter().any(|(from, to)| *from <= at && at <= *to);
+            let mut before = 0;
+            drive(&shared, &cef, 0, end, |at| {
+                let listings = locked(&cef).listings;
+                let listed = listings - before;
+                before = listings;
+                let poll = at.is_multiple_of(CHILD_POLL_MS);
+                assert_eq!(listed, usize::from(poll || waits(at)), "{case}, at {at} ms");
+                let counted = deaths.iter().filter(|d| **d <= at).count();
+                assert_eq!(g.health().gpu_process_deaths, counted, "{case}, at {at} ms");
+                instants += 1;
+                steps_listing += usize::from(listed == 1 && !poll);
+                want_steps_listing += usize::from(waits(at) && !poll);
+            });
+        }
+        eprintln!("instants checked: {instants}, steps that listed: {steps_listing}");
+        assert!(instants > 0 && want_steps_listing > 0);
+        assert_eq!(steps_listing, want_steps_listing);
+    }
+
+    // Owed 70 (a)'s residual: a GPU process born after one listing and dead before the next is never
+    // listed, so never counted. While a death waits for its relaunch the watch lists at every step,
+    // so that is a GPU process that lives under `GPU_WATCH_MS`; one that lives `GPU_WATCH_MS` across
+    // a step is listed and counted. The boundary pair, in one loop.
+    #[test]
+    fn a_gpu_process_that_lives_between_two_listings_is_not_counted() {
+        let cef = FakeCef::with(vec![
+            (FAKE_ROOT + 100, 0, Some(2_500)),
+            // Born after the 2 500 ms step's listing, dead before the 2 505 ms one.
+            (FAKE_ROOT + 101, 2_501, Some(2_504)),
+            // `GPU_WATCH_MS` long, across the 2 510 ms step.
+            (FAKE_ROOT + 102, 2_507, Some(2_507 + GPU_WATCH_MS)),
+            (FAKE_ROOT + 103, 2_520, None),
+        ]);
+        let (tx, _rx) = crossbeam_channel::bounded(8);
+        let g = unit_adapter(unit_shared(tx, fake_tree(&cef)));
+        let shared = Arc::clone(&g.shared);
+        let mut seen = Vec::new();
+        drive(&shared, &cef, 0, 4_000, |at| {
+            if (2_500..=2_520).contains(&at) {
+                seen.push((at, g.health().gpu_process_deaths));
+            }
+        });
+        let want: Vec<(u64, usize)> = vec![(2_500, 1), (2_505, 1), (2_510, 1), (2_515, 2), (2_520, 2)];
+        assert_eq!(seen, want);
+        assert_eq!(locked(&cef).deaths(), 3, "the kernel's count");
+        assert_eq!(g.health().gpu_process_deaths, 2, "one under a step: not counted");
+        eprintln!("instants checked: {}", seen.len());
+    }
+
+    fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + limit;
+        while Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        cond()
+    }
+
+    // The seam (Owed 70 (a)): the child poll's own thread runs the GPU watch between its polls. A
+    // crash loop on the wall clock, between two polls, of C14's fast leg's length
+    // (`CHROMIUM_GPU_DEATHS_ABORT` - 1 deaths): each relaunch is born `RELAUNCH_MS` after a death and
+    // killed `LIFE_MS` later, far under `CHILD_POLL_MS`. Each death is counted within half a poll,
+    // once; the restart cause comes at exactly `cef_gpu_deaths_to_restart`; and the thread still runs
+    // a child poll only every `CHILD_POLL_MS`.
+    #[test]
+    fn the_child_poll_thread_counts_a_crash_loop_between_two_polls() {
+        use domain::cef_health::RestartCause;
+        use domain::config::{Thresholds, CHROMIUM_GPU_DEATHS_ABORT};
+        const RELAUNCH_MS: u64 = 20;
+        const LIFE_MS: u64 = 100;
+        let t = Thresholds::default();
+        let n = t.cef_gpu_deaths_to_restart;
+        let kills = CHROMIUM_GPU_DEATHS_ABORT - 1;
+        // The clock stays at 1: a kill is a death at 1, a relaunch a birth at 0.
+        let cef = FakeCef::with(vec![(FAKE_ROOT + 100, 0, None)]);
+        locked(&cef).now = 1;
+        let (tx, _rx) = crossbeam_channel::bounded(8);
+        let g = unit_adapter(unit_shared(tx, fake_tree(&cef)));
+        let shared = Arc::clone(&g.shared);
+        let poller = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || poll_children(&shared))
+        };
+        let polls = || shared.polls.load(Ordering::SeqCst);
+        assert!(
+            wait_until(Duration::from_millis(2 * CHILD_POLL_MS), || polls() >= 1),
+            "no child poll"
+        );
+        let (started, polls_before) = (Instant::now(), polls());
+        let mut current = FAKE_ROOT + 100;
+        for k in 1..=kills {
+            for gpu in locked(&cef).gpus.iter_mut().filter(|x| x.0 == current) {
+                gpu.2 = Some(1);
+            }
+            let counted = wait_until(Duration::from_millis(CHILD_POLL_MS / 2), || {
+                g.health().gpu_process_deaths >= k
+            });
+            let h = g.health();
+            assert!(
+                counted,
+                "death {k} (pid {current}) not counted in half a poll: {h:?}"
+            );
+            assert_eq!(h.gpu_process_deaths, k, "death {k}: counted once");
+            assert_eq!(locked(&cef).deaths(), k, "death {k}: the kernel's count");
+            let want = (k >= n).then_some(RestartCause::GpuProcessDeaths { count: k });
+            assert_eq!(h.restart_cause(&t), want, "death {k}");
+            thread::sleep(Duration::from_millis(RELAUNCH_MS));
+            current = FAKE_ROOT + 100 + k as i32;
+            locked(&cef).gpus.push((current, 0, None));
+            thread::sleep(Duration::from_millis(LIFE_MS));
+        }
+        let elapsed = started.elapsed().as_millis() as u64;
+        let ran = polls() - polls_before;
+        shared.retired.store(true, Ordering::SeqCst);
+        assert!(
+            wait_until(Duration::from_millis(CHILD_POLL_MS), || poller.is_finished()),
+            "the poll thread did not stop"
+        );
+        poller.join().expect("the poll thread panicked");
+        eprintln!("crash loop: {kills} deaths counted in {elapsed} ms, {ran} child polls");
+        assert_eq!(g.health().gpu_process_deaths, kills);
+        assert!(
+            ran <= elapsed / CHILD_POLL_MS + 1,
+            "{ran} child polls in {elapsed} ms"
+        );
+    }
+
+    // Owed 70 (a): the GPU watch's cost, measured on the host that runs the tests (CI's runner, whose
+    // `/proc` holds more processes than the container's; an unoptimised build). A step reads one GPU
+    // process's `stat` (`pid_alive`); a listing walks every process's `stat` and CEF's children's
+    // command lines (`cef_children`, here with no CEF child).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_gpu_watch_cost_is_measured() {
+        const READS: u32 = 2_000;
+        const WALKS: u32 = 200;
+        let me = std::process::id() as i32;
+        let t0 = Instant::now();
+        let alive = (0..READS).filter(|_| pid_alive(me)).count();
+        let read_us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(READS);
+        let procs = std::fs::read_dir("/proc").map_or(0, |d| {
+            d.flatten()
+                .filter(|e| e.file_name().to_str().is_some_and(|s| s.parse::<i32>().is_ok()))
+                .count()
+        });
+        let t1 = Instant::now();
+        let listed: usize = (0..WALKS).map(|_| cef_children().len()).sum();
+        let walk_us = t1.elapsed().as_secs_f64() * 1e6 / f64::from(WALKS);
+        eprintln!(
+            "gpu watch cost: {READS} liveness reads at {read_us:.1} us each ({:.2}% of a core at one \
+             per {GPU_WATCH_MS} ms); {WALKS} walks over {procs} processes at {walk_us:.0} us each; \
+             {listed} CEF children listed",
+            read_us / (GPU_WATCH_MS as f64 * 10.0)
+        );
+        assert_eq!(alive, READS as usize, "this process reads as alive");
+        assert!(procs > 0, "no process in /proc");
     }
 
     fn page_note(build: u64, signal: PageSignal) -> Note {
