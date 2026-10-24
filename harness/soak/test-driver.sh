@@ -25,11 +25,12 @@ trap cleanup EXIT
 
 # The driver's files, as the image lays them out, with a compressed schedule.
 mkdir -p "$W/soak/pages" "$W/out" "$W/bin" "$W/state"
-cp "$HERE/driver.sh" "$HERE/schedule.jq" "$HERE/mediamtx.yml" "$W/soak/"
+cp "$HERE/driver.sh" "$HERE/schedule.jq" "$HERE/mediamtx.yml" "$HERE/sampler.py" "$W/soak/"
 cp "$ROOT/contracts/fixtures/relay-job.v1/session-composed-720p.json" "$W/soak/"
 cp "$ROOT/harness/pages/overlay-test.html" "$W/soak/pages/"
 jq '. + {min_drive_min: 1, dropout_every_s: 6, dropout_phase_s: 3, dropout_pause_s: 1, disconnect_hold_s: 2,
-         control_wait_s: 3, live_wait_s: 20, end_wait_s: 10, log_wait_s: 20, lost_beats_end_s: 5}' "$HERE/soak.json" >"$W/soak/soak.json"
+         control_wait_s: 3, live_wait_s: 20, end_wait_s: 10, log_wait_s: 20, lost_beats_end_s: 5,
+         sample_offsets_s: [6], sample_margin_s: 0}' "$HERE/soak.json" >"$W/soak/soak.json"
 
 STATE="$W/state"
 export STATE
@@ -156,6 +157,10 @@ check "the checker ran on the uploaded log" '.[0] | test("--compositor-log [^ ]*
   <(grep '^checker ' "$STATE/calls" | jq -R .)
 check "done: ok, live, checker 0, no leak" '.[0] | .ok and .went_live and .checker_exit == 0 and .leaks == 0 and .ended_early == null' "$W/out/done"
 check "secrets scanned" '.[0] | .scanned > 5 and .leaks == 0' "$W/out/secrets.json"
+# No recording under stubs: the sampler ran, and its one minute says it had no segment.
+check "the sampler ran: one minute, unsampled for want of a segment" \
+  'length == 1 and (.[0] | .minute == 0 and .differs == false and (.error | test("no programme segment")))' "$W/out/overlay-samples.jsonl"
+check "done carries the sampler's exit, 0" '.[0].sampler_exit == 0' "$W/out/done"
 check "status done" '.[0].phase == "done"' "$W/out/status.json"
 check "fake-control on every address, the private name in the session's origins" \
   '.[0] | test("--listen \\[::\\]:7000") and test("--input-origin srt://m0.vm.soak-test.internal:8890") and test("--overlay-origin http://m0.vm.soak-test.internal:7000")' \

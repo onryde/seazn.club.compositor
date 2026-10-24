@@ -388,7 +388,8 @@ jobs:
           OUT="$RUNNER_TEMP/out"
           got=0
           for f in report.json actions.jsonl heartbeats.jsonl control-state.json timeline.json done status.json \
-                   secrets.json ended driver.log checker.log fake-control.log fake-camera.log mediamtx.log; do
+                   secrets.json ended overlay-samples.jsonl driver.log checker.log sampler.log fake-control.log \
+                   fake-camera.log mediamtx.log; do
             rm -f "$OUT/$f.part"
             if flyctl ssh sftp get "/out/$f" "$OUT/$f.part" -a "$FLY_APP" --machine "$HID" -q > /dev/null 2>> "$OUT/fetch.err"; then
               mv "$OUT/$f.part" "$OUT/$f"; got=$((got + 1))

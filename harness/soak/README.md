@@ -15,17 +15,36 @@ gh workflow run soak.yml --ref <branch> -f sha=<40-hex head>                 # t
 | File | What it is |
 |---|---|
 | `Dockerfile` | The harness Machine's image. The C13 harness image (fake-camera, fake-control, checker) plus MediaMTX (compose.yml's digest), iptables and the driver, under `tini -s`. |
-| `mediamtx.yml` | `harness/mediamtx.yml` on one Machine. SRT `cam` in, RTMP `live/dest` out, and only `live/dest` recorded. |
+| `mediamtx.yml` | `harness/mediamtx.yml` on one Machine. SRT `cam` in, RTMP `live/dest` out. Both are recorded: `live/dest` under `/out/rec` (which the checker reads) and `cam` under `/out/camrec` (the sampler's reference). |
 | `driver.sh` | The harness Machine's main process. See its header and "The run" below. |
 | `soak.json` | The soak's own numbers: schedule, waits, ratios and the workflow's margins. The domain's numbers stay in `harness/thresholds.json`. |
 | `schedule.jq` | `soak_plan($soak; $drive_s)`: the dropout and disconnect times for a drive. It refuses a plan that cannot hold every action kind. |
 | `verdict.jq`, `verdict.sh` | The verdict over one run's files. `soak.yml` and `test-verdict.sh` call the same command. |
+| `sampler.py` | Check (d): once a minute, compares the programme with the camera-only recording over the camera's still bands (see "The overlay sampler"). |
 | `flylog.py` | Turns the platform's log stream into the `docker logs --timestamps` shape that logfacts reads, plus `logscan.json` for check (b). |
 | `test-verdict.sh` | Runs the verdict on `fixtures/green` (a 30-min miniature) and on one jq patch per red. Each case asserts its status, its exact failing ids, its reason and the check list. |
 | `test-driver.sh` | Runs the driver under stubs on a 1-minute compressed schedule. It also covers the error path, which holds `/out` until the hard stop. |
+| `test-sampler.sh` | Runs `sampler.py` on synthetic recordings made with ffmpeg: a moving square and a noise strip, with an overlay bar that goes off air for one minute, a disconnect, and a missing segment. It also covers an all-noise camera and a run with no start. |
 | `test-workflow.sh` | Checks `soak.yml`'s shape: the gate and the plan step, run for real; `--restart no`; the job token; the `always()` destroy. It also runs `flylog.py` on a recorded-shape stream. |
 
-`check.yml` runs the three tests.
+`check.yml` runs the four tests.
+
+## The overlay sampler (check (d))
+
+After the checker, the driver runs `sampler.py` on the run's recordings. For each minute it picks
+one instant clear of every dropout and disconnect, and decodes three frames: the programme at that
+instant, the camera, and the camera `control_gap_s` later. Each frame is cut into bands of 40 rows.
+
+- **A band is stable** when the two camera frames agree in it. On `ball`, that is every band except
+  the ball's and the strip's. On a stable band, the camera's frame is the reference whatever the
+  programme's latency.
+- **`region_diff`** is the largest programme-versus-camera difference over the stable bands. The
+  minute is on air when it is at least `overlay_diff_min`.
+- **No stable band, no reference.** On `noise` no band is stable. Every sample then carries an
+  error, and check (d) fails rather than passes.
+
+`overlay_diff_min` (4) and `stable_band_max` (2) are first guesses. The rehearsals' measured
+`region_diff` values calibrate them.
 
 ## The run
 

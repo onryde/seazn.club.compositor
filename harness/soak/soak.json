@@ -21,5 +21,13 @@
   "lost_beats_end_s": 90,
   "poll_after_min": 10,
   "hard_stop_after_min": 25,
-  "timeout_after_min": 40
+  "timeout_after_min": 40,
+  "sample_every_s": 60,
+  "sample_offsets_s": [15, 45],
+  "sample_margin_s": 3,
+  "sample_segment_max_s": 15,
+  "sample_band_rows": 40,
+  "control_gap_s": 1,
+  "stable_band_max": 2,
+  "overlay_diff_min": 4
 }

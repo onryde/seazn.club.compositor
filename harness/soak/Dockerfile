@@ -14,7 +14,8 @@ FROM bluenviron/mediamtx:1.21.2@sha256:c7540465f868a02652118bea5a0daab12a29ac0f6
 
 FROM ${HARNESS_IMAGE}
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends iptables jq procps \
+# ffmpeg and python3: the overlay sampler (sampler.py, check (d)).
+RUN apt-get update && apt-get install -y --no-install-recommends iptables jq procps ffmpeg python3 \
     && rm -rf /var/lib/apt/lists/* \
     && command -v iptables-legacy >/dev/null && command -v ip6tables-legacy >/dev/null \
     && command -v iptables-nft >/dev/null && command -v ip6tables-nft >/dev/null
@@ -24,9 +25,10 @@ COPY --from=mediamtx /mediamtx /usr/local/bin/mediamtx
 COPY harness/pages /soak/pages
 COPY contracts/fixtures/relay-job.v1/session-composed-720p.json /soak/session-composed-720p.json
 COPY harness/thresholds.json /soak/thresholds.json
-COPY harness/soak/driver.sh harness/soak/schedule.jq harness/soak/soak.json harness/soak/mediamtx.yml /soak/
+COPY harness/soak/driver.sh harness/soak/schedule.jq harness/soak/soak.json harness/soak/mediamtx.yml \
+     harness/soak/sampler.py /soak/
 RUN chmod 0755 /soak/driver.sh \
-    && for b in mediamtx fake-camera fake-control checker jq curl iptables ip6tables tini; do \
+    && for b in mediamtx fake-camera fake-control checker jq curl iptables ip6tables tini ffmpeg ffprobe python3; do \
          command -v "$b" >/dev/null || { echo "missing $b"; exit 1; }; done
 WORKDIR /out
 # `-s`: tini is not PID 1 on a Machine (the platform's init is), so it reaps as a subreaper, as the

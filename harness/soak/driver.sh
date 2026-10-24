@@ -3,9 +3,9 @@
 # It runs MediaMTX, fake-camera and fake-control on this Machine, waits for the compositor Machine's
 # first live beat, drives the schedule (schedule.jq: a camera dropout every 5 minutes, a destination
 # disconnect at the middle of each third of the drive), ends the run, takes the compositor's log
-# from the job, runs the checker, and writes /out/done. soak.yml polls /out/status.json, uploads
-# /out/compositor.log (then /out/log-ready) once /out/ended exists, and fetches the outputs after
-# /out/done.
+# from the job, runs the checker and the overlay sampler (sampler.py), and writes /out/done.
+# soak.yml polls /out/status.json, uploads /out/compositor.log (then /out/log-ready) once
+# /out/ended exists, and fetches the outputs after /out/done.
 #
 # Environment (the Machine's; set by soak.yml):
 #   SESSION_ID, JOB_TOKEN   the run's (JOB_TOKEN is random per run and never printed or written)
@@ -28,7 +28,7 @@ set -euo pipefail
 # the Machine uses the defaults.
 SOAK="${SOAK_ROOT:-/soak}"
 OUT="${SOAK_OUT:-/out}"
-mkdir -p "$OUT/rec"
+mkdir -p "$OUT/rec" "$OUT/camrec"
 exec > >(tee -a "$OUT/driver.log") 2>&1
 
 now_ms() {
@@ -300,16 +300,23 @@ kill -KILL "$mtx_pid" 2>/dev/null || true
 wait "$mtx_pid" 2>/dev/null || true
 status checking
 checker_exit=0
+sampler_exit=0
 XDG_CACHE_HOME=/tmp env -u JOB_TOKEN -u SESSION_ID -u HARNESS_SRT_PASSPHRASE checker --recordings "$OUT/rec" --emit "$OUT/emit.jsonl" --heartbeats "$OUT/heartbeats.jsonl" \
   --timeline "$OUT/timeline.json" --compositor-log "$OUT/compositor.log" --end-request-ms "$end_request_ms" \
   --out "$OUT/report.json" >"$OUT/checker.log" 2>&1 || checker_exit=$?
 tail -n 5 "$OUT/checker.log"
+# Check (d)'s samples: the programme against the camera-only recording, once a minute (on the test
+# page too, where the verdict holds (d) pending: its numbers are printed all the same).
+status sampling
+python3 -I "$SOAK/sampler.py" --programme "$OUT/rec" --camera "$OUT/camrec" --actions "$OUT/actions.jsonl" \
+  --soak "$SOAK/soak.json" --out "$OUT/overlay-samples.jsonl" >"$OUT/sampler.log" 2>&1 || sampler_exit=$?
+tail -n 2 "$OUT/sampler.log"
 
 # No credential in any file this run wrote (the recordings are binary and hold none: skipped). The
 # values go to grep on a pipe, never in argv.
 scanned=0
 leaks=0
-mapfile -t files < <(find "$OUT" -path "$OUT/rec" -prune -o -type f -print)
+mapfile -t files < <(find "$OUT" \( -path "$OUT/rec" -o -path "$OUT/camrec" \) -prune -o -type f -print)
 scanned="${#files[@]}"
 for name in JOB_TOKEN HARNESS_SRT_PASSPHRASE; do
   if printf '%s\n' "${!name}" | grep -qF -f - "${files[@]}"; then
@@ -320,8 +327,8 @@ done
 jq -cn --argjson s "$scanned" --argjson l "$leaks" '{scanned: $s, leaks: $l}' >"$OUT/secrets.json"
 log "secrets checked: $scanned files, $leaks leaks"
 
-jq -cn --argjson c "$checker_exit" --argjson live "$went_live" --arg why "$ended_early" --argjson l "$leaks" \
-  '{ok: ($l == 0), checker_exit: $c, went_live: ($live == 1), ended_early: (if $why == "" then null else $why end), leaks: $l}' \
+jq -cn --argjson c "$checker_exit" --argjson sx "$sampler_exit" --argjson live "$went_live" --arg why "$ended_early" --argjson l "$leaks" \
+  '{ok: ($l == 0), checker_exit: $c, sampler_exit: $sx, went_live: ($live == 1), ended_early: (if $why == "" then null else $why end), leaks: $l}' \
   >"$OUT/done"
 done_written=1
 status done "checker exit $checker_exit"
