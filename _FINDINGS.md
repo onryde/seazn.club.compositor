@@ -1979,8 +1979,13 @@ C14's F-024 (PR #52, branch `feat/c14-chaos`) records the fast loop's headline. 
 - **A listing's cost in the image** (amended 2026-10-24, the PR #55 confirm pass's I3; image runs
   40080601547 and 40085739077): with up to 6 CEF children, a listing took 1 439 us on the clock over 21
   processes in a debug build. Over 11 processes it took 370 us of the thread's CPU on the release profile,
-  the compositor's (431 us on the clock), and 632 us on the debug one. At 5% of a core the release cost
-  paces a wait's listings 7.4 ms apart.
+  the compositor's (431 us on the clock), and 632 us on the debug one. ~~At 5% of a core the release cost
+  paces a wait's listings 7.4 ms apart.~~ (amended 2026-10-24, the PR #55 confirm pass 2's r2-m1 and
+  r2-m3; image run 40087528576.) The next run's release listings averaged 483 and 516 us of CPU, over
+  the 400 us at which the 8 ms ceiling binds, so 9 of its 11 release waits held a gap there, and its held
+  death waits listed at 5.2 to 7.5% of a core. The coordinator accepted 7.5% of one of 4 cores for at
+  most 2 s per death. The worst case: a listing whose CPU reaches the ceiling is followed as it returns,
+  so a wait lists back to back, one full core for each death's 2 s wait.
 - **The exit's margin** (m6): the fast variant's `gpu_death_split` and `last_kill_not_before_die`
   checks go red when the browser outlives the deciding line long enough for further relaunches to be
   killed. That is one kill interval (69 to 88 ms) less the count and the driver's tick (about 5 to
