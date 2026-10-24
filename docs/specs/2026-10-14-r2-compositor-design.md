@@ -158,15 +158,18 @@ can be enumerated in tests.
 |---|---|---|
 | `Programme` | `Waiting → Live → Frozen → Reconnecting` | Waiting→Live after 1 s of continuous frames. Live→Frozen after 0.5 s with no frame. Frozen→Reconnecting after 3 s. Back to Live after 1 s continuous (hysteresis). |
 | `InputLink` | `Connecting → Running → Backoff(n)` | Backoff 1 s → 10 s cap, retried forever. A reader kick or EOS counts as one kick. More than 3 kicks in 5 min raises an alert flag. |
-| `OutputLink` | `Connected → Reconnecting → Stalled` | A sink error, or no bytes acked for 5 s, leads to `SwapSink`. A reconnect is expected to complete within 5 s. |
+| `OutputLink` | `Connected → Reconnecting → Stalled` | A sink error leads to `SwapSink`; a destination that stops taking bytes fails the sink's own socket wait after 5 s (rtmp2sink `timeout`, set explicitly). A reconnect is expected to complete within 5 s. **Amended 2026-10-24** (owner ruling "A", `docs/_INDEX.md` Owed 87): no progress or ack rule; a sink that sends nothing and never errors is not swapped (Owed 94). |
 | `Graphics` | `Loading → Ready → Recycling \| Failed` | A CEF crash or hang leads to restart with backoff, holding the last frame. Three failures in 5 min lead to `Failed`: the overlay is reported as failed, and video continues **without waiting on the browser**. Scheduled recycle every 2 h. |
 | `Lifecycle` | `Booting → Ready → Streaming → Draining → Exited(code)` | Driven by session bootstrap, heartbeat `desiredState`, `RELAY_DEADLINE_AT` and signals. |
 
 ### 4.3 Events, effects, value objects
 
 - **Events in** (from ports): `Tick`, `InputFrame`, `InputStalled`, `InputEos`, `OutputError`,
-  `OutputAckStalled`, `EncoderOverrun`, `CefReady`, `CefCrashed`, `HeartbeatReply(desired)`,
-  `Deadline`, `Signal(kind)`.
+  ~~`OutputAckStalled`~~ `OutputProgress`, `EncoderOverrun`, `CefReady`, `CefCrashed`,
+  `HeartbeatReply(desired)`, `Deadline`, `Signal(kind)`. **Amended 2026-10-24** (a pre-existing
+  error, corrected beside the Owed 87 amendment above; the PR #73 review's I-1): `OutputAckStalled`
+  was never built; F-005 made it `OutputProgress { gen, total_bytes }`, the sink's bytes-sent total,
+  which proves Connected (Owed 38) and feeds the bitrate but detects no stall.
 - **Effects out:** `RebuildInput`, `SwapSink`, `SetCameraLayer(on)`, `ShowSlate(kind)`, `RecycleCef`,
   `StepDown(rung)`, `SendHeartbeat(report)`, `Exit(code)`.
 - **Value objects:**

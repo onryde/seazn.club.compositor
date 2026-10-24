@@ -2,18 +2,19 @@
 # (CASE_COMPOSE). The compositor's TCP send buffer is capped at 8 KiB, in its own network namespace
 # (net.ipv4.tcp_wmem is per namespace; the shipped image is unchanged).
 #
-# The design (Owed 87, 2026-10-24): rtmp2sink counts its bytes sent only when a whole RTMP message
-# is written, and its socket times out only when one wait for room lasts 5 s. With a small buffer,
-# the design expected a slow destination to wake the writer every second or two inside one video
-# frame's message (about 16.7 KB at 4 Mbit/s and 30 fps), so that the socket never times out while
-# the total stands still past output_stall_after_ms, and only the stall rule can swap the sink.
+# The design (2026-10-24): rtmp2sink counts its bytes sent only when a whole RTMP message is written,
+# and its socket times out only when one wait for room lasts its `timeout`. With a small buffer, the
+# design expected a slow destination to wake the writer every second or two inside one video frame's
+# message (about 16.7 KB at 4 Mbit/s and 30 fps), so that the socket never times out while the total
+# stands still, the one path where only a stall rule could see the stall.
 #
 # DISPROVED ON CI (PR #65, 3 of 3 runs; docs/_INDEX.md, False premises found): the cap applies (the
 # namespace reads 4096 8192 8192, and each RTMP socket's buffer reads 8192), yet the socket queued
 # a whole frame past it (Send-Q 16 806-16 810 B, 3 s into the fault). Linux admits a write while
 # the queue is under the buffer, and with segmentation offload one write fills one segment, so each
-# wake completes a message, and rtmp2sink's own 5 s timeout swaps the sink first. Kept as case 17's
-# setting until the owner rules on the rule (Owed 87); `buffer_capped` judges the queue, not this.
+# wake completes a message, and rtmp2sink's own timeout fails the sink. Owed 87's ruling (the owner,
+# 2026-10-24, "A") retired the stall rule on that measurement; case 17 keeps this setting to watch
+# it: the sink's error must still catch the stall here.
 services:
   compositor:
     sysctls:

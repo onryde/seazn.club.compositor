@@ -243,9 +243,14 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
 - (Amended 2026-10-18, Owed 13) Progress is `OutputProgress` from `out-bytes-total` (the file size
   for `file://`), with `bitrate_kbps` and `egress_bytes` from the bytes-sent total. The grow/freeze
   test prints a non-zero count, and the live CF leg is recorded.
-- (Amended 2026-10-18, Owed 15) The poll choice is recorded, and
+- (Amended 2026-10-18, Owed 15) The poll choice is recorded~~, and
   `stall_is_detected_within_budget_of_the_last_byte` holds the chosen bound with the measured gap
-  printed.
+  printed~~ (amended 2026-10-24, Owed 87: the test is retired with the stall rule it timed).
+- (Amended 2026-10-24, Owed 87) Every rtmp2sink is built with `timeout` = `OUTPUT_SINK_TIMEOUT_S`,
+  read back from the element: `the_sink_timeout_is_rtmp2sinks_own_default`,
+  `every_rtmp_sink_gets_the_domains_timeout` and
+  `a_sink_timeout_other_than_the_default_reaches_every_later_sink` pass, and each mutant went red on
+  CI: the set removed, the constant at 20 s, and another value handed to the programme.
 - (Amended 2026-10-18, Owed 16) Both live legs, command bytes and trickle, are recorded with
   verdicts. A failing leg reopens C04, and the reopening is named in the PR.
 - (Amended 2026-10-18, Owed 17) `hide_then_set_overlay_composites_again` passes, and the
@@ -449,10 +454,31 @@ back to back, so the count tracked the tick grid and read 29 to 31 while C14 cas
 into the beat's `fps` (`adapters::stats::BeatRate`, C12's amendment of this date). The ladder's input
 is unchanged: one `EncoderOverrun` per `overrun`.
 
+## Amendment 2026-10-24 (Owed 87: rtmp2sink's timeout is set, not inherited)
+
+Owner, 2026-10-24, in chat, relayed by the coordinator: "A": the stall rule is retired, and rtmp2sink's own
+socket timeout is the only detector of a destination stall (`docs/_INDEX.md` Owed 87; C04's
+amendment of this date).
+- `gst_output.rs` sets every rtmp2sink's `timeout` (whole seconds) to `OUTPUT_SINK_TIMEOUT_S`, from
+  `domain::config::OUTPUT_SINK_TIMEOUT_MS`. That is today's default (GStreamer 1.24.2,
+  `gst/rtmp2/gstrtmp2locationhandler.c:35`, `#define DEFAULT_TIMEOUT 5`), so a GStreamer whose
+  default moves does not move the detector. A const assert keeps it whole seconds and in the
+  property's range.
+- Owed 15's `stall_is_detected_within_budget_of_the_last_byte` and Owed 71's
+  `the_stall_bound_still_refuses_a_late_detection` are retired with the rule they timed.
+  `OUTPUT_PROGRESS_POLL_MS` (250 ms) stays: it times the Connected proof and the bitrate, and its pin
+  is `the_progress_poll_is_owed_15s_choice`.
+- Tests: the element's default equals the constant; every RTMP sink of a swap reads it back, and a
+  filesink has none; a value other than the default, set through the `test-hooks` seam
+  `GstProgramme::set_output_sink_timeout_s`, reads back from every sink built after it and never from
+  one built before. Only that last test sees the set, since the production value equals the default.
+
 ## Do not touch
 
 Domain and app crates. If you find a port signature problem, report it as a deviation and don't
 change the port. (Amended 2026-10-15) The Audio section above: this amendment is video only.
+(Amended 2026-10-24, Owed 87) The sink timeout's value lives in `domain::config`, by the owner's
+ruling; the domain's side of that change is C04's amendment.
 
 ## Output cap
 

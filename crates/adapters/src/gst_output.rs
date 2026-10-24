@@ -25,6 +25,11 @@
 //! the scrubber. The sink's `Eos` after `drain()` takes one final total into `Stats` and sends
 //! `Event::OutputDrained`.
 //!
+//! **A destination stall is the sink's own error** (Owed 87; the owner, 2026-10-24, "A"). Every
+//! rtmp2sink gets `timeout` = `OUTPUT_SINK_TIMEOUT_MS`, in its unit, whole seconds: a socket wait
+//! that long fails the sink, and that bus error is the `OutputError` the domain swaps on. Set, not
+//! inherited: it equals GStreamer 1.24.2's default today, and the domain's 15 s budget reads it.
+//!
 //! **Teardown never blocks the caller.** A retired output is set to NULL on a reaper thread of its
 //! own (F-001: `set_state(NULL)` did not return for 10 s on a hung renderer).
 use std::collections::VecDeque;
@@ -37,6 +42,7 @@ use std::time::{Duration, Instant};
 
 use app::ports::{Inbound, TargetSpec};
 use crossbeam_channel::Sender;
+use domain::config::OUTPUT_SINK_TIMEOUT_MS;
 use domain::supervisor::Event;
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -46,11 +52,21 @@ use crate::redact::Scrubber;
 use crate::stats::Stats;
 
 /// How often the output's bytes-sent total is read (Owed 15, the choice recorded in `_FINDINGS.md`
-/// F-011): 250 ms, so the stall rule fires at most 250 ms after the true last byte plus
-/// `output_stall_after_ms` (5 s), and the PDF's "detected within 5 s" claim keeps its 5 s with a
-/// quarter-second poll term. A 1 s poll would add a whole second (Owed 15). C14 case 5's bound
-/// reads this const's value, never a literal.
+/// F-011): 250 ms. The totals prove a new sink Connected (`output_connected_after_ms`, Owed 38).
+/// Since Owed 87 no rule times their silence, so the poll no longer bounds a stall's detection:
+/// rtmp2sink's `timeout` does (`OUTPUT_SINK_TIMEOUT_S`).
 pub const OUTPUT_PROGRESS_POLL_MS: u64 = 250;
+
+/// rtmp2sink's `timeout` (a uint, "RTMP timeout in seconds") on every RTMP sink: the domain's
+/// `OUTPUT_SINK_TIMEOUT_MS` (Owed 87) in the property's unit.
+pub const OUTPUT_SINK_TIMEOUT_S: u32 = (OUTPUT_SINK_TIMEOUT_MS / 1_000) as u32;
+// The property counts whole seconds and 0 means no timeout: a constant it cannot carry exactly is a
+// compile error, never a rounded or disabled detector.
+const _: () = assert!(
+    OUTPUT_SINK_TIMEOUT_MS.is_multiple_of(1_000)
+        && OUTPUT_SINK_TIMEOUT_MS >= 1_000
+        && OUTPUT_SINK_TIMEOUT_MS / 1_000 <= u32::MAX as u64
+);
 
 /// The encoded ring's span (plan, Global Constraints: "Encoded ring buffer 2 s, dropping the oldest").
 pub const ENCODED_RING_SPAN: Duration = Duration::from_secs(2);
@@ -234,6 +250,10 @@ pub(crate) struct Shared {
     /// Progress events not sent because the inbound channel was full (the next poll carries a newer
     /// total, so none is owed).
     pub(crate) progress_dropped: Arc<AtomicU64>,
+    /// The `timeout` each new rtmp2sink gets: `OUTPUT_SINK_TIMEOUT_S`, which only a test hook
+    /// changes (`GstProgramme::set_output_sink_timeout_s`), so a read-back can tell the set from the
+    /// element's default (Owed 87).
+    pub(crate) sink_timeout_s: u32,
 }
 
 impl Shared {
@@ -403,6 +423,8 @@ pub(crate) fn build(
             // start without data: rtmp2sink's default, set here because the gate depends on it (with
             // `false` it connects on its first buffer, which the gate never sends).
             s.set_property("async-connect", true);
+            // The only detector of a destination stall (Owed 87): see the module doc.
+            s.set_property("timeout", shared.sink_timeout_s);
             s
         }
         Destination::File(path) => {

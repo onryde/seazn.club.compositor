@@ -7,7 +7,6 @@ use harness::thresholds::{
 
 fn live() -> AdapterConsts {
     AdapterConsts {
-        output_progress_poll_ms: adapters::gst_output::OUTPUT_PROGRESS_POLL_MS,
         cef_child_poll_ms: adapters::cef_graphics::CHILD_POLL_MS,
         encoded_ring_span_ms: adapters::gst_output::ENCODED_RING_SPAN.as_millis() as u64,
     }

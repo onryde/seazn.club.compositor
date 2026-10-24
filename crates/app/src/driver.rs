@@ -16,7 +16,7 @@
 //! - **The phase** is published after every `decide` that changed it, with a rising `seq` from
 //!   `(Waiting, 0)` (amendment 2026-10-15).
 //! - **The log** gets one line per hide (`overlay hidden reason=<r> gen=<g>`), one per sink swap
-//!   before the port call (`sink swap reason=first|error|connect_timeout|stall gen=<g>`, Owed 87:
+//!   before the port call (`sink swap reason=first|error|connect_timeout gen=<g>`, Owed 87:
 //!   what ended the sink before it; the port's own `sink swap gen=<g> target=…` line follows), and
 //!   one per graphics event handed to `decide`, a stale one included (`cef ready|crashed|alive
 //!   gen=<n>`; C12's amendment 2026-10-18). The skipped ticks and the queue's dropped beats reach it too
@@ -420,7 +420,6 @@ fn swap_name(r: SwapReason) -> &'static str {
         SwapReason::First => "first",
         SwapReason::Error => "error",
         SwapReason::ConnectTimeout => "connect_timeout",
-        SwapReason::Stall => "stall",
     }
 }
 

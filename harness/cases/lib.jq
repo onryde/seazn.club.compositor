@@ -45,28 +45,26 @@ def index_regressions: [.overlay.runs[] | select(.index != null) | .index] as $i
 # swap is the log's first `sink swap` line after the cut (docker-stamped, ms), and the anchor Owed 39
 # asks for is the last beat before that line whose egressBytes grew (the kernel's send buffer keeps
 # the total growing after a cut, so a bound timed from the cut is wrong by the drain). The true last
-# growth is at or before that beat, so `from_growth_ms <= output_stall_after_ms +
-# output_progress_poll_ms` never reds a correct swap, and a detector one stall threshold slow reds
-# unless the true growth fell in the last poll before the previous beat (under 1 run in 20 by phase,
-# when the threshold doubles). The beat that first carries the raised sinkSwaps must exist too.
+# growth is at or before that beat, so a bound from it never reds a correct swap. The beat that first
+# carries the raised sinkSwaps must exist too.
+#
+# Owed 87 (the owner, 2026-10-24, "A"): the output has no stall rule. A Connected sink is swapped
+# only after its own bus error (domain::output_link's `on_error`, then the back-off's `build`), and
+# for a stalled destination that error is rtmp2sink's socket timeout (`output_sink_timeout_ms`,
+# which C09 sets on every sink). The error path always logs `output gen=<g> error:` first:
+# `error_ms` is that line for the swap's outgoing generation, `error_to_swap_ms` the back-off from it
+# to the swap, and `error_from_cut_ms` the wait from the cut to it. A report with no `output_errors`
+# field reads no error, never one: the error is read, not assumed.
 #
 # `reason` (Owed 87): the driver's `sink swap reason=<r> gen=<g>` line for the swap's generation,
 # logged just before the swap line (PR #57). `reasons_paired` checks the reason lines number the
 # swap lines: as many, and the same generation at each place (their order against the swap lines is
-# compositor/tests/wiring.rs's to pin). A report with no `sink_swap_reasons` (one checked before this field) reads reason
-# "unknown", never a reason: the reason is read, not assumed.
+# compositor/tests/wiring.rs's to pin). A report with no `sink_swap_reasons` (one checked before this
+# field) reads reason "unknown", never a reason: the reason is read, not assumed.
 #
-# `cause` (C14 fix round 3, item 2) is the second witness of the same thing, from the sink's side: a
-# Connected sink is swapped by exactly two paths (domain::output_link): the stall rule (`build` at
-# once), or its bus error (`on_error`, then the back-off's `build`). The error path always logs
-# `output gen=<g> error:` first, and a sink the stall rule retires never logs one (gst_output.rs's
-# `Watch` returns once retired). So a swap to generation g+1 is "stall" only when generation g
-# logged no error before it; else "output_error", and `error_to_swap_ms` is the back-off between
-# them. A report with no `output_errors` field reads cause "unknown" (the re-review's m-3).
-#
-# `detect_ms` is when the stall was seen, from the last growth: the swap for the stall rule, the
-# sink's own error for the error path. Both are judged against the rule's budget (`bound_ms`), by
-# `stall_swap_judged`.
+# `detect_ms` is the error from the last growth, `from_growth_ms` the swap from it. `bound_ms` is the
+# stall's budget from the last growth: one sink timeout, the domain's back-off from Connected
+# (failure 1 waits the base), and one frame period (the driver acts on its next tick).
 def stall_swap($cut):
   ([beats[] | select(.received_ms <= $cut)] | last | .body.sinkSwaps) as $s0
   | ([beats[] | select(.received_ms > $cut and (.body.sinkSwaps // -1) > $s0)] | first) as $swap_beat
@@ -76,55 +74,55 @@ def stall_swap($cut):
   | (.log.sink_swap_reasons) as $reasons
   | (.log.sink_swaps) as $swaps
   | (if $sw == null or $errors == null then [] else [$errors[] | select(.gen == $sw.gen - 1 and .at_ms < $swap)] end) as $err
+  | ($err | first | .at_ms) as $seen
   | (if $swap == null then [] else [beats[] | select(.received_ms < $swap)] end) as $b
   | ([range(1; $b | length) | select(($b[.].body.egressBytes // 0) > ($b[. - 1].body.egressBytes // 0))
       | $b[.].received_ms] | last) as $grow
-  | (if ($err | length) > 0 then ($err | first | .at_ms) else $swap end) as $seen
   | {swaps_before: $s0, swap_ms: $swap, swap_gen: ($sw.gen // null), swap_beat_ms: ($swap_beat.received_ms // null),
      last_growth_ms: $grow,
      reason: (if $sw == null then null elif $reasons == null then "unknown"
        else ([$reasons[] | select(.gen == $sw.gen and .at_ms <= $swap)] | last | .reason) end),
      reasons_paired: ($reasons != null and ($reasons | length) == ($swaps | length)
        and all(range(0; $swaps | length); $reasons[.].gen == $swaps[.].gen)),
-     cause: (if $sw == null then null elif $errors == null then "unknown" elif ($err | length) > 0 then "output_error"
-       else "stall" end),
-     error_to_swap_ms: (if ($err | length) > 0 then $swap - ($err | first | .at_ms) else null end),
-     from_cut_ms: (if $swap == null then null else $swap - $cut end),
-     from_growth_ms: (if $swap == null or $grow == null then null else $swap - $grow end),
-     detect_ms: (if $seen == null or $grow == null then null else $seen - $grow end),
-     bound_ms: ($t.output_stall_after_ms + $t.output_progress_poll_ms)};
+     error_ms: $seen,
+     error_to_swap_ms: less($swap; $seen),
+     error_from_cut_ms: less($seen; $cut),
+     from_cut_ms: less($swap; $cut),
+     from_growth_ms: less($swap; $grow),
+     detect_ms: less($seen; $grow),
+     bound_ms: ($t.output_sink_timeout_ms + $t.output_backoff_base_ms + $t.frame_period_ms)};
 
-# A stall's swap after the cut at $cut, judged by the paths a case accepts ($paths, a list of
-# reasons):
-# - "stall", the stall rule: the reason line reads stall, the outgoing sink logged no error before
-#   it, the swap came within the rule's budget of the last growth (`bound_ms`:
-#   output_stall_after_ms + output_progress_poll_ms), and no sooner than the rule allows after the
-#   cut (the PR #65 review's m-3: the bytes flow at full rate until the cut, so the last growth is
-#   no earlier than one frame before it, and the rule's swap no earlier than output_stall_after_ms
-#   after that);
-# - "error", the sink's own error first (the coordinator's decision on Owed 87, 2026-10-24: in cases
-#   5 and 12 rtmp2sink's 5 s socket timeout fires before the rule can): the reason line reads error,
-#   the outgoing sink's error line came first (`error_to_swap_ms` is set only then: cause
-#   "output_error") and saw the stall within the same budget, and the sink was replaced after the
-#   domain's back-off from Connected (output_backoff_base_ms, a floor the product cannot beat) and
-#   inside the spec's output budget (§6 "≤5 s", budget_output_reconnect_ms).
-# Either way the reason lines must number the swap lines. (A reason of error with no error line
-# first leaves `error_to_swap_ms` null, and jq sorts null below every number: that reds.)
-def stall_swap_judged($cut; $paths):
+# A stall's swap after the cut at $cut, judged. Owed 87 leaves one path, the sink's own error:
+# - the swap, the beat that counts it and a growth beat before it all exist, and the reason lines
+#   number the swap lines;
+# - the reason line reads error, and the outgoing sink's error line came before the swap (else
+#   `error_to_swap_ms` is null, and jq sorts null below every number: that reds);
+# - the sink was replaced after the domain's back-off from Connected (output_backoff_base_ms, a floor
+#   the product cannot beat, less one frame period: the domain acts on its frame ticks, and the two
+#   lines' docker stamps, read one by one and cut to the ms, cannot resolve finer. PR #71's CI run
+#   40137725801 read 499 ms for a swap whose own `ts=` stamps were 500 ms apart; a swap that skipped
+#   the back-off lands within a tick of the error, far below it) and inside the spec's output budget
+#   (§6 "≤5 s", budget_output_reconnect_ms);
+# - the swap came within `bound_ms` of the last growth: a detector slower than the sink's timeout reds
+#   (C14's mutant m9 sets it to 20 s);
+# - the error came no sooner after the cut than the sink's timeout less one frame (the PR #65 review's
+#   m-3: the bytes flow at full rate until the cut, so the last write is no earlier than one frame
+#   before it): an error sooner than that is not the stall's;
+# - and no later than the sink's timeout plus `budget_output_lost_max_ms` after the cut (the PR #73
+#   review's m-1): what the sink writes after the cut goes into a socket nothing drains, and spec §6
+#   lets a stall lose at most that much programme, so its last write is no later than that and its
+#   error one sink timeout after. The growth bound above is anchored on a beat, up to one beat after
+#   the last write, so on its own it passes a timeout up to about 8-9 s; this ceiling is anchored on
+#   the cut, and reds one past about 6 s (CI's error_from_cut_ms read 5 450-5 898).
+def stall_swap_judged($cut):
   stall_swap($cut) as $s
   | $s.swap_ms != null and $s.swap_beat_ms != null and $s.last_growth_ms != null and $s.reasons_paired
-    and any($paths[]; . == $s.reason)
-    and $s.detect_ms != null and $s.detect_ms <= $s.bound_ms
-    and (if $s.reason == "stall" then $s.cause == "stall"
-           and $s.from_cut_ms >= $t.output_stall_after_ms - $t.frame_period_ms
-         else $s.error_to_swap_ms >= $t.output_backoff_base_ms
-           and $s.error_to_swap_ms <= $t.budget_output_reconnect_ms end);
-
-# `stall_swap`'s measure as cases 5, 12 and 17 print it, with each path's verdict beside it, so Owed
-# 87's signature (harness/chaos.json) can read whether the sink's own error path held in full.
-def stall_swap_shown($cut):
-  stall_swap($cut) + {error_path_passes: stall_swap_judged($cut; ["error"]),
-    stall_path_passes: stall_swap_judged($cut; ["stall"])};
+    and $s.reason == "error"
+    and $s.error_to_swap_ms >= $t.output_backoff_base_ms - $t.frame_period_ms
+    and $s.error_to_swap_ms <= $t.budget_output_reconnect_ms
+    and $s.from_growth_ms <= $s.bound_ms
+    and $s.error_from_cut_ms >= $t.output_sink_timeout_ms - $t.frame_period_ms
+    and $s.error_from_cut_ms <= $t.output_sink_timeout_ms + $t.budget_output_lost_max_ms;
 
 # The clear's phase in the output's reconnect cycle (cases 4, 5 and 12; the re-review's I-5, Owed
 # 84). Under the fault a sink is built every 6-7 s (a connect that times out, then the back-off), and

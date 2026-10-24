@@ -1,31 +1,28 @@
 # shellcheck shell=bash disable=SC2034,SC2016 # sourced by run-case.sh; jq filters keep their $ (SC2016)
-# Case 17, dest-stall-rule (C14 wave-gate-3 follow-ups, 2026-10-24): a destination that keeps the
-# socket open and takes bytes, too slowly for one video frame to leave within
-# output_stall_after_ms, and never errors. Only the stall rule could swap the sink there, and the
-# case demands that it does, within its budget: the swap's reason line reads `stall`, the outgoing
-# sink logged no error, and the swap came within output_stall_after_ms + output_progress_poll_ms of
-# the last growth and no sooner than the rule allows after the cut (`stall_swap_judged(...;
-# ["stall"])`, lib.jq).
+# Case 17, dest-stall-rule (C14 wave-gate-3 follow-ups, 2026-10-24; amended for Owed 87, the owner,
+# 2026-10-24, "A": the output's stall rule is retired, and rtmp2sink's own socket timeout is the
+# only detector of a destination stall). A destination that keeps the socket open and takes bytes,
+# too slowly for one video frame to leave within output_sink_timeout_ms, and never errors, through a
+# send buffer capped at 8 KiB. The case demands that the sink's own error still catches it within
+# budget: the outgoing sink logs `output gen=<g> error:` before the swap, the swap's reason line
+# reads `error`, the swap comes within one sink timeout, the back-off from Connected and a frame of
+# the last growth, and the error no sooner than one sink timeout, less a frame, after the cut
+# (`stall_swap_judged`, lib.jq). Mutant m9 (output_sink_timeout_ms at 20 s) must red `stall_swap`.
 #
-# RED ON CI, OWED 87 (3 of 3 runs, PR #65; the PR #65 review's C-1): the design's premise is false.
-# The design capped the compositor's TCP send buffer at 8 KiB in its network namespace
-# (harness/compose.stall-rule.yml) and from 20 s set `netem out rate` so one video frame (the
-# fixture's videoKbps / fps) leaves in STALL_DRAIN_X stall thresholds, expecting the kernel to wake
-# the writer every second or two inside one message while rtmp2's total (counted per whole message)
-# stood still. On CI the socket queued a whole frame past the cap (Send-Q 16 806-16 810 B against
-# 8 192, 3 s into the fault), so each wake completes a message: "no growth for 5 s" and "one socket
-# wait of 5 s" are the same gap, timed from the same write, and rtmp2sink's own 5 s timeout swaps
-# the sink (`reason=error`) as the rule's would. The case stays as the witness the owner's ruling on
-# the rule needs (docs/_INDEX.md Owed 87), and its red reads OWED 87 while that row's signature
-# holds (harness/chaos.json).
+# Why this setting (the PR #65 review's C-1): rtmp2 counts a message's bytes only once the whole
+# message is written (`rtmpconnection.c:519-628`), and the socket times out only when one wait for
+# room lasts the timeout. The cap was meant to wake the writer inside one message, so that the total
+# stands still while no wait lasts that long, the one path where only a stall rule could see the
+# stall. On CI the socket queued a whole frame past the cap (Send-Q 16 806-16 810 B against 8 192, 3 s
+# into the fault), so each wake completes a message and the socket's wait is the stall's gap. That
+# is the measurement Owed 87's ruling rests on, and this case keeps it under watch: if a kernel ever
+# honours the cap inside a message, the sink no longer errors here, and `stall_swap` reds.
 #
 # Anti-vacuity, judged on the effect, not the setting (the PR #65 review's I-1): `buffer_capped`
-# needs the cap set as asked (the namespace's tcp_wmem reads what compose set, every RTMP socket's
-# buffer read and at most the cap) AND at least one RTMP socket in the fault, each one's Send-Q read
-# and at most the cap;
-# `trickled` needs netem to have sent at least 2 packets, at a measured rate (its bytes over the
-# fault window) under one frame per stall threshold. Mutant 9 (output_stall_after_ms at 20 s) is
-# unkillable here while the case reds unmutated (Owed 87).
+# needs the cap set as asked (the namespace's tcp_wmem reads what compose set) and every RTMP
+# socket's buffer read and at most the cap before the cut (each socket's Send-Q in the fault is
+# measured, not judged: it runs past the cap, C-1); `trickled` needs netem to have sent at least 2
+# packets, at a measured rate (its bytes over the fault window) under one frame per sink timeout.
 
 CASE_LIVE_S=80
 CASE_KEY=stall_swap
@@ -49,7 +46,7 @@ print(json.dumps({"sockets": len(socks),
 case_drive() {
   local frame_bits rate wanted got
   frame_bits="$(jq -e '.output.videoKbps * 1000 / .output.fps | floor' "$FIXTURE")"
-  rate=$((frame_bits * 1000 / (STALL_DRAIN_X * $(threshold output_stall_after_ms))))
+  rate=$((frame_bits * 1000 / (STALL_DRAIN_X * $(threshold output_sink_timeout_ms))))
   # Each null when it cannot be read: buffer_capped then reds, and the drive goes on.
   wanted="$(compose config --format json | jq -c '.services.compositor.sysctls["net.ipv4.tcp_wmem"]
     | [splits("\\s+") | select(. != "") | tonumber]' 2>/dev/null || echo null)"
@@ -73,27 +70,19 @@ case_drive() {
 
 CASE_CHECKS=16
 case_verdict() {
-  require buffer_capped 'mark_value("send_buffer") as $b | (mark_value("sockets_in_fault").send_q // []) as $q
+  require buffer_capped 'mark_value("send_buffer") as $b
     | $b.read == $b.wanted and $b.before_cut.sockets >= 1
-    and ($b.before_cut.tb | all(. != null and . <= $b.wanted[2]))
-    and ($q | length) >= 1 and ($q | all(. != null and . <= $b.wanted[2]))' \
+    and ($b.before_cut.tb | all(. != null and . <= $b.wanted[2]))' \
     '{send_buffer: mark_value("send_buffer"), in_fault: mark_value("sockets_in_fault")}'
   # The trickle's measured rate: netem's bytes over the fault (the cut to its stats, read just before
-  # the clear), as bits per stall threshold against one frame's bits. A window of 0 or less reds there
+  # the clear), as bits per sink timeout against one frame's bits. A window of 0 or less reds there
   # (the bytes are never below 0), and shows no rate.
   require trickled 'mark_value("netem_out") as $n | (mark_at("netem_out") - mark_at("cut")) as $w
     | $n.sent_pkts >= 2
-    and $n.sent_bytes * 8 * $t.output_stall_after_ms < mark_value("rate").frame_bits * $w' \
+    and $n.sent_bytes * 8 * $t.output_sink_timeout_ms < mark_value("rate").frame_bits * $w' \
     '(mark_at("netem_out") - mark_at("cut")) as $w | {netem: mark_value("netem_out"), rate: mark_value("rate"),
       window_ms: $w, measured_bit_per_s: (if $w > 0 then mark_value("netem_out").sent_bytes * 8000 / $w | floor else null end)}'
-  # Shown with `queue_past_cap`, Owed 87's evidence here (harness/chaos.json): the cap set as asked,
-  # and an in-fault queue still past it (the whole-frame write, the PR #65 review's C-1). An unread
-  # queue is null, and null is never past a number.
-  require stall_swap 'stall_swap_judged(mark_at("cut"); ["stall"])' \
-    'stall_swap_shown(mark_at("cut")) + {queue_past_cap: (mark_value("send_buffer") as $b
-      | $b.read == $b.wanted and ($b.before_cut.tb | length) >= 1
-      and ($b.before_cut.tb | all(. != null and . <= $b.wanted[2]))
-      and (mark_value("sockets_in_fault").send_q // [] | any(. > $b.wanted[2])))}'
+  require stall_swap 'stall_swap_judged(mark_at("cut"))' 'stall_swap(mark_at("cut"))'
   measure swap_log_from_cut_ms '[.log.sink_swaps[] | select(.at_ms > mark_at("cut"))] | first | .at_ms - mark_at("cut")'
   measure sink_errors_in_fault '[.log.output_errors[] | select(.at_ms > mark_at("cut") and .at_ms <= mark_at("clear"))]
     | map({gen, after_cut_ms: (.at_ms - mark_at("cut"))})'

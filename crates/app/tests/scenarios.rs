@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use app::driver::Driver;
 use app::ports::{ControlRequest, Inbound, Measured, Metrics, SessionConfig};
-use domain::config::{OutputProfile, Thresholds};
+use domain::config::{OutputProfile, Thresholds, OUTPUT_SINK_TIMEOUT_MS};
 use domain::health::{ExitDetail, GraphicsStatus, HealthReport};
 use domain::input_link::LossReason;
 use domain::ladder::Rung;
@@ -2045,13 +2045,20 @@ fn progress(gen: u64, total_bytes: u64) -> Inbound {
     ev(Event::OutputProgress { gen, total_bytes })
 }
 
+fn swaps(sim: &Sim) -> usize {
+    sim.calls().iter().filter(|c| matches!(c, Call::Swap(..))).count()
+}
+
 // Five swaps through the real driver and domain, one per way the module doc of
-// `domain::output_link` ends a sink: the first build, the sink's own error, the connect timeout, and
-// the stall rule while proving and while Connected. Each line comes just before its port call.
+// `domain::output_link` ends a sink: the first build, the sink's own error (while connecting, while
+// proving and once Connected) and the connect timeout. Each line comes just before its port call.
+// Since Owed 87 (the owner, 2026-10-24, "A") a silent sink, proving or Connected, is swapped only
+// after its own error (rtmp2sink's socket timeout, for a destination stall), however long it is
+// silent: the silences here run three sink timeouts, past where the retired stall rule swapped.
 #[test]
 fn every_sink_swap_is_logged_with_its_reason_just_before_the_swap() {
     let t = th();
-    let (stall, slack) = (t.output_stall_after_ms, t.output_backoff_cap_ms + 1_000);
+    let (quiet, slack) = (3 * OUTPUT_SINK_TIMEOUT_MS, t.output_backoff_cap_ms + 1_000);
     let mut sim = Sim::new(t.clone(), session_720p());
     let at1 = sim.tick_until(SESSION_AT + 1_000, swapped(1));
 
@@ -2062,12 +2069,16 @@ fn every_sink_swap_is_logged_with_its_reason_just_before_the_swap() {
     // Generation 2 sends nothing.
     let at3 = sim.tick_until(at2 + t.output_connect_timeout_ms + slack, swapped(3));
 
-    // Generation 3 sends its `connect` command (476 B, F-011), then nothing while it proves.
+    // Generation 3 sends its `connect` command (476 B, F-011), then nothing while it proves, until
+    // its error.
     let first = at3 + 31;
-    sim.drive(first + 1, vec![(first, progress(3, 476))]);
-    let at4 = sim.tick_until(first + stall + slack, swapped(4));
+    let e3 = first + quiet;
+    sim.drive(e3, vec![(first, progress(3, 476))]);
+    assert_eq!(swaps(&sim), 3, "a silent proving sink is not swapped");
+    sim.drive(e3 + 1, vec![(e3, ev(Event::OutputError { gen: 3 }))]);
+    let at4 = sim.tick_until(e3 + slack, swapped(4));
 
-    // Generation 4 grows on the 250 ms poll until it is Connected, then stops.
+    // Generation 4 grows on the 250 ms poll until it is Connected, then stops, until its error.
     let first = at4 + 31;
     let growth: Vec<(u64, Inbound)> = (0..)
         .map(|k| (first + 250 * k, 476 + 50_000 * k))
@@ -2075,12 +2086,16 @@ fn every_sink_swap_is_logged_with_its_reason_just_before_the_swap() {
         .map(|(at, total)| (at, progress(4, total)))
         .collect();
     let last = growth.last().expect("growth").0;
-    sim.drive(last + 1, growth);
-    let at5 = sim.tick_until(last + stall + 1_000, swapped(5));
+    let e4 = last + quiet;
+    sim.drive(e4, growth);
+    assert_eq!(swaps(&sim), 4, "a silent Connected sink is not swapped");
+    sim.drive(e4 + 1, vec![(e4, ev(Event::OutputError { gen: 4 }))]);
+    let at5 = sim.tick_until(e4 + slack, swapped(5));
+    let base = t.output_backoff_base_ms;
     assert!(
-        at5 - last < stall + t.output_backoff_base_ms,
-        "a Connected sink's stall swaps at once: {} ms after its last growth",
-        at5 - last
+        (base..base + 100).contains(&(at5 - e4)),
+        "a Connected sink's error is failure 1, the base back-off: swapped {} ms after it",
+        at5 - e4
     );
 
     let calls = sim.calls();
@@ -2089,8 +2104,8 @@ fn every_sink_swap_is_logged_with_its_reason_just_before_the_swap() {
         (1, "first"),
         (2, "error"),
         (3, "connect_timeout"),
-        (4, "stall"),
-        (5, "stall"),
+        (4, "error"),
+        (5, "error"),
     ] {
         let i = calls
             .iter()

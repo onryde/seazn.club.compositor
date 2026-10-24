@@ -42,7 +42,7 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 
 use crate::frame_store::{FrameStore, AUDIO_CHANNELS, AUDIO_FRAME_BYTES, AUDIO_RATE, AUDIO_RING_BYTES};
-use crate::gst_output::{self, EncodedRing, Entry, LogFn, OutputGen, Shared};
+use crate::gst_output::{self, EncodedRing, Entry, LogFn, OutputGen, Shared, OUTPUT_SINK_TIMEOUT_S};
 use crate::redact::Scrubber;
 use crate::slate::Slate;
 use crate::stats::Stats;
@@ -135,6 +135,7 @@ impl GstProgramme {
                 scrubber: Arc::new(Mutex::new(Scrubber::default())),
                 reapers: Arc::new(AtomicUsize::new(0)),
                 progress_dropped: Arc::new(AtomicU64::new(0)),
+                sink_timeout_s: OUTPUT_SINK_TIMEOUT_S,
             },
             builds: 0,
             overlay_pushes: 0,
@@ -349,6 +350,22 @@ impl GstProgramme {
             .src(&r.pipeline)
             .build();
         r.pipeline.post_message(msg).is_ok()
+    }
+
+    /// Test hook: every RTMP sink built from now on gets `timeout` = `secs` instead of
+    /// `OUTPUT_SINK_TIMEOUT_S`, so a read-back tells the adapter's set from rtmp2sink's default.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_output_sink_timeout_s(&mut self, secs: u32) {
+        self.shared.sink_timeout_s = secs;
+    }
+
+    /// Test hook: the current output sink's `timeout` property, read back from the element. `None`
+    /// if there is no output, or its sink has no such property (a `file://` target's filesink).
+    #[cfg(feature = "test-hooks")]
+    pub fn output_sink_timeout_s(&self) -> Option<u32> {
+        let sink = self.running.as_ref()?.output.as_ref()?.sink();
+        sink.find_property("timeout")?;
+        Some(sink.property::<u32>("timeout"))
     }
 
     #[cfg(feature = "test-hooks")]
