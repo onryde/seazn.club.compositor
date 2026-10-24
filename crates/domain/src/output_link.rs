@@ -36,6 +36,10 @@
 //! - **The 15 s budget** (`OUTPUT_GAP_BUDGET_MS`, F-004) holds from an error through one failed
 //!   connect, not two: `tests/links.rs` measures every recovery path, and docs/_INDEX.md records the
 //!   paths that exceed it. The gap ends when the new sink's bytes flow, not when it is Connected.
+//! - **Every build carries its reason** (`SwapReason`, Owed 87): what ended the sink before it. An
+//!   error is the sink's own (rtmp2sink's socket timeout among them); a connect timeout and a stall
+//!   are this module's rules. A build after a back-off carries the failure that started it, and the
+//!   first build carries `First`.
 use crate::backoff::delay;
 use crate::config::Thresholds;
 use crate::time::{elapsed, Ms};
@@ -62,10 +66,29 @@ pub enum OutputState {
     Backoff { attempt: u32, until: Ms },
 }
 
+/// Why a sink generation was built: what ended the one before it (Owed 87).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapReason {
+    /// Generation 1: no sink came before it.
+    First,
+    /// The sink before it reported a failure (`on_error`): a bus error, rtmp2sink's own socket
+    /// timeout and a refused publish among them.
+    Error,
+    /// The sink before it sent no byte within `output_connect_timeout_ms` of its build.
+    ConnectTimeout,
+    /// The stall rule: the sink before it sent nothing new for `output_stall_after_ms`, proving or
+    /// Connected.
+    Stall,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputLink {
     state: OutputState,
     generation: u64,
+    /// Why the current generation was built.
+    built_for: SwapReason,
+    /// What ended the last sink: the reason the next build carries.
+    ended: SwapReason,
 }
 
 impl Default for OutputLink {
@@ -80,6 +103,8 @@ impl OutputLink {
         Self {
             state: OutputState::Backoff { attempt: 0, until: 0 },
             generation: 0,
+            built_for: SwapReason::First,
+            ended: SwapReason::First,
         }
     }
 
@@ -94,6 +119,11 @@ impl OutputLink {
 
     pub fn is_connected(&self) -> bool {
         matches!(self.state, OutputState::Connected { .. })
+    }
+
+    /// Why the current generation was built (`First` before any build).
+    pub fn swap_reason(&self) -> SwapReason {
+        self.built_for
     }
 
     /// The current sink's bytes-sent total, counted from 0 when the sink was built (C09: rtmp2sink
@@ -152,17 +182,17 @@ impl OutputLink {
             // Already failed: a second error from the same sink changes nothing.
             OutputState::Backoff { .. } => return,
         };
-        self.back_off(now, failed_before, t);
+        self.back_off(now, failed_before, t, SwapReason::Error);
     }
 
-    /// `true` ⇒ effect `SwapSink(generation())`.
+    /// `true` ⇒ effect `SwapSink(generation())`, its reason `swap_reason()`.
     pub fn on_tick(&mut self, now: Ms, t: &Thresholds) -> bool {
         match self.state {
-            OutputState::Backoff { attempt, until } if now >= until => self.build(now, attempt),
+            OutputState::Backoff { attempt, until } if now >= until => self.build(now, attempt, self.ended),
             OutputState::Connecting { attempt, since }
                 if elapsed(now, since) >= t.output_connect_timeout_ms =>
             {
-                self.back_off(now, attempt, t);
+                self.back_off(now, attempt, t, SwapReason::ConnectTimeout);
                 false
             }
             // The bytes stopped before the sink earned Connected: a failed attempt, so it waits.
@@ -171,34 +201,37 @@ impl OutputLink {
                 last_progress,
                 ..
             } if elapsed(now, last_progress) >= t.output_stall_after_ms => {
-                self.back_off(now, attempt, t);
+                self.back_off(now, attempt, t, SwapReason::Stall);
                 false
             }
             // Stalled: swap at once. The stall already spent 5 s of the 15 s budget.
             OutputState::Connected { last_progress, .. }
                 if elapsed(now, last_progress) >= t.output_stall_after_ms =>
             {
-                self.build(now, 0)
+                self.build(now, 0, SwapReason::Stall)
             }
             _ => false,
         }
     }
 
-    /// The next sink generation, carrying the failures before it.
-    fn build(&mut self, now: Ms, attempt: u32) -> bool {
+    /// The next sink generation, carrying the failures before it and the reason for it.
+    fn build(&mut self, now: Ms, attempt: u32, reason: SwapReason) -> bool {
         self.generation += 1;
         self.state = OutputState::Connecting { attempt, since: now };
+        self.built_for = reason;
         true
     }
 
     /// Failure number `failed_before + 1` waits `delay(failed_before)`. Both additions saturate: the
     /// clock is a u64 (time.rs), and "never gives up" has no last attempt.
-    fn back_off(&mut self, now: Ms, failed_before: u32, t: &Thresholds) {
+    /// `ended` is what ended the sink: the next build's reason.
+    fn back_off(&mut self, now: Ms, failed_before: u32, t: &Thresholds, ended: SwapReason) {
         let wait = delay(failed_before, t.output_backoff_base_ms, t.output_backoff_cap_ms);
         self.state = OutputState::Backoff {
             attempt: failed_before.saturating_add(1),
             until: now.saturating_add(wait),
         };
+        self.ended = ended;
     }
 }
 
@@ -1071,5 +1104,83 @@ mod tests {
             "stalled since the last growth: {:?}",
             o.state()
         );
+    }
+
+    // ---- Owed 87: every build names what ended the sink before it ----
+
+    /// Ticks to the next build (`next_build`) and checks it is generation `gen`, built for `want`;
+    /// returns its time.
+    fn swap_for(o: &mut OutputLink, now: Ms, th: &Thresholds, gen: u64, want: SwapReason) -> Ms {
+        let at = next_build(o, now, th);
+        assert_eq!(o.generation(), gen, "built at {at}");
+        assert_eq!(o.swap_reason(), want, "generation {gen}, built at {at}");
+        at
+    }
+
+    // One link through every way a sink ends, in the module doc's words: the first build, the sink's
+    // own error, the connect timeout, the stall rule while proving and while Connected. An end from
+    // another generation, or a second one from a sink that already failed, names nothing.
+    #[test]
+    fn each_build_names_what_ended_the_sink_before_it() {
+        let th = t();
+        let stall = th.output_stall_after_ms;
+        let mut o = OutputLink::new();
+        let mut checked = 0;
+        assert_eq!(o.swap_reason(), SwapReason::First, "before any build");
+
+        let mut now = swap_for(&mut o, 0, &th, 1, SwapReason::First);
+        checked += 1;
+        o.on_error(now + 100, 1, &th);
+        assert_eq!(
+            o.swap_reason(),
+            SwapReason::First,
+            "a back-off does not rename the generation still in place"
+        );
+        now = swap_for(&mut o, now + 100, &th, 2, SwapReason::Error);
+        checked += 1;
+
+        // Generation 2 sends nothing: the connect timeout.
+        now = swap_for(&mut o, now, &th, 3, SwapReason::ConnectTimeout);
+        checked += 1;
+
+        // Generation 3's bytes stop while it proves: the stall rule, a failure that waits.
+        feed(&mut o, now + 31, 3, 476, &th);
+        let last = now + 1_000;
+        feed(&mut o, last, 3, 52_000, &th);
+        assert!(!o.on_tick(last + stall, &th), "a failure waits");
+        now = swap_for(&mut o, last + stall, &th, 4, SwapReason::Stall);
+        checked += 1;
+
+        // Generation 4 earns Connected, then stalls: the stall rule, a swap at once.
+        feed(&mut o, now + 31, 4, 476, &th);
+        let c = now + 31 + th.output_connected_after_ms;
+        feed(&mut o, c, 4, 900_000, &th);
+        assert!(o.is_connected());
+        assert!(!o.on_tick(c + stall - 1, &th));
+        assert!(o.on_tick(c + stall, &th), "a Connected stall swaps at once");
+        assert_eq!((o.generation(), o.swap_reason()), (5, SwapReason::Stall));
+        now = c + stall;
+        checked += 1;
+
+        // Generation 5 errors after a stall swap: the latest end names the build.
+        o.on_error(now + 200, 5, &th);
+        now = swap_for(&mut o, now + 200, &th, 6, SwapReason::Error);
+        checked += 1;
+
+        // A late error from generation 5 changes nothing; generation 6 times out.
+        o.on_error(now + 10, 5, &th);
+        assert!(matches!(o.state(), OutputState::Connecting { .. }));
+        now = swap_for(&mut o, now + 10, &th, 7, SwapReason::ConnectTimeout);
+        checked += 1;
+
+        // Generation 7 times out, and its error then arrives in the back-off: still the timeout.
+        let timed_out = now + th.output_connect_timeout_ms;
+        assert!(!o.on_tick(timed_out, &th));
+        assert!(matches!(o.state(), OutputState::Backoff { .. }));
+        o.on_error(timed_out + 1, 7, &th);
+        swap_for(&mut o, timed_out + 1, &th, 8, SwapReason::ConnectTimeout);
+        checked += 1;
+
+        assert_eq!(checked, 8, "builds checked");
     }
 }

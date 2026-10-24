@@ -254,12 +254,12 @@ pub trait PhasePublisher: Send {
 }
 
 /// The driver's own log lines (C12's amendment 2026-10-18; C14 cases 8 and 11 and C15 read them):
-/// `overlay hidden reason=<r> gen=<g>`, `cef ready|crashed|alive gen=<n>`,
-/// `ticks skipped total=<n>` and `heartbeats dropped total=<n>` (at most one of each a minute, and
-/// the rest at the exit; review round 1, item 4), `cef health zygote_gone=<gen|-> leaked_teardowns=<n>
-/// gpu_process_deaths=<n>` when CEF's health changes (C11b), and `run()`'s
-/// `final beat not confirmed within 2000 ms` (Owed 35). The adapter (C12)
-/// writes each as `ts=<rfc3339> level=info msg=<line>` on stderr: the timestamp is the adapter's,
+/// `overlay hidden reason=<r> gen=<g>`, `sink swap reason=<r> gen=<g>` (Owed 87),
+/// `cef ready|crashed|alive gen=<n>`, `ticks skipped total=<n>` and `heartbeats dropped total=<n>`
+/// (at most one of each a minute, and the rest at the exit; review round 1, item 4),
+/// `cef health zygote_gone=<gen|-> leaked_teardowns=<n> gpu_process_deaths=<n>` when CEF's health
+/// changes (C11b), and `run()`'s `final beat not confirmed within 2000 ms` (Owed 35). The adapter
+/// (C12) writes each as `ts=<rfc3339> level=info msg=<line>` on stderr: the timestamp is the adapter's,
 /// because this crate reads no clock. No line carries a credential or a fatal error's text: the
 /// driver never logs either (C07 confirm pass; Owed 32).
 pub trait LogSink: Send {

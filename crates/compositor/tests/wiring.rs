@@ -292,6 +292,21 @@ fn graphics_log_lines_exist_in_both_driver_modes() {
             1,
             "{what}: the swap, its URL redacted: {hang:#?}"
         );
+        // Owed 87: the driver's reason line comes before the decorator's swap line (other threads'
+        // lines may land between the two in the live mode).
+        matched += assert_in_order(
+            &hang,
+            &[
+                "sink swap reason=first gen=1".into(),
+                "sink swap gen=1 target=rtmps://live.cloudflare.com:443/live/****".into(),
+            ],
+            &format!("{what} swap"),
+        );
+        assert_eq!(
+            hang.iter().filter(|l| l.starts_with("sink swap ")).count(),
+            2,
+            "{what}: one swap, two lines"
+        );
         let crash = crash_run(mode);
         matched += assert_in_order(
             &crash,

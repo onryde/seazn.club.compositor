@@ -1785,3 +1785,82 @@ fn a_given_up_generations_frames_never_reach_the_programme_through_the_driver() 
         "gen 2's frames are counted"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Owed 87: every swap's log line names what ended the sink before it
+// ---------------------------------------------------------------------------------------------
+
+fn swapped(gen: u64) -> impl Fn(&Call) -> bool {
+    move |c| matches!(c, Call::Swap(g, _) if *g == gen)
+}
+
+fn progress(gen: u64, total_bytes: u64) -> Inbound {
+    ev(Event::OutputProgress { gen, total_bytes })
+}
+
+// Five swaps through the real driver and domain, one per way the module doc of
+// `domain::output_link` ends a sink: the first build, the sink's own error, the connect timeout, and
+// the stall rule while proving and while Connected. Each line comes just before its port call.
+#[test]
+fn every_sink_swap_is_logged_with_its_reason_just_before_the_swap() {
+    let t = th();
+    let (stall, slack) = (t.output_stall_after_ms, t.output_backoff_cap_ms + 1_000);
+    let mut sim = Sim::new(t.clone(), session_720p());
+    let at1 = sim.tick_until(SESSION_AT + 1_000, swapped(1));
+
+    let err = at1 + 100;
+    sim.drive(err + 1, vec![(err, ev(Event::OutputError { gen: 1 }))]);
+    let at2 = sim.tick_until(err + slack, swapped(2));
+
+    // Generation 2 sends nothing.
+    let at3 = sim.tick_until(at2 + t.output_connect_timeout_ms + slack, swapped(3));
+
+    // Generation 3 sends its `connect` command (476 B, F-011), then nothing while it proves.
+    let first = at3 + 31;
+    sim.drive(first + 1, vec![(first, progress(3, 476))]);
+    let at4 = sim.tick_until(first + stall + slack, swapped(4));
+
+    // Generation 4 grows on the 250 ms poll until it is Connected, then stops.
+    let first = at4 + 31;
+    let growth: Vec<(u64, Inbound)> = (0..)
+        .map(|k| (first + 250 * k, 476 + 50_000 * k))
+        .take_while(|&(at, _)| at <= first + t.output_connected_after_ms + 250)
+        .map(|(at, total)| (at, progress(4, total)))
+        .collect();
+    let last = growth.last().expect("growth").0;
+    sim.drive(last + 1, growth);
+    let at5 = sim.tick_until(last + stall + 1_000, swapped(5));
+    assert!(
+        at5 - last < stall + t.output_backoff_base_ms,
+        "a Connected sink's stall swaps at once: {} ms after its last growth",
+        at5 - last
+    );
+
+    let calls = sim.calls();
+    let mut checked = 0;
+    for (gen, reason) in [
+        (1, "first"),
+        (2, "error"),
+        (3, "connect_timeout"),
+        (4, "stall"),
+        (5, "stall"),
+    ] {
+        let i = calls
+            .iter()
+            .position(swapped(gen))
+            .unwrap_or_else(|| panic!("no swap {gen}"));
+        assert_eq!(
+            calls[i - 1],
+            Call::Log(format!("sink swap reason={reason} gen={gen}")),
+            "the line just before swap {gen}"
+        );
+        checked += 1;
+    }
+    let lines = calls
+        .iter()
+        .filter(|c| matches!(c, Call::Log(l) if l.starts_with("sink swap ")))
+        .count();
+    let swaps = calls.iter().filter(|c| matches!(c, Call::Swap(..))).count();
+    eprintln!("swaps {swaps}, swap lines {lines}, checked {checked}");
+    assert_eq!((checked, lines, swaps), (5, 5, 5), "one line per swap");
+}

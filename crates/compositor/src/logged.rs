@@ -5,8 +5,9 @@
 //! (Owed 32: a stream key in a GStreamer error follows no marker, so `redact` alone cannot see it).
 //!
 //! - `LoggedProgramme`: `programme started` on a successful `start`, `programme start failed: <text>`
-//!   (scrubbed) on a failed one, and `sink swap gen=<n> target=<redacted>` on `swap_sink`. Nothing on
-//!   `hide_overlay`: the driver logs the one `overlay hidden reason=<r> gen=<g>` line per hide.
+//!   (scrubbed) on a failed one, and `sink swap gen=<n> target=<redacted>` on `swap_sink` (the driver's
+//!   `sink swap reason=<r> gen=<n>` comes just before it, Owed 87). Nothing on `hide_overlay`: the
+//!   driver logs the one `overlay hidden reason=<r> gen=<g>` line per hide.
 //! - `LoggedGraphics`: `graphics restart gen=<n>` and `graphics stop`.
 //! - `LoggedPlane`: a final beat whose call returned an error, with its text (C07 has scrubbed it; it
 //!   is scrubbed again here), on the final lane too (C08 review round 1: final beats run on
