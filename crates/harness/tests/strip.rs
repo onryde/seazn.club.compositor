@@ -7,7 +7,7 @@ mod common;
 use common::{explain, slate, x264_round_trip, Rng};
 use harness::camera::{self, Layout, Pattern};
 use harness::checker::CAMERA_AAC_DELAY_MS;
-use harness::media::{scan_segment, CameraPipeline, CameraSink};
+use harness::media::{scan_segment, CameraOptions, CameraPipeline, CameraSink, TS_ALIGNMENT};
 
 /// The brief's 1 000 random counters, each drawn on the ball picture; then the snow subset; then
 /// slates, which must read as no strip.
@@ -155,4 +155,118 @@ fn camera_round_trip(pattern: Pattern) {
         s.audio
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Owed 81's probe at the camera's sink (`CameraPipeline::on_sent` read by `harness::wire`): every
+/// frame the camera pushes is one video PES start in what the sink takes, in order, one camera
+/// period apart in PTS (90 kHz: 3 000 ticks a frame, give or take the mux's rounding of
+/// 33 333 333 ns), and the audio's PES are there too. Then the same with the audio off (the
+/// control's `--audio off`): video PES only. Then at alignment 1 (`--ts-alignment 1`): every buffer
+/// is one packet. Each buffer holds exactly the alignment's packets, and the checker still reads
+/// every strip.
+#[test]
+fn the_wire_probe_sees_every_frame_the_camera_sends_with_and_without_audio() {
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
+
+    use harness::wire::{self, Stream};
+
+    common::init();
+    const FRAMES: u32 = 90;
+    let mut runs = 0;
+    for (audio, ts_alignment) in [(true, TS_ALIGNMENT), (false, TS_ALIGNMENT), (true, 1)] {
+        let dir = std::env::temp_dir().join(format!(
+            "harness-wire-{}-{audio}-{ts_alignment}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ts = dir.join("camera.ts");
+        let opts = CameraOptions { audio, ts_alignment };
+        let mut cam =
+            CameraPipeline::start_with(&CameraSink::File(ts.clone()), 1280, 720, Pattern::Ball, opts)
+                .unwrap();
+        let seen: Arc<Mutex<Vec<wire::Scan>>> = Arc::default();
+        let s2 = Arc::clone(&seen);
+        cam.on_sent(Arc::new(move |b: &[u8]| s2.lock().unwrap().push(wire::scan(b))))
+            .unwrap();
+        for c in 1..=FRAMES {
+            cam.push(c).unwrap();
+        }
+        cam.finish(60).unwrap();
+        let scans = seen.lock().unwrap().clone();
+        let (bad, partial): (u64, usize) = scans
+            .iter()
+            .fold((0, 0), |(b, p), s| (b + s.bad_sync, p + s.partial_bytes));
+        let sizes: BTreeSet<u64> = scans.iter().map(|s| s.packets).collect();
+        let starts: Vec<_> = scans.iter().flat_map(|s| s.starts.clone()).collect();
+        let video: Vec<u64> = starts
+            .iter()
+            .filter(|p| p.stream == Stream::Video)
+            .map(|p| p.pts90k.expect("every video PES carries a PTS"))
+            .collect();
+        let audio_starts = starts.iter().filter(|p| p.stream == Stream::Audio).count();
+        eprintln!(
+            "wire (audio {audio}, alignment {ts_alignment}): {} buffers of {sizes:?} packets, {} video PES, \
+             {audio_starts} audio PES",
+            scans.len(),
+            video.len()
+        );
+        assert_eq!((bad, partial), (0, 0), "whole, well-synced packets");
+        // The EOS flush pads its last buffer to the alignment with null packets, so every buffer,
+        // that one too, holds exactly the alignment's packets.
+        assert_eq!(
+            sizes,
+            BTreeSet::from([u64::from(ts_alignment)]),
+            "packets per buffer"
+        );
+        assert_eq!(video.len(), FRAMES as usize, "one video PES per pushed frame");
+        for w in video.windows(2) {
+            assert!(
+                (2_999..=3_001).contains(&(w[1] - w[0])),
+                "video PTS step {} (90 kHz)",
+                w[1] - w[0]
+            );
+        }
+        if audio {
+            // Each push of 1 600 samples completes at most two AAC frames of 1 024, and the mux
+            // packs one or more AAC frames into each audio PES (plus the encoder's flush at EOS).
+            assert!(
+                (1..=2 * FRAMES as usize + 1).contains(&audio_starts),
+                "{audio_starts} audio PES"
+            );
+        } else {
+            assert_eq!(audio_starts, 0, "no audio track, no audio PES");
+        }
+        let s = scan_segment(&ts, "camera.ts", 0);
+        let counters: Vec<Option<u32>> = s.frames.iter().map(|f| f.counter).collect();
+        assert_eq!(
+            counters,
+            (1..=FRAMES).map(Some).collect::<Vec<_>>(),
+            "audio {audio}, alignment {ts_alignment}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        runs += 1;
+    }
+    assert_eq!(runs, 3);
+}
+
+/// An alignment an SRT payload cannot carry (over 7 packets), or none, is refused before anything
+/// is built.
+#[test]
+fn a_ts_alignment_outside_one_to_seven_is_refused() {
+    common::init();
+    let ts = std::env::temp_dir().join(format!("harness-wire-refused-{}.ts", std::process::id()));
+    let mut refused = 0;
+    for ts_alignment in [0, TS_ALIGNMENT + 1] {
+        let opts = CameraOptions {
+            ts_alignment,
+            ..CameraOptions::default()
+        };
+        let e = CameraPipeline::start_with(&CameraSink::File(ts.clone()), 1280, 720, Pattern::Ball, opts)
+            .expect_err("refused");
+        assert!(e.contains("ts alignment"), "{e}");
+        refused += 1;
+    }
+    assert_eq!(refused, 2);
+    assert!(!ts.exists(), "nothing was built");
 }

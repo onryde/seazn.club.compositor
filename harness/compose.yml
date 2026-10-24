@@ -5,12 +5,17 @@
 # Variables (run-case.sh exports them; secrets are random per run and never in argv):
 #   RELAY_IMAGE, HARNESS_IMAGE        the images under test (image.yml's build; the Dockerfile's
 #                                     `harness` stage)
-#   HARNESS_OUT                       out/<case>: emit.jsonl, heartbeats.jsonl, rec/ (recordings)
+#   HARNESS_OUT                       out/<case>: emit.jsonl, heartbeats.jsonl, rec/ (recordings),
+#                                     and Owed 81's probes: wire.jsonl (what fake-camera sent, and
+#                                     when) and tap.jsonl (when input-tap decoded each frame)
 #   HARNESS_UID, HARNESS_GID          the files in HARNESS_OUT belong to the runner's user
 #   SESSION_ID, JOB_TOKEN             the compositor's and fake-control's (random per run)
 #   HARNESS_SRT_PASSPHRASE            MediaMTX's camera path, fake-camera and the rewritten session
 #   RELAY_DEADLINE_AT                 the case's deadline (RFC 3339)
 #   CAMERA_SIZE, CAMERA_PATTERN       fake-camera's picture (defaults 1280x720, ball)
+#   CAMERA_AUDIO                      on (default) or off: the video alone (Owed 81's control)
+#   CAMERA_TS_ALIGNMENT               packets per buffer at the camera's mux, 1 to 7 (default 7,
+#                                     media.rs's SRT payload; Owed 81's fix candidate is 1)
 name: seazn-harness
 
 networks:
@@ -64,6 +69,44 @@ services:
       - ${CAMERA_SIZE:-1280x720}
       - --pattern
       - ${CAMERA_PATTERN:-ball}
+      # Owed 81's probe: every PES the camera hands srtsink, stamped (harness::wire).
+      - --wire
+      - /out/wire.jsonl
+      - --audio
+      - ${CAMERA_AUDIO:-on}
+      - --ts-alignment
+      - ${CAMERA_TS_ALIGNMENT:-7}
+    volumes:
+      - ${HARNESS_OUT:?}:/out
+
+  # Owed 81's probe: a second reader of the camera path, built as the compositor's input is
+  # (latency 1000 ms, its log's), that stamps each decoded frame. Not impaired: netem-in's filter
+  # matches the compositor's address only.
+  input-tap:
+    image: ${HARNESS_IMAGE:?}
+    init: true
+    user: "${HARNESS_UID:?}:${HARNESS_GID:?}"
+    networks:
+      harness:
+        ipv4_address: 172.28.0.50
+    depends_on: [mediamtx]
+    environment:
+      HARNESS_SRT_PASSPHRASE: ${HARNESS_SRT_PASSPHRASE:?}
+      XDG_CACHE_HOME: /tmp
+    command:
+      - input-tap
+      - --out
+      - /out/tap.jsonl
+      - --srt-host
+      - mediamtx
+      - --srt-port
+      - "8890"
+      - --stream-id
+      - read:cam
+      - --latency-ms
+      - "1000"
+      - --size
+      - 1280x720
     volumes:
       - ${HARNESS_OUT:?}:/out
 

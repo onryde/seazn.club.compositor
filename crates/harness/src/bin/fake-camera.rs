@@ -6,8 +6,16 @@
 //!
 //! ```text
 //! fake-camera --emit /out/emit.jsonl --listen 0.0.0.0:7001 --srt-host mediamtx --srt-port 8890 \
-//!   --stream-id publish:cam [--size 1280x720] [--pattern ball|snow|noise] [--latency-ms 200]
+//!   --stream-id publish:cam [--size 1280x720] [--pattern ball|snow|noise] [--latency-ms 200] \
+//!   [--wire /out/wire.jsonl] [--audio on|off] [--ts-alignment 1..7]
 //! ```
+//!
+//! `--wire` (Owed 81's probe) writes a line for every PES packet that starts in a buffer the camera
+//! hands `srtsink` (`{"build","stream","pid","pts90k","wall_us"}`, `harness::wire`), and one for
+//! each build's first counter (`{"build","first_counter","wall_us"}`), so a run can tell when the
+//! camera SENT each frame from when it pushed it (`--emit`). `--audio off` (Owed 81's control)
+//! sends the video alone: no tone bursts, so the checker's A/V facts are empty on such a run.
+//! `--ts-alignment` (default 7, `media::TS_ALIGNMENT`) is the mux's TS packets per SRT payload.
 //!
 //! The SRT passphrase is `HARNESS_SRT_PASSPHRASE` (environment, never argv). A failed build (MediaMTX
 //! not up yet, a kicked publisher) is logged and rebuilt a second later; the counter keeps its pace
@@ -21,11 +29,12 @@ use std::time::{Duration, Instant};
 
 use adapters::redact::Scrubber;
 use harness::camera::{self, parse_command, Pattern, Schedule};
-use harness::clock::now_ms;
-use harness::media::{self, CameraPipeline, CameraSink, SrtTarget, FRAME_NS};
+use harness::clock::{now_ms, now_us};
+use harness::media::{self, CameraOptions, CameraPipeline, CameraSink, SentFn, SrtTarget, FRAME_NS};
+use harness::wire::{self, Stream};
 use serde_json::json;
 
-const FLAGS: [&str; 8] = [
+const FLAGS: [&str; 11] = [
     "--emit",
     "--listen",
     "--srt-host",
@@ -34,6 +43,9 @@ const FLAGS: [&str; 8] = [
     "--size",
     "--pattern",
     "--latency-ms",
+    "--wire",
+    "--audio",
+    "--ts-alignment",
 ];
 const REQUIRED: [&str; 5] = ["--emit", "--listen", "--srt-host", "--srt-port", "--stream-id"];
 /// How long a failed build waits before the next.
@@ -59,6 +71,33 @@ fn args() -> Result<BTreeMap<&'static str, String>, String> {
 
 fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `--wire`'s file, shared by each build's probe.
+type Wire = Arc<Mutex<LineWriter<std::fs::File>>>;
+
+/// The probe for build `build`: each PES start in a sent buffer, stamped with the buffer's wall time.
+/// A buffer that is not whole, well-synced packets gets a line of its own, so a short read is seen.
+fn wire_probe(w: &Wire, build: u64) -> SentFn {
+    let w = Arc::clone(w);
+    Arc::new(move |bytes: &[u8]| {
+        let at = now_us();
+        let s = wire::scan(bytes);
+        let mut out = locked(&w);
+        for p in &s.starts {
+            let stream = match p.stream {
+                Stream::Video => "video",
+                Stream::Audio => "audio",
+            };
+            let line =
+                json!({"build": build, "stream": stream, "pid": p.pid, "pts90k": p.pts90k, "wall_us": at});
+            let _ = writeln!(out, "{line}");
+        }
+        if s.bad_sync > 0 || s.partial_bytes > 0 {
+            let line = json!({"build": build, "bad_sync": s.bad_sync, "partial_bytes": s.partial_bytes, "wall_us": at});
+            let _ = writeln!(out, "{line}");
+        }
+    })
 }
 
 fn size(s: &str) -> Result<(u32, u32), String> {
@@ -112,6 +151,22 @@ fn run() -> Result<(), (u8, String)> {
     scrub.add(&passphrase);
     let (w, h) = size(a.get("--size").map_or("1280x720", String::as_str)).map_err(with(64))?;
     let pattern = Pattern::parse(a.get("--pattern").map_or("ball", String::as_str)).map_err(with(64))?;
+    let audio = match a.get("--audio").map_or("on", String::as_str) {
+        "on" => true,
+        "off" => false,
+        other => return Err((64, format!("--audio {other}: on or off"))),
+    };
+    let opts = CameraOptions {
+        audio,
+        ts_alignment: a
+            .get("--ts-alignment")
+            .map_or(Ok(media::TS_ALIGNMENT), |v| v.parse())
+            .map_err(|_| (64, "--ts-alignment: a number".to_owned()))?,
+    };
+    // Refused here, before the first build: a build would refuse it every second forever.
+    if !(1..=media::TS_ALIGNMENT).contains(&opts.ts_alignment) {
+        return Err((64, format!("--ts-alignment: 1 to {}", media::TS_ALIGNMENT)));
+    }
     let target = SrtTarget {
         host: a["--srt-host"].clone(),
         port: a["--srt-port"]
@@ -130,6 +185,16 @@ fn run() -> Result<(), (u8, String)> {
         .open(&a["--emit"])
         .map_err(|e| (73, format!("{}: {e}", a["--emit"])))?;
     let mut emit = LineWriter::new(emit);
+    let wire: Option<Wire> = match a.get("--wire") {
+        Some(p) => Some(Arc::new(Mutex::new(LineWriter::new(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .map_err(|e| (73, format!("{p}: {e}")))?,
+        )))),
+        None => None,
+    };
     media::init().map_err(with(69))?;
 
     let schedule = Arc::new(Mutex::new(Schedule::new(w, h)));
@@ -140,8 +205,10 @@ fn run() -> Result<(), (u8, String)> {
         std::thread::spawn(move || controls(server, s, p));
     }
     println!(
-        "fake-camera: {w}x{h} {pattern:?} at {} fps to {}:{}; controls on {}",
+        "fake-camera: {w}x{h} {pattern:?} at {} fps (audio {}, ts alignment {}) to {}:{}; controls on {}",
         camera::FPS,
+        if audio { "on" } else { "off" },
+        opts.ts_alignment,
         target.host,
         target.port,
         a["--listen"]
@@ -153,15 +220,21 @@ fn run() -> Result<(), (u8, String)> {
     let mut builds = 0u64;
     loop {
         let size = locked(&schedule).size();
-        let mut cam = match CameraPipeline::start(&CameraSink::Srt(target.clone()), size.0, size.1, pattern) {
-            Ok(c) => c,
-            Err(e) => {
-                println!("fake-camera: build failed: {}", scrub.scrub(&e));
-                std::thread::sleep(REBUILD_AFTER);
-                continue;
-            }
-        };
+        let mut cam =
+            match CameraPipeline::start_with(&CameraSink::Srt(target.clone()), size.0, size.1, pattern, opts)
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("fake-camera: build failed: {}", scrub.scrub(&e));
+                    std::thread::sleep(REBUILD_AFTER);
+                    continue;
+                }
+            };
         builds += 1;
+        if let Some(w) = &wire {
+            cam.on_sent(wire_probe(w, builds)).map_err(with(70))?;
+        }
+        let mut first_of_build = true;
         // A new build starts at the counter due now: the frames due while there was none are gone.
         k = k.max(start.elapsed().as_nanos() as u64 / FRAME_NS);
         let failure = loop {
@@ -187,6 +260,13 @@ fn run() -> Result<(), (u8, String)> {
                 }
                 let line = json!({"counter": c, "wall_ms": now_ms()});
                 writeln!(emit, "{line}").map_err(|e| (74, format!("emit: {e}")))?;
+                if first_of_build {
+                    first_of_build = false;
+                    if let Some(w) = &wire {
+                        let line = json!({"build": builds, "first_counter": c, "wall_us": now_us()});
+                        writeln!(locked(w), "{line}").map_err(|e| (74, format!("wire: {e}")))?;
+                    }
+                }
                 let mut n = locked(&pushed);
                 *n += 1;
                 if (*n).is_multiple_of(REPORT_EVERY_FRAMES) {
