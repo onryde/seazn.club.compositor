@@ -15,7 +15,9 @@
 # then its status (`rc_at_ms`, `rc`).
 #
 # Commands:
-#   tree                       one line per process: pid, ppid, start_ms, comm, type (or null)
+#   tree                       one line per process: pid, ppid, start_ms, comm, type (or null);
+#                              start_ms is on the same wall clock (`boot_ms` plus the process's
+#                              start ticks), so it compares with docker's events and the kill marks
 #   kill-cef                   SIGKILL every CEF child at once (case 8); fails when it finds none
 #   kill-compositor            SIGKILL the compositor process (case 9)
 #   kill-zygote gpu|renderer   SIGKILL the compositor's zygote that parents the GPU process, or a
@@ -51,7 +53,26 @@ now_ms() {
 }
 
 CLK_TCK=$(getconf CLK_TCK)
-BTIME=$(awk '/^btime/ { print $2 }' "$PROC/stat")
+
+# The boot instant on this host's wall clock, in ms: the wall clock now, less /proc/uptime read at
+# the same moment (both kernel clocks; uptime's resolution is 10 ms). Never /proc/stat's btime
+# (fix round 3): it is whole seconds, fixed at boot while the wall clock is slewed, and CI's case
+# 14 read it 173 to 1 080 ms early against docker's events, so every process of the restarted
+# container looked older than the restart's `start` (6 of 6 legs).
+boot_ms() {
+  local up sec frac
+  IFS=' ' read -r up _ 2>/dev/null <"$PROC/uptime" || return 1
+  sec=${up%%.*}
+  frac=${up#*.}
+  [ "$frac" != "$up" ] || frac=0
+  frac="${frac}000"
+  frac=${frac:0:3}
+  echo $(($(now_ms) - (10#$sec * 1000 + 10#$frac)))
+}
+if ! BOOT_MS=$(boot_ms); then
+  echo '{"error":"no /proc/uptime"}'
+  exit 1
+fi
 
 # The --type= argument of a process (empty when none), read with builtins only. The product's own
 # rule (`split_cmdline` in crates/adapters/src/cef_graphics.rs, mirrored, never imported): the
@@ -87,7 +108,7 @@ read_stat() {
   read -r -a f <<<"$s" || true
   [ "${#f[@]}" -ge 20 ] || return 1
   STAT_PPID=${f[1]}
-  STAT_START_MS=$((BTIME * 1000 + f[19] * 1000 / CLK_TCK))
+  STAT_START_MS=$((BOOT_MS + f[19] * 1000 / CLK_TCK))
 }
 
 pids() {
