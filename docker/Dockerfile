@@ -84,10 +84,11 @@ COPY --from=cef-build /src/gstcefsrc/build/Release /opt/gstcef
 COPY --from=rust-build /usr/local/bin/compositor /usr/local/bin/compositor
 COPY docker/entrypoint.sh /entrypoint.sh
 COPY docker/supervise.sh /usr/local/lib/seazn/supervise.sh
+COPY docker/xvfb.sh /usr/local/lib/seazn/xvfb.sh
 ENV GST_PLUGIN_PATH=/opt/gstcef COMPOSITOR_DRIVERS=live DISPLAY=:99
 # Owed 54: the CEF user's HOME exists and is writable (GStreamer's registry, NSS's database), and
 # only this one process's CEF uses it.
-RUN chmod 0755 /entrypoint.sh && chmod 0644 /usr/local/lib/seazn/supervise.sh \
+RUN chmod 0755 /entrypoint.sh && chmod 0644 /usr/local/lib/seazn/supervise.sh /usr/local/lib/seazn/xvfb.sh \
  && command -v prlimit >/dev/null \
  && useradd --system --uid 10001 --home /home/relay --create-home --shell /usr/sbin/nologin relay \
  && missing=$(ldd /opt/gstcef/libcef.so /opt/gstcef/libgstcef.so /opt/gstcef/gstcefsubprocess /usr/local/bin/compositor \

@@ -1419,7 +1419,11 @@ logged `exit code=0` (or `exit code=75`'s path, unmeasured).
   every core there: 6 compositor aborts printed `Aborted` with no `(core dumped)`; a control in the
   same Machine dumped a 557 KB `core` with an unlimited limit and nothing with 0. Fly's own default is
   soft 0, hard unlimited, on init, tini, bash and Xvfb. The rootfs is reset at every start, an
-  `on-failure` restart included, so no core or profile file outlives a boot there.
+  `on-failure` restart included, so no core or profile file outlives a boot there. (Corrected
+  2026-10-24, the PR #54 review's m1: of that sentence only the starts after a requested stop were
+  measured, 10 of them, a file left in `/tmp` gone each time; the `on-failure` restart is cited from
+  Fly's docs, "Restarting wipes the ephemeral file system", with `persist_rootfs` defaulting to
+  `never`, which web's Machine create does not set. F-025.)
 - **So, as built:** the compositor is non-dumpable (`PR_SET_DUMPABLE 0`: no core of it under any
   pattern), and its RLIMIT_CORE is 1 byte, soft and hard, which CEF's children inherit (the dumpable
   flag resets at `execve`): refused for a pipe, and below the ELF minimum for a file. The entrypoint
@@ -1769,3 +1773,84 @@ INT and TERM also `wait`ed on the compositor, and re-waited after each trap.
   exists to the first poll that lists it. The adapter now lists at every ready too (the decision log's
   "Zygote watch at ready"); what is left is a zygote that dies between CEF's start and the first
   ready (Owed 70 (e)).
+
+## F-025: Owed 85's cause: a restarted container's Xvfb refuses its predecessor's lock (image run 40057826178, 2026-10-24)
+
+The follow-up to F-024's first fact (Owed 85; F-024 is on `feat/c14-chaos`, unmerged at the time).
+
+- **Measured, the real Xvfb** (image run 40057826178, head `f190df4`, the entrypoint unchanged; the
+  in-place restart probe, `scripts/image_probe.py --restarts 6`): containers under Docker's
+  `--restart on-failure:2` (ADR 0007 item 5's Docker equivalent), which restarts the same container,
+  so its writable layer and `/tmp` persist as under compose. `scripts/xvfb_witness.sh`, bind-mounted
+  ahead of `/usr/bin/Xvfb`, logged each Xvfb start's pid, the pid in `/tmp/.X99-lock` and Xvfb's own
+  stderr (the entrypoint sends that to `/dev/null`, which is where the reason had gone).
+  - 2 of the 4 restarts made (after 137 and after 133, in two containers): the new Xvfb started as
+    pid 10, found `lock=10 socket=yes`, and said `Fatal server error: (EE) Server is already active
+    for display 99`. No Xvfb ran in the new life, `/proc/net/unix` held no X99 socket, the
+    compositor's first build failed `init_cef: Failed to initialize CEF` (the GStreamer line's pid
+    18) and graphics went `failed` 3.5 s later. Those two containers' second restarts could not be
+    made (no CEF in the life before), so 4 of the 6 owed were checked, and the probe was red.
+  - The other 2 (after 75 then 133, one container): the new Xvfb was pid 11 against the lock's 10,
+    then pid 10 against 11; Xvfb found the lock's pid gone, took the lock as stale, and CEF was ready
+    in 2.2 s and 1.4 s, with one Xvfb and the lock naming it. Both met the previous life's socket
+    (`socket=yes`), and it did not stop them: Xvfb's transport unlinks the path before it binds
+    (xtrans 1.5.0's `SocketUNIXCreateListener`).
+- **Xvfb's rule** (xorg-server 21.1.12, Ubuntu 24.04's): `LockServer` (os/utils.c, called from
+  `OsInit`, os/osinit.c:313) reads the pid from an existing lock and calls `kill(pid, 0)`. Only
+  `ESRCH` makes the lock stale; success or `EPERM` is `FatalError("Server is already active for
+  display …")`, and the pid it finds live can be its own. The refusal comes before
+  `CreateWellKnownSockets` (dix/main.c), which unlinks and binds the socket path, so the old
+  `/tmp/.X11-unix/X99` stays, and the entrypoint's `[ -e /tmp/.X11-unix/X99 ]` wait passed on it at
+  once (F-024's 11-15 ms against 115-124 ms).
+- **Why the pid repeats:** a fresh container's Xvfb is pid 10 (image run 40027305462's table: tini 1,
+  the entrypoint 7, Xvfb 10, the waiter 20, the compositor 21), after the entrypoint's two `prlimit`
+  forks, which never vary. A container start is a new pid namespace, so a restart's forks repeat:
+  both failed restarts above, and 12 of round 2b's 13 below (the 13th: 19), logged the compositor as
+  pid 18 in the `init_cef` line, three forks fewer than a fresh start's 21: the three `sleep 0.1` the
+  wait loop skipped. The
+  namespace's first pids are not fixed, though: 1 life in 6 here started one pid later (Xvfb 11),
+  and such a life recovers when the lock's pid is gone at the check: C14's 5 recoveries in 18,
+  twice.
+- **C14's runs, the same signature:** round 2b (chaos runs 40056474269 and 40056388445, head
+  `66db5f4`) failed `init_cef` after 13 of 18 restarts again: 75 6 of 7, 133 3 of 5, 137 4 of 6.
+  Its `container-diff.txt` (names, `docker diff`) shows what a restart inherits: `/tmp/.X11-unix/X99`
+  and `/tmp/.X99-lock`, beside HOME's dconf, GStreamer registry and NSS database.
+- **Ruled out:** Chromium's singleton files (hypothesis 2) and `/dev/shm` leftovers (3). The CEF
+  profile, CEF's root cache path, is under `TMPDIR=/dev/shm/seazn`, and Docker mounts a fresh
+  `/dev/shm` at each start: in every restarted life the probe listed, `/dev/shm/seazn` held only that
+  life's own `seazn-cef-<pid>-…` (and its `.org.chromium.Chromium.*`), and the profile sweep removed
+  nothing; `container-diff.txt` lists no singleton file.
+- **Fly** (corrected 2026-10-24, the PR #54 review's m1: this said F-018 MEASURED the reset across an
+  `on-failure` restart; no file was ever checked across one): cited, not measured. Fly's docs say
+  "Restarting wipes the ephemeral file system" (docs.fly.io/apps/restart) and `persist_rootfs`
+  defaults to `never`; web's Machine create sets no `persist_rootfs` (seazn.club
+  `apps/web/src/server/relay/runner-fly.ts`). What was measured is narrower: a Fly probe for Owed 73
+  (2026-10-20, Machine `48e4533c564ed8`; its record is outside this repo) found a file it had left
+  in `/tmp` gone at each of 10 starts after a requested stop. So Owed 85 is a restart that keeps the
+  writable layer (compose, Docker's `--restart`, ADR 0007 item 5's Docker equivalent). The fix holds
+  on both, and on a Machine that ever sets `persist_rootfs` too: no X lock is written for a later
+  boot to meet.
+- **So** (the fix, `docker/xvfb.sh`, sourced by the entrypoint; corrected 2026-10-24 by the PR #54
+  review's C1 and I1, below): `start_xvfb` starts Xvfb with `-displayfd`, which removes both halves
+  of the cause. It sets Xvfb's `nolock` (xorg-server 21.1.12, os/utils.c's `ProcessCommandLine`;
+  `LockServer` then returns at once), so Xvfb neither reads nor writes `/tmp/.X99-lock` and no life
+  leaves one for the next; and ready is Xvfb's own display line on that fd (`NotifyParentProcess`,
+  os/connection.c, called from dix/main.c once its sockets listen and its screen and input are up),
+  read from a file made new at each start, instead of a socket file that may be an earlier life's,
+  so an Xvfb that exits first fails the start at once (70, "it exited before it was ready"). The
+  socket an earlier life left needs nothing: Xvfb replaces it (above). The check is image.yml's
+  "In-place restart probe" step: 6 restarts, each kind twice, every one made whatever an earlier
+  check found; after each, CEF ready, one Xvfb with `-displayfd`, no lock, and that Xvfb listening
+  on `/tmp/.X11-unix/X99`; per container, the witness shows no start met a lock and each restart met
+  the previous life's socket.
+- **Corrected 2026-10-24 (the PR #54 review's C1 and I1).** The fix as first built (`e7ab150`)
+  also removed the display's lock and socket before Xvfb started, and this finding called that
+  removal what made a restart safe, and had the probe require a lock naming the live Xvfb. Both were
+  wrong: under `-displayfd` there is no lock to remove or to name, and the socket is replaced by
+  Xvfb itself. Head `34632fd`'s image run 40058946304 shows it on the real Xvfb: CEF ready after each
+  of the 3 restarts made (75, 137, 133), every life's lock `''` (none), and the probe red on its own
+  lock check, whose failure then cancelled each container's second restart (the review's I2). Either
+  half alone fixed the restart, so neither was tested. **Decided** (coordinator-medium, 2026-10-24,
+  decision log): `-displayfd` stays and the removal goes; beside `-displayfd` it changed nothing
+  observable (the stub test's hand mutant that puts it back changes no outcome, only what each case's
+  Xvfb met), and alone it would keep the socket-file wait that a leftover socket fools.
