@@ -487,6 +487,15 @@ fn base_ns(s: &SegmentScan) -> u64 {
     s.frames.first().map_or(0, |f| f.pts_ns)
 }
 
+/// Where an outage sits in the recording's frames: before the first, before a segment's first, or
+/// after the last.
+#[derive(Debug, Clone, Copy)]
+enum Split {
+    Head,
+    Before(usize),
+    Tail,
+}
+
 /// How one segment's frames are dated (the module comment).
 #[derive(Debug, Clone, Copy)]
 struct Dating {
@@ -568,17 +577,19 @@ pub fn analyze(input: &Inputs, settings: &Settings) -> Report {
         let next_first = datings[kb].wall(b.frames[0].pts_ns);
         let gap = next_first - (prev_end + period);
         if gap > threshold {
-            outages.push(Outage::new(
-                round(prev_end + period),
-                round(next_first),
-                "between",
+            outages.push((
+                Outage::new(round(prev_end + period), round(next_first), "between"),
+                Split::Before(kb),
             ));
         } else if -gap > threshold {
             let content_gap = content_gap_ms(a, b, period, settings.camera_period_ms);
             let end = next_first - content_gap.unwrap_or(0.0) - period;
             datings[ka].anchor = Some((end, last_ns));
             if content_gap.is_some_and(|g| g > threshold) {
-                outages.push(Outage::new(round(end + period), round(next_first), "between"));
+                outages.push((
+                    Outage::new(round(end + period), round(next_first), "between"),
+                    Split::Before(kb),
+                ));
             }
             overlaps.push(SegmentOverlap {
                 file: a.file.clone(),
@@ -594,7 +605,10 @@ pub fn analyze(input: &Inputs, settings: &Settings) -> Report {
     let mut pts_gaps = Vec::new();
     let mut seg_facts = Vec::new();
     let mut content_ms = 0.0;
+    // Each segment's first frame's index in `frames`.
+    let mut seg_first = Vec::with_capacity(segments.len());
     for (s, d) in segments.iter().zip(&datings) {
+        seg_first.push(frames.len());
         seg_facts.push(SegmentFact {
             file: s.file.clone(),
             start_wall_ms: s.start_wall_us.div_euclid(1000),
@@ -624,26 +638,38 @@ pub fn analyze(input: &Inputs, settings: &Settings) -> Report {
     // The run's edges (PR #48 review, Gap Hunt): an output that starts late or dies early.
     if let (Some(first), Some(live)) = (frames.first(), first_live_ms(&input.beats)) {
         if first.wall - live as f64 > threshold {
-            outages.push(Outage::new(live, round(first.wall), "head"));
+            outages.push((Outage::new(live, round(first.wall), "head"), Split::Head));
         }
     }
     if let (Some(last), Some(end)) = (frames.last(), input.end_request_ms) {
         if end as f64 - (last.wall + period) > threshold {
-            outages.push(Outage::new(round(last.wall + period), end, "tail"));
+            outages.push((Outage::new(round(last.wall + period), end, "tail"), Split::Tail));
         }
     }
-    outages.sort_by_key(|o| o.from_wall_ms);
+    // Each outage's counters come from its own sides: the frames between it and its neighbouring
+    // outages, in recording order. A wall-time search could reach past the outage before it: a
+    // re-dated burst's frames clamp to their segment's name, after the start of the outage hidden
+    // under its overlap, and that outage then read its counter from before the first one and counted
+    // the first one's camera gap again (the re-review's m-4; Owed 84 (c)).
+    let mut split: Vec<(usize, Outage)> = outages
+        .into_iter()
+        .map(|(o, at)| {
+            let k = match at {
+                Split::Head => 0,
+                Split::Before(kb) => seg_first[kb],
+                Split::Tail => frames.len(),
+            };
+            (k, o)
+        })
+        .collect();
+    split.sort_by_key(|(k, o)| (*k, o.from_wall_ms));
     let emitted: BTreeMap<u32, i64> = input.emit.iter().map(|e| (e.counter, e.wall_ms)).collect();
-    for o in &mut outages {
-        o.counter_before = frames
-            .iter()
-            .rev()
-            .filter(|f| f.wall < o.from_wall_ms as f64)
-            .find_map(|f| f.counter);
-        o.counter_after = frames
-            .iter()
-            .filter(|f| f.wall >= o.to_wall_ms as f64 - 0.5)
-            .find_map(|f| f.counter);
+    let edges: Vec<usize> = split.iter().map(|(k, _)| *k).collect();
+    for (n, (k, o)) in split.iter_mut().enumerate() {
+        let lo = if n == 0 { 0 } else { edges[n - 1] };
+        let hi = edges.get(n + 1).copied().unwrap_or(frames.len());
+        o.counter_before = frames[lo..*k].iter().rev().find_map(|f| f.counter);
+        o.counter_after = frames[*k..hi].iter().find_map(|f| f.counter);
         if let (Some(b), Some(a)) = (o.counter_before, o.counter_after) {
             if let (Some(eb), Some(ea)) = (emitted.get(&b), emitted.get(&a)) {
                 o.counter_gap_ms = Some(ea - eb);
@@ -651,6 +677,8 @@ pub fn analyze(input: &Inputs, settings: &Settings) -> Report {
             }
         }
     }
+    let mut outages: Vec<Outage> = split.into_iter().map(|(_, o)| o).collect();
+    outages.sort_by_key(|o| o.from_wall_ms);
     // The recorded content's length (every segment's PTS span), so a re-dated backlog shortens
     // nothing; the frame rate over it.
     let duration_ms = round(content_ms);
@@ -1715,6 +1743,84 @@ mod tests {
         assert_eq!(r.output_outages[0].counter_gap_ms, None);
         assert_eq!(r.output_outages[0].lost_ms, None);
         assert_eq!(r.output_outages[0].counter_before, Some(30));
+    }
+
+    // The re-review's m-4 (Owed 84 (c)): a burst segment re-dated from the next one has all its
+    // frames clamped to its name, and the outage hidden under its overlap starts before that name.
+    // That outage's counters are its own boundary's, never a frame beyond the outage before it, so
+    // the first outage's camera gap is not counted twice (round 3's case 4 read 29 800).
+    #[test]
+    fn an_outage_after_a_re_dated_burst_reads_its_own_boundary_not_the_outage_before_it() {
+        // A: 1..=30 from 0 (the cut at 1 000). B, the burst after the reconnect: 35 frames,
+        // 240..=274, named at 10 000. C, after the recorder's reset, named at 10 300 with 320..: by
+        // name and PTS B overlaps C by 866 ms, and 274 -> 320 is 1 500 ms of camera time C never
+        // carried, so the outage under the overlap runs from 10 300 - 1 500 (8 800) to 10 300, and
+        // B's frames all clamp to 10 000.
+        let mut i = inputs(vec![
+            seg(0, strip_frames(1, 30)),
+            seg(10_000, strip_frames(240, 35)),
+            seg(10_300, strip_frames(320, 30)),
+        ]);
+        let camera = settings().camera_period_ms;
+        i.emit = (1..=400u32)
+            .map(|c| Emit {
+                counter: c,
+                wall_ms: (f64::from(c) * camera).round() as i64,
+            })
+            .collect();
+        let r = analyze(&i, &settings());
+        let got: Vec<(i64, i64, Option<u32>, Option<u32>)> = r
+            .output_outages
+            .iter()
+            .map(|o| (o.from_wall_ms, o.to_wall_ms, o.counter_before, o.counter_after))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1_000, 10_000, Some(30), Some(240)),
+                (8_800, 10_300, Some(274), Some(320))
+            ],
+            "{:?}",
+            r.output_outages
+        );
+        // Emits are a camera period apart, rounded to the ms: 30 -> 240 is 7 000 ms over 9 000 of
+        // wall (the burst's frames are 2 s older than their arrival), and 274 -> 320 (9 133 ->
+        // 10 667) is 1 534 over 1 500.
+        let emit = |c: u32| i.emit.iter().find(|e| e.counter == c).unwrap().wall_ms;
+        assert_eq!((emit(240) - emit(30), emit(320) - emit(274)), (7_000, 1_534));
+        let lost: Vec<Option<i64>> = r.output_outages.iter().map(|o| o.lost_ms).collect();
+        assert_eq!(lost, vec![Some(-2_000), Some(34)]);
+        // Two wall-gap outages with a slate-only segment between them: that side shows no counter,
+        // so both read None there, never a counter from across the other outage (the wall-time
+        // search read 30 and 240 across it and counted each outage's camera gap into the other).
+        let mut slate = strip_frames(100, 30);
+        for f in &mut slate {
+            f.counter = None;
+        }
+        let mut i = inputs(vec![
+            seg(0, strip_frames(1, 30)),
+            seg(5_000, slate),
+            seg(8_000, strip_frames(240, 30)),
+        ]);
+        i.emit = (1..=400u32)
+            .map(|c| Emit {
+                counter: c,
+                wall_ms: (f64::from(c) * camera).round() as i64,
+            })
+            .collect();
+        let r = analyze(&i, &settings());
+        let sides: Vec<(i64, Option<u32>, Option<u32>, Option<i64>)> = r
+            .output_outages
+            .iter()
+            .map(|o| (o.from_wall_ms, o.counter_before, o.counter_after, o.lost_ms))
+            .collect();
+        assert_eq!(
+            sides,
+            vec![(1_000, Some(30), None, None), (6_000, None, Some(240), None)],
+            "{:?}",
+            r.output_outages
+        );
+        eprintln!("outages checked: 2 recordings, 4 outages");
     }
 
     #[test]
