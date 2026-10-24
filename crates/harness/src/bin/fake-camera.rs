@@ -170,9 +170,13 @@ fn run() -> Result<(), (u8, String)> {
             }
             let counter = u32::try_from(k + 1).map_err(|_| (70, "the counter overflowed".to_owned()))?;
             k += 1;
-            let (out, want) = {
+            // A resume's first frame is a key frame (`Schedule::take_key_due`), asked for only when
+            // there is a frame to push.
+            let (out, want, key) = {
                 let mut s = locked(&schedule);
-                (s.on_frame(counter, now_ms()), s.size())
+                let out = s.on_frame(counter, now_ms());
+                let key = !out.is_empty() && s.take_key_due();
+                (out, s.size(), key)
             };
             if want != cam.size() {
                 if let Err(e) = cam.set_size(want.0, want.1) {
@@ -180,6 +184,11 @@ fn run() -> Result<(), (u8, String)> {
                 }
             }
             let mut failed = None;
+            if key {
+                if let Err(e) = cam.force_key_unit() {
+                    break e;
+                }
+            }
             for c in out {
                 if let Err(e) = cam.push(c) {
                     failed = Some(e);

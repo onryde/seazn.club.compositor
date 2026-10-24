@@ -143,6 +143,7 @@ fn run_delayed(name: &str, swap: bool, rungs: &[&str], audio_delay: u32) -> Repo
         },
         crashes_ms: vec![],
         end_request_ms: None,
+        log: harness::logfacts::LogFacts::default(),
     };
     let r = analyze(
         &inputs,
