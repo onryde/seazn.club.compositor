@@ -1,6 +1,9 @@
 //! Owed 86: the output's starvation alarm, fed one real frame rate a beat. Every level comes from the
 //! profile's own declarations (`OutputProfile::fps_floor`, `fps_recovered`), never from a number
 //! typed here, and every input that is a measurement is F-024's (the starved windows of C14 case 6).
+use std::fs;
+use std::path::Path;
+
 use domain::config::OutputProfile;
 use domain::starvation::{Alarm, StarvationAlarm};
 
@@ -183,4 +186,29 @@ fn every_rate_on_a_walk_matches_the_rule() {
     assert_eq!((raises, clears), (2 * BOTH_MODES.len(), BOTH_MODES.len()));
     assert!(held_raised > 0 && held_down > 0, "a hold was never reached");
     assert!(checked > 0);
+}
+
+/// The recovery level is the harness's fps bar, one number held in two places: here
+/// (`OUTPUT_FPS_RECOVERED_SHARE` of a 30 fps profile) and in the harness (`BUDGET_FPS_MEAN_MIN`,
+/// which the harness's own drift test keeps equal to the committed `harness/thresholds.json`). Read
+/// from that file, so neither moves alone (the PR #69 review's m2).
+#[test]
+fn the_recovery_level_is_the_harness_fps_bar() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../harness/thresholds.json");
+    let text = fs::read_to_string(&path).expect("harness/thresholds.json is committed");
+    let v: serde_json::Value = serde_json::from_str(&text).expect("harness/thresholds.json is JSON");
+    let bar = v["budget_fps_mean_min"]
+        .as_f64()
+        .expect("budget_fps_mean_min is a number");
+    let mut checked = 0;
+    for p in BOTH_MODES {
+        assert!(
+            (p.fps_recovered() - bar).abs() < 1e-12,
+            "{p:?}: recovered {} against the harness's {bar}",
+            p.fps_recovered()
+        );
+        checked += 1;
+    }
+    eprintln!("profiles checked against the harness's fps bar ({bar}): {checked}");
+    assert_eq!(checked, BOTH_MODES.len());
 }
