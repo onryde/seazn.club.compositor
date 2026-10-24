@@ -954,6 +954,22 @@ fn cef_killed_restarts_the_process_and_reds_when_the_kill_missed_or_the_exit_is_
         "died_not_in_place",
         "cef-inplace",
     );
+    let mut w = cef_killed(good(), 133);
+    let (a, b) = (w.at(30.0), w.end);
+    w.beats_in(a, b, |x| x["graphics"] = json!("failed"));
+    assert_fails(
+        &judge(&w, "cef-killed", "", "cef-failed"),
+        "beats_never_failed",
+        "cef-failed",
+    );
+    let mut w = cef_killed(good(), 133);
+    let k = w.at(20.0);
+    w.log.retain(|(at, m)| !(m.starts_with("cef ready") && *at > k));
+    assert_fails(
+        &judge(&w, "cef-killed", "", "cef-noready"),
+        "cef_ready_after_restart",
+        "cef-noready",
+    );
 }
 
 fn process_killed(pid: Value, restart_delay: i64) -> World {
