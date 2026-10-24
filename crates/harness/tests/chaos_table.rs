@@ -258,7 +258,7 @@ fn the_table_reds_on_a_fail_an_error_a_missing_verdict_or_a_missed_sweep() {
     });
     let out = run(&["--table", d]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(stdout(&out).contains("| dest-stall | FAIL | 4/4 | outage_ms | failed: stall_swap |"));
+    assert!(stdout(&out).contains("| dest-stall | FAIL | 4/4 | outage_ms | failed: stall_swap (Owed 87) |"));
     assert!(stdout(&out).contains("this run does not count"));
     reds += 1;
 
@@ -295,4 +295,131 @@ fn the_table_reds_on_a_fail_an_error_a_missing_verdict_or_a_missed_sweep() {
     assert_eq!(out.status.code(), Some(0));
     assert!(stdout(&out).contains("legs: 3, pass: 3, red: 0, not runnable: 0"));
     assert!(stdout(&out).contains("WAVE GATE 3: this run counts (3 of 3 legs PASS)"));
+}
+
+/// The checks a case's verdict can fail: every `require`/`require_run` name in its file, in the case
+/// files it sources, and in run-case.sh's helpers it calls (the names those helpers declare).
+fn declared_checks(case: &str) -> Vec<String> {
+    let read = |p: &str| std::fs::read_to_string(repo().join(p)).unwrap();
+    let mut text = read(&format!("harness/cases/{case}.sh"));
+    if text.contains("cases/cef-gpu-zygote-killed.sh") {
+        text.push_str(&read("harness/cases/cef-gpu-zygote-killed.sh"));
+    }
+    text.push_str(&read("harness/run-case.sh"));
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let t = line.trim_start();
+        for verb in ["require ", "require_run "] {
+            if let Some(rest) = t.strip_prefix(verb) {
+                if let Some(n) = rest.split_whitespace().next() {
+                    names.push(n.to_owned());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// C14 fix round 3, item 4: chaos.json names the Owed row behind each check a leg is known to fail,
+/// so a red table reads at a glance. Every name must be a check that leg can fail, and every row
+/// must exist in docs/_INDEX.md with a title here: an owed entry for a check that no longer exists,
+/// or a row that was never written, would make an unexplained red look explained.
+#[test]
+fn every_owed_entry_names_a_real_check_and_a_real_owed_row() {
+    let m = manifest();
+    let titles = m["owed_titles"].as_object().expect("chaos.json has owed_titles");
+    let index = std::fs::read_to_string(repo().join("docs/_INDEX.md")).unwrap();
+    let mut checked = 0;
+    for l in m["legs"].as_array().unwrap() {
+        let case = l["case"].as_str().unwrap();
+        let Some(owed) = l.get("owed") else { continue };
+        let checks = declared_checks(case);
+        for (check, row) in owed.as_object().unwrap() {
+            assert!(
+                checks.contains(check),
+                "{case}: owed check {check} is not a check the case declares"
+            );
+            let row = row.as_str().unwrap();
+            assert!(titles.contains_key(row), "Owed {row} has no title in chaos.json");
+            let n = row.split(' ').next().unwrap();
+            assert!(
+                index.contains(&format!("\n| {n} | ")),
+                "Owed {n} is not a row of docs/_INDEX.md"
+            );
+            checked += 1;
+        }
+    }
+    eprintln!("owed entries checked: {checked}");
+    assert!(
+        checked >= 10,
+        "the known reds of round 2 and 3 are listed ({checked})"
+    );
+}
+
+/// A red table names each failed check's Owed row, and says which reds no Owed row explains. No
+/// verdict is softened: an owed red is as red as any other, and the run never counts.
+#[test]
+fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("chaos-table-owed");
+    let d = dir.to_str().unwrap();
+    let m = manifest();
+    let title = |row: &str| m["owed_titles"][row].as_str().unwrap().to_owned();
+
+    verdicts(&dir, true);
+    // CI's dest-stall (rounds 2 and 3): every failed check is owed.
+    edit(&dir, "dest-stall", |v| {
+        v["status"] = json!("fail");
+        v["failed"] = json!(["stall_swap", "output_lost"]);
+    });
+    // A check no Owed row names: the news in the run.
+    edit(&dir, "camera-stop", |v| {
+        v["status"] = json!("fail");
+        v["failed"] = json!(["slate_ms"]);
+    });
+    // A leg with owed checks that failed on another one too.
+    edit(&dir, "cef-killed-r1", |v| {
+        v["status"] = json!("fail");
+        v["failed"] = json!(["overlay_back", "same_session"]);
+    });
+    let out = run(&["--table", d]);
+    let s = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "an owed red is still red");
+    assert!(s.contains(
+        "| dest-stall | FAIL | 4/4 | outage_ms | failed: stall_swap (Owed 87), output_lost (Owed 84) |"
+    ));
+    assert!(s.contains("| camera-stop | FAIL | 4/4 | outage_ms | failed: slate_ms (NOT OWED) |"));
+    assert!(s.contains("| cef-killed-r1 | FAIL | 4/4 | outage_ms | failed: overlay_back (Owed 85), same_session (NOT OWED) |"));
+    assert!(s.contains("red, every failed check owed: dest-stall\n"), "{s}");
+    assert!(s.contains(
+        "red on a check no Owed row names: camera-stop (slate_ms); cef-killed-r1 (same_session)\n"
+    ));
+    for row in ["84", "85", "87"] {
+        assert!(
+            s.contains(&format!("Owed {row}: {}\n", title(row))),
+            "Owed {row}'s title"
+        );
+    }
+    assert!(!s.contains("Owed 86:"), "only the rows this run's reds name");
+    assert!(s.contains("this run does not count"));
+    assert!(!s.contains("this run counts"));
+
+    // Only owed reds: still red, and the run still does not count.
+    verdicts(&dir, true);
+    edit(&dir, "dest-stall", |v| {
+        v["status"] = json!("fail");
+        v["failed"] = json!(["stall_swap"]);
+    });
+    let out = run(&["--table", d]);
+    let s = stdout(&out);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(s.contains("red on a check no Owed row names: none\n"));
+    assert!(s.contains("WAVE GATE 3: this run does not count"));
+
+    // A green run prints neither line.
+    verdicts(&dir, true);
+    let out = run(&["--table", d]);
+    let s = stdout(&out);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!s.contains("every failed check owed") && !s.contains("no Owed row names"));
+    eprintln!("owed table rows checked: 3, then 1, then 0");
 }

@@ -15,6 +15,12 @@
 #       NOT RUNNABLE leg: an unrun leg is never green (the PR #52 review's I6; case 16's are
 #       Owed 82, which only the owner's ruling closes).
 #
+# A FAIL row names, beside each failed check, the docs/_INDEX.md Owed row chaos.json's `owed` puts
+# behind it for that leg, or NOT OWED; under the table, the red legs every failed check of which is
+# owed, the reds no Owed row explains, and the title of each row named (C14 fix round 3, item 4).
+# That is reading aid only: an owed red is as red as any other, and the exit status and the gate
+# line never read it.
+#
 # The table only reads what each run judged. It never re-judges: run-case.sh's verdict is the one
 # authority, and `CASE_REJUDGE=1 harness/run-case.sh <case>` re-judges a downloaded out/<run>.
 set -euo pipefail
@@ -43,9 +49,26 @@ legs() {
     '($want | split(",") | map(gsub("^ +| +$"; ""))) as $w | [$all[] | select(.leg as $n | any($w[]; . == $n))]'
 }
 
+# The `owed` map of a leg (<case>[-<variant>]) in chaos.json: {check: Owed row}, or {}.
+owed_of() {
+  jq -c --arg leg "$1" '[.legs[] | select((.case + (if (.variant // "") == "" then "" else "-" + .variant end)) == $leg)
+    | .owed // {}] | first // {}' "$MANIFEST"
+}
+
+# The arguments after the first, joined by it; "none" when there are none.
+join_by() {
+  local sep="$1" out=""
+  shift
+  [ "$#" -gt 0 ] || { echo none; return 0; }
+  out="$1"
+  shift
+  for x in "$@"; do out="$out$sep$x"; done
+  printf '%s\n' "$out"
+}
+
 table() {
   local dir="$1" want="${2:-all}" selected n=0 red=0 not_runnable=0 swept=0 sweeps=0 passed=0
-  local leg name case_ f status key measured row unrun=()
+  local leg name case_ f status key measured row owed unowed unrun=() owed_reds=() unowed_reds=() rows_named=()
   selected="$(legs "$want")"
   echo "| leg | verdict | checks | key | measured |"
   echo "|---|---|---|---|---|"
@@ -80,7 +103,14 @@ table() {
         ;;
       fail)
         red=$((red + 1))
-        echo "| $name | FAIL | $row | ${key:--} | failed: $(jq -r '.failed | join(", ")' "$f" | cut -c1-160) |"
+        owed="$(owed_of "$(jq -r .leg <<<"$leg")")"
+        echo "| $name | FAIL | $row | ${key:--} | failed: $(jq -r --argjson o "$owed" '.failed
+          | map(. as $c | if $o[$c] then "\($c) (Owed \($o[$c]))" else "\($c) (NOT OWED)" end) | join(", ")' "$f") |"
+        unowed="$(jq -r --argjson o "$owed" '[.failed[] | select($o[.] == null)]
+          | if . == [] then "" else join(", ") end' "$f")"
+        if [ "$(jq '.failed | length' "$f")" -eq 0 ]; then unowed="no failed check named"; fi
+        if [ -n "$unowed" ]; then unowed_reds+=("$name ($unowed)"); else owed_reds+=("$name"); fi
+        while IFS= read -r r; do rows_named+=("$r"); done < <(jq -r --argjson o "$owed" '.failed[] | $o[.] // empty' "$f")
         ;;
       *)
         red=$((red + 1))
@@ -89,6 +119,14 @@ table() {
     esac
   done < <(jq -c '.[]' <<<"$selected")
   echo
+  if [ $((${#owed_reds[@]} + ${#unowed_reds[@]})) -gt 0 ]; then
+    echo "red, every failed check owed: $(join_by ", " "${owed_reds[@]}")"
+    echo "red on a check no Owed row names: $(join_by "; " "${unowed_reds[@]}")"
+    while IFS= read -r r; do
+      echo "Owed $r: $(jq -r --arg r "$r" '.owed_titles[$r] // "(no title in chaos.json)"' "$MANIFEST")"
+    done < <(printf '%s\n' "${rows_named[@]}" | sort -u -n)
+    echo
+  fi
   # The worst outage of each repeated case (each run already judged its own against the budget).
   local budget repeated
   budget="$(jq '.budget_process_restart_output_ms' "$HERE/thresholds.json")"
