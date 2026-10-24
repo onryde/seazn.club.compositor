@@ -203,7 +203,7 @@ fn gpu_process_deaths_restart_short_of_chromiums_abort() {
 
 // Every trigger at once: the beat names the most urgent. A dead zygote first (the next GPU-process
 // death may abort the process), then the GPU deaths (each brings the abort closer), then the leaks
-// (memory only).
+// (memory, and CPU while a held page keeps painting: Owed 93).
 #[test]
 fn the_final_beat_names_the_most_urgent_cause() {
     let th = t();

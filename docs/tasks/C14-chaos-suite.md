@@ -863,14 +863,30 @@ none an owner ruling. Decision log "C14 case 16 wired".
   <n> characters; verdict.json's measures has it whole]`, never silently. n-1, n-2 and n-4 are the
   Owed 87 agent's (the coordinator).
 - **Mutants.** 50 local, all killed, each by its named sim: the verdict 38, kill-renderer and
-  cef-cpu 6, the parsers 5, the cut 1. CI, on the throwaway draft PR `mut/c14-case16`:
-  - (a) the leg on the plain relay image (its `RELAY_IMAGE` not switched): `armed` red, with
+  cef-cpu 6, the parsers 5, the cut 1. CI, on the throwaway draft PR #72 (`mut/c14-case16`), a–f
+  (amended 2026-10-24, the PR #71 review's I1: the six as run; f is mutant 8, and d and e, the
+  product-side twins of b and c, were added). All six were KILLED on mutant run 40135507971, each
+  on its named check with its controls passing, after an unmutated baseline:
+  - (a) `two` on the plain relay image (its `RELAY_IMAGE` not switched): `armed` red, with
     `killed_one_current` passing;
-  - (b) `three` holding cef_leaks_to_restart + 1: `held_n` red, with `armed` passing;
-  - (c) the restart expected at 2 in `two`: `restart_as_ruled` red, with `armed` and `held_n`
-    passing;
-  - mutant 8 (the hold after `set_state(NULL)`, a scratch relay-test-hooks build): `reaper_killed`
-    red in both legs.
+  - (b) `three` holding cef_leaks_to_restart + 1: `held_n` red, with `armed` and
+    `killed_one_current` passing;
+  - (c) the verdict expecting a restart at 2 in `two`: `restart_as_ruled` red, with `armed`,
+    `held_n`, `leaks_counted` and `no_restart` passing;
+  - (d) the product restarting one leak later (`>` for `>=` in `cef_health.rs`), in `three`:
+    `restart_as_ruled` red, with `armed`, `held_n` and `leaks_counted` passing;
+  - (e) the product restarting at 2 (`cef_leaks_to_restart: 2`), in `two`: `restart_as_ruled`
+    red, with the same controls;
+  - (f), mutant 8: the hold after `set_state(NULL)` on a rebuilt relay-test-hooks image, in `two`.
+    `reaper_killed` is red (its reaper lines read `pids [] (of [])`), with `armed` and `held_n`
+    passing.
+- **The CI witness** (amended 2026-10-24, the PR #71 review). On PR chaos run 40134655269,
+  `cef-leaks-three` passed 24 of 24 checks and `cef-leaks-two` passed 16 of 16, so Owed 82 is
+  closed. `two`'s `cef_cpu` read each held page at about the live page's renderer CPU (Owed 93).
+- **Only case 16 runs on the hooks image** (amended 2026-10-24, the review's m1).
+  case_verdicts.rs sweeps every file under harness/. Only case 16's two files may name
+  `RELAY_TEST_HOOKS_IMAGE`, the hold key or case 16's overlay, and only cef-leaks.sh may assign
+  `RELAY_IMAGE`.
 
 ## Files
 
@@ -945,7 +961,9 @@ none an owner ruling. Decision log "C14 case 16 wired".
   held lines number N, counted by retirement. Each held teardown's reaper line lists at least 1
   killed pid. `three` exits 75 with its detail, and `two` stays on air at `leaked_teardowns=2` with
   its CEF CPU printed. Mutant 8 is red. (Amended 2026-10-24, case 16 wired: as built, its own
-  amendment; mutants a, b and c red too, each on its named check.)
+  amendment; mutants a, b and c red too, each on its named check. Amended again 2026-10-24, the
+  PR #71 review's I1: mutants a–f, f being mutant 8, all KILLED on mutant run 40135507971, and
+  both legs green on chaos run 40134655269.)
 
 ## Do not touch
 
