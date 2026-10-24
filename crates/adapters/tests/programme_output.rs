@@ -24,7 +24,7 @@ use adapters::slate::{logo_box, Slate, LOGO_PNG, SLATE_BACKDROP_RGB};
 use adapters::stats::StatsSnapshot;
 use app::ports::{Inbound, Metrics, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::Receiver;
-use domain::config::{OutputProfile, Thresholds, ENCODER_SPEED_REALTIME_MIN};
+use domain::config::{OutputProfile, Thresholds, ENCODER_SPEED_REALTIME_MIN, OUTPUT_FPS_MIN_WINDOW_MS};
 use domain::ladder::Rung;
 use domain::output_link::OutputLink;
 use domain::programme::{FrameChoice, SlateKind};
@@ -935,33 +935,62 @@ fn stats_encoded_frames_are_the_frames_the_output_carries() {
     );
 }
 
-/// Owed 86, the producer through the beat's sampler: over a real-pace window the programme's real
-/// output rate holds the starvation floor, a window in which nothing is pushed (the encoder starved
-/// of frames, as F-024's CPU starvation starved it of time) reads under it, and real pace again holds
-/// it. The band is the profile's: at least the floor, and no further above the profile's rate than
-/// the floor is below it. The pushes are the programme's; the reading is never a tick count.
+/// Owed 86 (the PR #69 review's I1), the producer through the beat's sampler: the pushes keep the
+/// tick grid's pace while the encoder hangs (`hang_encoder`, the hook that holds its output), as C14
+/// case 6's starvation held it (F-024: the beat counted 29 to 31 pushes a second while the output
+/// carried 11.5). The beat reads under the floor though every tick was pushed on time, so the reading
+/// is the encoder's output, never a push count; and after a whole window of real pace that lets the
+/// encoder's backlog out (the review's m5), the next window holds the band again. Every window is past
+/// the minimum (`OUTPUT_FPS_MIN_WINDOW_MS`). The band is the profile's: at least the floor, and no
+/// further above the profile's rate than the floor is below it.
 #[test]
-fn the_beats_fps_is_the_programmes_real_output_rate_and_falls_when_starved() {
+fn the_beats_fps_falls_while_the_encoder_hangs_though_every_push_keeps_its_pace() {
     let _s = serial();
     let (mut p, _rx, _f, _l) = programme();
     let mut m = ProcMetrics::new(p.stats());
     let fps = u64::from(P720.fps);
     let (floor, rate) = (P720.fps_floor(), f64::from(P720.fps));
     let band = floor..=rate + (rate - floor);
-    pace(&mut p, 0..fps, FrameChoice::Slate(SlateKind::Waiting));
+    let window_ms = OUTPUT_FPS_MIN_WINDOW_MS + 500;
+    let window = fps * window_ms / 1_000;
+    let hang = Duration::from_millis(2_000);
+    assert!(
+        hang.as_millis() >= 1_500 && hang.as_millis() + 500 < u128::from(window_ms),
+        "the hang lasts at least 1.5 s and ends inside its window"
+    );
+    let mut next = 0;
+    let mut paced = |p: &mut GstProgramme, ticks: u64| -> Duration {
+        let t = Instant::now();
+        pace(p, next..next + ticks, FrameChoice::Slate(SlateKind::Waiting));
+        next += ticks;
+        t.elapsed()
+    };
+    paced(&mut p, fps);
     assert!(
         p.stats().snapshot().encoded_frames.is_some(),
         "the encoder has started"
     );
     assert_eq!(m.sample().fps, None, "the window opens");
-    pace(&mut p, fps..3 * fps, FrameChoice::Slate(SlateKind::Waiting));
-    let healthy = m.sample().fps.expect("a 2 s window");
-    thread::sleep(Duration::from_millis(1_500));
-    let starved = m.sample().fps.expect("a 1.5 s window");
-    pace(&mut p, 3 * fps..5 * fps, FrameChoice::Slate(SlateKind::Waiting));
-    let resumed = m.sample().fps.expect("a 2 s window");
-    eprintln!("beat fps: {healthy:.3} → starved {starved:.3} → resumed {resumed:.3}");
+    paced(&mut p, window);
+    let healthy = m.sample().fps.expect("a window past the minimum");
+    assert!(p.hang_encoder(hang), "the encoder hook");
+    let took = paced(&mut p, window);
+    let starved = m.sample().fps.expect("a window past the minimum");
+    paced(&mut p, window);
+    let settled = m.sample().fps.expect("a window past the minimum");
+    paced(&mut p, window);
+    let resumed = m.sample().fps.expect("a window past the minimum");
+    let on_time = period(&P720) * (window as u32 - 1);
+    eprintln!(
+        "beat fps over {window} ticks a window: {healthy:.3} → encoder hung {hang:?}, {window} pushes \
+         in {took:?} (on time {on_time:?}): {starved:.3} → settled {settled:.3} → resumed {resumed:.3}"
+    );
     assert!(band.contains(&healthy), "real pace {healthy}, band {band:?}");
+    // Every tick of the hung window was pushed on the grid, so a push count would read the rate.
+    assert!(
+        took < on_time + Duration::from_millis(250),
+        "the pushes kept their pace: {took:?} for {on_time:?}"
+    );
     assert!(starved < floor, "starved {starved}, floor {floor}");
     assert!(band.contains(&resumed), "resumed {resumed}, band {band:?}");
 }
