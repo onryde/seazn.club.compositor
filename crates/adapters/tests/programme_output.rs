@@ -17,6 +17,8 @@ use adapters::gst_output::{
     ENCODED_RING_MAX_ENTRIES, ENCODED_RING_SPAN, OUTPUT_PROGRESS_POLL_MS, OUTPUT_QUEUE_BYTES,
 };
 use adapters::gst_programme::{GstProgramme, OVERLAY_SIZE};
+#[path = "support/rtmp.rs"]
+mod rtmp;
 use adapters::slate::{logo_box, Slate, LOGO_PNG, SLATE_BACKDROP_RGB};
 use adapters::stats::StatsSnapshot;
 use app::ports::{Inbound, ProgrammeOutput, TargetSpec};
@@ -31,6 +33,7 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
+use rtmp::FakeRtmp;
 use sha2::{Digest, Sha256};
 
 const P720: OutputProfile = OutputProfile::P720;
@@ -1480,21 +1483,41 @@ fn a_swap_during_the_drain_still_drains_once() {
     assert_eq!(p.refused_pushes(), 1);
 }
 
+/// A first sink that comes late sends nothing from before its swap (Owed 84; owner, 2026-10-24,
+/// option A). Until then this test pinned the opposite: the file started at frame 60, the 2 s
+/// keyframe still in the ring, 45 frames for the 30 paced since the swap. A file can write at once,
+/// so its reconnect point is the swap: the ring's 2 s are dropped, keyframe 60 among them, and the
+/// file starts at the keyframe asked for then.
 #[test]
-fn a_late_first_sink_starts_at_a_keyframe_inside_the_ring() {
+fn a_late_first_sink_starts_at_the_keyframe_after_its_swap_not_inside_the_ring() {
     let _s = serial();
     let dir = Tmp::new("late-sink");
-    let (mut p, rx, _f, _l) = programme();
-    // 2.5 s with no sink: the 2 s ring has dropped the first keyframe, so its oldest frame is a delta.
+    let (mut p, rx, frames, _l) = programme();
+    frames.set_camera(solid(gst_video::VideoFormat::I420, 1_280, 720, [255, 0, 0, 255]));
+    // 2.5 s of slate with no sink (the ring keeps its last 2 s, keyframe 60 in it), then the camera
+    // for OWED84_MARGIN_TICKS before the swap.
     pace(&mut p, 0..75, FrameChoice::Slate(SlateKind::Waiting));
+    pace(&mut p, 75..75 + OWED84_MARGIN_TICKS, FrameChoice::Emit);
+    let swap = 75 + OWED84_MARGIN_TICKS;
     p.swap_sink(1, &file_target(&dir.file("a.flv")));
-    pace(&mut p, 75..105, FrameChoice::Slate(SlateKind::Waiting));
+    pace(&mut p, swap..swap + 30, FrameChoice::Emit);
     drain_and_wait(&mut p, &rx);
     let d = decode(&dir.file("a.flv"));
     assert!(d.first_is_key(), "keys {:?}", &d.keys[..d.keys.len().min(5)]);
     assert_eq!(d.video_pts_ms.first(), Some(&0));
-    // It starts at frame 60, the 2 s keyframe still in the ring: 45 frames, not the 30 since the swap.
-    assert!(d.frames.len() >= 44, "{}", d.frames.len());
+    let n = d.frames.len();
+    assert!(
+        n <= 30,
+        "{n} frames for the 30 paced since the swap: the ring was replayed"
+    );
+    assert!(
+        n as u64 + OWED84_KEY_WAIT_TICKS >= 30,
+        "{n} frames: the keyframe came more than {OWED84_KEY_WAIT_TICKS} ticks after the swap"
+    );
+    let checked = assert_all_camera("late sink", &d);
+    eprintln!("late sink: frames checked {checked}");
+    assert_eq!(checked, n);
+    assert!(checked > 0);
 }
 
 #[test]
@@ -2429,4 +2452,261 @@ fn skipped_ticks_leave_no_hole_in_the_audio() {
         "audio {} ms",
         d.audio_ms()
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Owed 84: a sink sends nothing that was queued before it could send (owner, 2026-10-24, option A:
+// when the destination recovers after an outage, the queued stale frames are dropped and the stream
+// restarts at the next keyframe; viewers never get a burst of old frames). F-023 measured the burst
+// in C14 cases 4 and 12: a sink whose connect outlived the fault delivered about 4 s of backlog at the
+// clear, and MediaMTX's recorder discarded about 7.9 s. The RTMP legs run the real rtmp2sink against
+// `FakeRtmp`, which holds its publish reply for as long as a leg likes.
+//
+// Each leg shows the programme's slate until OWED84_MARGIN_TICKS before the reconnect point and the
+// camera (red) from then on, so a frame from before that margin is told by its picture.
+
+/// Camera ticks before the reconnect point. A frame the programme had not yet encoded when the sink
+/// could send is not stale (the encoder's own pipeline: the appsrcs hold at most 3 ticks, and
+/// zerolatency x264 adds none), so the slate stops 10 ticks (333 ms) before the reconnect.
+const OWED84_MARGIN_TICKS: u64 = 10;
+/// The keyframe asked for at the reconnect point comes within this many ticks (6, 200 ms). The
+/// encoder's own next keyframe could be a whole 2 s interval away (`key-int-max` = 2 × fps), so a
+/// sink that waited for it would lose up to 60 ticks.
+const OWED84_KEY_WAIT_TICKS: u64 = 6;
+/// The most a received message may run ahead of real time, measured from the first frame received.
+/// A stale backlog runs at least a whole 2 s ring ahead (F-023: about 4 s); this covers the AAC
+/// encoder's lead on the video (about 60 ms) and the mux's interleave, and stays a quarter of a ring.
+const OWED84_BURST_SLACK_MS: u128 = 500;
+
+fn rtmp_target(server: &FakeRtmp) -> TargetSpec {
+    TargetSpec {
+        url: server.url(),
+        stream_key: "OWED84-fake-stream-key".to_owned(),
+    }
+}
+
+/// Every decoded frame shows the camera (red), none the slate; returns how many were checked.
+fn assert_all_camera(case: &str, d: &Decoded) -> usize {
+    let mut checked = 0;
+    for (i, f) in d.frames.iter().enumerate() {
+        assert!(
+            is_red(f.centre) && !close(f.corner_tl, HOUSE_NIGHT, ON_AIR_TOL),
+            "{case}: frame {i} (PTS {} ms) is from before the reconnect: {f:?}",
+            d.video_pts_ms.get(i).copied().unwrap_or(u64::MAX)
+        );
+        checked += 1;
+    }
+    checked
+}
+
+/// What `server` received for one publish, checked against Owed 84 and RTMP's timing rules: the
+/// first video frame is a keyframe at PTS 0, nothing is from before the reconnect margin, no message
+/// runs ahead of real time (no burst), timestamps never go back (each kind, and in arrival order),
+/// and the audio starts with the picture, never ahead of it. `paced` is the ticks pushed after the
+/// reconnect point. Returns the frames checked.
+fn assert_fresh_start(case: &str, server: &FakeRtmp, dir: &Tmp, paced: u64) -> usize {
+    let n = server.settle(Duration::from_millis(400), Duration::from_secs(8));
+    let path = dir.file(&format!("{case}.flv"));
+    let tags = server.write_flv(&path);
+    let rec = server.record();
+    eprintln!(
+        "{case}: accepted {}, published {}, messages {n}, ended {:?}",
+        rec.accepted, rec.published, rec.ended
+    );
+    assert_eq!(rec.published, 1, "{case}: one publish, one reconnect checked");
+    assert_eq!(tags, rec.media.len());
+    let frames: Vec<&rtmp::Media> = rec
+        .media
+        .iter()
+        .filter(|m| m.is_avc_frame() || m.is_aac_frame())
+        .collect();
+    let first_video = frames
+        .iter()
+        .find(|m| m.is_avc_frame())
+        .expect("a video frame was received");
+    assert!(
+        first_video.is_keyframe(),
+        "{case}: the first video frame sent is not a keyframe"
+    );
+    let first_audio = frames
+        .iter()
+        .find(|m| m.is_aac_frame())
+        .expect("an audio frame was received");
+    assert!(
+        first_audio.ts_ms >= first_video.ts_ms
+            && u64::from(first_audio.ts_ms - first_video.ts_ms) <= 1_024 * 1_000 / 48_000,
+        "{case}: audio starts at {} ms, the picture at {} ms",
+        first_audio.ts_ms,
+        first_video.ts_ms
+    );
+    let (anchor_ts, anchor_at) = (frames[0].ts_ms, frames[0].at);
+    let (mut ahead_most, mut back) = (i128::MIN, 0);
+    for (i, m) in frames.iter().enumerate() {
+        let ahead =
+            i128::from(m.ts_ms - anchor_ts.min(m.ts_ms)) - m.at.duration_since(anchor_at).as_millis() as i128;
+        ahead_most = ahead_most.max(ahead);
+        assert!(
+            ahead <= OWED84_BURST_SLACK_MS as i128,
+            "{case}: message {i} (ts {} ms) arrived {ahead} ms ahead of real time: a burst",
+            m.ts_ms
+        );
+        if i > 0 && m.ts_ms < frames[i - 1].ts_ms {
+            back += 1;
+        }
+        let prev_same = frames[..i].iter().rev().find(|p| p.kind == m.kind);
+        assert!(
+            prev_same.is_none_or(|p| m.ts_ms >= p.ts_ms),
+            "{case}: message {i} goes back in time within its kind"
+        );
+    }
+    assert_eq!(back, 0, "{case}: {back} messages arrived out of timestamp order");
+    drop(rec);
+    let d = decode(&path);
+    assert!(
+        d.first_is_key(),
+        "{case}: decoded keys {:?}",
+        &d.keys[..d.keys.len().min(5)]
+    );
+    assert_eq!(d.video_pts_ms.first(), Some(&0), "{case}");
+    let checked = assert_all_camera(case, &d);
+    eprintln!(
+        "{case}: frames checked {checked} for {paced} paced after the reconnect; most ahead of real time {ahead_most} ms"
+    );
+    assert!(
+        checked as u64 + OWED84_KEY_WAIT_TICKS >= paced,
+        "{case}: {checked} frames for {paced} ticks: the keyframe came late"
+    );
+    assert!(
+        checked as u64 <= paced + OWED84_MARGIN_TICKS,
+        "{case}: {checked} frames"
+    );
+    checked
+}
+
+/// Paces `range` in steps of 10 ticks and checks, after each step, that the output holds nothing
+/// (its sink cannot send, so the ring stays the only queue). Returns the samples taken.
+fn pace_with_nothing_queued(p: &mut GstProgramme, range: std::ops::Range<u64>, choice: FrameChoice) -> u32 {
+    let mut samples = 0;
+    let mut from = range.start;
+    while from < range.end {
+        let to = (from + 10).min(range.end);
+        pace(p, from..to, choice);
+        let queued = p.output_queued_bytes().expect("an output");
+        assert_eq!(
+            queued,
+            (0, 0),
+            "tick {to}: the output queued {queued:?} B in front of a sink that cannot send"
+        );
+        samples += 1;
+        from = to;
+    }
+    samples
+}
+
+/// C14 cases 4 and 12's red phase: the destination comes back while the sink's connect is still
+/// pending. The destination holds its publish answer for 2.3 s (in C14 the pending part was the TCP
+/// connect; the sink cannot send in either), with the ring full of older programme.
+#[test]
+fn a_sink_whose_connect_is_pending_when_the_destination_returns_sends_nothing_queued() {
+    let _s = serial();
+    let dir = Tmp::new("owed84-pending");
+    let (mut p, rx, frames, _l) = programme();
+    frames.set_camera(solid(gst_video::VideoFormat::I420, 1_280, 720, [255, 0, 0, 255]));
+    let server = FakeRtmp::held();
+    let slate = FrameChoice::Slate(SlateKind::Reconnecting);
+    pace(&mut p, 0..60, slate);
+    p.swap_sink(1, &rtmp_target(&server));
+    let samples = pace_with_nothing_queued(&mut p, 60..120, slate);
+    {
+        let rec = server.record();
+        assert_eq!(rec.accepted, 1, "the sink connected to the destination");
+        assert_eq!(rec.published, 0, "and its publish is still held");
+    }
+    pace(&mut p, 120..120 + OWED84_MARGIN_TICKS, FrameChoice::Emit);
+    let clear = 120 + OWED84_MARGIN_TICKS;
+    server.release();
+    pace(&mut p, clear..clear + 90, FrameChoice::Emit);
+    let seen = drain_and_wait(&mut p, &rx);
+    assert!(
+        !seen.iter().any(|e| matches!(e, Event::OutputError { .. })),
+        "{seen:?}"
+    );
+    eprintln!("pending: queue samples while held {samples}");
+    assert_eq!(samples, 6);
+    assert_fresh_start("pending", &server, &dir, 90);
+}
+
+/// C14's green phase: the pending connect fails first (in C14 at rtmp2sink's 5 s socket timeout;
+/// here the destination closes it, so the leg does not wait out a timer), and the next swap's sink
+/// connects at once. Neither generation sends anything from before its own connect.
+#[test]
+fn after_a_connect_that_failed_the_next_sink_sends_nothing_queued() {
+    let _s = serial();
+    let dir = Tmp::new("owed84-failed");
+    let (mut p, rx, frames, _l) = programme();
+    frames.set_camera(solid(gst_video::VideoFormat::I420, 1_280, 720, [255, 0, 0, 255]));
+    let first = FakeRtmp::held();
+    let slate = FrameChoice::Slate(SlateKind::Reconnecting);
+    pace(&mut p, 0..60, slate);
+    p.swap_sink(1, &rtmp_target(&first));
+    let mut samples = pace_with_nothing_queued(&mut p, 60..120, slate);
+    first.refuse();
+    // Up to 2 s for rtmp2sink to report the refused connect.
+    let mut tick = 120;
+    let errored = loop {
+        samples += pace_with_nothing_queued(&mut p, tick..tick + 10, slate);
+        tick += 10;
+        let error = rx
+            .try_iter()
+            .any(|m| matches!(m, Inbound::Event(Event::OutputError { gen: 1 })));
+        if error || tick >= 180 {
+            break error;
+        }
+    };
+    assert!(errored, "rtmp2sink never reported the refused connect");
+    {
+        let rec = first.record();
+        assert_eq!((rec.accepted, rec.published, rec.media.len()), (1, 0, 0));
+    }
+    pace(&mut p, tick..tick + OWED84_MARGIN_TICKS, FrameChoice::Emit);
+    let swap = tick + OWED84_MARGIN_TICKS;
+    let second = FakeRtmp::prompt();
+    p.swap_sink(2, &rtmp_target(&second));
+    pace(&mut p, swap..swap + 90, FrameChoice::Emit);
+    drain_and_wait(&mut p, &rx);
+    eprintln!("failed: gen 1 errored by tick {tick}; queue samples while it connected {samples}");
+    assert!(
+        samples >= 7,
+        "the first connect was pending only {samples} samples"
+    );
+    assert_fresh_start("failed", &second, &dir, 90);
+}
+
+/// The drain ends with the encoders while the sink is still connecting: nothing is owed to a sink
+/// that never connected, and rtmp2sink would give the connect up only at its 5 s socket timeout.
+#[test]
+fn a_drain_while_the_sink_is_still_connecting_ends_without_waiting_for_it() {
+    let _s = serial();
+    let server = FakeRtmp::held();
+    let (mut p, rx, _f, _l) = programme();
+    let slate = FrameChoice::Slate(SlateKind::Reconnecting);
+    pace(&mut p, 0..30, slate);
+    p.swap_sink(1, &rtmp_target(&server));
+    pace(&mut p, 30..40, slate);
+    let t = Instant::now();
+    let mut seen = drain_and_wait(&mut p, &rx);
+    let took = t.elapsed();
+    seen.extend(events_for(&rx, Duration::from_millis(500)));
+    eprintln!("drain while connecting: OutputDrained after {took:?}");
+    assert!(took < Duration::from_millis(1_500), "{took:?}");
+    assert_eq!(
+        seen.iter().filter(|e| **e == Event::OutputDrained).count(),
+        1,
+        "{seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|e| matches!(e, Event::OutputError { .. })),
+        "{seen:?}"
+    );
+    assert_eq!(server.record().published, 0);
 }

@@ -717,19 +717,17 @@ impl ProgrammeOutput for GstProgramme {
         if let Some(old) = r.output.take() {
             old.retire(&self.shared);
         }
-        match gst_output::build(&self.shared, gen, target) {
-            Ok(out) => {
-                r.output = Some(out);
-                // The new output starts at a keyframe: ask the encoder for one now.
-                let ev = gst_video::UpstreamForceKeyUnitEvent::builder()
-                    .all_headers(true)
-                    .build();
-                if !r.parser_src.send_event(ev) {
-                    self.shared.log(&format!(
-                        "swap_sink gen={gen}: the keyframe request was not taken"
-                    ));
-                }
-            }
+        // The new output starts at a keyframe encoded after its sink can send (Owed 84): its feeder
+        // asks the encoder for one then, from its own thread.
+        let parser_src = r.parser_src.clone();
+        let request_key: gst_output::KeyRequest = Arc::new(move || {
+            let ev = gst_video::UpstreamForceKeyUnitEvent::builder()
+                .all_headers(true)
+                .build();
+            parser_src.send_event(ev)
+        });
+        match gst_output::build(&self.shared, gen, target, request_key) {
+            Ok(out) => r.output = Some(out),
             Err(text) => {
                 self.shared.log(&format!("swap_sink gen={gen}: {text}"));
                 self.send_now(Event::OutputError { gen });
