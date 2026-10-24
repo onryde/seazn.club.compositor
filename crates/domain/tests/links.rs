@@ -3,7 +3,7 @@
 //! recovery paths against F-004's 15 s broadcast budget. They live here, not inline, because the
 //! domain's crate root forbids `clippy::print_stderr`, and a sweep must print the count it checked
 //! (AGENTS.md §5).
-use domain::config::{OutputProfile, Thresholds, OUTPUT_GAP_BUDGET_MS};
+use domain::config::{OutputProfile, Thresholds, OUTPUT_GAP_BUDGET_MS, OUTPUT_SINK_TIMEOUT_MS};
 use domain::input_link::{InputAction, InputLink, InputState, LossReason, KICK_HISTORY_CAP};
 use domain::output_link::{OutputLink, OutputState};
 use domain::time::Ms;
@@ -69,7 +69,7 @@ fn output_kind(s: OutputState) -> Kind {
     match s {
         OutputState::Connecting { .. } => Kind::Connecting,
         OutputState::Proving { .. } => Kind::Proving,
-        OutputState::Connected { .. } => Kind::Up,
+        OutputState::Connected => Kind::Up,
         OutputState::Backoff { .. } => Kind::Backoff,
     }
 }
@@ -80,7 +80,7 @@ fn output_attempt(s: OutputState) -> Option<u32> {
         OutputState::Connecting { attempt, .. }
         | OutputState::Proving { attempt, .. }
         | OutputState::Backoff { attempt, .. } => Some(attempt),
-        OutputState::Connected { .. } => None,
+        OutputState::Connected => None,
     }
 }
 
@@ -249,8 +249,11 @@ fn input_early_ticks_and_other_generations_change_nothing() {
 }
 
 /// An output link in `kind` at sink generation 2 (1 torn down, 3 never built), one failure behind it
-/// (gen 1's). Proving holds 1 000 bytes, grown 1 ms short of the bound; Connected holds 1 000 bytes;
-/// Backoff is gen 2 refused while proving. Returns the link and the instant its timer is due.
+/// (gen 1's). Proving holds 1 000 bytes, grown 1 ms short of the bound; Connected grew to 1 000 bytes;
+/// Backoff is gen 2 refused while proving. Returns the link and the instant its timer is due: the
+/// connect timeout, the bound (Proving's only instant: growth there connects it, a tick does nothing),
+/// the end of the back-off. Connected has no timer (Owed 87), so its instant is the one where the
+/// retired stall rule swapped it: `OUTPUT_SINK_TIMEOUT_MS` after its last growth.
 fn output_in(kind: Kind, t: &Thresholds) -> (OutputLink, Ms) {
     let mut o = OutputLink::new();
     assert!(o.on_tick(0, t));
@@ -278,9 +281,8 @@ fn output_in(kind: Kind, t: &Thresholds) -> (OutputLink, Ms) {
     assert_eq!((output_kind(o.state()), o.generation()), (kind, 2), "setup");
     let due = match o.state() {
         OutputState::Connecting { since, .. } => since + t.output_connect_timeout_ms,
-        OutputState::Proving { last_progress, .. } | OutputState::Connected { last_progress, .. } => {
-            last_progress + t.output_stall_after_ms
-        }
+        OutputState::Proving { first_progress, .. } => first_progress + n,
+        OutputState::Connected => up + n + OUTPUT_SINK_TIMEOUT_MS,
         OutputState::Backoff { until, .. } => until,
     };
     (o, due)
@@ -289,9 +291,9 @@ fn output_in(kind: Kind, t: &Thresholds) -> (OutputLink, Ms) {
 #[derive(Debug, Clone, Copy)]
 enum OutputEvent {
     Tick,
-    /// A total above every one this sink reported (1 001: Connected holds 1 000).
+    /// A total above every one this sink reported (1 001: `output_in` grew it to 1 000 at most).
     Progress,
-    /// A total that is not above the highest: 0 for a new sink, a repeat for a connected one.
+    /// A total that is not above the highest: 0 for a new sink, a repeat for a proving or connected one.
     NoProgress,
     Error,
 }
@@ -305,7 +307,9 @@ const OUTPUT_EVENTS: [OutputEvent; 4] = [
 
 fn apply_output(o: &mut OutputLink, e: OutputEvent, now: Ms, gen: u64, t: &Thresholds) -> bool {
     let high = match o.state() {
-        OutputState::Proving { sent, .. } | OutputState::Connected { sent, .. } => sent,
+        OutputState::Proving { sent, .. } => sent,
+        // Connected keeps no total (Owed 87: nothing reads it); `output_in` grew it to 1 000.
+        OutputState::Connected => 1_000,
         _ => 0,
     };
     match e {
@@ -326,8 +330,9 @@ fn setup_attempt(kind: Kind) -> Option<u32> {
     }
 }
 
-/// The brief's transitions (Step 6) with the C04 corrections (bytes sent, F-005) and Owed 38's
-/// (Connected is earned; every end before it is a failure; only Connected resets the count):
+/// The brief's transitions (Step 6) with the C04 corrections (bytes sent, F-005), Owed 38's
+/// (Connected is earned; every end before it is a failure; only Connected resets the count) and Owed
+/// 87's (no stall rule: no tick ends Proving or Connected, only the sink's error):
 /// (kind after, built, failures carried after).
 fn brief_output(from: Kind, e: OutputEvent) -> (Kind, bool, Option<u32>) {
     use Kind as K;
@@ -336,12 +341,11 @@ fn brief_output(from: Kind, e: OutputEvent) -> (Kind, bool, Option<u32>) {
     match (from, e) {
         (K::Backoff, E::Tick) => (K::Connecting, true, setup_attempt(from)),
         (K::Connecting, E::Tick) => (K::Backoff, false, failed), // the connect timed out
-        (K::Proving, E::Tick) => (K::Backoff, false, failed),    // stalled before the bound
-        (K::Up, E::Tick) => (K::Connecting, true, Some(0)),      // stalled: swap at once, count reset
         (K::Connecting, E::Progress) => (K::Proving, false, setup_attempt(from)), // the first bytes
         (K::Proving, E::Progress) => (K::Up, false, None),       // growth at or past the bound
         (K::Connecting | K::Proving, E::Error) => (K::Backoff, false, failed),
         (K::Up, E::Error) => (K::Backoff, false, Some(1)), // failure 1 again: Connected reset it
+        // Everything else, a tick on Proving or Connected among it (Owed 87), changes nothing.
         (k, _) => (k, false, setup_attempt(k)),
     }
 }
@@ -411,16 +415,17 @@ fn advance(g: &mut Lcg, now: Ms, due: Option<Ms>) -> Ms {
 #[derive(Debug, Default)]
 struct OutputCounts {
     builds_from_backoff: usize,
-    stall_swaps: usize,
     connect_timeouts: usize,
-    proving_stalls: usize,
     early_or_quiet_ticks: usize,
+    /// Ticks at or past the instant the retired stall rule fired (Owed 87): each changed nothing.
+    silent_ticks_proving: usize,
+    silent_ticks_connected: usize,
     first_bytes: usize,
     proving_growth: usize,
     growth_1_ms_short: usize,
     connects: usize,
     connects_at_the_bound: usize,
-    refreshes: usize,
+    growth_while_connected: usize,
     repeats_connecting: usize,
     repeats_proving: usize,
     repeats_connected: usize,
@@ -439,7 +444,8 @@ struct OutputCounts {
 #[test]
 fn output_link_keeps_its_rules_over_generated_schedules() {
     let t = Thresholds::default();
-    let (stall, timeout) = (t.output_stall_after_ms, t.output_connect_timeout_ms);
+    // The retired stall rule's instant (Owed 87): a tick there is still drawn, and must change nothing.
+    let (quiet, timeout) = (OUTPUT_SINK_TIMEOUT_MS, t.output_connect_timeout_ms);
     let n = t.output_connected_after_ms;
     let mut c = OutputCounts::default();
     for case in 0..CASES {
@@ -455,10 +461,9 @@ fn output_link_keeps_its_rules_over_generated_schedules() {
         for _ in 0..STEPS {
             let due = match o.state() {
                 OutputState::Connecting { since, .. } => Some(since + timeout),
-                // Two instants matter while proving: the bound (on a growth) and the stall (on a tick).
+                // Two instants matter while proving: the bound (on a growth), and the retired rule's.
                 OutputState::Proving { .. } if g.next(2) == 0 => first.map(|f| f + n),
-                OutputState::Proving { .. } => Some(last + stall),
-                OutputState::Connected { last_progress, .. } => Some(last_progress + stall),
+                OutputState::Proving { .. } | OutputState::Connected => Some(last + quiet),
                 OutputState::Backoff { until, .. } => Some(until),
             };
             now = advance(&mut g, now, due);
@@ -474,18 +479,6 @@ fn output_link_keeps_its_rules_over_generated_schedules() {
                             assert_eq!(o.state(), OutputState::Connecting { attempt, since: now });
                             c.builds_from_backoff += 1;
                         }
-                        OutputState::Connected { last_progress, .. } if now - last_progress >= stall => {
-                            assert!(built, "case {case}: a stalled sink must be swapped");
-                            assert_eq!(failures, 0, "case {case}");
-                            assert_eq!(
-                                o.state(),
-                                OutputState::Connecting {
-                                    attempt: 0,
-                                    since: now
-                                }
-                            );
-                            c.stall_swaps += 1;
-                        }
                         OutputState::Connecting { attempt, since } if now - since >= timeout => {
                             assert!(!built, "case {case}: a timeout is not a build");
                             assert_eq!(attempt, failures, "case {case}");
@@ -499,24 +492,14 @@ fn output_link_keeps_its_rules_over_generated_schedules() {
                             c.connect_timeouts += 1;
                             c.waits_at_cap += usize::from(w == t.output_backoff_cap_ms);
                         }
-                        // Owed 38: the bytes stopped before the sink earned Connected: a failure.
-                        OutputState::Proving { attempt, .. } if now - last >= stall => {
-                            assert!(!built, "case {case}: a proving stall waits; it is not a swap");
-                            assert_eq!(attempt, failures, "case {case}");
-                            let w = out_wait(&t, failures);
-                            failures += 1;
-                            let want = OutputState::Backoff {
-                                attempt: failures,
-                                until: now + w,
-                            };
-                            assert_eq!(o.state(), want, "case {case}: a proving stall");
-                            c.proving_stalls += 1;
-                            c.waits_at_cap += usize::from(w == t.output_backoff_cap_ms);
-                        }
+                        // Owed 87: no tick ends a proving or connected sink, however long it is silent.
                         _ => {
                             assert!(!built, "case {case}: built from {before:?} at {now}");
                             assert_eq!(o.state(), before, "case {case}: a quiet tick changed {before:?}");
                             c.early_or_quiet_ticks += 1;
+                            let silent = now - last >= quiet;
+                            c.silent_ticks_proving += usize::from(silent && kind == Kind::Proving);
+                            c.silent_ticks_connected += usize::from(silent && kind == Kind::Up);
                         }
                     }
                     if built {
@@ -537,7 +520,6 @@ fn output_link_keeps_its_rules_over_generated_schedules() {
                                 let want = OutputState::Proving {
                                     attempt: failures,
                                     first_progress: now,
-                                    last_progress: now,
                                     sent: total,
                                 };
                                 assert_eq!(o.state(), want, "case {case}: the first bytes start the proof");
@@ -547,13 +529,9 @@ fn output_link_keeps_its_rules_over_generated_schedules() {
                             Kind::Proving => {
                                 let f = first.expect("a proving sink grew once");
                                 if now - f >= n {
-                                    let want = OutputState::Connected {
-                                        last_progress: now,
-                                        sent: total,
-                                    };
                                     assert_eq!(
                                         o.state(),
-                                        want,
+                                        OutputState::Connected,
                                         "case {case}: grew {} ms after the first",
                                         now - f
                                     );
@@ -564,7 +542,6 @@ fn output_link_keeps_its_rules_over_generated_schedules() {
                                     let want = OutputState::Proving {
                                         attempt: failures,
                                         first_progress: f,
-                                        last_progress: now,
                                         sent: total,
                                     };
                                     assert_eq!(
@@ -578,12 +555,8 @@ fn output_link_keeps_its_rules_over_generated_schedules() {
                                 }
                             }
                             _ => {
-                                let want = OutputState::Connected {
-                                    last_progress: now,
-                                    sent: total,
-                                };
-                                assert_eq!(o.state(), want, "case {case}: progress {total} over {high}");
-                                c.refreshes += 1;
+                                assert_eq!(o.state(), before, "case {case}: Connected reads no total");
+                                c.growth_while_connected += 1;
                             }
                         }
                         high = total;
@@ -652,16 +625,16 @@ fn output_link_keeps_its_rules_over_generated_schedules() {
     eprintln!("output schedules: {CASES} cases × {STEPS} steps: {c:?}");
     let all = [
         ("builds from back-off", c.builds_from_backoff),
-        ("stall swaps", c.stall_swaps),
         ("connect timeouts", c.connect_timeouts),
-        ("stalls while proving", c.proving_stalls),
         ("quiet ticks", c.early_or_quiet_ticks),
+        ("silent ticks while proving", c.silent_ticks_proving),
+        ("silent ticks while connected", c.silent_ticks_connected),
         ("first bytes", c.first_bytes),
         ("growth while proving", c.proving_growth),
         ("growth 1 ms short of the bound", c.growth_1_ms_short),
         ("connects", c.connects),
         ("connects exactly at the bound", c.connects_at_the_bound),
-        ("refreshes", c.refreshes),
+        ("growth while connected", c.growth_while_connected),
         ("repeats while connecting", c.repeats_connecting),
         ("repeats while proving", c.repeats_proving),
         ("repeats while connected", c.repeats_connected),
@@ -945,18 +918,23 @@ const POLL_MS: Ms = 1_000;
 /// How far past `last_progress` a simulation may run.
 const RUN_MS: Ms = 60_000;
 
+/// The fault: the sink errors `after` ms after its last progress. 0 is a reset that takes the last
+/// bytes with it; `OUTPUT_SINK_TIMEOUT_MS` is a destination stall, which since Owed 87 (the owner,
+/// 2026-10-24, "A") ends only by rtmp2sink's own socket timeout, that long after its last write.
 #[derive(Debug, Clone, Copy)]
-enum Fault {
-    /// The sink errors `after` ms after its last progress (0: a reset that takes the last bytes with it).
-    Error { after: Ms },
-    /// The bytes stop and nothing errors: the stall rule ends the push.
-    Stall,
+struct Fault {
+    after: Ms,
 }
+
+const RESET: Fault = Fault { after: 0 };
+const STALL: Fault = Fault {
+    after: OUTPUT_SINK_TIMEOUT_MS,
+};
 
 #[derive(Debug)]
 struct Recovery {
     last_progress: Ms,
-    /// The error, or for a stall the swap.
+    /// The sink's error.
     fault_at: Ms,
     recovered_at: Ms,
 }
@@ -997,11 +975,9 @@ fn recover(
                 assert!(o.is_connected(), "setup: the push is Connected before its fault");
             }
         }
-        if let Fault::Error { after } = fault {
-            if now == last_progress + after {
-                o.on_error(now, 1, t);
-                fault_at = Some(now);
-            }
+        if now == last_progress + fault.after {
+            o.on_error(now, 1, t);
+            fault_at = Some(now);
         }
         if let Some((gen, at)) = first_bytes {
             if now == at {
@@ -1019,10 +995,12 @@ fn recover(
             }
         }
         if ticks[now as usize] && o.on_tick(now, t) && o.generation() > 1 {
+            assert!(
+                fault_at.is_some(),
+                "built generation {} before the fault",
+                o.generation()
+            );
             builds_after_fault += 1;
-            if matches!(fault, Fault::Stall) && builds_after_fault == 1 {
-                fault_at = Some(now);
-            }
             if builds_after_fault > failed {
                 first_bytes = Some((o.generation(), now + connect_ms));
             }
@@ -1039,64 +1017,49 @@ fn worst_from_error(t: &Thresholds, k: u32) -> Ms {
     (0..=k).map(|j| out_wait(t, j)).sum::<Ms>() + Ms::from(k) * timeout + (timeout - 1)
 }
 
-/// From the last bytes, for a stall: the stall time, then the swap at once (no wait before it), and k
-/// failed connects each followed by its wait.
-fn worst_from_stall(t: &Thresholds, k: u32) -> Ms {
-    let timeout = t.output_connect_timeout_ms;
-    t.output_stall_after_ms
-        + (0..k).map(|j| out_wait(t, j)).sum::<Ms>()
-        + Ms::from(k) * timeout
-        + (timeout - 1)
-}
-
 const SHOWN: u32 = 3;
 
 #[test]
 fn output_recovery_paths_against_the_f004_budget_on_a_1_ms_grid() {
     let t = Thresholds::default();
     let worst_connect = t.output_connect_timeout_ms - 1;
-    let late = t.output_stall_after_ms - 1; // an error 1 ms before the stall rule would have fired
     let last = 20_000;
     let ticks = vec![true; (last + RUN_MS) as usize];
     let mut rows = Vec::new();
     for k in 0..=SHOWN {
-        let e = recover(&t, &ticks, last, Fault::Error { after: 0 }, k, worst_connect);
-        let s = recover(&t, &ticks, last, Fault::Stall, k, worst_connect);
-        let l = recover(&t, &ticks, last, Fault::Error { after: late }, k, worst_connect);
-        let row = (
-            k,
-            e.recovered_at - e.fault_at,
-            s.recovered_at - s.last_progress,
-            l.recovered_at - l.last_progress,
-        );
+        let e = recover(&t, &ticks, last, RESET, k, worst_connect);
+        let s = recover(&t, &ticks, last, STALL, k, worst_connect);
+        let row = (k, e.recovered_at - e.fault_at, s.recovered_at - s.last_progress);
         assert_eq!(row.1, worst_from_error(&t, k), "from the error, k = {k}");
         assert_eq!(
             e.fault_at, e.last_progress,
             "a reset takes the last bytes with it"
         );
-        assert_eq!(row.2, worst_from_stall(&t, k), "a stall, k = {k}");
+        assert_eq!(
+            row.2,
+            OUTPUT_SINK_TIMEOUT_MS + worst_from_error(&t, k),
+            "a stall, k = {k}"
+        );
         assert_eq!(
             s.fault_at - s.last_progress,
-            t.output_stall_after_ms,
-            "the swap comes at the stall time"
+            OUTPUT_SINK_TIMEOUT_MS,
+            "a stall ends at the sink's timeout"
         );
-        assert_eq!(row.3, late + worst_from_error(&t, k), "a late error, k = {k}");
         eprintln!(
-            "k = {k} failed connect(s): from the error {} ms; from the last bytes: after a stall {} ms, \
-             after an error 1 ms before the stall rule {} ms (budget {OUTPUT_GAP_BUDGET_MS} ms)",
-            row.1, row.2, row.3
+            "k = {k} failed connect(s): from the error {} ms; from the last bytes of a stall {} ms \
+             (budget {OUTPUT_GAP_BUDGET_MS} ms)",
+            row.1, row.2
         );
         rows.push(row);
     }
     let fits =
-        |gap: fn(&(u32, Ms, Ms, Ms)) -> Ms| rows.iter().take_while(|r| gap(r) < OUTPUT_GAP_BUDGET_MS).count();
-    let (from_error, stall, late_error) = (fits(|r| r.1), fits(|r| r.2), fits(|r| r.3));
+        |gap: fn(&(u32, Ms, Ms)) -> Ms| rows.iter().take_while(|r| gap(r) < OUTPUT_GAP_BUDGET_MS).count();
+    let (from_error, stall) = (fits(|r| r.1), fits(|r| r.2));
     eprintln!(
-        "failed connects that still fit {OUTPUT_GAP_BUDGET_MS} ms: from the error {}, after a stall {}, \
-         after a late error {} (of {} rows)",
+        "failed connects that still fit {OUTPUT_GAP_BUDGET_MS} ms: from the error {}, after a stall {} \
+         (of {} rows)",
         from_error as i64 - 1,
         stall as i64 - 1,
-        late_error as i64 - 1,
         rows.len()
     );
     assert!(!rows.is_empty(), "measured 0 recoveries");
@@ -1110,11 +1073,7 @@ fn output_recovery_paths_against_the_f004_budget_on_a_1_ms_grid() {
         );
     }
     // A single attempt fits on every path.
-    assert!(
-        rows[0].2 < OUTPUT_GAP_BUDGET_MS && rows[0].3 < OUTPUT_GAP_BUDGET_MS,
-        "{:?}",
-        rows[0]
-    );
+    assert!(rows[0].2 < OUTPUT_GAP_BUDGET_MS, "{:?}", rows[0]);
 }
 
 /// Tick instants for an output mode: tick i at ⌊i · frame period⌋ ms (C08 ticks on the frame period).
@@ -1136,13 +1095,13 @@ fn tick_grid(p: OutputProfile, len: Ms) -> (Vec<bool>, Ms) {
 }
 
 // On the real tick grid of both modes, at every phase of the fault against it: each timed step (a
-// back-off ending, a connect timing out, the stall rule) waits for the next tick, so the gap exceeds
-// the 1 ms worst case by at most one tick spacing per timed step, and the budget still holds.
+// back-off ending, a connect timing out) waits for the next tick, so the gap exceeds the 1 ms worst
+// case by at most one tick spacing per timed step, and the budget still holds. The sink's error is
+// an event, not a tick: it lands on its millisecond.
 #[test]
 fn the_budget_holds_on_the_frame_tick_grid_at_every_phase() {
     let t = Thresholds::default();
     let worst_connect = t.output_connect_timeout_ms - 1;
-    let late = t.output_stall_after_ms - 1;
     let (mut cases, mut worst_seen) = (0usize, 0);
     for mode in BOTH_MODES {
         let (ticks, widest) = tick_grid(mode, 21_000 + RUN_MS);
@@ -1154,7 +1113,7 @@ fn the_budget_holds_on_the_frame_tick_grid_at_every_phase() {
             let last = 20_000 + phase;
             for k in 0..=FAILED_CONNECTS_BUDGETED {
                 let slack = Ms::from(2 * k + 1) * widest;
-                let e = recover(&t, &ticks, last, Fault::Error { after: 0 }, k, worst_connect);
+                let e = recover(&t, &ticks, last, RESET, k, worst_connect);
                 let from_error = e.recovered_at - e.fault_at;
                 let floor = worst_from_error(&t, k);
                 assert!(
@@ -1167,26 +1126,15 @@ fn the_budget_holds_on_the_frame_tick_grid_at_every_phase() {
                 );
                 worst_seen = worst_seen.max(from_error);
                 if k == 0 {
-                    let s = recover(&t, &ticks, last, Fault::Stall, k, worst_connect);
+                    let s = recover(&t, &ticks, last, STALL, k, worst_connect);
                     let gap = s.recovered_at - s.last_progress;
-                    let floor = worst_from_stall(&t, k);
+                    let floor = OUTPUT_SINK_TIMEOUT_MS + worst_from_error(&t, k);
                     assert!(
                         (floor..=floor + slack).contains(&gap),
                         "{mode:?} φ{phase} stall: {gap}"
                     );
                     assert!(gap < OUTPUT_GAP_BUDGET_MS, "{mode:?} φ{phase} stall: {gap} ms");
-                    let l = recover(&t, &ticks, last, Fault::Error { after: late }, k, worst_connect);
-                    let gap = l.recovered_at - l.last_progress;
-                    let floor = late + worst_from_error(&t, k);
-                    assert!(
-                        (floor..=floor + slack).contains(&gap),
-                        "{mode:?} φ{phase} late error: {gap}"
-                    );
-                    assert!(
-                        gap < OUTPUT_GAP_BUDGET_MS,
-                        "{mode:?} φ{phase} late error: {gap} ms"
-                    );
-                    cases += 2;
+                    cases += 1;
                 }
                 cases += 1;
             }

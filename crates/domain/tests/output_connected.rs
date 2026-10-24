@@ -1,10 +1,12 @@
 //! Owed 38 (F-011): properties of `OutputLink`'s Connected rule over random destinations, under
 //! random thresholds. The ORACLE is written from the rule's text, never from the code under test: a
 //! sink is Connected at its first growth at least `output_connected_after_ms` after its first growth,
-//! if no error and no stall (`output_stall_after_ms` with no growth) came first. Every other end of a
-//! sink is a failure: failure number f waits base · 2^(f - 1), capped, and only Connected resets the
-//! count. Every property counts what it checked, prints it, and fails on 0 (AGENTS.md §5).
-use domain::config::Thresholds;
+//! if no error came first. Since Owed 87 (the owner, 2026-10-24, "A") nothing else ends a sink whose
+//! bytes flow: no stall rule, so a silent sink, proving or Connected, waits for its own error however
+//! long it is silent. Every other end of a sink is a failure: failure number f waits base · 2^(f - 1),
+//! capped, and only Connected resets the count. Every property counts what it checked, prints it, and
+//! fails on 0 (AGENTS.md §5).
+use domain::config::{Thresholds, OUTPUT_SINK_TIMEOUT_MS};
 use domain::output_link::{OutputLink, OutputState};
 use domain::time::Ms;
 use proptest::prelude::*;
@@ -20,27 +22,24 @@ fn wait(t: &Thresholds, failed_before: u32) -> Ms {
     (0..failed_before).fold(base.min(cap), |w, _| w.saturating_mul(2).min(cap))
 }
 
-/// How one refused publish ends: its error some ms after its last growth, or silence (the stall rule).
-#[derive(Debug, Clone, Copy)]
-enum End {
-    Error { after_last: Ms },
-    Stall,
-}
+/// The longest silence drawn: past the sink's timeout (the retired stall rule's 5 s) several times.
+const QUIET_MAX: Ms = 6 * OUTPUT_SINK_TIMEOUT_MS;
 
 /// A destination that refuses: first bytes `first_after` ms after the build, growth every `poll` ms
-/// for `grows_for` ms (always short of the bound), then `end`. `repeat` re-sends each total once.
+/// for `grows_for` ms (always short of the bound), then silence, and its error `error_after` ms after
+/// its last growth. `repeat` re-sends each total once.
 #[derive(Debug, Clone, Copy)]
 struct Refusal {
     first_after: Ms,
     poll: Ms,
     grows_for: Ms,
-    end: End,
+    error_after: Ms,
     repeat: bool,
 }
 
-/// The publish accepted at last: first bytes `first_after` ms after the build, growth every `poll` ms
-/// (always under the stall), plus a growth exactly at the bound and 1 ms short of it when asked; then
-/// an error `error_after` ms after it connects (capped under the stall).
+/// The publish accepted at last: first bytes `first_after` ms after the build, growth every `poll` ms,
+/// plus a growth exactly at the bound and 1 ms short of it when asked; then silence, and an error
+/// `error_after` ms after it connects.
 #[derive(Debug, Clone, Copy)]
 struct Accepted {
     first_after: Ms,
@@ -59,39 +58,32 @@ struct Case {
 }
 
 fn case() -> impl Strategy<Value = Case> {
-    (
-        300u64..9_000,
-        300u64..9_000,
-        300u64..9_000,
-        50u64..1_500,
-        0u64..4_000,
-        1u64..=50,
-    )
-        .prop_flat_map(|(n, stall, timeout, base, cap_extra, tick)| {
+    (300u64..9_000, 300u64..9_000, 50u64..1_500, 0u64..4_000, 1u64..=50)
+        .prop_flat_map(|(n, timeout, base, cap_extra, tick)| {
             let t = Thresholds {
                 output_connected_after_ms: n,
-                output_stall_after_ms: stall,
                 output_connect_timeout_ms: timeout,
                 output_backoff_base_ms: base,
                 output_backoff_cap_ms: base + cap_extra,
                 ..Thresholds::default()
             };
-            let poll = 20u64..stall.min(1_000);
+            let poll = 20u64..1_000;
             let first = 0u64..timeout.min(200);
-            let end = prop_oneof![
-                (0u64..stall).prop_map(|after_last| End::Error { after_last }),
-                Just(End::Stall),
-            ];
-            let refusal = (first.clone(), poll.clone(), 0u64..n, end, any::<bool>()).prop_map(
-                |(first_after, poll, grows_for, end, repeat)| Refusal {
+            let refusal = (
+                first.clone(),
+                poll.clone(),
+                0u64..n,
+                0u64..QUIET_MAX,
+                any::<bool>(),
+            )
+                .prop_map(|(first_after, poll, grows_for, error_after, repeat)| Refusal {
                     first_after,
                     poll,
                     grows_for,
-                    end,
+                    error_after,
                     repeat,
-                },
-            );
-            let accepted = (first, poll, any::<bool>(), any::<bool>(), 0u64..20_000).prop_map(
+                });
+            let accepted = (first, poll, any::<bool>(), any::<bool>(), 0u64..QUIET_MAX).prop_map(
                 |(first_after, poll, at_the_bound, one_short, error_after)| Accepted {
                     first_after,
                     poll,
@@ -120,7 +112,10 @@ fn case() -> impl Strategy<Value = Case> {
 struct Seen {
     cases: Cell<u32>,
     refused_by_error: Cell<u32>,
-    refused_by_stall: Cell<u32>,
+    /// Silences at least `OUTPUT_SINK_TIMEOUT_MS` long, where the retired stall rule ended the sink.
+    silent_proving: Cell<u32>,
+    silent_connected: Cell<u32>,
+    silent_ticks: Cell<u64>,
     growth_checked: Cell<u64>,
     repeats: Cell<u64>,
     stale: Cell<u64>,
@@ -172,7 +167,7 @@ fn refusals_never_connect_and_only_sustained_growth_resets_the_back_off() {
         .run(&case(), |c| {
             bump(&seen.cases);
             let t = &c.t;
-            let (n, stall) = (t.output_connected_after_ms, t.output_stall_after_ms);
+            let n = t.output_connected_after_ms;
             let mut o = OutputLink::new();
             prop_assert!(o.on_tick(0, t), "the first tick builds");
             let mut built = 0;
@@ -212,30 +207,22 @@ fn refusals_never_connect_and_only_sustained_growth_resets_the_back_off() {
                     prop_assert!(proving, "a refusal's growth proves: {:?}", o.state());
                     bump64(&seen.growth_checked);
                 }
-                let ended_at = match r.end {
-                    End::Error { after_last } => {
-                        let e = last + after_last;
-                        while now + c.tick < e {
-                            now += c.tick;
-                            prop_assert!(!o.on_tick(now, t));
-                        }
-                        o.on_error(e, o.generation(), t);
-                        bump(&seen.refused_by_error);
-                        e
+                // Silence: no tick ends the proving sink, however long; only its error does (Owed 87).
+                let ended_at = last + r.error_after;
+                while now + c.tick < ended_at {
+                    now += c.tick;
+                    prop_assert!(!o.on_tick(now, t), "a silent proving sink ended at {}", now);
+                    let proving = matches!(o.state(), OutputState::Proving { .. });
+                    prop_assert!(proving, "{} ms into the silence: {:?}", now - last, o.state());
+                    if now - last >= OUTPUT_SINK_TIMEOUT_MS {
+                        bump64(&seen.silent_ticks);
                     }
-                    End::Stall => {
-                        // The stall is seen at the first tick at least `stall` after the last growth.
-                        let s = (last + stall).div_ceil(c.tick) * c.tick;
-                        while now < s {
-                            now += c.tick;
-                            prop_assert!(!o.on_tick(now, t), "a proving stall is not a swap");
-                            let proving = matches!(o.state(), OutputState::Proving { .. });
-                            prop_assert_eq!(now == s, !proving, "at {} (the stall at {})", now, s);
-                        }
-                        bump(&seen.refused_by_stall);
-                        s
-                    }
-                };
+                }
+                if r.error_after >= OUTPUT_SINK_TIMEOUT_MS {
+                    bump(&seen.silent_proving);
+                }
+                o.on_error(ended_at, o.generation(), t);
+                bump(&seen.refused_by_error);
                 prop_assert!(!o.is_connected());
                 let w = wait(t, failures);
                 failures += 1;
@@ -254,7 +241,7 @@ fn refusals_never_connect_and_only_sustained_growth_resets_the_back_off() {
                 offer_stale(&mut o, ended_at, t, &seen)?;
                 built = build_at(&mut o, now, ended_at + w, &c)?;
             }
-            // The accepted publish: growth under the stall until the oracle's bound, then an error.
+            // The accepted publish: growth until the oracle's bound, then silence and an error.
             let a = c.accepted;
             prop_assert_eq!(
                 o.state(),
@@ -301,7 +288,6 @@ fn refusals_never_connect_and_only_sustained_growth_resets_the_back_off() {
                     OutputState::Proving {
                         attempt: failures,
                         first_progress: first,
-                        last_progress: g,
                         sent: total
                     },
                     "the failures still count while proving"
@@ -312,11 +298,19 @@ fn refusals_never_connect_and_only_sustained_growth_resets_the_back_off() {
             if connected_at - first == n {
                 bump(&seen.connects_at_the_bound);
             }
-            // A later error from the Connected sink is failure 1 again: Connected reset the count.
-            let e = connected_at + a.error_after.min(stall - 1);
+            // A later error from the Connected sink is failure 1 again: Connected reset the count. No
+            // tick before it ends the silent sink (Owed 87).
+            let e = connected_at + a.error_after;
             while now + c.tick < e {
                 now += c.tick;
-                prop_assert!(!o.on_tick(now, t));
+                prop_assert!(!o.on_tick(now, t), "a silent Connected sink swapped at {}", now);
+                prop_assert!(o.is_connected(), "{} ms into the silence", now - connected_at);
+                if now - connected_at >= OUTPUT_SINK_TIMEOUT_MS {
+                    bump64(&seen.silent_ticks);
+                }
+            }
+            if a.error_after >= OUTPUT_SINK_TIMEOUT_MS {
+                bump(&seen.silent_connected);
             }
             o.on_error(e, o.generation(), t);
             prop_assert_eq!(
@@ -339,9 +333,14 @@ fn refusals_never_connect_and_only_sustained_growth_resets_the_back_off() {
             u64::from(seen.refused_by_error.get()),
         ),
         (
-            "refusals ended by a stall",
-            u64::from(seen.refused_by_stall.get()),
+            "proving silences past the sink timeout",
+            u64::from(seen.silent_proving.get()),
         ),
+        (
+            "connected silences past the sink timeout",
+            u64::from(seen.silent_connected.get()),
+        ),
+        ("ticks past the sink timeout", seen.silent_ticks.get()),
         ("growth events checked", seen.growth_checked.get()),
         ("repeated totals", seen.repeats.get()),
         ("other-generation bytes offered", seen.stale.get()),

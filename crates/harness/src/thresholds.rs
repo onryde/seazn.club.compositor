@@ -11,6 +11,7 @@
 //! `cargo test`, not in a two-minute chaos run.
 use domain::config::{
     OutputProfile, Thresholds, CHROMIUM_GPU_DEATHS_ABORT, ENCODER_SPEED_REALTIME_MIN, OUTPUT_GAP_BUDGET_MS,
+    OUTPUT_SINK_TIMEOUT_MS,
 };
 use serde_json::{json, Map, Value};
 
@@ -57,8 +58,6 @@ pub const HARNESS_PAGE_POLL_MS: u64 = 1_000;
 /// values back and checks everything else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdapterConsts {
-    /// C09's `OUTPUT_PROGRESS_POLL_MS` (Owed 15): the `out-bytes-total` poll; case 5's and 12's bound.
-    pub output_progress_poll_ms: u64,
     /// C11's `CHILD_POLL_MS`: the CEF child poll; case 13's verdict window, case 15's lag.
     pub cef_child_poll_ms: u64,
     /// C09's `ENCODED_RING_SPAN` (the 2 s leaky output queue, spec §6), in ms.
@@ -80,7 +79,6 @@ pub fn dump(adapters: AdapterConsts) -> Value {
         input_srt_latency_ms,
         kick_alert_count,
         kick_window_ms,
-        output_stall_after_ms,
         output_backoff_base_ms,
         output_backoff_cap_ms,
         output_connect_timeout_ms,
@@ -105,7 +103,6 @@ pub fn dump(adapters: AdapterConsts) -> Value {
         bootstrap_backoff_cap_ms,
     } = Thresholds::default();
     let AdapterConsts {
-        output_progress_poll_ms,
         cef_child_poll_ms,
         encoded_ring_span_ms,
     } = adapters;
@@ -128,7 +125,6 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     put("input_srt_latency_ms", json!(input_srt_latency_ms));
     put("kick_alert_count", json!(kick_alert_count));
     put("kick_window_ms", json!(kick_window_ms));
-    put("output_stall_after_ms", json!(output_stall_after_ms));
     put("output_backoff_base_ms", json!(output_backoff_base_ms));
     put("output_backoff_cap_ms", json!(output_backoff_cap_ms));
     put("output_connect_timeout_ms", json!(output_connect_timeout_ms));
@@ -154,12 +150,13 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     // The domain's named consts, and the harness session's frame period (720p30, the fixture's).
     put("encoder_speed_realtime_min", json!(ENCODER_SPEED_REALTIME_MIN));
     put("output_gap_budget_ms", json!(OUTPUT_GAP_BUDGET_MS));
+    // rtmp2sink's `timeout`, which C09 sets: the only detector of a destination stall (Owed 87).
+    put("output_sink_timeout_ms", json!(OUTPUT_SINK_TIMEOUT_MS));
     put("chromium_gpu_deaths_abort", json!(CHROMIUM_GPU_DEATHS_ABORT));
     put("frame_period_ms", json!(OutputProfile::P720.frame_period_ms()));
     // C08's final-beat flush bound (an in-place restart's decision-to-exit part).
     put("final_beat_timeout_ms", json!(app::ports::FINAL_BEAT_TIMEOUT_MS));
     // The adapters'.
-    put("output_progress_poll_ms", json!(output_progress_poll_ms));
     put("cef_child_poll_ms", json!(cef_child_poll_ms));
     put("encoded_ring_span_ms", json!(encoded_ring_span_ms));
     // The budgets.
@@ -196,7 +193,6 @@ pub const COMMITTED: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../harness/
 pub fn committed_adapters(v: &Value) -> Option<AdapterConsts> {
     let n = |k: &str| v.get(k).and_then(Value::as_u64);
     Some(AdapterConsts {
-        output_progress_poll_ms: n("output_progress_poll_ms")?,
         cef_child_poll_ms: n("cef_child_poll_ms")?,
         encoded_ring_span_ms: n("encoded_ring_span_ms")?,
     })
@@ -214,7 +210,7 @@ mod tests {
         (text, v)
     }
 
-    // The drift gate's host half: everything but the adapters' three constants (the media test,
+    // The drift gate's host half: everything but the adapters' two constants (the media test,
     // tests/thresholds.rs, checks those against the adapters crate itself).
     #[test]
     fn the_committed_thresholds_are_what_the_domain_and_the_budgets_say() {
@@ -236,14 +232,14 @@ mod tests {
     fn each_threshold_is_dumped_under_its_own_name() {
         let t = Thresholds::default();
         let v = dump(AdapterConsts {
-            output_progress_poll_ms: 1,
             cef_child_poll_ms: 2,
             encoded_ring_span_ms: 3,
         });
-        let pairs: [(&str, u64); 6] = [
+        let pairs: [(&str, u64); 7] = [
             ("slate_after_ms", t.slate_after_ms),
             ("resume_after_ms", t.resume_after_ms),
-            ("output_stall_after_ms", t.output_stall_after_ms),
+            ("output_connect_timeout_ms", t.output_connect_timeout_ms),
+            ("output_sink_timeout_ms", OUTPUT_SINK_TIMEOUT_MS),
             ("cef_hang_after_ms", t.cef_hang_after_ms),
             ("heartbeat_interval_ms", t.heartbeat_interval_ms),
             ("cef_gpu_deaths_to_restart", t.cef_gpu_deaths_to_restart as u64),
@@ -252,10 +248,14 @@ mod tests {
             assert_eq!(v[k].as_u64(), Some(want), "{k}");
         }
         // The adapters' are carried, not invented.
-        assert_eq!(v["output_progress_poll_ms"].as_u64(), Some(1));
         assert_eq!(v["cef_child_poll_ms"].as_u64(), Some(2));
         assert_eq!(v["encoded_ring_span_ms"].as_u64(), Some(3));
-        eprintln!("named fields checked: {}", pairs.len() + 3);
+        // Owed 87 retired the stall rule, and with it the two numbers only its bound read.
+        let retired = ["output_stall_after_ms", "output_progress_poll_ms"];
+        for k in retired {
+            assert!(v.get(k).is_none(), "{k} is still dumped");
+        }
+        eprintln!("named fields checked: {}", pairs.len() + 2 + retired.len());
     }
 
     // The brief: "Add a unit test that each budget is consistent with its threshold". A spike-driven

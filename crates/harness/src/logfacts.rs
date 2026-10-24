@@ -98,7 +98,7 @@ pub struct Hidden {
 }
 
 /// `sink swap reason=<r> gen=<g>`: why generation g was built (the domain's `SwapReason`, named
-/// `first`, `error`, `connect_timeout` or `stall` by the driver).
+/// `first`, `error` or `connect_timeout` by the driver; Owed 87 retired `stall`).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SwapReasonLine {
     pub at_ms: i64,
@@ -561,12 +561,12 @@ mod tests {
             (31_066, "sink swap gen=2 target=rtmp://mediamtx:1935/live/****"),
             (37_067, "sink swap reason=connect_timeout gen=3"),
             (37_067, "sink swap gen=3 target=rtmp://mediamtx:1935/live/****"),
-            (40_000, "sink swap reason=stall gen=4"),
+            (40_000, "sink swap reason=error gen=4"),
             // Near misses: none is a reason line.
-            (41_000, "sink swap reason=stall gen=x"),
+            (41_000, "sink swap reason=error gen=x"),
             (41_100, "sink swap reason= gen=5"),
-            (41_200, "sink swap reason=stall gen=5 target=x"),
-            (41_300, "gen=1: page console: sink swap reason=stall gen=6"),
+            (41_200, "sink swap reason=error gen=5 target=x"),
+            (41_300, "gen=1: page console: sink swap reason=error gen=6"),
             (41_400, "sink swap reason=two words gen=7"),
         ];
         for (at, m) in lines {
@@ -584,7 +584,7 @@ mod tests {
                 (0, 1, "first"),
                 (31_066, 2, "error"),
                 (37_067, 3, "connect_timeout"),
-                (40_000, 4, "stall")
+                (40_000, 4, "error")
             ]
         );
         assert_eq!(
@@ -592,8 +592,8 @@ mod tests {
             vec![1, 2, 3],
             "a reason line is not a swap line"
         );
-        // The producer's own format and its four names, so the parser and the line cannot drift
-        // apart unseen.
+        // The producer's own format and its three names, so the parser and the line cannot drift
+        // apart unseen; and not the name Owed 87 retired.
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../app/src/driver.rs"))
             .expect("driver.rs");
         assert_eq!(
@@ -605,7 +605,6 @@ mod tests {
             ("First", "first"),
             ("Error", "error"),
             ("ConnectTimeout", "connect_timeout"),
-            ("Stall", "stall"),
         ];
         for (variant, name) in names {
             assert!(
@@ -613,6 +612,12 @@ mod tests {
                 "driver.rs's `swap_name` no longer names {variant} \"{name}\""
             );
         }
+        assert_eq!(
+            src.matches("SwapReason::").count(),
+            names.len(),
+            "driver.rs names a SwapReason this test does not"
+        );
+        assert!(!src.contains("\"stall\""), "driver.rs names the retired reason");
         eprintln!("log lines checked: {}, reasons read: {}", f.lines, read.len());
     }
 

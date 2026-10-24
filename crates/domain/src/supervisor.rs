@@ -583,7 +583,7 @@ impl Supervisor {
                 InputState::Backoff { .. } => LinkStatus::Backoff,
             },
             output: match self.output.state() {
-                OutputState::Connected { .. } => LinkStatus::Connected,
+                OutputState::Connected => LinkStatus::Connected,
                 // Bytes flow but the sink has not earned Connected (Owed 38): still connecting.
                 OutputState::Connecting { .. } | OutputState::Proving { .. } => LinkStatus::Connecting,
                 OutputState::Backoff { .. } => LinkStatus::Backoff,
@@ -2250,7 +2250,6 @@ mod tests {
             input_srt_latency_ms: 1_181,
             kick_alert_count: 3,
             kick_window_ms: 300_061,
-            output_stall_after_ms: 5_071,
             output_backoff_base_ms: 541,
             output_backoff_cap_ms: 2_081,
             output_connect_timeout_ms: 5_087,
@@ -2293,7 +2292,6 @@ mod tests {
             th.input_connect_timeout_ms,
             th.input_stall_after_ms,
             th.kick_window_ms,
-            th.output_stall_after_ms,
             th.output_backoff_base_ms,
             th.output_backoff_cap_ms,
             th.output_connect_timeout_ms,
@@ -2315,7 +2313,7 @@ mod tests {
         let mut unique = ms.to_vec();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(unique.len(), 26, "setup: every Ms threshold distinct");
+        assert_eq!(unique.len(), 25, "setup: every Ms threshold distinct");
         let base = th.bootstrap_backoff_base_ms;
         assert!(
             2 * base < th.bootstrap_backoff_cap_ms && 4 * base > th.bootstrap_backoff_cap_ms,
@@ -2500,34 +2498,54 @@ mod tests {
     // PR #29 review I1: after a swap, the new sink reads Stalled until it earns Connected. The beat
     // must not read Playing on the new sink's first bytes (476 B is also a refused publish's first
     // total, F-011), nor 1 ms short of the bound; it reads Playing at the bound. Both ways a
-    // Connected sink is swapped: by the stall rule, and by an error then the back-off.
+    // Connected sink is swapped since Owed 87 (the owner, 2026-10-24, "A"), each by the sink's error
+    // then the back-off: an error at once, and a destination stall, whose error is rtmp2sink's socket
+    // timeout `OUTPUT_SINK_TIMEOUT_MS` after the bytes stop. Until that error the stalled sink reads
+    // Playing and nothing swaps it: no rule of the link's watches the total.
     #[test]
     fn a_swapped_sink_reads_stalled_until_it_earns_connected() {
+        use crate::config::OUTPUT_SINK_TIMEOUT_MS;
         let th = t();
-        let (n, stall, base) = (
-            th.output_connected_after_ms,
-            th.output_stall_after_ms,
-            th.output_backoff_base_ms,
-        );
+        let (n, base) = (th.output_connected_after_ms, th.output_backoff_base_ms);
         let mut checked = 0;
         for how in ["a stall", "an error"] {
-            let (s, c, _) = on_air(booted(0).decide(Event::Tick, 0).next, 10);
+            let (mut s, c, total) = on_air(booted(0).decide(Event::Tick, 0).next, 10);
             assert_eq!(s.health(c).state, BeatState::Playing, "{how}: setup, on air");
-            let (s, swap_at) = match how {
-                "a stall" => (s, c + stall),
-                _ => (
-                    s.decide(Event::OutputError { gen: 1 }, c + 100).next,
-                    c + 100 + base,
-                ),
+            let error_at = match how {
+                "a stall" => c + OUTPUT_SINK_TIMEOUT_MS,
+                _ => c + 100,
             };
+            let mut quiet = 0;
+            for at in (c..error_at).step_by(250) {
+                s = s.decide(progress(&s, total), at).next; // the poll repeats the frozen total
+                let d = s.decide(Event::Tick, at);
+                assert!(
+                    !d.effects.iter().any(|e| matches!(e, Effect::SwapSink { .. })),
+                    "{how}: swapped {} ms into the silence: {:?}",
+                    at - c,
+                    d.effects
+                );
+                s = d.next;
+                assert_eq!(
+                    (s.health(at).state, s.health(at).output),
+                    (BeatState::Playing, LinkStatus::Connected),
+                    "{how}: {} ms into the silence",
+                    at - c
+                );
+                quiet += 1;
+            }
+            assert!(quiet >= 1, "{how}: no silence checked");
+            let (s, swap_at) = (
+                s.decide(Event::OutputError { gen: 1 }, error_at).next,
+                error_at + base,
+            );
             // Owed 87: the swap names how the sink before it ended.
-            let reason = match how {
-                "a stall" => SwapReason::Stall,
-                _ => SwapReason::Error,
-            };
             let d = s.decide(Event::Tick, swap_at);
             assert!(
-                d.effects.contains(&Effect::SwapSink { gen: 2, reason }),
+                d.effects.contains(&Effect::SwapSink {
+                    gen: 2,
+                    reason: SwapReason::Error
+                }),
                 "{how}: swapped at {swap_at}: {:?}",
                 d.effects
             );

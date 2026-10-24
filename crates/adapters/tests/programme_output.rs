@@ -24,9 +24,10 @@ use adapters::slate::{logo_box, Slate, LOGO_PNG, SLATE_BACKDROP_RGB};
 use adapters::stats::StatsSnapshot;
 use app::ports::{Inbound, Metrics, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::Receiver;
-use domain::config::{OutputProfile, Thresholds, ENCODER_SPEED_REALTIME_MIN, OUTPUT_FPS_MIN_WINDOW_MS};
+use domain::config::{
+    OutputProfile, Thresholds, ENCODER_SPEED_REALTIME_MIN, OUTPUT_FPS_MIN_WINDOW_MS, OUTPUT_SINK_TIMEOUT_MS,
+};
 use domain::ladder::Rung;
-use domain::output_link::OutputLink;
 use domain::programme::{FrameChoice, SlateKind};
 use domain::supervisor::Event;
 use gstreamer as gst;
@@ -48,7 +49,8 @@ const HOUSE_NIGHT: [u8; 3] = [0x15, 0x0b, 0x36];
 const ON_AIR_TOL: u8 = 2;
 /// The brief's pin of the vendored logo (C09 amendment 2026-10-15).
 const LOGO_SHA256: &str = "bee2648f76fa2590ac81d2c1e14050fe4c62687b8630437b0d6e6b080c2f90e8";
-/// Owed 15, option (a): poll the bytes-sent total at most every 250 ms, keeping the PDF's 5 s.
+/// Owed 15, option (a): poll the bytes-sent total at most every 250 ms (F-011's choice; since Owed
+/// 87 it no longer bounds a stall's detection, which is rtmp2sink's `timeout`).
 const OWED_15_POLL_MAX_MS: u64 = 250;
 /// F-004: AAC at 48 kHz carries 1 024 samples a frame, 46.875 frames/s, and the verified encode is
 /// 128 kbps.
@@ -1291,147 +1293,83 @@ fn progress_total_grows_while_pushing_and_freezes_when_the_sink_stops() {
 
 /// Owed 15 (a): the poll is at most 250 ms (the choice, `_FINDINGS.md` F-011).
 #[test]
-fn the_progress_poll_keeps_the_pdf_stall_bound() {
+fn the_progress_poll_is_owed_15s_choice() {
     // Read at run time, so the check is a test that reds rather than a constant folded away.
     let poll = std::hint::black_box(OUTPUT_PROGRESS_POLL_MS);
     assert!(poll <= OWED_15_POLL_MAX_MS, "{poll} ms");
     assert!(poll > 0);
 }
 
-/// The stall test's bound (Owed 71), from the constants alone: the worst case on time is the stall
-/// rule, plus the poll of the true last byte (Owed 15's pin, never the adapter's own constant, so a
-/// slower poll is not folded into its own bound) and one tick (the domain sees time only at ticks);
-/// a loaded runner may run one tick and one poll late on top. Returns (worst on time, allowance).
-fn stall_bound(t: &Thresholds) -> (u64, u64) {
-    let tick = period(&P720).as_millis() as u64;
-    let worst = t.output_stall_after_ms + OWED_15_POLL_MAX_MS + tick;
-    (worst, tick + OWED_15_POLL_MAX_MS)
+/// rtmp2sink's `timeout` in its unit, whole seconds, from the domain's constant (Owed 87).
+fn sink_timeout_s() -> u32 {
+    assert!(OUTPUT_SINK_TIMEOUT_MS.is_multiple_of(1_000), "whole seconds");
+    u32::try_from(OUTPUT_SINK_TIMEOUT_MS / 1_000).expect("fits the property")
 }
 
-/// Owed 71: the allowance is one tick and one poll, and it never stretches far enough to pass a
-/// detection a full second late (Owed 15's original 1 s poll). Pure arithmetic, so it runs anywhere.
-#[test]
-fn the_stall_bound_still_refuses_a_late_detection() {
-    let t = Thresholds::default();
-    let (worst, allowance) = stall_bound(&t);
-    let tick = period(&P720).as_millis() as u64;
-    eprintln!("stall bound: {worst} ms on time, {allowance} ms allowance");
-    assert_eq!(worst, t.output_stall_after_ms + OWED_15_POLL_MAX_MS + tick);
-    assert_eq!(allowance, tick + OWED_15_POLL_MAX_MS);
-    assert!(
-        worst + allowance < t.output_stall_after_ms + 1_000,
-        "a detection 1 s late would pass: {} ms",
-        worst + allowance
-    );
-}
-
-/// Owed 15: a sink whose writes stop is swapped within `output_stall_after_ms` + the poll of its
-/// true last byte, by the domain's own `OutputLink` in the loop (one tick of quantisation added: the
-/// domain sees time only at ticks). Owed 43 (after PR #29): the sink must first earn Connected
-/// (`output_connected_after_ms` of growth), so the writes stop 1 s after `is_connected()` first
-/// reads true, never at a fixed time, and the deadline follows the cut. Owed 71: the bound allows one
-/// more tick and one more poll for a loaded runner (`stall_bound`); the exact sum went red under load.
-#[test]
-fn stall_is_detected_within_budget_of_the_last_byte() {
-    let _s = serial();
-    let dir = Tmp::new("stall");
-    let (mut p, rx, _f, _l) = programme();
-    let t = Thresholds::default();
-    let mut link = OutputLink::new();
-    let t0 = Instant::now();
-    let ms = |at: Instant| at.duration_since(t0).as_millis() as u64;
-    let path = |gen: u64| dir.file(&format!("g{gen}.flv"));
-
-    // The true last write, watched on disk every 5 ms, independently of the adapter's poll.
-    let last_growth: Arc<Mutex<(u64, Instant)>> = Arc::new(Mutex::new((0, Instant::now())));
-    let watching = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let watcher = {
-        let (last_growth, watching, file) = (Arc::clone(&last_growth), Arc::clone(&watching), path(1));
-        thread::spawn(move || {
-            while watching.load(Ordering::SeqCst) {
-                let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
-                let mut g = last_growth.lock().unwrap();
-                if size > g.0 {
-                    *g = (size, Instant::now());
-                }
-                drop(g);
-                thread::sleep(Duration::from_millis(5));
-            }
-        })
-    };
-
-    let step = period(&P720);
-    let mut held = false;
-    let mut connected_at: Option<Instant> = None;
-    let mut swapped_at: Option<Instant> = None;
-    // The last growth as it stood when the swap was decided. The retired sink's teardown flushes
-    // what `filesink` still buffered (bytes it took before the cut), so growth seen after the swap
-    // is not a write the stall rule could have waited for.
-    let mut at_swap: Option<(u64, Instant)> = None;
-    let mut i = 0u64;
-    // Until the cut, the sink has its connect bound and 4 s more to earn Connected; then the
-    // stall bound and 4 s more to be swapped.
-    let mut deadline = t0 + Duration::from_millis(t.output_connected_after_ms + 4_000);
-    while Instant::now() < deadline {
-        let due = t0 + step * i as u32;
-        if let Some(wait) = due.checked_duration_since(Instant::now()) {
-            thread::sleep(wait);
-        }
-        let now = Instant::now();
-        while let Ok(Inbound::Event(e)) = rx.try_recv() {
-            match e {
-                Event::OutputProgress { gen, total_bytes } => link.on_progress(ms(now), gen, total_bytes, &t),
-                Event::OutputError { gen } => link.on_error(ms(now), gen, &t),
-                _ => {}
-            }
-        }
-        if link.on_tick(ms(now), &t) {
-            let gen = link.generation();
-            if gen >= 2 {
-                swapped_at = Some(now);
-                at_swap = Some(*last_growth.lock().unwrap());
-                p.swap_sink(gen, &file_target(&path(gen)));
-                // Watch on past the swap, so the teardown's flush lands while the watcher runs
-                // and the snapshot above, not the watcher's final reading, is what is judged.
-                thread::sleep(Duration::from_millis(500));
-                break;
-            }
-            p.swap_sink(gen, &file_target(&path(gen)));
-        }
-        if connected_at.is_none() && link.is_connected() {
-            connected_at = Some(now);
-        }
-        // One healthy second after the sink earns Connected, it stops taking writes.
-        if !held && connected_at.is_some_and(|c| now.duration_since(c) >= Duration::from_secs(1)) {
-            assert!(link.is_connected(), "the sink is still connected at the cut");
-            held = p.hold_sink_writes();
-            assert!(held, "the hook found the sink");
-            deadline = now + Duration::from_millis(t.output_stall_after_ms + 4_000);
-        }
-        p.push(i, FrameChoice::Slate(SlateKind::Waiting));
-        i += 1;
+/// An RTMP target nothing listens on: the sink is built and fails its connect; its properties stay
+/// readable until the next swap.
+fn unreachable_rtmp(key: &str) -> TargetSpec {
+    TargetSpec {
+        url: "rtmp://127.0.0.1:9/live".to_owned(),
+        stream_key: key.to_owned(),
     }
-    watching.store(false, Ordering::SeqCst);
-    watcher.join().expect("watcher");
-    let connected_at = connected_at.expect("the sink earned Connected within its bound and 4 s");
-    assert!(held, "the writes were cut");
-    let swapped_at = swapped_at.expect("the stall swapped the sink within its bound and 4 s of the cut");
-    let (bytes, last) = at_swap.expect("the snapshot is taken with the swap");
-    let flushed = last_growth.lock().unwrap().0 - bytes;
-    let gap = swapped_at.duration_since(last).as_millis() as u64;
-    let (worst, allowance) = stall_bound(&t);
-    let bound = worst + allowance + 1;
-    eprintln!(
-        "connected {} ms after t0; last byte (total {bytes}) to SwapSink: {gap} ms; bound {bound} ms \
-         ({worst} on time + {allowance} allowance); flushed by the teardown: {flushed} bytes",
-        ms(connected_at)
+}
+
+/// Owed 87 (the owner, 2026-10-24, "A"): the premise of "set, not inherited". The domain's constant
+/// is today's rtmp2sink default, read from the element GStreamer installed (1.24.2,
+/// `gstrtmp2locationhandler.c:35` `DEFAULT_TIMEOUT 5`). A red here means GStreamer's default moved:
+/// the product still sets the constant, but Owed 87's "equal to today's default" needs a new look.
+#[test]
+fn the_sink_timeout_is_rtmp2sinks_own_default() {
+    gst::init().expect("gstreamer");
+    let sink = gst::ElementFactory::make("rtmp2sink").build().expect("rtmp2sink");
+    let spec = sink.find_property("timeout").expect("rtmp2sink has `timeout`");
+    assert_eq!(spec.value_type(), u32::static_type(), "a uint, in seconds");
+    assert_eq!(sink.property::<u32>("timeout"), sink_timeout_s());
+}
+
+/// Owed 87: every RTMP sink is built with `timeout` = the domain's constant, read back from the
+/// element itself, on the first build and on a swap; a `file://` sink has no such property.
+#[test]
+fn every_rtmp_sink_gets_the_domains_timeout() {
+    let _s = serial();
+    let dir = Tmp::new("sink-timeout");
+    let (mut p, _rx, _f, _l) = programme();
+    let mut checked = 0;
+    for (gen, key) in [(1, "SECRETKEY-timeout-a"), (2, "SECRETKEY-timeout-b")] {
+        p.swap_sink(gen, &unreachable_rtmp(key));
+        assert_eq!(p.output_sink_timeout_s(), Some(sink_timeout_s()), "gen {gen}");
+        checked += 1;
+    }
+    p.swap_sink(3, &file_target(&dir.file("c.flv")));
+    assert_eq!(p.output_sink_timeout_s(), None, "a filesink has no timeout");
+    eprintln!("rtmp sinks checked: {checked}");
+    assert_eq!(checked, 2);
+}
+
+/// Owed 87: the timeout the adapter sets is what the sink gets, so a value other than rtmp2sink's
+/// default reads back as itself (the production value equals the default, so only this tells the
+/// set from no set). It holds for every sink built after it, never for one built before.
+#[test]
+fn a_sink_timeout_other_than_the_default_reaches_every_later_sink() {
+    let _s = serial();
+    let (mut p, _rx, _f, _l) = programme();
+    let other = sink_timeout_s() + 2;
+    p.swap_sink(1, &unreachable_rtmp("SECRETKEY-timeout-c"));
+    p.set_output_sink_timeout_s(other);
+    assert_eq!(
+        p.output_sink_timeout_s(),
+        Some(sink_timeout_s()),
+        "a sink built before keeps its timeout"
     );
-    assert!(bytes > 0);
-    assert!(
-        gap >= t.output_stall_after_ms,
-        "swapped before the stall rule could fire: {gap} ms"
-    );
-    assert!(gap <= bound, "{gap} ms past the last byte, bound {bound} ms");
+    let mut checked = 0;
+    for (gen, key) in [(2, "SECRETKEY-timeout-d"), (3, "SECRETKEY-timeout-e")] {
+        p.swap_sink(gen, &unreachable_rtmp(key));
+        assert_eq!(p.output_sink_timeout_s(), Some(other), "gen {gen}");
+        checked += 1;
+    }
+    eprintln!("overridden sinks checked: {checked}");
+    assert_eq!(checked, 2);
 }
 
 /// C08 amendment 2026-10-19: the adapter drops within 500 ms while what it owns is hung.

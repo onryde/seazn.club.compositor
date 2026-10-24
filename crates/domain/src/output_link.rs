@@ -1,45 +1,48 @@
 //! Programme push link (RTMPS to CF Input B): a sink is Connected only once its bytes-sent total has
-//! kept growing for `output_connected_after_ms`; swap it on an error or when its bytes stall for 5 s;
-//! back off 0.5 s → 2 s between failed attempts; ignore every other generation.
+//! kept growing for `output_connected_after_ms`; swap it on its error; back off 0.5 s → 2 s between
+//! failed attempts; ignore every other generation.
 //!
 //! ```text
-//! Backoff --due tick: build--> Connecting --first growth--> Proving --growth >= the bound----> Connected
-//!  ^  ^  ^                         |                           |                                 |    |
-//!  |  |  +-- timeout, or error ----+                           |                                 |    |
-//!  |  +-- error, or no growth for 5 s: one more failure -------+                                 |    |
-//!  +-- error: failure 1 (Connected reset the count) ---------------------------------------------+    |
-//!                              Connecting <-- no growth for 5 s: a swap at once, attempt 0 ----------+
+//! Backoff --due tick: build--> Connecting --first growth--> Proving --growth >= the bound--> Connected
+//!  ^  ^  ^                         |                           |                                |
+//!  |  |  +-- timeout, or error ----+                           |                                |
+//!  |  +-- error: one more failure -----------------------------+                                |
+//!  +-- error: failure 1 (Connected reset the count) --------------------------------------------+
 //! ```
 //!
 //! - **Liveness is bytes SENT, never bytes acked.** F-005: CF Input B sends no RTMP acknowledgements
 //!   (rtmp2sink `out-bytes-acked` stayed 0 for 290 s while `out-bytes-total` grew), so an ack rule
-//!   would stall every healthy push and never connect one. The adapter reports the sink's own
-//!   monotonic bytes-sent total, counted from 0 for each new sink (C09 feeds `out-bytes-total`).
+//!   would never connect a healthy push. The adapter reports the sink's own monotonic bytes-sent
+//!   total, counted from 0 for each new sink (C09 feeds `out-bytes-total`).
 //! - **Progress** (growth) is a total above the highest this sink has reported. A total that repeats or
-//!   goes backwards is no progress: it neither starts, nor proves, nor keeps alive a sink.
+//!   goes backwards is no progress: it neither starts nor proves a sink.
 //! - **Connected is earned, not given** (F-011, Owed 38). The first nonzero total is the 476 B RTMP
 //!   `connect` command, and a refused publish counts 262 KB (CF) to 1 MB (mediamtx) before its error
 //!   arrives, so the first growth only starts a **Proving** window. The sink is Connected at the first
-//!   growth at least `output_connected_after_ms` after its first growth. An error or a stall ends the
-//!   window first, and then the sink never connected.
+//!   growth at least `output_connected_after_ms` after its first growth. An error ends the window
+//!   first, and then the sink never connected.
 //! - **The connect timeout** (`output_connect_timeout_ms`; rtmp2sink's "Socket I/O timed out", F-004
-//!   rerun 1) runs from the build to the first growth. Once bytes flow, the stall rule takes over.
-//! - **Stalled** is no progress for `output_stall_after_ms`. From Connected the sink is swapped at once,
-//!   with no back-off and the count reset. While Proving it is a failed attempt like any other.
+//!   rerun 1) runs from the build to the first growth. It is the link's only timer on a sink.
+//! - **No stall rule** (Owed 87; the owner, 2026-10-24, "A"). Once bytes flow, a sink ends only by its
+//!   own error. A destination that stops taking bytes fails the sink's socket wait after
+//!   `OUTPUT_SINK_TIMEOUT_MS` (rtmp2sink's `timeout`, which C09 sets), and that error is the swap's
+//!   cause. The retired rule ("no growth for 5 s") timed the same gap from the same write: rtmp2 counts
+//!   a message only once all of it is written, and the socket's wait won 17 of 17 CI stalls. A sink
+//!   whose total stops growing with no error (its feed stopped upstream, or a hang inside rtmp2sink) is
+//!   no longer swapped here: docs/_INDEX.md Owed 87 records that trade.
 //! - **Back-off.** Every end before Connected is one more consecutive failure: a connect that times
-//!   out, an error, or a stall while proving. Failure number f waits `delay(f - 1)`: 0.5, 1, 2, 2 s. It
-//!   never gives up. **Only Connected resets it**: an error from Connected is failure 1 again, and a
-//!   Connected sink's stall swaps with the count at 0.
+//!   out, or an error. Failure number f waits `delay(f - 1)`: 0.5, 1, 2, 2 s. It never gives up.
+//!   **Only Connected resets it**: an error from Connected is failure 1 again.
 //! - **Generations.** Every build is a new generation, and an event from any other generation is
 //!   ignored in both directions: a late error from a torn-down sink cannot knock down its replacement,
-//!   and late bytes from it can neither start, prove nor keep alive the replacement.
+//!   and late bytes from it can neither start nor prove the replacement.
 //! - **The 15 s budget** (`OUTPUT_GAP_BUDGET_MS`, F-004) holds from an error through one failed
 //!   connect, not two: `tests/links.rs` measures every recovery path, and docs/_INDEX.md records the
 //!   paths that exceed it. The gap ends when the new sink's bytes flow, not when it is Connected.
 //! - **Every build carries its reason** (`SwapReason`, Owed 87): what ended the sink before it. An
-//!   error is the sink's own (rtmp2sink's socket timeout among them); a connect timeout and a stall
-//!   are this module's rules. A build after a back-off carries the failure that started it, and the
-//!   first build carries `First`.
+//!   error is the sink's own (rtmp2sink's socket timeout among them); the connect timeout is this
+//!   module's rule. A build after a back-off carries the failure that started it, and the first build
+//!   carries `First`.
 use crate::backoff::delay;
 use crate::config::Thresholds;
 use crate::time::{elapsed, Ms};
@@ -50,17 +53,15 @@ pub enum OutputState {
     /// before it.
     Connecting { attempt: u32, since: Ms },
     /// The sink's total has grown, but not yet for `output_connected_after_ms`. `first_progress` is its
-    /// first growth, `last_progress` its latest, `sent` the highest total; `attempt` failures came
-    /// before it and still count until it is Connected.
+    /// first growth, `sent` the highest total; `attempt` failures came before it and still count until
+    /// it is Connected.
     Proving {
         attempt: u32,
         first_progress: Ms,
-        last_progress: Ms,
         sent: u64,
     },
-    /// The sink earned Connected. `last_progress` is when the total last grew; `sent` is the highest
-    /// total this sink has reported.
-    Connected { last_progress: Ms, sent: u64 },
+    /// The sink earned Connected. Only its error ends it.
+    Connected,
     /// `attempt` consecutive failures so far; the next sink is built at the first tick at or after
     /// `until`.
     Backoff { attempt: u32, until: Ms },
@@ -72,13 +73,10 @@ pub enum SwapReason {
     /// Generation 1: no sink came before it.
     First,
     /// The sink before it reported a failure (`on_error`): a bus error, rtmp2sink's own socket
-    /// timeout and a refused publish among them.
+    /// timeout (a destination stall, `OUTPUT_SINK_TIMEOUT_MS`) and a refused publish among them.
     Error,
     /// The sink before it sent no byte within `output_connect_timeout_ms` of its build.
     ConnectTimeout,
-    /// The stall rule: the sink before it sent nothing new for `output_stall_after_ms`, proving or
-    /// Connected.
-    Stall,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,7 +116,7 @@ impl OutputLink {
     }
 
     pub fn is_connected(&self) -> bool {
-        matches!(self.state, OutputState::Connected { .. })
+        matches!(self.state, OutputState::Connected)
     }
 
     /// Why the current generation was built (`First` before any build).
@@ -127,7 +125,8 @@ impl OutputLink {
     }
 
     /// The current sink's bytes-sent total, counted from 0 when the sink was built (C09: rtmp2sink
-    /// `out-bytes-total`). Only a total above the highest one reported counts as progress.
+    /// `out-bytes-total`). Only a total above the highest one reported counts as progress, and only
+    /// until the sink is Connected: after that nothing reads it.
     pub fn on_progress(&mut self, now: Ms, gen: u64, total_bytes: u64, t: &Thresholds) {
         if gen != self.generation {
             return;
@@ -137,46 +136,37 @@ impl OutputLink {
             OutputState::Connecting { attempt, .. } if total_bytes > 0 => OutputState::Proving {
                 attempt,
                 first_progress: now,
-                last_progress: now,
                 sent: total_bytes,
             },
             OutputState::Proving {
                 attempt,
                 first_progress,
                 sent,
-                ..
             } if total_bytes > sent => {
                 if elapsed(now, first_progress) >= t.output_connected_after_ms {
-                    OutputState::Connected {
-                        last_progress: now,
-                        sent: total_bytes,
-                    }
+                    OutputState::Connected
                 } else {
                     OutputState::Proving {
                         attempt,
                         first_progress,
-                        last_progress: now,
                         sent: total_bytes,
                     }
                 }
             }
-            OutputState::Connected { sent, .. } if total_bytes > sent => OutputState::Connected {
-                last_progress: now,
-                sent: total_bytes,
-            },
-            // No growth; or the sink failed, and its late bytes change nothing (the next build
-            // replaces it).
+            // No growth; a Connected sink; or the sink failed, and its late bytes change nothing (the
+            // next build replaces it).
             unchanged => unchanged,
         };
     }
 
-    /// The current sink failed: a bus error, including a connect that timed out in rtmp2sink.
+    /// The current sink failed: a bus error, including rtmp2sink's own socket timeout (a connect
+    /// that timed out, or a destination that stopped taking bytes).
     pub fn on_error(&mut self, now: Ms, gen: u64, t: &Thresholds) {
         if gen != self.generation {
             return;
         }
         let failed_before = match self.state {
-            OutputState::Connected { .. } => 0,
+            OutputState::Connected => 0,
             // Not yet Connected: the failures before this sink still count (a refused publish).
             OutputState::Connecting { attempt, .. } | OutputState::Proving { attempt, .. } => attempt,
             // Already failed: a second error from the same sink changes nothing.
@@ -195,21 +185,7 @@ impl OutputLink {
                 self.back_off(now, attempt, t, SwapReason::ConnectTimeout);
                 false
             }
-            // The bytes stopped before the sink earned Connected: a failed attempt, so it waits.
-            OutputState::Proving {
-                attempt,
-                last_progress,
-                ..
-            } if elapsed(now, last_progress) >= t.output_stall_after_ms => {
-                self.back_off(now, attempt, t, SwapReason::Stall);
-                false
-            }
-            // Stalled: swap at once. The stall already spent 5 s of the 15 s budget.
-            OutputState::Connected { last_progress, .. }
-                if elapsed(now, last_progress) >= t.output_stall_after_ms =>
-            {
-                self.build(now, 0, SwapReason::Stall)
-            }
+            // Proving and Connected have no timer: only the sink's error ends them (Owed 87).
             _ => false,
         }
     }
@@ -238,13 +214,14 @@ impl OutputLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::OUTPUT_SINK_TIMEOUT_MS;
 
     fn t() -> Thresholds {
         Thresholds::default()
     }
 
     /// Build at `built`, the first bytes at once, and growth to `bytes` (above 1) at the bound: a link
-    /// Connected at generation 1 with `bytes` sent. Returns it and the instant it connected.
+    /// Connected at generation 1. Returns it and the instant it connected.
     fn connected(built: Ms, bytes: u64) -> (OutputLink, Ms) {
         let th = t();
         let mut o = OutputLink::new();
@@ -252,26 +229,17 @@ mod tests {
         o.on_progress(built, 1, 1, &th);
         let c = built + th.output_connected_after_ms;
         o.on_progress(c, 1, bytes, &th);
-        assert_eq!(
-            o.state(),
-            OutputState::Connected {
-                last_progress: c,
-                sent: bytes
-            }
-        );
+        assert_eq!(o.state(), OutputState::Connected);
         (o, c)
     }
 
     /// Ticks forward from `now` in 10 ms steps until the next build; returns its time. With no bytes
-    /// fed, the next build is due within the longer of the connect timeout (Connecting gives up) and
-    /// the stall (Proving fails, Connected swaps), plus the capped back-off, so a link that never
-    /// builds fails here instead of hanging the suite.
+    /// fed, the next build is due within the connect timeout (Connecting gives up) plus the capped
+    /// back-off, so a link that never builds fails here instead of hanging the suite. Proving and
+    /// Connected build nothing without an error (Owed 87), so this fails from them too.
     fn next_build(o: &mut OutputLink, mut now: Ms, th: &Thresholds) -> Ms {
         const STEP: Ms = 10;
-        let horizon = now
-            + th.output_connect_timeout_ms.max(th.output_stall_after_ms)
-            + th.output_backoff_cap_ms
-            + STEP;
+        let horizon = now + th.output_connect_timeout_ms + th.output_backoff_cap_ms + STEP;
         while !o.on_tick(now, th) {
             now += STEP;
             assert!(now <= horizon, "no build by {horizon} ms: {:?}", o.state());
@@ -322,8 +290,12 @@ mod tests {
         );
     }
 
+    // PDF chaos: the destination accepts but stalls → detected within 5 s. Since Owed 87 the detector
+    // is rtmp2sink's socket timeout (C09 sets `OUTPUT_SINK_TIMEOUT_MS`): its error arrives that long
+    // after the last write, and the link swaps one back-off base later (failure 1: Connected reset the
+    // count). No tick before the error swaps anything.
     #[test]
-    fn progress_stall_swaps_the_sink_within_5_s() {
+    fn a_destination_stall_swaps_on_the_sinks_timeout_error() {
         let th = t();
         let mut o = OutputLink::new();
         assert!(o.on_tick(0, &th));
@@ -336,31 +308,32 @@ mod tests {
         } // healthy until 10 s; then the bytes stop and every poll reports the same total
         assert!(o.is_connected(), "setup: 9.9 s of growth earns Connected");
         let last = now - 33;
-        let mut swapped_at = None;
-        while now < 20_000 {
+        let error_at = last + OUTPUT_SINK_TIMEOUT_MS; // rtmp2sink's socket wait gives up
+        while now < error_at {
             o.on_progress(now, 1, total, &th);
-            if o.on_tick(now, &th) {
-                swapped_at = Some(now);
-                break;
-            }
+            assert!(
+                !o.on_tick(now, &th),
+                "swapped {} ms after the last bytes",
+                now - last
+            );
             now += 33;
         }
-        let at = swapped_at.expect("stall never detected");
+        o.on_error(error_at, 1, &th);
+        let at = next_build(&mut o, error_at, &th);
         assert!(
-            at - last >= th.output_stall_after_ms,
-            "swapped {} ms after the last bytes",
-            at - last
+            error_at - last <= 5_000,
+            "PDF: detected within 5 s of the last bytes"
         );
-        assert!(
-            at - last <= th.output_stall_after_ms + 33,
-            "detected {} ms after the last bytes",
-            at - last
+        assert_eq!(
+            at - last,
+            OUTPUT_SINK_TIMEOUT_MS + th.output_backoff_base_ms,
+            "swapped one base back-off after the sink's error"
         );
-        assert_eq!(o.generation(), 2, "a stall swaps immediately; no back-off wait");
+        assert_eq!((o.generation(), o.swap_reason()), (2, SwapReason::Error));
         assert_eq!(
             o.state(),
             OutputState::Connecting {
-                attempt: 0,
+                attempt: 1,
                 since: at
             }
         );
@@ -382,8 +355,10 @@ mod tests {
         assert!(o.is_connected());
     }
 
+    // Gen 2 sends its first bytes and goes quiet; gen 1's total keeps growing, past gen 2's bound. Gen
+    // 1's bytes are not gen 2's: they neither grow nor connect it.
     #[test]
-    fn progress_from_old_generation_does_not_keep_new_sink_alive() {
+    fn progress_from_old_generation_does_not_prove_the_new_sink() {
         let th = t();
         let mut o = OutputLink::new();
         o.on_tick(0, &th);
@@ -391,24 +366,24 @@ mod tests {
         o.on_error(10, 1, &th);
         assert!(o.on_tick(600, &th), "the 0.5 s back-off ended at 510");
         o.on_progress(700, 2, 4_096, &th);
-        let mut proving = o.clone(); // the same sink, still proving: its stall is a failure
-        let c = 700 + th.output_connected_after_ms;
-        o.on_progress(c, 2, 8_192, &th);
-        assert!(o.is_connected(), "setup: gen 2 earned Connected");
+        let mut fed = 0;
         for (i, now) in (700..30_000).step_by(100).enumerate() {
             let total = 8_192 + i as u64 * 16_000; // gen 1's total keeps growing
             o.on_progress(now, 1, total, &th);
-            proving.on_progress(now, 1, total, &th);
+            fed += 1;
         }
         assert!(
-            o.on_tick(c + th.output_stall_after_ms, &th),
-            "gen-1 bytes must not mask a gen-2 stall"
+            fed * 100 > th.output_connected_after_ms,
+            "{fed} polls reach past the bound"
         );
-        assert!(!proving.on_tick(700 + th.output_stall_after_ms, &th));
-        assert!(
-            matches!(proving.state(), OutputState::Backoff { attempt: 2, .. }),
-            "gen-1 bytes must not mask a proving gen-2 stall either: {:?}",
-            proving.state()
+        assert_eq!(
+            o.state(),
+            OutputState::Proving {
+                attempt: 1,
+                first_progress: 700,
+                sent: 4_096
+            },
+            "gen-1 bytes must not prove gen 2"
         );
     }
 
@@ -471,7 +446,6 @@ mod tests {
             OutputState::Proving {
                 attempt: 0,
                 first_progress: 3_000,
-                last_progress: 3_000,
                 sent: 4_096
             }
         );
@@ -493,29 +467,6 @@ mod tests {
                 attempt: 1,
                 until: th.output_connect_timeout_ms + th.output_backoff_base_ms
             }
-        );
-    }
-
-    // The guard on the total: a repeat, a backwards total, and one still below the highest are all
-    // no progress, so the stall clock keeps running from the last real growth.
-    #[test]
-    fn a_repeated_or_backwards_total_is_no_progress() {
-        let th = t();
-        let (mut o, c) = connected(1_000, 1_000);
-        o.on_progress(c + 500, 1, 1_500, &th);
-        let grown = OutputState::Connected {
-            last_progress: c + 500,
-            sent: 1_500,
-        };
-        assert_eq!(o.state(), grown, "a larger total is progress");
-        o.on_progress(c + 1_000, 1, 1_500, &th); // a repeat
-        o.on_progress(c + 2_000, 1, 1_200, &th); // backwards
-        o.on_progress(c + 3_000, 1, 1_499, &th); // above the first total, below the highest
-        assert_eq!(o.state(), grown);
-        assert!(!o.on_tick(c + 500 + th.output_stall_after_ms - 1, &th));
-        assert!(
-            o.on_tick(c + 500 + th.output_stall_after_ms, &th),
-            "stalled since the last growth"
         );
     }
 
@@ -541,13 +492,13 @@ mod tests {
         assert_eq!(o.state(), s, "the sink failed; its late bytes change nothing");
     }
 
-    // A stall during back-off is ignored: the bytes stopped 4.9 s before the error, so the whole wait
-    // lies past 5 s without bytes, and still nothing is built before the wait ends.
+    // An error from Connected: nothing is built before its back-off ends, and the build at its end
+    // carries failure 1.
     #[test]
-    fn a_stall_during_backoff_is_ignored() {
+    fn nothing_is_built_before_the_back_off_ends() {
         let th = t();
         let (mut o, c) = connected(0, 1_000);
-        let e = c + th.output_stall_after_ms - 100;
+        let e = c + 100;
         o.on_error(e, 1, &th);
         let wait = th.output_backoff_base_ms;
         assert_eq!(
@@ -571,20 +522,21 @@ mod tests {
         );
     }
 
-    // An output error during a stall swap: the stalled sink errors as it is torn down (old generation,
-    // ignored); the new sink's own error backs off as failure 1.
+    // A second error from the sink a swap replaced: it errors again as it is torn down (old
+    // generation, ignored); the new sink's own error backs off as failure 2, since the new sink never
+    // earned Connected.
     #[test]
-    fn an_error_during_a_stall_swap_counts_only_from_the_new_sink() {
+    fn an_error_from_the_torn_down_sink_counts_only_from_the_new_one() {
         let th = t();
         let (mut o, c) = connected(0, 1_000);
-        let swap = c + th.output_stall_after_ms;
-        assert!(o.on_tick(swap, &th));
+        o.on_error(c + 100, 1, &th);
+        let swap = next_build(&mut o, c + 100, &th);
         assert_eq!(o.generation(), 2);
         o.on_error(swap + 10, 1, &th);
         assert_eq!(
             o.state(),
             OutputState::Connecting {
-                attempt: 0,
+                attempt: 1,
                 since: swap
             }
         );
@@ -592,8 +544,8 @@ mod tests {
         assert_eq!(
             o.state(),
             OutputState::Backoff {
-                attempt: 1,
-                until: swap + 20 + th.output_backoff_base_ms
+                attempt: 2,
+                until: swap + 20 + 2 * th.output_backoff_base_ms
             }
         );
     }
@@ -604,13 +556,13 @@ mod tests {
     fn old_sink_bytes_after_a_swap_never_connect_the_new_sink() {
         let th = t();
         let (mut o, c) = connected(0, 1_000);
-        let swap = c + th.output_stall_after_ms;
-        assert!(o.on_tick(swap, &th));
+        o.on_error(c + 100, 1, &th);
+        let swap = next_build(&mut o, c + 100, &th);
         o.on_progress(swap + 500, 1, 900_000, &th);
         assert_eq!(
             o.state(),
             OutputState::Connecting {
-                attempt: 0,
+                attempt: 1,
                 since: swap
             }
         );
@@ -619,8 +571,8 @@ mod tests {
         assert_eq!(
             o.state(),
             OutputState::Backoff {
-                attempt: 1,
-                until: swap + th.output_connect_timeout_ms + th.output_backoff_base_ms
+                attempt: 2,
+                until: swap + th.output_connect_timeout_ms + 2 * th.output_backoff_base_ms
             },
             "nothing connected generation 2"
         );
@@ -672,26 +624,32 @@ mod tests {
         );
     }
 
-    // stall → recover → stall: the second stall swaps again, at once.
+    // stall → recover → stall, each stall ended by the sink's timeout error: the second waits the base
+    // again, because the recovery earned Connected (it reset the count). No tick swaps either.
     #[test]
     fn a_second_stall_after_recovery_swaps_again() {
         let th = t();
+        let base = th.output_backoff_base_ms;
         let (mut o, c) = connected(0, 1_000);
-        let swap = c + th.output_stall_after_ms;
-        assert!(o.on_tick(swap, &th));
+        let first = c + OUTPUT_SINK_TIMEOUT_MS;
+        assert!(!o.on_tick(first, &th), "no swap without the sink's error");
+        o.on_error(first, 1, &th);
+        let swap = swap_for(&mut o, first, &th, 2, SwapReason::Error);
+        assert_eq!(swap, first + base);
         o.on_progress(swap + 300, 2, 4_096, &th);
         let c2 = swap + 300 + th.output_connected_after_ms;
         o.on_progress(c2, 2, 8_192, &th);
         assert!(o.is_connected());
-        let second = c2 + th.output_stall_after_ms;
-        assert!(!o.on_tick(second - 1, &th));
-        assert!(o.on_tick(second, &th), "the second stall swaps too");
-        assert_eq!(o.generation(), 3);
+        let second = c2 + OUTPUT_SINK_TIMEOUT_MS;
+        assert!(!o.on_tick(second, &th), "no swap without the sink's error");
+        o.on_error(second, 2, &th);
+        let at = swap_for(&mut o, second, &th, 3, SwapReason::Error);
+        assert_eq!(at, second + base, "failure 1 again: the recovery reset the count");
         assert_eq!(
             o.state(),
             OutputState::Connecting {
-                attempt: 0,
-                since: second
+                attempt: 1,
+                since: at
             }
         );
     }
@@ -709,10 +667,8 @@ mod tests {
         o.on_progress(c + 20, 2, 9_000, &th);
         assert_eq!(
             o.state(),
-            OutputState::Connected {
-                last_progress: c,
-                sent: 1_000
-            }
+            OutputState::Connected,
+            "generation 2's error must not end gen 1"
         );
     }
 
@@ -886,13 +842,7 @@ mod tests {
         }
         assert_eq!(at, first + n, "setup: a poll lands on the bound");
         feed(&mut o, at, 3, cf_healthy_total(at - first), &th);
-        assert_eq!(
-            o.state(),
-            OutputState::Connected {
-                last_progress: first + n,
-                sent: cf_healthy_total(n)
-            }
-        );
+        assert_eq!(o.state(), OutputState::Connected);
         // A later error is failure 1 again: Connected reset the two refusals.
         let e = first + n + 20_000;
         o.on_error(e, 3, &th);
@@ -906,13 +856,12 @@ mod tests {
     }
 
     // The bound is inclusive: growth exactly `output_connected_after_ms` after the first connects,
-    // 1 ms earlier does not. Under thresholds where the bound, the stall and the connect timeout all
-    // differ, so a bound that read another field moves.
+    // 1 ms earlier does not. Under thresholds where the bound and the connect timeout differ, so a
+    // bound that read the other field moves.
     #[test]
     fn the_bound_is_measured_from_the_first_growth_and_is_inclusive() {
         let distinct = Thresholds {
             output_connected_after_ms: 3_100,
-            output_stall_after_ms: 4_300,
             output_connect_timeout_ms: 6_700,
             ..t()
         };
@@ -933,14 +882,7 @@ mod tests {
                 "{n}: no tick may end a growing proof"
             );
             feed(&mut o, 40 + n, 1, 10_000_001, &th);
-            assert_eq!(
-                o.state(),
-                OutputState::Connected {
-                    last_progress: 40 + n,
-                    sent: 10_000_001
-                },
-                "{n}: Connected at the bound"
-            );
+            assert_eq!(o.state(), OutputState::Connected, "{n}: Connected at the bound");
         }
     }
 
@@ -966,7 +908,7 @@ mod tests {
     }
 
     // A generation change mid-window: the old sink's bytes neither start nor finish the new sink's
-    // proof, whether the change came from a refusal or from a stall swap.
+    // proof, whether the change came from a refusal or from a Connected sink's error.
     #[test]
     fn a_generation_change_mid_window_restarts_the_proof() {
         let th = t();
@@ -1027,83 +969,48 @@ mod tests {
         }
         feed(&mut o, at, 2, g2, &th);
         assert!(o.is_connected(), "gen 2 connects on its own bound");
-        // (3) A stall swap from a Connected gen 1: its late, growing totals never start gen 2's proof.
+        // (3) A Connected gen 1 errors: its late, growing totals never start gen 2's proof.
         let (mut o, last) = connected(0, 1_000);
-        let swap = last + th.output_stall_after_ms;
-        assert!(o.on_tick(swap, &th));
+        o.on_error(last + OUTPUT_SINK_TIMEOUT_MS, 1, &th);
+        let swap = next_build(&mut o, last + OUTPUT_SINK_TIMEOUT_MS, &th);
         for k in 1..=40 {
             feed(&mut o, swap + 100 * k, 1, 2_000 * k, &th);
         }
         assert_eq!(
             o.state(),
             OutputState::Connecting {
-                attempt: 0,
+                attempt: 1,
                 since: swap
             },
             "gen 1's bytes after the swap"
         );
     }
 
-    // Growth that stops before the bound: the stall rule ends the proof (5 s after the last growth,
-    // not 1 ms sooner), and since the sink never earned Connected it is a failure: it backs off.
+    // The guard on the total, while proving: a repeat, a backwards total, and one above the first
+    // but below the highest are all no growth. None connects the sink at or past the bound, none moves
+    // the highest total, and the next real growth connects it.
     #[test]
-    fn growth_that_stops_before_the_bound_stalls_and_counts_as_a_failure() {
-        let distinct = Thresholds {
-            output_connected_after_ms: 6_100,
-            output_stall_after_ms: 4_300,
-            output_connect_timeout_ms: 7_700,
-            ..t()
-        };
-        for th in [t(), distinct] {
-            let stall = th.output_stall_after_ms;
-            let mut o = OutputLink::new();
-            let mut now = 0;
-            now = next_build(&mut o, now, &th);
-            refuse(&mut o, now, &CF_REFUSED, CF_REFUSED_ERROR_AT, &th);
-            let built = next_build(&mut o, now, &th);
-            let mut last = built;
-            for k in 0..12 {
-                last = built + 31 + 250 * k; // 2.75 s of growth, then the bytes stop
-                feed(&mut o, last, 2, 476 + 50_000 * k, &th);
-            }
-            for at in (last..last + stall).step_by(33).chain([last + stall - 1]) {
-                feed(&mut o, at, 2, 476 + 50_000 * 11, &th); // the poll repeats the frozen total
-                assert!(!o.on_tick(at, &th), "{stall}: ended at {at}, before the stall");
-                assert!(!o.is_connected());
-            }
-            assert!(!o.on_tick(last + stall, &th), "a failure waits; it is not a swap");
-            assert_eq!(
-                o.state(),
-                OutputState::Backoff {
-                    attempt: 2,
-                    until: last + stall + 2 * th.output_backoff_base_ms
-                },
-                "{stall}: the second failure waits twice the base"
-            );
-            assert_eq!(o.generation(), 2);
-        }
-    }
-
-    // A total that repeats or goes backwards while proving is no growth: it does not connect at the
-    // bound, and the stall clock keeps running from the last real growth.
-    #[test]
-    fn a_repeated_total_while_proving_is_no_progress() {
+    fn a_repeated_or_backwards_total_is_no_progress() {
         let th = t();
-        let (n, stall) = (th.output_connected_after_ms, th.output_stall_after_ms);
+        let n = th.output_connected_after_ms;
         let mut o = OutputLink::new();
         assert!(o.on_tick(0, &th));
         feed(&mut o, 30, 1, 476, &th);
         feed(&mut o, 2_030, 1, 900_000, &th);
         feed(&mut o, 30 + n, 1, 900_000, &th); // a repeat, at the bound
         feed(&mut o, 30 + n + 1, 1, 899_999, &th); // backwards
-        assert!(!o.is_connected(), "a repeat is no growth");
-        assert!(!o.on_tick(2_030 + stall - 1, &th));
-        o.on_tick(2_030 + stall, &th);
-        assert!(
-            matches!(o.state(), OutputState::Backoff { attempt: 1, .. }),
-            "stalled since the last growth: {:?}",
-            o.state()
+        feed(&mut o, 30 + n + 2, 1, 500_000, &th); // above the first total, below the highest
+        assert_eq!(
+            o.state(),
+            OutputState::Proving {
+                attempt: 0,
+                first_progress: 30,
+                sent: 900_000
+            },
+            "no growth past the bound"
         );
+        feed(&mut o, 30 + n + 3, 1, 900_001, &th);
+        assert_eq!(o.state(), OutputState::Connected, "the next real growth connects");
     }
 
     // ---- Owed 87: every build names what ended the sink before it ----
@@ -1118,12 +1025,11 @@ mod tests {
     }
 
     // One link through every way a sink ends, in the module doc's words: the first build, the sink's
-    // own error, the connect timeout, the stall rule while proving and while Connected. An end from
-    // another generation, or a second one from a sink that already failed, names nothing.
+    // own error (while connecting, while proving and once Connected) and the connect timeout. An end
+    // from another generation, or a second one from a sink that already failed, names nothing.
     #[test]
     fn each_build_names_what_ended_the_sink_before_it() {
         let th = t();
-        let stall = th.output_stall_after_ms;
         let mut o = OutputLink::new();
         let mut checked = 0;
         assert_eq!(o.swap_reason(), SwapReason::First, "before any build");
@@ -1143,44 +1049,112 @@ mod tests {
         now = swap_for(&mut o, now, &th, 3, SwapReason::ConnectTimeout);
         checked += 1;
 
-        // Generation 3's bytes stop while it proves: the stall rule, a failure that waits.
+        // Generation 3's bytes stop while it proves, and it errors: the latest end names the build.
         feed(&mut o, now + 31, 3, 476, &th);
         let last = now + 1_000;
         feed(&mut o, last, 3, 52_000, &th);
-        assert!(!o.on_tick(last + stall, &th), "a failure waits");
-        now = swap_for(&mut o, last + stall, &th, 4, SwapReason::Stall);
+        o.on_error(last + OUTPUT_SINK_TIMEOUT_MS, 3, &th);
+        now = swap_for(&mut o, last + OUTPUT_SINK_TIMEOUT_MS, &th, 4, SwapReason::Error);
         checked += 1;
 
-        // Generation 4 earns Connected, then stalls: the stall rule, a swap at once.
+        // Generation 4 earns Connected, then errors.
         feed(&mut o, now + 31, 4, 476, &th);
         let c = now + 31 + th.output_connected_after_ms;
         feed(&mut o, c, 4, 900_000, &th);
         assert!(o.is_connected());
-        assert!(!o.on_tick(c + stall - 1, &th));
-        assert!(o.on_tick(c + stall, &th), "a Connected stall swaps at once");
-        assert_eq!((o.generation(), o.swap_reason()), (5, SwapReason::Stall));
-        now = c + stall;
+        o.on_error(c + OUTPUT_SINK_TIMEOUT_MS, 4, &th);
+        now = swap_for(&mut o, c + OUTPUT_SINK_TIMEOUT_MS, &th, 5, SwapReason::Error);
         checked += 1;
 
-        // Generation 5 errors after a stall swap: the latest end names the build.
-        o.on_error(now + 200, 5, &th);
-        now = swap_for(&mut o, now + 200, &th, 6, SwapReason::Error);
-        checked += 1;
-
-        // A late error from generation 5 changes nothing; generation 6 times out.
-        o.on_error(now + 10, 5, &th);
+        // A late error from generation 4 changes nothing; generation 5 times out.
+        o.on_error(now + 10, 4, &th);
         assert!(matches!(o.state(), OutputState::Connecting { .. }));
-        now = swap_for(&mut o, now + 10, &th, 7, SwapReason::ConnectTimeout);
+        now = swap_for(&mut o, now + 10, &th, 6, SwapReason::ConnectTimeout);
         checked += 1;
 
-        // Generation 7 times out, and its error then arrives in the back-off: still the timeout.
+        // Generation 6 times out, and its error then arrives in the back-off: still the timeout.
         let timed_out = now + th.output_connect_timeout_ms;
         assert!(!o.on_tick(timed_out, &th));
         assert!(matches!(o.state(), OutputState::Backoff { .. }));
-        o.on_error(timed_out + 1, 7, &th);
-        swap_for(&mut o, timed_out + 1, &th, 8, SwapReason::ConnectTimeout);
+        o.on_error(timed_out + 1, 6, &th);
+        swap_for(&mut o, timed_out + 1, &th, 7, SwapReason::ConnectTimeout);
         checked += 1;
 
-        assert_eq!(checked, 8, "builds checked");
+        assert_eq!(checked, 7, "builds checked");
+    }
+
+    // ---- Owed 87 (the owner, 2026-10-24, "A"): the link has no stall rule ----
+
+    /// Far past every timer the link has: the connect timeout, the bound and the capped back-off,
+    /// ten times over. A link that swaps or fails a sink for silence inside it has a stall rule.
+    fn silence(th: &Thresholds) -> Ms {
+        10 * (th.output_connect_timeout_ms + th.output_connected_after_ms + th.output_backoff_cap_ms)
+    }
+
+    // The empty case: a Connected sink whose total never grows again is never swapped by the link, on
+    // any tick, however long it is silent. rtmp2sink's own socket timeout is the only detector of a
+    // destination stall (C09 sets it), and the sink's error is what swaps it: failure 1, since
+    // Connected reset the count, then the back-off's build, named `Error`.
+    #[test]
+    fn a_connected_sink_that_sends_nothing_is_swapped_only_by_its_error() {
+        let th = t();
+        let (mut o, c) = connected(0, 1_000);
+        let quiet = silence(&th);
+        let mut ticks = 0;
+        for now in (c..=c + quiet).step_by(33) {
+            o.on_progress(now, 1, 1_000, &th); // the poll repeats the frozen total
+            assert!(!o.on_tick(now, &th), "swapped {} ms into the silence", now - c);
+            ticks += 1;
+        }
+        assert!(ticks > 1_000, "{ticks} ticks");
+        assert!(o.is_connected(), "{:?}", o.state());
+        assert_eq!(o.generation(), 1);
+        let e = c + quiet + 1;
+        o.on_error(e, 1, &th);
+        assert!(
+            matches!(o.state(), OutputState::Backoff { attempt: 1, until } if until == e + th.output_backoff_base_ms),
+            "{:?}",
+            o.state()
+        );
+        assert!(!o.on_tick(e + th.output_backoff_base_ms - 1, &th));
+        assert!(o.on_tick(e + th.output_backoff_base_ms, &th));
+        assert_eq!((o.generation(), o.swap_reason()), (2, SwapReason::Error));
+    }
+
+    // A sink that goes silent while it proves is not failed by the link either: it stays Proving,
+    // carrying the failures before it, until its own error ends it as one more failure.
+    #[test]
+    fn a_proving_sink_that_goes_silent_waits_for_its_error() {
+        let th = t();
+        let mut o = OutputLink::new();
+        assert!(o.on_tick(0, &th));
+        o.on_error(10, 1, &th);
+        let built = next_build(&mut o, 10, &th);
+        o.on_progress(built + 31, 2, 476, &th);
+        let last = built + 1_000;
+        o.on_progress(last, 2, 52_000, &th); // then nothing, short of the bound
+        let quiet = silence(&th);
+        let mut ticks = 0;
+        for now in (last..=last + quiet).step_by(33) {
+            o.on_progress(now, 2, 52_000, &th);
+            assert!(!o.on_tick(now, &th), "built {} ms into the silence", now - last);
+            assert!(
+                matches!(o.state(), OutputState::Proving { attempt: 1, .. }),
+                "{} ms into the silence: {:?}",
+                now - last,
+                o.state()
+            );
+            ticks += 1;
+        }
+        assert!(ticks > 1_000, "{ticks} ticks");
+        let e = last + quiet + 1;
+        o.on_error(e, 2, &th);
+        let wait = 2 * th.output_backoff_base_ms; // failure 2 waits twice the base
+        assert!(
+            matches!(o.state(), OutputState::Backoff { attempt: 2, until } if until == e + wait),
+            "{:?}",
+            o.state()
+        );
+        assert_eq!(swap_for(&mut o, e, &th, 3, SwapReason::Error), e + wait);
     }
 }

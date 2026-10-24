@@ -36,12 +36,6 @@ pub struct Thresholds {
     pub kick_alert_count: usize,
     /// PDF failure table: the "5 min" of "> 3 times in 5 min".
     pub kick_window_ms: Ms,
-    /// PDF chaos "destination accepts but stalls: detected within 5 s": a Connected output whose
-    /// bytes-SENT total has not grown for this long is stalled, and its sink is swapped at once (C04
-    /// `OutputLink::on_progress`). Not an ack stall: F-005 found CF Input B sends no RTMP
-    /// acknowledgements (rtmp2sink `out-bytes-acked` stayed 0 in its 290 s pushes while
-    /// `out-bytes-total` grew), so C09 feeds `out-bytes-total` (docs/_INDEX.md false premises).
-    pub output_stall_after_ms: Ms,
     /// C02 brief default, sized to the PDF budget "output reconnect ≤ 5 s": back-off 0.5 s → 2 s keeps
     /// attempts inside it. The first wait.
     pub output_backoff_base_ms: Ms,
@@ -157,6 +151,18 @@ pub const OUTPUT_FPS_MIN_WINDOW_MS: Ms = 2_500;
 /// not a `Thresholds` field: it is YouTube's behaviour, not a setting of ours.
 pub const OUTPUT_GAP_BUDGET_MS: Ms = 15_000;
 
+/// rtmp2sink's `timeout`, which C09 sets on every sink: the only detector of a destination stall (Owed 87;
+/// the owner, 2026-10-24, "A": the output's stall rule is retired). rtmp2 counts a message's bytes only once
+/// the whole message is written (`rtmpconnection.c:519-628`), so the rule's "no growth for 5 s" was the same
+/// event as one socket wait of 5 s, and the socket's own timeout swapped 17 of 17 CI destination stalls
+/// (docs/_INDEX.md Owed 87). It now answers the PDF's chaos row "destination accepts but stalls: detected
+/// within 5 s" (C14 case 17). Today's default, pinned, not inherited: GStreamer 1.24.2 (tag 81e2548f),
+/// `gst/rtmp2/gstrtmp2locationhandler.c:35` `#define DEFAULT_TIMEOUT 5`, the property's default ("RTMP
+/// timeout in seconds", a uint, `:84-86`), which `rtmp/rtmpclient.c:419` hands to
+/// `g_socket_client_set_timeout`: it bounds the TCP connect and every wait of the socket after it. A const,
+/// not a `Thresholds` field: the domain decides nothing on it (the sink's error is its event).
+pub const OUTPUT_SINK_TIMEOUT_MS: Ms = 5_000;
+
 /// F-013 (C11's confirm pass, probe GR, 2 of 2; the final C11 review's probe FD, kills 20 s apart):
 /// with its zygote alive, a killed GPU process is relaunched 5 times, and the 6th death is Chromium's
 /// FATAL "GPU process isn't usable. Goodbye." and SIGTRAP of the whole process. A count over the
@@ -178,7 +184,6 @@ impl Default for Thresholds {
             input_srt_latency_ms: 1_000,
             kick_alert_count: 3,
             kick_window_ms: 300_000,
-            output_stall_after_ms: 5_000,
             output_backoff_base_ms: 500,
             output_backoff_cap_ms: 2_000,
             output_connect_timeout_ms: 5_000,
@@ -314,10 +319,10 @@ mod tests {
     }
 
     // Each number against its own source. The plan's Global Constraints: input back-off 1 s → 10 s; a
-    // kick alert at MORE than 3 kicks in 5 min; output stall after 5 s (the plan says "no bytes acked";
-    // F-005 makes it no bytes sent); a heartbeat every 5000 ms; CEF recycled every 2 h. Spec §4.2: CEF
-    // Failed after 3 failures in 5 min. The C02 brief default: output back-off 0.5 s → 2 s, sized to
-    // the PDF's 5 s reconnect budget.
+    // kick alert at MORE than 3 kicks in 5 min; a heartbeat every 5000 ms; CEF recycled every 2 h.
+    // Spec §4.2: CEF Failed after 3 failures in 5 min. The C02 brief default: output back-off 0.5 s →
+    // 2 s, sized to the PDF's 5 s reconnect budget. (The plan's output stall after 5 s is rtmp2sink's
+    // own timeout since Owed 87: `the_sink_timeout_is_rtmp2s_own_default`.)
     #[test]
     fn link_and_lifecycle_numbers_match_their_sources() {
         let t = Thresholds::default();
@@ -327,7 +332,6 @@ mod tests {
             "input back-off"
         );
         assert_eq!((t.kick_alert_count, t.kick_window_ms), (3, 300_000), "kick alert");
-        assert_eq!(t.output_stall_after_ms, 5_000, "output stall");
         assert_eq!(
             (t.output_backoff_base_ms, t.output_backoff_cap_ms),
             (500, 2_000),
@@ -389,13 +393,22 @@ mod tests {
 
     // F-004 addendum: YouTube split the organiser's broadcast after a 30 s output gap and kept it
     // through 15 s, so every recovery path must finish its gap under 15 s. The output's own worst
-    // single-attempt recovery: the stall is detected, one capped back-off, then a connect that uses its
-    // whole timeout.
+    // single-attempt recovery from a destination stall: the sink's own timeout reports it (Owed 87),
+    // one capped back-off, then a connect that uses its whole timeout.
     #[test]
-    fn output_stall_and_one_reconnect_fit_inside_youtubes_15_s_split() {
+    fn a_destination_stall_and_one_reconnect_fit_inside_youtubes_15_s_split() {
         let t = Thresholds::default();
-        let gap = t.output_stall_after_ms + t.output_backoff_cap_ms + t.output_connect_timeout_ms;
+        let gap = OUTPUT_SINK_TIMEOUT_MS + t.output_backoff_cap_ms + t.output_connect_timeout_ms;
         assert!(gap < OUTPUT_GAP_BUDGET_MS, "output recovery gap {gap} ms");
+    }
+
+    // Owed 87 (the owner, 2026-10-24, "A"): the sink's timeout is pinned to the value every CI
+    // destination stall was swapped by, GStreamer 1.24.2's own default: `DEFAULT_TIMEOUT 5` (seconds),
+    // `gst/rtmp2/gstrtmp2locationhandler.c:35`, read at the tag. A literal on purpose: a test that read
+    // the constant it checks could not catch a change to it.
+    #[test]
+    fn the_sink_timeout_is_rtmp2s_own_default() {
+        assert_eq!(OUTPUT_SINK_TIMEOUT_MS, 5 * 1_000, "rtmp2 DEFAULT_TIMEOUT 5 s");
     }
 
     // F-011 (Owed 38): a refused publish counted bytes until its refusal arrived, the last total at
