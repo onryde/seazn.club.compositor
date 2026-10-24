@@ -1769,3 +1769,59 @@ INT and TERM also `wait`ed on the compositor, and re-waited after each trap.
   exists to the first poll that lists it. The adapter now lists at every ready too (the decision log's
   "Zygote watch at ready"); what is left is a zygote that dies between CEF's start and the first
   ready (Owed 70 (e)).
+
+## F-025: Owed 85's cause: a restarted container's Xvfb refuses its predecessor's lock (image run 40057826178, 2026-10-24)
+
+The follow-up to F-024's first fact (Owed 85; F-024 is on `feat/c14-chaos`, unmerged at the time).
+
+- **Measured, the real Xvfb** (image run 40057826178, head `f190df4`, the entrypoint unchanged; the
+  in-place restart probe, `scripts/image_probe.py --restarts 6`): containers under Docker's
+  `--restart on-failure:2` (ADR 0007 item 5's Docker equivalent), which restarts the same container,
+  so its writable layer and `/tmp` persist as under compose. `scripts/xvfb_witness.sh`, bind-mounted
+  ahead of `/usr/bin/Xvfb`, logged each Xvfb start's pid, the pid in `/tmp/.X99-lock` and Xvfb's own
+  stderr (the entrypoint sends that to `/dev/null`, which is where the reason had gone).
+  - 2 of the 4 restarts made (after 137 and after 133, in two containers): the new Xvfb started as
+    pid 10, found `lock=10 socket=yes`, and said `Fatal server error: (EE) Server is already active
+    for display 99`. No Xvfb ran in the new life, `/proc/net/unix` held no X99 socket, the
+    compositor's first build failed `init_cef: Failed to initialize CEF` (the GStreamer line's pid
+    18) and graphics went `failed` 3.5 s later. Those two containers' second restarts could not be
+    made (no CEF in the life before), so 4 of the 6 owed were checked, and the probe was red.
+  - The other 2 (after 75 then 133, one container): the new Xvfb was pid 11 against the lock's 10,
+    then pid 10 against 11; Xvfb found the lock's pid gone, took the lock as stale, and CEF was ready
+    in 2.2 s and 1.4 s, with one Xvfb and the lock naming it.
+- **Xvfb's rule** (xorg-server 21.1.12, Ubuntu 24.04's): `LockServer` (os/utils.c, called from
+  `OsInit`, os/osinit.c:313) reads the pid from an existing lock and calls `kill(pid, 0)`. Only
+  `ESRCH` makes the lock stale; success or `EPERM` is `FatalError("Server is already active for
+  display …")`, and the pid it finds live can be its own. The refusal comes before
+  `CreateWellKnownSockets` (dix/main.c), which unlinks and binds the socket path, so the old
+  `/tmp/.X11-unix/X99` stays, and the entrypoint's `[ -e /tmp/.X11-unix/X99 ]` wait passed on it at
+  once (F-024's 11-15 ms against 115-124 ms).
+- **Why the pid repeats:** a fresh container's Xvfb is pid 10 (image run 40027305462's table: tini 1,
+  the entrypoint 7, Xvfb 10, the waiter 20, the compositor 21), after the entrypoint's two `prlimit`
+  forks, which never vary. A container start is a new pid namespace, so a restart's forks repeat:
+  both failed restarts above, and 12 of round 2b's 13 below (the 13th: 19), logged the compositor as
+  pid 18 in the `init_cef` line, three forks fewer than a fresh start's 21: the three `sleep 0.1` the
+  wait loop skipped. The
+  namespace's first pids are not fixed, though: 1 life in 6 here started one pid later (Xvfb 11),
+  and such a life recovers when the lock's pid is gone at the check: C14's 5 recoveries in 18,
+  twice.
+- **C14's runs, the same signature:** round 2b (chaos runs 40056474269 and 40056388445, head
+  `66db5f4`) failed `init_cef` after 13 of 18 restarts again: 75 6 of 7, 133 3 of 5, 137 4 of 6.
+  Its `container-diff.txt` (names, `docker diff`) shows what a restart inherits: `/tmp/.X11-unix/X99`
+  and `/tmp/.X99-lock`, beside HOME's dconf, GStreamer registry and NSS database.
+- **Ruled out:** Chromium's singleton files (hypothesis 2) and `/dev/shm` leftovers (3). The CEF
+  profile, CEF's root cache path, is under `TMPDIR=/dev/shm/seazn`, and Docker mounts a fresh
+  `/dev/shm` at each start: in every restarted life the probe listed, `/dev/shm/seazn` held only that
+  life's own `seazn-cef-<pid>-…` (and its `.org.chromium.Chromium.*`), and the profile sweep removed
+  nothing; `container-diff.txt` lists no singleton file.
+- **Fly:** F-018 measured the rootfs reset at every start, an `on-failure` restart included, and
+  `/dev/shm` fresh (Machine `48e4533c564ed8`), so no lock outlives a boot there; Owed 85 is a
+  restart that keeps the writable layer (compose, Docker's `--restart`, ADR 0007 item 5's Docker
+  equivalent). The fix holds either way: on a fresh rootfs there is nothing to remove.
+- **So** (the fix, `docker/xvfb.sh`, sourced by the entrypoint): `start_xvfb` removes the display's
+  lock and socket before Xvfb starts (no process of an earlier life is left to own them: a container
+  start is a new pid namespace), and waits for Xvfb's own `-displayfd` line (written by
+  `NotifyParentProcess`, os/connection.c, once its sockets listen) instead of a socket file, so an
+  Xvfb that exits first fails the start at once (70, "it exited before it was ready") rather than
+  passing on a file. The check is the same probe on the fix: 6 restarts, each kind twice (image.yml's
+  "In-place restart probe" step).
