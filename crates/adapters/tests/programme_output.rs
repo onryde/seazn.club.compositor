@@ -1502,6 +1502,10 @@ fn a_late_first_sink_starts_at_the_keyframe_after_its_swap_not_inside_the_ring()
     p.swap_sink(1, &file_target(&dir.file("a.flv")));
     pace(&mut p, swap..swap + 30, FrameChoice::Emit);
     drain_and_wait(&mut p, &rx);
+    // The 30 paced end before the encoder's own next keyframe (frame 120): without the one asked for
+    // at the swap nothing is sent, and the drain ends with the encoders (PR #57 review I-1).
+    let len = file_len(&dir.file("a.flv"));
+    assert!(len > 0, "late sink: nothing reached the file ({len} B)");
     let d = decode(&dir.file("a.flv"));
     assert!(d.first_is_key(), "keys {:?}", &d.keys[..d.keys.len().min(5)]);
     assert_eq!(d.video_pts_ms.first(), Some(&0));
@@ -2711,4 +2715,219 @@ fn a_drain_while_the_sink_is_still_connecting_ends_without_waiting_for_it() {
         "{seen:?}"
     );
     assert_eq!(server.record().published, 0);
+}
+
+/// The file's size, 0 if it does not exist (filesink creates it when its pipeline starts).
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Whether the captured log holds a line containing `needle` within `timeout`.
+fn wait_for_line(lines: &Lines, needle: &str, timeout: Duration) -> bool {
+    let end = Instant::now() + timeout;
+    loop {
+        if lines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|l| l.contains(needle))
+        {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn logged(lines: &Lines, needle: &str) -> usize {
+    lines
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .filter(|l| l.contains(needle))
+        .count()
+}
+
+/// A session end must not wait out `drain_timeout_ms` (7 s) for an output that has sent nothing:
+/// rtmp2sink and filesink have nothing owed, and flvmux 1.24.2 forwards no EOS before its first
+/// buffer (PR #57 review I-1). This bound is the one the drain at a pending connect keeps.
+const OWED84_EMPTY_DRAIN_MAX: Duration = Duration::from_millis(1_500);
+/// A pause after the last paced tick that outlasts its encode (zerolatency x264 and the AAC
+/// encoder take milliseconds), so no frame is encoded after the gate opens.
+const OWED84_ENCODED_SETTLE: Duration = Duration::from_millis(200);
+
+/// Drains, and checks the drain ended within `OWED84_EMPTY_DRAIN_MAX` with exactly one
+/// `OutputDrained` and no `OutputError` (a further 500 ms is read for a second one). Returns how long
+/// it took.
+fn assert_empty_output_drains_at_once(case: &str, p: &mut GstProgramme, rx: &Receiver<Inbound>) -> Duration {
+    let t = Instant::now();
+    p.drain();
+    let mut seen = events_until(rx, OWED84_EMPTY_DRAIN_MAX, |e| *e == Event::OutputDrained);
+    let took = t.elapsed();
+    seen.extend(events_for(rx, Duration::from_millis(500)));
+    eprintln!("{case}: OutputDrained after {took:?}");
+    assert_eq!(
+        seen.iter().filter(|e| **e == Event::OutputDrained).count(),
+        1,
+        "{case}: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|e| matches!(e, Event::OutputError { .. })),
+        "{case}: {seen:?}"
+    );
+    took
+}
+
+/// I-1 (a): the destination accepts the publish in the instant the session ends. Whichever the
+/// feeder sees first, the open gate or the encoders' EOS, the drain ends with the encoders: at the
+/// gate (`reconnect_point`) or with nothing sent after it (`run`). The leg prints which.
+#[test]
+fn a_publish_accepted_during_the_drain_ends_it_with_the_encoders() {
+    let _s = serial();
+    let server = FakeRtmp::held();
+    let (mut p, rx, _f, lines) = programme();
+    let slate = FrameChoice::Slate(SlateKind::Reconnecting);
+    pace(&mut p, 0..30, slate);
+    p.swap_sink(1, &rtmp_target(&server));
+    pace(&mut p, 30..60, slate);
+    // Every paced frame is encoded before the publish is accepted, so each one is from before it.
+    thread::sleep(OWED84_ENCODED_SETTLE);
+    server.release();
+    assert_empty_output_drains_at_once("accepted during the drain", &mut p, &rx);
+    let opened = logged(&lines, "output gen=1: the sink can send");
+    eprintln!(
+        "accepted during the drain: the gate read open first: {}",
+        opened == 1
+    );
+    let rec = server.record();
+    assert_eq!(rec.accepted, 1, "the sink connected to the destination");
+    assert!(
+        !rec.media.iter().any(|m| m.is_avc_frame() || m.is_aac_frame()),
+        "a frame from before the publish was sent"
+    );
+}
+
+/// I-1 (b): the publish is accepted and the keyframe asked for, and the session ends before the
+/// encoder gets another frame to make it from. Nothing is sent, and the drain does not wait for it.
+#[test]
+fn a_drain_before_the_asked_keyframe_ends_without_waiting_for_it() {
+    let _s = serial();
+    let server = FakeRtmp::held();
+    let (mut p, rx, _f, lines) = programme();
+    let slate = FrameChoice::Slate(SlateKind::Reconnecting);
+    pace(&mut p, 0..30, slate);
+    p.swap_sink(1, &rtmp_target(&server));
+    pace(&mut p, 30..60, slate);
+    thread::sleep(OWED84_ENCODED_SETTLE);
+    server.release();
+    assert!(
+        wait_for_line(&lines, "output gen=1: the sink can send", Duration::from_secs(3)),
+        "the gate never opened"
+    );
+    assert_empty_output_drains_at_once("drain before the key", &mut p, &rx);
+    let rec = server.record();
+    assert_eq!((rec.accepted, rec.published), (1, 1), "the publish was accepted");
+    assert!(
+        !rec.media.iter().any(|m| m.is_avc_frame() || m.is_aac_frame()),
+        "a frame from before the publish was sent"
+    );
+}
+
+/// I-1 (c) and m-6: an encoder that never takes the keyframe request. It is asked again at each
+/// frame; the 30 paced end before the encoder's own next keyframe (frame 120, `key-int-max` = 2 ×
+/// fps), so nothing is sent, and the drain ends with the encoders.
+#[test]
+fn a_keyframe_request_never_taken_sends_nothing_and_the_drain_ends_with_the_encoders() {
+    let _s = serial();
+    let dir = Tmp::new("owed84-not-taken");
+    let (mut p, rx, _f, lines) = programme();
+    pace(&mut p, 0..75, FrameChoice::Slate(SlateKind::Waiting));
+    p.refuse_key_requests(u32::MAX);
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    pace(&mut p, 75..105, FrameChoice::Slate(SlateKind::Waiting));
+    assert_empty_output_drains_at_once("not taken", &mut p, &rx);
+    let asked = u32::MAX - p.key_refusals_left();
+    eprintln!("not taken: requests refused {asked}");
+    // One at the reconnect point, then one per ring entry while nothing is sent (30 ticks of video,
+    // and their audio).
+    assert!(asked > 30, "the request was asked {asked} times");
+    assert_eq!(
+        logged(&lines, "output gen=1: the keyframe request was not taken"),
+        1,
+        "logged once, not per try"
+    );
+    assert_eq!(file_len(&dir.file("a.flv")), 0, "nothing was sent");
+}
+
+/// m-6: a request the encoder refuses once is asked again at the next frame, so the stream starts
+/// within `OWED84_KEY_WAIT_TICKS` of the swap, not at the encoder's own next keyframe (frame 120,
+/// 35 ticks after this swap).
+#[test]
+fn a_keyframe_request_refused_once_is_asked_again_at_the_next_frame() {
+    let _s = serial();
+    let dir = Tmp::new("owed84-refused-once");
+    let (mut p, rx, frames, lines) = programme();
+    frames.set_camera(solid(gst_video::VideoFormat::I420, 1_280, 720, [255, 0, 0, 255]));
+    pace(&mut p, 0..75, FrameChoice::Slate(SlateKind::Waiting));
+    pace(&mut p, 75..75 + OWED84_MARGIN_TICKS, FrameChoice::Emit);
+    let swap = 75 + OWED84_MARGIN_TICKS;
+    p.refuse_key_requests(1);
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    let paced = 45;
+    pace(&mut p, swap..swap + paced, FrameChoice::Emit);
+    drain_and_wait(&mut p, &rx);
+    assert_eq!(p.key_refusals_left(), 0, "the first request was refused");
+    assert_eq!(
+        logged(&lines, "output gen=1: the keyframe request was taken at try 2"),
+        1,
+        "the refused request was not asked again"
+    );
+    let len = file_len(&dir.file("a.flv"));
+    assert!(len > 0, "refused once: nothing reached the file ({len} B)");
+    let d = decode(&dir.file("a.flv"));
+    assert!(d.first_is_key(), "keys {:?}", &d.keys[..d.keys.len().min(5)]);
+    assert_eq!(d.video_pts_ms.first(), Some(&0));
+    let n = d.frames.len() as u64;
+    assert!(
+        n + OWED84_KEY_WAIT_TICKS >= paced,
+        "{n} frames for the {paced} paced since the swap: the keyframe came late"
+    );
+    assert!(
+        n <= paced + OWED84_MARGIN_TICKS,
+        "{n} frames: the ring was replayed"
+    );
+    let checked = assert_all_camera("refused once", &d);
+    eprintln!("refused once: frames checked {checked}");
+    assert_eq!(checked as u64, n);
+}
+
+/// The gate reads rtmp2sink's `stats` contract and the empty drain flvmux's EOS rule, both read in
+/// the 1.24.2 source (F-027). check.yml installs the runner's GStreamer from Ubuntu 24.04's apt, as
+/// the image does (docker/Dockerfile `FROM ubuntu:24.04`): a bump on either side reds here first.
+/// This test runs on the runner only; image.yml runs only the graphics suite in the image.
+#[test]
+fn the_gate_reads_gstreamer_1_24() {
+    gst::init().expect("gstreamer");
+    let want = "1.24.";
+    let (major, minor, micro, _) = gst::version();
+    let core = format!("{major}.{minor}.{micro}");
+    let mut checked = 0;
+    for name in ["rtmp2sink", "flvmux"] {
+        let plugin = gst::ElementFactory::find(name)
+            .and_then(|f| f.plugin())
+            .unwrap_or_else(|| panic!("no {name}"));
+        let v = plugin.version();
+        assert!(
+            v.starts_with(want),
+            "{name} is from GStreamer {v}, not {want}x: re-read its stats and EOS rules (F-027)"
+        );
+        checked += 1;
+    }
+    assert!(
+        format!("{core}.").starts_with(want),
+        "GStreamer core {core}, not {want}x: re-read F-027"
+    );
+    assert_eq!(checked, 2);
 }
