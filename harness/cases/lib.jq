@@ -10,6 +10,8 @@
 def mark($n): ($case[$n] // []);
 def mark_at($n): (mark($n) | first | .at_ms);
 def mark_value($n): (mark($n) | first | .value);
+# $a - $b, or null when either is missing: a printed measure shows what it can of a red world.
+def less($a; $b): if $a == null or $b == null then null else $a - $b end;
 
 # docker events (die, start, restart, kill, oom, stop) of the compositor's container, in time order.
 def compositor_events: [$run.events[] | select(.service == "compositor")] | sort_by(.at_ms);
@@ -46,14 +48,29 @@ def index_regressions: [.overlay.runs[] | select(.index != null) | .index] as $i
 # output_progress_poll_ms` never reds a correct swap, and a detector one stall threshold slow reds
 # unless the true growth fell in the last poll before the previous beat (under 1 run in 20 by phase,
 # when the threshold doubles). The beat that first carries the raised sinkSwaps must exist too.
+#
+# `cause` (C14 fix round 3, item 2): a Connected sink is swapped by exactly two paths
+# (domain::output_link): the stall rule (`build` at once), or its bus error (`on_error`, then the
+# back-off's `build`). The `sink swap` line names neither (Owed 87), but the error path always logs
+# `output gen=<g> error:` first, and a sink the stall rule retires never logs one (gst_output.rs's
+# `Watch` returns once retired). So a swap to generation g+1 is the stall rule's ("stall") only when
+# generation g logged no error before it; else it is the error path's ("output_error"), and
+# `error_to_swap_ms` shows the back-off between them. Mutant 9 (the stall threshold at 20 s) swaps
+# just as fast on dest-trickle, through rtmp2sink's own 5 s socket timeout: only the cause tells
+# them apart.
 def stall_swap($cut):
   ([beats[] | select(.received_ms <= $cut)] | last | .body.sinkSwaps) as $s0
   | ([beats[] | select(.received_ms > $cut and (.body.sinkSwaps // -1) > $s0)] | first) as $swap_beat
-  | ([.log.sink_swaps[] | select(.at_ms > $cut)] | first | .at_ms) as $swap
+  | ([.log.sink_swaps[] | select(.at_ms > $cut)] | first) as $sw
+  | ($sw.at_ms) as $swap
+  | (if $sw == null then [] else [(.log.output_errors // [])[] | select(.gen == $sw.gen - 1 and .at_ms < $swap)] end) as $err
   | (if $swap == null then [] else [beats[] | select(.received_ms < $swap)] end) as $b
   | ([range(1; $b | length) | select(($b[.].body.egressBytes // 0) > ($b[. - 1].body.egressBytes // 0))
       | $b[.].received_ms] | last) as $grow
-  | {swaps_before: $s0, swap_ms: $swap, swap_beat_ms: ($swap_beat.received_ms // null), last_growth_ms: $grow,
+  | {swaps_before: $s0, swap_ms: $swap, swap_gen: ($sw.gen // null), swap_beat_ms: ($swap_beat.received_ms // null),
+     last_growth_ms: $grow,
+     cause: (if $sw == null then null elif ($err | length) > 0 then "output_error" else "stall" end),
+     error_to_swap_ms: (if ($err | length) > 0 then $swap - ($err | first | .at_ms) else null end),
      from_cut_ms: (if $swap == null then null else $swap - $cut end),
      from_growth_ms: (if $swap == null or $grow == null then null else $swap - $grow end),
      bound_ms: ($t.output_stall_after_ms + $t.output_progress_poll_ms)};

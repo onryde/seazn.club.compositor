@@ -5,7 +5,8 @@
 #   threshold  cef_gpu_deaths_to_restart kills, each once a NEW pid has replaced the last and at
 #              least KILL_SPACING_MS after the one before: the restart as in case 13
 #              (`restart in place: <n> CEF GPU-process deaths`), never Chromium's abort;
-#   one-fewer  one kill fewer: no restart and no exit in the run, `gpu_process_deaths=<n-1>` logged;
+#   one-fewer  one kill fewer: no restart and no exit in the run, `gpu_process_deaths=<n-1>` logged,
+#              and the overlay on air after the last kill (`require_overlay_back`, fix round 3);
 #   fast       the fast loop (the PR #34 review's gap): each kill the moment a new pid appears, until
 #              the process exits or chromium_gpu_deaths_abort - 1 are done (one short of the abort).
 #
@@ -71,9 +72,9 @@ require_restarted() {
 }
 
 case "$CASE_VARIANT" in
-  threshold) CASE_CHECKS=18 ;;
-  one-fewer) CASE_CHECKS=10 ;;
-  fast) CASE_CHECKS=19 ;;
+  threshold) CASE_CHECKS=19 ;;
+  one-fewer) CASE_CHECKS=11 ;;
+  fast) CASE_CHECKS=20 ;;
 esac
 case_verdict() {
   # The loop's own end line, when the exec lived to print it (a restart kills the exec with its
@@ -99,6 +100,8 @@ case_verdict() {
       require counter_regressions '.camera.counter_regressions == 0'
       require_run no_core '.cores.diff_ok and .cores.container_files == 0 and .cores.host_after == .cores.host_before' '.cores'
       require no_output_outages '.output_outages == []' '.output_outages | length'
+      # No restart, and the overlay is on air after the last kill (C14 fix round 3, item 3).
+      require_overlay_back '(mark("kill") | last | .at_ms)' '(mark("kill") | last | .at_ms)'
       ;;
     fast)
       require kills_distinct '(mark("kill") | length) >= 1 and (mark("kill") | map(.value.pid) | repeats) == []' \
