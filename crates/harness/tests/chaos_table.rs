@@ -137,7 +137,11 @@ fn the_plan_names_every_chaos_case_and_expands_the_repeats() {
         files.len()
     );
     assert_eq!(sorted, files, "chaos.json and harness/cases/*.sh disagree");
-    assert_eq!(files.len(), 16, "the brief's 16 cases (amended 2026-10-20)");
+    assert_eq!(
+        files.len(),
+        17,
+        "the brief's 16 cases (amended 2026-10-20) and case 17 (2026-10-24)"
+    );
 
     let out = run(&["--legs", "all"]);
     assert_eq!(out.status.code(), Some(0));
@@ -289,14 +293,17 @@ fn the_table_reds_on_a_fail_an_error_a_missing_verdict_or_a_missed_sweep() {
     assert!(s.contains(&format!("worst outage_ms, cef-killed: {} over 3 runs", 7_000 + k)));
 
     let mut reds = 0;
-    edit(&dir, "dest-stall", |v| {
+    edit(&dir, "cpu-starved", |v| {
         v["status"] = json!("fail");
-        v["failed"] = json!(["stall_swap"]);
-        v["measures"]["stall_swap"] = json!({"cause": "output_error"});
+        v["failed"] = json!(["ladder_moved"]);
+        v["measures"]["starvation_applied"] = json!({"applied": true});
+        v["measures"]["ladder_moved"] = json!({"dropped_rise": 0, "half_rate_beats": 0});
     });
     let out = run(&["--table", d]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(stdout(&out).contains("| dest-stall | FAIL | 4/4 | outage_ms | failed: stall_swap (Owed 87) |"));
+    assert!(
+        stdout(&out).contains("| cpu-starved | FAIL | 4/4 | outage_ms | failed: ladder_moved (Owed 86) |")
+    );
     assert!(stdout(&out).contains("this run does not count"));
     reds += 1;
 
@@ -564,7 +571,7 @@ fn every_owed_entry_names_a_real_check_and_a_real_open_owed_row_with_a_signature
         sigs.len()
     );
     assert!(
-        checked >= 6,
+        checked >= 10,
         "Owed 86's and 87's known reds are listed ({checked})"
     );
     assert!(
@@ -607,9 +614,44 @@ fn each_owed_signature_holds_on_its_causes_evidence_and_not_without_it() {
             json!({"starvation_applied": {"applied": true},
             "ladder_moved": {"dropped_rise": 0, "half_rate_beats": 2}}),
         ),
-        ("87", true, json!({"stall_swap": {"cause": "output_error"}})),
-        ("87", false, json!({"stall_swap": {"cause": "stall"}})),
-        ("87", false, json!({"stall_swap": {"cause": "unknown"}})),
+        // Owed 87 on CI's case 17 (PR #65, rejudged on this verdict): the sink's own error path held
+        // in full, the cap set as asked and the queue past it.
+        ("87", true, json!({"stall_swap": ci_rule()})),
+        // Cases 5 and 12's shape (no queue read): the error path held. A red there cannot take it,
+        // since the error path holding passes their check.
+        (
+            "87",
+            true,
+            json!({"stall_swap": {"reason": "error", "error_path_passes": true}}),
+        ),
+        // Not without its evidence: the cap not set as asked (case 17's own drive failed), the
+        // error path broken (a slow or early swap: the product, not the race), the rule's own swap
+        // (another cause), an unread reason, and a report from before the path verdicts.
+        (
+            "87",
+            false,
+            json!({"stall_swap": with(ci_rule(), "queue_past_cap", json!(false))}),
+        ),
+        (
+            "87",
+            false,
+            json!({"stall_swap": with(ci_rule(), "error_path_passes", json!(false))}),
+        ),
+        (
+            "87",
+            false,
+            json!({"stall_swap": with(ci_rule(), "reason", json!("stall"))}),
+        ),
+        (
+            "87",
+            false,
+            json!({"stall_swap": with(ci_rule(), "reason", json!("unknown"))}),
+        ),
+        (
+            "87",
+            false,
+            json!({"stall_swap": {"reason": "error", "cause": "output_error"}}),
+        ),
     ] {
         assert_eq!(
             signature_holds(&sig(row), &json!({"measures": measures})),
@@ -619,7 +661,22 @@ fn each_owed_signature_holds_on_its_causes_evidence_and_not_without_it() {
         checked += 1;
     }
     eprintln!("signature cases checked: {checked}");
-    assert_eq!(checked, 7);
+    assert_eq!(checked, 11);
+}
+
+/// Case 17's `stall_swap` measure as CI's run 40121220366 left it, rejudged on this branch's
+/// verdict (PR #65): the sink's own socket timeout 5 660 ms after the cut, the swap 515 ms later.
+fn ci_rule() -> Value {
+    json!({"swaps_before": 0, "swap_gen": 2, "reason": "error", "reasons_paired": true,
+        "cause": "output_error", "error_to_swap_ms": 515, "from_cut_ms": 6175, "from_growth_ms": 1497,
+        "detect_ms": 982, "bound_ms": 5250, "error_path_passes": true, "stall_path_passes": false,
+        "queue_past_cap": true})
+}
+
+/// `v` with `k` set to `x`.
+fn with(mut v: Value, k: &str, x: Value) -> Value {
+    v[k] = x;
+    v
 }
 
 /// A red table names each failed check's Owed row when that row's signature holds in the run, and
@@ -642,24 +699,32 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     };
 
     verdicts(&dir, true);
-    // CI's dest-trickle (rounds 2 to 4): its one failed check owed, the row's evidence present.
+    // CI's cpu-starved: its one failed check owed, the row's evidence present (Owed 86).
+    let starved = json!({"starvation_applied": {"applied": true},
+        "ladder_moved": {"dropped_rise": 0, "half_rate_beats": 0}});
     edit(
         &dir,
-        "dest-trickle",
+        "cpu-starved",
+        fail(json!(["ladder_moved"]), starved.clone()),
+    );
+    // CI's case 17 (PR #65): both its reds owed, Owed 87's evidence present.
+    edit(
+        &dir,
+        "dest-stall-rule",
         fail(
-            json!(["stall_swap"]),
-            json!({"stall_swap": {"cause": "output_error"}}),
+            json!(["buffer_capped", "stall_swap"]),
+            json!({"stall_swap": ci_rule()}),
         ),
     );
-    // CI's dest-stall, with Owed 84's old evidence (the clear inside a pending connect) beside 87's:
-    // PR #57 fixed 84 and its tags left chaos.json (the rebase onto main 567cfcc), so output_lost
-    // is news while stall_swap stays owed.
+    // CI's dest-stall of round 3, before the reason line: the cause alone, which is no longer 87's
+    // evidence (the signature reads the reason and the error path's verdict), beside Owed 84's old
+    // evidence (the clear inside a pending connect; its fix is in). Both reds are news.
     edit(
         &dir,
         "dest-stall",
         fail(
             json!(["stall_swap", "output_lost"]),
-            json!({"stall_swap": {"cause": "output_error"}, "clear_phase": {"connect_pending": true}}),
+            json!({"stall_swap": {"cause": "output_error"}, "clear_phase_driven": {"connect_pending": true}}),
         ),
     );
     // A check no Owed row names: the news in the run.
@@ -678,29 +743,32 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     let out = run(&["--table", d]);
     let s = stdout(&out);
     assert_eq!(out.status.code(), Some(1), "an owed red is still red");
+    let mut owed_rows = 0;
+    for row in [
+        "| cpu-starved | FAIL | 4/4 | outage_ms | failed: ladder_moved (Owed 86) |",
+        "| dest-stall | FAIL | 4/4 | outage_ms | failed: stall_swap (NOT OWED: Owed 87's signature absent), output_lost (NOT OWED) |",
+        "| dest-stall-rule | FAIL | 4/4 | outage_ms | failed: buffer_capped (Owed 87), stall_swap (Owed 87) |",
+        "| camera-stop | FAIL | 4/4 | outage_ms | failed: slate_ms (NOT OWED) |",
+        "| cef-killed-r1 | FAIL | 4/4 | outage_ms | failed: overlay_back (NOT OWED), same_session (NOT OWED) |",
+    ] {
+        assert!(s.contains(row), "{row}\n{s}");
+        owed_rows += 1;
+    }
+    assert_eq!(owed_rows, 5);
     assert!(
-        s.contains("| dest-trickle | FAIL | 4/4 | outage_ms | failed: stall_swap (Owed 87) |"),
+        s.contains("red, every failed check owed: cpu-starved, dest-stall-rule\n"),
         "{s}"
     );
-    assert!(
-        s.contains(
-            "| dest-stall | FAIL | 4/4 | outage_ms | failed: stall_swap (Owed 87), output_lost (NOT OWED) |"
-        ),
-        "{s}"
-    );
-    assert!(s.contains("| camera-stop | FAIL | 4/4 | outage_ms | failed: slate_ms (NOT OWED) |"));
     assert!(s.contains(
-        "| cef-killed-r1 | FAIL | 4/4 | outage_ms | failed: overlay_back (NOT OWED), same_session (NOT OWED) |"
+        "red on a check no Owed row names: camera-stop (slate_ms); dest-stall (stall_swap, output_lost); cef-killed-r1 (overlay_back, same_session)\n"
     ), "{s}");
-    assert!(s.contains("red, every failed check owed: dest-trickle\n"), "{s}");
-    assert!(s.contains(
-        "red on a check no Owed row names: camera-stop (slate_ms); dest-stall (output_lost); cef-killed-r1 (overlay_back, same_session)\n"
-    ), "{s}");
-    assert!(
-        s.contains(&format!("Owed 87: {}\n", title("87"))),
-        "Owed 87's title"
-    );
-    for gone in ["Owed 70", "Owed 84", "Owed 85", "Owed 86:"] {
+    for row in ["86", "87"] {
+        assert!(
+            s.contains(&format!("Owed {row}: {}\n", title(row))),
+            "Owed {row}'s title"
+        );
+    }
+    for gone in ["Owed 70", "Owed 84", "Owed 85"] {
         assert!(
             !s.contains(gone),
             "only the rows this run's reds name, never a fixed one: {gone}"
@@ -709,20 +777,20 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     assert!(s.contains("this run does not count"));
     assert!(!s.contains("this run counts"));
 
-    // The re-review's I-3: an owed check that fails WITHOUT its row's evidence is not that row's.
-    // dest-stall's stall_swap through the stall rule itself (cause "stall": a slow detector), and
+    // The re-review's I-3: an owed check that fails WITHOUT its row's evidence is not that row's:
     // cpu-starved's ladder_moved on a window that dropped frames (the ladder's input moved, so not
-    // Owed 86's still ladder); dest-trickle's stall_swap with 87's evidence. And the rows fixed on
-    // main read NOT OWED whatever their old evidence: dest-disconnect's output_lost in a pending
-    // connect (Owed 84, PR #57), the fast leg's overlay_back on a loop counted late (Owed 70 (a),
-    // PR #55).
+    // Owed 86's still ladder). And the rows fixed read NOT OWED whatever their old evidence:
+    // dest-disconnect's output_lost in a pending connect (Owed 84, PR #57), the fast leg's
+    // overlay_back on a loop counted late (Owed 70 (a), PR #55). And Owed 87's checks without its
+    // evidence: dest-stall's stall_swap through the rule itself, dest-trickle's on the cause alone,
+    // and case 17's reds with the cap not set as asked.
     verdicts(&dir, true);
     edit(
         &dir,
         "dest-disconnect",
         fail(
             json!(["output_lost"]),
-            json!({"clear_phase": {"swap_to_clear_ms": 3_970, "connect_pending": true}}),
+            json!({"clear_phase_driven": {"swap_to_clear_ms": 3_970, "connect_pending": true}}),
         ),
     );
     edit(
@@ -747,6 +815,14 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
             json!({"stall_swap": {"cause": "output_error"}}),
         ),
     );
+    edit(
+        &dir,
+        "dest-stall-rule",
+        fail(
+            json!(["buffer_capped", "stall_swap"]),
+            json!({"stall_swap": with(ci_rule(), "queue_past_cap", json!(false))}),
+        ),
+    );
     for r in 1..=3 {
         edit(
             &dir,
@@ -760,39 +836,35 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     let out = run(&["--table", d]);
     let s = stdout(&out);
     assert_eq!(out.status.code(), Some(1));
+    let mut rows = 0;
     for row in [
         "| dest-disconnect | FAIL | 4/4 | outage_ms | failed: output_lost (NOT OWED) |",
         "| dest-stall | FAIL | 4/4 | outage_ms | failed: stall_swap (NOT OWED: Owed 87's signature absent) |",
         "| cpu-starved | FAIL | 4/4 | outage_ms | failed: ladder_moved (NOT OWED: Owed 86's signature absent) |",
-        "| dest-trickle | FAIL | 4/4 | outage_ms | failed: stall_swap (Owed 87) |",
+        "| dest-trickle | FAIL | 4/4 | outage_ms | failed: stall_swap (NOT OWED: Owed 87's signature absent) |",
+        "| dest-stall-rule | FAIL | 4/4 | outage_ms | failed: buffer_capped (NOT OWED: Owed 87's signature absent), stall_swap (NOT OWED: Owed 87's signature absent) |",
         "| cef-gpu-deaths-fast-r1 | FAIL | 4/4 | outage_ms | failed: overlay_back (NOT OWED) |",
         "| cef-gpu-deaths-fast-r2 | FAIL | 4/4 | outage_ms | failed: overlay_back (NOT OWED) |",
         "| cef-gpu-deaths-fast-r3 | FAIL | 4/4 | outage_ms | failed: overlay_back (NOT OWED) |",
     ] {
         assert!(s.contains(row), "{row}\n{s}");
+        rows += 1;
     }
-    assert!(s.contains("red, every failed check owed: dest-trickle\n"), "{s}");
+    assert!(s.contains("red, every failed check owed: none\n"), "{s}");
     assert!(s.contains(
-        "red on a check no Owed row names: dest-disconnect (output_lost); dest-stall (stall_swap); cpu-starved (ladder_moved); cef-gpu-deaths-fast-r1 (overlay_back); cef-gpu-deaths-fast-r2 (overlay_back); cef-gpu-deaths-fast-r3 (overlay_back)\n"
+        "red on a check no Owed row names: dest-disconnect (output_lost); dest-stall (stall_swap); cpu-starved (ladder_moved); dest-trickle (stall_swap); cef-gpu-deaths-fast-r1 (overlay_back); cef-gpu-deaths-fast-r2 (overlay_back); cef-gpu-deaths-fast-r3 (overlay_back); dest-stall-rule (buffer_capped, stall_swap)\n"
     ), "{s}");
-    assert!(s.contains(&format!("Owed 87: {}\n", title("87"))));
-    for gone in ["Owed 70", "Owed 84", "Owed 85", "Owed 86:"] {
+    for gone in ["Owed 70", "Owed 84", "Owed 85", "Owed 86:", "Owed 87:"] {
         assert!(
             !s.contains(gone),
             "a row whose evidence is absent, or whose fix merged, is not named: {gone}"
         );
     }
+    assert_eq!(rows, 8);
 
     // Only owed reds: still red, and the run still does not count.
     verdicts(&dir, true);
-    edit(
-        &dir,
-        "dest-stall",
-        fail(
-            json!(["stall_swap"]),
-            json!({"stall_swap": {"cause": "output_error"}}),
-        ),
-    );
+    edit(&dir, "cpu-starved", fail(json!(["ladder_moved"]), starved));
     let out = run(&["--table", d]);
     let s = stdout(&out);
     assert_eq!(out.status.code(), Some(1));
@@ -805,7 +877,7 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     let s = stdout(&out);
     assert_eq!(out.status.code(), Some(0));
     assert!(!s.contains("every failed check owed") && !s.contains("no Owed row names"));
-    eprintln!("owed table rows checked: 4, then 7, then 1, then 0");
+    eprintln!("owed table rows checked: {owed_rows}, then {rows}, then 1, then 0");
 }
 
 /// A check may name a list of Owed rows, tried in order (chaos.json's `about`): the first whose
@@ -885,7 +957,7 @@ fn a_list_of_owed_rows_names_the_first_whose_signature_holds() {
     );
     assert!(
         s.contains(
-            "WAVE GATE 3: a run over another manifest (CHAOS_MANIFEST) never counts (31 of 31 legs PASS)\n"
+            "WAVE GATE 3: a run over another manifest (CHAOS_MANIFEST) never counts (35 of 35 legs PASS)\n"
         ),
         "{s}"
     );
@@ -894,7 +966,7 @@ fn a_list_of_owed_rows_names_the_first_whose_signature_holds() {
     let s = stdout(&out);
     assert_eq!(out.status.code(), Some(0));
     assert!(
-        s.contains("WAVE GATE 3: this run counts (31 of 31 legs PASS)\n"),
+        s.contains("WAVE GATE 3: this run counts (35 of 35 legs PASS)\n"),
         "{s}"
     );
     assert!(!s.contains("manifest: CHAOS_MANIFEST"), "{s}");

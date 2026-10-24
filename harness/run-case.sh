@@ -39,7 +39,8 @@
 #
 # A case file defines `case_drive` and `case_verdict`, and may set CASE_DEADLINE_S, CAMERA_SIZE,
 # CAMERA_PATTERN, CHECKER_RECORDINGS, CASE_LIVE_S, CASE_KEY (the measure run-chaos.sh's table
-# shows), CASE_TEARDOWN (a function run at every exit) and CASE_NOT_RUNNABLE (why the case cannot
+# shows), CASE_COMPOSE (a compose file beside compose.yml that this case alone adds:
+# compose.<name>.yml), CASE_TEARDOWN (a function run at every exit) and CASE_NOT_RUNNABLE (why the case cannot
 # run: it is then reported, never faked, and run-case.sh exits 3). It sets CASE_CHECKS to how many
 # checks its verdict calls: a verdict that ran fewer than it declares fails.
 # shellcheck disable=SC2016 # the verdict helpers' jq filters keep their $ for jq
@@ -89,12 +90,13 @@ CASE_DEADLINE_S=900
 CHECKER_RECORDINGS="$OUT/rec"
 CASE_CHECKS=0
 CASE_KEY=""
+CASE_COMPOSE=""
 CASE_NOT_RUNNABLE=""
 CASE_TEARDOWN=""
 LIVE_WAIT_S=180
 EXIT_WAIT_S=120
 
-compose() { docker compose -f "$HERE/compose.yml" "$@"; }
+compose() { docker compose -f "$HERE/compose.yml" ${CASE_COMPOSE:+-f "$HERE/$CASE_COMPOSE"} "$@"; }
 # This host's wall clock in ms (bash 5's EPOCHREALTIME: no fork per call; the clock `docker
 # events` and `docker logs --timestamps` read).
 now_ms() {
@@ -153,6 +155,77 @@ until_ms() {
 }
 # Sleeps until <seconds> after the case's drive started.
 at_s() { until_ms $((DRIVE_START_MS + $1 * 1000)); }
+
+# A docker stamp (RFC 3339 UTC, ns) in ms.
+stamp_ms() {
+  python3 -I -c 'import datetime, sys
+d, f = sys.argv[1].rstrip("Z").split(".")
+t = datetime.datetime.strptime(d, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+print(int(t.timestamp()) * 1000 + int(f[:3].ljust(3, "0")))' "$1"
+}
+# The first compositor log line at or after <ms> whose message matches <ERE>, waiting up to <s>
+# seconds: prints the line's docker stamp in ms and the message's first <ERE> match, or fails. The
+# lines are read in memory and never printed (the compositor scrubs them; nothing else sees them).
+await_log() {
+  local since="$1" pattern="$2" until=$(($(now_ms) + $3 * 1000)) line
+  while [ "$(now_ms)" -lt "$until" ]; do
+    line="$(docker logs --timestamps --since "$((since / 1000)).$(printf '%03d' $((since % 1000)))" "$cid" 2>&1 |
+      grep -E -m1 " msg=($pattern)" || true)"
+    if [ -n "$line" ]; then
+      echo "$(stamp_ms "${line%% *}") $(printf '%s\n' "$line" | grep -Eo "$pattern" | head -n 1)"
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+# Cases 4, 5 and 12: the clear's phase is the variant's: `pending` with none, `backoff` with the
+# backoff variant (the re-review's I-5).
+dest_phase() {
+  case "$CASE_VARIANT" in
+    "") echo pending ;;
+    backoff) echo backoff ;;
+    *)
+      echo "run-case: $CASE's variant is backoff or none (got '$CASE_VARIANT')" >&2
+      exit 64
+      ;;
+  esac
+}
+# Clears the out leg in <phase> of the output's reconnect cycle (`clear_phase`, lib.jq), waiting
+# from <s> seconds into the drive for the next sink built under the fault (the cycle is a connect
+# timeout plus the back-off, OUTPUT_CONNECT_TIMEOUT_MS + OUTPUT_BACKOFF_CAP_MS, so one comes within
+# that):
+# - pending: OUTPUT_CONNECT_TIMEOUT_MS / 2 after that sink's swap line, mid-connect;
+# - backoff: at that sink's own error line (its connect failed), so the next build, a back-off
+#   later, finds the path clear.
+# Marks netem_out (the leg's stats, just before the clear) and clear, whose value names the phase
+# driven, or "none" when the cycle never showed (the verdict's clear_phase_driven then reds).
+clear_out_in_phase() {
+  local phase="$1" from_ms=$((DRIVE_START_MS + $2 * 1000)) connect cycle swap gen err phase_done=none
+  connect="$(threshold output_connect_timeout_ms)"
+  cycle=$(((connect + $(threshold output_backoff_cap_ms)) / 1000 + 2))
+  at_s "$2"
+  if read -r swap gen < <(await_log "$from_ms" 'sink swap gen=[0-9]+' "$cycle"); then
+    gen="${gen##*=}"
+    mark netem_out "$("$HERE/netem.sh" stats out)"
+    case "$phase" in
+      pending)
+        until_ms $((swap + connect / 2))
+        phase_done=pending
+        ;;
+      backoff)
+        if read -r err _ < <(await_log "$swap" "output gen=$gen error: " $((cycle + 2))); then
+          phase_done=backoff
+        fi
+        ;;
+    esac
+  else
+    mark netem_out "$("$HERE/netem.sh" stats out)"
+  fi
+  "$HERE/netem.sh" clear out
+  mark clear "$(jq -cn --arg p "$phase_done" --argjson s "${swap:-null}" --argjson g "${gen:-null}" \
+    --argjson e "${err:-null}" '{phase: $p, swap_ms: $s, swap_gen: $g, error_ms: $e}')"
+}
 
 checks_run=0
 failures=0
@@ -237,20 +310,8 @@ require_restart_outage() {
     "{outage_ms: (restart_outage($die; $start) | .to_wall_ms - .from_wall_ms), budget: \$t.budget_process_restart_output_ms}"
 }
 
-# The output's checks after a fault cleared at mark "clear" (cases 4, 5 and 12), and the clear's
-# phase against the last `sink swap` at or before it (the re-review's I-5; Owed 84): a sink built
-# less than OUTPUT_CONNECT_TIMEOUT_MS before the clear was still connecting when the path came back,
-# so it connects after the clear with the fault's backlog, which is the burst Owed 84 names; a clear
-# after that connect timed out builds a fresh sink and never takes that path. `connect_pending` is
-# printed so a run says which path it took. It was Owed 84's signature in chaos.json until that
-# row's fix (PR #57) merged; a red on these checks now reads NOT OWED whatever the phase. 5 checks.
+# The output's checks after a fault cleared at mark "clear" (cases 4, 5, 12 and 17). 4 checks.
 require_output_recovers() {
-  measure clear_phase '([.log.sink_swaps[] | select(.at_ms <= mark_at("clear"))] | last) as $sw
-    | (if $sw == null or mark_at("clear") == null then null else mark_at("clear") - $sw.at_ms end) as $ago
-    | {swap_gen: ($sw.gen // null), swap_to_clear_ms: $ago,
-       swaps_in_fault: ([.log.sink_swaps[] | select(.at_ms > mark_at("cut") and .at_ms <= mark_at("clear"))] | length),
-       connect_pending: ($ago != null and $ago < $t.output_connect_timeout_ms),
-       connect_timeout_ms: $t.output_connect_timeout_ms}'
   require outage_spans_fault '[.output_outages[] | select(.to_wall_ms > mark_at("cut") and .from_wall_ms < mark_at("clear"))] | length >= 1' \
     '[.output_outages[] | {from_wall_ms, to_wall_ms}]'
   require output_reconnect 'outage_across(mark_at("clear")) as $o | $o != null and $o.from_wall_ms <= mark_at("clear")
@@ -262,6 +323,16 @@ require_output_recovers() {
     '{lost_ms: [.output_outages[] | .lost_ms], budget: $t.budget_output_lost_max_ms}'
   require no_outage_outside_fault '[.output_outages[] | select(.to_wall_ms < mark_at("cut")
       or .from_wall_ms > mark_at("clear") + $t.budget_output_reconnect_ms)] == []'
+}
+
+# The clear landed in the phase the leg drives (cases 4, 5 and 12; the re-review's I-5, Owed 84):
+# `pending` with no variant, `backoff` with the backoff variant (`clear_phase`, lib.jq). A clear
+# that missed its phase is the drive's own red: that leg did not witness Owed 84's fix in its
+# phase. Each phase runs as its own leg on every chaos run, so a run witnesses both. 1 check.
+require_clear_phase() {
+  local want
+  want="$(dest_phase)"
+  require clear_phase_driven "clear_phase | .phase == \"$want\" and .driven == \"$want\"" 'clear_phase'
 }
 
 # The overlay is back on air after a process restart (C14 fix round 3, item 3: the coordinator's
@@ -324,6 +395,10 @@ require_same_session_and_no_core() {
 
 # shellcheck source=/dev/null
 . "$CASE_FILE"
+if [ -n "$CASE_COMPOSE" ]; then
+  [[ "$CASE_COMPOSE" =~ ^compose\.[a-z0-9-]+\.yml$ ]] && [ -f "$HERE/$CASE_COMPOSE" ] ||
+    { echo "run-case: CASE_COMPOSE must name a harness/compose.<name>.yml (got '$CASE_COMPOSE')" >&2; exit 64; }
+fi
 
 verdict_status=""
 write_verdict() {
