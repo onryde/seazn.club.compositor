@@ -14,6 +14,8 @@
 #   RELAY_DEADLINE_AT                 the case's deadline (RFC 3339)
 #   CAMERA_SIZE, CAMERA_PATTERN       fake-camera's picture (defaults 1280x720, ball)
 #   CAMERA_AUDIO                      on (default) or off: the video alone (Owed 81's control)
+#   CAMERA_TS_ALIGNMENT               packets per buffer at the camera's mux, 1 to 7 (default 7,
+#                                     media.rs's SRT payload; Owed 81's fix candidate is 1)
 name: seazn-harness
 
 networks:
@@ -72,6 +74,8 @@ services:
       - /out/wire.jsonl
       - --audio
       - ${CAMERA_AUDIO:-on}
+      - --ts-alignment
+      - ${CAMERA_TS_ALIGNMENT:-7}
     volumes:
       - ${HARNESS_OUT:?}:/out
 

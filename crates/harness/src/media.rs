@@ -358,7 +358,7 @@ pub struct CameraPipeline {
     /// The sink the mux writes to (`on_sent`'s probe).
     sink: gst::Element,
     video: gst_app::AppSrc,
-    /// `None`: a video-only build (`start_with(.., false)`, Owed 81's control).
+    /// `None`: a video-only build (`CameraOptions::audio` false, Owed 81's control).
     audio: Option<gst_app::AppSrc>,
     layout: Layout,
     pattern: Pattern,
@@ -376,29 +376,58 @@ impl fmt::Debug for CameraPipeline {
     }
 }
 
+/// The TS packets per buffer the camera's mux pushes by default: 7, 1 316 bytes, an SRT payload
+/// (C10). `mpegtsmux` holds packets until it has that many (gstbasetsmux.c,
+/// `gst_base_ts_mux_push_packets`, 1.24.2), so a frame's last packets wait for later ones (F-028).
+pub const TS_ALIGNMENT: u32 = 7;
+
+/// How a camera build is made (`CameraPipeline::start_with`; Owed 81's controls).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CameraOptions {
+    /// The audio track. Without it (fake-camera's `--audio off`) the TS carries the video alone.
+    pub audio: bool,
+    /// `mpegtsmux alignment`: TS packets per pushed buffer (fake-camera's `--ts-alignment`), 1 to 7
+    /// (more than 7 would pass an SRT payload's 1 316 bytes).
+    pub ts_alignment: u32,
+}
+
+impl Default for CameraOptions {
+    fn default() -> Self {
+        Self {
+            audio: true,
+            ts_alignment: TS_ALIGNMENT,
+        }
+    }
+}
+
 impl CameraPipeline {
     pub fn start(sink: &CameraSink, w: u32, h: u32, pattern: Pattern) -> Result<Self, String> {
-        Self::start_with(sink, w, h, pattern, true)
+        Self::start_with(sink, w, h, pattern, CameraOptions::default())
     }
 
-    /// `start`, with or without the audio track. Without it (`audio` false: fake-camera's
-    /// `--audio off`, Owed 81's control) the TS carries the video alone, so the mux has no second
-    /// stream to interleave the frames with.
+    /// `start`, with or without the audio track and with another mux alignment (Owed 81's
+    /// controls). An alignment outside 1 to 7 is refused.
     pub fn start_with(
         sink: &CameraSink,
         w: u32,
         h: u32,
         pattern: Pattern,
-        audio: bool,
+        opts: CameraOptions,
     ) -> Result<Self, String> {
+        if !(1..=TS_ALIGNMENT).contains(&opts.ts_alignment) {
+            return Err(format!(
+                "ts alignment {}: 1 to {TS_ALIGNMENT} packets a buffer",
+                opts.ts_alignment
+            ));
+        }
         let layout = Layout::i420(w, h);
         check_layout(&layout)?;
         let pipeline = gst::Pipeline::new();
         let video = live_appsrc(&i420_caps(w, h)?, 8 * layout.size as u64);
-        let audio = audio.then(|| live_appsrc(&audio_caps(), 1 << 20));
+        let audio = opts.audio.then(|| live_appsrc(&audio_caps(), 1 << 20));
         let (h264parse, mux) = (make("h264parse")?, make("mpegtsmux")?);
         h264parse.set_property("config-interval", -1i32);
-        mux.set_property("alignment", 7i32);
+        mux.set_property("alignment", opts.ts_alignment as i32);
         let out = match sink {
             CameraSink::Srt(t) => {
                 let s = make("srtsink")?;

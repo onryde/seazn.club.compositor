@@ -7,7 +7,7 @@
 //! ```text
 //! fake-camera --emit /out/emit.jsonl --listen 0.0.0.0:7001 --srt-host mediamtx --srt-port 8890 \
 //!   --stream-id publish:cam [--size 1280x720] [--pattern ball|snow|noise] [--latency-ms 200] \
-//!   [--wire /out/wire.jsonl] [--audio on|off]
+//!   [--wire /out/wire.jsonl] [--audio on|off] [--ts-alignment 1..7]
 //! ```
 //!
 //! `--wire` (Owed 81's probe) writes a line for every PES packet that starts in a buffer the camera
@@ -15,6 +15,7 @@
 //! each build's first counter (`{"build","first_counter","wall_us"}`), so a run can tell when the
 //! camera SENT each frame from when it pushed it (`--emit`). `--audio off` (Owed 81's control)
 //! sends the video alone: no tone bursts, so the checker's A/V facts are empty on such a run.
+//! `--ts-alignment` (default 7, `media::TS_ALIGNMENT`) is the mux's TS packets per SRT payload.
 //!
 //! The SRT passphrase is `HARNESS_SRT_PASSPHRASE` (environment, never argv). A failed build (MediaMTX
 //! not up yet, a kicked publisher) is logged and rebuilt a second later; the counter keeps its pace
@@ -29,11 +30,11 @@ use std::time::{Duration, Instant};
 use adapters::redact::Scrubber;
 use harness::camera::{self, parse_command, Pattern, Schedule};
 use harness::clock::{now_ms, now_us};
-use harness::media::{self, CameraPipeline, CameraSink, SentFn, SrtTarget, FRAME_NS};
+use harness::media::{self, CameraOptions, CameraPipeline, CameraSink, SentFn, SrtTarget, FRAME_NS};
 use harness::wire::{self, Stream};
 use serde_json::json;
 
-const FLAGS: [&str; 10] = [
+const FLAGS: [&str; 11] = [
     "--emit",
     "--listen",
     "--srt-host",
@@ -44,6 +45,7 @@ const FLAGS: [&str; 10] = [
     "--latency-ms",
     "--wire",
     "--audio",
+    "--ts-alignment",
 ];
 const REQUIRED: [&str; 5] = ["--emit", "--listen", "--srt-host", "--srt-port", "--stream-id"];
 /// How long a failed build waits before the next.
@@ -154,6 +156,17 @@ fn run() -> Result<(), (u8, String)> {
         "off" => false,
         other => return Err((64, format!("--audio {other}: on or off"))),
     };
+    let opts = CameraOptions {
+        audio,
+        ts_alignment: a
+            .get("--ts-alignment")
+            .map_or(Ok(media::TS_ALIGNMENT), |v| v.parse())
+            .map_err(|_| (64, "--ts-alignment: a number".to_owned()))?,
+    };
+    // Refused here, before the first build: a build would refuse it every second forever.
+    if !(1..=media::TS_ALIGNMENT).contains(&opts.ts_alignment) {
+        return Err((64, format!("--ts-alignment: 1 to {}", media::TS_ALIGNMENT)));
+    }
     let target = SrtTarget {
         host: a["--srt-host"].clone(),
         port: a["--srt-port"]
@@ -192,9 +205,10 @@ fn run() -> Result<(), (u8, String)> {
         std::thread::spawn(move || controls(server, s, p));
     }
     println!(
-        "fake-camera: {w}x{h} {pattern:?} at {} fps (audio {}) to {}:{}; controls on {}",
+        "fake-camera: {w}x{h} {pattern:?} at {} fps (audio {}, ts alignment {}) to {}:{}; controls on {}",
         camera::FPS,
         if audio { "on" } else { "off" },
+        opts.ts_alignment,
         target.host,
         target.port,
         a["--listen"]
@@ -206,20 +220,16 @@ fn run() -> Result<(), (u8, String)> {
     let mut builds = 0u64;
     loop {
         let size = locked(&schedule).size();
-        let mut cam = match CameraPipeline::start_with(
-            &CameraSink::Srt(target.clone()),
-            size.0,
-            size.1,
-            pattern,
-            audio,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                println!("fake-camera: build failed: {}", scrub.scrub(&e));
-                std::thread::sleep(REBUILD_AFTER);
-                continue;
-            }
-        };
+        let mut cam =
+            match CameraPipeline::start_with(&CameraSink::Srt(target.clone()), size.0, size.1, pattern, opts)
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("fake-camera: build failed: {}", scrub.scrub(&e));
+                    std::thread::sleep(REBUILD_AFTER);
+                    continue;
+                }
+            };
         builds += 1;
         if let Some(w) = &wire {
             cam.on_sent(wire_probe(w, builds)).map_err(with(70))?;
