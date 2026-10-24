@@ -543,6 +543,13 @@ fn judge(w: &World, case: &str, variant: &str, tag: &str) -> Verdict {
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     eprintln!("--- {tag}: {case} {variant}\n{stdout}{stderr}");
+    // Every expression the verdict ran, its printed measures too, compiles: CI's jq (1.7.1) refused
+    // one that jq 1.8 takes, and its error printed after a PASS (C14 fix round 2). A runtime error
+    // (a measure over an event a red world lacks) is the red's own evidence, so it is allowed.
+    assert!(
+        !format!("{stdout}{stderr}").contains("compile error"),
+        "{tag}: a jq expression does not compile"
+    );
     let json: Value = serde_json::from_str(
         &std::fs::read_to_string(dir.join("verdict.json"))
             .unwrap_or_else(|_| panic!("{tag}: no verdict.json")),
@@ -1397,7 +1404,8 @@ fn cef_renderer_zygote_killed_restarts_in_place_and_reds_when_an_old_process_sur
     let w = zygote("renderer", true, "zygote");
     let v = judge(&w, "cef-renderer-zygote-killed", "", "rzyg-good");
     assert_pass(&v, "rzyg-good");
-    // The printed measure: the processes counted, and the oldest one's age at the restart.
+    // The printed measure: the processes counted, and the oldest one's start after the restart's.
+    // CI's jq (1.7.1) refused this object's bare `a - b` value (fix round 2; jq 1.8 takes it).
     let shown = &v.json["measures"]["old_tree_gone"];
     assert_eq!(shown["cef_processes"], 2, "rzyg-good: {shown}");
     assert_eq!(shown["oldest_ms_after_start"], 1_200, "rzyg-good: {shown}");
