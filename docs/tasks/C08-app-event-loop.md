@@ -379,6 +379,15 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
   hands every read to `decide`, with a `cef health …` line on a change and no read after `Exit`:
   `tests/cef_health.rs` (7) takes each trigger through the real driver to one final beat and one `Exit(75)`, and
   `run.rs` posts the restart's final beat before `run()` returns 75. 7 mutants red.
+- (Amended 2026-10-24, Owed 86) Each beat whose sample carries a finite `fps`, in a session, logs
+  `output fps beat=<fps> floor=<floor>` (two decimals; the floor `OutputProfile::fps_floor`), and the
+  driver's `domain::starvation::StarvationAlarm` adds `output starvation alarm raised fps=<fps>
+  floor=<floor>` on the beat below the floor and `output starvation alarm cleared fps=<fps>
+  recovered=<level>` on the first beat at or above `OutputProfile::fps_recovered` after it. The
+  heartbeat carries the same reading as `fps`; a beat before a session logs none; no `StepDown` follows.
+  `the_real_output_fps_is_logged_each_beat_and_starvation_raises_then_clears_the_alarm` and
+  `a_beat_before_any_session_writes_no_output_fps_line` pass, and the nominal fps in the line or on the
+  wire, the alarm dropped, and the finite filter removed each go red.
 
 ## Amendment 2026-10-15 (overlay templates spec)
 
@@ -691,6 +700,25 @@ The implementer's choices, inside the brief. None is an owner ruling; each mediu
   the hold (none), and a given-up generation's late frames (never on air). Frames in the scenarios
   carry their generation (`frame(gen)`); a walk that feeds frames past the 5 s connect timeout
   connects the generation first, as the adapter does.
+
+## Amendment 2026-10-24 (Owed 86: the honest beat)
+
+The coordinator's recommendation, approved by the owner 2026-10-24 (in chat, relayed by the
+coordinator: "Ok"): the beat reports the programme's REAL output frame rate, measured from the
+frames actually put out over the beat window and never the nominal configured fps, and raises a
+starvation alarm when it falls below a floor; the ladder does not change (`docs/_INDEX.md` Owed 86,
+decision log "Owed 86: the honest beat", where the floor, the clear level and the minimum window are
+recorded as the implementer's medium choices).
+- **The domain** gains (additions; no existing API changes): `config::OUTPUT_FPS_FLOOR_SHARE`
+  (= `ENCODER_SPEED_REALTIME_MIN`, 0.95), `OUTPUT_FPS_RECOVERED_SHARE` (29.5/30, C00 Step 4 and C14
+  cases 6 and 10), `OUTPUT_FPS_MIN_WINDOW_MS` (1 000), `OutputProfile::fps_floor` and `fps_recovered`,
+  and `starvation::StarvationAlarm` (`on_reading(fps, profile) -> Option<Alarm>`: raised below the
+  floor, cleared at or above the recovery level once raised, each change once; a reading that is not
+  finite or is negative changes nothing).
+- **The driver**, at `Effect::SendHeartbeat`, after the camera line: the `output fps` line and the
+  alarm's, as the acceptance bullet of this date says, then the heartbeat with the sample unchanged.
+  `Measured.fps` keeps its type (`app::ports` documents the new meaning). The ladder is not told: its
+  input stays the encoder queue's overruns.
 
 ## Do not touch
 

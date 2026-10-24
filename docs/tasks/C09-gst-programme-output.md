@@ -89,7 +89,7 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
 
   | Field | Definition | `None` until |
   |---|---|---|
-  | `fps` | frames `push()`ed into the programme in the last complete 1 s window | 1 s of pushes |
+  | ~~`fps`~~ `encoded_frames` (amended 2026-10-24, Owed 86) | ~~frames `push()`ed into the programme in the last complete 1 s window~~ video frames out of the encoder, this session (the beat's `fps` is C12's `BeatRate` over it) | ~~1 s of pushes~~ the first encoded frame |
   | `bitrate_kbps` | acked output bytes in the last complete 1 s window × 8 / 1000 (rtmp2sink `stats` poll, or the file size for `file://` targets) | the first ack poll on the current sink |
   | `egress_bytes` | acked output bytes, cumulative across every sink generation | the first ack |
   | `encoder_speed` | encoded video PTS advance in the last complete 1 s window ÷ wall time of that window (1.0 = real time; below 1 = the encoder is falling behind or starved) | 1 s of encoder output |
@@ -144,7 +144,7 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
        the adapter's log sink; assert !contains("SECRETKEY") */ }
   #[test] fn file_target_reports_connected_then_acks() { /* first buffer ⇒ OutputConnected{gen}; subsequent ⇒ OutputAck{gen} */ }
   #[test] fn stats_are_absent_before_anything_is_measured() { /* fresh GstProgramme: snapshot() == StatsSnapshot::default() (all None) */ }
-  #[test] fn stats_fps_counts_pushes_per_second() { /* push Slate ticks at real 33 ms pace for 2.2 s; fps within 30 ± 1 (expected from OutputProfile::P720.fps) */ }
+  #[test] fn stats_fps_counts_pushes_per_second() { /* superseded 2026-10-24, Owed 86: stats_encoded_frames_are_the_frames_the_output_carries */ /* push Slate ticks at real 33 ms pace for 2.2 s; fps within 30 ± 1 (expected from OutputProfile::P720.fps) */ }
   #[test] fn stats_egress_and_bitrate_follow_acked_bytes() { /* file target, 3 s real-pace pushes, drain, wait OutputDrained;
        the drain path takes one FINAL stats sample after the sink's EOS (step 7), so egress_bytes == final file size exactly;
        bitrate_kbps within ±50 % of OutputProfile::P720.video_kbps (CBR filler keeps it near the target) */ }
@@ -254,6 +254,12 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
   passes: the camera slot's write count reaches `Stats` on every tick, a camera tick counts the
   frames written since the tick before it less the one it shows (a `Repeat` tick too: it is the
   camera on air), and a slate tick counts none.
+- (Amended 2026-10-24, Owed 86) `StatsSnapshot::encoded_frames` replaces `fps`: every video buffer at
+  the encoder's appsink counts one, `None` before the first, and `push` feeds `Stats` no count.
+  `stats_encoded_frames_are_the_frames_the_output_carries` (90 paced ticks to a file decode to 90
+  frames, and the count reads 90) replaces `stats_fps_counts_pushes_per_second`, and
+  `the_beats_fps_is_the_programmes_real_output_rate_and_falls_when_starved` reads a healthy beat inside
+  the band, a 1.5 s starvation under the floor, and the resumed rate.
 
 ## Audio (C00 audio A/B, 2026-10-15; F-004 verdict, overrides anything above)
 
@@ -424,6 +430,22 @@ holds the camera frames no camera tick put on air (`adapters::stats::ReplacedFra
 It is `None` until the first camera tick. The heartbeat does not carry it (the contract is strict,
 Owed 90): the driver logs it once a beat. It counts the frames above one a camera tick, so a source
 faster than the programme and a late tick thread raise it too (`ReplacedFrames` says how).
+
+## Amendment 2026-10-24 (Owed 86: the honest beat)
+
+The coordinator's recommendation, approved by the owner 2026-10-24 (in chat, relayed by the
+coordinator: "Ok"): the beat reports the programme's REAL output frame rate, measured from the
+frames actually put out over the beat window and never the nominal configured fps, and raises a
+starvation alarm when it falls below a floor; the ladder does not change (`docs/_INDEX.md` Owed 86,
+decision log "Owed 86: the honest beat", where the floor, the clear level and the minimum window are
+recorded as the implementer's medium choices).
+The old `fps` counted `push()` calls in the last complete 1 s window. The driver runs every late tick
+back to back, so the count tracked the tick grid and read 29 to 31 while C14 case 6's output carried
+11.5 and 24.7 fps (F-024). `StatsSnapshot::fps` is gone: `Stats::on_encoded_video` (the seam
+`encoder_speed` reads) also counts the frame into `encoded_frames`, and `push` no longer calls
+`on_push` (removed). The rate is not the stats' job: C12's `ProcMetrics` turns two samples' totals
+into the beat's `fps` (`adapters::stats::BeatRate`, C12's amendment of this date). The ladder's input
+is unchanged: one `EncoderOverrun` per `overrun`.
 
 ## Do not touch
 
