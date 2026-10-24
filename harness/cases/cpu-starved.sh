@@ -21,8 +21,9 @@
 # against a quarter is unmeasured: Owed 86's fix is judged at this share, and the share is the
 # owner's to set (Owed 86, amended in fix round 4).
 #
-# Anti-vacuity, two witnesses: the quota was set below the demand and held the whole window
-# (`stress_ran`), and the compositor felt it (`starvation_applied`: the window's frame rate under
+# Anti-vacuity, two witnesses: the quota was requested below the demand and held the whole window
+# (`stress_ran`, read from the drive's own marks, so it trusts `docker update`'s exit status: the
+# quota requested, not the quota applied; the confirm pass's c-2), and the compositor felt it (`starvation_applied`: the window's frame rate under
 # BUDGET_FPS_MEAN_MIN, a beat's encoderSpeed under ENCODER_SPEED_REALTIME_MIN, or an overrun counted;
 # the re-review's I-4). A starvation nothing felt is the harness's own red, never the product's, and
 # `ladder_moved` passes only on a window that was starved.
@@ -113,7 +114,8 @@ LADDER='([beats[] | select(.received_ms < mark_at("stress"))] | last | .body.dro
 
 CASE_CHECKS=15
 case_verdict() {
-  # Anti-vacuity: the quota was set under the demand, held for STRESS_S, and put back.
+  # Anti-vacuity: the quota was requested under the demand, held for STRESS_S, and put back (the
+  # drive's marks; `starvation_applied` is the witness that it was applied).
   require stress_ran 'mark_value("stress") as $s | mark_value("stress_done") as $e
     | $s != null and $s.demand_cpus > 0 and $s.quota_cpus > 0 and $s.quota_cpus < $s.demand_cpus
     and $e != null and $e.cpus == $s.cpus and (mark_at("stress_done") - mark_at("stress")) >= $s.seconds * 1000' \

@@ -555,8 +555,8 @@ fn every_owed_entry_names_a_real_check_and_a_real_open_owed_row_with_a_signature
         sigs.len()
     );
     assert!(
-        checked >= 10,
-        "the known reds of round 2 and 3 are listed ({checked})"
+        checked >= 6,
+        "Owed 86's and 87's known reds are listed ({checked})"
     );
     assert!(
         sig_reads >= checked,
@@ -574,31 +574,6 @@ fn each_owed_signature_holds_on_its_causes_evidence_and_not_without_it() {
     let sig = |r: &str| m["owed_signatures"][r].as_str().unwrap().to_owned();
     let mut checked = 0;
     for (row, holds, measures) in [
-        (
-            "70 (a)",
-            true,
-            json!({"deaths_logged": {"kills": 5, "counted_max": 1, "needs": 3}}),
-        ),
-        (
-            "70 (a)",
-            false,
-            json!({"deaths_logged": {"kills": 4, "counted_max": 3, "needs": 3}}),
-        ),
-        (
-            "70 (a)",
-            false,
-            json!({"deaths_logged": {"kills": 2, "counted_max": 1, "needs": 3}}),
-        ),
-        (
-            "84",
-            true,
-            json!({"clear_phase": {"swap_to_clear_ms": 3_970, "connect_pending": true}}),
-        ),
-        (
-            "84",
-            false,
-            json!({"clear_phase": {"swap_to_clear_ms": 5_200, "connect_pending": false}}),
-        ),
         (
             "86",
             true,
@@ -635,7 +610,7 @@ fn each_owed_signature_holds_on_its_causes_evidence_and_not_without_it() {
         checked += 1;
     }
     eprintln!("signature cases checked: {checked}");
-    assert_eq!(checked, 12);
+    assert_eq!(checked, 7);
 }
 
 /// A red table names each failed check's Owed row when that row's signature holds in the run, and
@@ -658,7 +633,18 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     };
 
     verdicts(&dir, true);
-    // CI's dest-stall (rounds 2 and 3): every failed check is owed, each row's evidence present.
+    // CI's dest-trickle (rounds 2 to 4): its one failed check owed, the row's evidence present.
+    edit(
+        &dir,
+        "dest-trickle",
+        fail(
+            json!(["stall_swap"]),
+            json!({"stall_swap": {"cause": "output_error"}}),
+        ),
+    );
+    // CI's dest-stall, with Owed 84's old evidence (the clear inside a pending connect) beside 87's:
+    // PR #57 fixed 84 and its tags left chaos.json (the rebase onto main 567cfcc), so output_lost
+    // is news while stall_swap stays owed.
     edit(
         &dir,
         "dest-stall",
@@ -683,85 +669,110 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     let out = run(&["--table", d]);
     let s = stdout(&out);
     assert_eq!(out.status.code(), Some(1), "an owed red is still red");
-    assert!(s.contains(
-        "| dest-stall | FAIL | 4/4 | outage_ms | failed: stall_swap (Owed 87), output_lost (Owed 84) |"
-    ));
+    assert!(
+        s.contains("| dest-trickle | FAIL | 4/4 | outage_ms | failed: stall_swap (Owed 87) |"),
+        "{s}"
+    );
+    assert!(
+        s.contains(
+            "| dest-stall | FAIL | 4/4 | outage_ms | failed: stall_swap (Owed 87), output_lost (NOT OWED) |"
+        ),
+        "{s}"
+    );
     assert!(s.contains("| camera-stop | FAIL | 4/4 | outage_ms | failed: slate_ms (NOT OWED) |"));
     assert!(s.contains(
         "| cef-killed-r1 | FAIL | 4/4 | outage_ms | failed: overlay_back (NOT OWED), same_session (NOT OWED) |"
     ), "{s}");
-    assert!(s.contains("red, every failed check owed: dest-stall\n"), "{s}");
+    assert!(s.contains("red, every failed check owed: dest-trickle\n"), "{s}");
     assert!(s.contains(
-        "red on a check no Owed row names: camera-stop (slate_ms); cef-killed-r1 (overlay_back, same_session)\n"
+        "red on a check no Owed row names: camera-stop (slate_ms); dest-stall (output_lost); cef-killed-r1 (overlay_back, same_session)\n"
     ), "{s}");
-    for row in ["84", "87"] {
+    assert!(
+        s.contains(&format!("Owed 87: {}\n", title("87"))),
+        "Owed 87's title"
+    );
+    for gone in ["Owed 70", "Owed 84", "Owed 85", "Owed 86:"] {
         assert!(
-            s.contains(&format!("Owed {row}: {}\n", title(row))),
-            "Owed {row}'s title"
+            !s.contains(gone),
+            "only the rows this run's reds name, never a fixed one: {gone}"
         );
     }
-    assert!(
-        !s.contains("Owed 85") && !s.contains("Owed 86:"),
-        "only the rows this run's reds name, and never the fixed 85"
-    );
     assert!(s.contains("this run does not count"));
     assert!(!s.contains("this run counts"));
 
     // The re-review's I-3: an owed check that fails WITHOUT its row's evidence is not that row's.
-    // dest-stall's stall_swap through the stall rule itself (cause "stall": a slow detector); the
-    // fast leg's overlay_back with 70 (a)'s evidence absent, then present, then absent with Owed
-    // 85's old evidence present, which explains nothing since its tags left.
+    // dest-stall's stall_swap through the stall rule itself (cause "stall": a slow detector), and
+    // cpu-starved's ladder_moved on a window that dropped frames (the ladder's input moved, so not
+    // Owed 86's still ladder); dest-trickle's stall_swap with 87's evidence. And the rows fixed on
+    // main read NOT OWED whatever their old evidence: dest-disconnect's output_lost in a pending
+    // connect (Owed 84, PR #57), the fast leg's overlay_back on a loop counted late (Owed 70 (a),
+    // PR #55).
     verdicts(&dir, true);
+    edit(
+        &dir,
+        "dest-disconnect",
+        fail(
+            json!(["output_lost"]),
+            json!({"clear_phase": {"swap_to_clear_ms": 3_970, "connect_pending": true}}),
+        ),
+    );
     edit(
         &dir,
         "dest-stall",
         fail(json!(["stall_swap"]), json!({"stall_swap": {"cause": "stall"}})),
     );
-    let absent = json!({"kills": 5, "counted_max": 3, "needs": 3});
-    let present = json!({"kills": 5, "counted_max": 1, "needs": 3});
-    for (leg, deaths, failed_after) in [
-        ("cef-gpu-deaths-fast-r1", absent.clone(), 0),
-        ("cef-gpu-deaths-fast-r2", present.clone(), 0),
-        ("cef-gpu-deaths-fast-r3", absent.clone(), 1),
-    ] {
+    edit(
+        &dir,
+        "cpu-starved",
+        fail(
+            json!(["ladder_moved"]),
+            json!({"starvation_applied": {"applied": true},
+                "ladder_moved": {"dropped_rise": 40, "half_rate_beats": 0}}),
+        ),
+    );
+    edit(
+        &dir,
+        "dest-trickle",
+        fail(
+            json!(["stall_swap"]),
+            json!({"stall_swap": {"cause": "output_error"}}),
+        ),
+    );
+    for r in 1..=3 {
         edit(
             &dir,
-            leg,
+            &format!("cef-gpu-deaths-fast-r{r}"),
             fail(
                 json!(["overlay_back"]),
-                json!({"deaths_logged": deaths, "graphics_failed_after_start": failed_after}),
+                json!({"deaths_logged": {"kills": 5, "counted_max": 1, "needs": 3}}),
             ),
         );
     }
     let out = run(&["--table", d]);
     let s = stdout(&out);
     assert_eq!(out.status.code(), Some(1));
-    assert!(s.contains(
-        "| dest-stall | FAIL | 4/4 | outage_ms | failed: stall_swap (NOT OWED: Owed 87's signature absent) |"
-    ), "{s}");
-    for r in [1, 3] {
-        assert!(s.contains(&format!(
-            "| cef-gpu-deaths-fast-r{r} | FAIL | 4/4 | outage_ms | failed: overlay_back (NOT OWED: Owed 70 (a)'s signature absent) |"
-        )), "fast-r{r}: {s}");
+    for row in [
+        "| dest-disconnect | FAIL | 4/4 | outage_ms | failed: output_lost (NOT OWED) |",
+        "| dest-stall | FAIL | 4/4 | outage_ms | failed: stall_swap (NOT OWED: Owed 87's signature absent) |",
+        "| cpu-starved | FAIL | 4/4 | outage_ms | failed: ladder_moved (NOT OWED: Owed 86's signature absent) |",
+        "| dest-trickle | FAIL | 4/4 | outage_ms | failed: stall_swap (Owed 87) |",
+        "| cef-gpu-deaths-fast-r1 | FAIL | 4/4 | outage_ms | failed: overlay_back (NOT OWED) |",
+        "| cef-gpu-deaths-fast-r2 | FAIL | 4/4 | outage_ms | failed: overlay_back (NOT OWED) |",
+        "| cef-gpu-deaths-fast-r3 | FAIL | 4/4 | outage_ms | failed: overlay_back (NOT OWED) |",
+    ] {
+        assert!(s.contains(row), "{row}\n{s}");
     }
-    assert!(
-        s.contains(
-            "| cef-gpu-deaths-fast-r2 | FAIL | 4/4 | outage_ms | failed: overlay_back (Owed 70 (a)) |"
-        ),
-        "{s}"
-    );
-    assert!(
-        s.contains("red, every failed check owed: cef-gpu-deaths-fast-r2\n"),
-        "{s}"
-    );
+    assert!(s.contains("red, every failed check owed: dest-trickle\n"), "{s}");
     assert!(s.contains(
-        "red on a check no Owed row names: dest-stall (stall_swap); cef-gpu-deaths-fast-r1 (overlay_back); cef-gpu-deaths-fast-r3 (overlay_back)\n"
+        "red on a check no Owed row names: dest-disconnect (output_lost); dest-stall (stall_swap); cpu-starved (ladder_moved); cef-gpu-deaths-fast-r1 (overlay_back); cef-gpu-deaths-fast-r2 (overlay_back); cef-gpu-deaths-fast-r3 (overlay_back)\n"
     ), "{s}");
-    assert!(s.contains(&format!("Owed 70 (a): {}\n", title("70 (a)"))));
-    assert!(
-        !s.contains("Owed 87:") && !s.contains("Owed 85"),
-        "a row whose evidence is absent is not named, nor the fixed 85"
-    );
+    assert!(s.contains(&format!("Owed 87: {}\n", title("87"))));
+    for gone in ["Owed 70", "Owed 84", "Owed 85", "Owed 86:"] {
+        assert!(
+            !s.contains(gone),
+            "a row whose evidence is absent, or whose fix merged, is not named: {gone}"
+        );
+    }
 
     // Only owed reds: still red, and the run still does not count.
     verdicts(&dir, true);
@@ -785,24 +796,28 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     let s = stdout(&out);
     assert_eq!(out.status.code(), Some(0));
     assert!(!s.contains("every failed check owed") && !s.contains("no Owed row names"));
-    eprintln!("owed table rows checked: 3, then 4, then 1, then 0");
+    eprintln!("owed table rows checked: 4, then 7, then 1, then 0");
 }
 
 /// A check may name a list of Owed rows, tried in order (chaos.json's `about`): the first whose
 /// signature holds is named, and with none holding the row reads every row's signature absent. No
-/// leg of chaos.json carries a list since Owed 85 left it, so a copy of the manifest gives the fast
-/// leg's overlay_back a second row, a test row whose signature is Owed 85's old evidence.
+/// leg of chaos.json carries a list now (Owed 85, 84 and 70 (a) have left it), so a copy of the
+/// manifest gives the fast leg's overlay_back two test rows. And a table over that copy never counts
+/// toward wave gate 3, even all green (the confirm pass's CHAOS_MANIFEST minor), while the same
+/// verdicts over the committed manifest do.
 #[test]
 fn a_list_of_owed_rows_names_the_first_whose_signature_holds() {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("chaos-table-owed-list");
     let d = dir.to_str().unwrap();
     let mut m = manifest();
-    m["owed_signatures"]["99"] = json!(".measures.graphics_failed_after_start >= 1");
-    m["owed_titles"]["99"] = json!("a test row");
+    m["owed_signatures"]["98"] = json!(".measures.test_first == true");
+    m["owed_titles"]["98"] = json!("a first test row");
+    m["owed_signatures"]["99"] = json!(".measures.test_second == true");
+    m["owed_titles"]["99"] = json!("a second test row");
     let mut lists = 0;
     for l in m["legs"].as_array_mut().unwrap() {
         if l["case"] == "cef-gpu-deaths" && l["variant"] == "fast" {
-            l["owed"]["overlay_back"] = json!(["70 (a)", "99"]);
+            l["owed"] = json!({"overlay_back": ["98", "99"]});
             lists += 1;
         }
     }
@@ -810,19 +825,17 @@ fn a_list_of_owed_rows_names_the_first_whose_signature_holds() {
     verdicts(&dir, true);
     let path = dir.with_extension("json");
     std::fs::write(&path, m.to_string()).unwrap();
-    let fail = |deaths: Value, failed_after: i64| {
+    let fail = |first: bool, second: bool| {
         move |v: &mut Value| {
             v["status"] = json!("fail");
             v["failed"] = json!(["overlay_back"]);
-            v["measures"]["deaths_logged"] = deaths.clone();
-            v["measures"]["graphics_failed_after_start"] = json!(failed_after);
+            v["measures"]["test_first"] = json!(first);
+            v["measures"]["test_second"] = json!(second);
         }
     };
-    let absent = json!({"kills": 5, "counted_max": 3, "needs": 3});
-    let present = json!({"kills": 5, "counted_max": 1, "needs": 3});
-    edit(&dir, "cef-gpu-deaths-fast-r1", fail(absent.clone(), 0));
-    edit(&dir, "cef-gpu-deaths-fast-r2", fail(absent.clone(), 1));
-    edit(&dir, "cef-gpu-deaths-fast-r3", fail(present.clone(), 1));
+    edit(&dir, "cef-gpu-deaths-fast-r1", fail(false, false));
+    edit(&dir, "cef-gpu-deaths-fast-r2", fail(false, true));
+    edit(&dir, "cef-gpu-deaths-fast-r3", fail(true, true));
     let out = run_manifest(&["--table", d], &path);
     let s = stdout(&out);
     assert_eq!(out.status.code(), Some(1), "an owed red is still red");
@@ -831,9 +844,9 @@ fn a_list_of_owed_rows_names_the_first_whose_signature_holds() {
     };
     let mut checked = 0;
     for (r, tag) in [
-        (1, "NOT OWED: Owed 70 (a)'s and Owed 99's signature absent"),
+        (1, "NOT OWED: Owed 98's and Owed 99's signature absent"),
         (2, "Owed 99"),
-        (3, "Owed 70 (a)"),
+        (3, "Owed 98"),
     ] {
         assert!(s.contains(&row(r, tag)), "fast-r{r} reads {tag}: {s}");
         checked += 1;
@@ -844,9 +857,39 @@ fn a_list_of_owed_rows_names_the_first_whose_signature_holds() {
     );
     assert!(s.contains("red on a check no Owed row names: cef-gpu-deaths-fast-r1 (overlay_back)\n"));
     assert!(
-        s.contains("Owed 70 (a): ") && s.contains("Owed 99: a test row\n"),
+        s.contains("Owed 98: a first test row\n") && s.contains("Owed 99: a second test row\n"),
         "{s}"
     );
-    eprintln!("owed list rows checked: {checked}");
-    assert_eq!(checked, 3);
+
+    // All green over the copy: green, and never a gate run. The same verdicts over the committed
+    // manifest count.
+    verdicts(&dir, true);
+    let out = run_manifest(&["--table", d], &path);
+    let s = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{s}");
+    assert!(
+        s.contains(&format!(
+            "manifest: CHAOS_MANIFEST {}, not harness/chaos.json\n",
+            path.display()
+        )),
+        "{s}"
+    );
+    assert!(
+        s.contains(
+            "WAVE GATE 3: a run over another manifest (CHAOS_MANIFEST) never counts (31 of 31 legs PASS)\n"
+        ),
+        "{s}"
+    );
+    assert!(!s.contains("this run counts"), "{s}");
+    let out = run(&["--table", d]);
+    let s = stdout(&out);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        s.contains("WAVE GATE 3: this run counts (31 of 31 legs PASS)\n"),
+        "{s}"
+    );
+    assert!(!s.contains("manifest: CHAOS_MANIFEST"), "{s}");
+    checked += 1;
+    eprintln!("owed list rows checked: {checked} (3 rows, then the override's gate)");
+    assert_eq!(checked, 4);
 }

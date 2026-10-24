@@ -552,6 +552,37 @@ The coordinator's rebase dispatch. `feat/c14-chaos` is rebased onto main 263b08a
   Row 85 keeps main's text ("IN REVIEW 2026-10-24 …"). The dispatch's "FIXED text" is not on main:
   closing the row needs a green image run's id, and that is main's to record.
 
+## Amendment 2026-10-24, rebase onto main 567cfcc (PR #57 and PR #55 merged)
+
+The coordinator's dispatch after the confirm pass of a69b6bb (PASS). `feat/c14-chaos` is rebased
+onto main 567cfcc, never merged. Both sides of the docs are kept: #57's F-027, F-028, Owed 84, 87
+and 88 and its decision rows; #55's F-026, Owed 70 (a) and its decision rows; this branch's F-023
+and F-024.
+
+- **Owed 84 and Owed 70 (a) leave chaos.json**, as Owed 85 did. Their signatures, titles and tags
+  are gone: `output_lost` and `no_outage_outside_fault` in cases 4, 5 and 12, and every tag on case
+  15's `fast` leg. A red there now reads NOT OWED. That is the honest result of the re-run, never
+  re-tagged.
+- **What stays owed:** 86 (case 6's four checks), 87 (`stall_swap` in cases 5 and 12) and 82 (case
+  16, NOT RUNNABLE). 84 (c), the checker's double count of the cut (the re-review's m-4), has no row
+  or tag of its own.
+- **Owed 85 is closed FIXED** in docs/_INDEX.md: PR #54 merged as 263b08a, main's image run
+  40079483379 is green, and chaos runs 40087523077 and 40087535051 (a69b6bb) are green on all 24
+  restart legs, `overlay_back` included. This supersedes the previous amendment's last bullet.
+- **`CHAOS_MANIFEST` never counts.** A table over another manifest prints it on the run line, and
+  the gate line reads "a run over another manifest (CHAOS_MANIFEST) never counts", even all green.
+  chaos_table pins it beside the committed manifest's "this run counts" on the same verdicts, and
+  the refusal is mutated once.
+- **The confirm pass's minors.** c-1 (84's signature reads the phase, not the reset) is moot now
+  that the signature is gone. c-2: `stress_ran` reads the drive's own marks, so it is commented as
+  the quota requested, with `starvation_applied` as the witness that it was applied.
+- **Expected reds of the re-run:**
+  - cef-leaks ×2 (Owed 82, NOT RUNNABLE);
+  - cpu-starved (86);
+  - dest-stall and dest-trickle `stall_swap` (87).
+  - Anything else is NOT OWED, including case 4, 5 or 12's `output_lost` (84's prediction says
+    green) and case 15's `fast` leg (70 (a)'s says green).
+
 ## Files
 
 - Create: `harness/cases/{camera-stop,camera-flap,reader-kicked,dest-disconnect,dest-stall,cpu-starved,score-down,cef-killed,process-killed,input-impaired}.{sh,jq}` (amended 2026-10-24: all 16, cases 11–16 too, as `.sh` files with `require` lines over `harness/cases/lib.jq`; and `harness/chaos.json`, the legs)

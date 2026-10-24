@@ -242,8 +242,8 @@ require_restart_outage() {
 # less than OUTPUT_CONNECT_TIMEOUT_MS before the clear was still connecting when the path came back,
 # so it connects after the clear with the fault's backlog, which is the burst Owed 84 names; a clear
 # after that connect timed out builds a fresh sink and never takes that path. `connect_pending` is
-# printed so a green run says which path it took, and it is Owed 84's signature in chaos.json.
-# 5 checks.
+# printed so a run says which path it took. It was Owed 84's signature in chaos.json until that
+# row's fix (PR #57) merged; a red on these checks now reads NOT OWED whatever the phase. 5 checks.
 require_output_recovers() {
   measure clear_phase '([.log.sink_swaps[] | select(.at_ms <= mark_at("clear"))] | last) as $sw
     | (if $sw == null or mark_at("clear") == null then null else mark_at("clear") - $sw.at_ms end) as $ago

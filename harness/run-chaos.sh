@@ -14,8 +14,9 @@
 #       MISSING, on an empty selection, on a sweep that some leg calling it did not run, and on any
 #       NOT RUNNABLE leg: an unrun leg is never green (the PR #52 review's I6; case 16's are
 #       Owed 82, which only the owner's ruling closes). Only a whole manifest's run, on its first
-#       attempt (GITHUB_RUN_ATTEMPT 1), with every leg PASS, counts: a selection or a re-run is
-#       green for what it ran and says it never counts (the re-review's I-2 and m-7).
+#       attempt (GITHUB_RUN_ATTEMPT 1), over harness/chaos.json itself, with every leg PASS, counts:
+#       a selection, a re-run or another manifest (CHAOS_MANIFEST) is green for what it ran and says
+#       it never counts (the re-review's I-2 and m-7; the confirm pass's CHAOS_MANIFEST minor).
 #
 # A FAIL row names, beside each failed check, the docs/_INDEX.md Owed row chaos.json's `owed` puts
 # behind it for that leg (a row, or a list tried in order), or NOT OWED; under the table, the red
@@ -32,8 +33,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # CHAOS_MANIFEST: another manifest, for chaos_table.rs alone. Its list of rows behind one check is
-# pinned there, since no leg of chaos.json carries one now that Owed 85 has left it. chaos.yml never
-# sets it.
+# pinned there, since no leg of chaos.json carries one now. chaos.yml never sets it, and a table
+# over it never counts toward wave gate 3: the owed map and the legs it judges by are not the
+# committed ones.
 MANIFEST="${CHAOS_MANIFEST:-$HERE/chaos.json}"
 
 legs() {
@@ -189,9 +191,15 @@ table() {
   local total attempt="${GITHUB_RUN_ATTEMPT:-}" head="${CHAOS_HEAD_SHA:-${GITHUB_SHA:-}}"
   total="$(legs all | jq length)"
   echo "run: attempt ${attempt:-none (not a CI run)}, head ${head:-unknown}, legs $n of $total"
+  if [ -n "${CHAOS_MANIFEST:-}" ]; then echo "manifest: CHAOS_MANIFEST $MANIFEST, not harness/chaos.json"; fi
   if [ "$ok" -eq 1 ] && [ "$not_runnable" -eq 0 ]; then
-    # Only a whole first attempt counts (the re-review's I-2 and m-7): a selection of legs, or a
-    # re-run of failed jobs, is green for what it ran and never a gate run.
+    # Only a whole first attempt over the committed manifest counts (the re-review's I-2 and m-7):
+    # a selection of legs, a re-run of failed jobs, or another manifest is green for what it ran and
+    # never a gate run.
+    if [ -n "${CHAOS_MANIFEST:-}" ]; then
+      echo "WAVE GATE 3: a run over another manifest (CHAOS_MANIFEST) never counts ($passed of $n legs PASS)"
+      return 0
+    fi
     if [ "$n" -ne "$total" ]; then
       echo "WAVE GATE 3: a partial run ($n of $total legs) never counts ($passed of $n legs PASS)"
       return 0
