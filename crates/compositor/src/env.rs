@@ -31,6 +31,21 @@ pub const COMPOSITOR_FAKE_ZYGOTE_GONE: &str = "COMPOSITOR_FAKE_ZYGOTE_GONE";
 #[cfg(feature = "test-hooks")]
 pub const COMPOSITOR_TEST_HOLD_TEARDOWNS: &str = "COMPOSITOR_TEST_HOLD_TEARDOWNS";
 
+/// Owed 94, a `test-hooks` build only (C14's output-hung case; the owner, 2026-10-24, "B"): ms, `N`.
+/// The live programme's sink generation 1 has its writes held for good `N` ms after its build
+/// (`GstProgramme::stall_first_sink`, `SinkStall::Hold`): its total stops, the encoders keep
+/// delivering and no sink error comes, so only the domain's egress backstop swaps it. Unset, empty or
+/// `0` plants nothing; anything but ASCII digits is refused (78), and so is setting it with
+/// `COMPOSITOR_TEST_HANG_SINK_AFTER_MS`.
+#[cfg(feature = "test-hooks")]
+pub const COMPOSITOR_TEST_HOLD_SINK_AFTER_MS: &str = "COMPOSITOR_TEST_HOLD_SINK_AFTER_MS";
+
+/// Owed 94, a `test-hooks` build only: as `COMPOSITOR_TEST_HOLD_SINK_AFTER_MS`, with the sink's next
+/// write hung on its streaming lock instead (`SinkStall::Hang`), so its teardown hangs too (F-001):
+/// the backstop's swap must not wait on it.
+#[cfg(feature = "test-hooks")]
+pub const COMPOSITOR_TEST_HANG_SINK_AFTER_MS: &str = "COMPOSITOR_TEST_HANG_SINK_AFTER_MS";
+
 /// The four keys every run needs, in R1's order.
 pub const REQUIRED: [&str; 4] = [SESSION_ID, JOB_TOKEN, APP_URL, RELAY_DEADLINE_AT];
 
@@ -49,13 +64,26 @@ pub struct FakeKnobs {
     pub zygote_gone: bool,
 }
 
-/// The test hooks a `test-hooks` build reads (Owed 82). Empty in a build without the feature, so a
-/// release binary has nothing to arm. Read in both modes; only the live graphics adapter has them.
+/// Owed 94: how the planted sink stall stalls (`COMPOSITOR_TEST_HOLD_SINK_AFTER_MS`,
+/// `COMPOSITOR_TEST_HANG_SINK_AFTER_MS`).
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkStallHook {
+    Hold,
+    Hang,
+}
+
+/// The test hooks a `test-hooks` build reads (Owed 82, Owed 94). Empty in a build without the
+/// feature, so a release binary has nothing to arm. Read in both modes; only the live adapters have
+/// them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TestHooks {
     /// `COMPOSITOR_TEST_HOLD_TEARDOWNS`: retired CEF teardowns to hold for good (0: none).
     #[cfg(feature = "test-hooks")]
     pub hold_teardowns: usize,
+    /// Owed 94: the stall to plant on sink generation 1, and how many ms after its build.
+    #[cfg(feature = "test-hooks")]
+    pub sink_stall: Option<(SinkStallHook, u64)>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -162,17 +190,36 @@ pub fn parse(get: impl Fn(&str) -> Option<String>, release: bool) -> Result<Env,
     })
 }
 
-/// Owed 82: the hooks a `test-hooks` build was asked for.
+/// Owed 82 and Owed 94: the hooks a `test-hooks` build was asked for.
 #[cfg(feature = "test-hooks")]
 fn test_hooks(get: &impl Fn(&str) -> Option<String>) -> Result<TestHooks, EnvError> {
-    let key = COMPOSITOR_TEST_HOLD_TEARDOWNS;
-    let hold_teardowns = match get(key).as_deref() {
-        None | Some("") => 0,
-        // Digits only: `usize::from_str` also takes a leading `+`.
-        Some(v) if v.bytes().all(|b| b.is_ascii_digit()) => v.parse().map_err(|_| EnvError::Invalid(key))?,
-        Some(_) => return Err(EnvError::Invalid(key)),
+    let hold_teardowns = digits(get, COMPOSITOR_TEST_HOLD_TEARDOWNS)?;
+    let hold: u64 = digits(get, COMPOSITOR_TEST_HOLD_SINK_AFTER_MS)?;
+    let hang: u64 = digits(get, COMPOSITOR_TEST_HANG_SINK_AFTER_MS)?;
+    let sink_stall = match (hold, hang) {
+        (0, 0) => None,
+        (ms, 0) => Some((SinkStallHook::Hold, ms)),
+        (0, ms) => Some((SinkStallHook::Hang, ms)),
+        // One stall: the second key is the one refused.
+        _ => return Err(EnvError::Invalid(COMPOSITOR_TEST_HANG_SINK_AFTER_MS)),
     };
-    Ok(TestHooks { hold_teardowns })
+    Ok(TestHooks {
+        hold_teardowns,
+        sink_stall,
+    })
+}
+
+/// A hook's number: unset or empty is 0; ASCII digits only (`from_str` also takes a leading `+`).
+#[cfg(feature = "test-hooks")]
+fn digits<N: std::str::FromStr + Default>(
+    get: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+) -> Result<N, EnvError> {
+    match get(key).as_deref() {
+        None | Some("") => Ok(N::default()),
+        Some(v) if v.bytes().all(|b| b.is_ascii_digit()) => v.parse().map_err(|_| EnvError::Invalid(key)),
+        Some(_) => Err(EnvError::Invalid(key)),
+    }
 }
 
 /// A build without the feature reads no hook.
