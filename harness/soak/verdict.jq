@@ -22,7 +22,7 @@ def check($id; $name; $problems; $measured):
    reason: (if ($problems | length) == 0 then null else ($problems | join("; ")) end), measured: $measured};
 def pending($id; $name; $measured):
   {id: $id, name: $name, status: "pending",
-   reason: "pending: page source (the C14 test page drives the plumbing only; the production page is the owner's stg fixture)",
+   reason: "pending: page source (the C14 test page drives the plumbing only; the production page is the standalone web build on the harness Machine: page=real)",
    measured: $measured};
 def overlaps($o; $d): $o.from_wall_ms <= $d.end_ms and $o.to_wall_ms >= $d.at_ms;
 
