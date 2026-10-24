@@ -31,7 +31,10 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-MANIFEST="$HERE/chaos.json"
+# CHAOS_MANIFEST: another manifest, for chaos_table.rs alone. Its list of rows behind one check is
+# pinned there, since no leg of chaos.json carries one now that Owed 85 has left it. chaos.yml never
+# sets it.
+MANIFEST="${CHAOS_MANIFEST:-$HERE/chaos.json}"
 
 legs() {
   local want="$1" all unknown

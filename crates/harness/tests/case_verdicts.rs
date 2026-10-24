@@ -1296,7 +1296,7 @@ fn cef_killed_restarts_the_process_and_reds_when_the_kill_missed_or_the_death_is
     assert_eq!(
         graphics_failed(&v),
         json!(0),
-        "cef-good: Owed 85's signature is absent"
+        "cef-good: Owed 85's evidence is absent"
     );
     // The container died under the exec before its status line: the targets alone.
     assert_pass(
@@ -1381,7 +1381,7 @@ fn cef_killed_restarts_the_process_and_reds_when_the_kill_missed_or_the_death_is
     assert_eq!(
         graphics_failed(&v),
         json!(1),
-        "cef-nooverlay: Owed 85's signature holds"
+        "cef-nooverlay: Owed 85's evidence is present"
     );
     // The re-review's m-2: the budget runs from the output's last packet (spec §6's "output back"),
     // which is before the die. An overlay back 100 ms inside the budget from the die is outside it
@@ -1643,7 +1643,8 @@ fn overlay_lost_after_die(w: &mut World, after: i64, late_ms: Option<i64>) {
     w.overlay_none.push((die, to));
 }
 
-/// The `graphics_failed_after_start` measure (Owed 85's signature in chaos.json) a verdict recorded.
+/// The `graphics_failed_after_start` measure a verdict recorded: Owed 85's evidence (its chaos.json
+/// signature left with its tags when PR #54 fixed it).
 fn graphics_failed(v: &Verdict) -> Value {
     v.json["measures"]["graphics_failed_after_start"].clone()
 }
@@ -1731,7 +1732,7 @@ fn cef_gpu_zygote_killed_restarts_in_place_and_reds_without_the_in_place_restart
     assert_eq!(
         graphics_failed(&v),
         json!(1),
-        "zyg-nooverlay: Owed 85's signature holds"
+        "zyg-nooverlay: Owed 85's evidence is present"
     );
     let mut w = zygote("gpu-process", true, "zygote");
     overlay_lost_after_die(&mut w, k, Some(500));

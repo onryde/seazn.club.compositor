@@ -1,16 +1,14 @@
 {
-  "about": "The chaos suite's legs (C14 brief, amended 2026-10-20): each harness/cases/<case>.sh, variant and repeat is one leg of chaos.yml. The restart cases run 3 times and run-chaos.sh prints the worst outage. n is the brief's case number. `owed` (C14 fix round 3, item 4) names the docs/_INDEX.md Owed row behind each check a leg is known to fail (a row, or a list tried in order), so run-chaos.sh's table says which reds are explained; it never changes a verdict, and an owed red is as red as any other. A row is named for a failed check only when its `owed_signatures` filter (jq over that leg's verdict.json, its measures the evidence of the row's own cause) holds in that run (fix round 4, the re-review's I-3); else the check reads NOT OWED with the signature absent.",
+  "about": "The chaos suite's legs (C14 brief, amended 2026-10-20): each harness/cases/<case>.sh, variant and repeat is one leg of chaos.yml. The restart cases run 3 times and run-chaos.sh prints the worst outage. n is the brief's case number. `owed` (C14 fix round 3, item 4) names the docs/_INDEX.md Owed row behind each check a leg is known to fail (a row, or a list tried in order), so run-chaos.sh's table says which reds are explained; it never changes a verdict, and an owed red is as red as any other. A row is named for a failed check only when its `owed_signatures` filter (jq over that leg's verdict.json, its measures the evidence of the row's own cause) holds in that run (fix round 4, the re-review's I-3); else the check reads NOT OWED with the signature absent. Owed 85 (a restarted container's CEF never starting) left the map when PR #54 fixed it (main 263b08a, 2026-10-24): a restart leg's red is NOT OWED now.",
   "owed_signatures": {
     "70 (a)": ".measures.deaths_logged as $d | ($d.kills | type) == \"number\" and ($d.needs | type) == \"number\" and $d.kills >= $d.needs and ($d.counted_max // 0) < $d.needs",
     "84": ".measures.clear_phase.connect_pending == true",
-    "85": "(.measures.graphics_failed_after_start | type) == \"number\" and .measures.graphics_failed_after_start >= 1",
     "86": ".measures.starvation_applied.applied == true and .measures.ladder_moved.dropped_rise == 0 and .measures.ladder_moved.half_rate_beats == 0",
     "87": ".measures.stall_swap.cause == \"output_error\""
   },
   "owed_titles": {
     "70 (a)": "the 1 s child poll counts a fast GPU-death loop late (5 kills in about 330 ms, 1 counted), so nothing restarts",
     "84": "a sink that connects after the fault clears replays its backlog, and the recorder discards it",
-    "85": "CEF never starts again after a container restart, so the overlay stays off",
     "86": "the ladder never moves under CPU starvation, and the beats read healthy",
     "87": "the stall rule never swaps the sink: rtmp2sink's own 5 s socket timeout fails it first, and `sink swap` names no reason"
   },
@@ -24,22 +22,21 @@
     {"n": 6, "case": "cpu-starved", "runs": 1,
       "owed": {"window_fps": "86", "pts_gaps": "86", "ladder_moved": "86", "scheduled_changes_shown": "86"}},
     {"n": 7, "case": "score-down", "runs": 1},
-    {"n": 8, "case": "cef-killed", "runs": 3,
-      "owed": {"cef_ready_after_restart": "85", "beats_never_failed": "85", "overlay_back": "85"}},
+    {"n": 8, "case": "cef-killed", "runs": 3},
     {"n": 9, "case": "process-killed", "runs": 3},
     {"n": 10, "case": "input-impaired", "runs": 1},
     {"n": 11, "case": "cef-hung", "runs": 1},
     {"n": 12, "case": "dest-trickle", "runs": 1,
       "owed": {"stall_swap": "87", "output_lost": "84", "no_outage_outside_fault": "84"}},
-    {"n": 13, "case": "cef-gpu-zygote-killed", "runs": 3, "owed": {"overlay_back": "85"}},
-    {"n": 14, "case": "cef-renderer-zygote-killed", "runs": 3, "owed": {"overlay_back": "85"}},
-    {"n": 15, "case": "cef-gpu-deaths", "variant": "threshold", "runs": 3, "owed": {"overlay_back": "85"}},
+    {"n": 13, "case": "cef-gpu-zygote-killed", "runs": 3},
+    {"n": 14, "case": "cef-renderer-zygote-killed", "runs": 3},
+    {"n": 15, "case": "cef-gpu-deaths", "variant": "threshold", "runs": 3},
     {"n": 15, "case": "cef-gpu-deaths", "variant": "one-fewer", "runs": 1},
     {"n": 15, "case": "cef-gpu-deaths", "variant": "fast", "runs": 3,
       "owed": {"deaths_logged": "70 (a)", "final_beat_detail": "70 (a)", "died_in_place": "70 (a)",
         "restarted_once": "70 (a)", "gpu_death_split": "70 (a)", "last_kill_not_before_die": "70 (a)",
         "restart_outage_found": "70 (a)", "restart_outage_in_budget": "70 (a)", "same_session": "70 (a)",
-        "overlay_back": ["70 (a)", "85"]}},
+        "overlay_back": "70 (a)"}},
     {"n": 16, "case": "cef-leaks", "variant": "three", "runs": 1},
     {"n": 16, "case": "cef-leaks", "variant": "two", "runs": 1}
   ]

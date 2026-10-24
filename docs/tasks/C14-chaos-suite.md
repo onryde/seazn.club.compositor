@@ -534,6 +534,24 @@ red, and `stress_ran` must pass.
 - cef-killed, the two zygote cases and cef-gpu-deaths-threshold, wherever graphics gave up after
   the restart (85).
 
+## Amendment 2026-10-24, rebase onto main 263b08a (PR #54, Owed 85's fix, merged)
+
+The coordinator's rebase dispatch. `feat/c14-chaos` is rebased onto main 263b08a, never merged.
+
+- **Owed 85 leaves chaos.json.** Its signature, its title and its tags on cef-killed (3 checks),
+  the two zygote cases, cef-gpu-deaths-threshold and the fast leg's `overlay_back` are gone. Every
+  restart leg's `overlay_back` must now pass; a red there reads NOT OWED and is news.
+- **`graphics_failed_after_start` is still measured** beside `overlay_back`. It is the evidence a
+  return of that cause would carry.
+- **A list of rows behind one check** (tried in order) is no longer carried by any leg. chaos_table
+  pins it over a copy of the manifest (`CHAOS_MANIFEST`, read by run-chaos.sh for that test alone;
+  chaos.yml never sets it).
+- **The round-4 expected reds amended:** the last bullet's 85 is withdrawn. Those legs are expected
+  green.
+- **_FINDINGS.** F-023 and F-024 sit before main's F-025, and F-024's unproven cause points at F-025.
+  Row 85 keeps main's text ("IN REVIEW 2026-10-24 …"). The dispatch's "FIXED text" is not on main:
+  closing the row needs a green image run's id, and that is main's to record.
+
 ## Files
 
 - Create: `harness/cases/{camera-stop,camera-flap,reader-kicked,dest-disconnect,dest-stall,cpu-starved,score-down,cef-killed,process-killed,input-impaired}.{sh,jq}` (amended 2026-10-24: all 16, cases 11–16 too, as `.sh` files with `require` lines over `harness/cases/lib.jq`; and `harness/chaos.json`, the legs)
