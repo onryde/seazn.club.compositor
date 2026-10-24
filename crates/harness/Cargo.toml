@@ -56,6 +56,12 @@ name = "checker"
 path = "src/bin/checker.rs"
 required-features = ["media"]
 
+# Owed 81's probe: a second reader of the camera path, built as the compositor's input is.
+[[bin]]
+name = "input-tap"
+path = "src/bin/input-tap.rs"
+required-features = ["media"]
+
 [[test]]
 name = "strip"
 required-features = ["media"]

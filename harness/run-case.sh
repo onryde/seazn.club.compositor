@@ -112,7 +112,7 @@ collect() {
   else
     : >"$OUT/compositor.log"
   fi
-  compose logs --no-color mediamtx fake-camera fake-control >"$OUT/services.log" 2>&1 || true
+  compose logs --no-color mediamtx fake-camera fake-control input-tap >"$OUT/services.log" 2>&1 || true
 }
 teardown() {
   if [ "$stack_up" -eq 1 ]; then

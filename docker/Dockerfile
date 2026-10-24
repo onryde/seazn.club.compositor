@@ -64,19 +64,22 @@ ENV GST_PLUGIN_PATH=/opt/gstcef DISPLAY=:99
 RUN useradd --uid 10001 --create-home tester && chown -R 10001:10001 /src /opt/cargo
 USER tester
 
-# The harness (C13, harness/compose.yml): fake-camera, fake-control and the checker on the same
-# GStreamer as the runtime, plus tc (netem.sh's sidecars) and curl (the cases' controls). No CEF:
-# the harness only feeds and reads the relay image.
+# The harness (C13, harness/compose.yml): fake-camera, fake-control, the checker and input-tap
+# (Owed 81's probe) on the same GStreamer as the runtime, plus tc (netem.sh's sidecars) and curl
+# (the cases' controls). No CEF: the harness only feeds and reads the relay image.
 FROM rust-build AS harness-build
 RUN cargo build --release --locked -p harness --bins \
- && install -m 0755 target/release/fake-camera target/release/fake-control target/release/checker /usr/local/bin/
+ && install -m 0755 target/release/fake-camera target/release/fake-control target/release/checker \
+      target/release/input-tap /usr/local/bin/
 
 FROM gst-base AS harness
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 curl \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=harness-build /usr/local/bin/fake-camera /usr/local/bin/fake-control /usr/local/bin/checker /usr/local/bin/
+COPY --from=harness-build /usr/local/bin/fake-camera /usr/local/bin/fake-control /usr/local/bin/checker \
+     /usr/local/bin/input-tap /usr/local/bin/
 RUN for e in appsrc x264enc h264parse mpegtsmux srtsink audioconvert voaacenc aacparse queue filesrc \
-      decodebin qtdemux avdec_h264 avdec_aac videoconvert audioresample appsink fakesink; do \
+      decodebin qtdemux avdec_h264 avdec_aac videoconvert audioresample appsink fakesink \
+      srtsrc tsdemux videoconvertscale capsfilter; do \
       gst-inspect-1.0 "$e" >/dev/null 2>&1 || { echo "missing element $e"; exit 1; }; done
 
 FROM gst-base

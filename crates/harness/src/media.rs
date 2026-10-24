@@ -348,12 +348,18 @@ fn live_appsrc(caps: &gst::Caps, max_bytes: u64) -> gst_app::AppSrc {
         .build()
 }
 
+/// What `CameraPipeline::on_sent` calls with each buffer the camera sends.
+pub type SentFn = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
 /// One build of the camera's pipeline. A failure (`failure`) ends the build; the caller makes a new
 /// one, whose PTS start from 0 again.
 pub struct CameraPipeline {
     pipeline: gst::Pipeline,
+    /// The sink the mux writes to (`on_sent`'s probe).
+    sink: gst::Element,
     video: gst_app::AppSrc,
-    audio: gst_app::AppSrc,
+    /// `None`: a video-only build (`start_with(.., false)`, Owed 81's control).
+    audio: Option<gst_app::AppSrc>,
     layout: Layout,
     pattern: Pattern,
     base_counter: Option<u32>,
@@ -365,17 +371,31 @@ impl fmt::Debug for CameraPipeline {
             .field("layout", &self.layout)
             .field("pattern", &self.pattern)
             .field("base_counter", &self.base_counter)
+            .field("audio", &self.audio.is_some())
             .finish()
     }
 }
 
 impl CameraPipeline {
     pub fn start(sink: &CameraSink, w: u32, h: u32, pattern: Pattern) -> Result<Self, String> {
+        Self::start_with(sink, w, h, pattern, true)
+    }
+
+    /// `start`, with or without the audio track. Without it (`audio` false: fake-camera's
+    /// `--audio off`, Owed 81's control) the TS carries the video alone, so the mux has no second
+    /// stream to interleave the frames with.
+    pub fn start_with(
+        sink: &CameraSink,
+        w: u32,
+        h: u32,
+        pattern: Pattern,
+        audio: bool,
+    ) -> Result<Self, String> {
         let layout = Layout::i420(w, h);
         check_layout(&layout)?;
         let pipeline = gst::Pipeline::new();
         let video = live_appsrc(&i420_caps(w, h)?, 8 * layout.size as u64);
-        let audio = live_appsrc(&audio_caps(), 1 << 20);
+        let audio = audio.then(|| live_appsrc(&audio_caps(), 1 << 20));
         let (h264parse, mux) = (make("h264parse")?, make("mpegtsmux")?);
         h264parse.set_property("config-interval", -1i32);
         mux.set_property("alignment", 7i32);
@@ -398,26 +418,30 @@ impl CameraPipeline {
             }
         };
         let v: [gst::Element; 4] = [video.clone().upcast(), x264enc()?, h264parse, make("queue")?];
-        let a: [gst::Element; 5] = [
-            audio.clone().upcast(),
-            make("audioconvert")?,
-            make("voaacenc")?,
-            make("aacparse")?,
-            make("queue")?,
-        ];
         pipeline
-            .add_many(v.iter().chain(a.iter()).chain([&mux, &out]))
+            .add_many(v.iter().chain([&mux, &out]))
             .map_err(|e| e.to_string())?;
         gst::Element::link_many(&v).map_err(|e| format!("camera video: {e}"))?;
-        gst::Element::link_many(&a).map_err(|e| format!("camera audio: {e}"))?;
         v[3].link(&mux).map_err(|e| format!("camera video to mux: {e}"))?;
-        a[4].link(&mux).map_err(|e| format!("camera audio to mux: {e}"))?;
+        if let Some(audio) = &audio {
+            let a: [gst::Element; 5] = [
+                audio.clone().upcast(),
+                make("audioconvert")?,
+                make("voaacenc")?,
+                make("aacparse")?,
+                make("queue")?,
+            ];
+            pipeline.add_many(a.iter()).map_err(|e| e.to_string())?;
+            gst::Element::link_many(&a).map_err(|e| format!("camera audio: {e}"))?;
+            a[4].link(&mux).map_err(|e| format!("camera audio to mux: {e}"))?;
+        }
         mux.link(&out).map_err(|e| format!("camera mux to sink: {e}"))?;
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| format!("camera: cannot play: {e}"))?;
         Ok(Self {
             pipeline,
+            sink: out,
             video,
             audio,
             layout,
@@ -428,6 +452,35 @@ impl CameraPipeline {
 
     pub fn size(&self) -> (u32, u32) {
         (self.layout.width, self.layout.height)
+    }
+
+    /// Hands `f` the bytes of every buffer the sink is about to send, on the mux's streaming thread,
+    /// just before the sink takes it (Owed 81's probe: `wire::scan` reads them). Install it before
+    /// the first `push`, so no buffer passes unseen.
+    pub fn on_sent(&self, f: SentFn) -> Result<(), String> {
+        let pad = self
+            .sink
+            .static_pad("sink")
+            .ok_or("the camera's sink has no sink pad")?;
+        pad.add_probe(
+            gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+            move |_, info| {
+                if let Some(b) = info.buffer() {
+                    if let Ok(m) = b.map_readable() {
+                        f(m.as_slice());
+                    }
+                } else if let Some(list) = info.buffer_list() {
+                    for b in list.iter() {
+                        if let Ok(m) = b.map_readable() {
+                            f(m.as_slice());
+                        }
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            },
+        )
+        .ok_or("the camera's sink refused the probe")?;
+        Ok(())
     }
 
     /// A new picture size from the next frame (appsrc carries the caps change in order).
@@ -447,22 +500,26 @@ impl CameraPipeline {
         let pts = gst::ClockTime::from_nseconds(u64::from(counter.saturating_sub(base)) * FRAME_NS);
         let dur = gst::ClockTime::from_nseconds(FRAME_NS);
         let mut vb = gst::Buffer::from_mut_slice(camera::frame(&self.layout, self.pattern, counter));
-        let pcm: Vec<u8> = audio::frame_samples(counter)
-            .iter()
-            .flat_map(|s| s.to_le_bytes())
-            .collect();
-        let mut ab = gst::Buffer::from_mut_slice(pcm);
-        for b in [&mut vb, &mut ab] {
+        let stamp = |b: &mut gst::Buffer| -> Result<(), String> {
             let m = b.get_mut().ok_or("a new buffer is not writable")?;
             m.set_pts(pts);
             m.set_duration(dur);
-        }
+            Ok(())
+        };
+        stamp(&mut vb)?;
         self.video
             .push_buffer(vb)
             .map_err(|e| format!("camera video push: {e:?}"))?;
-        self.audio
-            .push_buffer(ab)
-            .map_err(|e| format!("camera audio push: {e:?}"))?;
+        if let Some(a) = &self.audio {
+            let pcm: Vec<u8> = audio::frame_samples(counter)
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect();
+            let mut ab = gst::Buffer::from_mut_slice(pcm);
+            stamp(&mut ab)?;
+            a.push_buffer(ab)
+                .map_err(|e| format!("camera audio push: {e:?}"))?;
+        }
         Ok(())
     }
 
@@ -479,7 +536,9 @@ impl CameraPipeline {
     /// Ends the streams and waits (at most `wait_s`) for the sink to take them, so a file is whole.
     pub fn finish(self, wait_s: u64) -> Result<(), String> {
         let _ = self.video.end_of_stream();
-        let _ = self.audio.end_of_stream();
+        if let Some(a) = &self.audio {
+            let _ = a.end_of_stream();
+        }
         let bus = self.pipeline.bus().ok_or("no bus")?;
         let msg = bus.timed_pop_filtered(
             gst::ClockTime::from_seconds(wait_s),

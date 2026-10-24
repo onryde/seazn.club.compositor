@@ -156,3 +156,77 @@ fn camera_round_trip(pattern: Pattern) {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Owed 81's probe at the camera's sink (`CameraPipeline::on_sent` read by `harness::wire`): every
+/// frame the camera pushes is one video PES start in what the sink takes, in order, one camera
+/// period apart in PTS (90 kHz: 3 000 ticks a frame, give or take the mux's rounding of
+/// 33 333 333 ns), and the audio's PES are there too. Then the same with the audio off (the
+/// control's `--audio off`): video PES only, and the checker still reads every strip.
+#[test]
+fn the_wire_probe_sees_every_frame_the_camera_sends_with_and_without_audio() {
+    use std::sync::{Arc, Mutex};
+
+    use harness::wire::{self, Stream};
+
+    common::init();
+    const FRAMES: u32 = 90;
+    for audio in [true, false] {
+        let dir = std::env::temp_dir().join(format!("harness-wire-{}-{audio}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ts = dir.join("camera.ts");
+        let mut cam =
+            CameraPipeline::start_with(&CameraSink::File(ts.clone()), 1280, 720, Pattern::Ball, audio)
+                .unwrap();
+        let seen: Arc<Mutex<Vec<wire::Scan>>> = Arc::default();
+        let s2 = Arc::clone(&seen);
+        cam.on_sent(Arc::new(move |b: &[u8]| s2.lock().unwrap().push(wire::scan(b))))
+            .unwrap();
+        for c in 1..=FRAMES {
+            cam.push(c).unwrap();
+        }
+        cam.finish(60).unwrap();
+        let scans = seen.lock().unwrap().clone();
+        let (bad, partial): (u64, usize) = scans
+            .iter()
+            .fold((0, 0), |(b, p), s| (b + s.bad_sync, p + s.partial_bytes));
+        let starts: Vec<_> = scans.iter().flat_map(|s| s.starts.clone()).collect();
+        let video: Vec<u64> = starts
+            .iter()
+            .filter(|p| p.stream == Stream::Video)
+            .map(|p| p.pts90k.expect("every video PES carries a PTS"))
+            .collect();
+        let audio_starts = starts.iter().filter(|p| p.stream == Stream::Audio).count();
+        eprintln!(
+            "wire (audio {audio}): {} buffers, {} video PES, {audio_starts} audio PES",
+            scans.len(),
+            video.len()
+        );
+        assert_eq!((bad, partial), (0, 0), "whole, well-synced packets");
+        assert_eq!(video.len(), FRAMES as usize, "one video PES per pushed frame");
+        for w in video.windows(2) {
+            assert!(
+                (2_999..=3_001).contains(&(w[1] - w[0])),
+                "video PTS step {} (90 kHz)",
+                w[1] - w[0]
+            );
+        }
+        if audio {
+            // Each push of 1 600 samples completes at most two AAC frames of 1 024, and the mux
+            // packs one or more AAC frames into each audio PES (plus the encoder's flush at EOS).
+            assert!(
+                (1..=2 * FRAMES as usize + 1).contains(&audio_starts),
+                "{audio_starts} audio PES"
+            );
+        } else {
+            assert_eq!(audio_starts, 0, "no audio track, no audio PES");
+        }
+        let s = scan_segment(&ts, "camera.ts", 0);
+        let counters: Vec<Option<u32>> = s.frames.iter().map(|f| f.counter).collect();
+        assert_eq!(
+            counters,
+            (1..=FRAMES).map(Some).collect::<Vec<_>>(),
+            "audio {audio}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
