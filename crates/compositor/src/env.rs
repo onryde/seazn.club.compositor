@@ -23,6 +23,14 @@ pub const COMPOSITOR_FAKE_START_FAIL: &str = "COMPOSITOR_FAKE_START_FAIL";
 /// which the domain acts on at the first Running tick: the in-place restart, exit 75 (C11b).
 pub const COMPOSITOR_FAKE_ZYGOTE_GONE: &str = "COMPOSITOR_FAKE_ZYGOTE_GONE";
 
+/// Owed 82, a `test-hooks` build only (C14 case 16; owner option A, 2026-10-24): a count, `N`. The
+/// live graphics adapter's next `N` retired CEF teardowns never return (`hold_next_teardowns`), so
+/// the reaper kills and counts each as leaked as it would a real stuck one. Unset, empty or `0` holds
+/// none; anything but ASCII digits is refused (78). A build without the feature has neither the key
+/// nor the hook: it ignores the variable.
+#[cfg(feature = "test-hooks")]
+pub const COMPOSITOR_TEST_HOLD_TEARDOWNS: &str = "COMPOSITOR_TEST_HOLD_TEARDOWNS";
+
 /// The four keys every run needs, in R1's order.
 pub const REQUIRED: [&str; 4] = [SESSION_ID, JOB_TOKEN, APP_URL, RELAY_DEADLINE_AT];
 
@@ -41,6 +49,15 @@ pub struct FakeKnobs {
     pub zygote_gone: bool,
 }
 
+/// The test hooks a `test-hooks` build reads (Owed 82). Empty in a build without the feature, so a
+/// release binary has nothing to arm. Read in both modes; only the live graphics adapter has them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TestHooks {
+    /// `COMPOSITOR_TEST_HOLD_TEARDOWNS`: retired CEF teardowns to hold for good (0: none).
+    #[cfg(feature = "test-hooks")]
+    pub hold_teardowns: usize,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct Env {
     pub session_id: String,
@@ -52,6 +69,7 @@ pub struct Env {
     pub deadline_ms: u64,
     pub drivers: Drivers,
     pub fake: FakeKnobs,
+    pub hooks: TestHooks,
 }
 
 // The token prints as `****` (AGENTS.md §7); a fake start-failure text may carry a planted credential.
@@ -140,5 +158,25 @@ pub fn parse(get: impl Fn(&str) -> Option<String>, release: bool) -> Result<Env,
         deadline_ms,
         drivers,
         fake,
+        hooks: test_hooks(&get)?,
     })
+}
+
+/// Owed 82: the hooks a `test-hooks` build was asked for.
+#[cfg(feature = "test-hooks")]
+fn test_hooks(get: &impl Fn(&str) -> Option<String>) -> Result<TestHooks, EnvError> {
+    let key = COMPOSITOR_TEST_HOLD_TEARDOWNS;
+    let hold_teardowns = match get(key).as_deref() {
+        None | Some("") => 0,
+        // Digits only: `usize::from_str` also takes a leading `+`.
+        Some(v) if v.bytes().all(|b| b.is_ascii_digit()) => v.parse().map_err(|_| EnvError::Invalid(key))?,
+        Some(_) => return Err(EnvError::Invalid(key)),
+    };
+    Ok(TestHooks { hold_teardowns })
+}
+
+/// A build without the feature reads no hook.
+#[cfg(not(feature = "test-hooks"))]
+fn test_hooks(_: &impl Fn(&str) -> Option<String>) -> Result<TestHooks, EnvError> {
+    Ok(TestHooks::default())
 }

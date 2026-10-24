@@ -203,3 +203,64 @@ fn now_ms_is_monotonic_across_a_wall_clock_step() {
     eprintln!("clock reads checked: {checked}");
     assert_eq!(checked, 200);
 }
+
+/// Owed 82 (owner option A, 2026-10-24), a `test-hooks` build: `COMPOSITOR_TEST_HOLD_TEARDOWNS` is a
+/// count of ASCII digits, in both modes (C14 case 16's legs set 2 and 3); unset, empty or 0 holds
+/// none; anything else is refused naming the key, never the value.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn test_hook_hold_teardowns_takes_a_count_and_refuses_anything_else() {
+    let key = env::COMPOSITOR_TEST_HOLD_TEARDOWNS;
+    let mut checked = 0;
+    for mode in ["live", "fake"] {
+        let mut m = base();
+        m.insert(env::COMPOSITOR_DRIVERS, mode.to_owned());
+        assert_eq!(parse(&m, true).unwrap().hooks.hold_teardowns, 0, "{mode}: unset");
+        checked += 1;
+        for (v, want) in [("", 0), ("0", 0), ("2", 2), ("3", 3), ("03", 3), ("12", 12)] {
+            m.insert(key, v.to_owned());
+            assert_eq!(
+                parse(&m, true).unwrap().hooks.hold_teardowns,
+                want,
+                "{mode} {v:?}"
+            );
+            checked += 1;
+        }
+        for bad in [
+            "two",
+            "-1",
+            "+2",
+            " 2",
+            "2 ",
+            "2.0",
+            "0x2",
+            "99999999999999999999999",
+        ] {
+            m.insert(key, bad.to_owned());
+            let err = parse(&m, true).expect_err(bad);
+            assert_eq!(err, EnvError::Invalid(key), "{mode} {bad:?}");
+            let text = err.to_string();
+            assert!(text.contains(key), "{text:?} does not name {key}");
+            assert!(!text.contains(bad.trim()), "{text:?} carries the value {bad:?}");
+            checked += 1;
+        }
+    }
+    eprintln!("hold-teardowns values checked: {checked}");
+    assert_eq!(checked, 2 * (1 + 6 + 8), "anti-vacuity");
+}
+
+/// Owed 82: a build without the feature does not read the key at all, so a value it would refuse
+/// parses, and nothing is armed (`TestHooks` is empty).
+#[cfg(not(feature = "test-hooks"))]
+#[test]
+fn test_hook_hold_teardowns_is_not_read_without_the_feature() {
+    let mut checked = 0;
+    for v in ["3", "two"] {
+        let mut m = base();
+        m.insert("COMPOSITOR_TEST_HOLD_TEARDOWNS", v.to_owned());
+        let e = parse(&m, true).unwrap_or_else(|err| panic!("{v:?} refused: {err}"));
+        assert_eq!(e.hooks, env::TestHooks::default(), "{v:?}");
+        checked += 1;
+    }
+    assert_eq!(checked, 2, "anti-vacuity");
+}

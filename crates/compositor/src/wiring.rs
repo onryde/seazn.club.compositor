@@ -48,7 +48,7 @@ use signal_hook::iterator::Signals;
 use testkit::fakes::{session_720p, CefKnob, FakeGraphics, FakeInput, FakeProgramme, Log, ScriptedPlane};
 
 use crate::clock::Clock;
-use crate::env::{Drivers, Env};
+use crate::env::{Drivers, Env, TestHooks};
 use crate::logged::{LoggedGraphics, LoggedPlane, LoggedProgramme, Logger};
 
 /// The inbound channel's bound (AGENTS.md §4; C08 as built, Owed 35). Every sender is bounded by it,
@@ -436,11 +436,12 @@ struct Media {
     stats: Arc<Stats>,
 }
 
-fn live_media(t: &Thresholds, tx: &Sender<Inbound>, log: &Logger) -> Media {
+fn live_media(t: &Thresholds, tx: &Sender<Inbound>, log: &Logger, hooks: &TestHooks) -> Media {
     let frames = FrameStore::default();
     // First (Owed 53): its `new` installs the process's GStreamer log handler.
     let graphics = CefGraphics::new(frames.clone(), tx.clone(), cef_fps(), t.cef_rss_cap_mb)
         .with_log(log.adapter_sink());
+    arm_test_hooks(&graphics, hooks);
     let programme = GstProgramme::new(frames.clone(), tx.clone()).with_log(log.adapter_sink());
     let stats = programme.stats();
     let slot = ProfileSlot::default();
@@ -458,6 +459,19 @@ fn live_media(t: &Thresholds, tx: &Sender<Inbound>, log: &Logger) -> Media {
         stats,
     }
 }
+
+/// Owed 82: a `test-hooks` build arms the held teardowns its environment asked for; the adapter's
+/// line saying so is C14's witness that the run carries the hook.
+#[cfg(feature = "test-hooks")]
+fn arm_test_hooks(graphics: &CefGraphics, hooks: &TestHooks) {
+    if hooks.hold_teardowns > 0 {
+        graphics.hold_next_teardowns(hooks.hold_teardowns);
+    }
+}
+
+/// A build without the feature has no hook to arm.
+#[cfg(not(feature = "test-hooks"))]
+fn arm_test_hooks(_: &CefGraphics, _: &TestHooks) {}
 
 fn fake_media(env: &Env) -> Media {
     let calls = Log::default();
@@ -493,7 +507,7 @@ pub fn run(env: &Env, clock: &Arc<Clock>, log: &Logger, signals: Signals) -> i32
     };
     let (phase, origin) = phase_endpoint(env, log);
     let media = match env.drivers {
-        Drivers::Live => live_media(&t, &tx, log),
+        Drivers::Live => live_media(&t, &tx, log, &env.hooks),
         Drivers::Fake => fake_media(env),
     };
     let control = control_worker::spawn(Box::new(LoggedPlane::new(plane, log.clone())), tx.clone());
