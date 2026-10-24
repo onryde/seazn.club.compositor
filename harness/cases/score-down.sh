@@ -10,7 +10,7 @@
 # answer on air (no overlay-less frame), changes again after the recovery, and never regresses.
 
 CASE_LIVE_S=100
-CASE_KEY=stale_beat_ms
+CASE_KEY=stale_beat
 SCORE_DOWN_MS=60000
 
 case_drive() {

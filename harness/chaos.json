@@ -1,0 +1,24 @@
+{
+  "about": "The chaos suite's legs (C14 brief, amended 2026-10-20): each harness/cases/<case>.sh, variant and repeat is one leg of chaos.yml. The restart cases run 3 times and run-chaos.sh prints the worst outage. n is the brief's case number.",
+  "legs": [
+    {"n": 1, "case": "camera-stop", "runs": 1},
+    {"n": 2, "case": "camera-flap", "runs": 1},
+    {"n": 3, "case": "reader-kicked", "runs": 1},
+    {"n": 4, "case": "dest-disconnect", "runs": 1},
+    {"n": 5, "case": "dest-stall", "runs": 1},
+    {"n": 6, "case": "cpu-starved", "runs": 1},
+    {"n": 7, "case": "score-down", "runs": 1},
+    {"n": 8, "case": "cef-killed", "runs": 3},
+    {"n": 9, "case": "process-killed", "runs": 3},
+    {"n": 10, "case": "input-impaired", "runs": 1},
+    {"n": 11, "case": "cef-hung", "runs": 1},
+    {"n": 12, "case": "dest-trickle", "runs": 1},
+    {"n": 13, "case": "cef-gpu-zygote-killed", "runs": 3},
+    {"n": 14, "case": "cef-renderer-zygote-killed", "runs": 3},
+    {"n": 15, "case": "cef-gpu-deaths", "variant": "threshold", "runs": 3},
+    {"n": 15, "case": "cef-gpu-deaths", "variant": "one-fewer", "runs": 1},
+    {"n": 15, "case": "cef-gpu-deaths", "variant": "fast", "runs": 3},
+    {"n": 16, "case": "cef-leaks", "variant": "three", "runs": 1},
+    {"n": 16, "case": "cef-leaks", "variant": "two", "runs": 1}
+  ]
+}

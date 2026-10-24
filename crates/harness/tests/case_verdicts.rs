@@ -574,6 +574,15 @@ fn assert_pass(v: &Verdict, tag: &str) {
     assert_eq!(v.json["checks_run"].as_u64(), Some(declared as u64), "{tag}");
     assert_eq!(pass + other, declared, "{tag}: every check prints one line");
     assert!(pass >= 1, "{tag}: nothing judged");
+    // run-chaos.sh's table shows the case's key: a check or measure the verdict recorded.
+    let key = v.json["key"].as_str().unwrap_or("");
+    assert!(
+        !key.is_empty() && v.json["measures"].get(key).is_some(),
+        "{tag}: the key '{key}' is not among the measures {:?}",
+        v.json["measures"]
+            .as_object()
+            .map(|m| m.keys().collect::<Vec<_>>())
+    );
 }
 
 /// A red run: a fail with `check` named, and the verdict still ran every check it declares.
