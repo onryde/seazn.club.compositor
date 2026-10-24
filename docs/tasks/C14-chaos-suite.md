@@ -306,6 +306,60 @@ control check that proves the stack ran:
 | 6 | `restart_cause` returns nothing for a zygote, in a scratch relay build | `cef-gpu-zygote-killed` | `FAIL died_in_place` |
 | 7 | `cef_gpu_deaths_to_restart` 6, in a scratch relay build | `cef-gpu-deaths threshold` | `FAIL died_in_place` |
 
+## Amendment 2026-10-24, fix round 1 (the PR #52 review; chaos run 40045826841)
+
+The review (NEEDS FIXES) read the first CI run: 7 PASS, 2 NOT RUNNABLE, 18 FAIL, 4 hung. This
+section supersedes the lines of "Amendment 2026-10-24" it names. The rows are in `docs/_INDEX.md`
+(decision "C14 fix round 1", false premises dated "C14 fix round 1", Owed 79, 82, 83 and 84) and
+`_FINDINGS.md` F-023.
+
+**What changed:**
+- **Kills (C1).** `harness/in-container.sh` reads a process's `--type=` by the product's rule
+  (`split_cmdline` in `crates/adapters/src/cef_graphics.rs`, mirrored): a NUL-only split found no
+  CEF child, because Chromium's renamed children hold one space-joined string. Every kill prints
+  its targets before it kills (`kill` mark) and its status after (`kill_rc`). A kill with no target
+  fails the leg. `crates/harness/tests/in_container.rs` runs the script on a fake /proc of real
+  space-joined CEF 139 command lines.
+- **Case 5 (I1).** The witness is the netem qdisc's backlog (`netem.sh stats`: `backlog_bytes`,
+  `backlog_pkts`), not its Sent count.
+- **Case 12 (I2).** The witness is the qdisc's sent packets (at least 2) and the swap. The beats'
+  "2 distinct egressBytes" is withdrawn: a correct swap ends that window after one or two beats.
+- **Case 6 (I3).** Replaces deviation 5. The burn runs inside the compositor's container
+  (`in-container.sh burn`, 4 workers per CPU of its quota), so it shares the compositor's cgroup.
+  `ladder_moved` requires a beat at `overlay_half_rate` and droppedFrames up by at least
+  `ladder_overruns_to_step`; a burn that moves nothing is a FAIL. The harness image is unchanged.
+- **Cases 5 and 12 (I4).** `stall_swap` times the swap from the log's `sink swap` line against the
+  last beat whose egressBytes grew, within `output_stall_after_ms + output_progress_poll_ms`. A
+  doubled threshold reds, except in about 1 run in 20 by phase.
+- **Budgets (I4, m7).** Each `BUDGET_*` is pinned to the sentence its source states (spec §6, or
+  this brief), so a budget edited and regenerated reds `cargo test` (Owed 83).
+- **Cases 1 and 2 (I5).** fake-camera sends a key frame at every resume, so `suppressed_ms` no
+  longer counts a decoder's wait for the next key. Case 2 pauses
+  `(slate_after_ms + input_stall_after_ms) / 2` (4 000 ms), one flap every 10 s. Its floor is
+  `resume_after_ms − BUDGET_FRAME_TO_ENCODER_MS`: the hold-off starts at the first frame's arrival,
+  and the frame shown at the switch is up to that much older.
+- **NOT RUNNABLE (I6, the coordinator's ruling).** Replaces "It reports NOT RUNNABLE and never counts
+  it red". A NOT RUNNABLE leg fails in `chaos.yml`. The table ends with a wave gate 3 line, and with
+  case 16 unrun it reads `WAVE GATE 3: BLOCKED: 2 NOT RUNNABLE (...; Owed 82, the owner's ruling)`
+  and exits 1. The false-positive sweep must run on every leg that calls it, not on any one.
+- **Case 15 (I8).** `gpu-loop` has a deadline: the drive's end less
+  BUDGET_PROCESS_RESTART_OUTPUT_MS. A loop that reaches it fails `kill_loop_in_time`.
+- **Cases 4 and 12 (I9).** The two extra outages are product behaviour plus MediaMTX's recorder:
+  a sink that connects after the clear sends its backlog, and the recorder discards it (F-023).
+  The verdicts are not loosened. Owed 84 is for the owner.
+- **Case 11.** Replaces deviation 6. The detect bound is the brief's again (`cef_hang_after_ms` +
+  one frame period): CI read the strip 6 ms behind the log.
+
+**Wave gate 3** cannot count a run while case 16 is NOT RUNNABLE (Owed 82), nor while cases 4 and
+12 are red (Owed 84).
+
+**Mutants**, two added to the table above:
+
+| # | Mutant | Case | Required |
+|---|---|---|---|
+| 8 | `in-container.sh` splits each command-line field on NUL only (CI's first build, C1) | `cef-killed` | `FAIL kill_applied` |
+| 9 | `output_stall_after_ms` 10 000 in a scratch relay build; the verdict reads the committed thresholds.json (I4) | `dest-stall` | `FAIL stall_swap` |
+
 ## Files
 
 - Create: `harness/cases/{camera-stop,camera-flap,reader-kicked,dest-disconnect,dest-stall,cpu-starved,score-down,cef-killed,process-killed,input-impaired}.{sh,jq}` (amended 2026-10-24: all 16, cases 11–16 too, as `.sh` files with `require` lines over `harness/cases/lib.jq`; and `harness/chaos.json`, the legs)
