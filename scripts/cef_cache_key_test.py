@@ -114,7 +114,8 @@ def step_with(text, name):
 FULL_IMAGE_STEPS = [
     "actions/checkout@v4", "Free disk space", "gstcefsrc pin (F-001)", "docker/setup-buildx-action@v3",
     "Log in to GHCR (read)", "Build cache (GHCR, read)", "Build the image", "Build the cef-test stage",
-    "Plugin check", "Runs as non-root, with no CEF log override", "C11's graphics tests beside cefsrc",
+    "Plugin check", "Runs as non-root, with no CEF log override",
+    "In-place restart probe (Owed 85, CEF ready after 75, 133 and 137)", "C11's graphics tests beside cefsrc",
     "Smoke budget", "60 s fake smoke", "Exit 75 smoke (C11b, a dead CEF zygote)",
     "Live-mode probe (no core, TMPDIR, 32 live exits)", "Image size", "Logs",
 ]
