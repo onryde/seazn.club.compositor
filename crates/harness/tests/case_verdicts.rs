@@ -101,6 +101,8 @@ struct World {
     log: Vec<(i64, String)>,
     /// When the CEF child poll counted a GPU-process death (the `cef health` lines' count).
     gpu_deaths: Vec<i64>,
+    /// When a teardown was counted leaked (the `cef health` lines' `leaked_teardowns`, case 16).
+    leaks: Vec<i64>,
     /// docker events of the compositor's container: (at, action, exit code).
     events: Vec<(i64, &'static str, Option<i64>)>,
     marks: Vec<(String, i64, Value)>,
@@ -150,6 +152,7 @@ impl World {
             beats: vec![],
             log: vec![],
             gpu_deaths: vec![],
+            leaks: vec![],
             events: vec![(live - 9_000, "start", None)],
             marks: vec![],
             control_state: json!({"session_fetches": 1, "other_session_requests": 0,
@@ -434,9 +437,10 @@ impl World {
             let mut at = s + 1_000;
             while at < die - 200 {
                 let deaths = self.gpu_deaths.iter().filter(|&&d| d >= s && d <= at).count();
+                let leaked = self.leaks.iter().filter(|&&d| d >= s && d <= at).count();
                 lines.push((
                     at,
-                    format!("cef health zygote_gone=- leaked_teardowns=0 gpu_process_deaths={deaths}"),
+                    format!("cef health zygote_gone=- leaked_teardowns={leaked} gpu_process_deaths={deaths}"),
                 ));
                 at += hb;
             }
@@ -2696,21 +2700,682 @@ fn cef_gpu_deaths_reds_when_the_kill_loop_reaches_its_deadline() {
 }
 
 /// The review's I6: NOT RUNNABLE is never a pass. run-case.sh exits 3 (non-success), chaos.yml's leg
-/// fails on it, and run-chaos.sh's table holds wave gate 3 blocked (chaos_table.rs).
+/// fails on it, and run-chaos.sh's table holds wave gate 3 blocked (chaos_table.rs). No case is NOT
+/// RUNNABLE since case 16 was wired (Owed 82's hook), so the mechanism is probed on a copy of the
+/// harness with a case of its own, and every real case file is checked to declare no reason.
 #[test]
-fn cef_leaks_is_reported_not_runnable_never_faked_and_never_a_pass() {
-    for variant in ["three", "two"] {
-        let tag = format!("leaks-{variant}");
-        let v = judge(&World::new(60), "cef-leaks", variant, &tag);
-        eprintln!("{tag}: {}", v.json);
-        assert_eq!(v.status, "not_runnable", "{tag}");
-        assert_eq!(v.exit, Some(3), "{tag}: NOT RUNNABLE exits non-success");
-        assert_eq!(v.json["checks_run"], 0, "{tag}");
-        assert!(v.json["not_runnable_reason"]
-            .as_str()
-            .is_some_and(|r| r.contains("hold_teardowns")));
-        assert!(v.lines.iter().any(|l| l.starts_with("NOT RUNNABLE ")), "{tag}");
+fn a_not_runnable_case_is_reported_never_faked_and_never_a_pass() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("not-runnable-probe");
+    let _ = std::fs::remove_dir_all(&root);
+    let h = root.join("harness");
+    std::fs::create_dir_all(h.join("cases")).unwrap();
+    for f in ["run-case.sh", "thresholds.json", "cases/lib.jq"] {
+        std::fs::copy(repo().join("harness").join(f), h.join(f)).unwrap();
     }
+    // run-case.sh reads the page token at load, to scan for it.
+    let fixture = "contracts/fixtures/relay-job.v1/session-composed-720p.json";
+    std::fs::create_dir_all(root.join(fixture).parent().unwrap()).unwrap();
+    std::fs::copy(repo().join(fixture), root.join(fixture)).unwrap();
+    let reason = "a probe case that cannot run (case_verdicts.rs)";
+    std::fs::write(
+        h.join("cases/probe-not-runnable.sh"),
+        format!(
+            "# shellcheck shell=bash\nCASE_NOT_RUNNABLE=\"{reason}\"\ncase_drive() {{ :; }}\nCASE_CHECKS=1\n\
+             case_verdict() {{ require never '.x'; }}\n"
+        ),
+    )
+    .unwrap();
+    let out_root = root.join("out");
+    let out = Command::new(bash())
+        .arg(h.join("run-case.sh"))
+        .arg("probe-not-runnable")
+        .current_dir(&root)
+        .env("CASE_REJUDGE", "1")
+        .env("CASE_OUT_ROOT", &out_root)
+        .env_remove("CASE_RUN")
+        .output()
+        .expect("run-case.sh runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    eprintln!("{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    let v: Value = serde_json::from_str(
+        &std::fs::read_to_string(out_root.join("probe-not-runnable/verdict.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(v["status"], "not_runnable", "{v}");
+    assert_eq!(out.status.code(), Some(3), "NOT RUNNABLE exits non-success");
+    assert_eq!(v["checks_run"], 0, "{v}");
+    assert_eq!(v["not_runnable_reason"], reason, "{v}");
+    assert!(stdout.lines().any(|l| l.starts_with("NOT RUNNABLE ")));
+    // Every real case runs: none declares a reason (a case file that sets one is reported, never
+    // run, so this would hide it from every verdict here).
+    let mut cases = 0;
+    for e in std::fs::read_dir(repo().join("harness/cases")).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_some_and(|x| x == "sh") {
+            let text = std::fs::read_to_string(&p).unwrap();
+            assert!(
+                !text.contains("CASE_NOT_RUNNABLE="),
+                "{} declares itself NOT RUNNABLE",
+                p.display()
+            );
+            cases += 1;
+        }
+    }
+    eprintln!("case files with no NOT RUNNABLE reason: {cases}");
+    assert!(cases >= 17, "the sweep read too few case files ({cases})");
+}
+
+/// Owed 82's arming line, before a process's `compositor started` (boot()'s, at +200).
+fn arm(w: &mut World, start: i64, n: u64) {
+    w.line(
+        start + 150,
+        format!("WARN test hook (Owed 82): the next {n} CEF teardowns never return"),
+    );
+}
+
+const LEAK_ORIGIN: &str = "http://fake-control:7000";
+
+/// Case 16's world (the C14 brief's amendment "Owed 82's handoff"): a compositor armed to hold
+/// `hold` teardowns, and from 20 s each current build's renderer killed once that build's `cef
+/// ready` is in, `hold` kills. Each kill is a CEF crash, and its page's reload logs a stale `cef
+/// ready gen=<old>`. Before the cef_fail_count-th crash the next build loads after the back-off
+/// (the base, doubling, at most the cap) and the old one is retired; the cef_fail_count-th fails
+/// graphics, and its stop is the retirement. Each retired build's teardown is held, the reaper kills
+/// its reloaded renderer REAPER_KILL_AFTER_MS after the retirement (whose page reloads again: one
+/// more stale ready), and it is counted leaked TEARDOWN_LEAK_AFTER_MS after the kill. At
+/// cef_leaks_to_restart leaked the compositor restarts in place, and the restarted process arms
+/// `hold` again. The renderers' pids and client ids are the simulation's: the current build's id
+/// the highest, as the product's attribution says.
+fn leaks(hold: u64) -> World {
+    let n_restart = World::new(1).ms("cef_leaks_to_restart") as u64;
+    let restarts = hold >= n_restart;
+    let mut w = World::new(if restarts { 80 } else { 60 });
+    let reaper = w.ms("reaper_kill_after_ms");
+    let leak = w.ms("teardown_leak_after_ms");
+    let base = w.ms("cef_backoff_base_ms");
+    let cap = w.ms("cef_backoff_cap_ms");
+    let fail = w.ms("cef_fail_count") as usize;
+    let boot = w.live - 9_000;
+    arm(&mut w, boot, hold);
+    w.line(boot + 1_000, format!("gen=1: loading {LEAK_ORIGIN}"));
+    let (mut load, mut ready) = (boot + 1_000, boot + 1_500);
+    let mut deciding = None;
+    let mut failed_from = None;
+    for i in 0..hold as usize {
+        let gen = i as u64 + 1;
+        let k = w.at(20.0).max(ready + 300);
+        w.mark("ready", ready, json!({"gen": gen, "loading_ms": load}));
+        let renderers: Vec<Value> = (1..=gen)
+            .map(|j| json!({"pid": 400 + j, "client_id": 6 + j}))
+            .collect();
+        w.mark(
+            "kill",
+            k,
+            json!({"at_ms": k, "pid": 400 + gen, "client_id": 6 + gen, "renderers": renderers}),
+        );
+        w.mark("kill_rc", k + 5, json!({"rc_at_ms": k + 5, "rc": 0}));
+        w.line(k + 200, format!("cef crashed gen={gen}"));
+        w.line(k + 1_500, format!("cef ready gen={gen}"));
+        let retire = if i + 1 < fail {
+            let next = gen + 1;
+            let r = k + 200 + (base << i).min(cap);
+            w.line(r, format!("graphics restart gen={next}"));
+            load = r + 10;
+            ready = load + 2_000;
+            w.line(load, format!("gen={next}: loading {LEAK_ORIGIN}"));
+            w.line(ready, format!("cef ready gen={next}"));
+            w.overlay_none.push((k + 200, ready + 100));
+            r
+        } else {
+            w.line(k + 250, format!("overlay hidden reason=failed gen={gen}"));
+            w.line(k + 255, "graphics stop");
+            failed_from = Some(k + 200);
+            k + 255
+        };
+        let left = hold - 1 - i as u64;
+        w.line(
+            retire + 12,
+            format!(
+                "WARN test hook (Owed 82) gen={gen}: this CEF teardown never returns ({left} more to hold)"
+            ),
+        );
+        let pid = 600 + gen;
+        let kill = retire + reaper;
+        w.line(
+            kill,
+            format!(
+                "WARN gen={gen}: teardown has not returned after {reaper} ms; SIGKILL sent to renderer pids [{pid}] (of [{pid}])"
+            ),
+        );
+        w.line(kill + 800, format!("cef ready gen={gen}"));
+        let at = kill + leak;
+        w.leaks.push(at);
+        let n = w.leaks.len();
+        w.line(
+            at,
+            format!(
+                "WARN gen={gen}: teardown still has not returned {leak} ms after the kill: its thread, pipeline and renderer stay until the process restarts ({n} leaked; Owed 55)"
+            ),
+        );
+        w.line(
+            at + 5,
+            format!("cef health zygote_gone=- leaked_teardowns={n} gpu_process_deaths=0"),
+        );
+        if n as u64 == n_restart {
+            deciding = Some(at + 5);
+        }
+    }
+    w.mark(
+        "drive_done",
+        w.at(20.0) + 30_000,
+        json!({"kills": hold, "stopped": "none"}),
+    );
+    if restarts {
+        let d = deciding.expect("the leak count reached the restart");
+        let detail = format!("restart in place: {n_restart} CEF teardowns leaked");
+        let start = w.restart(d + 600, 75, Some(&detail));
+        if let Some(f) = failed_from {
+            w.overlay_none.push((f, d + 600));
+        }
+        arm(&mut w, start, hold);
+        w.line(start + 1_000, format!("gen=1: loading {LEAK_ORIGIN}"));
+    } else {
+        // The CEF children's CPU, twice (cef_cpu: printed, never judged).
+        for (s, r, g) in [(40.0, 9_000, 1_000), (55.0, 12_000, 1_600)] {
+            let at = w.at(s);
+            w.mark(
+                "cef_cpu",
+                at,
+                json!({"sample_ms": at, "children": [
+                    {"pid": 30, "type": "gpu-process", "client_id": null, "cpu_ms": g},
+                    {"pid": 403, "type": "renderer", "client_id": 9, "cpu_ms": r}]}),
+            );
+        }
+    }
+    w
+}
+
+/// The world's log line that starts with `prefix`, changed by `f` (None: removed).
+fn edit_line(w: &mut World, prefix: &str, f: impl Fn(&str) -> Option<String>) {
+    let i = w
+        .log
+        .iter()
+        .position(|(_, m)| m.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no log line starts with {prefix:?}"));
+    match f(&w.log[i].1) {
+        Some(m) => w.log[i].1 = m,
+        None => {
+            w.log.remove(i);
+        }
+    }
+}
+
+fn kill_marks(w: &mut World) -> impl Iterator<Item = &mut (String, i64, Value)> {
+    w.marks.iter_mut().filter(|m| m.0 == "kill")
+}
+
+#[test]
+fn cef_leaks_two_carries_its_leaks_on_air_and_reds_without_the_hold_or_its_witnesses() {
+    let n = World::new(1).ms("cef_leaks_to_restart") as u64;
+    let hold = n - 1;
+    let v = judge(&leaks(hold), "cef-leaks", "two", "leaks2-good");
+    assert_pass(&v, "leaks2-good");
+    let r = &v.json["measures"]["retirements"];
+    let gens: Vec<u64> = (1..=hold).collect();
+    assert_eq!(
+        (&r["held"], &r["kills"], &r["want"]),
+        (&json!(hold), &json!(hold), &json!(hold)),
+        "leaks2-good: {r}"
+    );
+    assert_eq!(
+        (&r["held_gens"], &r["killed_gens"]),
+        (&json!(gens), &json!(gens)),
+        "{r}"
+    );
+    // The CPU measure, from the sim's two samples 15 s apart: (12 000 - 9 000) / 15 and
+    // (1 600 - 1 000) / 15 ms per s.
+    let cpu = &v.json["measures"]["cef_cpu"];
+    assert_eq!(cpu["samples"], 2, "{cpu}");
+    assert_eq!(cpu["interval_ms"], 15_000, "{cpu}");
+    assert_eq!(
+        cpu["ms_per_s"],
+        json!([{"type": "gpu-process", "client_id": null, "ms_per_s": 40},
+            {"type": "renderer", "client_id": 9, "ms_per_s": 200}]),
+        "{cpu}"
+    );
+    // A retirement no kill made (a load timeout: count retirements, not kills): the second build's
+    // teardown is held with no kill of it, and the leg passes.
+    let one_kill = |w: &mut World| {
+        let last = w
+            .marks
+            .iter()
+            .filter(|m| m.0 == "kill")
+            .map(|m| m.1)
+            .max()
+            .unwrap();
+        w.marks
+            .retain(|m| !((m.0 == "kill" || m.0 == "kill_rc" || m.0 == "ready") && m.1 >= last - 300));
+    };
+    let mut w = leaks(hold);
+    one_kill(&mut w);
+    let v = judge(&w, "cef-leaks", "two", "leaks2-load-timeout");
+    assert_pass(&v, "leaks2-load-timeout");
+    let r = &v.json["measures"]["retirements"];
+    assert_eq!((&r["held"], &r["kills"]), (&json!(hold), &json!(hold - 1)), "{r}");
+    let mut checked = 0;
+    let mut red = |w: World, checks: &[&str], tag: &str| {
+        let v = judge(&w, "cef-leaks", "two", tag);
+        for c in checks {
+            assert_fails(&v, c, tag);
+        }
+        checked += 1;
+    };
+    // The plain relay image: no arming, so nothing is held, reaped or leaked, and the leg would
+    // read "0 leaked" (mutant a's world): every retirement witness reds, none vacuously passes.
+    let mut w = leaks(hold);
+    w.log.retain(|(_, m)| !m.starts_with("WARN "));
+    w.leaks.clear();
+    w.log
+        .retain(|(_, m)| !m.starts_with("cef health ") || m.contains("leaked_teardowns=0"));
+    red(
+        w,
+        &[
+            "armed",
+            "held_n",
+            "reaper_killed",
+            "leaks_counted",
+            "leaked_logged",
+        ],
+        "leaks2-plain-image",
+    );
+    // No process boot read at all (an empty or unstamped log): no arming is no pass.
+    let mut w = leaks(hold);
+    w.log
+        .retain(|(_, m)| !m.starts_with("compositor started") && !m.contains("(Owed 82): the next"));
+    red(w, &["armed"], "leaks2-no-boot");
+    let mut w = leaks(hold);
+    edit_line(&mut w, "WARN test hook (Owed 82): the next", |m| {
+        Some(m.replace(&format!("next {hold} "), &format!("next {} ", hold + 1)))
+    });
+    red(w, &["armed"], "leaks2-armed-other-n");
+    let mut w = leaks(hold);
+    let i = w
+        .log
+        .iter()
+        .position(|(_, m)| m.contains("(Owed 82): the next"))
+        .unwrap();
+    w.log[i].0 += 100;
+    red(w, &["armed"], "leaks2-armed-after-boot");
+    // The kill hit a held build's renderer, not the current one; failed; came before the current
+    // build's ready; or never ran.
+    let mut w = leaks(hold);
+    if let Some(k) = kill_marks(&mut w).last() {
+        k.2["client_id"] = json!(7);
+        k.2["pid"] = json!(401);
+    }
+    red(w, &["killed_one_current"], "leaks2-kill-old");
+    let mut w = leaks(hold);
+    if let Some(rc) = w.marks.iter_mut().find(|m| m.0 == "kill_rc") {
+        rc.2["rc"] = json!(1);
+    }
+    red(w, &["killed_one_current"], "leaks2-kill-rc");
+    let mut w = leaks(hold);
+    let i = w.log.iter().position(|(_, m)| m == "cef ready gen=2").unwrap();
+    w.log[i].0 += 60_000;
+    red(w, &["killed_one_current"], "leaks2-kill-before-ready");
+    let mut w = leaks(hold);
+    w.marks.retain(|m| m.0 != "kill" && m.0 != "kill_rc");
+    red(w, &["killed_one_current"], "leaks2-no-kill");
+    // A kill past N (the drive ran on), and a kill whose status never printed.
+    let mut w = leaks(hold);
+    let next_ready = format!("cef ready gen={}", hold + 1);
+    let ready = w.log.iter().find(|(_, m)| *m == next_ready).map(|l| l.0).unwrap();
+    let k = ready + 300;
+    let renderers: Vec<Value> = (1..=hold + 1)
+        .map(|j| json!({"pid": 400 + j, "client_id": 6 + j}))
+        .collect();
+    w.mark(
+        "kill",
+        k,
+        json!({"at_ms": k, "pid": 401 + hold, "client_id": 7 + hold, "renderers": renderers}),
+    );
+    w.mark("kill_rc", k + 5, json!({"rc_at_ms": k + 5, "rc": 0}));
+    red(w, &["killed_one_current"], "leaks2-kill-past-n");
+    let mut w = leaks(hold);
+    let last = w
+        .marks
+        .iter()
+        .filter(|m| m.0 == "kill_rc")
+        .map(|m| m.1)
+        .max()
+        .unwrap();
+    w.marks.retain(|m| !(m.0 == "kill_rc" && m.1 == last));
+    red(w, &["killed_one_current"], "leaks2-kill-no-rc");
+    // One retirement short; the count not counting down; one held past the budget.
+    let mut w = leaks(hold);
+    edit_line(&mut w, "WARN test hook (Owed 82) gen=2", |_| None);
+    red(w, &["held_n"], "leaks2-held-short");
+    let mut w = leaks(hold);
+    edit_line(&mut w, "WARN test hook (Owed 82) gen=2", |m| {
+        Some(m.replace("(0 more", "(1 more"))
+    });
+    red(w, &["held_n"], "leaks2-held-lefts");
+    let mut w = leaks(hold);
+    let at = w.at(45.0);
+    w.line(
+        at,
+        "WARN test hook (Owed 82) gen=3: this CEF teardown never returns (0 more to hold)",
+    );
+    red(w, &["held_n"], "leaks2-held-past-budget");
+    // Two held lines of one gen (one kill, the other retirement a load timeout's), and a killed
+    // build whose teardown was never held (another gen's was).
+    let mut w = leaks(hold);
+    one_kill(&mut w);
+    edit_line(&mut w, "WARN test hook (Owed 82) gen=2", |m| {
+        Some(m.replace("gen=2:", "gen=1:"))
+    });
+    red(w, &["held_n"], "leaks2-held-same-gen");
+    let mut w = leaks(hold);
+    edit_line(&mut w, "WARN test hook (Owed 82) gen=2", |m| {
+        Some(m.replace("gen=2:", "gen=9:"))
+    });
+    red(w, &["held_n"], "leaks2-held-other-gen");
+    // Mutant 8's signature (the hold after set_state(NULL): no renderer to kill), no reaper line,
+    // and a reaper on another wait than the adapters' constant.
+    let mut w = leaks(hold);
+    edit_line(&mut w, "WARN gen=2: teardown has not returned", |m| {
+        Some(m.replace("pids [602] (of [602])", "pids [] (of [])"))
+    });
+    red(w, &["reaper_killed"], "leaks2-reaper-none");
+    let mut w = leaks(hold);
+    edit_line(&mut w, "WARN gen=1: teardown has not returned", |_| None);
+    red(w, &["reaper_killed", "leaks_counted"], "leaks2-reaper-missing");
+    let reaper = w_ms("reaper_kill_after_ms");
+    let mut w = leaks(hold);
+    edit_line(&mut w, "WARN gen=1: teardown has not returned", |m| {
+        Some(m.replace(&format!("after {reaper} ms"), &format!("after {} ms", reaper - 1)))
+    });
+    red(w, &["reaper_killed"], "leaks2-reaper-ms");
+    // A leak never counted, or counted after the session's end (no room left).
+    let mut w = leaks(hold);
+    edit_line(&mut w, "WARN gen=2: teardown still has not returned", |_| None);
+    red(w, &["leaks_counted"], "leaks2-leak-missing");
+    let mut w = leaks(hold);
+    let end = w.end;
+    let i = w
+        .log
+        .iter()
+        .position(|(_, m)| m.starts_with("WARN gen=2: teardown still"))
+        .unwrap();
+    w.log[i].0 = end + 500;
+    red(w, &["leaks_counted"], "leaks2-leak-late");
+    // The count not 1..N, a leak of another gen, and a leak logged before its reaper's kill.
+    let mut w = leaks(hold);
+    edit_line(&mut w, "WARN gen=2: teardown still has not returned", |m| {
+        Some(m.replace("(2 leaked;", "(1 leaked;"))
+    });
+    red(w, &["leaks_counted"], "leaks2-leak-count");
+    let mut w = leaks(hold);
+    edit_line(&mut w, "WARN gen=2: teardown still has not returned", |m| {
+        Some(m.replace("WARN gen=2:", "WARN gen=9:"))
+    });
+    red(w, &["leaks_counted"], "leaks2-leak-other-gen");
+    // The leak counted for a build that was reaped but never held (a teardown not the hook's).
+    let mut w = leaks(hold);
+    let leak_at = w
+        .log
+        .iter()
+        .find(|(_, m)| m.starts_with("WARN gen=2: teardown still"))
+        .unwrap()
+        .0;
+    let reaper = w.ms("reaper_kill_after_ms");
+    w.line(
+        leak_at - 100,
+        format!(
+            "WARN gen=3: teardown has not returned after {reaper} ms; SIGKILL sent to renderer pids [603] (of [603])"
+        ),
+    );
+    edit_line(&mut w, "WARN gen=2: teardown still has not returned", |m| {
+        Some(m.replace("WARN gen=2:", "WARN gen=3:"))
+    });
+    red(w, &["leaks_counted"], "leaks2-leak-unheld-gen");
+    let mut w = leaks(hold);
+    let leak_at = w
+        .log
+        .iter()
+        .find(|(_, m)| m.starts_with("WARN gen=2: teardown still"))
+        .unwrap()
+        .0;
+    let i = w
+        .log
+        .iter()
+        .position(|(_, m)| m.starts_with("WARN gen=2: teardown has not"))
+        .unwrap();
+    w.log[i].0 = leak_at + 100;
+    red(w, &["leaks_counted"], "leaks2-leak-before-reaper");
+    // Owner ruling 4A: two leaked is carried, never restarted (mutant c's ruling, simulated).
+    let mut w = leaks(hold);
+    let at = w.at(45.0);
+    w.restart(
+        at,
+        75,
+        Some(&format!("restart in place: {hold} CEF teardowns leaked")),
+    );
+    red(w, &["restart_as_ruled"], "leaks2-restarted");
+    // The count logged short of the hold at the end.
+    let mut w = leaks(hold);
+    w.leaks.pop();
+    w.log
+        .retain(|(_, m)| !m.contains(&format!("leaked_teardowns={hold} ")));
+    red(w, &["leaked_logged"], "leaks2-logged-short");
+    // The last health line names a zygote gone, or a GPU death, beside the leaks.
+    for (tag, line) in [
+        (
+            "leaks2-health-zygote",
+            format!("cef health zygote_gone=1 leaked_teardowns={hold} gpu_process_deaths=0"),
+        ),
+        (
+            "leaks2-health-gpu",
+            format!("cef health zygote_gone=- leaked_teardowns={hold} gpu_process_deaths=1"),
+        ),
+    ] {
+        let mut w = leaks(hold);
+        let at = w.end - 50;
+        w.line(at, line);
+        red(w, &["leaked_logged"], tag);
+    }
+    // The overlay off air after the last kill, graphics given up, or the output lost.
+    let mut w = leaks(hold);
+    let last = w
+        .marks
+        .iter()
+        .filter(|m| m.0 == "kill")
+        .map(|m| m.1)
+        .max()
+        .unwrap();
+    w.overlay_none.push((last, w.end + 60_000));
+    red(w, &["overlay_on_air"], "leaks2-overlay-off");
+    // The newest build ready, then its page holding one frame (a stale score on air).
+    let mut w = leaks(hold);
+    let ready = w.log.iter().find(|(_, m)| *m == next_ready).map(|l| l.0).unwrap();
+    w.overlay_hold.push((ready + 200, w.end + 60_000));
+    red(w, &["overlay_on_air"], "leaks2-overlay-held");
+    let mut w = leaks(hold);
+    let at = w.at(50.0);
+    w.line(at, format!("overlay hidden reason=failed gen={}", hold + 1));
+    red(w, &["overlay_on_air"], "leaks2-graphics-failed");
+    let mut w = leaks(hold);
+    let at = w.at(48.0);
+    w.outages.push((at, at + 2_000));
+    red(w, &["on_air_to_end"], "leaks2-outage");
+    eprintln!("two's reds checked: {checked}");
+    assert_eq!(checked, 32);
+}
+
+/// thresholds.json's value for `key`.
+fn w_ms(key: &str) -> i64 {
+    World::new(1).ms(key)
+}
+
+#[test]
+fn cef_leaks_three_restarts_in_place_at_the_third_leak_and_reds_without_it() {
+    let n = w_ms("cef_leaks_to_restart") as u64;
+    let v = judge(&leaks(n), "cef-leaks", "three", "leaks3-good");
+    assert_pass(&v, "leaks3-good");
+    assert_eq!(v.json["measures"]["retirements"]["held"], json!(n), "{}", v.json);
+    // A shown value past run-case.sh's 300-character cut says so, with its length; verdict.json
+    // keeps it whole (the PR #65 confirm pass's n-3). Three kills' list is past it.
+    let whole = v.json["measures"]["killed_one_current"].to_string();
+    assert_eq!(
+        v.json["measures"]["killed_one_current"]["kills"]
+            .as_array()
+            .map(Vec::len),
+        Some(n as usize)
+    );
+    let line = v
+        .lines
+        .iter()
+        .find(|l| l.starts_with("PASS killed_one_current: "))
+        .unwrap();
+    let marker = format!(
+        " [cut at 300 of {} characters; verdict.json's measures has it whole]",
+        whole.len()
+    );
+    assert!(
+        whole.len() > 300 && line.ends_with(&marker),
+        "{line}\nwant the marker {marker:?}"
+    );
+    let short = v.lines.iter().find(|l| l.starts_with("PASS held_n: ")).unwrap();
+    assert!(
+        !short.contains("[cut at 300"),
+        "a value under the cut is printed whole: {short}"
+    );
+    // The restarted process is armed again and its session-end stop is held, reaped and leaked in
+    // the drain: never this case's (the first process's window).
+    let mut w = leaks(n);
+    let (end, reaper, leak) = (
+        w.end,
+        w.ms("reaper_kill_after_ms"),
+        w.ms("teardown_leak_after_ms"),
+    );
+    w.line(
+        end + 300,
+        format!(
+            "WARN test hook (Owed 82) gen=1: this CEF teardown never returns ({} more to hold)",
+            n - 1
+        ),
+    );
+    w.line(
+        end + 300 + reaper,
+        format!(
+            "WARN gen=1: teardown has not returned after {reaper} ms; SIGKILL sent to renderer pids [] (of [])"
+        ),
+    );
+    w.line(
+        end + 300 + reaper + leak,
+        format!(
+            "WARN gen=1: teardown still has not returned {leak} ms after the kill: its thread, pipeline and renderer stay until the process restarts (1 leaked; Owed 55)"
+        ),
+    );
+    assert_pass(
+        &judge(&w, "cef-leaks", "three", "leaks3-p2-held"),
+        "leaks3-p2-held",
+    );
+    let mut checked = 0;
+    let mut red = |w: World, check: &str, tag: &str| {
+        assert_fails(&judge(&w, "cef-leaks", "three", tag), check, tag);
+        checked += 1;
+    };
+    // The restarted process's arming line read in the first process instead (both before its
+    // boot): one per boot, each after the boot before it.
+    let mut w = leaks(n);
+    let i = w
+        .log
+        .iter()
+        .rposition(|(_, m)| m.contains("(Owed 82): the next"))
+        .unwrap();
+    let first = w
+        .log
+        .iter()
+        .position(|(_, m)| m.contains("(Owed 82): the next"))
+        .unwrap();
+    w.log[i].0 = w.log[first].0 + 10;
+    red(w, "armed", "leaks3-armed-twice-in-p1");
+    // The restarted process unarmed (a second process on another image).
+    let mut w = leaks(n);
+    let i = w
+        .log
+        .iter()
+        .rposition(|(_, m)| m.contains("(Owed 82): the next"))
+        .unwrap();
+    w.log.remove(i);
+    red(w, "armed", "leaks3-p2-unarmed");
+    // The domain restarting nothing at the third leak (no die, no restart beat).
+    let mut w = leaks(n);
+    let die = w
+        .events
+        .iter()
+        .filter(|e| e.1 == "die" && e.2 == Some(75))
+        .map(|e| e.0)
+        .max()
+        .unwrap();
+    w.events.retain(|e| !(e.0 >= die && e.0 <= die + 1_000));
+    w.events.push((w.end + 3_000, "die", Some(0)));
+    w.beats.retain(|b| b.1["exitReason"] != "restart");
+    w.restarts = 0;
+    red(w, "restart_as_ruled", "leaks3-no-restart");
+    // The restart's detail names another count; the deciding line counted a GPU death too.
+    let mut w = leaks(n);
+    for b in &mut w.beats {
+        if b.1["exitReason"] == "restart" {
+            b.1["exitDetail"] = json!(format!("restart in place: {} CEF teardowns leaked", n - 1));
+        }
+    }
+    red(w, "final_beat_detail", "leaks3-detail");
+    let mut w = leaks(n);
+    edit_line(
+        &mut w,
+        &format!("cef health zygote_gone=- leaked_teardowns={n} "),
+        |m| Some(m.replace("gpu_process_deaths=0", "gpu_process_deaths=1")),
+    );
+    red(w, "leaks_health", "leaks3-deciding-gpu");
+    let mut w = leaks(n);
+    edit_line(
+        &mut w,
+        &format!("cef health zygote_gone=- leaked_teardowns={n} "),
+        |m| Some(m.replace("zygote_gone=-", "zygote_gone=1")),
+    );
+    red(w, "leaks_health", "leaks3-deciding-zygote");
+    let mut w = leaks(n);
+    edit_line(
+        &mut w,
+        &format!("cef health zygote_gone=- leaked_teardowns={n} "),
+        |m| {
+            Some(m.replace(
+                &format!("leaked_teardowns={n}"),
+                &format!("leaked_teardowns={}", n + 1),
+            ))
+        },
+    );
+    red(w, "leaks_health", "leaks3-deciding-past-n");
+    // The first process's reaper line missing, the restarted one's of the same gen present.
+    let mut w = leaks(n);
+    edit_line(&mut w, "WARN gen=1: teardown has not returned", |_| None);
+    let reaper = w.ms("reaper_kill_after_ms");
+    let end = w.end;
+    w.line(
+        end + 400,
+        format!(
+            "WARN gen=1: teardown has not returned after {reaper} ms; SIGKILL sent to renderer pids [701] (of [701])"
+        ),
+    );
+    red(w, "reaper_killed", "leaks3-reaper-in-p2");
+    // The third retirement never held (the graphics stop's teardown returned).
+    let mut w = leaks(n);
+    edit_line(&mut w, &format!("WARN test hook (Owed 82) gen={n}"), |_| None);
+    red(w, "held_n", "leaks3-third-not-held");
+    eprintln!("three's reds checked: {checked}");
+    assert_eq!(checked, 9);
 }
 
 /// The case files that are not chaos cases, each run by hand from harness.yml: C13's smoke case

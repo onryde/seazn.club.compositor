@@ -2,12 +2,15 @@ name: chaos
 # The chaos suite (C14): every leg of harness/chaos.json (each harness/cases/<case>.sh, variant and
 # repeat) is its own matrix leg with fail-fast off, so one red never hides another. run-chaos.sh's
 # table then reads every leg's verdict.json and goes red on any FAIL, ERROR or MISSING, and on any
-# NOT RUNNABLE leg (case 16, cef-leaks, until Owed 82 is ruled): an unrun leg is never green, and the
-# table's last lines say whether the run counts toward wave gate 3.
+# NOT RUNNABLE leg: an unrun leg is never green, and the table's last lines say whether the run
+# counts toward wave gate 3.
 #
 # The relay and harness images are built once, as harness.yml builds them (image.yml's caches, read
-# only), and handed to the legs as an artifact. The compose stack runs here and nowhere local (owner
-# ruling 2026-10-23: no local Docker).
+# only), and handed to the legs as an artifact, with the relay-test-hooks image beside them: the
+# relay image with Owed 82's held-teardown hook compiled in (the Dockerfile's `relay-test-hooks`
+# target, never pushed). Only case 16 (cef-leaks) runs on it (its RELAY_TEST_HOOKS_IMAGE); every
+# other leg runs the relay image. The compose stack runs here and nowhere local (owner ruling
+# 2026-10-23: no local Docker).
 #
 # Wave gate 3 is three consecutive green full runs. Dispatch each one after the last has finished
 # green:
@@ -60,6 +63,7 @@ jobs:
     permissions: { contents: read, packages: read }
     env:
       RELAY_IMAGE: seazn-relay:${{ github.sha }}
+      RELAY_TEST_HOOKS_IMAGE: seazn-relay-test-hooks:${{ github.sha }}
       HARNESS_IMAGE: seazn-harness:${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
@@ -118,6 +122,19 @@ jobs:
           load: true
           push: false
           cache-from: ${{ steps.cache.outputs.from }}
+      # Case 16 only (Owed 82): the relay image plus the compositor built with `--features
+      # test-hooks`, so its legs can hold teardowns (COMPOSITOR_TEST_HOLD_TEARDOWNS).
+      - name: Build the relay-test-hooks image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: relay-test-hooks
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          tags: ${{ env.RELAY_TEST_HOOKS_IMAGE }}
+          load: true
+          push: false
+          cache-from: ${{ steps.cache.outputs.from }}
       - name: Build the harness image
         uses: docker/build-push-action@v6
         with:
@@ -131,7 +148,7 @@ jobs:
           cache-from: ${{ steps.cache.outputs.from }}
       - name: Save the images
         run: |
-          docker save "$RELAY_IMAGE" "$HARNESS_IMAGE" | zstd -T0 -3 -q -o "$RUNNER_TEMP/images.tar.zst"
+          docker save "$RELAY_IMAGE" "$RELAY_TEST_HOOKS_IMAGE" "$HARNESS_IMAGE" | zstd -T0 -3 -q -o "$RUNNER_TEMP/images.tar.zst"
           ls -l "$RUNNER_TEMP/images.tar.zst"
       - uses: actions/upload-artifact@v4
         with:
@@ -152,6 +169,7 @@ jobs:
         leg: ${{ fromJSON(needs.plan.outputs.legs) }}
     env:
       RELAY_IMAGE: seazn-relay:${{ github.sha }}
+      RELAY_TEST_HOOKS_IMAGE: seazn-relay-test-hooks:${{ github.sha }}
       HARNESS_IMAGE: seazn-harness:${{ github.sha }}
       LEG: ${{ matrix.leg.name }}
       LEG_CASE: ${{ matrix.leg.case }}

@@ -33,6 +33,14 @@
 #                              `usage_usec` from cgroup v2's cpu.stat, or cgroup v1's
 #                              cpuacct.usage in µs; fails when neither reads. Prints `sample_ms`,
 #                              never `at_ms`: it is a reading, not a mark
+#   kill-renderer              SIGKILL the renderer with the highest `--renderer-client-id` (case
+#                              16: the newest build's; client ids only grow), and no other process.
+#                              Prints the chosen pid, its client id and every renderer seen (pid,
+#                              client_id or null) first; fails with `pid` null when no renderer has
+#                              a numeric id
+#   cef-cpu                    each CEF child's CPU time (case 16's `two`, printed, never judged):
+#                              pid, type, client_id (null but a renderer's) and cpu_ms, utime plus
+#                              stime from /proc/<pid>/stat. Prints `sample_ms`, never `at_ms`
 #
 # A pid listed can be gone by the time it is read (this script's own command substitutions are in
 # every listing). Every /proc read is a builtin `read`/`mapfile` with its error redirect FIRST and a
@@ -75,23 +83,36 @@ if ! BOOT_MS=$(boot_ms); then
   exit 1
 fi
 
-# The --type= argument of a process (empty when none), read with builtins only. The product's own
-# rule (`split_cmdline` in crates/adapters/src/cef_graphics.rs, mirrored, never imported): the
-# command line splits on NUL AND on whitespace, because Chromium's renamed children (setproctitle)
-# hold ONE space-joined string, padded with NULs. A NUL-only split finds no `--type=` in them (the
-# PR #52 review's C1). The first argument that starts with `--type=` wins (`flag_value`).
-type_of() {
+# The value of a process's `<flag>` argument, `$2` naming the flag with its `=` (empty when none),
+# read with builtins only. The product's own rule (`split_cmdline` in
+# crates/adapters/src/cef_graphics.rs, mirrored, never imported): the command line splits on NUL
+# AND on whitespace, because Chromium's renamed children (setproctitle) hold ONE space-joined
+# string, padded with NULs. A NUL-only split finds no `--type=` in them (the PR #52 review's C1).
+# The first argument that starts with the flag wins (`flag_value`).
+arg_of() {
   local field a fields=() words=()
   mapfile -d '' -t fields 2>/dev/null <"$PROC/$1/cmdline" || return 0
   for field in "${fields[@]}"; do
     IFS=$' \t\n\r\f\v' read -r -d '' -a words <<<"$field" || true
     for a in "${words[@]}"; do
-      if [[ $a == --type=* ]]; then
-        printf '%s' "${a#--type=}"
+      if [[ $a == "$2"* ]]; then
+        printf '%s' "${a#"$2"}"
         return 0
       fi
     done
   done
+}
+
+# The --type= argument of a process (empty when none).
+type_of() {
+  arg_of "$1" --type=
+}
+
+# A renderer's `--renderer-client-id`, as JSON: the number, or null when absent or not digits.
+client_id_of() {
+  local id
+  id=$(arg_of "$1" --renderer-client-id=)
+  if [[ "$id" =~ ^[0-9]+$ ]]; then printf '%s' "$((10#$id))"; else printf null; fi
 }
 
 # One line of a /proc file into REPLY_LINE; fails when the process is gone.
@@ -100,8 +121,8 @@ read_line() {
   IFS= read -r REPLY_LINE 2>/dev/null <"$1" || [ -n "$REPLY_LINE" ]
 }
 
-# Sets STAT_PPID and STAT_START_MS for a pid (fields after the comm's closing parenthesis); fails
-# when the process is gone.
+# Sets STAT_PPID, STAT_START_MS and STAT_CPU_MS (utime plus stime) for a pid (fields after the
+# comm's closing parenthesis: proc(5)'s field 3 is f[0]); fails when the process is gone.
 read_stat() {
   local s f=()
   read_line "$PROC/$1/stat" || return 1
@@ -110,6 +131,7 @@ read_stat() {
   [ "${#f[@]}" -ge 20 ] || return 1
   STAT_PPID=${f[1]}
   STAT_START_MS=$((BOOT_MS + f[19] * 1000 / CLK_TCK))
+  STAT_CPU_MS=$(((f[11] + f[12]) * 1000 / CLK_TCK))
 }
 
 pids() {
@@ -296,6 +318,40 @@ cmd_gpu_loop() {
   [ "$kills" -eq "$n" ] || { [ "$alive" = false ] && [ "$kills" -ge 1 ]; }
 }
 
+cmd_kill_renderer() {
+  local p id chosen="" best=-1 seen="" rc=0
+  for p in $(pids_of_type renderer); do
+    id=$(client_id_of "$p")
+    seen="${seen:+$seen,}{\"pid\":$p,\"client_id\":$id}"
+    if [ "$id" != null ] && [ "$id" -gt "$best" ]; then
+      best=$id
+      chosen=$p
+    fi
+  done
+  if [ -z "$chosen" ]; then
+    printf '{"at_ms":%s,"pid":null,"client_id":null,"renderers":[%s]}\n' "$(now_ms)" "$seen"
+    print_rc 1
+    exit 1
+  fi
+  printf '{"at_ms":%s,"pid":%s,"client_id":%s,"renderers":[%s]}\n' "$(now_ms)" "$chosen" "$best" "$seen"
+  kill -KILL "$chosen" || rc=$?
+  print_rc "$rc"
+  [ "$rc" -eq 0 ]
+}
+
+cmd_cef_cpu() {
+  local p t id out=""
+  for p in $(pids); do
+    t=$(type_of "$p")
+    [ -n "$t" ] || continue
+    read_stat "$p" || continue
+    id=null
+    if [ "$t" = renderer ]; then id=$(client_id_of "$p"); fi
+    out="${out:+$out,}{\"pid\":$p,\"type\":\"$t\",\"client_id\":$id,\"cpu_ms\":$STAT_CPU_MS}"
+  done
+  printf '{"sample_ms":%s,"children":[%s]}\n' "$(now_ms)" "$out"
+}
+
 # The container's cgroup CPU time, µs. A container has its own cgroup namespace (Docker's default
 # on cgroup v2), so the root of /sys/fs/cgroup is the container's own cgroup.
 cmd_cpu_usage() {
@@ -321,8 +377,10 @@ case "${1:-}" in
   kill-zygote) cmd_kill_zygote "${2:?gpu|renderer}" ;;
   gpu-loop) cmd_gpu_loop "${2:?N}" "${3:?SPACING_MS}" "${4:?DEADLINE_MS}" ;;
   cpu-usage) cmd_cpu_usage ;;
+  kill-renderer) cmd_kill_renderer ;;
+  cef-cpu) cmd_cef_cpu ;;
   *)
-    echo '{"error":"usage: tree | kill-cef | kill-compositor | kill-zygote gpu|renderer | gpu-loop N SPACING_MS DEADLINE_MS | cpu-usage"}'
+    echo '{"error":"usage: tree | kill-cef | kill-compositor | kill-zygote gpu|renderer | gpu-loop N SPACING_MS DEADLINE_MS | cpu-usage | kill-renderer | cef-cpu"}'
     exit 64
     ;;
 esac

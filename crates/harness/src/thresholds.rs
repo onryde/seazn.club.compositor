@@ -62,6 +62,12 @@ pub struct AdapterConsts {
     pub cef_child_poll_ms: u64,
     /// C09's `ENCODED_RING_SPAN` (the 2 s leaky output queue, spec §6), in ms.
     pub encoded_ring_span_ms: u64,
+    /// C11's `REAPER_KILL_AFTER_MS`: a retired build's teardown not back by then has its renderers
+    /// SIGKILLed (case 16: each held teardown's reaper line, and the room a leg leaves).
+    pub reaper_kill_after_ms: u64,
+    /// C11's `TEARDOWN_LEAK_AFTER_MS`: still not back this long after the kill, it counts leaked
+    /// (case 16: the leak count, about `reaper_kill_after_ms` + this after the retirement).
+    pub teardown_leak_after_ms: u64,
 }
 
 /// `harness/thresholds.json`, as `dump-thresholds` writes it.
@@ -105,6 +111,8 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     let AdapterConsts {
         cef_child_poll_ms,
         encoded_ring_span_ms,
+        reaper_kill_after_ms,
+        teardown_leak_after_ms,
     } = adapters;
     let mut m = Map::new();
     let mut put = |k: &str, v: Value| {
@@ -159,6 +167,8 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     // The adapters'.
     put("cef_child_poll_ms", json!(cef_child_poll_ms));
     put("encoded_ring_span_ms", json!(encoded_ring_span_ms));
+    put("reaper_kill_after_ms", json!(reaper_kill_after_ms));
+    put("teardown_leak_after_ms", json!(teardown_leak_after_ms));
     // The budgets.
     put("budget_slate_after_loss_ms", json!(BUDGET_SLATE_AFTER_LOSS_MS));
     put("budget_return_to_live_ms", json!(BUDGET_RETURN_TO_LIVE_MS));
@@ -195,6 +205,8 @@ pub fn committed_adapters(v: &Value) -> Option<AdapterConsts> {
     Some(AdapterConsts {
         cef_child_poll_ms: n("cef_child_poll_ms")?,
         encoded_ring_span_ms: n("encoded_ring_span_ms")?,
+        reaper_kill_after_ms: n("reaper_kill_after_ms")?,
+        teardown_leak_after_ms: n("teardown_leak_after_ms")?,
     })
 }
 
@@ -210,7 +222,7 @@ mod tests {
         (text, v)
     }
 
-    // The drift gate's host half: everything but the adapters' two constants (the media test,
+    // The drift gate's host half: everything but the adapters' four constants (the media test,
     // tests/thresholds.rs, checks those against the adapters crate itself).
     #[test]
     fn the_committed_thresholds_are_what_the_domain_and_the_budgets_say() {
@@ -234,6 +246,8 @@ mod tests {
         let v = dump(AdapterConsts {
             cef_child_poll_ms: 2,
             encoded_ring_span_ms: 3,
+            reaper_kill_after_ms: 4,
+            teardown_leak_after_ms: 5,
         });
         let pairs: [(&str, u64); 7] = [
             ("slate_after_ms", t.slate_after_ms),
@@ -250,12 +264,14 @@ mod tests {
         // The adapters' are carried, not invented.
         assert_eq!(v["cef_child_poll_ms"].as_u64(), Some(2));
         assert_eq!(v["encoded_ring_span_ms"].as_u64(), Some(3));
+        assert_eq!(v["reaper_kill_after_ms"].as_u64(), Some(4));
+        assert_eq!(v["teardown_leak_after_ms"].as_u64(), Some(5));
         // Owed 87 retired the stall rule, and with it the two numbers only its bound read.
         let retired = ["output_stall_after_ms", "output_progress_poll_ms"];
         for k in retired {
             assert!(v.get(k).is_none(), "{k} is still dumped");
         }
-        eprintln!("named fields checked: {}", pairs.len() + 2 + retired.len());
+        eprintln!("named fields checked: {}", pairs.len() + 4 + retired.len());
     }
 
     // The brief: "Add a unit test that each budget is consistent with its threshold". A spike-driven

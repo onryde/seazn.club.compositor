@@ -51,7 +51,9 @@
   "output_connected_after_ms": 5000,
   "output_gap_budget_ms": 15000,
   "output_sink_timeout_ms": 5000,
+  "reaper_kill_after_ms": 3000,
   "resume_after_ms": 1000,
   "slate_after_ms": 3000,
-  "source": "cargo run -p harness --bin dump-thresholds > harness/thresholds.json (C14); never edited by hand"
+  "source": "cargo run -p harness --bin dump-thresholds > harness/thresholds.json (C14); never edited by hand",
+  "teardown_leak_after_ms": 3000
 }
