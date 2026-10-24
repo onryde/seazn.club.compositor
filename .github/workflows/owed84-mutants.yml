@@ -20,6 +20,9 @@ jobs:
           - G3-no-keyframe-request
           - G4-connect-on-first-buffer
           - G5-old-keyframe-may-start
+          - G6-empty-output-waits-at-eos
+          - G7-refused-key-not-asked-again
+          - G8-gstreamer-pin
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }

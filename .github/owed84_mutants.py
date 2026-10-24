@@ -5,7 +5,9 @@ Every leg first runs its target tests on the unmutated head, and each must pass.
   marker) and runs the targets again: each must FAIL, with the expected panic text. A build error is
   not a kill.
 - the red-baseline leg puts back main's gst_output.rs and gst_programme.rs (the code before the fix)
-  and runs the four Owed 84 legs: each must FAIL, with the expected panic text.
+  and runs the four Owed 84 legs: each must FAIL, with the expected panic text. Main has no
+  key-request hooks, so inert ones are appended for the round-2 tests to build. Round 2's own red
+  (the review's I-1 and m-6) is G6 and G7: each takes back exactly one new guard.
 """
 import os
 import re
@@ -20,6 +22,23 @@ PENDING = "a_sink_whose_connect_is_pending_when_the_destination_returns_sends_no
 FAILED = "after_a_connect_that_failed_the_next_sink_sends_nothing_queued"
 DRAIN = "a_drain_while_the_sink_is_still_connecting_ends_without_waiting_for_it"
 LATE = "a_late_first_sink_starts_at_the_keyframe_after_its_swap_not_inside_the_ring"
+BEFORE_KEY = "a_drain_before_the_asked_keyframe_ends_without_waiting_for_it"
+NOT_TAKEN = "a_keyframe_request_never_taken_sends_nothing_and_the_drain_ends_with_the_encoders"
+REFUSED_ONCE = "a_keyframe_request_refused_once_is_asked_again_at_the_next_frame"
+VERSION = "the_gate_reads_gstreamer_1_24"
+TESTS = "crates/adapters/tests/programme_output.rs"
+HOOKS = """
+
+// owed84_mutants.py red-baseline: the hooks the round-2 tests call, inert on the code before the fix.
+#[cfg(feature = "test-hooks")]
+impl GstProgramme {
+    pub fn refuse_key_requests(&self, _n: u32) {}
+    pub fn key_refusals_left(&self) -> u32 {
+        0
+    }
+}
+"""
+NO_DRAIN = ["no matching event within"]
 
 QUEUED = ["in front of a sink that cannot send"]
 LEGS = {
@@ -31,15 +50,15 @@ LEGS = {
     ),
     "G2-no-gated-drain": (
         OUT,
-        "if r.video_eos && r.audio_eos {\n                drop(r);\n                self.ring.release(self.gen);",
-        "if false && r.video_eos && r.audio_eos /*G2*/ {\n                drop(r);\n                self.ring.release(self.gen);",
-        [(DRAIN, ["no matching event within"])],
+        "if r.video_eos && r.audio_eos {\n                drop(r);\n                self.release_unsent();",
+        "if false && r.video_eos && r.audio_eos /*G2*/ {\n                drop(r);\n                self.release_unsent();",
+        [(DRAIN, NO_DRAIN)],
     ),
     "G3-no-keyframe-request": (
         OUT,
         "let taken = (self.request_key)();",
         "let taken = true /*G3*/;",
-        [(PENDING, ["the keyframe came late"]), (LATE, ["the keyframe came more than", "keys ["])],
+        [(PENDING, ["the keyframe came late"]), (LATE, ["nothing reached the file"])],
     ),
     "G4-connect-on-first-buffer": (
         OUT,
@@ -52,6 +71,24 @@ LEGS = {
         "if !e.key || e.seq < self.reconnect {",
         "if !e.key /*G5*/ {",
         [(LATE, ["is from before the reconnect", "the ring was replayed"])],
+    ),
+    "G6-empty-output-waits-at-eos": (
+        OUT,
+        "Next::Eos => {\n                    if !pick.started() {\n                        self.release_unsent();",
+        "Next::Eos => {\n                    if false && !pick.started() /*G6*/ {\n                        self.release_unsent();",
+        [(BEFORE_KEY, NO_DRAIN), (NOT_TAKEN, NO_DRAIN)],
+    ),
+    "G7-refused-key-not-asked-again": (
+        OUT,
+        "if !pick.started() {\n                        self.ask_key(&mut ask);",
+        "if false && !pick.started() /*G7*/ {\n                        self.ask_key(&mut ask);",
+        [(REFUSED_ONCE, ["was not asked again"]), (NOT_TAKEN, ["the request was asked"])],
+    ),
+    "G8-gstreamer-pin": (
+        TESTS,
+        'let want = "1.24.";',
+        'let want = "1.26." /*G8*/;',
+        [(VERSION, ["re-read its stats and EOS rules"])],
     ),
 }
 RED = [
@@ -105,8 +142,8 @@ def main(leg):
     if leg == "red-baseline":
         for path in (OUT, PROG):
             src = subprocess.run(["git", "show", f"{BEFORE}:{path}"], capture_output=True, text=True, check=True).stdout
-            open(path, "w").write(src)
-        print(f"put back {OUT} and {PROG} from {BEFORE}")
+            open(path, "w").write(src + (HOOKS if path == PROG else ""))
+        print(f"put back {OUT} and {PROG} from {BEFORE}, with inert key-request hooks")
     else:
         path, old, new, _ = LEGS[leg]
         text = open(path).read()
