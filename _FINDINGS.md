@@ -1949,8 +1949,12 @@ C14's F-024 (PR #52, branch `feat/c14-chaos`) records the fast loop's headline. 
   - The `cef health` lines counted `gpu_process_deaths=1` in 7 legs and 2 in 2 (run 40056474269's
     r2 and r3). No leg restarted.
   - 40 to 97 pids were born between two kills.
-  - In a `threshold` leg, `exit code=75` came 7 ms after the `cef health` line that read 3 deaths.
-    From the deciding line to the container's `die`: 127 to 177 ms (that leg and the 3
+  - From the deciding `cef health` line to `exit code=75`: 4.5 to 14.1 ms, median 7.5 ms, in 21 legs
+    of the same 3 runs (amended 2026-10-24, the PR #55 review's m6; it first read one leg, 7 ms). The
+    21 are every `cef-gpu-deaths` `threshold` leg (r1 to r3) and every `cef-gpu-zygote-killed` and
+    `cef-renderer-zygote-killed` leg, in each run. The exception is run 40051995233's 6 zygote legs,
+    which logged no zygote verdict, so no restart.
+  - From the deciding line to the container's `die`: 127 to 177 ms (one `threshold` leg and 3
     `cef-gpu-zygote-killed` legs); the rest is the entrypoint's teardown.
 - **How the loop kills** (`harness/in-container.sh`, `cmd_gpu_loop`, read, not run): each pass walks
   `/proc` and forks one subshell per pid to read its `--type`, then kills the first GPU pid of the
@@ -1959,8 +1963,20 @@ C14's F-024 (PR #52, branch `feat/c14-chaos`) records the fast loop's headline. 
 - **Estimate (not measured):** 69 to 88 ms between kills fits one pass that found no relaunch, the
   50 ms sleep, and one pass that found it, so a walk took about (69 − 50) / 2 to (88 − 50) / 2 ms,
   10 to 19 ms. The walk was not timed.
+- **The estimate bounds existence, not visibility** (amended 2026-10-24, the PR #55 review's m5). A
+  zygote's fresh fork reads `--type=zygote` until it is renamed `--type=gpu-process`. The watch
+  lists it as a GPU process only from the rename, and the harness's walk reads the newest pids near
+  its end. So the window in which the watch can see a relaunch may be much shorter than one walk.
+  The margin is measured only by a kill-to-count latency per death: the image test prints one (PR
+  #55), and C14's re-run owes one per leg.
 - **So:** the 1 s child poll sees at most one relaunch of such a loop, and a pid-gap or start-time
   inference cannot recover the rest (most of the gap is likely the walk's own forks, one per pid it
   reads, and start times tick at 10 ms). The adapter now runs a GPU watch between polls (decision
-  log "Owed 70 (a): the GPU watch"). It misses only a GPU process born and dead between two of its
-  5 ms steps, and the estimate gives each of these two or more.
+  log "Owed 70 (a): the GPU watch"). It misses a GPU process visible for less than its listing pace:
+  one 5 ms step while a listing costs under 250 us, and 20 times a listing's cost above that (review
+  round 1).
+- **The exit's margin** (m6): the fast variant's `gpu_death_split` and `last_kill_not_before_die`
+  checks go red when the browser outlives the deciding line long enough for further relaunches to be
+  killed. That is one kill interval (69 to 88 ms) less the count and the driver's tick (about 5 to
+  40 ms, the review's figure): about 30 to 80 ms from the decision to `exit code=75`. The 21 legs
+  measured 14.1 ms at the most.
