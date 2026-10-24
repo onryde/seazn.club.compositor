@@ -1,15 +1,16 @@
 name: image
 # The relay image (C12 Step 8): build it, check its plugins, run C11's graphics tests beside a real
 # cefsrc, smoke the binary in fake mode (exit 0, and C11b's exit 75), probe one live-mode run, cap
-# the size, and check that its binary carries no test hook (Owed 82). This workflow never pushes an image: pushing is C16's job. The one thing it pushes is
-# BuildKit's layer cache (decision log "CI: CEF layer from GHCR"): the `cache` job, on a push to main
-# or a fill dispatch only, writes the cache manifest and the layers of the runtime target's stages
-# (gst-base, cef-build, rust-build, the runtime; never cef-test's own, never a runnable image) to
+# the size, and check that its binary carries no test hook (Owed 82). This workflow never pushes an
+# image: pushing is C16's job. The one thing it pushes is BuildKit's layer cache (decision log "CI:
+# CEF layer from GHCR"): the `cache` job, on a push to main or a fill dispatch only, writes the
+# cache manifest and the layers of the runtime target's stages (gst-base, cef-build, rust-build, the
+# runtime; never cef-test's own, never a runnable image) to
 # ghcr.io/<owner>/seazn-relay-cache:cef-<key> (the key: scripts/cef-cache-key.sh). `image` reads it
 # with a read-only token wherever that token may (the package is private; a fork PR's read is
-# unverified); a cache that is missing, unreadable or without the CEF tree is a miss, never a failure.
-# The cache is CI-only and untrusted for shipping: any repository writer can write the tag (C16 never
-# reads it).
+# unverified); a cache that is missing, unreadable or without the CEF tree is a miss, never a
+# failure. The cache is CI-only and untrusted for shipping: any repository writer can write the tag
+# (C16 never reads it).
 on:
   push: { branches: [main] }
   pull_request: {}
