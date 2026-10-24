@@ -165,6 +165,7 @@ fn full_measured() -> Measured {
         encoder_speed: Some(1.0),
         cpu_pct: Some(41.5),
         mem_mb: Some(812),
+        camera_frames_replaced: Some(57),
     }
 }
 
@@ -439,6 +440,8 @@ fn a_measured_zero_is_sent_as_zero() {
         encoder_speed: Some(0.0),
         cpu_pct: Some(0.0),
         mem_mb: Some(0),
+        // Measured, but not a contract key (Owed 90): `camera_frames_replaced_stays_off_the_wire…`.
+        camera_frames_replaced: Some(0),
     };
     let wire = heartbeat_wire(&report(), &m);
     let mut checked = 0;
@@ -463,6 +466,51 @@ fn a_measured_zero_is_sent_as_zero() {
     assert!(violations(&schema_def("heartbeat"), &wire).is_empty(), "{wire}");
     eprintln!("measured zeros checked: {checked}");
     assert_eq!(checked, 11);
+}
+
+/// Owed 81 (i), Owed 90: `camera_frames_replaced` is measured, but the vendored `heartbeat` declares
+/// no key for it and refuses an unknown one (`additionalProperties: false`; web's `RelayHeartbeat` is
+/// `.strict()`, so the beat would be a 400 and lost). The wire therefore never carries it, 0 and the
+/// largest count included, and the beat is the same as without it. When a re-vendor brings the key
+/// this test reds, and the field is wired then.
+#[test]
+fn camera_frames_replaced_stays_off_the_wire_until_the_contract_declares_it() {
+    let hb = &contract()["$defs"]["heartbeat"];
+    assert_eq!(
+        hb["additionalProperties"], false,
+        "the contract refuses an unknown key"
+    );
+    let declared = hb["properties"].as_object().expect("the heartbeat's properties");
+    assert!(
+        declared.get("cameraFramesReplaced").is_none(),
+        "the contract declares cameraFramesReplaced now: write it on the wire (Owed 90)"
+    );
+    let v = schema_def("heartbeat");
+    let without = heartbeat_wire(
+        &report(),
+        &Measured {
+            camera_frames_replaced: None,
+            ..full_measured()
+        },
+    );
+    let mut checked = 0;
+    for n in [0, 57, u64::MAX] {
+        let m = Measured {
+            camera_frames_replaced: Some(n),
+            ..full_measured()
+        };
+        let wire = heartbeat_wire(&report(), &m);
+        let keys = wire.as_object().expect("an object");
+        assert!(
+            keys.keys().all(|k| declared.contains_key(k)),
+            "{n}: a key the contract does not declare: {wire}"
+        );
+        assert_eq!(wire, without, "{n}: the count changes nothing on the wire");
+        assert!(violations(&v, &wire).is_empty(), "{wire}");
+        checked += 1;
+    }
+    eprintln!("camera_frames_replaced counts kept off the wire: {checked}");
+    assert_eq!(checked, 3);
 }
 
 /// "Never inserts a key whose value is unknown": a NaN or an infinity is not a measurement (JSON has

@@ -98,6 +98,7 @@ fn copies_every_stats_field_into_measured() {
         bitrate_kbps: Some(3_987),
         egress_bytes: Some(123_456_789),
         encoder_speed: Some(0.97),
+        camera_frames_replaced: Some(41),
     };
     stats.force_snapshot(set);
     let got = ProcMetrics::new(Arc::clone(&stats)).sample();
@@ -105,15 +106,17 @@ fn copies_every_stats_field_into_measured() {
     assert_eq!(got.bitrate_kbps, set.bitrate_kbps);
     assert_eq!(got.egress_bytes, set.egress_bytes);
     assert_eq!(got.encoder_speed, set.encoder_speed);
+    assert_eq!(got.camera_frames_replaced, set.camera_frames_replaced);
     let fresh = ProcMetrics::new(Arc::new(Stats::default())).sample();
     assert_eq!(
         (
             fresh.fps,
             fresh.bitrate_kbps,
             fresh.egress_bytes,
-            fresh.encoder_speed
+            fresh.encoder_speed,
+            fresh.camera_frames_replaced
         ),
-        (None, None, None, None),
+        (None, None, None, None, None),
         "a field C09 reports as None stays absent"
     );
 }

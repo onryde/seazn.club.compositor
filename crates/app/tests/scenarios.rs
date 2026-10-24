@@ -1,10 +1,10 @@
 //! The driver (C08) folding the REAL `Supervisor` through fakes for every port, on a manual clock.
 //! Every duration comes from `Thresholds::default()` (or a named override), never from the driver.
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use app::driver::Driver;
-use app::ports::{ControlRequest, Inbound, Measured, SessionConfig};
+use app::ports::{ControlRequest, Inbound, Measured, Metrics, SessionConfig};
 use domain::config::{OutputProfile, Thresholds};
 use domain::health::{ExitDetail, GraphicsStatus, HealthReport};
 use domain::input_link::LossReason;
@@ -1559,6 +1559,76 @@ fn dropped_heartbeats_are_logged_at_most_once_a_minute_and_at_the_exit() {
         "the held rest, at the exit"
     );
     eprintln!("beats inside the minute: {beats}");
+}
+
+/// A `Metrics` whose `camera_frames_replaced` the test sets between beats (the rest stays
+/// `metrics()`'s).
+struct ScriptedReplaced(Arc<Mutex<Option<u64>>>);
+
+impl Metrics for ScriptedReplaced {
+    fn sample(&mut self) -> Measured {
+        Measured {
+            camera_frames_replaced: *self.0.lock().unwrap_or_else(PoisonError::into_inner),
+            ..metrics()
+        }
+    }
+}
+
+/// Owed 81 (i): every beat whose metrics sample carries `camera_frames_replaced` writes one line,
+/// `camera frames replaced beat=<n> total=<n>`, `beat` being the rise since the last beat's sample,
+/// the final beat included. A sample without it (nothing measured yet) writes none.
+/// Every expected line is the script's own difference. A total lower than the last (the adapter's
+/// count only grows, so only a fault reaches it) reads `beat=0`, and the next beat counts from it.
+#[test]
+fn camera_frames_replaced_is_logged_once_a_beat_with_the_beats_rise() {
+    let log = Log::default();
+    let total = Arc::new(Mutex::new(None));
+    let set = |n: Option<u64>| *total.lock().unwrap_or_else(PoisonError::into_inner) = n;
+    let mut p = ports(&log, metrics());
+    p.metrics = Box::new(ScriptedReplaced(Arc::clone(&total)));
+    let mut d = Driver::new(th(), p, FAR, 0);
+    assert_eq!(d.tick_due(0), None);
+    assert_eq!(d.step(Inbound::Session(session_720p()), SESSION_AT), None);
+    let is_beat = |c: &Call| matches!(c, Call::Control(ControlRequest::Heartbeat(..)));
+    let next_beat = |d: &mut Driver| {
+        let mark = log.len();
+        loop {
+            let at = d.next_tick_at();
+            assert!(at < FAR, "no beat");
+            assert_eq!(d.tick_due(at), None);
+            if log.calls_from(mark).iter().any(is_beat) {
+                return at;
+            }
+        }
+    };
+    let lines = || lines_starting(&log, "camera frames replaced");
+    let mut at = next_beat(&mut d);
+    assert!(lines().is_empty(), "not measured: no line");
+    let script: [(u64, &str); 6] = [
+        (0, "beat=0 total=0"),
+        (6, "beat=6 total=6"),
+        (6, "beat=0 total=6"),
+        (13, "beat=7 total=13"),
+        (4, "beat=0 total=4"),
+        (9, "beat=5 total=9"),
+    ];
+    let mut want = Vec::new();
+    for (n, line) in script {
+        set(Some(n));
+        at = next_beat(&mut d);
+        want.push(format!("camera frames replaced {line}"));
+        assert_eq!(lines(), want, "the beat at {at}");
+    }
+    // A SIGTERM drains at once with its one final beat; the exit after it sends none.
+    set(Some(12));
+    let beats_before = log.count(is_beat);
+    assert_eq!(d.step(ev(Event::Signal(SignalKind::Term)), at + 1), None);
+    assert_eq!(d.step(ev(Event::OutputDrained), at + 2), Some(0));
+    assert_eq!(log.count(is_beat) - beats_before, 1, "the drain's final beat");
+    want.push("camera frames replaced beat=3 total=12".to_owned());
+    assert_eq!(lines(), want, "the final beat's line");
+    eprintln!("camera frames replaced lines checked: {}", want.len());
+    assert_eq!(want.len(), script.len() + 1);
 }
 
 /// The empty case: a run that skipped no tick and dropped no beat logs neither line, at the exit
