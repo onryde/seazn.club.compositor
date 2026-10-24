@@ -1,4 +1,4 @@
-# C14: Chaos suite (~~10~~ 12 cases, automated pass/fail; amended 2026-10-18)
+# C14: Chaos suite (~~10~~ ~~12~~ 16 cases, automated pass/fail; amended 2026-10-18, 2026-10-20 and 2026-10-24)
 
 **Repo:** `seazn.club.compositor`. **Depends on:** C13. Read spec §6 (the robustness table and
 budgets) and §9.4 (the cases).
@@ -36,7 +36,7 @@ Add a unit test that each budget is consistent with its threshold. For example,
 `slate_after_ms + one frame period ≤ BUDGET_SLATE_AFTER_LOSS_MS`. A spike-driven threshold change
 that breaks a budget then reds at `cargo test`, not in a 2-minute chaos run.
 
-### The 10 cases (12 with the 2026-10-18 amendment's cases 11 and 12)
+### The 10 cases (12 with the 2026-10-18 amendment's cases 11 and 12; 16 with the 2026-10-20 amendment's cases 13–16)
 
 The PDF's kill-switch case is replaced by "CEF killed".
 
@@ -228,10 +228,88 @@ its `exitCode` clause (the process then aborts at the next GPU death, or runs on
 `cef_gpu_deaths_to_restart` to 6 in the scratch build: expected red, case 15 (the abort comes first). As with mutant
 1, the verdict reads the committed `harness/thresholds.json`.
 
+## Amendment 2026-10-24 (as built: branch `feat/c14-chaos`; the coordinator's dispatch of 2026-10-23)
+
+The suite has **16 cases**. The title, Files, Step 7 and Acceptance said 10 or 12, but cases 13–16
+came with the 2026-10-20 amendment, so those lines are corrected inline. It runs in CI only (owner
+ruling 2026-10-23: no local Docker), so Steps 4 and 6 are `chaos.yml` runs, not local runs.
+
+**What is built** (the coordinator's ruling: C14 owns the harness extensions it needs):
+- `harness/cases/<case>.sh`, one file per case. Each holds the case's drive, its marks and its
+  verdict.
+  - The verdict is a list of `require` lines. Each line is jq over the checker's `report.json`,
+    using `harness/cases/lib.jq`, with `$t`, `$run`, `$case` and `$timeline` bound.
+  - Every number comes from `harness/thresholds.json`.
+  - A case declares its check count, and a verdict that runs fewer checks fails.
+- `harness/run-case.sh <case> [<variant>]` is C13's runner, extended. It adds:
+  - docker events, reduced to die and start with exit codes;
+  - `docker logs --timestamps`;
+  - `RestartCount` at live and at the end, fake-control's `/control/state`, and the cores check;
+  - the case's marks;
+  - `CASE_REJUDGE=1`, which re-judges a downloaded `out/<run>` with no stack;
+  - `CASE_NOT_RUNNABLE`, which reports and exits 3.
+- `harness/in-container.sh` makes every kill from `/proc`, as root in the compositor's container.
+  The relay image has no procps, and it is not changed for the harness.
+- `harness/chaos.json` lists 31 legs: the 16 cases, case 15's three runs and case 16's two. Cases 8,
+  9, 13 and 14, and case 15's `threshold` and `fast` runs, run 3 times each.
+- `.github/workflows/chaos.yml` runs each case, variant and repeat as its own matrix leg, with
+  fail-fast off. It runs on pull requests that touch `harness/**`, `crates/harness/**` or the
+  workflow, and on `workflow_dispatch` (`cases=all`, or a list of legs).
+- `harness/run-chaos.sh --table` prints the table.
+  - It goes red on FAIL, ERROR or MISSING, and on a false-positive sweep that ran on no leg.
+  - It reports NOT RUNNABLE and never counts it red.
+  - It prints the worst outage of each repeated case.
+- `crates/harness/tests/case_verdicts.rs` simulates each case's run from the product's declared
+  behaviour, runs it through `checker::analyze`, and re-judges it with run-case.sh.
+  - Every good run passes, printing every declared check.
+  - Each of 31 red runs fails on its named check.
+  - The two case 16 runs report NOT RUNNABLE.
+  - `crates/harness/tests/chaos_table.rs` checks the plan and the table.
+
+**Wave gate 3 (three consecutive green full runs):** run
+`gh workflow run chaos.yml --ref <branch> -f cases=all` three times. Dispatch each run only after the
+previous one has finished green. Paste the three tables from the table job's summary.
+
+**Deviations** (the implementer's, inside the dispatch; none is an owner ruling):
+1. The budgets live in `crates/harness/src/thresholds.rs`, not `crates/domain/src/config.rs`
+   (Step 1), because the dispatch kept the domain read only. The drift gate is a test
+   (`harness::thresholds` and `tests/thresholds.rs`), not a check.yml step (Step 2), because
+   check.yml was another PR's.
+2. Verdicts are `require` lines in each case file, sharing `lib.jq`, not one `.jq` file per case.
+3. `chaos.yml` runs on harness pull requests and on dispatch, as the dispatch set it. It has no
+   nightly `schedule` (Files).
+4. `run-chaos.sh` tables the verdicts of the parallel legs; it does not run the cases in sequence.
+5. Case 6's stress is a stress-ng container beside the stack. It competes for the host's CPU, not
+   from inside the compositor's cgroup. Only the harness image gains `stress-ng`.
+6. Case 11's detect bound adds `BUDGET_FRAME_TO_ENCODER_MS`. The hide is judged on the recording's
+   strip, and that frame reaches MediaMTX after the decision.
+7. Cases 13 and 14 run for 70 s, not 60, to fit the restart's outage (up to 15 s) and case 14's
+   process-tree read at 60 s.
+8. Case 8's restart evidence (Owed 19) is the new process's own `cef ready`, and every beat after
+   the kill reads `ready`, `restarting` or `starting`. Since Owed 62 the kill takes the whole
+   process, so the old process has no generation g+1.
+9. Case 3's return is timed from the first content gap that ends after the kick's mark. The mark
+   is stamped before the kick lands, so the gap can start just after it.
+
+**False premises:** see `docs/_INDEX.md`, rows dated 2026-10-24.
+
+**Mutants** run on the throwaway draft PR `mut/c14-r1`. Each needs its own named FAIL line, plus a
+control check that proves the stack ran:
+
+| # | Mutant | Case | Required |
+|---|---|---|---|
+| 1 | `resume_after_ms` 0 in a scratch relay build; the verdict reads the committed thresholds.json | `camera-flap` | `FAIL flap_hysteresis` |
+| 2 | Comment out case 8's kill line. Replaces "disable the held overlay frame", which is stale: since Owed 62 the kill takes the process, and no held frame is judged | `cef-killed` | `FAIL kill_applied` |
+| 3 | Comment out case 1's `/pause` | `camera-stop` | `FAIL camera_paused` |
+| 4 | Delete C05b's Ready hang arm (`on_air`'s Ready branch) in a scratch relay build | `cef-hung` | `FAIL one_hang_hide` |
+| 5 | Comment out case 12's `netem` line | `dest-trickle` | `FAIL trickled` |
+| 6 | `restart_cause` returns nothing for a zygote, in a scratch relay build | `cef-gpu-zygote-killed` | `FAIL died_in_place` |
+| 7 | `cef_gpu_deaths_to_restart` 6, in a scratch relay build | `cef-gpu-deaths threshold` | `FAIL died_in_place` |
+
 ## Files
 
-- Create: `harness/cases/{camera-stop,camera-flap,reader-kicked,dest-disconnect,dest-stall,cpu-starved,score-down,cef-killed,process-killed,input-impaired}.{sh,jq}`
-- Create: `harness/run-chaos.sh` (runs all 10 in sequence, prints a table, exits non-zero on any red)
+- Create: `harness/cases/{camera-stop,camera-flap,reader-kicked,dest-disconnect,dest-stall,cpu-starved,score-down,cef-killed,process-killed,input-impaired}.{sh,jq}` (amended 2026-10-24: all 16, cases 11–16 too, as `.sh` files with `require` lines over `harness/cases/lib.jq`; and `harness/chaos.json`, the legs)
+- Create: `harness/run-chaos.sh` (~~runs all 10 in sequence~~ amended 2026-10-24: tables all 16 cases' 31 legs from chaos.yml's parallel runs, prints a table, exits non-zero on any red)
 - Create: `crates/harness/src/bin/dump-thresholds.rs`
 - Modify: `crates/domain/src/config.rs` (the budget consts and their test only)
 - Create: `.github/workflows/chaos.yml`: `workflow_dispatch` plus nightly `schedule`, never on PRs (it
@@ -266,12 +344,12 @@ its `exitCode` clause (the process then aborts at the next GPU death, or runs on
      does not count.
 - [ ] **Step 6: Run `run-chaos.sh` three times in a row**, all green (spec §9.7 item 1). Paste the
   three tables.
-- [ ] **Step 7: Commit and open the PR.** `test(chaos): twelve automated failure cases (C14)` (amended 2026-10-18; was "ten"). Then
+- [ ] **Step 7: Commit and open the PR.** `test(chaos): ~~twelve~~ sixteen automated failure cases (C14)` (amended 2026-10-18; was "ten"; amended 2026-10-24: sixteen, and the dispatch's PR title `feat(harness): the chaos suite (C14)`). Then
   trigger `chaos.yml` once by dispatch, and paste the run URL.
 
 ## Acceptance
 
-- ~~10~~ 12 cases, each with an anti-vacuity clause (amended 2026-10-18: case 11 `cef-hung`, Owed 18; case 12 `dest-trickle`, Owed 16).
+- ~~10~~ ~~12~~ 16 cases, each with an anti-vacuity clause (amended 2026-10-18: case 11 `cef-hung`, Owed 18; case 12 `dest-trickle`, Owed 16; amended 2026-10-24: cases 13–16 of the 2026-10-20 amendment).
 - Every number comes from `thresholds.json`.
 - 3 consecutive local green runs, plus 1 green CI dispatch.
 - ~~3~~ 5 mutants went red (amended 2026-10-18: mutants 4 and 5).
