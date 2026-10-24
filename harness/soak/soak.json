@@ -19,8 +19,9 @@
   "end_wait_s": 120,
   "log_wait_s": 900,
   "lost_beats_end_s": 90,
-  "poll_after_min": 10,
+  "poll_after_min": 20,
   "hard_stop_after_min": 25,
+  "post_check_reserve_s": 180,
   "timeout_after_min": 40,
   "sample_every_s": 60,
   "sample_offsets_s": [15, 45],
@@ -32,5 +33,6 @@
   "overlay_diff_min": 4,
   "score_every_s": 30,
   "web_port": 3000,
+  "web_credential_cookies": ["seazn_session"],
   "harness_guest": {"test": {"cpus": 4, "memory_mb": 8192}, "real": {"cpus": 8, "memory_mb": 16384}}
 }

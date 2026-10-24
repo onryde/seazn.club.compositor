@@ -157,26 +157,35 @@ if ($page != "real" and $page != "test") then error("verdict: page must be real 
       + (if $bare > 0 then ["\($bare) overlay hidden line(s) without a reason (a build older than C05b's amendment)"] else [] end);
       $m) end,
 
-  # (c) The score driver recorded at least deliveries_per_min deliveries in every minute of the drive.
+  # (c) The score driver recorded at least deliveries_per_min deliveries in every minute of the drive,
+  #     and the PAGE received them: its own feed-health signal (`seazn:score-stale`, which the beats
+  #     carry as scoreStale) reached the beats in the drive, and never read true. The driver's 200s
+  #     alone say the API took the score, not that the page polled it back.
   ($drive_min | floor) as $minutes
   | [range(0; $minutes) as $k
      | select([$deliveries[] | select(.ok == true and $s != null and .at_ms >= $s + $k * 60000 and .at_ms < $s + ($k + 1) * 60000)]
          | length < $soak.deliveries_per_min) | $k] as $short
+  | [$drive_beats[] | select(.body | has("scoreStale"))] as $stale_carried
+  | [$stale_carried[] | select(.body.scoreStale != false)] as $stale
   | {deliveries_ok: ([$deliveries[] | select(.ok == true)] | length), deliveries_refused: ([$deliveries[] | select(.ok != true)] | length),
-     minutes: $minutes, minutes_short: ($short | length)} as $m
+     minutes: $minutes, minutes_short: ($short | length),
+     stale_beats_carried: ($stale_carried | length), stale_beats_true: ($stale | length)} as $m
   | if $page == "test" then pending("5c"; "score deliveries"; $m)
     else check("5c"; "score deliveries";
       $no_start
-      + (if ($short | length) > 0 then ["deliveries: \($short | length) of \($minutes) minutes had fewer than \($soak.deliveries_per_min) (first: minute \($short[0]))"] else [] end);
+      + (if ($short | length) > 0 then ["deliveries: \($short | length) of \($minutes) minutes had fewer than \($soak.deliveries_per_min) (first: minute \($short[0]))"] else [] end)
+      + (if ($stale_carried | length) == 0 then ["no drive beat carried scoreStale: the page never reported its feed's health"] else [] end)
+      + (if ($stale | length) > 0 then ["score stale: \($stale | length) drive beat(s) say the page had no good live-data update for the page's stale budget (first at \($stale[0].received_ms))"] else [] end);
       $m) end,
 
-  # (d) Once a minute, a sample of the programme's overlay region differs from the camera-only
-  #     reference: the overlay is on air.
-  [range(0; $minutes) as $k | select([$samples[] | select(.minute == $k and .differs == true)] | length == 0) | $k] as $off
-  | {samples: ($samples | length), minutes: $minutes, minutes_off_air: ($off | length)} as $m
+  # (d) Once a sample slot (sample_every_s: the sampler's own unit), a sample of the programme's
+  #     overlay region differs from the camera-only reference: the overlay is on air.
+  ($drive_s / $soak.sample_every_s | floor) as $slots
+  | [range(0; $slots) as $k | select([$samples[] | select(.minute == $k and .differs == true)] | length == 0) | $k] as $off
+  | {samples: ($samples | length), minutes: $slots, minutes_off_air: ($off | length)} as $m
   | if $page == "test" then pending("5d"; "overlay on air"; $m)
     else check("5d"; "overlay on air";
-      (if ($off | length) > 0 then ["overlay off air: \($off | length) of \($minutes) minutes had no sample that differs from the camera-only reference (first: minute \($off[0]))"] else [] end);
+      (if ($off | length) > 0 then ["overlay off air: \($off | length) of \($slots) minutes had no sample that differs from the camera-only reference (first: minute \($off[0]))"] else [] end);
       $m) end,
 
   # 6. No step down: every beat's rung is rung_ok (`full`); a stepped beat is web's sizing alarm.

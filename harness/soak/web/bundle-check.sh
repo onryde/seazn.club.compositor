@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # The standalone web build's telemetry gate (C15, page=real). A local web server sends to LIVE
 # PostHog when its build carries a key, so the soak's build leaves every NEXT_PUBLIC_POSTHOG*,
-# Sentry DSN and Stripe key unset, and this proves it on the build itself: no file under the given
-# directories carries a PostHog project key, a Sentry DSN or a Stripe key. It names the file and
-# the kind of key, never the value. Zero files scanned is a failure, never a pass.
+# Sentry DSN and Stripe key unset, and this proves it on the build itself: no given file, and no
+# file under a given directory, carries a PostHog project key, a Sentry DSN or a Stripe key. It
+# names the file and the kind of key, never the value. Zero files scanned is a failure, never a pass.
 #
-#   harness/soak/web/bundle-check.sh <dir>...      (e.g. .next/static .next/server)
+#   harness/soak/web/bundle-check.sh <file or dir>...      (soak.yml: everything app.tgz packs but
+#                                                          node_modules, and the database dump)
 set -euo pipefail
-[ "$#" -gt 0 ] || { echo "bundle-check: usage: bundle-check.sh <dir>..." >&2; exit 64; }
+[ "$#" -gt 0 ] || { echo "bundle-check: usage: bundle-check.sh <file or dir>..." >&2; exit 64; }
 
 files=0
 for d in "$@"; do
-  [ -d "$d" ] || { echo "bundle-check: FAIL $d is not a directory"; exit 1; }
+  [ -d "$d" ] || [ -f "$d" ] || { echo "bundle-check: FAIL $d is not a file or a directory"; exit 1; }
   n=$(find "$d" -type f | wc -l | tr -d ' ')
   files=$((files + n))
 done

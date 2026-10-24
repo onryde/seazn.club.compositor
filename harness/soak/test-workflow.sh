@@ -19,6 +19,10 @@
 #   bundle before it packs; the images job smokes the page-source image before it pushes it, and
 #   runs when the web job was skipped; the harness Machine's image and guest follow the page
 #   (soak.json's harness_guest); the page source's outputs are fetched; no SOAK_OVERLAY_URL is left;
+# - the run list says PLUMBING ONLY on page=test (run-name, the step summary); the page source's
+#   artifact survives "Re-run failed jobs"; the compositor's deadline is anchored at its launch; the
+#   leak gate run for real four ways (page=real or test with no harness scan, a leak, clean); and
+#   soak.json's watch, hard stop, timeout and post-check reserve in order;
 # - flylog.py on a recorded-shape stream: pretty-printed entries, a replayed buffer, another
 #   Machine's entry, a cut-off tail, stamps with 9 and 3 fraction digits and an offset, a bare and a
 #   reasoned `overlay hidden`; and an empty stream refused.
@@ -176,8 +180,12 @@ check "the bundle check runs after the build and before the pack and the upload"
   '[.jobs.web.steps | to_entries[] | select(.value.name == "Build (no telemetry setting)" or .value.name == "The bundle carries no telemetry key"
      or .value.name == "Pack the page source" or (.value.uses // "" | startswith("actions/upload-artifact"))) | .key]
    | length == 4 and . == sort'
-grep -qF 'harness/soak/web/bundle-check.sh "$A/static" "$A/server"' <<<"$(step web "The bundle carries no telemetry key")" \
-  && pass "the bundle check scans the staged build's static and server trees" || fail "the bundle check's targets"
+bc="$(step web "The bundle carries no telemetry key")"
+grep -qF 'find "$A" -mindepth 1 -maxdepth 1 ! -name node_modules ! -name apps -print' <<<"$bc" \
+  && grep -qF 'find "$A/apps" -mindepth 2 -maxdepth 2 ! -name node_modules -print' <<<"$bc" \
+  && grep -qF 'harness/soak/web/bundle-check.sh "${parts[@]}" "$RUNNER_TEMP/build/db"' <<<"$bc" \
+  && grep -qF 'A=web/apps/web/.next/standalone' <<<"$bc" \
+  && pass "the bundle check scans what app.tgz packs (but node_modules) and the dump" || fail "the bundle check's targets"
 smoke="$(step images "Build and smoke the page-source image")"
 grep -qF 'docker run --rm --entrypoint /soak/web/smoke.sh "$WEB_IMAGE"' <<<"$smoke" && pass "the page-source image is smoked" || fail "the smoke"
 check "the smoke comes before the push, both page=real's image steps conditional" \
@@ -198,6 +206,48 @@ miss=""; for f in deliveries.jsonl score.log seed.json web-up.log web.log postgr
   grep -qE "(^| )$f( |;|$)" <<<"$fetch" || miss="$miss $f"; done
 [ -z "$miss" ] && pass "the fetch takes the page source's outputs (7 files)" || fail "the fetch" "missing:$miss"
 grep -qF SOAK_OVERLAY_URL "$YML" && fail "no SOAK_OVERLAY_URL is left" "it is" || pass "no SOAK_OVERLAY_URL is left"
+
+# --- the run list, re-runs, the deadline, the leak gate -------------------------------------------
+check "run-name: the page and the minutes, PLUMBING ONLY on page=test" \
+  '.["run-name"] | contains("page=${{ inputs.page }}") and contains("${{ inputs.minutes }} min")
+   and contains("inputs.page == '"'"'test'"'"' && '"'"' (PLUMBING ONLY)'"'"'")'
+grep -qF '# PLUMBING ONLY — NOT A SOAK PASS' <<<"$verdict" && pass "the step summary heads a plumbing run PLUMBING ONLY" || fail "the summary heading"
+check "the page source's artifact: one name per run, replaced by a re-run (no run_attempt)" \
+  '[.jobs.web.steps[], .jobs.images.steps[] | select((.uses // "") | test("actions/(up|down)load-artifact")) | .with]
+   | length == 2 and all(.name == "soak-web-${{ github.run_id }}") and (.[0].overwrite == true)'
+if awk '/the harness never came up/ { up = NR } /deadline_c_ms=\$\(\(\$\(date \+%s%3N\) \+ 10#\$MINUTES \* 60000\)\)/ { d = NR }
+        /DEADLINE_AT="\$deadline_at"/ { c = NR } END { exit !(up && d > up && c > d) }' <<<"$launch"; then
+  pass "the compositor's deadline is anchored at its launch, after the harness came up"
+else
+  fail "the compositor's deadline anchor"
+fi
+gate="$(step soak "Leak gate")"
+leakgate() { # <page> <secrets.json content or ""> : runs the step on a fake /out; rc, then what is left
+  rm -rf "$W/lg"; mkdir -p "$W/lg/out"
+  printf 'tok_%s\n' "$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')" >"$W/lg/job-token"
+  for f in status.json done driver.log web.log report.json; do echo '{}' >"$W/lg/out/$f"; done
+  [ -z "$2" ] || printf '%s\n' "$2" >"$W/lg/out/secrets.json"
+  : >"$W/lg/gh-out"
+  local rc=0
+  RUNNER_TEMP="$W/lg" PAGE="$1" GITHUB_OUTPUT="$W/lg/gh-out" bash -eo pipefail -c "$gate" >"$W/lg/log" 2>&1 || rc=$?
+  echo "$rc $(cd "$W/lg/out" && ls | sort | tr '\n' ' ')"
+}
+got="$(leakgate real "")"
+[ "$got" = "0 done status.json " ] && grep -qx 'ok=true' "$W/lg/gh-out" \
+  && pass "leak gate: page=real with no harness scan keeps only status.json and done" || fail "leak gate, page=real, no scan" "$got"
+got="$(leakgate test "")"
+[ "$got" = "0 done driver.log report.json status.json web.log " ] \
+  && pass "leak gate: page=test with no harness scan uploads on the job's scan" || fail "leak gate, page=test, no scan" "$got"
+got="$(leakgate real '{"scanned":24,"leaks":1,"skipped":[],"leaked":[{"kind":"WEB_COOKIE[seazn_session]","where":["web.log:3 \"cookie: seazn_session=<WEB_COOKIE[seazn_session]>\""]}]}')"
+[ "${got%% *}" = 1 ] && ! grep -qx 'ok=true' "$W/lg/gh-out" \
+  && grep -qF 'leaked: WEB_COOKIE[seazn_session] in web.log:3 "cookie: seazn_session=<WEB_COOKIE[seazn_session]>"' "$W/lg/log" \
+  && pass "leak gate: a leak uploads nothing and prints the harness's redacted report" || fail "leak gate, a leak" "$got: $(head -c 400 "$W/lg/log")"
+got="$(leakgate real '{"scanned":24,"leaks":0,"skipped":[],"leaked":[]}')"
+[ "${got%% *}" = 0 ] && grep -qx 'ok=true' "$W/lg/gh-out" && pass "leak gate: a clean scan uploads" || fail "leak gate, clean" "$got"
+jq -e '.poll_after_min >= 20 and .poll_after_min < .hard_stop_after_min and .hard_stop_after_min < .timeout_after_min
+       and .post_check_reserve_s > 60 and .post_check_reserve_s < (.hard_stop_after_min - .poll_after_min) * 60' "$HERE/soak.json" >/dev/null \
+  && pass "soak.json: watch 20+ min past the run, then the hard stop, then the job's timeout; the post-check reserve fits" \
+  || fail "soak.json's watch, stop and reserve" "$(jq -c '{poll_after_min, hard_stop_after_min, timeout_after_min, post_check_reserve_s}' "$HERE/soak.json")"
 
 # --- flylog.py ---------------------------------------------------------------------------------
 cat >"$W/stream.json" <<'EOF'

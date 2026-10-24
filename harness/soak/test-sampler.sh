@@ -13,8 +13,9 @@
 #
 # Expected, minute by minute: 0 and 1 on air; 2 off air (the bar is gone, and there is no error);
 # 3 on air from its second offset (the first falls in the disconnect); 4 on air; 5 an error (no
-# programme segment). Then: an all-noise camera has no stable band (every sample an error, never on air), and
-# a run with no start action is refused.
+# programme segment); the floor (median band difference) near zero where on air. Then: an all-noise
+# camera has no stable band (every sample an error, never on air), a programme 8 luma brighter than
+# the camera with no bar is a level shift (never on air), and a run with no start action is refused.
 #
 #   harness/soak/test-sampler.sh        (needs ffmpeg and python3; prints `checked: N`)
 set -euo pipefail
@@ -44,6 +45,9 @@ render "$W/cam" "$strip;[0:v][1:v]overlay=x='mod(n*8,1208)':y=240[b];[b][s]overl
 render "$W/prog" "$strip;[0:v][1:v]overlay=x='mod((n+15)*8,1208)':y=240[b];[b][s]overlay=x=0:y=680[c];color=gray:s=400x40:r=30:d=40[bar];[c][bar]overlay=x=440:y=560:enable='not(between(t,12,18))'[v]"
 rm "$W/prog/2026-10-24_12-00-30-000000.mp4"
 render "$W/noise" "[0:v]geq=lum=random(1)*255:cb=128:cr=128[v]"
+# The programme as the camera half a second later, 8 luma brighter everywhere, and no bar: a level
+# shift, which the largest band difference alone would read as on air.
+render "$W/shift" "$strip;[0:v][1:v]overlay=x='mod((n+15)*8,1208)':y=240[b];[b][s]overlay=x=0:y=680[c];[c]lutyuv=y='clip(val+8,0,255)'[v]"
 
 t0=$(python3 -I -c 'import datetime; print(int(datetime.datetime(2026,10,24,12,0,0,tzinfo=datetime.timezone.utc).timestamp()*1000))')
 jq '. + {sample_every_s: 6, sample_offsets_s: [2, 4], sample_margin_s: 1}' "$HERE/soak.json" >"$W/soak.json"
@@ -71,6 +75,16 @@ python3 -I "$HERE/sampler.py" --programme "$W/prog" --camera "$W/noise" --action
   --out "$W/noise.jsonl" >/dev/null 2>&1 || rc=$?
 jq -e -s '(map(.differs) | any | not) and ([.[0,1,2,3,4] | .error | test("no stable band")] | all)' "$W/noise.jsonl" >/dev/null 2>&1 \
   && pass "a noise camera: no stable band, never on air" || fail "the noise camera" "exit $rc; $(jq -c -s 'map({differs, error})' "$W/noise.jsonl" 2>/dev/null)"
+
+s '[.[0,1,3,4] | .median_diff < 2] | all' && pass "on air: the floor (median_diff) stays under 2 where only the bar differs" \
+  || fail "the floor" "$(jq -c -s 'map({minute, region_diff, median_diff})' "$W/samples.jsonl")"
+
+rc=0
+python3 -I "$HERE/sampler.py" --programme "$W/shift" --camera "$W/cam" --actions "$W/actions.jsonl" --soak "$W/soak.json" \
+  --out "$W/shift.jsonl" >/dev/null 2>&1 || rc=$?
+jq -e -s '(map(.differs) | any | not) and ([.[0,1,2,3,4] | .median_diff >= 4 and (.error | test("level shift"))] | all)' "$W/shift.jsonl" >/dev/null 2>&1 \
+  && pass "a level-shifted programme with no overlay: never on air, a level-shift error" \
+  || fail "the level shift" "exit $rc; $(jq -c -s 'map({differs, region_diff, median_diff, error})' "$W/shift.jsonl" 2>/dev/null)"
 
 grep -v '"start"' "$W/actions.jsonl" >"$W/nostart.jsonl"
 rc=0

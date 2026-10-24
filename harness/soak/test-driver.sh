@@ -9,7 +9,10 @@
 # Runs 3 and 4 (in parallel) take page=real with a stub page source (web/up.sh) and a stub score
 # driver: the session fake-control serves carries the page's URL and token and stays out of /out,
 # the deliveries are written, and the secrets scan covers the page source's credentials (run 4
-# plants the page token in /out, and must read as a leak).
+# plants the page token in /out, and must read as a leak). Run 5 (in parallel too) hangs the checker:
+# the driver stops it at the hard stop's reserve, skips the sampler, and still exits by the hard
+# stop. Run 6 (page=real) fails in the page source after its signing key reached /out: the error
+# path's scan names it before anything is fetched.
 #
 #   HARNESS_BASH=<bash 5> harness/soak/test-driver.sh     (driver.sh needs bash 5: mapfile, EPOCHREALTIME)
 #
@@ -34,7 +37,7 @@ cp "$ROOT/contracts/fixtures/relay-job.v1/session-composed-720p.json" "$W/soak/"
 cp "$ROOT/harness/pages/overlay-test.html" "$W/soak/pages/"
 jq '. + {min_drive_min: 1, dropout_every_s: 6, dropout_phase_s: 3, dropout_pause_s: 1, disconnect_hold_s: 2,
          control_wait_s: 3, live_wait_s: 20, end_wait_s: 10, log_wait_s: 20, lost_beats_end_s: 5,
-         sample_offsets_s: [6], sample_margin_s: 0}' "$HERE/soak.json" >"$W/soak/soak.json"
+         sample_offsets_s: [6], sample_margin_s: 0, post_check_reserve_s: 5}' "$HERE/soak.json" >"$W/soak/soak.json"
 
 STATE="$W/state"
 export STATE
@@ -90,10 +93,12 @@ esac
 EOF
   printf '#!/usr/bin/env bash\nexit 3\n' >"$W/bin/$fam-legacy"
 done
-# The checker: a report whose frame count says it ran on the driver's inputs.
+# The checker: a report whose frame count says it ran on the driver's inputs; it hangs (its pid
+# recorded) when the run's state says so.
 cat >"$W/bin/checker" <<'EOF'
 #!/usr/bin/env bash
 echo "checker $*" >>"$STATE/calls"
+if [ -e "$STATE/hang" ]; then echo "$$" >"$STATE/checker.pid"; exec sleep 300; fi
 o=""
 while [ "$#" -gt 0 ]; do [ "$1" = --out ] && o="$2"; shift; done
 echo '{"frames":1}' >"$o"
@@ -139,7 +144,11 @@ echo "up.sh $(env | cut -d= -f1 | sort | tr '\n' ' ')" >>"$STATE/calls"
 mkdir -p "$WEB_STATE"; chmod 700 "$WEB_STATE"
 r() { od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; }
 r >"$WEB_STATE/auth-secret"
-printf '{"seazn_session":"%s","seazn_org":"%s"}' "ses$(r)" "org$(r)" >"$WEB_STATE/cookies.json"
+# The jar as the web leaves it: the session, the org, and the signed-in hint, whose value is "1"
+# (rehearsal 40131252539 read that "1" as a leak in every file).
+printf '{"seazn_session":"%s","seazn_org":"%s","seazn_signed_in":"1"}' "ses$(r)" "org$(r)" >"$WEB_STATE/cookies.json"
+# A page source that fails after its signing key reached /out (and before the signed URL).
+if [ -e "$STATE/web-fail" ]; then echo "AUTH_SECRET=$(cat "$WEB_STATE/auth-secret")" >>"$OUT/web.log"; echo "soak-web: FAIL (stub)"; exit 1; fi
 st="eyJ$(r).eyJ$(r).$(r)"
 printf 'http://%s:%s/overlay/fixtures/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee?sid=%s&st=%s&host=compositor&delay=%s&template=bar\n' \
   "$HOST" "$WEB_PORT" "$SESSION_ID" "$st" "$WEB_DELAY_MS" >"$WEB_STATE/overlay-url"
@@ -196,6 +205,33 @@ touch "$W/state4/leak"
 real_run 3 &
 real_pids="$!"
 real_run 4 &
+real_pids="$real_pids $!"
+# Run 5: page=test, the checker hangs. Its start and end times recorded, against its hard stop.
+mkdir -p "$W/out5" "$W/state5"
+touch "$W/state5/hang"
+stub_run "$W/out5" "$W/state5"
+(
+  t="$(now_ms)"
+  rc=0
+  env -i PATH="$PATH_STUB" HOME="$W" STATE="$W/state5" SOAK_ROOT="$W/soak" SOAK_OUT="$W/out5" \
+    SESSION_ID="11111111-2222-4333-8444-555555555556" JOB_TOKEN="$JOB_TOKEN" SOAK_DRIVE_MIN=1 \
+    SOAK_DEADLINE_MS=$((t + 600000)) SOAK_HARD_STOP_MS=$((t + 100000)) SOAK_PAGE=test \
+    FLY_MACHINE_ID=m0 FLY_APP_NAME=soak-test "$BASH5" "$W/soak/driver.sh" >"$W/driver5.out" 2>&1 || rc=$?
+  echo "$rc $t $(now_ms)" >"$W/rc5"
+) &
+real_pids="$real_pids $!"
+# Run 6: page=real, the page source fails after leaking its key into /out; the hard stop is near.
+mkdir -p "$W/out6" "$W/state6"
+touch "$W/state6/web-fail"
+(
+  t="$(now_ms)"
+  rc=0
+  env -i PATH="$PATH_STUB" HOME="$W" STATE="$W/state6" SOAK_ROOT="$W/soak" SOAK_OUT="$W/out6" SOAK_WEB_STATE="$W/web6" \
+    SESSION_ID="11111111-2222-4333-8444-555555555557" JOB_TOKEN="$JOB_TOKEN" SOAK_DRIVE_MIN=1 \
+    SOAK_DEADLINE_MS=$((t + 600000)) SOAK_HARD_STOP_MS=$((t + 8000)) SOAK_PAGE=real \
+    FLY_MACHINE_ID=m0 FLY_APP_NAME=soak-test "$BASH5" "$W/soak/driver.sh" >"$W/driver6.out" 2>&1 || rc=$?
+  echo "$rc" >"$W/rc6"
+) &
 real_pids="$real_pids $!"
 
 # The hard stop from the launch itself (the stubs above took a moment), with room for a slow boot.
@@ -261,13 +297,14 @@ env -i PATH="$W/bin:/usr/bin:/bin:/usr/sbin:/sbin:$(dirname "$(command -v jq)")"
   SOAK_DRIVE_MIN=1 SOAK_DEADLINE_MS=$((t1 + 600000)) SOAK_HARD_STOP_MS=$((t1 + 8000)) SOAK_PAGE=test \
   FLY_MACHINE_ID=m0 FLY_APP_NAME=soak-test "$BASH5" "$W/soak/driver.sh" >"$W/driver2.out" 2>&1 || rc2=$?
 held_ms=$(($(now_ms) - t1))
-check "error: done not ok, with the driver's exit" '.[0] | .ok == false and .driver_exit == 1' "$W/out2/done"
+check "error: done not ok, with the driver's exit" '.[0] | .ok == false and .driver_exit == 1 and .leaks == 0' "$W/out2/done"
 check "error: status error" '.[0].phase == "error"' "$W/out2/status.json"
+check "error: the secrets scan ran before the fetch, clean, nothing skipped" '.[0] | .scanned > 0 and .leaks == 0 and .skipped == []' "$W/out2/secrets.json"
 checked=$((checked + 1))
-if [ "$rc2" -eq 1 ] && [ "$held_ms" -ge 7500 ]; then
-  echo "PASS error: exit 1, /out held to the hard stop (${held_ms} ms)"
+if [ "$rc2" -eq 1 ] && [ "$held_ms" -ge 7500 ] && [ "$held_ms" -lt 14000 ]; then
+  echo "PASS error: exit 1, /out held to the hard stop and no longer (${held_ms} ms)"
 else
-  echo "FAIL error: exit $rc2 after ${held_ms} ms (want 1, held at least 7500 ms)"
+  echo "FAIL error: exit $rc2 after ${held_ms} ms (want 1, held from 7500 ms to under 14000 ms)"
   tail -n 20 "$W/driver2.out"
   failures=$((failures + 1))
 fi
@@ -302,14 +339,60 @@ check "real: done ok, no leak" '.[0] | .ok and .leaks == 0 and .checker_exit == 
 checked=$((checked + 1))
 if grep -q "secrets checked" "$W/driver3.out" && ! grep -q "is empty: nothing to scan with" "$W/driver3.out"; then echo "PASS real: every credential had a value to scan with"; else
   echo "FAIL real: a credential was empty"; failures=$((failures + 1)); fi
+checked=$((checked + 1))
+if grep -q "secrets: cookies not scanned (no authority, not credentials): seazn_org, seazn_signed_in" "$W/driver3.out"; then
+  echo "PASS real: the session cookie scanned, the org and the hint named as not credentials"; else
+  echo "FAIL real: no cookies-not-scanned line"; grep 'secrets' "$W/driver3.out"; failures=$((failures + 1)); fi
 check "real leak: the page token in /out reads as a leak, done not ok" '.[0] | .leaks == 1 and .ok == false' "$W/out4/done"
 checked=$((checked + 1))
-if grep -q "FAIL WEB_PAGE_TOKEN appears in /out" "$W/driver4.out"; then echo "PASS real leak: named WEB_PAGE_TOKEN"; else
-  echo "FAIL real leak: no WEB_PAGE_TOKEN line"; tail -n 10 "$W/driver4.out"; failures=$((failures + 1)); fi
+if grep -q "FAIL WEB_PAGE_TOKEN appears in /out: web.log:1 \"GET /overlay?st=<WEB_PAGE_TOKEN>\"" "$W/driver4.out"; then
+  echo "PASS real leak: named WEB_PAGE_TOKEN, its file and line, the line redacted"; else
+  echo "FAIL real leak: no redacted WEB_PAGE_TOKEN line"; grep 'appears in' "$W/driver4.out"; failures=$((failures + 1)); fi
+check "real leak: secrets.json carries the redacted report (kind, file:line, the line)" \
+  '.[0] | .leaks == 1 and (.leaked | length == 1) and .leaked[0].kind == "WEB_PAGE_TOKEN"
+   and .leaked[0].where == ["web.log:1 \"GET /overlay?st=<WEB_PAGE_TOKEN>\""]' "$W/out4/secrets.json"
+checked=$((checked + 1))
+if sed -nE 's/.*[?&]st=([^&]+).*/\1/p' "$W/web4/overlay-url" | grep -qF -f - "$W/driver4.out" "$W/out4/secrets.json"; then
+  echo "FAIL real leak: the report printed the token it found"; failures=$((failures + 1)); else
+  echo "PASS real leak: the report (the log, secrets.json) never prints the token"; fi
+
+# Run 5: the hung checker stopped at the reserve, the sampler skipped, the driver out by the hard stop.
+read -r rc5 t5 e5 <"$W/rc5"
+checked=$((checked + 1))
+if [ "$rc5" -eq 0 ] && [ $((e5 - t5)) -ge 99000 ] && [ $((e5 - t5)) -lt 104000 ]; then
+  echo "PASS hung checker: the driver exited 0 by the hard stop ($((e5 - t5)) ms of 100000)"
+else
+  echo "FAIL hung checker: the driver exited $rc5 after $((e5 - t5)) ms (want 0, from 99000 to under 104000)"
+  tail -n 20 "$W/driver5.out"; failures=$((failures + 1))
+fi
+check "hung checker: done carries 124 for the checker and the sampler" '.[0] | .checker_exit == 124 and .sampler_exit == 124 and .leaks == 0' "$W/out5/done"
+checked=$((checked + 1))
+if grep -q "FAIL checker: still running at the hard stop's reserve: stopped" "$W/driver5.out" \
+  && grep -q "FAIL sampler: no time left before the hard stop's reserve: skipped" "$W/driver5.out"; then
+  echo "PASS hung checker: stopped by name, the sampler skipped by name"
+else
+  echo "FAIL hung checker: no stop or skip line"; tail -n 12 "$W/driver5.out"; failures=$((failures + 1)); fi
+checked=$((checked + 1))
+if [ -s "$W/state5/checker.pid" ] && ! kill -0 "$(cat "$W/state5/checker.pid")" 2>/dev/null; then
+  echo "PASS hung checker: its process is gone"
+else
+  echo "FAIL hung checker: $( [ -s "$W/state5/checker.pid" ] && echo "pid $(cat "$W/state5/checker.pid") still runs" || echo "it never started")"
+  failures=$((failures + 1)); fi
+
+# Run 6: the page source's key in /out, found by the error path's scan; the token never made, skipped.
+checked=$((checked + 1))
+if [ "$(cat "$W/rc6")" -eq 1 ] && grep -q "FAIL WEB_SIGNING_KEY appears in /out" "$W/driver6.out"; then
+  echo "PASS web error: exit 1, the error path's scan names WEB_SIGNING_KEY"
+else
+  echo "FAIL web error: exit $(cat "$W/rc6"), no WEB_SIGNING_KEY line"; tail -n 12 "$W/driver6.out"; failures=$((failures + 1)); fi
+check "web error: secrets.json has the leak and skips the token it never made" \
+  '.[0] | .scanned > 0 and .leaks == 1 and .skipped == ["WEB_PAGE_TOKEN"]' "$W/out6/secrets.json"
+check "web error: done not ok, with the leak" '.[0] | .ok == false and .leaks == 1' "$W/out6/done"
 
 checked=$((checked + 1))
-if printf '%s\n' "$JOB_TOKEN" | grep -rqF -f - "$W/out" "$W/out2" "$W/out3" "$W/out4" "$W/driver.out" "$W/driver2.out" \
-  "$W/driver3.out" "$W/driver4.out" "$STATE/calls" "$W/state3/calls" "$W/state4/calls"; then
+if printf '%s\n' "$JOB_TOKEN" | grep -rqF -f - "$W/out" "$W/out2" "$W/out3" "$W/out4" "$W/out5" "$W/out6" "$W/driver.out" "$W/driver2.out" \
+  "$W/driver3.out" "$W/driver4.out" "$W/driver5.out" "$W/driver6.out" "$STATE/calls" "$W/state3/calls" "$W/state4/calls" \
+  "$W/state5/calls" "$W/state6/calls"; then
   echo "FAIL the job token reached a file"
   failures=$((failures + 1))
 else

@@ -29,11 +29,18 @@ COPY harness/soak/web/build/db /web/db
 COPY harness/soak/web/build/web.json /web/web.json
 COPY harness/soak/web/lib.mjs harness/soak/web/seed.mjs harness/soak/web/score.mjs harness/soak/web/overlay-url.mjs \
      harness/soak/web/serve.sh harness/soak/web/up.sh harness/soak/web/smoke.sh harness/soak/web/session.sql /soak/web/
-# Every shared library the copied node links must resolve here: a missing one fails the build by
-# name, not the Machine with a crash.
+# Every shared library the copied node links must resolve here, and so must every native add-on's
+# (`*.node`: sharp at 7dcb3c42e2, which loads lazily, on the first route that needs it): a missing
+# one, or a GLIBC_x the image lacks, fails the build by name, not the Machine with a crash. The add-on
+# count is printed; none at all fails too (the web's sharp went missing from the trace).
 RUN chmod 0755 /usr/local/bin/node /soak/web/serve.sh /soak/web/up.sh /soak/web/smoke.sh \
     && ldd /usr/local/bin/node \
     && if ldd /usr/local/bin/node | grep 'not found'; then echo "node: a shared library is missing (above)"; exit 1; fi \
+    && find /web/app -name '*.node' -type f > /tmp/addons \
+    && n=0 && while read -r f; do n=$((n + 1)); ldd "$f" > /tmp/addon.ldd 2>&1 || true; \
+         if grep 'not found' /tmp/addon.ldd; then echo "$f: a shared library is missing (above)"; exit 1; fi; \
+       done < /tmp/addons \
+    && echo "native add-ons: $n checked" && test "$n" -gt 0 && rm -f /tmp/addons /tmp/addon.ldd \
     && node --version && test -f /web/app/apps/web/server.js \
     && install -d -o postgres -g postgres -m 700 /var/lib/soak-pg \
     && runuser -u postgres -- /usr/lib/postgresql/16/bin/initdb -D /var/lib/soak-pg -U postgres --auth=trust \

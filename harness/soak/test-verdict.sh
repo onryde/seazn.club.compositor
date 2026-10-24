@@ -140,7 +140,7 @@ case_ stepped-beat real fail '6' '6:sizing alarm: the guest is short of CPU' \
 
 # --- guard reds: each other conjunct, alone -------------------------------------------------------
 # No report: every check that reads it fails ("no report"), never passes on nothing.
-case_ no-report real fail '1,2,4,5.beats,5.disconnects,5a,5b,6,inputs' 'inputs:no report' '.report = null'
+case_ no-report real fail '1,2,4,5.beats,5.disconnects,5a,5b,5c,6,inputs' 'inputs:no report' '.report = null'
 case_ no-frames real fail 'inputs' 'no frames' '.report.frames = 0'
 # No start action: the drive's windows are unknown, so every windowed check fails too.
 case_ no-start real fail '1,5.beats,5a,5c,inputs' 'inputs:one start and one end action' 'del(.actions[] | select(.kind == "start"))'
@@ -150,6 +150,13 @@ case_ checker-failure real fail 'inputs' 'checker failed' '.report.checker_failu
 case_ memory-no-beats real fail '1' 'no memMb' \
   '(.actions[] | select(.kind == "start") | .at_ms) as $s
    | .report.heartbeats.series |= map(if .received_ms >= $s + 1200000 then del(.body.memMb) else . end)'
+# The three anti-vacuity guards nothing else reaches alone: a renamed beat field must fail, never
+# pass on nothing (hour 1's memMb; droppedFrames and rung on every beat).
+case_ memory-no-beats-hour1 real fail '1' 'no memMb in hour 1' \
+  '(.actions[] | select(.kind == "start") | .at_ms) as $s
+   | .report.heartbeats.series |= map(if .received_ms < $s + 600000 then del(.body.memMb) else . end)'
+case_ no-dropped-frames-field real fail '4' 'no beat carried droppedFrames' '.report.heartbeats.series |= map(del(.body.droppedFrames))'
+case_ no-rung-field real fail '6' 'no beat carried a rung' '.report.heartbeats.series |= map(del(.body.rung))'
 case_ pts-gap real fail '2' 'pts gaps' '.report.pts_gaps = [{at_ms: 1792800400000, gap_ms: 400}]'
 case_ late-reconnect real fail '2' 'after its disconnect ended' \
   '.report.output_outages[1].to_wall_ms = ((.actions[] | select(.kind == "disconnect" and .slot == 1) | .end_ms) + 8000)'
@@ -175,6 +182,13 @@ case_ delivery-gap real fail '5c' 'deliveries' \
 case_ delivery-refused real fail '5c' 'deliveries' \
   '(.actions[] | select(.kind == "start") | .at_ms) as $s
    | .deliveries |= map(if .at_ms >= $s + 420000 and .at_ms < $s + 480000 then .ok = false | .status = 409 else . end)'
+# (c) judges what the page received: one drive beat with scoreStale true (the page went its stale
+# budget without a good poll), and no beat carrying scoreStale at all (the page never said).
+case_ score-stale real fail '5c' '5c:score stale: 1 drive beat' \
+  '(.actions[] | select(.kind == "start") | .at_ms) as $s
+   | (.report.heartbeats.series | map(.received_ms >= $s + 900000) | index(true)) as $i
+   | .report.heartbeats.series[$i].body.scoreStale = true'
+case_ score-stale-unreported real fail '5c' 'no drive beat carried scoreStale' '.report.heartbeats.series |= map(del(.body.scoreStale))'
 case_ overlay-off-air real fail '5d' 'overlay' '.samples[9].differs = false'
 case_ overlay-unsampled real fail '5d' 'overlay' 'del(.samples[9])'
 

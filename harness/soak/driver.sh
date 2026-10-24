@@ -10,8 +10,11 @@
 # Environment (the Machine's; set by soak.yml):
 #   SESSION_ID, JOB_TOKEN   the run's (JOB_TOKEN is random per run and never printed or written)
 #   SOAK_DRIVE_MIN          the drive, in minutes (the verdict's duration)
-#   SOAK_DEADLINE_MS        the compositor's RELAY_DEADLINE_AT, epoch ms (a guard: the drive must end
-#                           before it)
+#   SOAK_DEADLINE_MS        a lower bound on the compositor's RELAY_DEADLINE_AT, epoch ms: the launch
+#                           step's start plus the run (the compositor's own is anchored at its launch,
+#                           after this Machine's boot, so later). A guard: the drive should end before
+#                           it; the WARN below is conservative, and the compositor's `deadline=` line
+#                           is the real one
 #   SOAK_HARD_STOP_MS       epoch ms: this process exits by then whatever happened, so the Machine
 #                           stops even if the job's cleanup never runs
 #   SOAK_PAGE               test (C14's overlay-test.html, served by fake-control: plumbing) or real
@@ -77,6 +80,102 @@ log "disk: $(df -h "$OUT" | tail -n 1 | awk '{print $2" total, "$4" free"}')"
 HARNESS_SRT_PASSPHRASE="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 export HARNESS_SRT_PASSPHRASE
 
+# The secrets scan: no credential in any file this run wrote (the recordings are binary and hold
+# none: skipped). The values go to grep on a pipe, never in argv. On page=real, the page source's
+# too: its signing key, the page token in the signed URL, and the seed account's credential cookies
+# (soak.json's web_credential_cookies: the session; the jar's other cookies carry no authority, the
+# signed-in hint's value is "1", and are named as not scanned).
+# `scan_secrets strict` (the success path, where every credential was made): an empty one counts as
+# a leak, since there is nothing to scan with. `scan_secrets made` (the error path, which may have
+# stopped before the page source made its credentials): an empty one is skipped, by name. A leak is
+# reported by kind, file and line, with the line redacted (leak_where). Writes secrets.json; sets
+# scanned and leaks.
+scanned=0
+leaks=0
+declare -A vals=()
+scan_names=()
+files=()
+# `leak_where <name>`: where vals[name] is, never what: each file:line (five at most) and the line
+# around it with every credential this scan holds replaced by its name and any other long token-like
+# run masked. python reads the values from its environment (export, a builtin), never argv.
+leak_where() {
+  local f n
+  while IFS=: read -r f n; do
+    [[ "$n" =~ ^[0-9]+$ ]] || continue
+    (
+      i=0
+      for k in "${scan_names[@]}"; do
+        [ -n "${vals[$k]:-}" ] || continue
+        export "SCAN_N_$i=$k" "SCAN_V_$i=${vals[$k]}"
+        i=$((i + 1))
+      done
+      exec python3 -I -c '
+import os, re, sys
+path, want = sys.argv[1], int(sys.argv[2])
+pairs, i = [], 0
+while "SCAN_V_%d" % i in os.environ:
+    pairs.append((os.environ["SCAN_N_%d" % i], os.environ["SCAN_V_%d" % i])); i += 1
+line = b""
+with open(path, "rb") as fh:
+    for k, line in enumerate(fh, 1):
+        if k == want:
+            break
+text = line.decode("utf-8", "replace").rstrip("\n")
+for name, v in sorted(pairs, key=lambda p: -len(p[1])):
+    text = text.replace(v, "<" + name + ">")
+text = re.sub(r"[A-Za-z0-9+/=_.~%-]{24,}", "<long>", text)
+at = max(text.find("<" + sys.argv[3] + ">"), 0)
+print("%s:%d \"%s\"" % (os.path.basename(path), want, text[max(at - 60, 0):at + 100]))
+' "$f" "$n" "$1"
+    ) || echo "$(basename "$f"):$n (the line could not be read)"
+  done < <(printf '%s\n' "${vals[$1]}" | grep -nF -f - "${files[@]}" 2>/dev/null | cut -d: -f1,2 | head -n 5)
+}
+scan_secrets() {
+  local mode="$1" name skipped=() leaked=() where k
+  leaks=0
+  mapfile -t files < <(find "$OUT" \( -path "$OUT/rec" -o -path "$OUT/camrec" \) -prune -o -type f -print)
+  scanned="${#files[@]}"
+  vals=([JOB_TOKEN]="$JOB_TOKEN" [HARNESS_SRT_PASSPHRASE]="${HARNESS_SRT_PASSPHRASE:-}")
+  scan_names=(JOB_TOKEN HARNESS_SRT_PASSPHRASE)
+  if [ "$SOAK_PAGE" = real ]; then
+    vals[WEB_SIGNING_KEY]="$(cat "$WEB_STATE/auth-secret" 2>/dev/null || true)"
+    vals[WEB_PAGE_TOKEN]="$(sed -nE 's/.*[?&]st=([^&]+).*/\1/p' "$WEB_STATE/overlay-url" 2>/dev/null || true)"
+    scan_names+=(WEB_SIGNING_KEY WEB_PAGE_TOKEN)
+    for k in $(jq -r '.web_credential_cookies[]' "$SOAK/soak.json"); do
+      vals["WEB_COOKIE[$k]"]="$(jq -r --arg k "$k" '.[$k] // ""' "$WEB_STATE/cookies.json" 2>/dev/null || true)"
+      scan_names+=("WEB_COOKIE[$k]")
+    done
+    if [ -s "$WEB_STATE/cookies.json" ]; then
+      local others
+      others="$(jq -r --slurpfile s "$SOAK/soak.json" '[keys[] | select(. as $k | $s[0].web_credential_cookies | index($k) | not)] | join(", ")' "$WEB_STATE/cookies.json" 2>/dev/null || true)"
+      [ -z "$others" ] || log "secrets: cookies not scanned (no authority, not credentials): $others"
+    fi
+  fi
+  if [ "$scanned" -eq 0 ]; then
+    log "FAIL no file in /out to scan"
+    leaks=$((leaks + 1))
+  fi
+  for name in "${scan_names[@]}"; do
+    if [ -z "${vals[$name]:-}" ]; then
+      if [ "$mode" = strict ]; then
+        log "FAIL $name is empty: nothing to scan with"
+        leaks=$((leaks + 1))
+      else
+        skipped+=("$name")
+      fi
+    elif [ "$scanned" -gt 0 ] && printf '%s\n' "${vals[$name]}" | grep -qF -f - "${files[@]}"; then
+      where="$(leak_where "$name")"
+      log "FAIL $name appears in /out: $(paste -sd ';' - <<<"$where" | sed 's/;/; /g')"
+      leaks=$((leaks + 1))
+      # The redacted report, for the job to print when it refuses the upload.
+      leaked+=("$(jq -cn --arg n "$name" --arg w "$where" '{kind: $n, where: ($w | split("\n") | map(select(. != "")))}')")
+    fi
+  done
+  printf '%s\n' "${leaked[@]}" | jq -cs --argjson s "$scanned" --argjson l "$leaks" --arg skipped "${skipped[*]:-}" \
+    '{scanned: $s, leaks: $l, skipped: ($skipped | split(" ") | map(select(. != ""))), leaked: .}' >"$OUT/secrets.json"
+  log "secrets checked: $scanned files, $leaks leaks${skipped[*]:+ (not made yet, skipped: ${skipped[*]})}"
+}
+
 pids=()
 done_written=0
 stopping=0
@@ -86,7 +185,10 @@ finish() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done
   if [ "$done_written" -eq 0 ]; then
     status error "the driver exited ($rc) before done"
-    jq -cn --argjson rc "$rc" '{ok: false, driver_exit: $rc}' >"$OUT/done"
+    # The job uploads what it fetches here too: the same scan first (secrets.json), over what was
+    # made, unless the Machine is being stopped (nothing is fetched then).
+    [ "$stopping" -eq 1 ] || scan_secrets made
+    jq -cn --argjson rc "$rc" --argjson l "$leaks" '{ok: false, driver_exit: $rc, leaks: $l}' >"$OUT/done"
     # Keep /out for the job's fetch (it reads phase error and fetches at once), unless the Machine is
     # being stopped: the hard stop still bounds it.
     if [ "$stopping" -eq 0 ]; then
@@ -194,7 +296,7 @@ start_ms="$(now_ms)"
 end_ms=$((start_ms + DRIVE_S * 1000))
 ending_budget_ms=$(($(soak end_wait_s) * 1000))
 if [ $((end_ms + ending_budget_ms)) -gt "$SOAK_DEADLINE_MS" ]; then
-  log "WARN the drive ends $(((end_ms + ending_budget_ms - SOAK_DEADLINE_MS) / 1000)) s after the compositor's deadline allows"
+  log "WARN the drive ends $(((end_ms + ending_budget_ms - SOAK_DEADLINE_MS) / 1000)) s after the launch step's deadline bound allows (the compositor's own is later by its boot: its \`deadline=\` line)"
 fi
 
 # The schedule, in time order: [{kind, slot, at_s}], dropouts and disconnects (never overlapping:
@@ -338,44 +440,50 @@ for _ in $(seq 1 30); do kill -0 "$mtx_pid" 2>/dev/null || break; sleep 1; done
 kill -KILL "$mtx_pid" 2>/dev/null || true
 wait "$mtx_pid" 2>/dev/null || true
 status checking
+# The checker and the sampler each run until the hard stop less post_check_reserve_s (the job's
+# fetch after done), no longer: one that hangs is stopped (TERM, then KILL after 5 s) and reads exit
+# 124, and one with no time left is skipped with 124. So the hard stop bounds this Machine on every
+# path, a hung checker's too, even when the job's cleanup never runs.
+check_until_ms=$((SOAK_HARD_STOP_MS - $(soak post_check_reserve_s) * 1000))
+bounded() { # <name> <log> <command>...
+  local name="$1" out="$2" p rc=0
+  shift 2
+  if [ "$(now_ms)" -ge "$check_until_ms" ]; then
+    log "FAIL $name: no time left before the hard stop's reserve: skipped"
+    return 124
+  fi
+  "$@" >"$out" 2>&1 &
+  p=$!
+  pids+=("$p")
+  while kill -0 "$p" 2>/dev/null; do
+    if [ "$(now_ms)" -ge "$check_until_ms" ]; then
+      log "FAIL $name: still running at the hard stop's reserve: stopped"
+      kill -TERM "$p" 2>/dev/null || true
+      for _ in 1 2 3 4 5; do kill -0 "$p" 2>/dev/null || break; sleep 1; done
+      kill -KILL "$p" 2>/dev/null || true
+      wait "$p" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+  done
+  wait "$p" || rc=$?
+  return "$rc"
+}
 checker_exit=0
 sampler_exit=0
-XDG_CACHE_HOME=/tmp env -u JOB_TOKEN -u SESSION_ID -u HARNESS_SRT_PASSPHRASE checker --recordings "$OUT/rec" --emit "$OUT/emit.jsonl" --heartbeats "$OUT/heartbeats.jsonl" \
+bounded checker "$OUT/checker.log" env -u JOB_TOKEN -u SESSION_ID -u HARNESS_SRT_PASSPHRASE XDG_CACHE_HOME=/tmp \
+  checker --recordings "$OUT/rec" --emit "$OUT/emit.jsonl" --heartbeats "$OUT/heartbeats.jsonl" \
   --timeline "$OUT/timeline.json" --compositor-log "$OUT/compositor.log" --end-request-ms "$end_request_ms" \
-  --out "$OUT/report.json" >"$OUT/checker.log" 2>&1 || checker_exit=$?
-tail -n 5 "$OUT/checker.log"
+  --out "$OUT/report.json" || checker_exit=$?
+tail -n 5 "$OUT/checker.log" 2>/dev/null || true
 # Check (d)'s samples: the programme against the camera-only recording, once a minute (on the test
 # page too, where the verdict holds (d) pending: its numbers are printed all the same).
 status sampling
-python3 -I "$SOAK/sampler.py" --programme "$OUT/rec" --camera "$OUT/camrec" --actions "$OUT/actions.jsonl" \
-  --soak "$SOAK/soak.json" --out "$OUT/overlay-samples.jsonl" >"$OUT/sampler.log" 2>&1 || sampler_exit=$?
-tail -n 2 "$OUT/sampler.log"
+bounded sampler "$OUT/sampler.log" python3 -I "$SOAK/sampler.py" --programme "$OUT/rec" --camera "$OUT/camrec" \
+  --actions "$OUT/actions.jsonl" --soak "$SOAK/soak.json" --out "$OUT/overlay-samples.jsonl" || sampler_exit=$?
+tail -n 2 "$OUT/sampler.log" 2>/dev/null || true
 
-# No credential in any file this run wrote (the recordings are binary and hold none: skipped). The
-# values go to grep on a pipe, never in argv. On page=real, the page source's too: its signing key,
-# the page token in the signed URL, and the seed account's session cookies.
-scanned=0
-leaks=0
-mapfile -t files < <(find "$OUT" \( -path "$OUT/rec" -o -path "$OUT/camrec" \) -prune -o -type f -print)
-scanned="${#files[@]}"
-names=(JOB_TOKEN HARNESS_SRT_PASSPHRASE)
-if [ "$SOAK_PAGE" = real ]; then
-  WEB_SIGNING_KEY="$(cat "$WEB_STATE/auth-secret" 2>/dev/null || true)"
-  WEB_PAGE_TOKEN="$(sed -nE 's/.*[?&]st=([^&]+).*/\1/p' "$WEB_STATE/overlay-url" 2>/dev/null || true)"
-  WEB_COOKIES="$(jq -r '.[]' "$WEB_STATE/cookies.json" 2>/dev/null || true)"
-  names+=(WEB_SIGNING_KEY WEB_PAGE_TOKEN WEB_COOKIES)
-fi
-for name in "${names[@]}"; do
-  if [ -z "${!name}" ]; then
-    log "FAIL $name is empty: nothing to scan with"
-    leaks=$((leaks + 1))
-  elif printf '%s\n' "${!name}" | grep -qF -f - "${files[@]}"; then
-    log "FAIL $name appears in /out"
-    leaks=$((leaks + 1))
-  fi
-done
-jq -cn --argjson s "$scanned" --argjson l "$leaks" '{scanned: $s, leaks: $l}' >"$OUT/secrets.json"
-log "secrets checked: $scanned files, $leaks leaks"
+scan_secrets strict
 
 jq -cn --argjson c "$checker_exit" --argjson sx "$sampler_exit" --argjson live "$went_live" --arg why "$ended_early" --argjson l "$leaks" \
   '{ok: ($l == 0), checker_exit: $c, sampler_exit: $sx, went_live: ($live == 1), ended_early: (if $why == "" then null else $why end), leaks: $l}' \
@@ -386,5 +494,7 @@ log "done: checker exit $checker_exit; waiting for the job to fetch /out"
 
 # Stay up for the job's fetch, then stop (the Machine stops with this process): a lost cleanup
 # never leaves the harness running past the hard stop.
-while [ "$(now_ms)" -lt "$SOAK_HARD_STOP_MS" ]; do sleep 10; done
+while [ "$(now_ms)" -lt "$SOAK_HARD_STOP_MS" ]; do
+  sleep "$(awk -v d=$((SOAK_HARD_STOP_MS - $(now_ms))) 'BEGIN { s = d / 1000; if (s > 10) s = 10; if (s < 0.1) s = 0.1; printf "%.3f", s }')"
+done
 log "hard stop"

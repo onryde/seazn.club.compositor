@@ -14,15 +14,19 @@ honest frame), and decodes three frames: the programme at T, the camera at T, an
   is stable; on noise, none is.
 - `region_diff` is the largest mean absolute difference between the programme and the camera over
   the stable bands: the overlay's pixels, where it is drawn over a still part of the picture.
-- A minute `differs` (the overlay is on air) when some band is stable and region_diff >=
-  `overlay_diff_min`. With no stable band there is no reference: the sample carries an error and
+- `median_diff` is the median of the same differences: the floor, which an overlay drawn over a
+  part of the picture leaves near zero. A floor at or over `overlay_diff_min` is a uniform level
+  shift or a misalignment between the two recordings, not an overlay.
+- A minute `differs` (the overlay is on air) when some band is stable, region_diff >=
+  `overlay_diff_min` and median_diff is under it. With no stable band there is no reference, and
+  with a raised floor the reference does not line up: either way the sample carries an error and
   differs false, so check (d) fails rather than passes on a picture it cannot read.
 
     python3 -I harness/soak/sampler.py --programme <dir> --camera <dir> --actions <actions.jsonl>
         --soak <soak.json> --out <overlay-samples.jsonl> [--ffmpeg <bin>]
 
-Writes one JSON line per minute: {minute, at_ms, differs, region_diff, stable_bands, moving_bands,
-programme, camera} or {minute, at_ms, differs: false, error}. Exit 0 (the verdict judges), 64 on a usage error,
+Writes one JSON line per minute: {minute, at_ms, differs, region_diff, median_diff, stable_bands,
+moving_bands, programme, camera} or {minute, at_ms, differs: false, error}. Exit 0 (the verdict judges), 64 on a usage error,
 1 when the run has no start action (nothing to sample).
 """
 
@@ -129,9 +133,15 @@ def judge(prog, cam, cam_later, soak):
         return {"differs": False, "error": "no stable band: the camera moves everywhere (no reference)",
                 "moving_bands": len(control)}
     diff = bands(prog, cam, rows)
-    rd = round(max(diff[i] for i in stable), 2)
-    return {"differs": rd >= soak["overlay_diff_min"], "region_diff": rd,
-            "stable_bands": len(stable), "moving_bands": len(control) - len(stable)}
+    over = sorted(diff[i] for i in stable)
+    rd = round(over[-1], 2)
+    n = len(over)
+    md = round(over[n // 2] if n % 2 else (over[n // 2 - 1] + over[n // 2]) / 2, 2)
+    out = {"differs": rd >= soak["overlay_diff_min"] and md < soak["overlay_diff_min"], "region_diff": rd,
+           "median_diff": md, "stable_bands": len(stable), "moving_bands": len(control) - len(stable)}
+    if md >= soak["overlay_diff_min"]:
+        out["error"] = "the programme differs from the camera everywhere (a level shift or misalignment, not an overlay)"
+    return out
 
 
 def plan(actions, soak):

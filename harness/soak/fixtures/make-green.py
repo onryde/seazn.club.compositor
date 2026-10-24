@@ -35,7 +35,7 @@ while t <= S + D * 1000 + 10000:
             "droppedFrames": dropped, "encoderSpeed": 1.0, "cpuPct": 52.0,
             "memMb": 910 + (i % 7), "programmePhase": "live", "input": "connected",
             "output": "connected", "graphics": graphics, "pipelineRebuilds": 0, "sinkSwaps": 0,
-            "rung": "full",
+            "rung": "full", "scoreStale": False,
         },
     })
     t += HB

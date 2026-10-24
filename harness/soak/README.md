@@ -48,7 +48,11 @@ instant, the camera, and the camera `control_gap_s` later. Each frame is cut int
   the ball's and the strip's. On a stable band, the camera's frame is the reference whatever the
   programme's latency.
 - **`region_diff`** is the largest programme-versus-camera difference over the stable bands. The
-  minute is on air when it is at least `overlay_diff_min`.
+  minute is on air when it is at least `overlay_diff_min`, and the floor is not.
+- **`median_diff`** is the floor: the median of the same differences. An overlay over part of the
+  picture leaves it near zero. A floor at or over `overlay_diff_min` is a level shift or a
+  misalignment between the recordings, not an overlay: the sample carries an error and is off air
+  (`test-sampler.sh`: the programme 8 luma brighter, no bar).
 - **No stable band, no reference.** On `noise` no band is stable. Every sample then carries an
   error, and check (d) fails rather than passes.
 
@@ -70,7 +74,9 @@ instant, the camera, and the camera `control_gap_s` later. Each frame is cut int
       Machine's private name resolves.
    2. It launches the compositor Machine:
       - `APP_URL=http://<harness>.vm.seazn-relay-soak.internal:7000`;
-      - `RELAY_DEADLINE_AT` = launch + minutes;
+      - `RELAY_DEADLINE_AT` = the compositor's own launch + minutes, after the harness's boot and
+        `up.sh` (the harness's `SOAK_DEADLINE_MS` is the launch step's start + minutes, a lower
+        bound, so its WARN is conservative);
       - `--restart no` and `--rm` (a Machine that exits is destroyed).
 
       The job token (32 random bytes) is masked. It reaches the Machines only in their config
@@ -84,12 +90,18 @@ instant, the camera, and the camera `control_gap_s` later. Each frame is cut int
    5. The job watches `/out/status.json` every minute (`flyctl machine exec`). At `awaiting_log`, it
       waits for the compositor Machine to exit and for the stream's lag. It converts the stream
       (`flylog.py`), uploads it to `/out/compositor.log` and touches `/out/log-ready`.
-   6. The driver runs the checker and a secrets scan, then writes `/out/done`. It stays up until its
-      hard stop (launch + minutes + `hard_stop_after_min`), so the Machine is bounded even if the
-      job's cleanup never runs. An error writes `done {ok: false}` and phase `error`, and holds the
-      same way.
-   7. The job fetches the outputs (`flyctl ssh sftp get`) and runs a leak gate (the job token,
-      plus the harness's own scan). It then runs `verdict.sh` and uploads `soak-<run>`.
+   6. The driver runs the checker, the sampler and a secrets scan, then writes `/out/done`. It stays
+      up until its hard stop (launch + minutes + `hard_stop_after_min`), so the Machine is bounded
+      even if the job's cleanup never runs. The checker and the sampler each run only until the hard
+      stop less `post_check_reserve_s` (180 s, the job's fetch): a hung one is stopped and reads exit
+      124, and one with no time left is skipped with 124 (`test-driver.sh` run 5). An error writes
+      `done {ok: false}` and phase `error`, runs the same secrets scan over what was made, and holds
+      the same way.
+   7. The job watches until `/out/done` or minutes + `poll_after_min` (20). It fetches the outputs
+      (`flyctl ssh sftp get`) and runs a leak gate: the job token, plus the harness's own scan. A
+      leak uploads nothing and prints the harness's redacted report: the kind, the file and line,
+      and the line with every credential replaced by its name. With no harness scan at all, page=real
+      keeps only `status.json` and `done`. It then runs `verdict.sh` and uploads `soak-<run>`.
    8. **`if: always()`:** it destroys every Machine in the app, then lists it, and fails unless the
       list is empty. The concurrency group `soak` allows one run at a time, so "every Machine" is
       this run's.
@@ -125,12 +137,13 @@ comes from `thresholds.json`, `soak.json` or the drive.
 | `5.beats`, `5.dropouts`, `5.disconnects` | The anti-vacuity counts, scaled to the drive. A disconnect needs dropped packets and an outage it caused. |
 | 5a | `cef alive` lines. |
 | 5b | Graphics never `failed`. Every `overlay hidden` names hang, crash or recycle, and none is bare. |
-| 5c | Score deliveries per minute. |
-| 5d | Overlay samples per minute. |
+| 5c | Score deliveries per minute, and the page received them: drive beats carry the page's `scoreStale` (its `seazn:score-stale` signal), and none reads true. |
+| 5d | An on-air sample per `sample_every_s` slot (the sampler's own unit). |
 | 6 | Every beat's rung is `full`. A stepped beat fails with "sizing alarm: the guest is short of CPU (C17 runbook)". |
 
 On `page=test`, checks 5a–5d read `pending: page source`, and the best status is `plumbing`, not
-`pass`. The workflow then prints `::warning::PLUMBING ONLY`.
+`pass`. The workflow then prints `::warning::PLUMBING ONLY`, heads the step summary "PLUMBING ONLY —
+NOT A SOAK PASS", and the run list names the run `soak page=test <N> min (PLUMBING ONLY)`.
 
 ## The page source (page=real)
 
@@ -146,11 +159,15 @@ R2005 (#982, merge `e0608604c5`) and R2007 PR A (#974, `TemplateId = "bar" | "bu
 2. A dump of the roles and the database, before anything is seeded.
 3. `SKIP_TYPECHECK=1 npm run build`. The step fails if any PostHog, Sentry or Stripe setting is in
    its environment, and none is set, so a local server has nothing to send to live PostHog.
-4. `web/bundle-check.sh` over the staged `.next/static` and `.next/server`. It fails on any PostHog
-   project key, Sentry DSN or Stripe key.
+4. `web/bundle-check.sh` over what `app.tgz` packs except the third-party `node_modules` (into which
+   the build inlines nothing): `server.js` with its inlined config, `.next`, `public` and the rest of
+   `apps/web`, and the database dump. It fails on any PostHog project key, Sentry DSN or Stripe key.
+   On rehearsal 40131252539's artifact: 7149 files, clean.
 
 The images job layers the result onto the soak image (`web.Dockerfile`). Postgres is restored at
-build time, so a dump that does not restore fails the build. It then runs `web/smoke.sh` inside the
+build time, so a dump that does not restore fails the build. `ldd` runs over the node binary and
+every native add-on (`*.node`: sharp's, at `7dcb3c42e2`), and any `not found` fails the build; no
+add-on at all fails it too. It then runs `web/smoke.sh` inside the
 image before it pushes it as `harness-web-<sha>`. The smoke is `up.sh` exactly as the Machine runs
 it, plus three deliveries.
 
@@ -176,7 +193,9 @@ it, plus three deliveries.
    `st` is web's relay-page token, signed with the run's key and valid until 30 min past the hard
    stop. The URL, the session file fake-control serves (`pageToken`, `fixtureId`) and the cookies
    all stay under `/run/soak-web`.
-6. **The pre-flight.** The URL must answer 200 from the Machine.
+6. **The pre-flight.** From the Machine, as the compositor will ask: the page, one `/_next/static`
+   script its HTML names, and the overlay poll the page makes (with `sid` and `st`) must each
+   answer 200. A page whose chunks were never emitted, or whose live-data route fails, fails here.
 
 During the drive, `score.mjs` records a delivery every `score_every_s` (30 s): two a minute against
 check (c)'s one. Runs are even, with boundaries among them. A refused delivery re-reads the position
@@ -184,7 +203,9 @@ from the ledger and tries again at once.
 
 ODI rather than T20: T20's 240 balls would end the match at minute 120 of a 180-minute drive, while
 ODI's first innings alone is 300 balls. The secrets scan adds the signing key, the page token and
-the session cookies to `/out`'s list. The fetch takes `deliveries.jsonl`, `score.log`, `seed.json`,
+the credential cookies (`soak.json` `web_credential_cookies`: `seazn_session`) to `/out`'s list.
+The jar's other cookies carry no authority and are named in the log as not scanned:
+`seazn_org` (an id) and `seazn_signed_in` (its value is `1`). The fetch takes `deliveries.jsonl`, `score.log`, `seed.json`,
 `web-up.log`, `web.log` and `postgres.log`.
 
 **Harness Machine size, page=real: performance-8x, 16384 MB** (soak.json `harness_guest.real`).
@@ -238,11 +259,41 @@ page=test stays at performance-4x, 8192 MB. The compositor Machine is alone on t
 7. **`image.yml` never pushes.** `soak.yml` builds and pushes both images itself.
 8. **A `workflow_dispatch` workflow can be dispatched only once a file of that name exists on the
    default branch**, so the first rehearsal waits for `soak.yml` to reach `main`.
+9. **The page=real rehearsal 40131252539 tripped the leak gate on a harness false positive**
+   (`{"scanned":24,"leaks":1}`, nothing uploaded; the harness's log line was
+   `FAIL WEB_COOKIES appears in /out`). The scan took every value in the cookie jar, and the web's
+   signed-in hint `seazn_signed_in` has the value `1` (`apps/web/src/lib/auth.ts:79` at
+   `7dcb3c42e2`), which every file holds. The other four kinds were scanned on their own and were
+   clean in all 24 files, `compositor.log`, `web.log` and `fake-control.log` among them: the page
+   token (the relay token in the signed URL), the signing key, the job token and the SRT passphrase.
+   So the compositor's log did not carry the relay token. Whether the session cookie was also in a
+   file the evidence cannot say (the `1` matched first); the next run scans it on its own. The scan
+   now takes the credential cookies only, and reports a leak by kind, file and line, redacted.
+   `test-driver.sh`'s stub jar carries the hint, so the old scan reds.
+10. **The review's positive witness for the real page (M8) has no line to read yet.** It proposed
+    requiring the compositor's `gen=N: loading <origin>` line (`cef_graphics.rs`, `restart`). In
+    rehearsal 40124733978's platform log (1155 lines) no `loading` line appears; the first line of
+    generation 1 is `gen=1: ready`. Owed below.
+
+## Owed (not in this PR)
+
+- **The cost legs (I5)**: the next PR, with their own acceptance (the brief's cost-leg and
+  snow-versus-noise checks cannot be reached from this one).
+- **M7**: a slate outside the scheduled windows (an unplanned input loss) differs from the camera
+  and counts as on air. Cross-check the beat's `programmePhase == live` at each sample's instant.
+- **M8**: a positive witness that the real page is the one on air (every generation's `loading`
+  origin names the web port). The line has to reach the platform log first (finding 10).
+- **M10**: `serve.sh`'s environment allowlist is advisory while node runs as root, which can read
+  `/proc/1/environ` (the job token). Run node, `seed.mjs` and `score.mjs` as an unprivileged user.
+- **The 3 h timing**: multiply the page=real rehearsal's checker and sampler wall times
+  (`driver.log`: `checking` to `done`) by 7.2 against the post-check time (about 19 min after the
+  drive's end) before the 3 h run.
 
 ## Risks the rehearsal measures
 
-- The checker's decode time on the recordings, which must fit inside `poll_after_min`. Read it from
-  `driver.log`: `checking` to `done`.
+- The checker's and the sampler's time on the recordings, which must fit before the hard stop less
+  `post_check_reserve_s` (and inside the watch's `poll_after_min`). Read it from `driver.log`:
+  `checking` to `done`.
 - Whether the log stream is complete. Check 5a's ratio catches lost lines on a real page.
 - Whether `flyctl ssh sftp` works with the soak token.
 - Whether `--rootfs-size 30` is accepted and the disk holds 3 h of recordings.

@@ -10,7 +10,7 @@
 # 4. The composed stream session the relay door checks (session.sql), with id SESSION_ID.
 # 5. The relay door's URL (overlay-url.mjs), signed with this run's key, valid until half an hour
 #    past the hard stop, at this Machine's private name (the compositor's CEF loads it from there).
-# 6. A pre-flight: the URL answers 200.
+# 6. A pre-flight: the page, one of its scripts and its overlay poll each answer 200.
 #
 # Writes $OUT/seed.json (ids only), $OUT/web.log, $OUT/postgres.log; and, under WEB_STATE (mode 700,
 # outside /out, never fetched): auth-secret, cookies.json, overlay-url, server.pid.
@@ -62,10 +62,25 @@ AUTH_SECRET="$(cat "$WEB_STATE/auth-secret")" node "$HERE/overlay-url.mjs" --bas
   --sid "$SESSION_ID" --fixture "$fixture" --exp-ms $((SOAK_HARD_STOP_MS + 1800000)) --delay "$WEB_DELAY_MS" \
   --template "$WEB_TEMPLATE" --out "$WEB_STATE/overlay-url"
 
-# 6. The pre-flight, from here: the URL as the compositor will ask for it (its Host), connected to
-# this Machine's loopback (the private name may not resolve this early in boot), through curl's
-# config on stdin, never argv.
-code="$(printf 'url = "%s"\n' "$(cat "$WEB_STATE/overlay-url")" \
-  | curl -sS -m 20 -K - --connect-to "$HOST:$WEB_PORT:127.0.0.1:$WEB_PORT" -o /dev/null -w '%{http_code}' 2>/dev/null || true)"
+# 6. The pre-flight, from here: what the compositor's CEF will ask for, as it will ask (its Host),
+# connected to this Machine's loopback (the private name may not resolve this early in boot). The
+# signed URLs go through curl's config on stdin, never argv. A page whose HTML answers but whose
+# chunks were never emitted, or whose live-data route fails, is still a dead overlay, so all three:
+# the page, one of the /_next/static scripts its HTML names, and the overlay poll the page makes
+# (the relay's, with sid and st). The HTML may carry the token: it stays under WEB_STATE.
+fetch() { # <url> <out>: the HTTP status, the signed URL through stdin
+  printf 'url = "%s"\n' "$1" \
+    | curl -sS -m 20 -K - --connect-to "$HOST:$WEB_PORT:127.0.0.1:$WEB_PORT" -o "$2" -w '%{http_code}' 2>/dev/null || true
+}
+base="http://$HOST:$WEB_PORT"
+code="$(fetch "$(cat "$WEB_STATE/overlay-url")" "$WEB_STATE/preflight-page.html")"
 [ "$code" = 200 ] || { log "FAIL the overlay page answered ${code:-nothing}"; exit 1; }
-log "the overlay page answers 200"
+chunk="$(grep -aoE '/_next/static/[A-Za-z0-9/_.~%-]+\.js' "$WEB_STATE/preflight-page.html" | head -n 1 || true)"
+[ -n "$chunk" ] || { log "FAIL the overlay page's HTML names no /_next/static script"; exit 1; }
+code="$(fetch "$base$chunk" "$WEB_STATE/preflight-chunk.js")"
+[ "$code" = 200 ] && [ -s "$WEB_STATE/preflight-chunk.js" ] || { log "FAIL the page's script $chunk answered ${code:-nothing}"; exit 1; }
+st="$(sed -nE 's/.*[?&]st=([^&]+).*/\1/p' "$WEB_STATE/overlay-url")"
+code="$(fetch "$base/api/v1/public/fixtures/$fixture/overlay?sid=$SESSION_ID&st=$st" "$WEB_STATE/preflight-overlay.json")"
+[ "$code" = 200 ] && jq -e 'type == "object"' "$WEB_STATE/preflight-overlay.json" >/dev/null 2>&1 \
+  || { log "FAIL the overlay poll answered ${code:-nothing}"; exit 1; }
+log "the overlay page answers 200, its script $chunk 200, the overlay poll 200 ($(jq -r 'keys | length' "$WEB_STATE/preflight-overlay.json") keys)"

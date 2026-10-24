@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # bundle-check.sh on synthetic builds: a clean build passes; a build carrying a PostHog project key,
 # a Sentry DSN or a Stripe key fails and names the file but never the value; PostHog's own default
-# host (a library constant, not a key) passes; an empty build and a missing directory fail. The
+# host (a library constant, not a key) passes; a file argument is scanned like a directory's files;
+# an empty build and a missing directory fail. The
 # planted values are made at run time, so no key-shaped literal sits in the repo.
 #
 #   harness/soak/web/test-bundle-check.sh        (prints `checked: N`)
@@ -48,6 +49,16 @@ grep -qF "$dsn" "$W/sentry.out" && fail "sentry: the value is never printed" "it
 build "$W/stripe"
 printf 'var s="pk_%s_%s";\n' test "$(rep Zz9 8)" >>"$W/stripe/static/chunks/a.js"
 run stripe 1 "$W/stripe/static" "$W/stripe/server"
+
+# A file named on its own is scanned too (soak.yml passes server.js and the dump beside the
+# directories): clean passes and counts it, a key in it fails.
+build "$W/file"
+printf 'const nextConfig = {"env":{}};\n' >"$W/file/server.js"
+run file-clean 0 "$W/file/server.js" "$W/file/static"
+grep -q '2 files scanned' "$W/file-clean.out" && pass "file: a file argument counts (1 file and 1 under static)" || fail "file: count" "$(cat "$W/file-clean.out")"
+printf 'var k="phc_%s";\n' "$(rep Qq7 8)" >>"$W/file/server.js"
+run file-key 1 "$W/file/server.js" "$W/file/static"
+grep -q 'PostHog project key (phc_) in .*/file/server.js' "$W/file-key.out" && pass "file: a key in a file argument is named" || fail "file: message" "$(cat "$W/file-key.out")"
 
 mkdir -p "$W/empty/static"
 run empty 1 "$W/empty/static"
