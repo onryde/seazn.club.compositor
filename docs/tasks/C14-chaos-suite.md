@@ -414,6 +414,60 @@ mutant takes 20 000:
 |---|---|---|---|
 | 9 | `output_stall_after_ms` 20 000 in a scratch relay build; the verdict reads the committed thresholds.json | `dest-trickle` | `FAIL stall_swap` (controls `trickled`, `fp_swept_inputs`) |
 
+## Amendment 2026-10-24, fix round 3 (chaos runs 40056474269 and 40056388445; mutants 40056471001)
+
+The coordinator's fix-round-3 dispatch. Each red was read from its artifacts first.
+
+**Case 14 (`old_tree_gone`, 6 of 6 red): a harness clock, not a surviving tree.**
+- Every typed process in `tree_after` was the new tree's. Each was parented to the new compositor
+  and started 130–450 ms after the new init.
+- in-container.sh's `start_ms` was `btime` plus the start ticks. btime is whole seconds, fixed at
+  boot, and it read 173–1 080 ms early against docker's events.
+- `start_ms` is now the wall clock less the process's age, from /proc/uptime read beside it.
+- The check anchors on the sampled init (pid 1), not on docker's `start` event:
+  - the init must have started after the kill;
+  - the sample must come after the `start` event;
+  - every typed process must be younger than the init.
+- The event is the daemon's report of the start, and CEF's first child starts 130 ms in.
+
+**Cases 5 and 12 (`stall_swap`): the swap's cause (Owed 87).**
+- In 4 of 4 CI swaps, rtmp2sink's own 5 s socket timeout failed the sink first. Its
+  `output gen=1 error:` line came 5.53–5.78 s after the cut, and the swap followed after the
+  500 ms back-off.
+- So a bound alone cannot witness the stall rule: mutant 9's 20 s threshold swapped as fast.
+- The `sink swap` line names no reason. A Connected sink is swapped by the stall rule or by its
+  own bus error, and the error path always logs its error first.
+- `stall_swap` therefore requires `cause` "stall": no `output gen=<g> error` from the outgoing
+  generation before the swap (logfacts' `output_errors`).
+- Both cases red on it until Owed 87's product change.
+- **Mutant 9 is unkillable on a green baseline until then.** Its baseline reds `stall_swap`.
+  It stays in the list, so the run records that.
+
+**Cases 8 and 13–15: the overlay comes back (the coordinator's decision).**
+- `require_overlay_back`: the first recorded frame whose score strip reads, after the restart's
+  `start`, comes within BUDGET_PROCESS_RESTART_OUTPUT_MS of the die. The budget is spec §6's "a
+  process crash's output is back within 15 s", which takes §9.4's "overlay back" with it.
+- It is in `require_in_place_restart` (cases 13, 14, 15 threshold, 15 fast) and in case 8.
+- Case 15 one-fewer has no restart, so it is timed from the last kill.
+- CI's healthy restarts had the overlay back 2.1–2.2 s after the die. Owed 85's never did, so those
+  legs red `overlay_back` until Owed 85 is fixed.
+
+**The table (item 4).**
+- chaos.json's `owed` names the Owed row behind each check a leg is known to fail.
+- run-chaos.sh marks each failed check with its row, or NOT OWED.
+- It lists the red legs whose every failed check is owed, the reds no row explains, and each named
+  row's title.
+- No verdict, exit status or gate line reads it.
+
+**Expected reds:**
+- cef-leaks ×2 (Owed 82, NOT RUNNABLE);
+- dest-disconnect (84);
+- dest-stall and dest-trickle (87, and 84 by phase);
+- cpu-starved (86);
+- cef-gpu-deaths-fast ×3 (70 (a));
+- cef-killed, cef-gpu-zygote-killed, cef-renderer-zygote-killed and cef-gpu-deaths-threshold,
+  wherever the restarted CEF does not come back (85).
+
 ## Files
 
 - Create: `harness/cases/{camera-stop,camera-flap,reader-kicked,dest-disconnect,dest-stall,cpu-starved,score-down,cef-killed,process-killed,input-impaired}.{sh,jq}` (amended 2026-10-24: all 16, cases 11–16 too, as `.sh` files with `require` lines over `harness/cases/lib.jq`; and `harness/chaos.json`, the legs)
