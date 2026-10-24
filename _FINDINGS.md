@@ -1774,10 +1774,39 @@ INT and TERM also `wait`ed on the compositor, and re-waited after each trap.
   "Zygote watch at ready"); what is left is a zygote that dies between CEF's start and the first
   ready (Owed 70 (e)).
 
+## F-023: a sink that connects after the fault clears delivers its backlog in a burst, and MediaMTX's recorder discards it (chaos run 40045826841, 2026-10-24)
+
+- **Measured** (C14 fix round 1, from the run's `dest-disconnect`, `dest-trickle` and `dest-stall`
+  artifacts; the PR #52 review's I9):
+  - **dest-disconnect (case 4):** `netem out loss 100%` from 00:41:54.188 to the clear at
+    00:42:24.421. The output's last sink before the clear swapped at 00:42:20.409 (gen 5), about 4 s
+    before it. Its connect blocked under the fault; at the clear it delivered the frames queued since
+    its swap: the first recorded frame after the clear is camera counter 1502, the counter on air at
+    the gen 5 swap. About 4.1 s of backlog: the 2 s `ENCODED_RING_SPAN` and the 512 KiB
+    `OUTPUT_QUEUE_BYTES` (about 1–2 s at the programme's rate).
+  - In the same second MediaMTX v1.21.2's recorder logged `WAR [recorder] sample of track 1 received
+    too late, discarding` and `ERR [recorder] detected drift between recording duration and absolute
+    time, resetting`. It closed a 34-frame segment (00:42:24.541) and opened the next at
+    00:42:26.525: camera counters 1505 to 1743 (238, about 7.9 s of content) reached MediaMTX and
+    were not recorded. The checker reads that as outage 2, `lost_ms` 7 082 against
+    BUDGET_OUTPUT_LOST_MAX_MS 2 000.
+  - Outage 3 (00:42:36.525 to 00:42:38.407, counter gap 0, `lost_ms` −1 882) is the checker's
+    dating, not a loss: MediaMTX names a segment by its first sample's arrival (F-021), 11.88 s after
+    a 300-frame (10 s) segment (Owed 80).
+  - **dest-trickle (case 12):** the same shape. Last swap 00:45:18.958, clear 00:45:22.473, the
+    recorder's "too late" and drift reset at 00:45:23; three outages, `lost_ms` [−4 109, 30 366,
+    −1 884] (the 30 366 is outage 2 dated from a burst-named segment that overlaps outage 1).
+  - **dest-stall (case 5):** its last swap (00:42:23.926) came 0.86 s after the clear
+    (00:42:23.064), so no sink sat connecting under the fault. The recorder logged only "too late",
+    no reset, and the run had one outage (`lost_ms` −911).
+- **So:** when a sink's connect outlives the fault, the product sends the stale backlog it queued
+  since the swap at the connect, faster than real time, and this recorder refuses it and resets. A
+  real ingest's answer to the burst (Cloudflare, YouTube) is unmeasured. The verdicts are not
+  loosened: cases 4 and 12 stay red on `output_lost` and `no_outage_outside_fault` until the owner
+  rules Owed 84. The negative `lost_ms` values also show that the checker's `counter_gap − wall_span`
+  is not "programme lost" when a connect replays its backlog (Owed 84 (c)).
 ## F-025: Owed 85's cause: a restarted container's Xvfb refuses its predecessor's lock (image run 40057826178, 2026-10-24)
-
 The follow-up to F-024's first fact (Owed 85; F-024 is on `feat/c14-chaos`, unmerged at the time).
-
 - **Measured, the real Xvfb** (image run 40057826178, head `f190df4`, the entrypoint unchanged; the
   in-place restart probe, `scripts/image_probe.py --restarts 6`): containers under Docker's
   `--restart on-failure:2` (ADR 0007 item 5's Docker equivalent), which restarts the same container,
