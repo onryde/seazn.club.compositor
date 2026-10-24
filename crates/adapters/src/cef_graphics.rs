@@ -745,6 +745,15 @@ fn monotonic_us() -> u64 {
     u64::try_from(ORIGIN.get_or_init(Instant::now).elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
+/// The calling thread's CPU time in microseconds (`CLOCK_THREAD_CPUTIME_ID`): what a GPU watch
+/// listing costs (the PR #55 review's I3), which a preempted or blocked listing does not inflate.
+pub fn thread_cpu_us() -> u64 {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+    let secs = u64::try_from(t.tv_sec).unwrap_or(0);
+    let micros = u64::try_from(t.tv_nsec).unwrap_or(0) / 1_000;
+    secs.saturating_mul(1_000_000).saturating_add(micros)
+}
+
 /// One listing read into the zygote watch: `Some(gen)` when it decides the verdict, which it
 /// publishes with `gen`, the newest build's generation then (once for the process).
 fn read_zygotes(shared: &Shared, watch: &mut CefWatch, kids: &[CefChild]) -> Option<u64> {

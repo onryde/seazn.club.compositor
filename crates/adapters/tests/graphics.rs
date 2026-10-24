@@ -21,8 +21,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use adapters::cef_graphics::{
-    cef_children, CefGraphics, ReaperPath, CEF_NICE, CHILD_POLL_MS, GPU_WAIT_SHARE_PCT, GPU_WATCH_MS,
-    REAPER_KILL_AFTER_MS, SPARE_RENDERER_OFF, TEARDOWN_LEAK_AFTER_MS,
+    cef_children, thread_cpu_us, CefGraphics, ReaperPath, CEF_NICE, CHILD_POLL_MS, GPU_WAIT_SHARE_PCT,
+    GPU_WATCH_MS, REAPER_KILL_AFTER_MS, SPARE_RENDERER_OFF, TEARDOWN_LEAK_AFTER_MS,
 };
 use adapters::frame_store::FrameStore;
 use adapters::gst_programme::GstProgramme;
@@ -1558,22 +1558,21 @@ fn gpu_loop_case() {
     let (started, polls_before) = (Instant::now(), r.g.polls());
     let mut killed: Vec<i32> = Vec::new();
     let mut counted_ms: Vec<u128> = Vec::new();
-    // This test's listings: how many, their summed and longest time (us), the most CEF children.
-    let (mut listings, mut listed_us, mut longest_us, mut most) = (0_u32, 0_f64, 0_f64, 0_usize);
+    // This test's listings: how many, their summed and longest time on the clock and in this
+    // thread's CPU (us), the most CEF children.
+    let (mut listings, mut most) = (0_u32, 0_usize);
+    let (mut listed_us, mut longest_us, mut cpu_us, mut cpu_longest_us) = (0_f64, 0_f64, 0_u64, 0_u64);
     for k in 1..=kills {
         // The GPU process now: the first one (the polls above listed it), then each relaunch, looked
         // for every 2 ms so its life is about `LOOP_LIFE_MS`.
         let end = Instant::now() + hang_bound();
         let pid = loop {
-            let t0 = Instant::now();
+            let (t0, c0) = (Instant::now(), thread_cpu_us());
             let kids = cef_children();
-            let us = t0.elapsed().as_secs_f64() * 1e6;
-            (listings, listed_us, longest_us, most) = (
-                listings + 1,
-                listed_us + us,
-                longest_us.max(us),
-                most.max(kids.len()),
-            );
+            let (us, cpu) = (t0.elapsed().as_secs_f64() * 1e6, thread_cpu_us() - c0);
+            (listings, most) = (listings + 1, most.max(kids.len()));
+            (listed_us, longest_us) = (listed_us + us, longest_us.max(us));
+            (cpu_us, cpu_longest_us) = (cpu_us + cpu, cpu_longest_us.max(cpu));
             let now = kids
                 .iter()
                 .find(|c| c.kind == "gpu-process" && !killed.contains(&c.pid))
@@ -1614,12 +1613,24 @@ fn gpu_loop_case() {
     assert_eq!(h.unrecoverable, None, "the zygotes live: {h:?}");
     assert!(listings > 0 && most > 0, "no listing with CEF's children");
     let mean_us = listed_us / f64::from(listings);
-    let pace_ms = (GPU_WATCH_MS as f64).max(mean_us * 100.0 / GPU_WAIT_SHARE_PCT as f64 / 1_000.0);
+    let cpu_mean_us = cpu_us as f64 / f64::from(listings);
+    let pace_ms = (GPU_WATCH_MS as f64).max(cpu_mean_us * 100.0 / GPU_WAIT_SHARE_PCT as f64 / 1_000.0);
+    // The share of a core one listing per F-026's estimated relaunch life (10 to 19 ms) would take.
+    let share = |life_ms: f64| cpu_mean_us / (life_ms * 10.0);
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
     eprintln!(
-        "gpu loop child: {kills} GPU processes killed {killed:?} in {took} ms, {polls} child polls, each \
-         counted {counted_ms:?} ms after its kill; {listings} listings with up to {most} CEF children \
-         over {procs} processes at {mean_us:.0} us each (the longest {longest_us:.0} us): a wait lists \
-         every {pace_ms:.1} ms at that cost; {h:?}"
+        "gpu loop child ({profile} build): {kills} GPU processes killed {killed:?} in {took} ms, {polls} \
+         child polls, each counted {counted_ms:?} ms after its kill; {listings} listings with up to \
+         {most} CEF children over {procs} processes at {cpu_mean_us:.0} us of CPU each (the longest \
+         {cpu_longest_us} us), {mean_us:.0} us on the clock (the longest {longest_us:.0} us): a wait \
+         lists every {pace_ms:.1} ms at that cost, and a listing every 10 ms would take {:.1}% of a \
+         core, every 19 ms {:.1}%; {h:?}",
+        share(10.0),
+        share(19.0)
     );
     r.g.stop();
 }

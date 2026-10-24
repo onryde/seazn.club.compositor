@@ -22,8 +22,9 @@ gstreamer-app = { version = "0.24", features = ["v1_24"] }
 gstreamer-video = { version = "0.24", features = ["v1_24"] }
 crossbeam-channel = "0.5"
 # C11: the reaper's SIGKILL and the CEF children's nice (`setpriority` per thread) without `unsafe`
-# (the workspace forbids it). Already in the lock through tempfile.
-rustix = { version = "1", default-features = false, features = ["std", "process", "param"] }
+# (the workspace forbids it); Owed 70 (a): the GPU watch's thread CPU clock (`time`). Already in the
+# lock through tempfile.
+rustix = { version = "1", default-features = false, features = ["std", "process", "param", "time"] }
 # C12: the loopback programme-phase endpoint (`phase_http.rs`; overlay templates spec 2026-10-15 §4.3).
 # The one HTTP server crate in the workspace: blocking, no async runtime, no TLS (loopback only).
 tiny_http = "0.12"
