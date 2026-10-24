@@ -1,0 +1,51 @@
+# MediaMTX for the soak's harness Machine (C15): harness/mediamtx.yml (C13, F-021) on one Machine
+# instead of a compose network. The binary is the same 1.21.2 (harness/soak/Dockerfile copies it
+# from compose.yml's image, by the same digest).
+#
+# - path `cam`: fake-camera publishes (`publish:cam`, from this Machine), the compositor reads
+#   (`read:cam`, over the private network), both over SRT with one passphrase: the run's random
+#   HARNESS_SRT_PASSPHRASE, set through the environment (MTX_PATHS_CAM_SRTREADPASSPHRASE and
+#   ...SRTPUBLISHPASSPHRASE, driver.sh), never in this file or in argv;
+# - path `live/dest`: the compositor publishes its programme over RTMP, and MediaMTX records it as
+#   fMP4 segments named by their wall-clock start (TZ=UTC, driver.sh), which the checker reads.
+#   The camera path is never recorded: the checker would read it as programme.
+#
+# The Machine has no public service: these ports are reachable on the app's private network only.
+# The dest disconnect (driver.sh) drops inbound TCP to the RTMP port for both address families.
+logLevel: info
+logDestinations: [stdout]
+
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+      - action: read
+
+api: false
+metrics: false
+pprof: false
+playback: false
+rtsp: false
+hls: false
+webrtc: false
+moq: false
+rtmp: true
+rtmpAddress: :1935
+srt: true
+srtAddress: :8890
+
+paths:
+  cam:
+    source: publisher
+  live/dest:
+    source: publisher
+    record: true
+    recordPath: /out/rec/%path/%Y-%m-%d_%H-%M-%S-%f
+    recordFormat: fmp4
+    recordPartDuration: 1s
+    recordSegmentDuration: 10s
+    # Never delete: the checker reads every segment after the run.
+    recordDeleteAfter: 0s
