@@ -769,8 +769,10 @@ socket timeout is the only detector of a destination stall (`docs/_INDEX.md` Owe
   `stall` path and `stall_swap_shown`. In cases 5, 12 and 17 it passes when:
   - the swap reads `reason=error`, and the reason lines pair the swap lines;
   - the outgoing sink's `output gen=<g> error:` line came before the swap;
-  - the swap came output_backoff_base_ms to budget_output_reconnect_ms (§6, 5 s) after the error,
-    and within `bound_ms` (output_sink_timeout_ms + output_backoff_base_ms + frame_period_ms) of the
+  - the swap came output_backoff_base_ms − frame_period_ms to budget_output_reconnect_ms (§6, 5 s)
+    after the error (the floor less one frame: the docker stamps cannot resolve the product's tick;
+    PR #71's run 40137725801 read 499 ms for a swap whose own `ts=` stamps were 500 ms apart), and
+    within `bound_ms` (output_sink_timeout_ms + output_backoff_base_ms + frame_period_ms) of the
     last growth;
   - the error came no sooner than output_sink_timeout_ms − frame_period_ms after the cut, and no
     later than output_sink_timeout_ms + budget_output_lost_max_ms (review round 1's m-1: what the
@@ -857,11 +859,11 @@ socket timeout is the only detector of a destination stall (`docs/_INDEX.md` Owe
 - ~~(Amended 2026-10-18, Owed 13/15) Case 5's bound is `output_stall_after_ms + poll + beat`, read
   from `thresholds.json`.~~ (Amended 2026-10-24, Owed 87) In cases 5, 12 and 17, `stall_swap` passes
   only on the sink's own error: `reason=error`, the error line before the swap, the swap
-  output_backoff_base_ms to budget_output_reconnect_ms after it and within output_sink_timeout_ms +
-  output_backoff_base_ms + frame_period_ms of the last growth, and the error no sooner than
-  output_sink_timeout_ms − frame_period_ms after the cut and no later than output_sink_timeout_ms +
-  budget_output_lost_max_ms, each read from `thresholds.json`. m9 (`OUTPUT_SINK_TIMEOUT_MS` 20 s) is
-  KILLED on case 17.
+  output_backoff_base_ms − frame_period_ms to budget_output_reconnect_ms after it and within
+  output_sink_timeout_ms + output_backoff_base_ms + frame_period_ms of the last growth, and the error
+  no sooner than output_sink_timeout_ms − frame_period_ms after the cut and no later than
+  output_sink_timeout_ms + budget_output_lost_max_ms, each read from `thresholds.json`. m9
+  (`OUTPUT_SINK_TIMEOUT_MS` 20 s) is KILLED on case 17.
 - (Amended 2026-10-18, Owed 20) Case 6 asserts the score stays on air through the stress and
   after it, and every beat's `rung` is `full`/`overlay_half_rate`, never back to `full` after a step.
 - (Amended 2026-10-20, C11b; Owed 62, 68, 69) Case 8 takes case 9's shape, with a non-zero, non-75 exit and no core
