@@ -1973,8 +1973,14 @@ C14's F-024 (PR #52, branch `feat/c14-chaos`) records the fast loop's headline. 
   inference cannot recover the rest (most of the gap is likely the walk's own forks, one per pid it
   reads, and start times tick at 10 ms). The adapter now runs a GPU watch between polls (decision
   log "Owed 70 (a): the GPU watch"). It misses a GPU process visible for less than its listing pace:
-  one 5 ms step while a listing costs under 250 us, and 20 times a listing's cost above that (review
-  round 1).
+  ~~one 5 ms step while a listing costs under 250 us, and 20 times a listing's cost above that (review
+  round 1)~~ in a wait, 5 to 8 ms: 20 times a listing's CPU, held to `GPU_LISTING_GAP_MAX_MS`, which is
+  this estimate's 10 ms less a 2 ms margin (amended 2026-10-24, review round 2).
+- **A listing's cost in the image** (amended 2026-10-24, the PR #55 confirm pass's I3; image runs
+  40080601547 and 40085739077): with up to 6 CEF children, a listing took 1 439 us on the clock over 21
+  processes in a debug build. Over 11 processes it took 370 us of the thread's CPU on the release profile,
+  the compositor's (431 us on the clock), and 632 us on the debug one. At 5% of a core the release cost
+  paces a wait's listings 7.4 ms apart.
 - **The exit's margin** (m6): the fast variant's `gpu_death_split` and `last_kill_not_before_die`
   checks go red when the browser outlives the deciding line long enough for further relaunches to be
   killed. That is one kill interval (69 to 88 ms) less the count and the driver's tick (about 5 to
