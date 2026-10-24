@@ -1505,9 +1505,11 @@ fn a_late_first_sink_starts_at_the_keyframe_after_its_swap_not_inside_the_ring()
     let d = decode(&dir.file("a.flv"));
     assert!(d.first_is_key(), "keys {:?}", &d.keys[..d.keys.len().min(5)]);
     assert_eq!(d.video_pts_ms.first(), Some(&0));
+    // A frame pushed before the swap but encoded after it is not stale (`OWED84_MARGIN_TICKS`); the
+    // ring's replay started at its oldest keyframe (frame 60, a slate), 25 ticks before the swap.
     let n = d.frames.len();
     assert!(
-        n <= 30,
+        n as u64 <= 30 + OWED84_MARGIN_TICKS,
         "{n} frames for the 30 paced since the swap: the ring was replayed"
     );
     assert!(
