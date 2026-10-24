@@ -21,8 +21,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use adapters::cef_graphics::{
-    cef_children, CefGraphics, ReaperPath, CEF_NICE, CHILD_POLL_MS, REAPER_KILL_AFTER_MS, SPARE_RENDERER_OFF,
-    TEARDOWN_LEAK_AFTER_MS,
+    cef_children, CefGraphics, ReaperPath, CEF_NICE, CHILD_POLL_MS, GPU_WAIT_SHARE_PCT, GPU_WATCH_MS,
+    REAPER_KILL_AFTER_MS, SPARE_RENDERER_OFF, TEARDOWN_LEAK_AFTER_MS,
 };
 use adapters::frame_store::FrameStore;
 use adapters::gst_programme::GstProgramme;
@@ -1506,9 +1506,12 @@ fn gpu_deaths_case() {
 // Owed 70 (a), from real kills: a GPU crash loop faster than one child poll (F-026: C14's fast loop
 // killed each relaunch 69 to 88 ms after the kill before, and the 1 s poll counted 1 or 2 of 5). The GPU
 // process is killed, then each relaunch `LOOP_LIFE_MS` after this test first lists it, never waiting
-// for a poll to list it: `cef_gpu_deaths_to_restart` deaths, under the abort (the 6th). The GPU watch
-// counts each one between polls: within half a poll, once. It spends the process's GPU deaths, so it
-// runs in a child of its own.
+// for a poll to list it: C14's fast leg's `CHROMIUM_GPU_DEATHS_ABORT` - 1 deaths, one under the abort.
+// The GPU watch counts each one between polls, within half a poll and once, and the restart cause
+// comes at `cef_gpu_deaths_to_restart`, never at one fewer. It also times this test's own
+// `cef_children()` calls, the walk the watch's listings make, with CEF's children present (the PR #55
+// review's I2: CI's check runner had listed none). It spends the process's GPU deaths, so it runs in
+// a child of its own.
 #[test]
 fn a_gpu_crash_loop_faster_than_a_poll_is_counted_from_real_kills() {
     let _s = serial();
@@ -1532,10 +1535,12 @@ fn a_gpu_crash_loop_faster_than_a_poll_is_counted_from_real_kills() {
 }
 
 fn gpu_loop_case() {
-    // About half of F-026's 69 to 88 ms between kills, and 8 `GPU_WATCH_MS` steps.
+    // About half of F-026's 69 to 88 ms between kills.
     const LOOP_LIFE_MS: u64 = 40;
-    let n = Thresholds::default().cef_gpu_deaths_to_restart;
-    assert!(n < CHROMIUM_GPU_DEATHS_ABORT, "the child would abort");
+    let t = Thresholds::default();
+    let n = t.cef_gpu_deaths_to_restart;
+    let kills = CHROMIUM_GPU_DEATHS_ABORT - 1;
+    assert!(n <= kills, "the loop would not reach the threshold");
     let mut r = rig();
     r.g.restart(1, &page(""));
     events_until(&r.rx, load_timeout(), ready(1));
@@ -1545,14 +1550,31 @@ fn gpu_loop_case() {
         CefHealth::default(),
         "healthy before the first kill"
     );
+    let procs = std::fs::read_dir("/proc").map_or(0, |d| {
+        d.flatten()
+            .filter(|e| e.file_name().to_str().is_some_and(|s| s.parse::<i32>().is_ok()))
+            .count()
+    });
     let (started, polls_before) = (Instant::now(), r.g.polls());
     let mut killed: Vec<i32> = Vec::new();
-    for k in 1..=n {
+    let mut counted_ms: Vec<u128> = Vec::new();
+    // This test's listings: how many, their summed and longest time (us), the most CEF children.
+    let (mut listings, mut listed_us, mut longest_us, mut most) = (0_u32, 0_f64, 0_f64, 0_usize);
+    for k in 1..=kills {
         // The GPU process now: the first one (the polls above listed it), then each relaunch, looked
         // for every 2 ms so its life is about `LOOP_LIFE_MS`.
         let end = Instant::now() + hang_bound();
         let pid = loop {
-            let now = cef_children()
+            let t0 = Instant::now();
+            let kids = cef_children();
+            let us = t0.elapsed().as_secs_f64() * 1e6;
+            (listings, listed_us, longest_us, most) = (
+                listings + 1,
+                listed_us + us,
+                longest_us.max(us),
+                most.max(kids.len()),
+            );
+            let now = kids
                 .iter()
                 .find(|c| c.kind == "gpu-process" && !killed.contains(&c.pid))
                 .map(|c| c.pid);
@@ -1566,24 +1588,39 @@ fn gpu_loop_case() {
             thread::sleep(Duration::from_millis(LOOP_LIFE_MS));
         }
         let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).status();
+        let at = Instant::now();
         killed.push(pid);
+        let bound = at + Duration::from_millis(CHILD_POLL_MS / 2);
+        while r.g.health().gpu_process_deaths < k && Instant::now() < bound {
+            thread::sleep(Duration::from_millis(1));
+        }
+        counted_ms.push(at.elapsed().as_millis());
+        let h = r.g.health();
         assert!(
-            wait_for(Duration::from_millis(CHILD_POLL_MS / 2), || r
-                .g
-                .health()
-                .gpu_process_deaths
-                >= k),
-            "death {k} (pid {pid}) was not counted in half a poll: {:?}",
-            r.g.health()
+            h.gpu_process_deaths >= k,
+            "death {k} (pid {pid}) was not counted in half a poll: {h:?}"
         );
-        assert_eq!(r.g.health().gpu_process_deaths, k, "death {k}: counted once");
+        assert_eq!(h.gpu_process_deaths, k, "death {k}: counted once");
+        assert_eq!(
+            h.restart_cause(&t).is_some(),
+            k >= n,
+            "death {k}: the restart cause at {n}: {h:?}"
+        );
     }
     let took = started.elapsed().as_millis();
     let polls = r.g.polls() - polls_before;
     let h = r.g.health();
-    assert_eq!(h.gpu_process_deaths, n, "{h:?}");
+    assert_eq!(h.gpu_process_deaths, kills, "{h:?}");
     assert_eq!(h.unrecoverable, None, "the zygotes live: {h:?}");
-    eprintln!("gpu loop child: {n} GPU processes killed {killed:?} in {took} ms, {polls} child polls, {h:?}");
+    assert!(listings > 0 && most > 0, "no listing with CEF's children");
+    let mean_us = listed_us / f64::from(listings);
+    let pace_ms = (GPU_WATCH_MS as f64).max(mean_us * 100.0 / GPU_WAIT_SHARE_PCT as f64 / 1_000.0);
+    eprintln!(
+        "gpu loop child: {kills} GPU processes killed {killed:?} in {took} ms, {polls} child polls, each \
+         counted {counted_ms:?} ms after its kill; {listings} listings with up to {most} CEF children \
+         over {procs} processes at {mean_us:.0} us each (the longest {longest_us:.0} us): a wait lists \
+         every {pace_ms:.1} ms at that cost; {h:?}"
+    );
     r.g.stop();
 }
 
