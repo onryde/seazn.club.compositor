@@ -6,6 +6,7 @@
 //! | `cpu_pct` | `utime + stime` of this process and every descendant (`/proc/<pid>/stat`), the delta since the last sample ÷ the wall delta ÷ the CPUs this process may use × 100 |
 //! | `mem_mb` | the sum of `VmRSS` over the same tree (`/proc/<pid>/status`) |
 //! | `fps`, `bitrate_kbps`, `egress_bytes`, `encoder_speed` | `Stats::snapshot()`, unchanged: a `None` there stays absent on the wire |
+//! | `camera_frames_replaced` | `Stats::snapshot()`, unchanged; logged by the driver, never on the wire (Owed 90) |
 //! | `measured_latency_ms` | never: it needs SEI (F-003), so it is omitted, never 0 |
 //!
 //! The first sample has no CPU delta yet, so its `cpu_pct` is `None`. A process is keyed by its pid
@@ -178,6 +179,7 @@ impl Metrics for ProcMetrics {
             encoder_speed: s.encoder_speed,
             cpu_pct,
             mem_mb: mem_kb.map(|kb| kb / 1024),
+            camera_frames_replaced: s.camera_frames_replaced,
         }
     }
 }
