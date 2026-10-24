@@ -1,5 +1,6 @@
-//! Programme push link (RTMPS to CF Input B): a sink is Connected only once its bytes-sent total has
-//! kept growing for `output_connected_after_ms`; swap it on its error; back off 0.5 s → 2 s between
+//! Programme push link (RTMPS to CF Input B): a sink is Connected at its first growth at least
+//! `output_connected_after_ms` after its first growth, with no error between (a silence between is
+//! no failure since Owed 87); swap it on its error; back off 0.5 s → 2 s between
 //! failed attempts; ignore every other generation.
 //!
 //! ```text
@@ -1159,5 +1160,58 @@ mod tests {
             o.state()
         );
         assert_eq!(swap_for(&mut o, e, &th, 3, SwapReason::Error), e + wait);
+    }
+
+    // The PR #73 review's m-2: with no stall rule, a silence inside the proof is no failure and does
+    // not restart it. A proving sink silent for longer than the old stall threshold (one sink timeout
+    // and more) that grows again connects at its first growth at or past the bound, counted from its
+    // FIRST growth; a growth that resumes short of the bound keeps it proving.
+    #[test]
+    fn a_proving_sink_that_grows_again_after_a_silence_connects_at_the_bound() {
+        let th = t();
+        let mut checked = 0;
+        for quiet in [OUTPUT_SINK_TIMEOUT_MS + 1, 2 * th.output_connected_after_ms] {
+            let mut o = OutputLink::new();
+            assert!(o.on_tick(0, &th));
+            let first = 31;
+            o.on_progress(first, 1, 476, &th);
+            let last = first + 100;
+            o.on_progress(last, 1, 8_192, &th);
+            for now in (last..=last + quiet).step_by(33) {
+                o.on_progress(now, 1, 8_192, &th);
+                assert!(!o.on_tick(now, &th), "built {} ms into the silence", now - last);
+            }
+            let back = last + quiet + 1;
+            assert!(
+                back - first >= th.output_connected_after_ms,
+                "setup: past the bound"
+            );
+            o.on_progress(back, 1, 16_384, &th);
+            assert_eq!(o.state(), OutputState::Connected, "quiet {quiet} ms");
+            assert_eq!(o.generation(), 1, "no build: a silence is not a failure");
+            checked += 1;
+        }
+        // Short of the bound: the growth that resumes keeps the proof running from its first growth.
+        let mut o = OutputLink::new();
+        assert!(o.on_tick(0, &th));
+        o.on_progress(31, 1, 476, &th);
+        let back = 31 + th.output_connected_after_ms - 1;
+        o.on_progress(back, 1, 8_192, &th);
+        assert_eq!(
+            o.state(),
+            OutputState::Proving {
+                attempt: 0,
+                first_progress: 31,
+                sent: 8_192
+            }
+        );
+        o.on_progress(back + 1, 1, 9_000, &th);
+        assert_eq!(
+            o.state(),
+            OutputState::Connected,
+            "at the bound from the first growth"
+        );
+        checked += 1;
+        assert_eq!(checked, 3);
     }
 }

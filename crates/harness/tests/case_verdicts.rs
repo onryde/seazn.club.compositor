@@ -1074,7 +1074,8 @@ enum ErrLine {
 /// (Owed 87; the owner, 2026-10-24, "A": rtmp2sink's `timeout` is the only detector of a
 /// destination stall), and the swap follows the back-off from Connected and a tick later, named
 /// `error`; the next beat carries it. `timeout_x` 1 is the product; 2 a detector twice as slow; 4
-/// mutant m9 (the timeout at 20 s), simulated; 0 errors and swaps nothing.
+/// the sink's own wait at 20 s (mutant m9's value; on CI the destination closed the publisher first,
+/// about 11 s after the cut: case 17's `rule-m9-ci`); 0 errors and swaps nothing.
 fn dest_stall(trickle: i64, timeout_x: i64, stats: Value) -> World {
     dest_stall_err(trickle, timeout_x, stats, ErrLine::Product)
 }
@@ -1427,9 +1428,9 @@ fn dest_stall_rule_swaps_on_the_sinks_error_and_reds_on_a_slow_one_or_no_cap() {
         assert_eq!(m["reason"].as_str(), Some("error"), "{tag}: {m}");
         checked += 1;
     }
-    // Mutant m9 (output_sink_timeout_ms at 20 s, simulated: four timeouts), a detector twice as
-    // slow, and no swap at all: `stall_swap` reds, with the controls `buffer_capped` and `trickled`
-    // passing (m9's leg reads them).
+    // The sink's own wait at m9's 20 s (four timeouts; CI's m9 was closed by the destination first,
+    // `rule-m9-ci` below), a detector twice as slow, and no swap at all: `stall_swap` reds, with the
+    // controls `buffer_capped` and `trickled` passing (m9's leg reads them).
     for (tag, x) in [("rule-m9", 4), ("rule-slow", 2), ("rule-noswap", 0)] {
         let w = dest_stall_rule(
             x,
@@ -1467,6 +1468,53 @@ fn dest_stall_rule_swaps_on_the_sinks_error_and_reds_on_a_slow_one_or_no_cap() {
             && m["swap_beat_ms"].is_i64()
             && m["reason"] == "error",
         "rule-early must red on the floor alone: {m}"
+    );
+    checked += 1;
+    // CI's m9 (run 40136067430, PR #74; the PR #73 review's I-3): with the sink's timeout at 20 s,
+    // MediaMTX closed the publisher first, its message still unwritten (`connection closed
+    // remotely` 10 998 ms after the cut, the swap 513 ms later). The destination's own deadline, not
+    // a 20 s wait: `stall_swap` reds on the bound from the growth and on the ceiling from the cut,
+    // with the controls passing. (`rule-m9` above, four timeouts, is the sink's own 20 s wait, a
+    // physics CI did not show; it reds the same way.)
+    let w = with_rule_marks(
+        dest_stall_error_at(10_998, 0, trickling()),
+        capped(),
+        json!([8192]),
+        json!([16_810]),
+    );
+    let v = judge(&w, "dest-stall-rule", "", "rule-m9-ci");
+    assert_fails(&v, "stall_swap", "rule-m9-ci");
+    assert_eq!(
+        v.json["failed"],
+        json!(["stall_swap"]),
+        "rule-m9-ci: the controls pass"
+    );
+    let m = &v.json["measures"]["stall_swap"];
+    assert!(
+        m["from_growth_ms"].as_f64().unwrap() > m["bound_ms"].as_f64().unwrap()
+            && m["error_from_cut_ms"].as_i64() == Some(10_998),
+        "rule-m9-ci: CI's shape: {m}"
+    );
+    checked += 1;
+    // An error later after the cut than the sink's timeout plus the output-lost budget, in a world
+    // that kept growing until just before the swap (so the growth bound holds): it reds on the
+    // cut-anchored ceiling alone (the PR #73 review's m-1).
+    let late = w.ms("output_sink_timeout_ms") + w.ms("budget_output_lost_max_ms") + 1;
+    let w = with_rule_marks(
+        dest_stall_error_at(late, 1_000, trickling()),
+        capped(),
+        json!([8192]),
+        json!([16_810]),
+    );
+    let v = judge(&w, "dest-stall-rule", "", "rule-late-error");
+    assert_fails(&v, "stall_swap", "rule-late-error");
+    let m = &v.json["measures"]["stall_swap"];
+    assert!(
+        m["from_growth_ms"].as_f64().unwrap() <= m["bound_ms"].as_f64().unwrap()
+            && m["error_from_cut_ms"].as_i64() == Some(late)
+            && m["reasons_paired"] == true
+            && m["reason"] == "error",
+        "rule-late-error must red on the ceiling alone: {m}"
     );
     checked += 1;
     // The retired reason, and no error line: each a red.
@@ -1584,7 +1632,7 @@ fn dest_stall_rule_swaps_on_the_sinks_error_and_reds_on_a_slow_one_or_no_cap() {
     );
     checked += 1;
     eprintln!("dest-stall-rule sims checked: {checked}");
-    assert_eq!(checked, 19);
+    assert_eq!(checked, 21);
 }
 
 /// What the starvation did to the compositor (case 6).

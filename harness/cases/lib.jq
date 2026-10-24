@@ -104,7 +104,13 @@ def stall_swap($cut):
 #   (C14's mutant m9 sets it to 20 s);
 # - the error came no sooner after the cut than the sink's timeout less one frame (the PR #65 review's
 #   m-3: the bytes flow at full rate until the cut, so the last write is no earlier than one frame
-#   before it): an error sooner than that is not the stall's.
+#   before it): an error sooner than that is not the stall's;
+# - and no later than the sink's timeout plus `budget_output_lost_max_ms` after the cut (the PR #73
+#   review's m-1): what the sink writes after the cut goes into a socket nothing drains, and spec §6
+#   lets a stall lose at most that much programme, so its last write is no later than that and its
+#   error one sink timeout after. The growth bound above is anchored on a beat, up to one beat after
+#   the last write, so on its own it passes a timeout up to about 8-9 s; this ceiling is anchored on
+#   the cut, and reds one past about 6 s (CI's error_from_cut_ms read 5 450-5 898).
 def stall_swap_judged($cut):
   stall_swap($cut) as $s
   | $s.swap_ms != null and $s.swap_beat_ms != null and $s.last_growth_ms != null and $s.reasons_paired
@@ -112,7 +118,8 @@ def stall_swap_judged($cut):
     and $s.error_to_swap_ms >= $t.output_backoff_base_ms
     and $s.error_to_swap_ms <= $t.budget_output_reconnect_ms
     and $s.from_growth_ms <= $s.bound_ms
-    and $s.error_from_cut_ms >= $t.output_sink_timeout_ms - $t.frame_period_ms;
+    and $s.error_from_cut_ms >= $t.output_sink_timeout_ms - $t.frame_period_ms
+    and $s.error_from_cut_ms <= $t.output_sink_timeout_ms + $t.budget_output_lost_max_ms;
 
 # The clear's phase in the output's reconnect cycle (cases 4, 5 and 12; the re-review's I-5, Owed
 # 84). Under the fault a sink is built every 6-7 s (a connect that times out, then the back-off), and

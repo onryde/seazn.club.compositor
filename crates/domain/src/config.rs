@@ -44,8 +44,9 @@ pub struct Thresholds {
     /// Spec §4.2: "a reconnect is expected to complete within 5 s". F-004 addendum: stall detection,
     /// one capped back-off and one whole connect must stay under YouTube's 15 s broadcast split.
     pub output_connect_timeout_ms: Ms,
-    /// F-011 (Owed 38; the coordinator's ruling): a sink is Connected only once its bytes-sent total
-    /// has kept growing for this long since its first growth, with no error and no stall between. The
+    /// F-011 (Owed 38; the coordinator's ruling): a sink is Connected at its first growth at least
+    /// this long after its first growth, with no error between (since Owed 87 a silence between is no
+    /// failure and does not restart the proof: only the sink's error ends it). The
     /// first nonzero `out-bytes-total` is the 476 B RTMP `connect` command (22–69 ms after the build,
     /// n = 10 on CF), and a REFUSED publish keeps counting until its refusal arrives: 262 334 B by
     /// 538 ms on CF (a made-up key) and 1 008 779 B over 2 033 ms on mediamtx (a denied path). No byte
