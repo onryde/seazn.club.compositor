@@ -9,11 +9,18 @@
 # `overlay hidden reason=hang gen=g`, then `graphics restart gen=g+1`, then `cef ready gen=g+1`, and no
 # other hide. The strip, frame-exact: the overlay holds one index from the hang while the timeline
 # schedules a change (the frame is held, not idle), then shows no overlay for at least one frame,
-# then the overlay again after the new generation's ready. The strip's gap starts within
-# cef_hang_after_ms + one frame period of the page's last `seazn:alive` (the brief's bound: CI run
-# 40045826841 read the strip 6 ms behind the log, so no transport term is owed; the PR #52 review's
-# m1). Camera frames continue, the output never drops, and every beat in the span (at least one)
-# reads ready, restarting or starting, never failed.
+# then the overlay again after the new generation's ready. Camera frames continue, the output never
+# drops, and every beat in the span (at least one) reads ready, restarting or starting, never failed.
+#
+# The detect bound (C14 fix round 3's re-review, I-1). The product's rule is judged on the log: the
+# hide comes at the first tick at or after cef_hang_after_ms past the last alive
+# (domain::graphics), so `hide − alive` lies in [cef_hang_after_ms, + one frame period), and one more
+# period each way covers the docker stamps of two lines and a late tick. The strip is judged against
+# the logged hide within BUDGET_FRAME_TO_ENCODER_MS (spec §6): a strip time is the MediaMTX
+# segment's name plus the frame's offset, and the names step ±17 ms of arrival jitter (F-021). The
+# brief's one bound, strip − alive ≤ cef_hang_after_ms + one frame period, left the strip's dating no
+# slack: PR run 40065135366 read the log at 10 031 (on the rule) and the strip at 10 037 (a false
+# premise row; the round-1 review's m1 rested on one sample).
 # Anti-vacuity: the page's own hang line, at least 2 alive lines before it and none after.
 
 CASE_LIVE_S=60
@@ -52,9 +59,12 @@ case_verdict() {
     and ([scheduled[] | select(.due_ms > $h.at_ms and .due_ms < $gap.from_ms)] | length) >= 1' \
     "$HUNG"' | {held: [.overlay.runs[] | select(.to_ms > $h.at_ms and .from_ms < $gap.from_ms) | .index],
       scheduled_meanwhile: ([scheduled[] | select(.due_ms > $h.at_ms and .due_ms < $gap.from_ms)] | length)}'
-  require detect_ms "$HUNG"' | $alive != null and ($gap.from_ms - $alive.at_ms) <= ($t.cef_hang_after_ms + $t.frame_period_ms)' \
-    "$HUNG"' | {strip_from_last_alive_ms: ($gap.from_ms - $alive.at_ms), log_from_last_alive_ms: ($hid.at_ms - $alive.at_ms),
-      bound: ($t.cef_hang_after_ms + $t.frame_period_ms)}'
+  require detect_ms "$HUNG"' | ($hid.at_ms - $alive.at_ms) as $log
+    | $log >= ($t.cef_hang_after_ms - $t.frame_period_ms) and $log <= ($t.cef_hang_after_ms + 2 * $t.frame_period_ms)
+    and (($gap.from_ms - $hid.at_ms) | abs) <= $t.budget_frame_to_encoder_ms' \
+    "$HUNG"' | {log_from_last_alive_ms: less($hid.at_ms; $alive.at_ms), strip_from_log_ms: less($gap.from_ms; $hid.at_ms),
+      log_bounds: [($t.cef_hang_after_ms - $t.frame_period_ms), ($t.cef_hang_after_ms + 2 * $t.frame_period_ms)],
+      strip_budget: $t.budget_frame_to_encoder_ms}'
   require overlay_back "$HUNG"' | $ready != null and $gap.to_ms >= $ready.at_ms
     and ([.overlay.runs[] | select(.from_ms >= $gap.to_ms and .index != null)] | length) >= 1' \
     "$HUNG"' | {gap_to_ms: $gap.to_ms, ready_ms: $ready.at_ms}'

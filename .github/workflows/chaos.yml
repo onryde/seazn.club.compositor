@@ -233,6 +233,8 @@ jobs:
       - name: The table
         env:
           CASES: ${{ inputs.cases || 'all' }}
+          # The branch head the legs ran (a PR run's GITHUB_SHA is its merge commit).
+          CHAOS_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           mkdir -p "$RUNNER_TEMP/verdicts"
           rc=0

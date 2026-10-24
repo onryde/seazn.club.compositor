@@ -13,6 +13,13 @@
 # the NEW compositor and started 130 to 450 ms after the new init. The `start` event is the daemon's
 # report of the start, so it is no anchor for a process that starts a hundred ms into the
 # container: the init is.
+#
+# What `old_tree_gone` can see (the re-review's m-5): little. A restarted container is a new pid
+# namespace, so no process of the old tree can appear in a sample taken after the restart; the check
+# fails only when no container restart followed the kill (which `died_in_place` and `restarted_once`
+# judge as well) or when the sample is not the new container's. An orphan of the old tree, the
+# brief's real worry, is not witnessed here: that needs a `tree` sampled after the kill and before
+# the die. It stays as the sample's own anchoring check, and is no evidence about orphans.
 
 # shellcheck source=/dev/null
 . "$HERE/cases/cef-gpu-zygote-killed.sh"
@@ -26,7 +33,7 @@ case_after_kill() {
   in_compositor tree | mark_lines tree_after || true
 }
 
-CASE_CHECKS=18
+CASE_CHECKS=19
 case_verdict() {
   zygote_verdict
   require old_tree_gone '[mark("tree_after")[] | .value] as $all

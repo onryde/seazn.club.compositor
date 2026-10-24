@@ -6,7 +6,7 @@
 #              least KILL_SPACING_MS after the one before: the restart as in case 13
 #              (`restart in place: <n> CEF GPU-process deaths`), never Chromium's abort;
 #   one-fewer  one kill fewer: no restart and no exit in the run, `gpu_process_deaths=<n-1>` logged,
-#              and the overlay on air after the last kill (`require_overlay_back`, fix round 3);
+#              and every score change scheduled after the last kill shown (the re-review's m-1);
 #   fast       the fast loop (the PR #34 review's gap): each kill the moment a new pid appears, until
 #              the process exits or chromium_gpu_deaths_abort - 1 are done (one short of the abort).
 #
@@ -72,9 +72,9 @@ require_restarted() {
 }
 
 case "$CASE_VARIANT" in
-  threshold) CASE_CHECKS=19 ;;
+  threshold) CASE_CHECKS=20 ;;
   one-fewer) CASE_CHECKS=11 ;;
-  fast) CASE_CHECKS=20 ;;
+  fast) CASE_CHECKS=21 ;;
 esac
 case_verdict() {
   # The loop's own end line, when the exec lived to print it (a restart kills the exec with its
@@ -100,8 +100,21 @@ case_verdict() {
       require counter_regressions '.camera.counter_regressions == 0'
       require_run no_core '.cores.diff_ok and .cores.container_files == 0 and .cores.host_after == .cores.host_before' '.cores'
       require no_output_outages '.output_outages == []' '.output_outages | length'
-      # No restart, and the overlay is on air after the last kill (C14 fix round 3, item 3).
-      require_overlay_back '(mark("kill") | last | .at_ms)' '(mark("kill") | last | .at_ms)'
+      # No restart, and the page still paints after the last kill: every score change the timeline
+      # schedules after it shows (the re-review's m-1: round 3's `overlay_back` here passed on the
+      # held frame, CI's `back_ms` 20 and 22, a frame that never left; a page that stops painting
+      # while it beats keeps a stale score on air, and the hang rule never hides a page that beats).
+      require scheduled_changes_shown '. as $r | (mark("kill") | last | .at_ms) as $k
+        | ($r.overlay.score_index_changes | map(.index)) as $shown
+        | ($r.frames_table | map(select(.[2] != null)) | last | .[0]) as $last
+        | [scheduled[] | select($k != null and .due_ms > $k and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due
+        | ($due | length) >= 1 and ($due - $shown) == []' \
+        '. as $r | (mark("kill") | last | .at_ms) as $k
+        | ($r.frames_table | map(select(.[2] != null)) | last | .[0]) as $last
+        | [scheduled[] | select($k != null and .due_ms > $k and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due
+        | {due_after_last_kill: ($due | length), missing: ($due - ($r.overlay.score_index_changes | map(.index))),
+           lag_ms: [$r.overlay.score_index_changes[] | select(.due_wall_ms != null and $k != null and .due_wall_ms > $k)
+             | .frame_wall_ms - .due_wall_ms] | {min: min, max: max}}'
       ;;
     fast)
       require kills_distinct '(mark("kill") | length) >= 1 and (mark("kill") | map(.value.pid) | repeats) == []' \

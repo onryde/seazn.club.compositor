@@ -6,8 +6,7 @@
 # The relay image is never changed for the harness (the dispatch's ruling: no package is added to
 # the shipped image), and it carries no procps, so everything here reads /proc with bash builtins:
 # no pkill, no ps. A process's type is its `--type=` argument (CEF's children: zygote, gpu-process,
-# renderer, utility; F-013), its parent and start time come from /proc/<pid>/stat. Processes run
-# from here (the burn's workers) are in the container's cgroup, as every `docker exec` is.
+# renderer, utility; F-013), its parent and start time come from /proc/<pid>/stat.
 #
 # Every line printed is one JSON object, stamped with this host's wall clock in ms (the kernel's
 # CLOCK_REALTIME, the clock `docker logs --timestamps` and `docker events` use). A kill prints its
@@ -30,9 +29,10 @@
 #                              exec dies with its container), or at DEADLINE_MS (this host's epoch
 #                              ms), and then FAILS (`timed_out`): no leg may wait out the relay's own
 #                              deadline. Prints one `done_at_ms` line at its end
-#   burn WORKERS SECONDS       WORKERS busy loops for SECONDS each, in this container's cgroup (case
-#                              6); prints its start (`at_ms`) and, once every worker has stopped
-#                              itself, its end (`done_at_ms`, `elapsed_ms`)
+#   cpu-usage                  the CPU time this container's cgroup has used (case 6, fix round 4):
+#                              `usage_usec` from cgroup v2's cpu.stat, or cgroup v1's
+#                              cpuacct.usage in µs; fails when neither reads. Prints `sample_ms`,
+#                              never `at_ms`: it is a reading, not a mark
 #
 # A pid listed can be gone by the time it is read (this script's own command substitutions are in
 # every listing). Every /proc read is a builtin `read`/`mapfile` with its error redirect FIRST and a
@@ -40,11 +40,12 @@
 # inside `|| return 1` (fix round 2: CI's `tree` stopped at the first vanished pid and `kill-zygote`
 # printed nothing, 6 of 6 legs).
 #
-# IN_CONTAINER_PROC moves /proc (the harness's own test, crates/harness/tests/in_container.rs, runs
-# this on a fake tree); the cases never set it.
+# IN_CONTAINER_PROC moves /proc and IN_CONTAINER_CGROUP /sys/fs/cgroup (the harness's own test,
+# crates/harness/tests/in_container.rs, runs this on a fake tree); the cases never set them.
 set -euo pipefail
 
 PROC="${IN_CONTAINER_PROC:-/proc}"
+CGROUP="${IN_CONTAINER_CGROUP:-/sys/fs/cgroup}"
 
 now_ms() {
   local t=$EPOCHREALTIME
@@ -295,27 +296,22 @@ cmd_gpu_loop() {
   [ "$kills" -eq "$n" ] || { [ "$alive" = false ] && [ "$kills" -ge 1 ]; }
 }
 
-cmd_burn() {
-  local workers="$1" seconds="$2" i start
-  if ! [[ "$workers" =~ ^[1-9][0-9]*$ && "$seconds" =~ ^[1-9][0-9]*$ ]]; then
-    echo '{"error":"burn WORKERS SECONDS"}'
-    exit 64
+# The container's cgroup CPU time, µs. A container has its own cgroup namespace (Docker's default
+# on cgroup v2), so the root of /sys/fs/cgroup is the container's own cgroup.
+cmd_cpu_usage() {
+  local k v usage=""
+  if [ -r "$CGROUP/cpu.stat" ]; then
+    while read -r k v; do
+      if [ "$k" = usage_usec ]; then usage="$v"; fi
+    done 2>/dev/null <"$CGROUP/cpu.stat" || true
+  elif [ -r "$CGROUP/cpuacct/cpuacct.usage" ] && read -r v 2>/dev/null <"$CGROUP/cpuacct/cpuacct.usage"; then
+    if [[ "$v" =~ ^[0-9]+$ ]]; then usage=$((v / 1000)); fi
   fi
-  start=$(now_ms)
-  printf '{"at_ms":%s,"workers":%s,"seconds":%s}\n' "$start" "$workers" "$seconds"
-  # Each worker stops itself at its own deadline (EPOCHREALTIME, no fork per turn): an exec killed
-  # with its container leaves no spin.
-  local end=$((start + seconds * 1000))
-  for ((i = 0; i < workers; i++)); do
-    (
-      t=${EPOCHREALTIME//[.,]/}
-      while ((10#$t / 1000 < end)); do t=${EPOCHREALTIME//[.,]/}; done
-    ) &
-  done
-  wait
-  local done_at
-  done_at=$(now_ms)
-  printf '{"done_at_ms":%s,"workers":%s,"elapsed_ms":%s}\n' "$done_at" "$workers" $((done_at - start))
+  if ! [[ "$usage" =~ ^[0-9]+$ ]]; then
+    echo '{"error":"no cgroup CPU usage (cpu.stat usage_usec or cpuacct.usage)"}'
+    exit 1
+  fi
+  printf '{"sample_ms":%s,"usage_usec":%s}\n' "$(now_ms)" "$usage"
 }
 
 case "${1:-}" in
@@ -324,9 +320,9 @@ case "${1:-}" in
   kill-compositor) cmd_kill_compositor ;;
   kill-zygote) cmd_kill_zygote "${2:?gpu|renderer}" ;;
   gpu-loop) cmd_gpu_loop "${2:?N}" "${3:?SPACING_MS}" "${4:?DEADLINE_MS}" ;;
-  burn) cmd_burn "${2:?WORKERS}" "${3:?SECONDS}" ;;
+  cpu-usage) cmd_cpu_usage ;;
   *)
-    echo '{"error":"usage: tree | kill-cef | kill-compositor | kill-zygote gpu|renderer | gpu-loop N SPACING_MS DEADLINE_MS | burn WORKERS SECONDS"}'
+    echo '{"error":"usage: tree | kill-cef | kill-compositor | kill-zygote gpu|renderer | gpu-loop N SPACING_MS DEADLINE_MS | cpu-usage"}'
     exit 64
     ;;
 esac

@@ -34,7 +34,7 @@ case_drive() {
   at_s "$CASE_LIVE_S"
 }
 
-CASE_CHECKS=11
+CASE_CHECKS=12
 case_verdict() {
   require fault_applied 'mark_value("netem_out") | .backlog_bytes > 0' 'mark_value("netem_out")'
   require stall_swap 'stall_swap(mark_at("cut")) | .swap_ms != null and .swap_beat_ms != null and .last_growth_ms != null
