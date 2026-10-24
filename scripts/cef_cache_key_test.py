@@ -114,12 +114,18 @@ def step_with(text, name):
 FULL_IMAGE_STEPS = [
     "actions/checkout@v4", "Free disk space", "gstcefsrc pin (F-001)", "docker/setup-buildx-action@v3",
     "Log in to GHCR (read)", "Build cache (GHCR, read)", "Build the image", "Build the cef-test stage",
-    "Plugin check", "Runs as non-root, with no CEF log override",
-    "In-place restart probe (Owed 85, CEF ready after 75, 133 and 137)", "C11's graphics tests beside cefsrc",
+    "Plugin check", "Runs as non-root, with no CEF log override", "C11's graphics tests beside cefsrc",
     "Smoke budget", "60 s fake smoke", "Exit 75 smoke (C11b, a dead CEF zygote)",
-    "Live-mode probe (no core, TMPDIR, 32 live exits)", "Image size", "Logs",
+    "Live-mode probe (no core, TMPDIR, 32 live exits)", "Image size",
+    "In-place restart probe (Owed 85, CEF ready after 75, 133 and 137)", "Logs",
 ]
 LAST_BUILD_STEP = "Build the cef-test stage"
+# Owed 85's restart probe (the PR #54 review's I3): its red hides no later step, and no red check
+# step before it hides it.
+RESTART_PROBE = "In-place restart probe (Owed 85, CEF ready after 75, 133 and 137)"
+# GitHub's status-check functions: an `if:` with none of them runs only while every earlier step
+# succeeded (GitHub adds `success() &&`).
+STATUS_FN = re.compile(r"\b(?:always|cancelled|failure|success)\(\)")
 
 
 def image_job(text):
@@ -154,7 +160,8 @@ def own_if(text, name):
 def term(t, ctx):
     """One comparison of the few forms image.yml uses; anything else is refused (extend it here)."""
     t = t.strip()
-    if t == "always()":
+    # Not cancelled: this test evaluates runs that were never cancelled.
+    if t in ("always()", "!cancelled()"):
         return True
     m = re.fullmatch(r"(github\.event_name|inputs\.measure|env\.TIMING) (==|!=) '([^']*)'", t)
     if not m:
@@ -419,6 +426,25 @@ def main():
                                f"as owed ({len(want)}){'' if ran == want else f': ran {ran}'}")
         print(f"image job guards evaluated: {evaluated} (step, event) pairs")
         check(evaluated > 0, "the guard sweep evaluated at least one step")
+
+        # After a red step (on a push or a pull request, where TIMING is false): a step runs only when its
+        # `if:` names a status function and holds.
+        ctx = {"github.event_name": "pull_request", "inputs.measure": "", "env.TIMING": "false"}
+
+        def runs_after_red(cond):
+            return bool(cond) and bool(STATUS_FN.search(cond)) and evaluate(cond, ctx)
+
+        at = names.index(RESTART_PROBE)
+        after = steps[at + 1:]
+        hidden = [n for n, cond in after if not runs_after_red(cond)]
+        check(not hidden, f"a red restart probe hides no later step ({len(after)} after it; hidden: {hidden})")
+        checks_before = steps[names.index(LAST_BUILD_STEP) + 1:at]
+        probe_if = steps[at][1]
+        hides = [n for n, _ in checks_before if not runs_after_red(probe_if)]
+        check(not hides, f"no red check step before the restart probe hides it ({len(checks_before)} before it; "
+                         f"hiding: {hides})")
+        print(f"red-step guards evaluated: {len(after) + len(checks_before)} (red step, step) pairs")
+        check(len(after) + len(checks_before) > 0, "the red-step sweep evaluated at least one pair")
     except ValueError as e:
         check(False, f"the image job's guards: {e}")
 

@@ -173,14 +173,6 @@ jobs:
             echo "::error::the image sets TINI_KILL_PROCESS_GROUP"
             exit 1
           fi
-      # Owed 85 (F-025): Docker's restart in place (`--restart on-failure`, ADR 0007 item 5) keeps the
-      # container's writable layer, /tmp included, as compose's does in C14. Each exit C14 saw restarted
-      # (75, 133, 137) must come back with CEF ready, one Xvfb and the X lock naming it: 6 restarts, two
-      # per container, each kind twice. About 2 minutes, so it runs before the long steps.
-      - name: In-place restart probe (Owed 85, CEF ready after 75, 133 and 137)
-        if: env.TIMING != 'true'
-        timeout-minutes: 10
-        run: python3 -I scripts/image_probe.py "$IMAGE" --keep-log restart.log --restarts 6
       - name: C11's graphics tests beside cefsrc
         if: env.TIMING != 'true'
         run: |
@@ -262,6 +254,17 @@ jobs:
             echo "::error::the image is $bytes bytes, over the 2.5 GB cap"
             exit 1
           fi
+      # Owed 85 (F-025): Docker's restart in place (`--restart on-failure`, ADR 0007 item 5) keeps the
+      # container's writable layer, /tmp included, as compose's does in C14. Each exit C14 saw restarted
+      # (75, 133, 137) must come back with CEF ready, one Xvfb with -displayfd, no X lock and its socket
+      # listening: 6 restarts, two per container, each kind twice. Measured 13 s for 3 restarts (run
+      # 40058946304) and 18 s for 4 (run 40057826178); the probe's own waits bound it near 11 minutes.
+      # Last, and run whatever an earlier step found (`!cancelled()`), so its red hides no other C12 check
+      # and no other red hides it (the PR #54 review's I3); scripts/cef_cache_key_test.py checks both.
+      - name: In-place restart probe (Owed 85, CEF ready after 75, 133 and 137)
+        if: ${{ !cancelled() && env.TIMING != 'true' }}
+        timeout-minutes: 15
+        run: python3 -I scripts/image_probe.py "$IMAGE" --keep-log restart.log --restarts 6
       - name: Logs
         if: always() && env.TIMING != 'true'
         uses: actions/upload-artifact@v4

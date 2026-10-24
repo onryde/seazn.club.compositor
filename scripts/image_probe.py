@@ -51,14 +51,23 @@ equivalent, the cap read from the ADR), which restarts the same container and so
 layer, `/tmp` included, as compose's restart does in C14's chaos cases. Each container is ended
 twice from inside, by two of the three exits C14 saw restarted (F-024): C11b's 75 after a killed CEF
 zygote, SIGTRAP (133, Chromium's FATAL abort) and SIGKILL (137) to the compositor; Docker restarts it
-in place each time, so the second restart meets the first restart's leftovers. After each restart:
+in place each time, so the second restart meets the first restart's leftovers. Every restart is
+made whatever an earlier check found (the PR #54 review's I2): a check fails on its own, and only a
+container that is gone, or a zygote kind with no CEF to kill a zygote of (the compositor is then
+SIGKILLed instead, a failure of that kind), changes what the next restart does. After each restart:
 the old life ended on the kind's own status and line, Docker counted the restart, and the new life's
-CEF is ready (`cef ready gen=1`, no `init_cef` failure); then exactly one Xvfb runs and the X lock
-names it. Until each verdict the probe reads only `docker logs` and `docker inspect`, never
-`docker exec`: an exec'd process takes a pid in the container's namespace, and the new Xvfb's pid
-against the old lock's is what F-025 found. `scripts/xvfb_witness.sh`, bind-mounted at
-/usr/local/bin/Xvfb (never in the image), records each Xvfb start's pid, the lock it found and
-Xvfb's own stderr; the probe prints them. 0 restarts checked is a failure.
+CEF is ready (`cef ready gen=1`, no `init_cef` failure); then exactly one Xvfb runs, with
+`-displayfd`; there is no X lock (`-displayfd` sets Xvfb's `nolock`: xorg-server's os/utils.c, the
+review's C1); and that Xvfb listens on `/tmp/.X11-unix/X99` (a listening entry in /proc/net/unix
+whose inode is one of its own fds). Until each verdict the probe reads only `docker logs` and
+`docker inspect`, never `docker exec`: an exec'd process takes a pid in the container's namespace,
+and the new Xvfb's pid against the old lock's is what F-025 found. `scripts/xvfb_witness.sh`,
+bind-mounted at /usr/local/bin/Xvfb (never in the image), records each Xvfb start's pid, the lock
+and socket it met, and Xvfb's own stderr: per container, one start per life, no start met a lock,
+the first start met no socket and each restart met the previous life's (the restart did keep
+`/tmp`, so the case is not vacuous). Each life's `Xvfb ready after N ms` (xvfb.sh) is printed (the
+review's m3). The kept log is written after each container (m2). Exactly N restarts checked, or a
+failure.
 
 Usage: image_probe.py <image> [--keep-log <path>] [--exits N] [--restarts N]
 """
@@ -117,6 +126,12 @@ RESTART_KINDS = (
     ("SIGTRAP to the compositor (Chromium's abort)", "TRAP", 128 + signal.SIGTRAP),
     ("SIGKILL to the compositor", "KILL", 128 + signal.SIGKILL),
 )
+# The new life's X server (the PR #54 review's C1): the listening socket's path (Xvfb's UNIX
+# transport, xtrans's UNIX_PATH and display 99) and the kernel's flag for a listening socket in
+# /proc/net/unix (include/linux/net.h's __SO_ACCEPTCON).
+X_SOCKET = "/tmp/.X11-unix/X99"
+X_LOCK = "/tmp/.X99-lock"
+ACCEPTCON = 1 << 16
 # Lines of Xvfb's own stderr worth printing (its refusals: os/utils.c, os/connection.c); the rest
 # (xkbcomp's keysym warnings) stays in the kept log.
 X_REFUSAL = re.compile(r"already active|Fatal server error|Cannot establish|lock file|Could not create")
@@ -391,6 +406,20 @@ def main():
             r = sh("docker", "cp", f"{NAME}:{WITNESS_X_LOG}", f"{d}/w.log", check=False)
             return Path(d, "w.log").read_text(errors="replace") if r.returncode == 0 else ""
 
+    def x_listening(xpid):
+        """Inodes of the listening sockets on X_SOCKET that `xpid` holds open. Read as the image's user,
+        Xvfb's own: its fd links need ptrace access, which root in a container without CAP_SYS_PTRACE
+        lacks for another uid's process (Docker's default capabilities)."""
+        out = in_container(f'cat /proc/net/unix; echo ----; for f in /proc/{xpid}/fd/*; do readlink "$f"; done')
+        table, _, fds = out.partition("----\n")
+        held = set(re.findall(r"^socket:\[(\d+)\]$", fds, re.M))
+        found = []
+        for row in table.splitlines()[1:]:
+            f = row.split()
+            if len(f) >= 8 and f[7] == X_SOCKET and int(f[3], 16) & ACCEPTCON and f[6] in held:
+                found.append(f[6])
+        return found
+
     def restart_phase(n):
         m = re.search(r"Docker\s+`--restart on-failure:(\d+)`", ADR_0007.read_text())
         if not m:
@@ -409,31 +438,40 @@ def main():
             containers += 1
             kinds = [RESTART_KINDS[(i + j) % len(RESTART_KINDS)] for j in range(min(per, n - i))]
             up = start(fixture, extra=extra)
-            for life, (kind, tag, want) in enumerate(kinds, start=2):
-                what = f"restart {i + 1} of {n} (the container's restart {life - 1}, {kind}, {fixture.name})"
+            life, made = 1, 0
+            for kind, tag, want in kinds:
                 i += 1
-                if not up:
-                    check(False, f"{what}: CEF was not up in the life before")
+                what = f"restart {i} of {n} (the container's restart {life}, {kind}, {fixture.name})"
+                if not check(running(), f"{what}: the container runs, so it can be restarted"):
                     continue
                 cpid = compositor_pid()
-                target, sig = cpid, tag
+                target, sig, ends, ok = cpid, tag, want, True
                 if tag == "zygote":
-                    # Two child polls: the restart alone, after the poll has listed the zygote.
-                    time.sleep(2 * child_poll)
-                    zyg = [p_ for p_, (pp, a_) in cmdlines().items() if cpid and pp == cpid and "--type=zygote" in a_]
-                    target, sig = (zyg[0] if zyg else 0), "KILL"
+                    zyg = []
+                    if up:
+                        # Two child polls: the restart alone, after the poll has listed the zygote.
+                        time.sleep(2 * child_poll)
+                        zyg = [p_ for p_, (pp, a_) in cmdlines().items() if cpid and pp == cpid and "--type=zygote" in a_]
+                    if zyg:
+                        target, sig = zyg[0], "KILL"
+                    else:
+                        # No CEF, so no zygote: the restart is still made, the compositor's SIGKILL.
+                        ok = check(False, f"{what}: a CEF zygote to kill (CEF {'up' if up else 'not up'} in the life "
+                                          f"before); the compositor is SIGKILLed instead")
+                        target, sig, ends = cpid, "KILL", 128 + signal.SIGKILL
                 if not check(target > 0, f"{what}: a process to kill (compositor {cpid}, target {target})"):
-                    up = False
                     continue
                 k = sh("docker", "exec", NAME, "kill", f"-{sig}", str(target), check=False)
                 check(k.returncode == 0, f"{what}: kill -{sig} {target} returned {k.returncode}")
+                life += 1
+                made += 1
                 state, pieces, took = await_life(life)
                 checked += 1
                 old = pieces[life - 1] if len(pieces) > life - 1 else ""
                 new = pieces[life] if len(pieces) > life else ""
-                line = (f"msg=exit code={want}" if tag == "zygote"
-                        else f"level=error msg={KILLED} {signal.Signals(want - 128).name} (status {want})")
-                ok = check(line in old, f"{what}: the old life ended on {want} ({line!r})")
+                line = (f"msg=exit code={ends}" if ends < 128
+                        else f"level=error msg={KILLED} {signal.Signals(ends - 128).name} (status {ends})")
+                ok &= check(line in old, f"{what}: the old life ended on {ends} ({line!r})")
                 rc = sh("docker", "inspect", "-f", "{{.RestartCount}}", NAME).stdout.strip()
                 ok &= check(rc == str(life - 1), f"{what}: restarted in place (RestartCount {rc}, want {life - 1})")
                 failed_init = "Failed to initialize CEF" in new
@@ -443,35 +481,52 @@ def main():
                 # The verdict is in: from here the probe may exec into the container.
                 if running():
                     xv = [r_[0] for r_ in procs() if r_[1] == "Xvfb"]
-                    lock = sh("docker", "exec", NAME, "cat", "/tmp/.X99-lock", check=False).stdout.strip()
-                    ok &= check(len(xv) == 1, f"{what}: one Xvfb in the new life ({xv})")
-                    ok &= check(len(xv) == 1 and lock == str(xv[0]),
-                                f"{what}: the X lock names the live Xvfb (lock {lock!r}, Xvfb {xv})")
-                    unix = in_container("grep -c '/tmp/.X11-unix/X99$' /proc/net/unix || true").strip()
+                    argv = cmdlines().get(xv[0], (0, ""))[1].split() if len(xv) == 1 else []
+                    ok &= check(len(xv) == 1 and "-displayfd" in argv,
+                                f"{what}: one Xvfb in the new life, with -displayfd ({xv}, argv {' '.join(argv)!r})")
+                    lock = in_container(f"if [ -e {X_LOCK} ]; then echo yes; else echo no; fi").strip()
+                    ok &= check(lock == "no", f"{what}: no X lock ({X_LOCK}: {lock}; -displayfd sets Xvfb's nolock)")
+                    heard = x_listening(xv[0]) if len(xv) == 1 else []
+                    ok &= check(len(heard) >= 1,
+                                f"{what}: that Xvfb listens on {X_SOCKET} (its listening sockets there: {heard})")
                     shm = in_container("ls -A /dev/shm/seazn 2>&1 || true").split()
-                    print(f"     measured: X99 sockets in /proc/net/unix: {unix}; /dev/shm/seazn: {shm}; the profile "
-                          f"sweep removed an earlier life's directory: {'CEF profile directories of processes' in new}")
+                    print(f"     measured: /dev/shm/seazn: {shm}; the profile sweep removed an earlier life's "
+                          f"directory: {'CEF profile directories of processes' in new}")
                 else:
                     ok &= check(False, f"{what}: the container runs after the restart")
-                up = ok and state == "ready"
+                # Only what the next restart needs gates it (the review's I2), never an earlier check.
+                up = state == "ready" and running()
                 ready += 1 if ok else 0
-                by_status[want] = by_status.get(want, 0) + (1 if ok else 0)
+                by_status[ends] = by_status.get(ends, 0) + (1 if ok else 0)
+            logs = sh("docker", "logs", NAME).stderr
             witness = witness_log()
             starts = [l_ for l_ in witness.splitlines() if l_.startswith("xvfb-witness ")]
+            met = [dict(kv.split("=", 1) for kv in l_.split()[1:]) for l_ in starts]
             said = [l_.strip() for l_ in witness.splitlines() if X_REFUSAL.search(l_)]
+            took_ms = re.findall(r"level=info msg=Xvfb ready after (\d+) ms$", logs, re.M)
             print(f"  container {containers}: the X witness, one line per Xvfb start: {starts}")
             print(f"  container {containers}: Xvfb's own refusals (its stderr): {said}")
-            check(len(starts) >= 1 + len(kinds),
-                  f"container {containers}: the witness saw each life's Xvfb start ({len(starts)}, want {1 + len(kinds)})")
-            kept.append(sh("docker", "logs", NAME).stderr + "\n---- the X witness ----\n" + witness)
+            print(f"  container {containers}: measured: Xvfb ready after {took_ms} ms, one per life")
+            check(len(starts) == 1 + made,
+                  f"container {containers}: the witness saw one Xvfb start per life ({len(starts)}, want {1 + made})")
+            check(bool(met) and all(f.get("lock") == "none" for f in met),
+                  f"container {containers}: no Xvfb start met an X lock ({[f.get('lock') for f in met]})")
+            check([f.get("socket") for f in met] == ["no"] + ["yes"] * made,
+                  f"container {containers}: the first start met no X socket and each restart the previous "
+                  f"life's ({[f.get('socket') for f in met]}): the restarts kept /tmp")
+            check(len(took_ms) == 1 + made,
+                  f"container {containers}: each life logged its Xvfb's ready time ({len(took_ms)}, want {1 + made})")
+            kept.append(logs + "\n---- the X witness ----\n" + witness)
+            if a.keep_log:
+                Path(a.keep_log).write_text("\n==== next run ====\n".join(kept))
             sh("docker", "rm", "-f", NAME, check=False)
-        print(f"restarts with CEF ready again, by the old life's exit status: {by_status}")
+        print(f"restarts with every check passed, by the old life's exit status: {by_status}")
         check(checked == n and n > 0, f"in-place restarts checked: {checked} of {n}")
-        check(ready == n and n > 0, f"in-place restarts with CEF ready, one Xvfb and its lock: {ready} of {n}")
+        check(ready == n and n > 0,
+              f"in-place restarts with CEF ready, one Xvfb with -displayfd, no lock and its socket listening: "
+              f"{ready} of {n}")
         leaks = [x for x in SECRETS for logs in kept if x in logs]
         check(not leaks and len(kept) == containers, f"no credential in {len(kept)} container logs ({len(set(leaks))} leaked)")
-        if a.keep_log:
-            Path(a.keep_log).write_text("\n==== next run ====\n".join(kept))
 
     try:
         if a.restarts:
