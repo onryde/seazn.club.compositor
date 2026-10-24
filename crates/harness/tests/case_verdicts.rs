@@ -1133,10 +1133,17 @@ fn dest_stall_in(trickle: i64, timeout_x: i64, stats: Value, err: ErrLine, phase
 /// later: a detector faster than the sink's timeout (case 17's `rule-early`, the PR #65 review's
 /// m-3), in `trickle`'s world.
 fn dest_stall_error_at(after_cut: i64, trickle: i64, stats: Value) -> World {
+    let w = World::new(80);
+    let gap = w.ms("output_backoff_base_ms") + TICK_AFTER_BACKOFF_MS;
+    dest_stall_error_swap_at(after_cut, gap, trickle, stats)
+}
+
+/// [`dest_stall_error_at`], the swap `error_to_swap` ms after the error, as the log's stamps read it.
+fn dest_stall_error_swap_at(after_cut: i64, error_to_swap: i64, trickle: i64, stats: Value) -> World {
     let mut w = dest_stall_in(trickle, 0, stats, ErrLine::Missing, "pending");
     let cut = w.at(20.0);
     let error = cut + after_cut;
-    let swap = error + w.ms("output_backoff_base_ms") + TICK_AFTER_BACKOFF_MS;
+    let swap = error + error_to_swap;
     w.line(
         error,
         "output gen=1 error: Connection error: Socket I/O timed out (gstrtmp2sink.c)",
@@ -1152,6 +1159,13 @@ fn dest_stall_error_at(after_cut: i64, trickle: i64, stats: Value) -> World {
 fn cut_floor_ms(w: &World) -> i64 {
     let frame = w.t["frame_period_ms"].as_f64().expect("frame_period_ms");
     (w.ms("output_sink_timeout_ms") as f64 - frame).ceil() as i64
+}
+
+/// The shortest error-to-swap the floor accepts: the domain's back-off from Connected less one frame
+/// period (the log's stamps cannot resolve the product's tick), rounded up to the ms the log carries.
+fn backoff_floor_ms(w: &World) -> i64 {
+    let frame = w.t["frame_period_ms"].as_f64().expect("frame_period_ms");
+    (w.ms("output_backoff_base_ms") as f64 - frame).ceil() as i64
 }
 
 /// Case 5 in CI (run 40045826841): at 1 kbit nothing was sent in 30 s, and the queue held the leg.
@@ -1192,16 +1206,42 @@ fn dest_stall_swaps_on_the_sinks_error_and_reds_without_it_or_a_slow_one() {
     let v = judge(&w, "dest-stall", "", "stall-backoff-as-pending");
     assert_fails(&v, "clear_phase_driven", "stall-backoff-as-pending");
     checked += 2;
-    // The back-off is a floor no product can beat: 1 ms under it reds, the back-off itself passes.
-    let w = dest_stall_err(0, 1, stalled(), ErrLine::At(1, base - 1));
+    // The back-off is a floor no product can beat, less one frame of stamping: 1 ms under that reds,
+    // the floor itself and the back-off pass. A swap that skipped the back-off (a tick after the
+    // error) reds.
+    let floor = backoff_floor_ms(&w);
+    assert!(floor < base && floor > TICK_AFTER_BACKOFF_MS, "{floor}");
+    let w = dest_stall_err(0, 1, stalled(), ErrLine::At(1, floor - 1));
     assert_fails(
         &judge(&w, "dest-stall", "", "stall-err-early"),
         "stall_swap",
         "stall-err-early",
     );
-    let w = dest_stall_err(0, 1, stalled(), ErrLine::At(1, base));
-    assert_pass(&judge(&w, "dest-stall", "", "stall-err-floor"), "stall-err-floor");
-    checked += 2;
+    let w = dest_stall_err(0, 1, stalled(), ErrLine::At(1, TICK_AFTER_BACKOFF_MS));
+    assert_fails(
+        &judge(&w, "dest-stall", "", "stall-err-no-backoff"),
+        "stall_swap",
+        "stall-err-no-backoff",
+    );
+    for (tag, before) in [("stall-err-floor", floor), ("stall-err-base", base)] {
+        let w = dest_stall_err(0, 1, stalled(), ErrLine::At(1, before));
+        assert_pass(&judge(&w, "dest-stall", "", tag), tag);
+    }
+    checked += 4;
+    // PR #71's CI run 40137725801 (dest-stall-backoff, main's harness): the swap 499 ms after the
+    // error by the docker stamps (its lines' own `ts=` read 500), 6 197 ms after the cut. The
+    // product backed off exactly its base; main's floor at the base itself red it, NOT OWED. Here it
+    // passes (judged in the default leg: the clear's phase is not this check's).
+    let w = dest_stall_error_swap_at(6_197 - 499, 499, 0, stalled());
+    let v = judge(&w, "dest-stall", "", "stall-ci-499");
+    assert_pass(&v, "stall-ci-499");
+    let m = &v.json["measures"]["stall_swap"];
+    assert_eq!(
+        (m["error_to_swap_ms"].as_i64(), m["from_cut_ms"].as_i64()),
+        (Some(499), Some(6_197)),
+        "stall-ci-499: {m}"
+    );
+    checked += 1;
     // An error sooner after the cut than the sink's timeout allows is not the stall's (the PR #65
     // review's m-3): the floor itself passes, 1 ms sooner reds on the floor alone.
     let w = dest_stall_error_at(cut_floor_ms(&w), 0, stalled());
@@ -1306,7 +1346,7 @@ fn dest_stall_swaps_on_the_sinks_error_and_reds_without_it_or_a_slow_one() {
         checked += 1;
     }
     eprintln!("dest-stall sims checked: {checked}");
-    assert_eq!(checked, 24);
+    assert_eq!(checked, 27);
 }
 
 #[test]
@@ -1314,7 +1354,7 @@ fn dest_trickle_swaps_under_a_trickle_and_reds_when_nothing_trickled() {
     // Case 12's qdisc in CI: 16 packets through at 8 kbit, one more queued.
     let trickling = || netem_queued(true, 19_271, 16, 0, 65_536, 1);
     let w = dest_stall(5_000, 1, trickling());
-    let (base, budget) = (w.ms("output_backoff_base_ms"), w.ms("budget_output_reconnect_ms"));
+    let budget = w.ms("budget_output_reconnect_ms");
     // CI's case 12 (run 40106770881): sink 1's socket timeout, the reason line `error`, and the
     // back-off's swap (Owed 87).
     assert_pass(&judge(&w, "dest-trickle", "", "trickle-good"), "trickle-good");
@@ -1324,7 +1364,7 @@ fn dest_trickle_swaps_under_a_trickle_and_reds_when_nothing_trickled() {
         "trickle-backoff",
     );
     let mut checked = 2;
-    let w = dest_stall_err(5_000, 1, trickling(), ErrLine::At(1, base - 1));
+    let w = dest_stall_err(5_000, 1, trickling(), ErrLine::At(1, backoff_floor_ms(&w) - 1));
     assert_fails(
         &judge(&w, "dest-trickle", "", "trickle-err-early"),
         "stall_swap",

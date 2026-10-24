@@ -98,8 +98,11 @@ def stall_swap($cut):
 # - the reason line reads error, and the outgoing sink's error line came before the swap (else
 #   `error_to_swap_ms` is null, and jq sorts null below every number: that reds);
 # - the sink was replaced after the domain's back-off from Connected (output_backoff_base_ms, a floor
-#   the product cannot beat) and inside the spec's output budget (§6 "≤5 s",
-#   budget_output_reconnect_ms);
+#   the product cannot beat, less one frame period: the domain acts on its frame ticks, and the two
+#   lines' docker stamps, read one by one and cut to the ms, cannot resolve finer. PR #71's CI run
+#   40137725801 read 499 ms for a swap whose own `ts=` stamps were 500 ms apart; a swap that skipped
+#   the back-off lands within a tick of the error, far below it) and inside the spec's output budget
+#   (§6 "≤5 s", budget_output_reconnect_ms);
 # - the swap came within `bound_ms` of the last growth: a detector slower than the sink's timeout reds
 #   (C14's mutant m9 sets it to 20 s);
 # - the error came no sooner after the cut than the sink's timeout less one frame (the PR #65 review's
@@ -115,7 +118,7 @@ def stall_swap_judged($cut):
   stall_swap($cut) as $s
   | $s.swap_ms != null and $s.swap_beat_ms != null and $s.last_growth_ms != null and $s.reasons_paired
     and $s.reason == "error"
-    and $s.error_to_swap_ms >= $t.output_backoff_base_ms
+    and $s.error_to_swap_ms >= $t.output_backoff_base_ms - $t.frame_period_ms
     and $s.error_to_swap_ms <= $t.budget_output_reconnect_ms
     and $s.from_growth_ms <= $s.bound_ms
     and $s.error_from_cut_ms >= $t.output_sink_timeout_ms - $t.frame_period_ms
