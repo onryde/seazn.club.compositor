@@ -35,17 +35,25 @@ pub struct StatsSnapshot {
     pub camera_frames_replaced: Option<u64>,
 }
 
-/// Camera frames the camera slot replaced before any tick put them on air (owner, 2026-10-24, in
-/// chat, relayed by the coordinator; `docs/_INDEX.md` Owed 81 (i); PR #59's stage-by-stage finding).
-/// The slot holds only the newest frame (`FrameStore`), and each tick shows whatever it holds, so
-/// frames that arrive in a burst between two ticks are overwritten unseen and nothing else counts
-/// them: `fps` counts ticks and `droppedFrames` the ladder's overruns.
+/// Camera frames the camera slot replaced before any tick put them on air (the coordinator's
+/// recommendation, approved by the owner 2026-10-24; `docs/_INDEX.md` Owed 81 (i); PR #59's
+/// stage-by-stage finding). The slot holds only the newest frame (`FrameStore`), and each tick shows
+/// whatever it holds, so frames that arrive in a burst between two ticks are overwritten unseen and
+/// nothing else counts them: `fps` counts ticks and `droppedFrames` the ladder's overruns.
 ///
 /// Fed once a tick with `written`, the frames the slot has taken so far. A tick that puts the camera
 /// on air (`Emit`, `Repeat`) shows the newest of the frames written since the tick before it and
 /// counts the rest; a slate tick (`Waiting`, `Reconnecting`, `Final`) counts none, because a slate is
 /// on air by the programme's own rule and the phase already says so. Frames the input never wrote
 /// (a gated build's, an appsink drop) are not in `written`, so they are not counted here.
+///
+/// **What it measures:** the frames above one a camera tick, which is input judder only for a source
+/// at the programme's rate. A steady source faster than the output reads as replaced too: a 60 fps
+/// camera on a 30 fps programme writes 2 a tick and reads 1 a tick, which is replacement, not
+/// judder. A slower one reads 0 while ticks repeat (a 25 fps camera: 1 tick in 6). A late tick
+/// thread raises it as well: the driver runs late ticks back to back, so a stall of `k` periods
+/// counts the `k − 1` frames that arrived in it, with no `ticks skipped` line below 1 s. Read it
+/// against the source's rate and the driver's lateness lines (Owed 89).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReplacedFrames {
     /// The highest `written` any tick has read.
@@ -373,6 +381,8 @@ mod tests {
     // ---- camera frames replaced (Owed 81 (i)) ----
 
     /// Both output profiles (AGENTS.md §5, "the other mode"); the tick grid runs at each one's fps.
+    /// Both are 30 fps today, so this is one grid swept twice, not two: the rule reads only write
+    /// counts, never the rate, and a profile at another rate would put its own grid here unchanged.
     const PROFILES: [OutputProfile; 2] = [OutputProfile::P720, OutputProfile::P1080];
 
     /// The driver's tick grid (C08): tick `i` is due at ⌈i·1000 / fps⌉ ms.
@@ -442,6 +452,7 @@ mod tests {
         let mixed: Vec<u64> = [1, 2, 3, 1, 1, 2, 1, 3, 2, 1].repeat(30);
         let cases: [(&str, Vec<u64>, u64); 4] = [
             ("steady", vec![1; 300], 0),
+            // Also what a steady 60 fps source reads on this 30 fps grid: 2 frames an interval.
             ("pairs", vec![2; 150], 150),
             ("threes", vec![3; 100], 200),
             ("mixed", mixed, 210),
