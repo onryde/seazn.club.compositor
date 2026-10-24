@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Owed 81: a harness run's camera-frame cadence, stage by stage (_FINDINGS.md F-028).
+"""Owed 81: a harness run's camera-frame cadence, stage by stage (_FINDINGS.md F-029).
 
 Stages, all from the same run's out/<case>/:
   push   emit.jsonl: when fake-camera pushed each counter into its encoder (whole ms);

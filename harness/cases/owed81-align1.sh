@@ -1,7 +1,7 @@
 # shellcheck shell=bash disable=SC2034 # sourced by run-case.sh, which reads CASE_CHECKS
 # Owed 81's fix candidate: the smoke case's run (60 s live, pass-through netem on both legs, audio
 # on) with the camera's mux at one packet a buffer, so no frame's last packets wait for the next
-# frame's to fill a buffer of seven (F-028). Compare its `camera.cadence` and its wire.jsonl /
+# frame's to fill a buffer of seven (F-029). Compare its `camera.cadence` and its wire.jsonl /
 # tap.jsonl with a smoke run's.
 # Sourced by run-case.sh.
 
