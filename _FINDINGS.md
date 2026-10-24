@@ -1854,3 +1854,87 @@ The follow-up to F-024's first fact (Owed 85; F-024 is on `feat/c14-chaos`, unme
   decision log): `-displayfd` stays and the removal goes; beside `-displayfd` it changed nothing
   observable (the stub test's hand mutant that puts it back changes no outcome, only what each case's
   Xvfb met), and alone it would keep the socket-file wait that a leftover socket fools.
+
+## F-027: where Owed 84's backlog queued, and how rtmp2sink 1.24.2 connects (source read; a fake destination checked against ffmpeg, 2026-10-24)
+
+The follow-up to F-023 (on `feat/c14-chaos`, unmerged at the time). Source: GStreamer 1.24.2,
+`subprojects/gst-plugins-bad/gst/rtmp2/` (`gstrtmp2sink.c`, `rtmp/rtmpclient.c`,
+`rtmp/rtmpconnection.c`), read at the tag.
+
+- **Where the frames queued** (`gst_output.rs` before the fix): each output generation's feeder
+  started at its build and took the encoded ring from its oldest entry (up to `ENCODED_RING_SPAN`,
+  2 s by PTS). rtmp2sink's `render` waits `while (is_running && !self->connection)`, so whatever the
+  feeder pushed during a pending connect waited in the output appsrcs (`OUTPUT_QUEUE_BYTES`, 512 KiB
+  each), in flvmux's queue and in `render`, and went out at the connect as fast as the socket took
+  it. The swap's force-key event did make a fresh keyframe, but the feeder had started at the ring's
+  oldest keyframe, before it.
+- **When rtmp2sink can send:** `async-connect` defaults to TRUE, so `start()` begins the connect
+  task (with FALSE the connect waits for the first buffer). `self->connection` is set only in
+  `connect_task_done`, after the client's chain (`connect` `_result`, `createStream` `_result`,
+  then `publish`'s `onStatus` `NetStream.Publish.Start`) has finished. `stats` returns that
+  connection's counters. Without a connection it returns the counters saved when the last one
+  ended (`self->stats`, saved at `gstrtmp2sink.c` 990 and read at 1215ff), and a structure of zeros
+  before any. The saved counters are cleared when the connect task starts (977), and each build
+  makes a new rtmp2sink. So this sink's `out-bytes-total` reads 0 until its publish is accepted, and
+  above 0 from then on (the commands it has sent; F-011's 476 B). The middle branch was added in
+  PR #57's review round 2 (m-2).
+- **What rtmp2sink gives up at its 5 s `timeout`:** the TCP connect (`GSocketClient`'s timeout) and
+  the connection's writes (`gst_rtmp_connection_write_buffer_done` emits the error). Not a held
+  reply: the connection's read source retries a read that hit the socket's timeout
+  (`gst_rtmp_connection_input_ready`: `G_IO_ERROR_TIMED_OUT` reads "continuing"). So a destination
+  that takes the TCP connection and holds its `publish` answer holds rtmp2sink's connect until the
+  domain's `output_connect_timeout_ms` swaps it. The handshake's own reads were not checked.
+- **A connection error during the connect fails it at once:** the client's `connection_error`
+  returns the task's error, and `connect_task_done` posts `Failed to connect` on the bus.
+- **The fake destination** (`crates/adapters/tests/support/rtmp.rs`, the gst legs' destination):
+  checked on the host against ffmpeg's RTMP publish (`-re`, H.264 and AAC, the publish held 1.5 s,
+  then released): 1 connection accepted, 1 publish, 312 media messages (120 video, 189 audio), the
+  first video message a keyframe at timestamp 0, no timestamp going back, and the FLV it writes
+  decodes in ffprobe (120 H.264 frames, 189 AAC frames). rtmp2sink against it runs in CI only (no
+  GStreamer on the host).
+- **The gate's cost** (PR #57 review m-5): while the sink connects, the feeder reads the gate at
+  each ring push (about 77 a second at 30 fps with AAC) and at each 20 ms `WAKE`. That is about 80 to
+  130 `stats` reads a second, each a lock and a copy of a small structure. It stops when the gate
+  opens.
+- **flvmux forwards no EOS before its first buffer** (gst-plugins-good 1.24.2 `gstflvmux.c`,
+  `gst_flv_mux_aggregate`). In its header state, with no buffer on any pad, it asks for more data
+  (2057-2059) before it reaches the all-pads-EOS check (2128). These are the PR #57 review's line
+  numbers (its I-1). So an output whose feeder sent nothing never posts EOS, and a drain that waited
+  for it waited out `drain_timeout_ms`. Mutant run 40084647054's G3 leg (no keyframe request)
+  witnessed it: a file sink that got nothing never drained. The feeder now ends that drain itself
+  (`release_unsent`).
+- **The version:** these facts are 1.24.2's. `the_gate_reads_gstreamer_1_24`
+  (`crates/adapters/tests/programme_output.rs`) fails when the runner's core, rtmp2sink or flvmux
+  leaves 1.24.x. It runs in check.yml only, so it covers the image only while both install Ubuntu
+  24.04's apt GStreamer.
+
+## F-028: Owed 80's 2 s overlap is MediaMTX's start, not a compositor backlog (harness runs 40081524300 and 40084630169, 2026-10-24)
+
+Measured from the two harness smoke runs on PR #57 (heads `bc159b3` and `3fc0fc5`, both with Owed
+84's gate), from their artifacts: `report.json`'s `segment_overlaps`, `compositor.log`,
+`services.log`, and ffprobe over the recordings (`-show_entries packet=pts_time,flags`; `K` is the
+MP4 sync-sample flag). The PR #57 review measured the first run the same way and also read its NAL
+types.
+
+| | 40081524300 (`bc159b3`) | 40084630169 (`3fc0fc5`) |
+|---|---|---|
+| Gate open (`the sink can send`) | 09:26:30.258, 32 ms after the build, 1 video frame dropped | 10:10:46.977, 17 ms after the build, 0 dropped |
+| MediaMTX `is publishing to path 'live/dest'` | 09:26:32 (the log has whole seconds) | 10:10:48 |
+| Recorder warning | `sample of track 1 received too late, discarding` | none |
+| Segment 1 | `09-26-32-234771`: 359 video packets, the first 59 not keyframes, first keyframe at PTS 1.991 s, then every 2.000 s | `10-10-48-917301`: 300 video packets, a keyframe first at PTS 0, then every 2.000 s |
+| Segment 2 named after segment 1 | 9.974 s | 7.986 s |
+| `overlap_ms`, `content_gap_ms` | 1 992, 33 | 2 014, 0 |
+
+- **No compositor backlog:** in both runs, at most one frame was queued when the gate opened, and
+  that frame was dropped; the compositor starts at a keyframe made after the gate (Owed 84's gst
+  legs, not measured here). The 2 s overlap is unchanged from Owed 80's measurement on main.
+- **The destination's start:** in both runs MediaMTX logged `is publishing` about 2 s after the
+  gate, and segment 1 holds about 2 s more content than its name's span to segment 2. The likely
+  reading, which is not verified, is that MediaMTX reads about 2 s of the stream before it publishes
+  (its RTMP track probe) and records it under a name taken when it starts.
+- **The lost keyframe, in one run of two:** in the first run the recorder discarded a sample, and
+  segment 1 opens with 59 frames that are not keyframes. The keyframe asked for at the connect was
+  lost, and x264's next one (`key-int-max` = 2 × fps) came 2.0 s later. If a destination does that at
+  each reconnect, each reconnect's recording starts up to 2 s late, which counts against C14's
+  `output_reconnect` (Owed 84) and not against `output_lost`.
+- Not checked: MediaMTX's source, or what it receives on the wire, and Cloudflare's start.

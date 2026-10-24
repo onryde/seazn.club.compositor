@@ -994,7 +994,7 @@ impl World {
         for e in d.effects {
             match e {
                 Effect::RebuildInput { gen } => self.pending.push(Event::InputConnected { gen }),
-                Effect::SwapSink { gen } => {
+                Effect::SwapSink { gen, .. } => {
                     self.swaps.push(gen);
                     self.sink_gen = gen;
                     self.sink_total = 0;

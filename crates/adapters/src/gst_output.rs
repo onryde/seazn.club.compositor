@@ -4,9 +4,19 @@
 //!
 //! The two pipelines are joined only by the **encoded ring**: the programme's encoder appsinks push
 //! every encoded sample into it (2 s by PTS, dropping the oldest; plan, Global Constraints), and one
-//! feeder thread per output generation takes from it. A new output starts at a video keyframe (the
-//! feeder skips the ring up to the first one, and the swap asks the encoder for one), and its PTS
-//! starts at 0.
+//! feeder thread per output generation takes from it. A new output starts at a video keyframe, and
+//! its PTS starts at 0.
+//!
+//! **A sink sends nothing that was queued before it connected** (Owed 84; owner, 2026-10-24,
+//! option A: when the destination recovers after an outage, the queued stale frames are dropped and
+//! the stream restarts at the next keyframe, so viewers never get a burst of old frames; F-023).
+//! The feeder takes nothing from the ring until the sink can send (`Gate`): a file at once, and
+//! rtmp2sink once its publish is accepted. Until then the ring stays the only queue, and it drops
+//! its oldest. At that moment (the reconnect point) the feeder asks the encoder for a keyframe, and
+//! no video frame the ring holds then may start the stream (`Picker`): the first frame sent is a
+//! keyframe encoded after the reconnect point, and no audio older than it is sent. A request the
+//! encoder does not take is asked again at each entry. A drain that reaches an output that has sent
+//! nothing, at the gate or after it, ends with the encoders (`release_unsent`).
 //!
 //! **Progress** (Owed 13). A poll every `OUTPUT_PROGRESS_POLL_MS` reads the sink's bytes-SENT total,
 //! rtmp2sink `stats` field `out-bytes-total` (F-010), or the file's size for `file://`, and sends
@@ -58,24 +68,27 @@ const WAKE: Duration = Duration::from_millis(20);
 const BUS_WAIT: Duration = Duration::from_millis(50);
 
 pub(crate) type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
+/// Asks the programme's encoder for a keyframe (a force-key-unit event); false if it was not taken.
+pub(crate) type KeyRequest = Arc<dyn Fn() -> bool + Send + Sync>;
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// One encoded sample, its PTS already in running time (x264enc's output segment starts at 1 000 h,
-/// so a raw PTS would put the video 1 000 h ahead of the audio: spike trap, F-001's chain).
+/// so a raw PTS would put the video 1 000 h ahead of the audio: spike trap, F-001's chain). `S` is
+/// the sample, a `gst::Sample` everywhere but in the `Picker`'s own tests.
 #[derive(Clone)]
-pub(crate) struct Entry {
+pub(crate) struct Entry<S = gst::Sample> {
     seq: u64,
-    pub(crate) sample: gst::Sample,
+    pub(crate) sample: S,
     pub(crate) video: bool,
     pub(crate) key: bool,
     pub(crate) pts: gst::ClockTime,
 }
 
-impl Entry {
-    pub(crate) fn new(sample: gst::Sample, video: bool, key: bool, pts: gst::ClockTime) -> Self {
+impl<S> Entry<S> {
+    pub(crate) fn new(sample: S, video: bool, key: bool, pts: gst::ClockTime) -> Self {
         Self {
             seq: 0,
             sample,
@@ -368,8 +381,13 @@ fn make(name: &str) -> Result<gst::Element, String> {
 }
 
 /// Builds and starts generation `gen` for `target`, and starts its feeder and poll threads. The
-/// encoder's next keyframe is asked for by the caller (`force_key`).
-pub(crate) fn build(shared: &Shared, gen: u64, target: &TargetSpec) -> Result<OutputGen, String> {
+/// feeder asks for the encoder's next keyframe through `request_key` when the sink can send (Owed 84).
+pub(crate) fn build(
+    shared: &Shared,
+    gen: u64,
+    target: &TargetSpec,
+    request_key: KeyRequest,
+) -> Result<OutputGen, String> {
     let dest = Destination::parse(target)?;
     let pipeline = gst::Pipeline::new();
     let vsrc = make("appsrc")?;
@@ -381,6 +399,10 @@ pub(crate) fn build(shared: &Shared, gen: u64, target: &TargetSpec) -> Result<Ou
             let s = make("rtmp2sink")?;
             s.set_property("location", location.as_str());
             s.set_property("sync", false);
+            // The gate (Owed 84) waits for the publish before it feeds a byte, so the connect must
+            // start without data: rtmp2sink's default, set here because the gate depends on it (with
+            // `false` it connects on its first buffer, which the gate never sends).
+            s.set_property("async-connect", true);
             s
         }
         Destination::File(path) => {
@@ -433,6 +455,12 @@ pub(crate) fn build(shared: &Shared, gen: u64, target: &TargetSpec) -> Result<Ou
         asrc,
         ring: Arc::clone(&shared.ring),
         retired: Arc::clone(&retired),
+        gate: match &dest {
+            Destination::Rtmp(_) => Gate::Publish(sink.clone()),
+            Destination::File(_) => Gate::Open,
+        },
+        request_key,
+        shared: shared.clone(),
     };
     thread::Builder::new()
         .name(format!("output-feed-{gen}"))
@@ -509,6 +537,42 @@ fn into_appsrc(e: gst::Element) -> Result<gst_app::AppSrc, String> {
         .map_err(|_| "output: appsrc is not an AppSrc".to_owned())
 }
 
+/// When an output generation may start taking the ring (Owed 84).
+enum Gate {
+    /// A file is written as soon as the pipeline plays: open at the build.
+    Open,
+    /// rtmp2sink, open once its publish is accepted. Measured in GStreamer 1.24.2's
+    /// `gstrtmp2sink.c`: `render` waits while `self->connection` is unset, and `connect_task_done`
+    /// sets it only after the publish's `NetStream.Publish.Start` (`start_publish_done`). `stats`
+    /// reads that connection's counters; without one, the counters saved when a connection ended,
+    /// and the null stats (every field 0) before any. Each build makes a new rtmp2sink, whose saved
+    /// counters are cleared when its connect task starts, so this sink's `out-bytes-total` leaves 0
+    /// exactly when its publish is accepted: the connection has sent its `connect` command by then
+    /// (476 B, F-011). Anything fed before that queues in front of a sink that cannot send, and goes
+    /// out in one burst at the connect (F-023). The gate is read at each ring push and each `WAKE`
+    /// while the sink connects, about 100 reads a second, each a lock and a copy of the stats
+    /// structure; it stops at the open (F-027).
+    Publish(gst::Element),
+}
+
+impl Gate {
+    fn is_open(&self) -> bool {
+        match self {
+            Gate::Open => true,
+            Gate::Publish(sink) => rtmp_total(sink) > 0,
+        }
+    }
+}
+
+/// rtmp2sink `stats`'s `out-bytes-total` (F-010): the bytes its connection has sent, 0 before it has
+/// one.
+fn rtmp_total(sink: &gst::Element) -> u64 {
+    // GStreamer 1.24's `stats` contract (F-027); `the_gate_reads_gstreamer_1_24` pins the version.
+    sink.property::<gst::Structure>("stats")
+        .get::<u64>("out-bytes-total")
+        .unwrap_or(0)
+}
+
 /// Takes the ring into one output generation.
 struct Feeder {
     gen: u64,
@@ -516,6 +580,9 @@ struct Feeder {
     asrc: gst_app::AppSrc,
     ring: Arc<EncodedRing>,
     retired: Arc<AtomicBool>,
+    gate: Gate,
+    request_key: KeyRequest,
+    shared: Shared,
 }
 
 enum Next {
@@ -524,66 +591,124 @@ enum Next {
     Stop,
 }
 
+/// The keyframe asked for at the reconnect point (Owed 84): asked again at each entry until the
+/// encoder takes it or the stream has started, so a refused request does not leave the stream
+/// waiting for the encoder's own keyframe, up to 2 s away (PR #57 review m-6).
+#[derive(Default)]
+struct KeyAsk {
+    tries: u32,
+    taken: bool,
+}
+
 impl Feeder {
     fn run(self) {
-        // The first entry pushed is a video keyframe; its PTS becomes 0.
-        let mut base: Option<gst::ClockTime> = None;
-        let mut need_key = true;
-        let mut expected_seq: Option<u64> = None;
-        // Audio that reached the ring before the first keyframe did: the audio encoder runs ahead
-        // of the video one, so the keyframe's first ~60 ms of audio arrives before it. Held, and
-        // pushed once the keyframe sets the base (dropping it lost 2 or 3 AAC frames per sink).
-        // Bounded like the ring it came from.
-        let mut early_audio: VecDeque<Entry> = VecDeque::new();
+        let Some(reconnect) = self.reconnect_point() else {
+            return;
+        };
+        let mut pick = Picker::new(reconnect);
+        let mut ask = KeyAsk::default();
+        self.ask_key(&mut ask);
         loop {
             match self.next() {
                 Next::Stop => return,
                 Next::Eos => {
+                    if !pick.started() {
+                        self.release_unsent();
+                    }
                     let _ = self.vsrc.end_of_stream();
                     let _ = self.asrc.end_of_stream();
                     return;
                 }
                 Next::Entry(e) => {
-                    // The ring dropped entries this output never took: video resumes at a keyframe.
-                    if expected_seq.is_some_and(|s| s != e.seq) {
-                        need_key = true;
+                    if !pick.started() {
+                        self.ask_key(&mut ask);
                     }
-                    expected_seq = Some(e.seq + 1);
-                    if e.video && need_key {
-                        if !e.key {
-                            continue;
-                        }
-                        need_key = false;
-                        if base.is_none() {
-                            base = Some(e.pts);
-                            self.push(&e, e.pts);
-                            for a in early_audio.drain(..) {
-                                self.push(&a, e.pts);
-                            }
-                            continue;
-                        }
-                    }
-                    let Some(base) = base else {
-                        if !e.video {
-                            if early_audio.len() >= ENCODED_RING_MAX_ENTRIES {
-                                early_audio.pop_front();
-                            }
-                            early_audio.push_back(e);
-                        }
-                        continue;
-                    };
-                    self.push(&e, base);
+                    pick.take(e, |e, base| self.push(e, base));
                 }
             }
         }
     }
 
-    /// Pushes `e` rebased to `base`; an entry from before the base (audio older than the first
-    /// keyframe) is not this output's.
-    fn push(&self, e: &Entry, base: gst::ClockTime) {
-        if e.pts < base {
+    /// Asks the encoder for a keyframe, unless it has taken a request already.
+    fn ask_key(&self, ask: &mut KeyAsk) {
+        if ask.taken {
             return;
         }
+        ask.tries += 1;
+        let taken = (self.request_key)();
+        ask.taken = taken;
+        if !taken && ask.tries == 1 {
+            self.shared.log(&format!(
+                "output gen={}: the keyframe request was not taken; it is asked again at each frame",
+                self.gen
+            ));
+        } else if taken && ask.tries > 1 {
+            self.shared.log(&format!(
+                "output gen={}: the keyframe request was taken at try {}",
+                self.gen, ask.tries
+            ));
+        }
+    }
+
+    /// The drain reached an output that has sent nothing, at the gate or after it (PR #57 review
+    /// I-1). Nothing is owed to it, and it could never drain: flvmux 1.24.2 forwards no EOS before
+    /// its first buffer (`gst_flv_mux_aggregate` asks for data in its header state, gstflvmux.c
+    /// 2057-2059), so its sink never posts the EOS a drain waits for. The ring is released, and the
+    /// drain ends with the encoders, as after a sink error (`Watch`).
+    fn release_unsent(&self) {
+        self.ring.release(self.gen);
+        if self.ring.take_drained_without_output() {
+            self.shared.send(Event::OutputDrained);
+        }
+    }
+
+    /// Waits, taking nothing, until the sink can send (`Gate`), and returns the reconnect point: the
+    /// seq of the first entry encoded after it (`run` then asks for the keyframe). `None`: retired,
+    /// the ring is another generation's, or both encoders ended first. That last is the programme's
+    /// drain reaching a sink that never connected: nothing is owed to it (whatever the ring holds
+    /// predates any connect), so `release_unsent`.
+    fn reconnect_point(&self) -> Option<u64> {
+        let since = Instant::now();
+        loop {
+            if self.retired.load(Ordering::SeqCst) {
+                return None;
+            }
+            if self.gate.is_open() {
+                let r = locked(&self.ring.state);
+                if r.owner != self.gen {
+                    return None;
+                }
+                let first = r.next_seq;
+                let held = r.entries.iter().filter(|e| e.video).count();
+                drop(r);
+                self.shared.log(&format!(
+                    "output gen={}: the sink can send after {} ms; the {held} video frames queued \
+                     before it are dropped, and it starts at the next keyframe",
+                    self.gen,
+                    since.elapsed().as_millis()
+                ));
+                return Some(first);
+            }
+            let r = locked(&self.ring.state);
+            if r.owner != self.gen {
+                return None;
+            }
+            if r.video_eos && r.audio_eos {
+                drop(r);
+                self.release_unsent();
+                return None;
+            }
+            drop(
+                self.ring
+                    .wake
+                    .wait_timeout(r, WAKE)
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+        }
+    }
+
+    /// Pushes `e` rebased to `base`.
+    fn push(&self, e: &Entry, base: gst::ClockTime) {
         let src = if e.video { &self.vsrc } else { &self.asrc };
         if let Some(sample) = rebased(&e.sample, base) {
             let _ = src.push_sample(&sample);
@@ -620,6 +745,81 @@ impl Feeder {
         let v = self.vsrc.current_level_bytes();
         let a = self.asrc.current_level_bytes();
         v > 0 && a > 0 && (v >= OUTPUT_QUEUE_BYTES || a >= OUTPUT_QUEUE_BYTES)
+    }
+}
+
+/// Which ring entries one output generation sends, and the base each is rebased by. No GStreamer
+/// call: the feeder pushes what `take` hands it.
+///
+/// - The first entry sent is a video keyframe, its PTS the base (0 on the wire). A keyframe whose
+///   seq is below the reconnect point was queued before the sink could send, so it never starts the
+///   stream, and neither does any frame behind it (Owed 84).
+/// - Audio that reaches the ring before that keyframe is held, bounded like the ring: the audio
+///   encoder runs about 60 ms ahead of the video one, so a keyframe's first audio arrives before it
+///   (dropping it lost 2 or 3 AAC frames per sink). Once the keyframe sets the base, the held audio
+///   at or after it is sent, and no audio before it, so the audio never starts ahead of the video.
+/// - A seq gap (the ring dropped entries this output never took) makes the video resume at a
+///   keyframe.
+pub(crate) struct Picker<S = gst::Sample> {
+    reconnect: u64,
+    base: Option<gst::ClockTime>,
+    need_key: bool,
+    expected_seq: Option<u64>,
+    early_audio: VecDeque<Entry<S>>,
+}
+
+impl<S> Picker<S> {
+    /// `reconnect`: the seq of the first entry encoded after the sink could send.
+    pub(crate) fn new(reconnect: u64) -> Self {
+        Self {
+            reconnect,
+            base: None,
+            need_key: true,
+            expected_seq: None,
+            early_audio: VecDeque::new(),
+        }
+    }
+
+    /// Whether anything has been sent: the first keyframe set the base.
+    pub(crate) fn started(&self) -> bool {
+        self.base.is_some()
+    }
+
+    /// Hands `send` each entry to send now, in order, with its base.
+    pub(crate) fn take(&mut self, e: Entry<S>, mut send: impl FnMut(&Entry<S>, gst::ClockTime)) {
+        if self.expected_seq.is_some_and(|s| s != e.seq) {
+            self.need_key = true;
+        }
+        self.expected_seq = Some(e.seq + 1);
+        if e.video && self.need_key {
+            if !e.key || e.seq < self.reconnect {
+                return;
+            }
+            self.need_key = false;
+            if self.base.is_none() {
+                let base = e.pts;
+                self.base = Some(base);
+                send(&e, base);
+                for a in self.early_audio.drain(..) {
+                    if a.pts >= base {
+                        send(&a, base);
+                    }
+                }
+                return;
+            }
+        }
+        let Some(base) = self.base else {
+            if !e.video {
+                if self.early_audio.len() >= ENCODED_RING_MAX_ENTRIES {
+                    self.early_audio.pop_front();
+                }
+                self.early_audio.push_back(e);
+            }
+            return;
+        };
+        if e.pts >= base {
+            send(&e, base);
+        }
     }
 }
 
@@ -763,11 +963,267 @@ impl Watch {
     fn total(&self) -> u64 {
         match &self.file {
             Some(path) => std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
-            None => self
-                .sink
-                .property::<gst::Structure>("stats")
-                .get::<u64>("out-bytes-total")
-                .unwrap_or(0),
+            None => rtmp_total(&self.sink),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Owed 84's rule, sample-free: an entry is its seq (the sample) with its kind, key flag and PTS.
+    fn entry(seq: u64, video: bool, key: bool, pts_ms: u64) -> Entry<u64> {
+        let mut e = Entry::new(seq, video, key, gst::ClockTime::from_mseconds(pts_ms));
+        e.seq = seq;
+        e
+    }
+
+    /// Every entry `take` sends for `entries`, as (seq, base ms), in order.
+    fn sent(reconnect: u64, entries: Vec<Entry<u64>>) -> Vec<(u64, u64)> {
+        let mut pick = Picker::new(reconnect);
+        let mut out = Vec::new();
+        for e in entries {
+            pick.take(e, |e, base| out.push((e.sample, base.mseconds())));
+        }
+        out
+    }
+
+    /// A ring as the encoders fill it (30 fps video, 48 kHz AAC whose encoder runs about 60 ms ahead),
+    /// holding a natural keyframe (seq 0) when a sink can send at seq 6. The control run (a reconnect
+    /// point of 0) starts at that keyframe, so it is the reconnect point alone that moves the start.
+    fn ring_with_an_old_keyframe() -> Vec<Entry<u64>> {
+        vec![
+            entry(0, true, true, 0),
+            entry(1, false, false, 0),
+            entry(2, false, false, 21),
+            entry(3, true, false, 33),
+            entry(4, false, false, 43),
+            entry(5, true, false, 67),
+            // The reconnect point: seq 6 is the first entry encoded after the sink could send.
+            entry(6, false, false, 64),
+            entry(7, true, false, 100),
+            entry(8, false, false, 85),
+            entry(9, false, false, 107),
+            entry(10, false, false, 128),
+            entry(11, false, false, 149),
+            // The keyframe the reconnect asked for.
+            entry(12, true, true, 133),
+            entry(13, false, false, 171),
+            entry(14, true, false, 167),
+        ]
+    }
+
+    #[test]
+    fn a_keyframe_queued_before_the_reconnect_point_never_starts_the_stream() {
+        // Control: with the reconnect point at the ring's start, its old keyframe starts the stream.
+        let all = sent(0, ring_with_an_old_keyframe());
+        assert_eq!(all.first(), Some(&(0, 0)), "{all:?}");
+        // From seq 6: the first entry sent is the keyframe asked for (seq 12, PTS 133 ms the base),
+        // then the held audio at or after it (149 ms; 64 to 128 ms are older), then the rest.
+        assert_eq!(
+            sent(6, ring_with_an_old_keyframe()),
+            vec![(12, 133), (11, 133), (13, 133), (14, 133)]
+        );
+    }
+
+    #[test]
+    fn with_no_keyframe_after_the_reconnect_point_nothing_is_sent() {
+        let ring: Vec<_> = ring_with_an_old_keyframe()
+            .into_iter()
+            .filter(|e| e.seq != 12)
+            .collect();
+        assert_eq!(sent(6, ring), vec![]);
+        // An empty ring sends nothing, whatever the point.
+        assert_eq!(sent(0, vec![]), vec![]);
+    }
+
+    // `started` is what the feeder's drain reads (PR #57 review I-1): false while every entry was
+    // refused or held, true from the first one sent, each read checked against what `take` sent.
+    #[test]
+    fn started_reads_whether_anything_was_sent() {
+        let mut checked = 0;
+        for reconnect in [0, 6, 13] {
+            let mut pick = Picker::new(reconnect);
+            assert!(!pick.started(), "{reconnect}: before any entry");
+            let mut sent_any = false;
+            for e in ring_with_an_old_keyframe() {
+                pick.take(e, |_, _| sent_any = true);
+                assert_eq!(pick.started(), sent_any, "{reconnect}");
+                checked += 1;
+            }
+            // 13 is past the ring's last keyframe (12): nothing is ever sent.
+            assert_eq!(sent_any, reconnect <= 12, "{reconnect}");
+        }
+        assert_eq!(checked, 3 * ring_with_an_old_keyframe().len());
+    }
+
+    #[test]
+    fn a_gap_after_the_start_resumes_the_video_at_a_keyframe_and_keeps_the_audio() {
+        let mut ring = ring_with_an_old_keyframe();
+        ring.extend([
+            // The ring dropped seq 15 to 19, so 20 (a delta) follows a gap and is not sent.
+            entry(20, true, false, 300),
+            entry(21, false, false, 299),
+            entry(22, true, true, 333),
+            entry(23, true, false, 367),
+        ]);
+        assert_eq!(sent(6, ring)[4..].to_vec(), vec![(21, 133), (22, 133), (23, 133)]);
+    }
+
+    /// A deterministic generator (an LCG, so a failure replays).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    /// One generated ring: what the encoders push (30 fps video with a keyframe every `gop` frames or
+    /// at random, AAC frames of 1 024 samples at 48 kHz), each encoder late by up to 60 ms of its own,
+    /// so the audio arrives ahead of the video or behind it; with runs of entries this output never
+    /// took (the ring dropped them), and a reconnect point anywhere.
+    fn generated(rng: &mut Lcg) -> (u64, Vec<Entry<u64>>) {
+        let gop = 1 + rng.below(60);
+        let (video_late, audio_late) = (rng.below(61), rng.below(61));
+        let frames = 1 + rng.below(240);
+        let mut timed: Vec<(u64, bool, bool)> = Vec::new();
+        for i in 0..frames {
+            let key = i % gop == 0 || rng.below(40) == 0;
+            timed.push((i * 1_000 / 30, true, key));
+        }
+        let mut a = 0u64;
+        while a * 1_024 * 1_000 / 48_000 < frames * 1_000 / 30 {
+            timed.push((a * 1_024 * 1_000 / 48_000, false, false));
+            a += 1;
+        }
+        let arrival =
+            |&(pts, video, _): &(u64, bool, bool)| pts + if video { video_late } else { audio_late };
+        timed.sort_by_key(arrival);
+        let mut out = Vec::new();
+        let mut seq = 0u64;
+        for (pts, video, key) in timed {
+            // About one entry in 50 starts a dropped run of 1 to 30.
+            if rng.below(50) == 0 {
+                seq += 1 + rng.below(30);
+            }
+            out.push(entry(seq, video, key, pts));
+            seq += 1;
+        }
+        let reconnect = rng.below(seq + 2);
+        (reconnect, out)
+    }
+
+    /// Owed 84 and the A/V rule over 4 000 generated rings: the first entry sent is a video keyframe
+    /// at or past the reconnect point and its PTS is the base; no video from before that point is
+    /// sent; nothing older than the base is sent; no audio goes before the first video; the video
+    /// after a dropped run restarts at a keyframe; each kind's PTS never goes back.
+    #[test]
+    fn a_generated_sweep_never_sends_a_frame_from_before_the_reconnect_point() {
+        let mut rng = Lcg(84);
+        let (mut cases, mut started, mut old_key_refused, mut gaps_resumed, mut audio_held) = (0, 0, 0, 0, 0);
+        let mut late_audio_refused = 0;
+        for _ in 0..4_000 {
+            let (reconnect, ring) = generated(&mut rng);
+            let old_key = ring.iter().any(|e| e.video && e.key && e.seq < reconnect);
+            let mut pick = Picker::new(reconnect);
+            let mut out: Vec<(Entry<u64>, u64)> = Vec::new();
+            let mut last_taken: Option<u64> = None;
+            let mut gap_since_video = false;
+            for e in ring {
+                if last_taken.is_some_and(|s| s + 1 != e.seq) {
+                    gap_since_video = true;
+                }
+                last_taken = Some(e.seq);
+                let before = out.len();
+                let late = before > 0 && !e.video && e.pts.mseconds() < out[0].1;
+                pick.take(e, |e, base| out.push((e.clone(), base.mseconds())));
+                if late && out.len() == before {
+                    late_audio_refused += 1;
+                }
+                if before == 0 && out.len() > 1 {
+                    audio_held += 1;
+                }
+                for (e, _) in &out[before..] {
+                    if e.video {
+                        if gap_since_video && before > 0 {
+                            assert!(
+                                e.key,
+                                "case {}: video seq {} after a dropped run is not a keyframe",
+                                cases + 1,
+                                e.seq
+                            );
+                            gaps_resumed += 1;
+                        }
+                        gap_since_video = false;
+                    }
+                }
+            }
+            cases += 1;
+            let Some((first, base)) = out.first() else {
+                continue;
+            };
+            started += 1;
+            assert!(
+                first.video && first.key,
+                "case {cases}: the first entry sent is not a keyframe"
+            );
+            assert!(
+                first.seq >= reconnect,
+                "case {cases}: it was queued before the reconnect point"
+            );
+            assert_eq!(
+                first.pts.mseconds(),
+                *base,
+                "case {cases}: its PTS is not the base"
+            );
+            if old_key {
+                old_key_refused += 1;
+            }
+            let (mut last_v, mut last_a) = (None, None);
+            for (e, b) in &out {
+                assert_eq!(b, base, "case {cases}: one base for the whole output");
+                assert!(
+                    e.pts.mseconds() >= *base,
+                    "case {cases}: seq {} is older than the base",
+                    e.seq
+                );
+                assert!(
+                    !e.video || e.seq >= reconnect,
+                    "case {cases}: video seq {} predates the reconnect",
+                    e.seq
+                );
+                let last = if e.video { &mut last_v } else { &mut last_a };
+                assert!(
+                    last.is_none_or(|p| e.pts >= p),
+                    "case {cases}: seq {} goes back",
+                    e.seq
+                );
+                *last = Some(e.pts);
+            }
+        }
+        eprintln!(
+            "cases {cases}, started {started}, with an old keyframe refused {old_key_refused}, \
+             video resumed after a gap {gaps_resumed}, held audio sent {audio_held}, \
+             late audio refused {late_audio_refused}"
+        );
+        assert_eq!(cases, 4_000);
+        for (what, n) in [
+            ("started", started),
+            ("an old keyframe refused", old_key_refused),
+            ("resumed after a gap", gaps_resumed),
+            ("held audio sent with the keyframe", audio_held),
+            (
+                "audio older than the base arriving after it, refused",
+                late_audio_refused,
+            ),
+        ] {
+            assert!(n >= 30, "the sweep reached {what} only {n} times");
         }
     }
 }

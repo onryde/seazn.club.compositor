@@ -186,6 +186,43 @@ fn assert_in_order(lines: &[String], want: &[String], what: &str) -> usize {
     want.len()
 }
 
+/// Owed 87: each `sink swap gen=<g> target=…` line (the decorator's) has the driver's
+/// `sink swap reason=<r> gen=<g>` before it and after the previous swap, `<r>` one of the domain's
+/// four words, and the first swap's reason is `first`; there is no other `sink swap` line. Returns
+/// the swaps checked.
+fn assert_each_swap_has_its_reason(lines: &[String], what: &str) -> usize {
+    let mut pending: Option<(String, String)> = None;
+    let mut checked = 0;
+    for l in lines.iter().filter(|l| l.starts_with("sink swap ")) {
+        if let Some(rest) = l.strip_prefix("sink swap reason=") {
+            let (reason, gen) = rest
+                .split_once(" gen=")
+                .unwrap_or_else(|| panic!("{what}: {l:?}"));
+            assert!(
+                ["first", "error", "connect_timeout", "stall"].contains(&reason),
+                "{what}: {l:?}"
+            );
+            assert!(pending.is_none(), "{what}: two reasons before one swap: {l:?}");
+            pending = Some((reason.to_owned(), gen.to_owned()));
+        } else if let Some(rest) = l.strip_prefix("sink swap gen=") {
+            let gen = rest.split(' ').next().unwrap_or_default();
+            let (reason, of) = pending
+                .take()
+                .unwrap_or_else(|| panic!("{what}: swap {gen} has no reason line before it"));
+            assert_eq!(of, gen, "{what}: the reason line names another generation");
+            if checked == 0 {
+                assert_eq!((gen, reason.as_str()), ("1", "first"), "{what}");
+            }
+            checked += 1;
+        } else {
+            panic!("{what}: an unknown sink swap line {l:?}");
+        }
+    }
+    assert!(pending.is_none(), "{what}: a reason line with no swap after it");
+    eprintln!("{what}: swaps with their reason checked {checked}");
+    checked
+}
+
 fn count(lines: &[String], line: &str) -> usize {
     lines.iter().filter(|l| *l == line).count()
 }
@@ -292,6 +329,20 @@ fn graphics_log_lines_exist_in_both_driver_modes() {
             1,
             "{what}: the swap, its URL redacted: {hang:#?}"
         );
+        // Owed 87: the driver's reason line comes before the decorator's swap line (other threads'
+        // lines may land between the two in the live mode).
+        matched += assert_in_order(
+            &hang,
+            &[
+                "sink swap reason=first gen=1".into(),
+                "sink swap gen=1 target=rtmps://live.cloudflare.com:443/live/****".into(),
+            ],
+            &format!("{what} swap"),
+        );
+        // Every swap has its reason line before it, and no reason line lacks its swap. The live mode
+        // swaps again when its real sink fails (a made-up key at Cloudflare), so the count is the run's.
+        let swaps = assert_each_swap_has_its_reason(&hang, &what);
+        assert!(swaps >= 1, "{what}: no swap checked");
         let crash = crash_run(mode);
         matched += assert_in_order(
             &crash,

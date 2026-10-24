@@ -51,7 +51,7 @@ use crate::health::{
 use crate::input_link::{InputAction, InputLink, InputState, LossReason};
 use crate::ladder::{Ladder, Rung};
 use crate::lifecycle::{ExitReason, Lifecycle};
-use crate::output_link::{OutputLink, OutputState};
+use crate::output_link::{OutputLink, OutputState, SwapReason};
 use crate::programme::{FrameChoice, Programme, ProgrammePhase};
 use crate::time::{elapsed, Ms};
 
@@ -164,8 +164,11 @@ pub enum Effect {
     AbandonInput {
         gen: u64,
     },
+    /// Build sink generation `gen`; `reason` is what ended the one before it (Owed 87): C08 logs
+    /// `sink swap reason=<r> gen=<g>` before the swap.
     SwapSink {
         gen: u64,
+        reason: SwapReason,
     },
     RestartGraphics {
         gen: u64,
@@ -412,6 +415,7 @@ impl Supervisor {
                 if self.output.on_tick(now, &t) {
                     fx.push(Effect::SwapSink {
                         gen: self.output.generation(),
+                        reason: self.output.swap_reason(),
                     });
                 }
                 match self.graphics.on_tick(now, &t) {
@@ -904,7 +908,10 @@ mod tests {
         let s = booted(1_000);
         let d = s.decide(Event::Tick, 1_000);
         assert!(d.effects.contains(&Effect::RebuildInput { gen: 1 }));
-        assert!(d.effects.contains(&Effect::SwapSink { gen: 1 }));
+        assert!(d.effects.contains(&Effect::SwapSink {
+            gen: 1,
+            reason: SwapReason::First
+        }));
         assert!(d.effects.contains(&Effect::RestartGraphics { gen: 1 }));
         assert!(d
             .effects
@@ -2113,7 +2120,10 @@ mod tests {
             d.effects
         );
         assert!(
-            d.effects.contains(&Effect::SwapSink { gen: 2 }),
+            d.effects.contains(&Effect::SwapSink {
+                gen: 2,
+                reason: SwapReason::Error
+            }),
             "{:?}",
             d.effects
         );
@@ -2187,7 +2197,7 @@ mod tests {
             if now % period() == 0 {
                 let d = s.decide(Event::Tick, now);
                 for e in &d.effects {
-                    if let Effect::SwapSink { gen } = e {
+                    if let Effect::SwapSink { gen, .. } = e {
                         built = Some((now, *gen));
                         builds.push(now);
                     }
@@ -2510,9 +2520,14 @@ mod tests {
                     c + 100 + base,
                 ),
             };
+            // Owed 87: the swap names how the sink before it ended.
+            let reason = match how {
+                "a stall" => SwapReason::Stall,
+                _ => SwapReason::Error,
+            };
             let d = s.decide(Event::Tick, swap_at);
             assert!(
-                d.effects.contains(&Effect::SwapSink { gen: 2 }),
+                d.effects.contains(&Effect::SwapSink { gen: 2, reason }),
                 "{how}: swapped at {swap_at}: {:?}",
                 d.effects
             );

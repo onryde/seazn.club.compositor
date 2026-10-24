@@ -20,6 +20,8 @@
 //! **Never blocks** the loop: the appsrcs leak the oldest buffer when full, and nothing here waits
 //! on a pipeline. Teardown goes to reaper threads.
 use std::fmt;
+#[cfg(feature = "test-hooks")]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
@@ -88,6 +90,9 @@ pub struct GstProgramme {
     push_errors: u64,
     half_rate: bool,
     running: Option<Running>,
+    /// Test hook (`refuse_key_requests`): keyframe requests still to refuse.
+    #[cfg(feature = "test-hooks")]
+    key_refusals: Arc<AtomicU32>,
 }
 
 /// Everything `start()` built.
@@ -137,6 +142,8 @@ impl GstProgramme {
             push_errors: 0,
             half_rate: false,
             running: None,
+            #[cfg(feature = "test-hooks")]
+            key_refusals: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -195,6 +202,19 @@ impl GstProgramme {
     #[cfg(feature = "test-hooks")]
     pub fn teardown_counter(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.shared.reapers)
+    }
+
+    /// Test hook: the next `n` keyframe requests of any output are refused, as an encoder that does
+    /// not take the event would (`send_event` false).
+    #[cfg(feature = "test-hooks")]
+    pub fn refuse_key_requests(&self, n: u32) {
+        self.key_refusals.store(n, Ordering::SeqCst);
+    }
+
+    /// Test hook: the refusals `refuse_key_requests` set that no request has used yet.
+    #[cfg(feature = "test-hooks")]
+    pub fn key_refusals_left(&self) -> u32 {
+        self.key_refusals.load(Ordering::SeqCst)
     }
 
     /// Test hook: holds every write of the current output's sink (a blocking probe on its sink pad),
@@ -717,19 +737,26 @@ impl ProgrammeOutput for GstProgramme {
         if let Some(old) = r.output.take() {
             old.retire(&self.shared);
         }
-        match gst_output::build(&self.shared, gen, target) {
-            Ok(out) => {
-                r.output = Some(out);
-                // The new output starts at a keyframe: ask the encoder for one now.
-                let ev = gst_video::UpstreamForceKeyUnitEvent::builder()
-                    .all_headers(true)
-                    .build();
-                if !r.parser_src.send_event(ev) {
-                    self.shared.log(&format!(
-                        "swap_sink gen={gen}: the keyframe request was not taken"
-                    ));
-                }
+        // The new output starts at a keyframe encoded after its sink can send (Owed 84): its feeder
+        // asks the encoder for one then, from its own thread.
+        let parser_src = r.parser_src.clone();
+        #[cfg(feature = "test-hooks")]
+        let refusals = Arc::clone(&self.key_refusals);
+        let request_key: gst_output::KeyRequest = Arc::new(move || {
+            #[cfg(feature = "test-hooks")]
+            if refusals
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return false;
             }
+            let ev = gst_video::UpstreamForceKeyUnitEvent::builder()
+                .all_headers(true)
+                .build();
+            parser_src.send_event(ev)
+        });
+        match gst_output::build(&self.shared, gen, target, request_key) {
+            Ok(out) => r.output = Some(out),
             Err(text) => {
                 self.shared.log(&format!("swap_sink gen={gen}: {text}"));
                 self.send_now(Event::OutputError { gen });

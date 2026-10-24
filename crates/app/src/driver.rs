@@ -15,9 +15,11 @@
 //!   `BootstrapOk`) exits as a fatal error.
 //! - **The phase** is published after every `decide` that changed it, with a rising `seq` from
 //!   `(Waiting, 0)` (amendment 2026-10-15).
-//! - **The log** gets one line per hide (`overlay hidden reason=<r> gen=<g>`) and one per graphics
-//!   event handed to `decide`, a stale one included (`cef ready|crashed|alive gen=<n>`; C12's
-//!   amendment 2026-10-18). The skipped ticks and the queue's dropped beats reach it too
+//! - **The log** gets one line per hide (`overlay hidden reason=<r> gen=<g>`), one per sink swap
+//!   before the port call (`sink swap reason=first|error|connect_timeout|stall gen=<g>`, Owed 87:
+//!   what ended the sink before it; the port's own `sink swap gen=<g> target=…` line follows), and
+//!   one per graphics event handed to `decide`, a stale one included (`cef ready|crashed|alive
+//!   gen=<n>`; C12's amendment 2026-10-18). The skipped ticks and the queue's dropped beats reach it too
 //!   (`ticks skipped total=<n>`, `heartbeats dropped total=<n>`; review round 1, item 4): a line when
 //!   the count rises, at most one a minute, and whatever rose since the last line at the exit. No line
 //!   carries a credential or a fatal error's text.
@@ -34,6 +36,7 @@ use domain::config::Thresholds;
 use domain::graphics::HideReason;
 use domain::health::ExitDetail;
 use domain::lifecycle::{ExitReason, Lifecycle};
+use domain::output_link::SwapReason;
 use domain::programme::ProgrammePhase;
 use domain::supervisor::{Decision, Effect, Event, Refusal, Supervisor};
 
@@ -304,10 +307,12 @@ impl Driver {
             }
             // The domain gave the generation up (C10b): the adapter shuts it out. No session needed.
             Effect::AbandonInput { gen } => p.input.abandon(gen),
-            Effect::SwapSink { gen } => {
+            Effect::SwapSink { gen, reason } => {
                 let Some(cfg) = &self.session else {
                     return self.no_session(now);
                 };
+                p.log
+                    .info(&format!("sink swap reason={} gen={gen}", swap_name(reason)));
                 p.programme.swap_sink(gen, &cfg.target);
             }
             Effect::RestartGraphics { gen } => {
@@ -364,6 +369,16 @@ impl Driver {
     fn no_session(&mut self, now: u64) -> Option<i32> {
         let detail = Some(ExitDetail::new(NO_SESSION));
         self.decide(Event::Fatal { detail }, now)
+    }
+}
+
+/// Owed 87: the domain's swap reason as the log line names it.
+fn swap_name(r: SwapReason) -> &'static str {
+    match r {
+        SwapReason::First => "first",
+        SwapReason::Error => "error",
+        SwapReason::ConnectTimeout => "connect_timeout",
+        SwapReason::Stall => "stall",
     }
 }
 
