@@ -2018,6 +2018,14 @@ impl CefGraphics {
     /// before its `set_state(NULL)`, so the reaper's kill and its leak count run exactly as for a real
     /// one, and the process carries the leak until it exits (C14 case 16). Unlike `hold_teardowns`,
     /// no cap lets it go. A second call replaces what is left of the first; 0 holds none.
+    ///
+    /// The held build stays PLAYING, so the reaper's SIGKILL makes cefsrc reload its page under the
+    /// same client id, and nothing kills it again: each held teardown leaves a live overlay page for
+    /// the rest of the process (at `CEF_NICE`, its page's polls running, its ready and alive lines an
+    /// old gen's, its frames off air), as a real leak leaves its renderer. The unit tests have no
+    /// renderer, so they witness only that the hold comes before `set_state(NULL)` (the pipeline is
+    /// still PLAYING at the leak count); that the kill reaches a renderer, at least one pid in each
+    /// held teardown's reaper line, is C14 case 16's witness on the real image.
     #[cfg(feature = "test-hooks")]
     pub fn hold_next_teardowns(&self, n: usize) {
         self.shared.teardowns_to_hold.store(n, Ordering::SeqCst);
@@ -4607,8 +4615,8 @@ mod tests {
     /// Owed 82: one build on an empty pipeline, started on its own thread (`run_build`) as `restart`
     /// starts a page's, then retired (`retire_current`) with the reaper's watch behind it. CI's
     /// GStreamer has no cefsrc; the path under test, from the retirement to the leak count, is the
-    /// same with one.
-    fn retire_one(g: &mut CefGraphics, gen: u64) -> Arc<Life> {
+    /// same with one. The pipeline is returned too, so the caller can read the state it was left in.
+    fn retire_one(g: &mut CefGraphics, gen: u64) -> (Arc<Life>, gst::Pipeline) {
         gst::init().expect("gstreamer");
         let mut live = Live {
             gen,
@@ -4620,20 +4628,27 @@ mod tests {
         g.start(&mut live);
         assert!(live.running, "setup: gen={gen}'s thread started");
         let life = Arc::clone(&live.life);
+        let pipeline = live.pipeline.clone();
         g.current = Some(live);
         g.retire_current();
-        life
+        (life, pipeline)
     }
 
     /// Owed 82: `held` of `builds` retirements held by the hook, one at a time (the hook takes its
     /// budget in the order the teardowns start), each held one's line seen before the next. Then
-    /// the leak count settles: the lines, the gauge and the domain's cause.
+    /// the leak count settles: the lines, the gauge and the domain's cause. A held build's pipeline is
+    /// still PLAYING at its leak count, as a teardown stuck inside `set_state(NULL)` leaves cefsrc
+    /// live for the reaper's kill (the PR #62 review's I2: a hold after the NULL would close the
+    /// browser first, and the reaper would kill nothing); a returned one's is NULL.
     fn held_teardowns_run(held: usize, builds: u64) -> (CefHealth, Vec<String>) {
         let (tx, _rx) = crossbeam_channel::bounded(64);
         let shared = unit_shared(tx, ProcTree::live());
         let lines = capture_log(&shared);
         let mut g = unit_adapter(Arc::clone(&shared));
-        g.set_reaper_kill_after(Duration::from_millis(100));
+        // 1 s, so a returning build's thread under a loaded `cargo test` wakes and runs its empty NULL
+        // well inside the reaper's wait (the PR #62 review's m2: at 100 ms it could be reported killed).
+        let kill_after = Duration::from_secs(1);
+        g.set_reaper_kill_after(kill_after);
         g.hold_next_teardowns(held);
         let mut lives = Vec::new();
         for gen in 1..=builds {
@@ -4649,7 +4664,7 @@ mod tests {
         // Every reaper's watch is over by its kill plus `TEARDOWN_LEAK_AFTER_MS`; wait for both
         // outcomes, the held ones counted and the others torn down (a returned teardown's thread
         // counts itself down just after the reaper sees it return).
-        let settle = Duration::from_millis(100 + TEARDOWN_LEAK_AFTER_MS + 5_000);
+        let settle = kill_after + Duration::from_millis(TEARDOWN_LEAK_AFTER_MS + 5_000);
         assert!(
             wait_until(settle, || locked(&shared.reports).len() == builds as usize
                 && shared.leaked.load(Ordering::SeqCst) == held
@@ -4657,14 +4672,32 @@ mod tests {
             "the reaper's watches did not settle: {:?}",
             locked(&lines)
         );
-        for (i, life) in lives.iter().enumerate() {
+        let mut checked = 0;
+        for (i, (life, pipeline)) in lives.iter().enumerate() {
             let returned = life.wait_done(Duration::ZERO).is_some();
             assert_eq!(returned, i >= held, "gen={}: returned={returned}", i + 1);
-            // The reaper's kill reached the held ones only (no renderer here, so no pid).
+            // The reaper's kill reached the held ones only (no renderer here, so no pid: on the real
+            // image, C14 case 16 requires at least one per held teardown, Owed 82).
             let path = locked(&shared.reports).get(&(i as u64 + 1)).cloned();
             let killed = matches!(path, Some(ReaperPath::Killed { .. }));
             assert_eq!(killed, i < held, "gen={}: {path:?}", i + 1);
+            let want = if i < held {
+                gst::State::Playing
+            } else {
+                gst::State::Null
+            };
+            assert_eq!(
+                pipeline.current_state(),
+                want,
+                "gen={}: a held teardown parks before its set_state(NULL); a returned one ran it",
+                i + 1
+            );
+            checked += 3;
         }
+        assert!(
+            checked > 0 && checked == 3 * builds as usize,
+            "anti-vacuity: every build read ({checked})"
+        );
         assert_eq!(g.teardowns_in_flight(), held, "the held ones never count down");
         let h = g.health();
         let out = locked(&lines).clone();
