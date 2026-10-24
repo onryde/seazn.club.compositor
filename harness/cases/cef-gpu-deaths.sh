@@ -61,7 +61,11 @@ require_split() {
 }
 
 require_restarted() {
-  require deaths_logged "$DECIDING != null" "$DECIDING"
+  # Shown: the deciding line, and the kills against the most deaths any line counted (C14 fix round
+  # 2: CI's fast loop read 5 kills and 1 counted, which the bare line showed as null).
+  require deaths_logged "$DECIDING != null" \
+    "{line: $DECIDING, kills: (mark(\"kill\") | length), counted_max: ([.log.cef_health[] | .gpu_process_deaths] | max),
+      needs: \$t.cef_gpu_deaths_to_restart}"
   require_in_place_restart 'mark_at("kill")' "\"restart in place: \\($DECIDING.gpu_process_deaths) CEF GPU-process deaths\""
   require_split
 }
