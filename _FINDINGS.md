@@ -1805,6 +1805,35 @@ INT and TERM also `wait`ed on the compositor, and re-waited after each trap.
   loosened: cases 4 and 12 stay red on `output_lost` and `no_outage_outside_fault` until the owner
   rules Owed 84. The negative `lost_ms` values also show that the checker's `counter_gap − wall_span`
   is not "programme lost" when a connect replays its backlog (Owed 84 (c)).
+
+## F-024: four facts from C14's second CI round (chaos runs 40051995233 and 40051902711, mutants 40051985045, 2026-10-24)
+
+- **A restarted container's CEF mostly fails to start** (Owed 85). Read from the 18 container
+  restarts in the two runs: cases 8, 9 and 15's threshold variant, 3 runs each, twice.
+  - The restarted compositor's first build logged `init_cef: Failed to initialize CEF`
+    (gstcefsrc.cc:903) in 13 of them, 144–175 ms after the container's `start` event in the 4 timed. Its next two
+    builds failed at once ("the pipeline did not start"), and graphics ended `failed`.
+  - By exit kind: 75 (C11b's restart) 7 of 7; 133 (Chromium's abort) 4 of 5; 137 (the compositor
+    SIGKILLed) 2 of 6. The 2 recoveries timed logged `cef ready gen=1` about 0.83 s after the start.
+  - A restarted container's compositor starts 11–15 ms after the `start` event. A fresh container's
+    starts 115–124 ms after it, which is the entrypoint's wait for Xvfb's socket. Compose restarts
+    the container rather than recreating it, and `/tmp` is on its writable layer, so the previous
+    Xvfb's `/tmp/.X11-unix/X99` passes the wait at once. Whether that is the cause is not proven:
+    CEF's own log is off (`log-severity=disable`, F-013).
+- **Case 5's swap comes from the sink's own socket timeout, not the stall rule.** Under
+  `netem out rate 1kbit`, rtmp2sink failed with `Connection error: Socket I/O timed out` 5.6 s after
+  the cut in both runs, and the sink was swapped 0.5 s later. With `output_stall_after_ms` doubled
+  (mutant 9), the swap still came 1 332 ms after the last growth beat. Under 8 kbit (case 12) no
+  run logged that error, so the stall rule swapped.
+- **Under CPU starvation the ladder never moved** (Owed 86). 16 busy loops in the compositor's
+  cgroup for 40 s:
+  - The window carried 11.5 fps (dispatch) and 24.7 fps (PR), with encoderSpeed 0.37–0.67 and
+    0.63–1.03.
+  - Every beat read fps 29–31, droppedFrames 0 and rung `full`.
+  - After the burn the encoder caught up at encoderSpeed 2.97 and 15 Mbps (dispatch).
+- **A fast GPU-death loop outruns the 1 s child poll** (Owed 70 (a)). In 6 of 6 runs Chromium
+  relaunched the GPU process in about 80 ms. The loop's 5 kills of 5 distinct pids took 312–337 ms,
+  and `cef health` counted `gpu_process_deaths=1`. No restart followed.
 ## F-025: Owed 85's cause: a restarted container's Xvfb refuses its predecessor's lock (image run 40057826178, 2026-10-24)
 The follow-up to F-024's first fact (Owed 85; F-024 is on `feat/c14-chaos`, unmerged at the time).
 - **Measured, the real Xvfb** (image run 40057826178, head `f190df4`, the entrypoint unchanged; the

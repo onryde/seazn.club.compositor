@@ -360,6 +360,60 @@ section supersedes the lines of "Amendment 2026-10-24" it names. The rows are in
 | 8 | `in-container.sh` splits each command-line field on NUL only (CI's first build, C1) | `cef-killed` | `FAIL kill_applied` |
 | 9 | `output_stall_after_ms` 10 000 in a scratch relay build; the verdict reads the committed thresholds.json (I4) | `dest-stall` | `FAIL stall_swap` |
 
+## Amendment 2026-10-24, fix round 2 (chaos runs 40051995233 and 40051902711; mutants 40051985045)
+
+Both chaos runs were on 90f8a5b. Every red was read from its artifacts before anything changed.
+This section supersedes the lines it names. The rows are in `docs/_INDEX.md`: decision "C14 fix
+round 2", false premises dated "C14 fix round 2", Owed 70, 84, 85 and 86. The measurements are in
+`_FINDINGS.md` F-024.
+
+**What changed:**
+- **Kills (items 1 and 3).** `in-container.sh` died before it printed or killed. Under bash 5.2
+  with `set -e`, `$(<"/proc/$pid/stat")` on a vanished pid ends the script, even inside `||`.
+  Every /proc read is a builtin `read` or `mapfile` now. `in_container.rs`'s fake /proc gains a
+  vanished pid that sorts first.
+- **Case 8 (item 4).** Replaces "non-zero and not 75" (amendment 2026-10-20).
+  - Since F-022's listing at ready, C11b's zygote verdict can beat Chromium's abort. CI read 75 in
+    1 run of 6.
+  - The owner's ruling "B" (Owed 56) asks for that restart.
+  - `died_to_restart` accepts any non-zero exit, and accepts 75 only with C11b's own final beat
+    (`exitReason` "restart").
+- **Case 14.** `old_tree_gone` requires the kill mark. Without the mark, `starts_after(null)` is
+  the run's first start, so every tree passed.
+- **Case 15, fast.** `deaths_logged` shows the deciding line and the kills, against the most deaths
+  any line counted. The check itself is unchanged.
+- **chaos.yml (item 6).** The NOT RUNNABLE error line is built by jq from the verdict. The step's
+  source, which GitHub prints in every leg, no longer carries the words.
+- **run-case.sh.** It keeps the names from `docker diff` in `container-diff.txt`, for Owed 85.
+
+**Product findings, not loosened:**
+- **Owed 70 (a).** The fast loop's 5 kills took about 330 ms, and the poll counted 1.
+- **Owed 85.** CEF fails to start in 13 of 18 container restarts, after every kind of exit.
+  - The cause is unproven. What is measured: a restarted entrypoint skips its Xvfb wait, because the
+    previous Xvfb's socket persists on the container's writable layer.
+  - Cases 13–15 never ask for the overlay back. The recommendation is in that row; it is not built.
+- **Owed 86.** Under the burn, the window ran at 11.5 and 24.7 fps, and every beat read fps 30,
+  droppedFrames 0 and rung `full`.
+- **Owed 84 extends to case 5.** It depends on the clear's phase. A clear that lands within a
+  pending connect's 5 s timeout bursts and resets the recorder, and one that lands after the timeout
+  does not.
+
+**Expected reds** until those rows are ruled:
+- cef-leaks-two and cef-leaks-three (Owed 82);
+- dest-disconnect, dest-stall and dest-trickle (Owed 84; green only by phase);
+- cef-gpu-deaths-fast ×3 (Owed 70 (a));
+- cef-killed ×3, wherever the restart's CEF fails (Owed 85);
+- cpu-starved (Owed 86).
+
+**Mutant 9, retargeted.** Under case 5's 1 kbit, rtmp2sink's own socket timeout swaps the sink
+before the stall rule fires, so a doubled threshold passed. Case 12's trickle is the only path to
+the stall rule. 10 000 would survive about 1 run in 20 by the phase of the growth beat, so the
+mutant takes 20 000:
+
+| # | Mutant | Case | Required |
+|---|---|---|---|
+| 9 | `output_stall_after_ms` 20 000 in a scratch relay build; the verdict reads the committed thresholds.json | `dest-trickle` | `FAIL stall_swap` (controls `trickled`, `fp_swept_inputs`) |
+
 ## Files
 
 - Create: `harness/cases/{camera-stop,camera-flap,reader-kicked,dest-disconnect,dest-stall,cpu-starved,score-down,cef-killed,process-killed,input-impaired}.{sh,jq}` (amended 2026-10-24: all 16, cases 11–16 too, as `.sh` files with `require` lines over `harness/cases/lib.jq`; and `harness/chaos.json`, the legs)
