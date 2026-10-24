@@ -10,6 +10,7 @@ use domain::health::{ExitDetail, GraphicsStatus, HealthReport};
 use domain::input_link::LossReason;
 use domain::ladder::Rung;
 use domain::lifecycle::ExitReason;
+use domain::output_link::Encoded;
 use domain::programme::{FrameChoice, ProgrammePhase, SlateKind};
 use domain::supervisor::{Desired, Event, HeartbeatRefusal, Refusal, SignalKind};
 use testkit::fakes::{ports, session_720p, Call, FakeControl, FakeGraphics, FakeProgramme, Log};
@@ -2042,19 +2043,34 @@ fn swapped(gen: u64) -> impl Fn(&Call) -> bool {
 }
 
 fn progress(gen: u64, total_bytes: u64) -> Inbound {
-    ev(Event::OutputProgress { gen, total_bytes })
+    ev(Event::OutputProgress {
+        gen,
+        total_bytes,
+        encoded: Encoded::default(),
+    })
+}
+
+/// A reading with both encoders at `k` samples (Owed 94: they deliver while `k` grows).
+fn delivering(gen: u64, total_bytes: u64, k: u64) -> Inbound {
+    ev(Event::OutputProgress {
+        gen,
+        total_bytes,
+        encoded: Encoded { video: k, audio: k },
+    })
 }
 
 fn swaps(sim: &Sim) -> usize {
     sim.calls().iter().filter(|c| matches!(c, Call::Swap(..))).count()
 }
 
-// Five swaps through the real driver and domain, one per way the module doc of
+// Six swaps through the real driver and domain, one per way the module doc of
 // `domain::output_link` ends a sink: the first build, the sink's own error (while connecting, while
-// proving and once Connected) and the connect timeout. Each line comes just before its port call.
-// Since Owed 87 (the owner, 2026-10-24, "A") a silent sink, proving or Connected, is swapped only
-// after its own error (rtmp2sink's socket timeout, for a destination stall), however long it is
-// silent: the silences here run three sink timeouts, past where the retired stall rule swapped.
+// proving and once Connected), the connect timeout and the egress backstop. Each line comes just
+// before its port call. Since Owed 87 (the owner, 2026-10-24, "A") a silent sink whose encoders are
+// not read, proving or Connected, is swapped only after its own error (rtmp2sink's socket timeout,
+// for a destination stall), however long it is silent: the silences here run three sink timeouts,
+// past where the retired stall rule swapped. Owed 94 (the owner, 2026-10-24, "B"): a Connected sink
+// that stops while both encoders keep delivering is swapped by the backstop.
 #[test]
 fn every_sink_swap_is_logged_with_its_reason_just_before_the_swap() {
     let t = th();
@@ -2098,6 +2114,30 @@ fn every_sink_swap_is_logged_with_its_reason_just_before_the_swap() {
         at5 - e4
     );
 
+    // Generation 5 grows on the poll until it is Connected, both encoders delivering on every
+    // reading; then its total stops, the encoders keep delivering, and no error comes.
+    let (first, flat) = (at5 + 31, t.output_egress_flat_ms);
+    let grown = first + t.output_connected_after_ms + 250;
+    let mut readings = Vec::new();
+    let (mut total, mut last) = (0, first);
+    for (k, at) in (0..).map(|k| (k, first + 250 * k)) {
+        if at >= grown + flat - 1 {
+            break;
+        }
+        if at <= grown {
+            (total, last) = (476 + 50_000 * k, at);
+        }
+        readings.push((at, delivering(5, total, k + 1)));
+    }
+    sim.drive(last + flat - 1, readings);
+    assert_eq!(swaps(&sim), 5, "swapped before the backstop's threshold");
+    let at6 = sim.tick_until(last + flat + slack, swapped(6));
+    assert!(
+        (flat + base..flat + base + 100).contains(&(at6 - last)),
+        "the backstop, then failure 1's base back-off: swapped {} ms after the last growth",
+        at6 - last
+    );
+
     let calls = sim.calls();
     let mut checked = 0;
     for (gen, reason) in [
@@ -2106,6 +2146,7 @@ fn every_sink_swap_is_logged_with_its_reason_just_before_the_swap() {
         (3, "connect_timeout"),
         (4, "error"),
         (5, "error"),
+        (6, "egress_stalled"),
     ] {
         let i = calls
             .iter()
@@ -2124,5 +2165,5 @@ fn every_sink_swap_is_logged_with_its_reason_just_before_the_swap() {
         .count();
     let swaps = calls.iter().filter(|c| matches!(c, Call::Swap(..))).count();
     eprintln!("swaps {swaps}, swap lines {lines}, checked {checked}");
-    assert_eq!((checked, lines, swaps), (5, 5, 5), "one line per swap");
+    assert_eq!((checked, lines, swaps), (6, 6, 6), "one line per swap");
 }

@@ -9,6 +9,7 @@ use domain::health::{
 };
 use domain::ladder::Rung;
 use domain::lifecycle::ExitReason;
+use domain::output_link::Encoded;
 use domain::programme::ProgrammePhase;
 use domain::supervisor::{Desired, Effect, Event, Refusal, SignalKind, Supervisor};
 use serde_json::{json, Value};
@@ -1140,6 +1141,7 @@ impl World {
                 self.decide(Event::OutputProgress {
                     gen: self.sink_gen,
                     total_bytes: self.sink_total,
+                    encoded: Encoded::default(),
                 });
             }
             if self.page_gen > 0 && self.now - self.last_alive >= 1_000 {

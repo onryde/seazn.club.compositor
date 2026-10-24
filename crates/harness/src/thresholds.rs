@@ -11,7 +11,7 @@
 //! `cargo test`, not in a two-minute chaos run.
 use domain::config::{
     OutputProfile, Thresholds, CHROMIUM_GPU_DEATHS_ABORT, ENCODER_SPEED_REALTIME_MIN, OUTPUT_GAP_BUDGET_MS,
-    OUTPUT_SINK_TIMEOUT_MS,
+    OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS, TICK_WIDEST_MS,
 };
 use serde_json::{json, Map, Value};
 
@@ -89,6 +89,7 @@ pub fn dump(adapters: AdapterConsts) -> Value {
         output_backoff_cap_ms,
         output_connect_timeout_ms,
         output_connected_after_ms,
+        output_egress_flat_ms,
         cef_fail_count,
         cef_fail_window_ms,
         cef_load_timeout_ms,
@@ -137,6 +138,7 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     put("output_backoff_cap_ms", json!(output_backoff_cap_ms));
     put("output_connect_timeout_ms", json!(output_connect_timeout_ms));
     put("output_connected_after_ms", json!(output_connected_after_ms));
+    put("output_egress_flat_ms", json!(output_egress_flat_ms));
     put("cef_fail_count", json!(cef_fail_count));
     put("cef_fail_window_ms", json!(cef_fail_window_ms));
     put("cef_load_timeout_ms", json!(cef_load_timeout_ms));
@@ -160,6 +162,10 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     put("output_gap_budget_ms", json!(OUTPUT_GAP_BUDGET_MS));
     // rtmp2sink's `timeout`, which C09 sets: the only detector of a destination stall (Owed 87).
     put("output_sink_timeout_ms", json!(OUTPUT_SINK_TIMEOUT_MS));
+    // C09's poll of the sink's total, and the widest gap between ticks: the egress backstop's terms
+    // (Owed 94), which the output-hung case's bounds read.
+    put("output_progress_poll_ms", json!(OUTPUT_PROGRESS_POLL_MS));
+    put("tick_widest_ms", json!(TICK_WIDEST_MS));
     put("chromium_gpu_deaths_abort", json!(CHROMIUM_GPU_DEATHS_ABORT));
     put("frame_period_ms", json!(OutputProfile::P720.frame_period_ms()));
     // C08's final-beat flush bound (an in-place restart's decision-to-exit part).
@@ -249,11 +255,14 @@ mod tests {
             reaper_kill_after_ms: 4,
             teardown_leak_after_ms: 5,
         });
-        let pairs: [(&str, u64); 7] = [
+        let pairs: [(&str, u64); 10] = [
             ("slate_after_ms", t.slate_after_ms),
             ("resume_after_ms", t.resume_after_ms),
             ("output_connect_timeout_ms", t.output_connect_timeout_ms),
             ("output_sink_timeout_ms", OUTPUT_SINK_TIMEOUT_MS),
+            ("output_egress_flat_ms", t.output_egress_flat_ms),
+            ("output_progress_poll_ms", OUTPUT_PROGRESS_POLL_MS),
+            ("tick_widest_ms", TICK_WIDEST_MS),
             ("cef_hang_after_ms", t.cef_hang_after_ms),
             ("heartbeat_interval_ms", t.heartbeat_interval_ms),
             ("cef_gpu_deaths_to_restart", t.cef_gpu_deaths_to_restart as u64),
@@ -266,8 +275,9 @@ mod tests {
         assert_eq!(v["encoded_ring_span_ms"].as_u64(), Some(3));
         assert_eq!(v["reaper_kill_after_ms"].as_u64(), Some(4));
         assert_eq!(v["teardown_leak_after_ms"].as_u64(), Some(5));
-        // Owed 87 retired the stall rule, and with it the two numbers only its bound read.
-        let retired = ["output_stall_after_ms", "output_progress_poll_ms"];
+        // Owed 87 retired the stall rule, and with it the threshold only its bound read (the poll it
+        // also dropped is back for Owed 94's backstop, above).
+        let retired = ["output_stall_after_ms"];
         for k in retired {
             assert!(v.get(k).is_none(), "{k} is still dumped");
         }

@@ -20,8 +20,9 @@
 //!
 //! **Progress** (Owed 13). A poll every `OUTPUT_PROGRESS_POLL_MS` reads the sink's bytes-SENT total,
 //! rtmp2sink `stats` field `out-bytes-total` (F-010), or the file's size for `file://`, and sends
-//! `Event::OutputProgress { gen, total_bytes }`. Never acknowledged bytes: CF Input B sends none
-//! (F-005). A bus error sends `Event::OutputError { gen }`, and its text goes to the log only after
+//! `Event::OutputProgress { gen, total_bytes, encoded }`. Never acknowledged bytes: CF Input B sends
+//! none (F-005). `encoded` is the encoders' totals at the same reading, the samples each pushed into
+//! the ring (Owed 94: the domain's egress backstop counts only while both grow). A bus error sends `Event::OutputError { gen }`, and its text goes to the log only after
 //! the scrubber. The sink's `Eos` after `drain()` takes one final total into `Stats` and sends
 //! `Event::OutputDrained`.
 //!
@@ -43,6 +44,7 @@ use std::time::{Duration, Instant};
 use app::ports::{Inbound, TargetSpec};
 use crossbeam_channel::Sender;
 use domain::config::OUTPUT_SINK_TIMEOUT_MS;
+use domain::output_link::Encoded;
 use domain::supervisor::Event;
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -51,11 +53,10 @@ use gstreamer_app as gst_app;
 use crate::redact::Scrubber;
 use crate::stats::Stats;
 
-/// How often the output's bytes-sent total is read (Owed 15, the choice recorded in `_FINDINGS.md`
-/// F-011): 250 ms. The totals prove a new sink Connected (`output_connected_after_ms`, Owed 38).
-/// Since Owed 87 no rule times their silence, so the poll no longer bounds a stall's detection:
-/// rtmp2sink's `timeout` does (`OUTPUT_SINK_TIMEOUT_S`).
-pub const OUTPUT_PROGRESS_POLL_MS: u64 = 250;
+/// How often the output's bytes-sent total is read: the domain's `OUTPUT_PROGRESS_POLL_MS` (Owed 15,
+/// 250 ms), which moved there because the egress backstop's budget reads it (Owed 94). A destination
+/// stall's detection is rtmp2sink's `timeout` (`OUTPUT_SINK_TIMEOUT_S`, Owed 87), not this poll.
+pub use domain::config::OUTPUT_PROGRESS_POLL_MS;
 
 /// rtmp2sink's `timeout` (a uint, "RTMP timeout in seconds") on every RTMP sink: the domain's
 /// `OUTPUT_SINK_TIMEOUT_MS` (Owed 87) in the property's unit.
@@ -125,6 +126,8 @@ struct RingState {
     owner: u64,
     /// `OutputDrained` was sent (it carries no generation, so it is sent once in all).
     drained_sent: bool,
+    /// The samples each encoder has pushed, dropped ones included: what the encoders delivered.
+    encoded: Encoded,
 }
 
 /// The programme → output hand-off: bounded by span and by count, dropping the oldest.
@@ -139,6 +142,11 @@ impl EncodedRing {
         let mut r = locked(&self.state);
         e.seq = r.next_seq;
         r.next_seq += 1;
+        if e.video {
+            r.encoded.video += 1;
+        } else {
+            r.encoded.audio += 1;
+        }
         r.entries.push_back(e);
         loop {
             let over_count = r.entries.len() > ENCODED_RING_MAX_ENTRIES;
@@ -153,6 +161,11 @@ impl EncodedRing {
         }
         drop(r);
         self.wake.notify_all();
+    }
+
+    /// What the encoders have pushed so far, per track (Owed 94; every progress reading carries it).
+    pub(crate) fn encoded(&self) -> Encoded {
+        locked(&self.state).encoded
     }
 
     /// The entries held now (the test hooks read it).
@@ -952,15 +965,17 @@ impl Watch {
         }
     }
 
-    /// One reading into `Stats` and one `OutputProgress`, never waited for: a full channel drops it
-    /// (the next poll carries a newer total), counts it, and says so once when the channel fills and
-    /// once, with the count, when an event is delivered again.
+    /// One reading into `Stats` and one `OutputProgress` (the sink's total and the encoders' at the
+    /// same moment), never waited for: a full channel drops it (the next poll carries newer totals),
+    /// counts it, and says so once when the channel fills and once, with the count, when an event is
+    /// delivered again.
     fn progress(&mut self) {
         let total = self.total();
         self.shared.stats.on_sink_total(self.stats_sink, total);
         let e = Inbound::Event(Event::OutputProgress {
             gen: self.gen,
             total_bytes: total,
+            encoded: self.shared.ring.encoded(),
         });
         if self.shared.tx.try_send(e).is_err() {
             self.shared.progress_dropped.fetch_add(1, Ordering::Relaxed);
