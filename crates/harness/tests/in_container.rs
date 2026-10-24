@@ -10,6 +10,12 @@
 //! `kill-zygote` runs, so cases 8, 13, 14 and 15 never applied their fault). The rule is mirrored
 //! in the script, never imported: the script runs in the relay image, which has no harness.
 //!
+//! Every fake /proc also holds a VANISHED pid, listed first: a directory whose files are gone, as
+//! the script's own command-substitution subshell is by the time its pid list is walked. Fix round 2:
+//! CI's `main: line 57: /proc/175/cmdline: No such file or directory`, and under `set -e` bash 5.2's
+//! `$(<file)` on a missing file ends the script silently even inside `|| return 1`, so `tree` stopped
+//! at the first vanished pid and `kill-zygote` printed nothing at all (6 of 6 legs).
+//!
 //! Needs bash 5 (`EPOCHREALTIME`, `mapfile -d`): HARNESS_BASH, as in case_verdicts.rs.
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -35,6 +41,9 @@ fn bash() -> String {
     );
     bash
 }
+
+/// A pid directory with nothing in it: a process gone between the listing and the read.
+const VANISHED: &str = "1";
 
 /// The boot time the fake `/proc/stat` declares, in s.
 const BTIME_S: i64 = 1_792_800_000;
@@ -82,6 +91,8 @@ impl FakeProc {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("stat"), format!("cpu  1 2 3 4\nbtime {BTIME_S}\n")).unwrap();
+        // The vanished pid: "1" sorts before every real pid in the script's glob.
+        std::fs::create_dir_all(dir.join(VANISHED)).unwrap();
         Self { dir, procs: vec![] }
     }
 
@@ -119,10 +130,14 @@ impl FakeProc {
             .output()
             .expect("in-container.sh runs");
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         eprintln!(
-            "--- in-container.sh {args:?}: {:?}\n{stdout}{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
+            "--- in-container.sh {args:?}: {:?}\n{stdout}{stderr}",
+            out.status.code()
+        );
+        assert!(
+            !stderr.contains("No such file"),
+            "a vanished pid is skipped quietly: {stderr}"
         );
         let lines = stdout
             .lines()

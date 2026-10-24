@@ -32,6 +32,12 @@
 #                              6); prints its start (`at_ms`) and, once every worker has stopped
 #                              itself, its end (`done_at_ms`, `elapsed_ms`)
 #
+# A pid listed can be gone by the time it is read (this script's own command substitutions are in
+# every listing). Every /proc read is a builtin `read`/`mapfile` with its error redirect FIRST and a
+# status test: under `set -e`, bash 5.2's `$(<file)` on a missing file ends the script silently even
+# inside `|| return 1` (fix round 2: CI's `tree` stopped at the first vanished pid and `kill-zygote`
+# printed nothing, 6 of 6 legs).
+#
 # IN_CONTAINER_PROC moves /proc (the harness's own test, crates/harness/tests/in_container.rs, runs
 # this on a fake tree); the cases never set it.
 set -euo pipefail
@@ -54,7 +60,7 @@ BTIME=$(awk '/^btime/ { print $2 }' "$PROC/stat")
 # PR #52 review's C1). The first argument that starts with `--type=` wins (`flag_value`).
 type_of() {
   local field a fields=() words=()
-  mapfile -d '' -t fields <"$PROC/$1/cmdline" 2>/dev/null || return 0
+  mapfile -d '' -t fields 2>/dev/null <"$PROC/$1/cmdline" || return 0
   for field in "${fields[@]}"; do
     IFS=$' \t\n\r\f\v' read -r -d '' -a words <<<"$field" || true
     for a in "${words[@]}"; do
@@ -66,12 +72,20 @@ type_of() {
   done
 }
 
-# Sets STAT_PPID and STAT_START_MS for a pid (fields after the comm's closing parenthesis).
+# One line of a /proc file into REPLY_LINE; fails when the process is gone.
+read_line() {
+  REPLY_LINE=""
+  IFS= read -r REPLY_LINE 2>/dev/null <"$1" || [ -n "$REPLY_LINE" ]
+}
+
+# Sets STAT_PPID and STAT_START_MS for a pid (fields after the comm's closing parenthesis); fails
+# when the process is gone.
 read_stat() {
-  local s f
-  { s=$(<"$PROC/$1/stat"); } 2>/dev/null || return 1
-  s=${s##*) }
-  read -r -a f <<<"$s"
+  local s f=()
+  read_line "$PROC/$1/stat" || return 1
+  s=${REPLY_LINE##*) }
+  read -r -a f <<<"$s" || true
+  [ "${#f[@]}" -ge 20 ] || return 1
   STAT_PPID=${f[1]}
   STAT_START_MS=$((BTIME * 1000 + f[19] * 1000 / CLK_TCK))
 }
@@ -87,7 +101,8 @@ pids() {
 compositor_pid() {
   local p c
   for p in $(pids); do
-    { c=$(<"$PROC/$p/comm"); } 2>/dev/null || continue
+    read_line "$PROC/$p/comm" || continue
+    c=$REPLY_LINE
     if [ "$c" = compositor ]; then
       printf '%s' "$p"
       return 0
@@ -123,9 +138,9 @@ print_rc() {
 cmd_tree() {
   local p c t
   for p in $(pids); do
-    read_stat "$p" 2>/dev/null || continue
-    { c=$(<"$PROC/$p/comm"); } 2>/dev/null || continue
-    c=${c//[^A-Za-z0-9._ -]/?}
+    read_stat "$p" || continue
+    read_line "$PROC/$p/comm" || continue
+    c=${REPLY_LINE//[^A-Za-z0-9._ -]/?}
     t=$(type_of "$p")
     if [ -n "$t" ]; then t="\"$t\""; else t=null; fi
     printf '{"at_ms":%s,"pid":%s,"ppid":%s,"start_ms":%s,"comm":"%s","type":%s}\n' \
@@ -182,12 +197,12 @@ cmd_kill_zygote() {
     exit 1
   fi
   for z in $(pids_of_type zygote); do
-    read_stat "$z" 2>/dev/null || continue
+    read_stat "$z" || continue
     [ "$STAT_PPID" = "$comp" ] || continue
     kids=()
     child_types=()
     for c in $(pids); do
-      read_stat "$c" 2>/dev/null || continue
+      read_stat "$c" || continue
       if [ "$STAT_PPID" = "$z" ]; then
         kids+=("$c")
         child_types+=("$(type_of "$c")")
@@ -207,8 +222,8 @@ cmd_kill_zygote() {
   fi
   local ztype zppid
   ztype=$(type_of "$chosen")
-  read_stat "$chosen"
-  zppid=$STAT_PPID
+  zppid=null
+  if read_stat "$chosen"; then zppid=$STAT_PPID; fi
   printf '{"at_ms":%s,"pid":%s,"ppid":%s,"compositor":%s,"type":"%s","want":"%s","children":%s,"child_types":%s}\n' \
     "$(now_ms)" "$chosen" "$zppid" "$comp" "$ztype" "$want" "$(json_list "${kids[@]}")" \
     "$(json_strs "${child_types[@]}")"
