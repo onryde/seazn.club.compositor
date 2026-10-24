@@ -275,9 +275,10 @@ require_output_recovers() {
 # frame lies between the two, so the forms agree, and where it ends before the start (a frame dated
 # between the die and the start, which only the old process can have made) the outage's end would
 # read that frame as the new process's. No outage, or no frame back, is a FAIL. Owed 85's restarts,
-# whose CEF never starts, red here. Its signature is measured beside it:
-# `graphics_failed_after_start`, the `overlay hidden reason=failed` lines after <start> (graphics
-# gave up after CEF_FAIL_COUNT builds; the re-review's I-3). 2 checks.
+# whose CEF never started, red here; PR #54 fixed that cause (main 263b08a), so no owed tag excuses
+# such a red now. Its evidence is still measured beside it: `graphics_failed_after_start`, the
+# `overlay hidden reason=failed` lines after <start> (graphics gave up after CEF_FAIL_COUNT builds;
+# the re-review's I-3). 2 checks.
 require_overlay_back() {
   local die="$1" start="$2"
   measure graphics_failed_after_start "($start) as \$s

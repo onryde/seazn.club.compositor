@@ -41,14 +41,27 @@ fn run(args: &[&str]) -> Output {
 /// run-chaos.sh with `attempt` as GITHUB_RUN_ATTEMPT (None: not a CI run). The runner's own
 /// GITHUB_* values never leak in: check.yml runs this test inside a CI job.
 fn run_attempt(args: &[&str], attempt: Option<&str>) -> Output {
+    run_env(args, attempt, None)
+}
+
+/// run-chaos.sh over another manifest (CHAOS_MANIFEST), as a run's first attempt.
+fn run_manifest(args: &[&str], manifest: &Path) -> Output {
+    run_env(args, Some("1"), Some(manifest))
+}
+
+fn run_env(args: &[&str], attempt: Option<&str>, manifest: Option<&Path>) -> Output {
     let mut c = Command::new(bash());
     c.arg(repo().join("harness/run-chaos.sh"))
         .args(args)
         .env_remove("GITHUB_RUN_ATTEMPT")
         .env_remove("GITHUB_SHA")
+        .env_remove("CHAOS_MANIFEST")
         .env("CHAOS_HEAD_SHA", HEAD);
     if let Some(a) = attempt {
         c.env("GITHUB_RUN_ATTEMPT", a);
+    }
+    if let Some(m) = manifest {
+        c.env("CHAOS_MANIFEST", m);
     }
     let out = c.output().expect("run-chaos.sh runs");
     eprintln!(
@@ -475,9 +488,9 @@ fn signature_holds(sig: &str, verdict: &Value) -> Option<bool> {
 /// C14 fix round 3, item 4: chaos.json names the Owed row behind each check a leg is known to fail,
 /// so a red table reads at a glance. Every name must be a check that leg can fail, and every row
 /// must exist in docs/_INDEX.md, still open, with a title here: an owed entry for a check that no
-/// longer exists, a row that was never written, or a row since CLOSED (the re-review's m-6: a later
-/// regression of `overlay_back` would read "(Owed 85)" after #54 closed it) would make an unexplained
-/// red look explained. And each row has a signature (the re-review's I-3) that compiles, is false
+/// longer exists, a row that was never written, or a row since CLOSED (the re-review's m-6: had Owed
+/// 85's tags stayed after #54 fixed it, a later regression of `overlay_back` would read "(Owed 85)")
+/// would make an unexplained red look explained. And each row has a signature (the re-review's I-3) that compiles, is false
 /// on a verdict that measured nothing (absent evidence is no cause), and reads only measures the
 /// leg's case records (a signature over a measure no case writes could never hold).
 #[test]
@@ -586,9 +599,6 @@ fn each_owed_signature_holds_on_its_causes_evidence_and_not_without_it() {
             false,
             json!({"clear_phase": {"swap_to_clear_ms": 5_200, "connect_pending": false}}),
         ),
-        ("85", true, json!({"graphics_failed_after_start": 1})),
-        ("85", false, json!({"graphics_failed_after_start": 0})),
-        ("85", false, json!({"graphics_failed_after_start": null})),
         (
             "86",
             true,
@@ -625,7 +635,7 @@ fn each_owed_signature_holds_on_its_causes_evidence_and_not_without_it() {
         checked += 1;
     }
     eprintln!("signature cases checked: {checked}");
-    assert_eq!(checked, 15);
+    assert_eq!(checked, 12);
 }
 
 /// A red table names each failed check's Owed row when that row's signature holds in the run, and
@@ -659,7 +669,9 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     );
     // A check no Owed row names: the news in the run.
     edit(&dir, "camera-stop", fail(json!(["slate_ms"]), json!({})));
-    // A leg with owed checks that failed on another one too.
+    // A restart leg's overlay_back with Owed 85's old evidence, graphics given up after the start,
+    // beside a check no Owed row ever named: PR #54 fixed that cause and its tags left chaos.json
+    // (the rebase onto main 263b08a), so both reds are news.
     edit(
         &dir,
         "cef-killed-r1",
@@ -675,80 +687,80 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
         "| dest-stall | FAIL | 4/4 | outage_ms | failed: stall_swap (Owed 87), output_lost (Owed 84) |"
     ));
     assert!(s.contains("| camera-stop | FAIL | 4/4 | outage_ms | failed: slate_ms (NOT OWED) |"));
-    assert!(s.contains("| cef-killed-r1 | FAIL | 4/4 | outage_ms | failed: overlay_back (Owed 85), same_session (NOT OWED) |"));
+    assert!(s.contains(
+        "| cef-killed-r1 | FAIL | 4/4 | outage_ms | failed: overlay_back (NOT OWED), same_session (NOT OWED) |"
+    ), "{s}");
     assert!(s.contains("red, every failed check owed: dest-stall\n"), "{s}");
     assert!(s.contains(
-        "red on a check no Owed row names: camera-stop (slate_ms); cef-killed-r1 (same_session)\n"
-    ));
-    for row in ["84", "85", "87"] {
+        "red on a check no Owed row names: camera-stop (slate_ms); cef-killed-r1 (overlay_back, same_session)\n"
+    ), "{s}");
+    for row in ["84", "87"] {
         assert!(
             s.contains(&format!("Owed {row}: {}\n", title(row))),
             "Owed {row}'s title"
         );
     }
-    assert!(!s.contains("Owed 86:"), "only the rows this run's reds name");
+    assert!(
+        !s.contains("Owed 85") && !s.contains("Owed 86:"),
+        "only the rows this run's reds name, and never the fixed 85"
+    );
     assert!(s.contains("this run does not count"));
     assert!(!s.contains("this run counts"));
 
     // The re-review's I-3: an owed check that fails WITHOUT its row's evidence is not that row's.
-    // cef-killed's overlay_back, and CEF's graphics never gave up (a late overlay, a C15 that makes
-    // CEF ready at 16 s); dest-stall's stall_swap through the stall rule itself (cause "stall": a
-    // slow detector); the fast leg's overlay_back with neither 70 (a) nor 85 shown, then with 85.
+    // dest-stall's stall_swap through the stall rule itself (cause "stall": a slow detector); the
+    // fast leg's overlay_back with 70 (a)'s evidence absent, then present, then absent with Owed
+    // 85's old evidence present, which explains nothing since its tags left.
     verdicts(&dir, true);
-    edit(
-        &dir,
-        "cef-killed-r2",
-        fail(json!(["overlay_back"]), json!({"graphics_failed_after_start": 0})),
-    );
     edit(
         &dir,
         "dest-stall",
         fail(json!(["stall_swap"]), json!({"stall_swap": {"cause": "stall"}})),
     );
-    edit(
-        &dir,
-        "cef-gpu-deaths-fast-r1",
-        fail(
-            json!(["overlay_back"]),
-            json!({"deaths_logged": {"kills": 5, "counted_max": 3, "needs": 3},
-                "graphics_failed_after_start": 0}),
-        ),
-    );
-    edit(
-        &dir,
-        "cef-gpu-deaths-fast-r2",
-        fail(
-            json!(["overlay_back"]),
-            json!({"deaths_logged": {"kills": 5, "counted_max": 3, "needs": 3},
-                "graphics_failed_after_start": 1}),
-        ),
-    );
+    let absent = json!({"kills": 5, "counted_max": 3, "needs": 3});
+    let present = json!({"kills": 5, "counted_max": 1, "needs": 3});
+    for (leg, deaths, failed_after) in [
+        ("cef-gpu-deaths-fast-r1", absent.clone(), 0),
+        ("cef-gpu-deaths-fast-r2", present.clone(), 0),
+        ("cef-gpu-deaths-fast-r3", absent.clone(), 1),
+    ] {
+        edit(
+            &dir,
+            leg,
+            fail(
+                json!(["overlay_back"]),
+                json!({"deaths_logged": deaths, "graphics_failed_after_start": failed_after}),
+            ),
+        );
+    }
     let out = run(&["--table", d]);
     let s = stdout(&out);
     assert_eq!(out.status.code(), Some(1));
     assert!(s.contains(
-        "| cef-killed-r2 | FAIL | 4/4 | outage_ms | failed: overlay_back (NOT OWED: Owed 85's signature absent) |"
-    ), "{s}");
-    assert!(s.contains(
         "| dest-stall | FAIL | 4/4 | outage_ms | failed: stall_swap (NOT OWED: Owed 87's signature absent) |"
-    ));
-    assert!(s.contains(
-        "| cef-gpu-deaths-fast-r1 | FAIL | 4/4 | outage_ms | failed: overlay_back (NOT OWED: Owed 70 (a)'s and Owed 85's signature absent) |"
-    ));
+    ), "{s}");
+    for r in [1, 3] {
+        assert!(s.contains(&format!(
+            "| cef-gpu-deaths-fast-r{r} | FAIL | 4/4 | outage_ms | failed: overlay_back (NOT OWED: Owed 70 (a)'s signature absent) |"
+        )), "fast-r{r}: {s}");
+    }
     assert!(
-        s.contains("| cef-gpu-deaths-fast-r2 | FAIL | 4/4 | outage_ms | failed: overlay_back (Owed 85) |")
+        s.contains(
+            "| cef-gpu-deaths-fast-r2 | FAIL | 4/4 | outage_ms | failed: overlay_back (Owed 70 (a)) |"
+        ),
+        "{s}"
     );
     assert!(
         s.contains("red, every failed check owed: cef-gpu-deaths-fast-r2\n"),
         "{s}"
     );
     assert!(s.contains(
-        "red on a check no Owed row names: dest-stall (stall_swap); cef-killed-r2 (overlay_back); cef-gpu-deaths-fast-r1 (overlay_back)\n"
+        "red on a check no Owed row names: dest-stall (stall_swap); cef-gpu-deaths-fast-r1 (overlay_back); cef-gpu-deaths-fast-r3 (overlay_back)\n"
     ), "{s}");
-    assert!(s.contains(&format!("Owed 85: {}\n", title("85"))));
+    assert!(s.contains(&format!("Owed 70 (a): {}\n", title("70 (a)"))));
     assert!(
-        !s.contains("Owed 87:") && !s.contains("Owed 70 (a):"),
-        "a row whose evidence is absent is not named"
+        !s.contains("Owed 87:") && !s.contains("Owed 85"),
+        "a row whose evidence is absent is not named, nor the fixed 85"
     );
 
     // Only owed reds: still red, and the run still does not count.
@@ -774,4 +786,67 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     assert_eq!(out.status.code(), Some(0));
     assert!(!s.contains("every failed check owed") && !s.contains("no Owed row names"));
     eprintln!("owed table rows checked: 3, then 4, then 1, then 0");
+}
+
+/// A check may name a list of Owed rows, tried in order (chaos.json's `about`): the first whose
+/// signature holds is named, and with none holding the row reads every row's signature absent. No
+/// leg of chaos.json carries a list since Owed 85 left it, so a copy of the manifest gives the fast
+/// leg's overlay_back a second row, a test row whose signature is Owed 85's old evidence.
+#[test]
+fn a_list_of_owed_rows_names_the_first_whose_signature_holds() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("chaos-table-owed-list");
+    let d = dir.to_str().unwrap();
+    let mut m = manifest();
+    m["owed_signatures"]["99"] = json!(".measures.graphics_failed_after_start >= 1");
+    m["owed_titles"]["99"] = json!("a test row");
+    let mut lists = 0;
+    for l in m["legs"].as_array_mut().unwrap() {
+        if l["case"] == "cef-gpu-deaths" && l["variant"] == "fast" {
+            l["owed"]["overlay_back"] = json!(["70 (a)", "99"]);
+            lists += 1;
+        }
+    }
+    assert_eq!(lists, 1, "the fast leg is in chaos.json");
+    verdicts(&dir, true);
+    let path = dir.with_extension("json");
+    std::fs::write(&path, m.to_string()).unwrap();
+    let fail = |deaths: Value, failed_after: i64| {
+        move |v: &mut Value| {
+            v["status"] = json!("fail");
+            v["failed"] = json!(["overlay_back"]);
+            v["measures"]["deaths_logged"] = deaths.clone();
+            v["measures"]["graphics_failed_after_start"] = json!(failed_after);
+        }
+    };
+    let absent = json!({"kills": 5, "counted_max": 3, "needs": 3});
+    let present = json!({"kills": 5, "counted_max": 1, "needs": 3});
+    edit(&dir, "cef-gpu-deaths-fast-r1", fail(absent.clone(), 0));
+    edit(&dir, "cef-gpu-deaths-fast-r2", fail(absent.clone(), 1));
+    edit(&dir, "cef-gpu-deaths-fast-r3", fail(present.clone(), 1));
+    let out = run_manifest(&["--table", d], &path);
+    let s = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "an owed red is still red");
+    let row = |r: u32, tag: &str| {
+        format!("| cef-gpu-deaths-fast-r{r} | FAIL | 4/4 | outage_ms | failed: overlay_back ({tag}) |")
+    };
+    let mut checked = 0;
+    for (r, tag) in [
+        (1, "NOT OWED: Owed 70 (a)'s and Owed 99's signature absent"),
+        (2, "Owed 99"),
+        (3, "Owed 70 (a)"),
+    ] {
+        assert!(s.contains(&row(r, tag)), "fast-r{r} reads {tag}: {s}");
+        checked += 1;
+    }
+    assert!(
+        s.contains("red, every failed check owed: cef-gpu-deaths-fast-r2, cef-gpu-deaths-fast-r3\n"),
+        "{s}"
+    );
+    assert!(s.contains("red on a check no Owed row names: cef-gpu-deaths-fast-r1 (overlay_back)\n"));
+    assert!(
+        s.contains("Owed 70 (a): ") && s.contains("Owed 99: a test row\n"),
+        "{s}"
+    );
+    eprintln!("owed list rows checked: {checked}");
+    assert_eq!(checked, 3);
 }
