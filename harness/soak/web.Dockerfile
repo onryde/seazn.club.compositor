@@ -18,10 +18,10 @@ ARG SOAK_IMAGE
 FROM ${SOAK_IMAGE}
 USER root
 # Ubuntu 24.04's Postgres 16, the version the web repo's CI migrates on. No default cluster: the
-# soak's own is made below.
+# soak's own is made below. libatomic1: the runner's node binary links it (rehearsal 40130557751).
 RUN mkdir -p /etc/postgresql-common/createcluster.d \
     && echo 'create_main_cluster = false' >/etc/postgresql-common/createcluster.d/soak.conf \
-    && apt-get update && apt-get install -y --no-install-recommends postgresql-16 postgresql-client-16 \
+    && apt-get update && apt-get install -y --no-install-recommends postgresql-16 postgresql-client-16 libatomic1 \
     && rm -rf /var/lib/apt/lists/*
 COPY harness/soak/web/build/node /usr/local/bin/node
 ADD harness/soak/web/build/app.tgz /web/app/
@@ -29,7 +29,11 @@ COPY harness/soak/web/build/db /web/db
 COPY harness/soak/web/build/web.json /web/web.json
 COPY harness/soak/web/lib.mjs harness/soak/web/seed.mjs harness/soak/web/score.mjs harness/soak/web/overlay-url.mjs \
      harness/soak/web/serve.sh harness/soak/web/up.sh harness/soak/web/smoke.sh harness/soak/web/session.sql /soak/web/
+# Every shared library the copied node links must resolve here: a missing one fails the build by
+# name, not the Machine with a crash.
 RUN chmod 0755 /usr/local/bin/node /soak/web/serve.sh /soak/web/up.sh /soak/web/smoke.sh \
+    && ldd /usr/local/bin/node \
+    && if ldd /usr/local/bin/node | grep 'not found'; then echo "node: a shared library is missing (above)"; exit 1; fi \
     && node --version && test -f /web/app/apps/web/server.js \
     && install -d -o postgres -g postgres -m 700 /var/lib/soak-pg \
     && runuser -u postgres -- /usr/lib/postgresql/16/bin/initdb -D /var/lib/soak-pg -U postgres --auth=trust \
