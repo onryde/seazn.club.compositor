@@ -668,6 +668,7 @@ the same list.
   - Expected red: both legs, on the "at least 1 killed pid" verdict.
   - The adapters' unit tests kill the same mutant on the held pipeline's state (PR #62's mutant
     run). This one proves that the case's own verdict is not vacuous.
+
 ## Amendment 2026-10-24, wave-gate-3 follow-ups (branch `feat/c14-wg3-followups`)
 
 The coordinator's dispatch after #52 merged at 7beb540; rebased onto main b606d1b (#59: its two
@@ -715,9 +716,46 @@ wave-gate-3 follow-ups".
     - lib.jq's `error_to_swap_ms != null`: jq sorts null below every number.
     - `buffer_capped`'s three-value count: an unset cap reds on the buffer bound.
   - CI's m9 (`output_stall_after_ms` 20 000) now runs on case 17. Its target is `stall_swap`, with `buffer_capped` and `trickled` as controls. It must end KILLED (branch `mut/c14-wg3`).
-- **Expected reds of the next run:** cef-leaks ×2 (Owed 82, NOT RUNNABLE) and cpu-starved (86).
-  Anything else is NOT OWED. A red in case 17 is a finding about its physics, recorded in Owed 87's
-  row, never re-tagged.
+- ~~**Expected reds of the next run:** cef-leaks ×2 (Owed 82, NOT RUNNABLE) and cpu-starved (86).
+  Anything else is NOT OWED.~~ (False: case 17 red too. Withdrawn by the amendment below.) A red in
+  case 17 is a finding about its physics, recorded in Owed 87's row, never re-tagged.
+
+## Amendment 2026-10-24, wave-gate-3 review round 1 (PR #65)
+
+The PR #65 review (Needs fixes: C-1, I-1 to I-3, m-1 to m-5) and the coordinator's dispatch;
+rebased onto main 2537ddc (#62). Harness only. Decision log "C14 wave-gate-3 follow-ups", its
+review-round-1 amendment.
+
+- **Case 17's premise is disproved (C-1).** In 3 of 3 CI runs the 8 KiB cap applied and the
+  in-fault Send-Q still held 16 806–16 810 B, and the swap read `reason=error` (false premises, same
+  date). The coordinator stopped the harness fix: the rule's fate is the owner's (Owed 87, reopened,
+  with the mechanism and the options). Case 17 stays as built until the owner rules; m9 stays on it
+  and cannot be killed while it reds.
+- **Owed 87 is restored to chaos.json (I-2).**
+  - Tags: `stall_swap` in the 4 legs of cases 5 and 12 and in case 17, and case 17's `buffer_capped`.
+  - Signature: `stall_swap.reason` "error" with `error_path_passes` true (lib.jq
+    `stall_swap_shown`) and, where case 17 read it, `queue_past_cap` true.
+  - So case 17's two reds read Owed 87. In cases 5 and 12 the error path passing passes the check,
+    so a red there reads NOT OWED with the row named as absent.
+- **Case 17's anti-vacuity judges the effect (I-1).**
+  - `buffer_capped`: also at least one in-fault socket, each Send-Q read and at most the cap.
+  - `trickled`: netem's measured bytes over the fault (the cut to netem's stats) under one frame's
+    bits per stall threshold, with the rate shown.
+  - Case 17 declares 16 checks and measures, and shows `clear_phase` and `publishes_from_clear_ms`
+    (m-4: each publish after the cut, against the clear, from logfacts `sink_publishes`).
+- **The stall path's floor (m-3).** A `stall` swap is at least output_stall_after_ms −
+  frame_period_ms after the cut, in every case that judges it.
+- **Sweeps (m-1, m-2, m-5).**
+  - Each NOT_CHAOS control's stack knobs and exported CAMERA_* equal smoke's, but for its one
+    documented camera variable (smoke and both controls run the `probe` profile).
+  - Every `$t.<key>` and `$(threshold <key>)` read in lib.jq, run-case.sh and the case files is a
+    thresholds.json key; a key missing, or no reads at all, fails.
+  - The checker's outage count is counted.
+- **lost_ms (I-3)** is Owed 91, not fixed here: the dating step moves it by about −2 s in 11 of 15
+  destination legs, the size of `output_lost`'s budget.
+- **Expected reds of the next run:** cef-leaks ×2 (Owed 82, NOT RUNNABLE), cpu-starved (86) and
+  dest-stall-rule (87, both checks). Anything else is NOT OWED.
+- **Case 16** (Owed 82's hook) is the next C14 task, in its own PR.
 
 ## Files
 
