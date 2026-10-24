@@ -1,0 +1,35 @@
+name: owed84-mutants
+# DO NOT MERGE. Owed 84's gst-level mutants and its red baseline (PR #57, branch
+# fix/owed84-stale-frames), one leg each: .github/owed84_mutants.py.
+on:
+  pull_request: {}
+permissions: { contents: read }
+defaults:
+  run: { shell: bash }
+jobs:
+  leg:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        leg:
+          - red-baseline
+          - G1-gate-always-open
+          - G2-no-gated-drain
+          - G3-no-keyframe-request
+          - G4-connect-on-first-buffer
+          - G5-old-keyframe-may-start
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: GStreamer
+        timeout-minutes: 10
+        env: { APT_INSTALL_RESULT: "${{ runner.temp }}/apt-install-result" }
+        run: scripts/apt-install.sh libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.91.0" }
+      - uses: Swatinem/rust-cache@v2
+      - name: ${{ matrix.leg }}
+        env: { LEG: "${{ matrix.leg }}" }
+        run: python3 -I .github/owed84_mutants.py "$LEG"
