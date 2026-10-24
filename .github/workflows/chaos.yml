@@ -180,7 +180,10 @@ jobs:
           rc=0
           harness/run-case.sh "$LEG_CASE" ${LEG_VARIANT:+"$LEG_VARIANT"} || rc=$?
           if [ "$(jq -r '.status // ""' "harness/out/$LEG/verdict.json" 2>/dev/null)" = not_runnable ]; then
-            echo "::error::$LEG is NOT RUNNABLE, so it is not a pass: $(jq -r '.not_runnable_reason' "harness/out/$LEG/verdict.json")"
+            # The words come from the verdict itself, so the step's own source, which GitHub prints
+            # in every leg's log, never carries them (C14 fix round 2, item 6).
+            jq -r --arg leg "$LEG" '"::error::\($leg) is \(.status | ascii_upcase | sub("_"; " ")), so it is not a pass: \(.not_runnable_reason)"' \
+              "harness/out/$LEG/verdict.json"
             [ "$rc" -ne 0 ] || rc=3
           fi
           exit "$rc"

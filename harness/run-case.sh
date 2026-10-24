@@ -26,7 +26,8 @@
 #     out/<run>/docker-events.jsonl and run.json's `events`;
 #   - the compositor's RestartCount when the run went live and at its end, fake-control's
 #     /control/state at the end, and the cores check (`docker diff` of the compositor's container,
-#     and the host's crash directories before and after);
+#     and the host's crash directories before and after); that diff's names are kept in
+#     out/<run>/container-diff.txt;
 #   - the case's marks (`mark <name> [json]`, out/<run>/marks.jsonl), which the verdict reads as
 #     `$case`; and the controls a case drives: `camera`, `mtx` (MediaMTX's API), `in_compositor`
 #     (harness/in-container.sh, as root in the compositor's container), `at_s` (the case's clock);
@@ -379,6 +380,9 @@ collect() {
     local diff_ok=false files=0 diff
     if diff="$(docker diff "$cid" 2>/dev/null)"; then
       diff_ok=true
+      # The names alone (C14 fix round 2, Owed 85): what a restarted container inherits from the
+      # run before it on its writable layer.
+      printf '%s\n' "$diff" >"$OUT/container-diff.txt"
       files="$(printf '%s\n' "$diff" | awk '{ print $2 }' | grep -cE '(^|/)core(\.[0-9]+)?$' || true)"
     fi
     jq -n --argjson ok "$diff_ok" --argjson files "${files:-0}" --argjson before "$cores_before" \
@@ -435,7 +439,7 @@ scan_secrets() {
     fi
   done
   # The page token: the compositor scrubs it from its log, and nothing else logs a query.
-  mapfile -t files < <(present compositor.log services.log checker.log console.log)
+  mapfile -t files < <(present compositor.log services.log checker.log console.log container-diff.txt)
   if [ "${#files[@]}" -gt 0 ] && printf '%s\n' "$PAGE_TOKEN" | grep -qF -f - "${files[@]}"; then
     log "FAIL the page token appears in a log"
     leaks=$((leaks + 1))
@@ -443,7 +447,8 @@ scan_secrets() {
   # SESSION_ID: never in the harness's own files. The compositor's log is reported, not judged,
   # and so is the console, which tails that log when the run never goes live.
   for f in services.log checker.log emit.jsonl heartbeats.jsonl timeline.json run.json report.json \
-    docker-events.jsonl marks.jsonl case.json measures.jsonl verdict.json control-state.json cores.json; do
+    docker-events.jsonl marks.jsonl case.json measures.jsonl verdict.json control-state.json cores.json \
+    container-diff.txt; do
     [ -f "$OUT/$f" ] || continue
     if printf '%s\n' "$SESSION_ID" | grep -qF -f - "$OUT/$f"; then
       log "FAIL SESSION_ID appears in $f"
