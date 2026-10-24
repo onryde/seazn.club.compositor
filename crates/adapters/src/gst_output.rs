@@ -14,7 +14,9 @@
 //! rtmp2sink once its publish is accepted. Until then the ring stays the only queue, and it drops
 //! its oldest. At that moment (the reconnect point) the feeder asks the encoder for a keyframe, and
 //! no video frame the ring holds then may start the stream (`Picker`): the first frame sent is a
-//! keyframe encoded after the reconnect point, and no audio older than it is sent.
+//! keyframe encoded after the reconnect point, and no audio older than it is sent. A request the
+//! encoder does not take is asked again at each entry. A drain that reaches an output that has sent
+//! nothing, at the gate or after it, ends with the encoders (`release_unsent`).
 //!
 //! **Progress** (Owed 13). A poll every `OUTPUT_PROGRESS_POLL_MS` reads the sink's bytes-SENT total,
 //! rtmp2sink `stats` field `out-bytes-total` (F-010), or the file's size for `file://`, and sends
@@ -542,10 +544,14 @@ enum Gate {
     /// rtmp2sink, open once its publish is accepted. Measured in GStreamer 1.24.2's
     /// `gstrtmp2sink.c`: `render` waits while `self->connection` is unset, and `connect_task_done`
     /// sets it only after the publish's `NetStream.Publish.Start` (`start_publish_done`). `stats`
-    /// reads that connection's counters, and the null stats (every field 0) before it, so a fresh
-    /// sink's `out-bytes-total` leaves 0 exactly when the publish is accepted: the connection has
-    /// sent its `connect` command by then (476 B, F-011). Anything fed before that queues in front of
-    /// a sink that cannot send, and goes out in one burst at the connect (F-023).
+    /// reads that connection's counters; without one, the counters saved when a connection ended,
+    /// and the null stats (every field 0) before any. Each build makes a new rtmp2sink, whose saved
+    /// counters are cleared when its connect task starts, so this sink's `out-bytes-total` leaves 0
+    /// exactly when its publish is accepted: the connection has sent its `connect` command by then
+    /// (476 B, F-011). Anything fed before that queues in front of a sink that cannot send, and goes
+    /// out in one burst at the connect (F-023). The gate is read at each ring push and each `WAKE`
+    /// while the sink connects, about 100 reads a second, each a lock and a copy of the stats
+    /// structure; it stops at the open (F-027).
     Publish(gst::Element),
 }
 
@@ -561,6 +567,7 @@ impl Gate {
 /// rtmp2sink `stats`'s `out-bytes-total` (F-010): the bytes its connection has sent, 0 before it has
 /// one.
 fn rtmp_total(sink: &gst::Element) -> u64 {
+    // GStreamer 1.24's `stats` contract (F-027); `the_gate_reads_gstreamer_1_24` pins the version.
     sink.property::<gst::Structure>("stats")
         .get::<u64>("out-bytes-total")
         .unwrap_or(0)
@@ -584,31 +591,82 @@ enum Next {
     Stop,
 }
 
+/// The keyframe asked for at the reconnect point (Owed 84): asked again at each entry until the
+/// encoder takes it or the stream has started, so a refused request does not leave the stream
+/// waiting for the encoder's own keyframe, up to 2 s away (PR #57 review m-6).
+#[derive(Default)]
+struct KeyAsk {
+    tries: u32,
+    taken: bool,
+}
+
 impl Feeder {
     fn run(self) {
         let Some(reconnect) = self.reconnect_point() else {
             return;
         };
         let mut pick = Picker::new(reconnect);
+        let mut ask = KeyAsk::default();
+        self.ask_key(&mut ask);
         loop {
             match self.next() {
                 Next::Stop => return,
                 Next::Eos => {
+                    if !pick.started() {
+                        self.release_unsent();
+                    }
                     let _ = self.vsrc.end_of_stream();
                     let _ = self.asrc.end_of_stream();
                     return;
                 }
-                Next::Entry(e) => pick.take(e, |e, base| self.push(e, base)),
+                Next::Entry(e) => {
+                    if !pick.started() {
+                        self.ask_key(&mut ask);
+                    }
+                    pick.take(e, |e, base| self.push(e, base));
+                }
             }
         }
     }
 
-    /// Waits, taking nothing, until the sink can send (`Gate`), then asks the encoder for a keyframe
-    /// and returns the reconnect point: the seq of the first entry encoded after it. `None`: retired,
+    /// Asks the encoder for a keyframe, unless it has taken a request already.
+    fn ask_key(&self, ask: &mut KeyAsk) {
+        if ask.taken {
+            return;
+        }
+        ask.tries += 1;
+        let taken = (self.request_key)();
+        ask.taken = taken;
+        if !taken && ask.tries == 1 {
+            self.shared.log(&format!(
+                "output gen={}: the keyframe request was not taken; it is asked again at each frame",
+                self.gen
+            ));
+        } else if taken && ask.tries > 1 {
+            self.shared.log(&format!(
+                "output gen={}: the keyframe request was taken at try {}",
+                self.gen, ask.tries
+            ));
+        }
+    }
+
+    /// The drain reached an output that has sent nothing, at the gate or after it (PR #57 review
+    /// I-1). Nothing is owed to it, and it could never drain: flvmux 1.24.2 forwards no EOS before
+    /// its first buffer (`gst_flv_mux_aggregate` asks for data in its header state, gstflvmux.c
+    /// 2057-2059), so its sink never posts the EOS a drain waits for. The ring is released, and the
+    /// drain ends with the encoders, as after a sink error (`Watch`).
+    fn release_unsent(&self) {
+        self.ring.release(self.gen);
+        if self.ring.take_drained_without_output() {
+            self.shared.send(Event::OutputDrained);
+        }
+    }
+
+    /// Waits, taking nothing, until the sink can send (`Gate`), and returns the reconnect point: the
+    /// seq of the first entry encoded after it (`run` then asks for the keyframe). `None`: retired,
     /// the ring is another generation's, or both encoders ended first. That last is the programme's
     /// drain reaching a sink that never connected: nothing is owed to it (whatever the ring holds
-    /// predates any connect), so the ring is released and the drain ends with the encoders, as it
-    /// does after a sink error (`Watch`).
+    /// predates any connect), so `release_unsent`.
     fn reconnect_point(&self) -> Option<u64> {
         let since = Instant::now();
         loop {
@@ -623,19 +681,12 @@ impl Feeder {
                 let first = r.next_seq;
                 let held = r.entries.iter().filter(|e| e.video).count();
                 drop(r);
-                let taken = (self.request_key)();
                 self.shared.log(&format!(
                     "output gen={}: the sink can send after {} ms; the {held} video frames queued \
                      before it are dropped, and it starts at the next keyframe",
                     self.gen,
                     since.elapsed().as_millis()
                 ));
-                if !taken {
-                    self.shared.log(&format!(
-                        "output gen={}: the keyframe request was not taken",
-                        self.gen
-                    ));
-                }
                 return Some(first);
             }
             let r = locked(&self.ring.state);
@@ -644,10 +695,7 @@ impl Feeder {
             }
             if r.video_eos && r.audio_eos {
                 drop(r);
-                self.ring.release(self.gen);
-                if self.ring.take_drained_without_output() {
-                    self.shared.send(Event::OutputDrained);
-                }
+                self.release_unsent();
                 return None;
             }
             drop(
@@ -730,6 +778,11 @@ impl<S> Picker<S> {
             expected_seq: None,
             early_audio: VecDeque::new(),
         }
+    }
+
+    /// Whether anything has been sent: the first keyframe set the base.
+    pub(crate) fn started(&self) -> bool {
+        self.base.is_some()
     }
 
     /// Hands `send` each entry to send now, in order, with its base.
@@ -983,6 +1036,26 @@ mod tests {
         assert_eq!(sent(6, ring), vec![]);
         // An empty ring sends nothing, whatever the point.
         assert_eq!(sent(0, vec![]), vec![]);
+    }
+
+    // `started` is what the feeder's drain reads (PR #57 review I-1): false while every entry was
+    // refused or held, true from the first one sent, each read checked against what `take` sent.
+    #[test]
+    fn started_reads_whether_anything_was_sent() {
+        let mut checked = 0;
+        for reconnect in [0, 6, 13] {
+            let mut pick = Picker::new(reconnect);
+            assert!(!pick.started(), "{reconnect}: before any entry");
+            let mut sent_any = false;
+            for e in ring_with_an_old_keyframe() {
+                pick.take(e, |_, _| sent_any = true);
+                assert_eq!(pick.started(), sent_any, "{reconnect}");
+                checked += 1;
+            }
+            // 13 is past the ring's last keyframe (12): nothing is ever sent.
+            assert_eq!(sent_any, reconnect <= 12, "{reconnect}");
+        }
+        assert_eq!(checked, 3 * ring_with_an_old_keyframe().len());
     }
 
     #[test]
