@@ -23,6 +23,10 @@
 //!   (`ticks skipped total=<n>`, `heartbeats dropped total=<n>`; review round 1, item 4): a line when
 //!   the count rises, at most one a minute, and whatever rose since the last line at the exit. No line
 //!   carries a credential or a fatal error's text.
+//! - **The camera frames no tick showed** (Owed 81 (i)): each beat's metrics sample that carries
+//!   `camera_frames_replaced` writes `camera frames replaced beat=<n> total=<n>`, where `beat` is the
+//!   rise since the last beat's sample (the final beat included). It stands in for a
+//!   beat field the contract does not have yet (Owed 90); a sample without it writes nothing.
 //! - **CEF's health** (C11b) is read from the graphics port once per `tick_due` that ran a tick, after
 //!   its ticks, and handed to `decide` every time (the domain decides the in-place restart, never the
 //!   driver), with one line when it changes (`cef health zygote_gone=<gen|-> leaked_teardowns=<n>
@@ -113,6 +117,8 @@ pub struct Driver {
     skipped_ticks: u64,
     skips: Tally,
     drops: Tally,
+    /// The camera-frames-replaced total of the last beat's sample (Owed 81 (i)).
+    replaced_at_beat: u64,
     phase: ProgrammePhase,
     phase_seq: u64,
     /// CEF's health as last read (C11b): its line is written when it changes.
@@ -135,6 +141,7 @@ impl Driver {
             skipped_ticks: 0,
             skips: Tally::default(),
             drops: Tally::default(),
+            replaced_at_beat: 0,
             phase: ProgrammePhase::Waiting,
             phase_seq: 0,
             cef: CefHealth::default(),
@@ -337,6 +344,14 @@ impl Driver {
             Effect::StepDown(r) => p.programme.step_down(r),
             Effect::SendHeartbeat(h) => {
                 let m = p.metrics.sample();
+                if let Some(total) = m.camera_frames_replaced {
+                    // The adapter's total only grows; a lower one (a fault) reads 0, and the next
+                    // beat counts from it.
+                    let beat = total.saturating_sub(self.replaced_at_beat);
+                    self.replaced_at_beat = total;
+                    p.log
+                        .info(&format!("camera frames replaced beat={beat} total={total}"));
+                }
                 p.control.request(ControlRequest::Heartbeat(h, m));
                 let dropped = p.control.dropped();
                 if self.drops.due(dropped, now) {

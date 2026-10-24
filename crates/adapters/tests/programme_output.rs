@@ -566,6 +566,74 @@ fn emit_uses_the_latest_camera_frame() {
     assert_eq!(p.camera_missing(), 0);
 }
 
+/// Owed 81 (i), the seam: `FrameStore::set_camera` (what C10's input calls for every frame) through
+/// `push` into the programme's `Stats`. `writes(i)` frames go into the slot just before tick `i`; a
+/// camera tick shows the newest of them, so it loses `writes(i) − 1`, and a slate tick loses none.
+/// The script's count, by hand: the live bursts of 3 before ticks 6, 9 and 12 lose 2 each, the
+/// burst of 3 before the `Repeat` tick 17 loses 2 (a frozen tick is the camera on air: the domain's
+/// freeze can lag the slot while the burst's frame events are still queued), the 2 frames before
+/// tick 25 lose 1, and the frames under the waiting and reconnecting slates lose none.
+#[test]
+fn camera_frames_replaced_counts_the_frames_no_tick_showed() {
+    let _s = serial();
+    let (mut p, _rx, frames, _l) = programme();
+    let writes = |i: u64| -> usize {
+        match i {
+            0..=4 | 20..=24 => 3, // under a slate
+            5 => 1,
+            6 | 9 | 12 => 3,
+            7 | 8 | 10 | 11 | 13 | 14 => 0,
+            15 | 16 | 18 | 19 => 0, // frozen: no frame
+            17 => 3,                // frozen, but the slot took a burst
+            25 => 2,
+            _ => 1,
+        }
+    };
+    let choice = |i: u64| match i {
+        0..=4 => FrameChoice::Slate(SlateKind::Waiting),
+        15..=19 => FrameChoice::Repeat,
+        20..=24 => FrameChoice::Slate(SlateKind::Reconnecting),
+        _ => FrameChoice::Emit,
+    };
+    let replaced = |p: &GstProgramme| p.stats().snapshot().camera_frames_replaced;
+    // One picture, written as many frames: the slot counts writes, not pictures.
+    let red = solid(gst_video::VideoFormat::I420, 1_280, 720, [255, 0, 0, 255]);
+    let mut written = 0;
+    let mut phase = |p: &mut GstProgramme, range: std::ops::Range<u64>| {
+        pace_with(p, range, choice, |i| {
+            for _ in 0..writes(i) {
+                frames.set_camera(red.clone());
+                written += 1;
+            }
+        });
+    };
+    phase(&mut p, 0..5);
+    assert_eq!(replaced(&p), None, "the waiting slate alone measures nothing");
+    phase(&mut p, 5..15);
+    assert_eq!(replaced(&p), Some(6), "three live bursts of 3");
+    phase(&mut p, 15..20);
+    assert_eq!(
+        replaced(&p),
+        Some(8),
+        "frozen: the burst of 3 before the Repeat tick 17 loses 2"
+    );
+    phase(&mut p, 20..25);
+    assert_eq!(
+        replaced(&p),
+        Some(8),
+        "under the reconnecting slate, nothing counts"
+    );
+    phase(&mut p, 25..40);
+    assert_eq!(
+        replaced(&p),
+        Some(9),
+        "two frames before tick 25, then one a tick"
+    );
+    eprintln!("frames written to the camera slot: {written}");
+    assert_eq!(written, 15 + 1 + 9 + 3 + 15 + 2 + 14, "the script ran in full");
+    assert_eq!(p.camera_missing(), 0, "every camera tick had a frame");
+}
+
 #[test]
 fn camera_of_a_different_size_is_letterboxed_not_renegotiated() {
     let _s = serial();

@@ -185,6 +185,13 @@ pub struct Measured {
     pub encoder_speed: Option<f64>,
     pub cpu_pct: Option<f64>,
     pub mem_mb: Option<u64>,
+    /// Camera frames no tick put on air, this session (Owed 81 (i)). The driver logs it once a beat
+    /// (`camera frames replaced beat=<n> total=<n>`). It is NOT on the heartbeat: the contract's
+    /// `heartbeat` refuses an unknown key (a 400 loses the beat), so it waits for web to declare it
+    /// (`docs/_INDEX.md` Owed 90). It counts the frames above one a camera tick, so a source faster
+    /// than the programme (60 fps on 30) and a late tick thread raise it too, judder or not (the
+    /// stats module's `ReplacedFrames` says how).
+    pub camera_frames_replaced: Option<u64>,
 }
 
 /// The two outbound calls to R1 (spec §5): the session GET and the heartbeat POST.
