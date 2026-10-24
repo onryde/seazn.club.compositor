@@ -1047,6 +1047,12 @@ fn score_down_reports_stale_and_holds_the_last_score_and_reds_when_the_page_is_s
 /// `in-container.sh kill-cef` at 20 s: its targets (`kill`, printed before the kill) and, when the
 /// exec lived to print it, its status (`kill_rc`).
 fn cef_killed_rc(kill: Value, rc: Option<i64>, code: i64) -> World {
+    cef_killed_with(kill, rc, code, None)
+}
+
+/// As `cef_killed_rc`; with `detail`, the process sends C11b's final beat (`exitReason` "restart")
+/// before it dies.
+fn cef_killed_with(kill: Value, rc: Option<i64>, code: i64, detail: Option<&str>) -> World {
     let mut w = World::new(70);
     let k = w.at(20.0);
     let mut v = kill;
@@ -1055,7 +1061,7 @@ fn cef_killed_rc(kill: Value, rc: Option<i64>, code: i64) -> World {
     if let Some(rc) = rc {
         w.mark("kill_rc", k + 5, json!({"rc_at_ms": k + 5, "rc": rc}));
     }
-    w.restart(k + 1_200, code, None);
+    w.restart(k + 1_200, code, detail);
     w
 }
 
@@ -1064,7 +1070,7 @@ fn cef_killed(kill: Value, code: i64) -> World {
 }
 
 #[test]
-fn cef_killed_restarts_the_process_and_reds_when_the_kill_missed_or_the_exit_is_in_place() {
+fn cef_killed_restarts_the_process_and_reds_when_the_kill_missed_or_the_death_is_no_restart() {
     let good = || json!({"killed": [201, 202, 203], "types": ["zygote", "zygote", "gpu-process"]});
     assert_pass(
         &judge(&cef_killed(good(), 133), "cef-killed", "", "cef-good"),
@@ -1090,11 +1096,27 @@ fn cef_killed_restarts_the_process_and_reds_when_the_kill_missed_or_the_exit_is_
     );
     let w = cef_killed_rc(good(), Some(1), 133);
     assert_fails(&judge(&w, "cef-killed", "", "cef-rc"), "kill_applied", "cef-rc");
+    // C14 fix round 2 (CI, 1 run of 6): C11b's zygote verdict came before Chromium's abort, and the
+    // process restarted in place, as the owner's ruling "B" asks for a dead zygote (Owed 56).
+    let w = cef_killed_with(
+        good(),
+        Some(0),
+        75,
+        Some("restart in place: a CEF zygote is gone (gen 1)"),
+    );
+    assert_pass(&judge(&w, "cef-killed", "", "cef-inplace"), "cef-inplace");
+    // A 75 with no restart beat is not C11b's restart.
     let w = cef_killed(good(), 75);
     assert_fails(
-        &judge(&w, "cef-killed", "", "cef-inplace"),
-        "died_not_in_place",
-        "cef-inplace",
+        &judge(&w, "cef-killed", "", "cef-75-nobeat"),
+        "died_to_restart",
+        "cef-75-nobeat",
+    );
+    let w = cef_killed(good(), 0);
+    assert_fails(
+        &judge(&w, "cef-killed", "", "cef-exit0"),
+        "died_to_restart",
+        "cef-exit0",
     );
     let mut w = cef_killed(good(), 133);
     let (a, b) = (w.at(30.0), w.end);
@@ -1373,9 +1395,20 @@ fn cef_gpu_zygote_killed_restarts_in_place_and_reds_without_the_in_place_restart
 #[test]
 fn cef_renderer_zygote_killed_restarts_in_place_and_reds_when_an_old_process_survives() {
     let w = zygote("renderer", true, "zygote");
-    assert_pass(
-        &judge(&w, "cef-renderer-zygote-killed", "", "rzyg-good"),
-        "rzyg-good",
+    let v = judge(&w, "cef-renderer-zygote-killed", "", "rzyg-good");
+    assert_pass(&v, "rzyg-good");
+    // The printed measure: the processes counted, and the oldest one's age at the restart.
+    let shown = &v.json["measures"]["old_tree_gone"];
+    assert_eq!(shown["cef_processes"], 2, "rzyg-good: {shown}");
+    assert_eq!(shown["oldest_ms_after_start"], 1_200, "rzyg-good: {shown}");
+    // Fix round 2: with no kill mark, `starts_after(null)` took the run's first start, so every
+    // process looked younger than "the restart" and the check passed on nothing.
+    let mut w = zygote("renderer", true, "zygote");
+    w.marks.retain(|(name, _, _)| name != "kill" && name != "kill_rc");
+    assert_fails(
+        &judge(&w, "cef-renderer-zygote-killed", "", "rzyg-nokill"),
+        "old_tree_gone",
+        "rzyg-nokill",
     );
     let mut w = zygote("renderer", true, "zygote");
     let at = w.at(60.0);
@@ -1478,6 +1511,38 @@ fn cef_gpu_deaths_fast_restarts_before_the_abort_and_reds_when_the_loop_reaches_
         &judge(&w, "cef-gpu-deaths", "fast", "fast-late"),
         "last_kill_not_before_die",
         "fast-late",
+    );
+    // C14 fix round 2, CI's world (runs 40051995233 and 40051902711, Owed 70 (a) measured): Chromium
+    // relaunched the GPU process in about 80 ms, so the loop's kills of 5 distinct pids took about
+    // 330 ms, and the 1 s child poll counted one death. No restart: deaths_logged reds, and its
+    // measure shows the kills against the most the log counted.
+    let mut w = World::new(90);
+    let k0 = w.at(20.0);
+    for i in 0..i64::from(abort - 1) {
+        let k = k0 + i * 80;
+        w.mark("kill", k, json!({"at_ms": k, "pid": 300 + i, "n": i + 1}));
+    }
+    w.gpu_deaths.push(k0 + 700);
+    w.line(
+        k0 + 700,
+        "cef health zygote_gone=- leaked_teardowns=0 gpu_process_deaths=1",
+    );
+    let done = k0 + 400;
+    w.mark(
+        "kill_done",
+        done,
+        json!({"done_at_ms": done, "done": abort - 1, "wanted": abort - 1,
+            "compositor_alive": true, "timed_out": false}),
+    );
+    let v = judge(&w, "cef-gpu-deaths", "fast", "fast-ci");
+    assert_fails(&v, "deaths_logged", "fast-ci");
+    let shown = &v.json["measures"]["deaths_logged"];
+    assert_eq!(shown["kills"], abort - 1, "fast-ci: {shown}");
+    assert_eq!(shown["counted_max"], 1, "fast-ci: {shown}");
+    assert_eq!(
+        shown["needs"],
+        World::new(1).ms("cef_gpu_deaths_to_restart"),
+        "fast-ci: {shown}"
     );
 }
 
