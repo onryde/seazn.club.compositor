@@ -31,6 +31,10 @@ jobs:
         run: |
           python3 -I scripts/cef_cache_key_test.py
           python3 -I scripts/cache_timing.py --self-test
+      # scripts/cadence_stages.py, Owed 81's stage-by-stage cadence reader (F-028): its sampler, its
+      # cadence count, its PTS-to-counter map, its fit and its strip reader, on synthetic runs.
+      - name: Cadence stage tool
+        run: python3 -I scripts/cadence_stages.py --self-test
       # scripts/apt-install.sh: the retries, the per-attempt bounds and the mirror fallback, under fakes.
       - name: apt install script
         run: python3 -I scripts/apt_install_test.py
