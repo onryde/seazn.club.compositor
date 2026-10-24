@@ -75,6 +75,40 @@ fn wait_eos(pipeline: &gst::Pipeline, what: &str) {
     pipeline.set_state(gst::State::Null).expect("null");
 }
 
+/// The indexes, in PTS order, of the key frames of an MPEG-TS file's H.264 stream (h264parse leaves
+/// DELTA_UNIT off an IDR access unit).
+pub fn key_frame_indexes(ts: &Path) -> Vec<usize> {
+    let p = gst::parse::launch(&format!(
+        "filesrc location={} ! tsdemux ! h264parse ! video/x-h264,alignment=au ! appsink name=out sync=false",
+        ts.display()
+    ))
+    .expect("the key-frame pipeline")
+    .downcast::<gst::Pipeline>()
+    .expect("a pipeline");
+    let sink = p
+        .by_name("out")
+        .expect("its appsink")
+        .downcast::<gst_app::AppSink>()
+        .expect("an appsink");
+    p.set_state(gst::State::Playing).expect("playing");
+    let mut frames: Vec<(u64, bool)> = Vec::new();
+    while let Ok(s) = sink.pull_sample() {
+        let b = s.buffer().expect("a buffer");
+        frames.push((
+            b.pts().map_or(0, gst::ClockTime::nseconds),
+            !b.flags().contains(gst::BufferFlags::DELTA_UNIT),
+        ));
+    }
+    p.set_state(gst::State::Null).expect("null");
+    frames.sort_by_key(|f| f.0);
+    frames
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.1)
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// One decoded frame of a round trip.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Decoded {

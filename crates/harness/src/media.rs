@@ -353,6 +353,8 @@ fn live_appsrc(caps: &gst::Caps, max_bytes: u64) -> gst_app::AppSrc {
 pub struct CameraPipeline {
     pipeline: gst::Pipeline,
     video: gst_app::AppSrc,
+    /// The x264enc, for a key frame on demand ([`Self::force_key_unit`]).
+    encoder: gst::Element,
     audio: gst_app::AppSrc,
     layout: Layout,
     pattern: Pattern,
@@ -397,7 +399,8 @@ impl CameraPipeline {
                 s
             }
         };
-        let v: [gst::Element; 4] = [video.clone().upcast(), x264enc()?, h264parse, make("queue")?];
+        let encoder = x264enc()?;
+        let v: [gst::Element; 4] = [video.clone().upcast(), encoder.clone(), h264parse, make("queue")?];
         let a: [gst::Element; 5] = [
             audio.clone().upcast(),
             make("audioconvert")?,
@@ -419,6 +422,7 @@ impl CameraPipeline {
         Ok(Self {
             pipeline,
             video,
+            encoder,
             audio,
             layout,
             pattern,
@@ -464,6 +468,21 @@ impl CameraPipeline {
             .push_buffer(ab)
             .map_err(|e| format!("camera audio push: {e:?}"))?;
         Ok(())
+    }
+
+    /// Asks the encoder for a key frame (with its SPS and PPS) on the next frame pushed (C14: a
+    /// resume, `camera::Schedule::take_key_due`). An upstream force-key-unit event on the encoder's
+    /// source pad, which GstVideoEncoder answers on the next frame it codes.
+    pub fn force_key_unit(&self) -> Result<(), String> {
+        let event = gst_video::UpstreamForceKeyUnitEvent::builder()
+            .all_headers(true)
+            .build();
+        let pad = self.encoder.static_pad("src").ok_or("x264enc has no src pad")?;
+        if pad.send_event(event) {
+            Ok(())
+        } else {
+            Err("x264enc refused the key-unit request".into())
+        }
     }
 
     /// The build's error or EOS, if the bus has one (never blocks).
