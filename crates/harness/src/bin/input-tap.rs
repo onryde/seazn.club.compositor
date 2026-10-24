@@ -15,7 +15,9 @@
 //!
 //! The SRT passphrase is `HARNESS_SRT_PASSPHRASE` (environment, never argv). A build that fails or
 //! ends (no stream on the path yet, a kicked reader) is logged and rebuilt a second later, forever:
-//! the stack's teardown stops it.
+//! the stack's teardown stops it. A build that decodes nothing for 5 s says so once per silence,
+//! with the H264 buffers that reached the parser, so a run tells "no H264 arrived" from "H264
+//! arrived and did not decode" (`harness::silence`; the PR #59 review's m-4).
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{LineWriter, Write};
@@ -29,7 +31,8 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
-use harness::clock::now_us;
+use harness::clock::{now_ms, now_us};
+use harness::silence::Silence;
 use harness::strip::{self, Plane};
 use serde_json::json;
 
@@ -53,6 +56,8 @@ const APPSINK_MAX_BUFFERS: u32 = 2;
 const REBUILD_AFTER: Duration = Duration::from_secs(1);
 /// How often the tap prints its count (frames).
 const DEFAULT_REPORT_EVERY: u64 = 300;
+/// How long a build decodes nothing before it says so.
+const SILENT_AFTER_MS: i64 = 5_000;
 
 fn args() -> Result<BTreeMap<&'static str, String>, String> {
     let mut out = BTreeMap::new();
@@ -186,12 +191,36 @@ fn run_build(t: &Target, tap: &Arc<Tap>, build: u64) -> Result<String, String> {
             }
         });
     }
+    // What reached the parser (H264 from tsdemux), and when the last frame came out of the decoder.
+    let h264 = Arc::new(AtomicU64::new(0));
+    let decoded = Arc::new(AtomicU64::new(0));
+    let silence = Arc::new(Mutex::new(Silence::new(SILENT_AFTER_MS, now_ms())));
+    {
+        let h264 = Arc::clone(&h264);
+        vparse
+            .static_pad("sink")
+            .ok_or("h264parse has no sink pad")?
+            .add_probe(
+                gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+                move |_, info| {
+                    let n = match &info.data {
+                        Some(gst::PadProbeData::BufferList(l)) => l.len() as u64,
+                        _ => 1,
+                    };
+                    h264.fetch_add(n, Ordering::Relaxed);
+                    gst::PadProbeReturn::Ok
+                },
+            );
+    }
     let tap2 = Arc::clone(tap);
+    let (decoded2, silence2) = (Arc::clone(&decoded), Arc::clone(&silence));
     vsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |s| {
                 let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                 let at = now_us();
+                decoded2.fetch_add(1, Ordering::Relaxed);
+                locked(&silence2).frame(at / 1_000);
                 let counter = counter_of(&sample);
                 let pts_ns = sample.buffer().and_then(|b| b.pts()).map(|p| p.nseconds());
                 let line = json!({"build": build, "counter": counter, "pts_ns": pts_ns, "wall_us": at});
@@ -214,6 +243,15 @@ fn run_build(t: &Target, tap: &Arc<Tap>, build: u64) -> Result<String, String> {
             gst::ClockTime::from_seconds(1),
             &[gst::MessageType::Eos, gst::MessageType::Error],
         ) else {
+            if let Some(ms) = locked(&silence).check(now_ms()) {
+                println!(
+                    "input-tap: build {build}: no video frame in {} s ({} H264 buffers reached the \
+                     parser, {} frames decoded in this build)",
+                    ms / 1_000,
+                    h264.load(Ordering::Relaxed),
+                    decoded.load(Ordering::Relaxed)
+                );
+            }
             continue;
         };
         break match msg.view() {
@@ -226,7 +264,11 @@ fn run_build(t: &Target, tap: &Arc<Tap>, build: u64) -> Result<String, String> {
         };
     };
     let _ = pipeline.set_state(gst::State::Null);
-    Ok(why)
+    Ok(format!(
+        "{why} ({} H264 buffers reached the parser, {} frames decoded)",
+        h264.load(Ordering::Relaxed),
+        decoded.load(Ordering::Relaxed)
+    ))
 }
 
 fn run() -> Result<(), (u8, String)> {
