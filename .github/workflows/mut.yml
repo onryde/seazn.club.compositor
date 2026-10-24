@@ -1,0 +1,22 @@
+# DO NOT MERGE (PR #60 fix round 1): the four wiring mutants that need GStreamer.
+name: mut-camera-replaced
+on:
+  pull_request: {}
+permissions: { contents: read }
+jobs:
+  mutants:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run: { shell: bash }
+    steps:
+      - uses: actions/checkout@v4
+      - name: GStreamer
+        timeout-minutes: 10
+        env: { APT_INSTALL_RESULT: "${{ runner.temp }}/apt-install-result" }
+        run: scripts/apt-install.sh libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.91.0" }
+      - uses: Swatinem/rust-cache@v2
+      - name: Baseline, then each mutant (the seam test must fail by its own assertion)
+        run: python3 -I scripts/mut_camera_replaced.py 2>&1 | tee mut.log
