@@ -583,6 +583,57 @@ and F-024.
   - Anything else is NOT OWED, including case 4, 5 or 12's `output_lost` (84's prediction says
     green) and case 15's `fast` leg (70 (a)'s says green).
 
+## Amendment 2026-10-24, wave-gate-3 follow-ups (branch `feat/c14-wg3-followups`)
+
+The coordinator's dispatch after #52 merged at 7beb540; rebased onto main b606d1b (#59: its two
+Owed 81 controls are NOT_CHAOS; #60). Harness only; no product crate changed. Decision log "C14
+wave-gate-3 follow-ups".
+
+- **Owed 87, the coordinator's decision (medium, recommendation applied).** In cases 5 and 12 the
+  sink's socket errors first, so a swap with `reason=error` inside the spec's output budget is a
+  PASS. `stall_swap_judged($cut; $paths)` (lib.jq) judges either path from the driver's
+  `sink swap reason=<r> gen=<g>` line (logfacts.rs `sink_swap_reasons`), and the reason lines must
+  pair the swap lines by generation:
+  - `stall`: no error from the outgoing sink, and the swap within output_stall_after_ms +
+    output_progress_poll_ms of the last growth;
+  - `error`: the outgoing sink's error line first, the stall seen within the same bound, and the
+    swap from output_backoff_base_ms (the domain's back-off from Connected) to
+    budget_output_reconnect_ms (§6, 5 s) after the error.
+  Cases 5 and 12 accept both; Owed 87 leaves chaos.json, so a `stall_swap` red reads NOT OWED.
+- **Case 17, `dest-stall-rule` (new; 14 checks; one run).** A destination that keeps the socket
+  open and takes bytes, too slowly for a frame to leave inside the stall threshold, and never
+  errors. `harness/compose.stall-rule.yml` caps the compositor's tcp_wmem at `4096 8192 8192` in its
+  network namespace, added by run-case.sh's new `CASE_COMPOSE` knob (the name is validated, and the
+  file must exist); the shipped image is unchanged. The rate is frame_bits × 1000 / (STALL_DRAIN_X
+  × output_stall_after_ms), with STALL_DRAIN_X 2: 13 333 bit/s for the fixture. Its `stall_swap`
+  accepts `stall` only. Anti-vacuity: `buffer_capped` (the namespace's tcp_wmem reads what compose
+  set; at least one RTMP socket, each one's buffer read and at most the cap) and `trickled` (netem
+  sent 2 packets or more, at a non-zero rate under one frame per threshold). The physics is read from
+  rtmp2 1.24.2's source and was not run here (no Docker); the first CI run is its witness, and a red
+  with `reason=error` means the cap did not hold the socket open (the measures
+  `sink_errors_in_fault` and `sockets_in_fault` say how).
+- **m-4.** The checker reads an outage's `counter_before` and `counter_after` from the frames on its
+  own sides, bounded by its neighbours' splits (`checker.rs`, `Split`). A re-dated burst no longer
+  counts the cut's camera gap a second time.
+- **I-5.** Cases 4, 5 and 12 each run two legs. With no variant the drive clears half a connect
+  timeout after a swap in the fault, so the last sink is still connecting; with `backoff` it clears
+  just after that sink's own `output gen=<g> error:` line. `clear_out_in_phase` (run-case.sh) waits
+  on the compositor's docker-stamped log, and `clear_phase_driven` reds unless the log's phase and
+  the drive's mark both name the variant. The manifest has 23 entries, 35 legs.
+- **m-r2.** Each NOT_CHAOS control must drive exactly smoke's `case_drive` and `CASE_LIVE_S`
+  (case_verdicts.rs `every_not_chaos_control_drives_what_smoke_drives`).
+- **Case 6** keeps the 0.75 share; Owed 86 goes to the owner.
+- **Mutants.**
+  - Every new guard was mutated once on the host: 31 mutants, all KILLED by their named test.
+  - The checker's split order survived the first pass. Its test gained outages out of wall order, where a wall sort slices backwards.
+  - Two clauses that nothing could kill were dropped as equivalent:
+    - lib.jq's `error_to_swap_ms != null`: jq sorts null below every number.
+    - `buffer_capped`'s three-value count: an unset cap reds on the buffer bound.
+  - CI's m9 (`output_stall_after_ms` 20 000) now runs on case 17. Its target is `stall_swap`, with `buffer_capped` and `trickled` as controls. It must end KILLED (branch `mut/c14-wg3`).
+- **Expected reds of the next run:** cef-leaks ×2 (Owed 82, NOT RUNNABLE) and cpu-starved (86).
+  Anything else is NOT OWED. A red in case 17 is a finding about its physics, recorded in Owed 87's
+  row, never re-tagged.
+
 ## Files
 
 - Create: `harness/cases/{camera-stop,camera-flap,reader-kicked,dest-disconnect,dest-stall,cpu-starved,score-down,cef-killed,process-killed,input-impaired}.{sh,jq}` (amended 2026-10-24: all 16, cases 11–16 too, as `.sh` files with `require` lines over `harness/cases/lib.jq`; and `harness/chaos.json`, the legs)
