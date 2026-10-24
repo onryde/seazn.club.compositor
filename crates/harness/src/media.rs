@@ -378,7 +378,7 @@ impl fmt::Debug for CameraPipeline {
 
 /// The TS packets per buffer the camera's mux pushes by default: 7, 1 316 bytes, an SRT payload
 /// (C10). `mpegtsmux` holds packets until it has that many (gstbasetsmux.c,
-/// `gst_base_ts_mux_push_packets`, 1.24.2), so a frame's last packets wait for later ones (F-028).
+/// `gst_base_ts_mux_push_packets`, 1.24.2), so a frame's last packets wait for later ones (F-029).
 pub const TS_ALIGNMENT: u32 = 7;
 
 /// How a camera build is made (`CameraPipeline::start_with`; Owed 81's controls).
