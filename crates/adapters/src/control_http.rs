@@ -126,6 +126,17 @@ fn measurement(x: Option<f64>) -> Option<Value> {
     x.filter(|v| v.is_finite() && *v >= 0.0).map(Value::from)
 }
 
+/// The beat's `fps` (the programme's real output rate over the beat window, Owed 86), a measurement
+/// sent to one decimal: the coordinator's decision, 2026-10-24, on the PR #69 review's I2, so R1's
+/// chip reads "30 fps" or "11.5 fps", never the raw f64. Rounded after the measurement check, so a
+/// negative rate is omitted, never sent as -0.0.
+fn fps_wire(x: Option<f64>) -> Option<Value> {
+    x.filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| (v * 10.0).round() / 10.0)
+        .filter(|v| v.is_finite())
+        .map(Value::from)
+}
+
 /// The heartbeat body (contract `#/$defs/heartbeat`, sent bare). Every key whose value is unknown is
 /// absent, never `null` and never 0: `scoreStale` and `phaseChannel` until the page reports them,
 /// each `Measured` field until an adapter measures it, and `exitReason` / `exitDetail` on every beat
@@ -161,7 +172,7 @@ fn wire(report: &HealthReport, measured: &Measured, scrubber: &Scrubber) -> Valu
     if let Some(c) = report.phase_channel {
         put("phaseChannel", phase_channel_wire(c).into());
     }
-    if let Some(v) = measurement(measured.fps) {
+    if let Some(v) = fps_wire(measured.fps) {
         put("fps", v);
     }
     if let Some(n) = measured.bitrate_kbps {

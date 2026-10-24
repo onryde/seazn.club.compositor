@@ -539,6 +539,53 @@ fn a_non_finite_or_negative_measurement_is_omitted() {
     assert_eq!(checked, 15);
 }
 
+/// Owed 86: the beat's `fps` is the real output rate, a measured f64, and is sent to one decimal (the
+/// coordinator's decision, 2026-10-24, on the PR #69 review's I2: R1's chip printed the raw value,
+/// "29.998128116638 fps"). Each case's wire value is that rule worked by hand; the other measured
+/// floats are untouched, a negative rate stays omitted, and each beat validates.
+#[test]
+fn the_beats_fps_is_sent_to_one_decimal() {
+    let v = schema_def("heartbeat");
+    let mut checked = 0;
+    for (fps, want, text) in [
+        (29.998128116638, 30.0, "30.0"),
+        (30.0, 30.0, "30.0"),
+        (11.46, 11.5, "11.5"),
+        (11.5, 11.5, "11.5"),
+        (24.66, 24.7, "24.7"),
+        (28.449, 28.4, "28.4"),
+        (59.774, 59.8, "59.8"),
+        (4.591, 4.6, "4.6"),
+        (0.04, 0.0, "0.0"),
+        (0.0, 0.0, "0.0"),
+    ] {
+        let m = Measured {
+            fps: Some(fps),
+            encoder_speed: Some(0.987_654),
+            cpu_pct: Some(41.234_5),
+            ..full_measured()
+        };
+        let wire = heartbeat_wire(&report(), &m);
+        assert_eq!(wire["fps"].as_f64(), Some(want), "{fps}: {wire}");
+        assert_eq!(wire["fps"].to_string(), text, "{fps}: {wire}");
+        assert_eq!(wire["encoderSpeed"].as_f64(), Some(0.987_654), "{wire}");
+        assert_eq!(wire["cpuPct"].as_f64(), Some(41.234_5), "{wire}");
+        assert!(violations(&v, &wire).is_empty(), "{wire}");
+        checked += 1;
+    }
+    let m = Measured {
+        fps: Some(-0.04),
+        ..full_measured()
+    };
+    assert!(
+        heartbeat_wire(&report(), &m).get("fps").is_none(),
+        "a negative rate is omitted"
+    );
+    checked += 1;
+    eprintln!("fps values checked on the wire: {checked}");
+    assert_eq!(checked, 11);
+}
+
 /// Every integer the contract declares has `maximum` 2^53 − 1 (a JSON number web reads exactly). A
 /// counter past it is written at it, never above (a 400 would lose every later beat).
 #[test]
