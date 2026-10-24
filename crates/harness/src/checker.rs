@@ -1809,7 +1809,7 @@ mod tests {
             })
             .collect();
         let r = analyze(&i, &settings());
-        let sides: Vec<(i64, Option<u32>, Option<u32>, Option<i64>)> = r
+        let sides: Vec<_> = r
             .output_outages
             .iter()
             .map(|o| (o.from_wall_ms, o.counter_before, o.counter_after, o.lost_ms))
@@ -1820,7 +1820,40 @@ mod tests {
             "{:?}",
             r.output_outages
         );
-        eprintln!("outages checked: 2 recordings, 4 outages");
+        // An outage whose wall order is not its recording order: C's camera runs 10 200 ms past B's
+        // last strip (274 -> 580), so the outage under B's overlap starts before the cut's outage
+        // does. Each still reads the frames on its own sides, in recording order (A | B | C): the
+        // split, not the wall time, orders the sides.
+        let mut i = inputs(vec![
+            seg(0, strip_frames(1, 30)),
+            seg(10_000, strip_frames(240, 35)),
+            seg(10_300, strip_frames(580, 30)),
+        ]);
+        i.emit = (1..=700u32)
+            .map(|c| Emit {
+                counter: c,
+                wall_ms: (f64::from(c) * camera).round() as i64,
+            })
+            .collect();
+        let r = analyze(&i, &settings());
+        let mut sides: Vec<(i64, Option<u32>, Option<u32>)> = r
+            .output_outages
+            .iter()
+            .map(|o| (o.to_wall_ms, o.counter_before, o.counter_after))
+            .collect();
+        assert!(
+            r.output_outages.len() == 2 && r.output_outages[0].to_wall_ms == 10_300,
+            "the overlap's outage first by wall: {:?}",
+            r.output_outages
+        );
+        sides.sort_unstable();
+        assert_eq!(
+            sides,
+            vec![(10_000, Some(30), Some(240)), (10_300, Some(274), Some(580))],
+            "{:?}",
+            r.output_outages
+        );
+        eprintln!("outages checked: 3 recordings, 6 outages");
     }
 
     #[test]
