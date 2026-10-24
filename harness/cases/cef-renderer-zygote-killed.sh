@@ -24,5 +24,6 @@ case_verdict() {
     | (starts_after(mark_at("kill")) | first | .at_ms) as $start
     | mark_at("kill") != null and ($p | length) >= 1 and $start != null and ($p | all(.start_ms > $start))' \
     '{cef_processes: ([mark("tree_after")[] | .value | select(.type != null)] | length),
-      oldest_ms_after_start: ([mark("tree_after")[] | .value | select(.type != null) | .start_ms] | min) - (starts_after(mark_at("kill")) | first | .at_ms)}'
+      oldest_ms_after_start: (([mark("tree_after")[] | .value | select(.type != null) | .start_ms] | min)
+        - (starts_after(mark_at("kill")) | first | .at_ms))}'
 }
