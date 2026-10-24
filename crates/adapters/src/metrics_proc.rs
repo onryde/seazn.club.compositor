@@ -149,6 +149,10 @@ fn clock_ticks_per_second() -> f64 {
 impl Metrics for ProcMetrics {
     fn sample(&mut self) -> Measured {
         let now = Instant::now();
+        // The counters first, read at `now`, so the `/proc` walk's time (one read per process of
+        // the tree) never lands inside the rate's window (the PR #69 review's m3).
+        let s = self.stats.snapshot();
+        let fps = self.rate.sample(now, s.encoded_frames);
         let tree = process_tree(self.root);
         let ticks: BTreeMap<ProcKey, u64> = tree
             .iter()
@@ -176,9 +180,8 @@ impl Metrics for ProcMetrics {
                 .sum()
         });
         self.last = (!ticks.is_empty()).then_some((now, ticks));
-        let s = self.stats.snapshot();
         Measured {
-            fps: self.rate.sample(now, s.encoded_frames),
+            fps,
             bitrate_kbps: s.bitrate_kbps,
             egress_bytes: s.egress_bytes,
             measured_latency_ms: None,

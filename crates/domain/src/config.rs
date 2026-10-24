@@ -141,12 +141,15 @@ pub const OUTPUT_FPS_FLOOR_SHARE: f64 = ENCODER_SPEED_REALTIME_MIN;
 /// keeps its state, so a rate hovering at the floor does not raise and clear on alternate beats.
 pub const OUTPUT_FPS_RECOVERED_SHARE: f64 = 29.5 / 30.0;
 
-/// Owed 86: the shortest window the output's frame rate is read over. `ENCODER_SPEED_REALTIME_MIN`'s
-/// own reasoning: a 1 s window at 30 fps holds 29–31 frames, which the floor passes; a shorter one
-/// can fail a healthy clock by its one-frame quantum (a 0.5 s window holds 14–16, and 14/15 = 0.933).
-/// A beat that comes sooner than this after the last reading (the hold's first beat, the drain's)
-/// repeats that reading.
-pub const OUTPUT_FPS_MIN_WINDOW_MS: Ms = 1_000;
+/// Owed 86: the shortest window the output's frame rate is read over, half the spec's 5 s beat
+/// (§5.3). The first build took `ENCODER_SPEED_REALTIME_MIN`'s 1 s, which covers only the one-frame
+/// quantum; the PR #69 review's m4 found an off-grid beat (the hold's first, the drain's) can close a
+/// window just after the driver's catch-up burst, 2 to 3 frames short, which over 1 s reads 27 to 28,
+/// under the floor on a healthy clock. Over 2.5 s, 3 frames short reads 28.8 (a 4th reads 28.4). A
+/// beat sooner than this after the last reading repeats that reading and leaves the window open, so
+/// the next beat reads over all of it (with a shorter bootstrap `heartbeatIntervalMs`, every other
+/// beat reads).
+pub const OUTPUT_FPS_MIN_WINDOW_MS: Ms = 2_500;
 
 /// F-004 (owner-observed; docs/_INDEX.md decision log, the C00 owner session): YouTube kept the
 /// organiser's broadcast through 5 s and 15 s output gaps and started a new broadcast after a 30 s
@@ -515,30 +518,47 @@ mod tests {
         }
     }
 
-    // Owed 86: the shortest window is the one where the one-frame quantum cannot cross the floor. A
-    // healthy clock read over the minimum window, one frame short, still passes the floor; read over
-    // half of it, one frame short, it fails, so the minimum is what keeps a healthy clock unalarmed.
-    // And over the spec's 5 s beat (§5.3), one frame short, a healthy clock reaches the recovery
+    // Owed 86 (the PR #69 review's m4): the minimum window is half the spec's beat (§5.3). An off-grid
+    // beat (the hold's first, the drain's) can close a window just after the driver's catch-up burst,
+    // the review's 2 to 3 frames short. Over the minimum, a healthy clock 3 frames short still passes
+    // the floor; over the first build's 1 s window it fails it, so the minimum is what keeps a healthy
+    // clock unalarmed. And over the 5 s beat, one frame short, a healthy clock reaches the recovery
     // level, so the alarm clears on a healthy beat.
     #[test]
     fn the_minimum_window_keeps_a_healthy_clock_above_the_floor() {
+        // The PR #69 review's m4: a catch-up burst leaves an off-grid window 2 to 3 frames short.
+        const CATCH_UP_SHORT: f64 = 3.0;
+        const FIRST_BUILD_WINDOW_MS: f64 = 1_000.0;
         let t = Thresholds::default();
+        let beat = t.heartbeat_interval_ms as f64;
+        assert_eq!(beat, 5_000.0, "spec §5.3");
+        assert_eq!(
+            OUTPUT_FPS_MIN_WINDOW_MS * 2,
+            t.heartbeat_interval_ms,
+            "half the spec's beat"
+        );
+        let mut checked = 0;
         for p in BOTH_MODES {
             let fps = f64::from(p.fps);
-            let short_by_one = |window_ms: f64| (fps * window_ms / 1_000.0 - 1.0) * 1_000.0 / window_ms;
+            let short_by =
+                |frames: f64, window_ms: f64| (fps * window_ms / 1_000.0 - frames) * 1_000.0 / window_ms;
             let min = OUTPUT_FPS_MIN_WINDOW_MS as f64;
-            assert!(short_by_one(min) >= p.fps_floor(), "{p:?}: {}", short_by_one(min));
             assert!(
-                short_by_one(min / 2.0) < p.fps_floor(),
-                "{p:?}: half the window passes too, so the minimum is not the bound"
+                short_by(CATCH_UP_SHORT, min) >= p.fps_floor(),
+                "{p:?}: {} over the minimum",
+                short_by(CATCH_UP_SHORT, min)
             );
-            let beat = t.heartbeat_interval_ms as f64;
-            assert_eq!(beat, 5_000.0, "spec §5.3");
             assert!(
-                short_by_one(beat) >= p.fps_recovered(),
+                short_by(CATCH_UP_SHORT, FIRST_BUILD_WINDOW_MS) < p.fps_floor(),
+                "{p:?}: 1 s passes too, so the minimum is not the bound"
+            );
+            assert!(
+                short_by(1.0, beat) >= p.fps_recovered(),
                 "{p:?}: a healthy beat {} never clears",
-                short_by_one(beat)
+                short_by(1.0, beat)
             );
+            checked += 1;
         }
+        assert_eq!(checked, BOTH_MODES.len());
     }
 }

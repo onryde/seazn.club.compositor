@@ -400,10 +400,12 @@ mod tests {
 
     // A beat sooner than the minimum window after the last reading (the hold's first beat, the
     // drain's) repeats that reading and keeps the window open, so the next beat reads over all of it.
-    // A beat at the same instant is the same. At the minimum itself the window closes.
+    // A beat at the same instant is the same. At the minimum itself the window closes: 24 fps from
+    // the reading at 5 000 ms, which no window opened by a short beat would read.
     #[test]
     fn a_beat_inside_the_minimum_window_repeats_the_last_reading() {
         let min = OUTPUT_FPS_MIN_WINDOW_MS;
+        assert!(min <= 5_000, "the spec's 5 s beat closes a window");
         let t0 = Instant::now();
         let mut r = BeatRate::default();
         assert_eq!(r.sample(t0, Some(0)), None);
@@ -422,10 +424,15 @@ mod tests {
             Some(30.0),
             "1 ms short"
         );
-        // The window that stayed open: 60 frames from 5 000 ms to 7 000 ms.
-        assert_eq!(r.sample(t0 + ms(7_000), Some(210)), Some(30.0));
-        // Exactly the minimum: 24 frames in 1 s.
-        assert_eq!(r.sample(t0 + ms(7_000 + min), Some(234)), Some(24.0));
+        // Exactly the minimum after the reading at 5 000 ms: 24 frames a second over it.
+        let frames = 24 * min / 1_000;
+        let got = r
+            .sample(t0 + ms(5_000 + min), Some(150 + frames))
+            .expect("the window closes at the minimum");
+        assert!(
+            (got - 24.0).abs() < 1e-9,
+            "{frames} frames over {min} ms read {got}"
+        );
     }
 
     // A total lower than the window's start is no newer count (the counter only grows, so only a

@@ -862,9 +862,9 @@ fn the_real_output_fps_reaches_the_log_and_the_beat_through_the_real_sampler() {
     let (mut before, fps, mut after) = next_beat(&mut d);
     assert_eq!(fps, None, "the first total opens the window");
     assert!(lines().is_empty(), "no reading, no line: {:?}", lines());
-    // A window well past the 1 s minimum; a starved one (a sixth of the floor's frames), then a
+    // A window past the minimum (OUTPUT_FPS_MIN_WINDOW_MS); a starved one (a sixth of the floor's frames), then a
     // healthy one (twice the profile's rate, so a slow runner's longer window still clears).
-    let wait = Duration::from_millis(1_300);
+    let wait = Duration::from_millis(domain::config::OUTPUT_FPS_MIN_WINDOW_MS + 300);
     let floor_frames = (profile.fps_floor() * wait.as_secs_f64()) as u64;
     let healthy_frames = 2 * u64::from(profile.fps) * wait.as_millis() as u64 / 1_000;
     let mut want = Vec::new();
