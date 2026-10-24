@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# soak.yml's shape, and its log converter (C15). The workflow only runs on Fly, so what can go wrong
+# without a Machine is checked here:
+#
+# - the token gate: an empty FLY_API_TOKEN_SOAK warns and skips (the gate step run for real, both
+#   ways), and the image and soak jobs run only when it said enabled;
+# - the numbers: the plan step run for real (30 and 185 minutes, and a run too short to drive), the
+#   soak job's timeout read from it;
+# - the Machines: --restart no and --rm on the one `flyctl machine run`, restart "no" in both
+#   configs, the compositor on the production guest;
+# - the job token: made from 32 random bytes, masked before any other use, and only ever in a
+#   variable assignment or a builtin's redirect (never argv), never in a run line's `-e`/`--env`;
+#   FLY_API_TOKEN on steps only;
+# - the cleanup: an `if: always()` step destroys every Machine and fails unless the list reads empty;
+# - inputs reach scripts through env only (no `${{ inputs.* }}` inside a run);
+# - flylog.py on a recorded-shape stream: pretty-printed entries, a replayed buffer, another
+#   Machine's entry, a cut-off tail, stamps with 9 and 3 fraction digits and an offset, a bare and a
+#   reasoned `overlay hidden`; and an empty stream refused.
+#
+#   harness/soak/test-workflow.sh                 (SOAK_YML=<file> checks another copy: mutants)
+#
+# Needs ruby (YAML), jq and python3. Prints `checked: N` and fails on zero.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
+YML="${SOAK_YML:-$ROOT/.github/workflows/soak.yml}"
+W="$(mktemp -d)"
+trap 'rm -rf "$W"' EXIT
+
+ruby -ryaml -rjson -e 'puts JSON.generate(YAML.load(File.read(ARGV[0])))' "$YML" >"$W/wf.json"
+
+checked=0
+failures=0
+pass() { checked=$((checked + 1)); echo "PASS $1"; }
+fail() { checked=$((checked + 1)); failures=$((failures + 1)); echo "FAIL $1${2:+: $2}"; }
+# check <name> <jq filter over the workflow, true to pass>
+check() {
+  if jq -e "$2" "$W/wf.json" >/dev/null 2>&1; then pass "$1"; else fail "$1"; fi
+}
+step() { jq -r --arg j "$1" --arg n "$2" '.jobs[$j].steps[] | select(.name == $n) | .run' "$W/wf.json"; }
+
+# --- trigger and gate -------------------------------------------------------------------------
+check "dispatch only, inputs sha, minutes 185, page test" \
+  '(.on // .["true"]) as $on | ($on | keys) == ["workflow_dispatch"]
+   and $on.workflow_dispatch.inputs.minutes.default == "185" and ($on.workflow_dispatch.inputs | has("sha"))
+   and $on.workflow_dispatch.inputs.page.default == "test"'
+check "the gate reads FLY_API_TOKEN_SOAK" \
+  '.jobs.plan.steps[] | select(.id == "gate") | .env.FLY_API_TOKEN == "${{ secrets.FLY_API_TOKEN_SOAK }}"'
+check "images and soak run only when the gate said enabled" \
+  '[.jobs.images, .jobs.soak] | all(.if == "needs.plan.outputs.enabled == '"'"'true'"'"'")'
+gate="$(jq -r '.jobs.plan.steps[] | select(.id == "gate") | .run' "$W/wf.json")"
+: >"$W/gate.out"
+out="$(FLY_API_TOKEN="" GITHUB_OUTPUT="$W/gate.out" bash -eo pipefail -c "$gate" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] && grep -qx 'enabled=false' "$W/gate.out" && grep -qF '::warning::FLY_API_TOKEN_SOAK unset — soak skipped' <<<"$out"; then
+  pass "an empty token: the warning, enabled=false, exit 0"
+else
+  fail "an empty token" "exit $rc, output '$out', outputs '$(cat "$W/gate.out")'"
+fi
+: >"$W/gate.out"
+out="$(FLY_API_TOKEN="x" GITHUB_OUTPUT="$W/gate.out" bash -eo pipefail -c "$gate" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] && grep -qx 'enabled=true' "$W/gate.out" && ! grep -q warning <<<"$out"; then
+  pass "a token: enabled=true, no warning"
+else
+  fail "a token" "exit $rc, outputs '$(cat "$W/gate.out")'"
+fi
+
+# --- the numbers --------------------------------------------------------------------------------
+numbers="$(step plan "The run's numbers")"
+margin="$(jq -r .deadline_margin_min "$HERE/soak.json")"
+after="$(jq -r .timeout_after_min "$HERE/soak.json")"
+[ "$after" = 40 ] && pass "soak.json's timeout_after_min is the brief's 40" || fail "timeout_after_min" "$after, the brief says 40"
+for m in 30 185; do
+  : >"$W/plan.out"
+  (cd "$ROOT" && MINUTES="$m" GITHUB_OUTPUT="$W/plan.out" bash -eo pipefail -c "$numbers" >/dev/null 2>&1) && rc=0 || rc=$?
+  if [ "$rc" -eq 0 ] && grep -qx "timeout=$((m + 40))" "$W/plan.out" && grep -qx "drive=$((m - margin))" "$W/plan.out"; then
+    pass "$m minutes: timeout $((m + 40)), drive $((m - margin))"
+  else
+    fail "$m minutes" "exit $rc, outputs '$(tr '\n' ' ' <"$W/plan.out")'"
+  fi
+done
+short=$(($(jq -r .min_drive_min "$HERE/soak.json") + margin - 1))
+(cd "$ROOT" && MINUTES="$short" GITHUB_OUTPUT="$W/plan.out" bash -eo pipefail -c "$numbers" >/dev/null 2>&1) && rc=0 || rc=$?
+[ "$rc" -ne 0 ] && pass "$short minutes (a drive under min_drive_min) is refused" || fail "$short minutes" "accepted"
+check "the soak job's timeout is the plan's" \
+  '.jobs.soak["timeout-minutes"] == "${{ fromJSON(needs.plan.outputs.timeout) }}" and .jobs.plan.outputs.timeout == "${{ steps.plan.outputs.timeout }}"'
+
+# --- the Machines ---------------------------------------------------------------------------------
+launch="$(step soak "Launch the Machines")"
+runs="$(grep -c 'flyctl machine run ' <<<"$launch" || true)"
+if [ "$runs" -eq 1 ] && grep -E 'flyctl machine run .*--restart no .*--rm ' <<<"$launch" >/dev/null; then
+  pass "one flyctl machine run, with --restart no and --rm"
+else
+  fail "flyctl machine run" "$runs run line(s), or no --restart no / --rm"
+fi
+if [ "$(grep -c 'restart: {policy: "no"}' <<<"$launch" || true)" -eq 2 ] && [ "$(grep -c 'auto_destroy: true' <<<"$launch" || true)" -eq 2 ]; then
+  pass "both configs: restart no, auto_destroy"
+else
+  fail "both configs" "restart no / auto_destroy not in both"
+fi
+grep -qF 'guest: {cpu_kind: "performance", cpus: 4, memory_mb: 8192}' <<<"$launch" \
+  && grep -qF 'COMPOSITOR_DRIVERS: "live"' <<<"$launch" \
+  && pass "the compositor: performance, 4 CPUs, 8192 MB, live drivers" || fail "the compositor's guest"
+
+# --- the job token ---------------------------------------------------------------------------------
+grep -qE 'job_token="\$\(od -An -N32 -tx1 /dev/urandom' <<<"$launch" && pass "the job token: 32 random bytes" || fail "the job token's source"
+first_use="$(grep -n 'job_token' <<<"$launch" | grep -v 'job_token="$(od' | grep -v '=~ \^\[0-9a-f\]{64}' | head -n 1 | cut -d: -f2-)"
+if grep -qF 'echo "::add-mask::$job_token"' <<<"$first_use"; then
+  pass "masked before any other use"
+else
+  fail "masked before any other use" "first use: $first_use"
+fi
+bad="$(grep 'job_token' <<<"$launch" | grep -v -E \
+  'job_token="\$\(od |\[\[ "\$job_token" =~|echo "::add-mask::\$job_token"$|printf .%s\\n. "\$job_token" > "\$RUNNER_TEMP/job-token"$|JOB_TOKEN="\$job_token" ' || true)"
+[ -z "$bad" ] && pass "the job token only in an assignment, the mask, or a builtin's redirect" || fail "the job token in argv" "$bad"
+bad="$(jq -r '[.jobs[].steps[]? | .run // empty] | join("\n")' "$W/wf.json" | grep -E -- '(-e|--env) +"?JOB_TOKEN|--arg[a-z]* +[a-z_]+ +"?\$job_token' || true)"
+[ -z "$bad" ] && pass "no JOB_TOKEN on a command line" || fail "JOB_TOKEN on a command line" "$bad"
+check "FLY_API_TOKEN on steps only" \
+  '((.env // {}) | has("FLY_API_TOKEN") | not) and ([.jobs[] | (.env // {}) | has("FLY_API_TOKEN")] | any | not)'
+
+# --- the cleanup ----------------------------------------------------------------------------------
+check "the destroy step is if: always(), in the job that launches" \
+  '[.jobs.soak.steps[] | select(.id == "destroy")] | length == 1 and .[0].if == "always()"'
+check "it comes after the launch" \
+  '[.jobs.soak.steps | to_entries[] | select(.value.id == "launch" or .value.id == "destroy") | .value.id] == ["launch", "destroy"]'
+destroy="$(jq -r '.jobs.soak.steps[] | select(.id == "destroy") | .run' "$W/wf.json")"
+grep -qF 'flyctl machine destroy "$id" -a "$FLY_APP" --force' <<<"$destroy" \
+  && grep -qF 'flyctl machine list -a "$FLY_APP"' <<<"$destroy" \
+  && grep -qF '::error::Machines left in' <<<"$destroy" \
+  && pass "it destroys every Machine, lists the app, and fails unless empty" || fail "the destroy step's body"
+
+# --- inputs through env only, the verdict -------------------------------------------------------------
+bad="$(jq -r '[.jobs[].steps[]? | .run // empty] | join("\n")' "$W/wf.json" | grep -n -F '${{ inputs.' || true)"
+[ -z "$bad" ] && pass "no input expanded inside a run" || fail "an input inside a run" "$bad"
+verdict="$(step soak "Verdict")"
+grep -qF 'harness/soak/verdict.sh --dir "$OUT" --page "$PAGE" --drive-min "$DRIVE_MIN"' <<<"$verdict" \
+  && grep -qF '::warning::PLUMBING ONLY' <<<"$verdict" && pass "the verdict: verdict.sh, PLUMBING ONLY on the test page" || fail "the verdict step"
+
+# --- flylog.py ---------------------------------------------------------------------------------
+cat >"$W/stream.json" <<'EOF'
+{
+  "instance": "m1",
+  "level": "info",
+  "message": "ts=2026-10-24T12:00:00.100Z level=info msg=boot",
+  "region": "lhr",
+  "timestamp": "2026-10-24T12:00:00.123456789Z"
+}
+{"instance":"m2","message":"another Machine","timestamp":"2026-10-24T12:00:00.200Z"}
+{"instance":"m1","message":"ts=2026-10-24T12:00:01.000Z level=warn msg=overlay hidden reason=hang gen=1","timestamp":"2026-10-24T12:00:01.001Z"}
+not json at all
+{"instance":"m1","message":"ts=2026-10-24T12:00:02.000Z level=warn msg=overlay hidden","timestamp":"2026-10-24T13:00:02+01:00"}
+{"instance":"m1","message":"no stamp here","timestamp":""}
+{
+  "instance": "m1",
+  "level": "info",
+  "message": "ts=2026-10-24T12:00:00.100Z level=info msg=boot",
+  "region": "lhr",
+  "timestamp": "2026-10-24T12:00:00.123456789Z"
+}
+{"instance":"m1","message":"ts=2026-10-24T12:00:03.000Z msg=overlay hiddenness is not a hide","timestamp":"2026-10-24T12:00:03Z"}
+{"instance":"m1","message":"cut off","timest
+EOF
+cat >"$W/want.log" <<'EOF'
+2026-10-24T12:00:00.123456Z ts=2026-10-24T12:00:00.100Z level=info msg=boot
+2026-10-24T12:00:01.001000Z ts=2026-10-24T12:00:01.000Z level=warn msg=overlay hidden reason=hang gen=1
+2026-10-24T12:00:02.000000Z ts=2026-10-24T12:00:02.000Z level=warn msg=overlay hidden
+no stamp here
+2026-10-24T12:00:03.000000Z ts=2026-10-24T12:00:03.000Z msg=overlay hiddenness is not a hide
+EOF
+rc=0
+python3 -I "$HERE/flylog.py" --in "$W/stream.json" --machine m1 --log "$W/got.log" --scan "$W/scan.json" >/dev/null || rc=$?
+if [ "$rc" -eq 0 ] && diff -u "$W/want.log" "$W/got.log" >"$W/log.diff"; then
+  pass "flylog: the lines, in order, once each, of this Machine, stamps in UTC"
+else
+  fail "flylog's lines" "exit $rc; $(head -c 600 "$W/log.diff")"
+fi
+jq -e '. == {lines: 5, overlay_hidden_lines: 2, other_machine_entries: 1}' "$W/scan.json" >/dev/null 2>&1 \
+  && pass "flylog: logscan counts both hides, the bare one too, and not the lookalike" || fail "flylog's logscan" "$(cat "$W/scan.json" 2>/dev/null)"
+printf '{"instance":"m2","message":"x","timestamp":"2026-10-24T12:00:00Z"}\n' >"$W/empty.json"
+rc=0
+python3 -I "$HERE/flylog.py" --in "$W/empty.json" --machine m1 --log "$W/e.log" --scan "$W/e.json" >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 1 ] && pass "flylog: a stream with nothing of the Machine is refused" || fail "flylog's empty stream" "exit $rc"
+
+echo "checked: $checked, $failures failures"
+[ "$checked" -gt 0 ] && [ "$failures" -eq 0 ]

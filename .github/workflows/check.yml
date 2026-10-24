@@ -37,6 +37,16 @@ jobs:
       # synthetic runs.
       - name: Cadence stage tool
         run: python3 -I scripts/cadence_stages.py --self-test
+      # harness/soak (C15): the verdict on its fixtures (the green, the brief's reds and each guard's
+      # red, by reason), the driver under stubs on a 1-minute schedule and its error path (about
+      # 2 minutes), and soak.yml's shape (the token gate, --restart no, the masked job token, the
+      # always() destroy) with its log converter.
+      - name: Soak verdict, driver and workflow
+        if: ${{ !cancelled() }}
+        run: |
+          harness/soak/test-verdict.sh
+          HARNESS_BASH=/bin/bash harness/soak/test-driver.sh
+          harness/soak/test-workflow.sh
       # scripts/apt-install.sh: the retries, the per-attempt bounds and the mirror fallback, under fakes.
       - name: apt install script
         run: python3 -I scripts/apt_install_test.py

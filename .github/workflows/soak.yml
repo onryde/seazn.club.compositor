@@ -1,26 +1,35 @@
 name: soak
-# The dispatch anchor for C15's soak (docs/tasks/C15-soak.md). GitHub dispatches a workflow_dispatch
-# workflow only when a file of that name exists on the default branch. Until C15's PR lands, this
-# file is that anchor: the soak itself lives on its branch and is dispatched from there, with the
-# branch's own soak.yml.
+# The soak (C15, docs/tasks/C15-soak.md, spec 9.5): the real relay image on the production guest, as
+# one Fly Machine, against a harness Machine beside it (harness/soak: MediaMTX, fake-camera,
+# fake-control, the checker and driver.sh), in the dedicated app seazn-relay-soak. This job drives
+# it end to end: it builds and pushes both images, launches the Machines, watches the driver, hands
+# the harness the compositor's log (the platform's log stream), fetches the outputs, judges them
+# (harness/soak/verdict.sh), and destroys every Machine in the app whatever happened.
 #
-#   gh workflow run soak.yml --ref feat/c15-soak -f minutes=30 -f sha=<40-hex head>
+#   gh workflow run soak.yml --ref <branch> -f minutes=30 -f sha=<40-hex head>     (the rehearsal)
+#   gh workflow run soak.yml --ref <branch> -f sha=<40-hex head>                   (the 3 h soak)
 #
-# Dispatched on main, it launches nothing. It skips with a warning when FLY_API_TOKEN_SOAK is
-# empty, and otherwise fails, saying where the soak is. C15's PR replaces this file.
+# page=test (the default) serves C14's overlay-test.html: PLUMBING ONLY. Checks (a) to (d) read
+# pending, and the run's best verdict is "plumbing", never "pass". page=real points the compositor
+# at the production page in the repo secret SOAK_OVERLAY_URL (a page URL can carry a signed token,
+# so it is never an input: inputs are printed in the run).
+#
+# Credentials: FLY_API_TOKEN_SOAK (the job skips with a warning when it is empty), set on the steps
+# that call flyctl only. The job token is random per run, masked, kept in mode-600 files under
+# RUNNER_TEMP and handed to the Machines in their config file (never argv, never a log).
 on:
   workflow_dispatch:
     inputs:
       sha:
-        description: "The commit to soak, 40 hex. Empty: the ref's head."
+        description: "The commit to soak, 40 hex (both images are built from it). Empty: the ref's head."
         required: false
         default: ""
       minutes:
-        description: "The Machines' run in minutes (185 = the 3 h soak)"
+        description: "The Machines' run in minutes; the drive is this less soak.json's deadline_margin_min (185 = the 3 h soak)"
         required: true
         default: "185"
       page:
-        description: "test (PLUMBING ONLY) or real"
+        description: "test (C14's overlay-test.html, PLUMBING ONLY) or real (the page in the SOAK_OVERLAY_URL secret)"
         type: choice
         options: [test, real]
         default: test
@@ -30,20 +39,460 @@ on:
         options: [ball, snow, noise]
         default: ball
 permissions: { contents: read }
+concurrency:
+  # One soak at a time: the cleanup destroys every Machine in the app, and a second run's would be
+  # among them.
+  group: soak
+  cancel-in-progress: false
 defaults:
   run: { shell: bash }
+env:
+  FLY_APP: seazn-relay-soak
+  FLY_REGION: lhr
+  # flyctl, pinned with its release checksum (superfly/flyctl v0.4.116, flyctl_0.4.116_checksums.txt).
+  FLYCTL_VERSION: 0.4.116
+  FLYCTL_SHA256: ab929c80ef0c1f7d623052267885632f47b4c5dd7c0ed8383d16f42472abe7b9
 jobs:
   plan:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+      sha: ${{ steps.args.outputs.sha }}
+      drive: ${{ steps.plan.outputs.drive }}
+      timeout: ${{ steps.plan.outputs.timeout }}
     steps:
       - name: The Fly token
+        id: gate
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
         run: |
           if [ -z "$FLY_API_TOKEN" ]; then
             echo "::warning::FLY_API_TOKEN_SOAK unset — soak skipped"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "::error::the soak is not on this ref yet: dispatch it from C15's branch (gh workflow run soak.yml --ref feat/c15-soak ...)"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+      - name: The inputs
+        id: args
+        env:
+          SHA_IN: ${{ inputs.sha }}
+          MINUTES: ${{ inputs.minutes }}
+          PAGE: ${{ inputs.page }}
+        run: |
+          sha="${SHA_IN:-$GITHUB_SHA}"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::sha must be 40 hex: '$sha'"; exit 1; }
+          [[ "$MINUTES" =~ ^[0-9]{1,3}$ ]] || { echo "::error::minutes must be whole minutes: '$MINUTES'"; exit 1; }
+          case "$PAGE" in test | real) ;; *) echo "::error::page must be test or real"; exit 1 ;; esac
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.args.outputs.sha }}
+      # GitHub's expressions have no arithmetic: the numbers are made here, from soak.json.
+      - name: The run's numbers
+        id: plan
+        env:
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          s=harness/soak/soak.json
+          drive=$((10#$MINUTES - $(jq -r .deadline_margin_min "$s")))
+          timeout=$((10#$MINUTES + $(jq -r .timeout_after_min "$s")))
+          min=$(jq -r .min_drive_min "$s")
+          [ "$drive" -ge "$min" ] || { echo "::error::a $MINUTES-minute run drives $drive min, under soak.json's min_drive_min ($min)"; exit 1; }
+          # GitHub's job cap is 360 minutes.
+          [ "$timeout" -le 350 ] || { echo "::error::minutes + $(jq -r .timeout_after_min "$s") is $timeout, over the job cap"; exit 1; }
+          echo "drive=$drive" >> "$GITHUB_OUTPUT"
+          echo "timeout=$timeout" >> "$GITHUB_OUTPUT"
+          echo "run $MINUTES min: drive $drive min, job timeout $timeout min"
+
+  images:
+    needs: plan
+    if: needs.plan.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04
+    # A cold CEF build (image.yml's); the soak job's own timeout covers the Machines only.
+    timeout-minutes: 90
+    # Read only: this workflow writes no GHCR cache and no GitHub cache. It pushes to Fly's registry.
+    permissions: { contents: read, packages: read }
+    env:
+      SHA: ${{ needs.plan.outputs.sha }}
+      RELAY_IMAGE: seazn-relay:${{ needs.plan.outputs.sha }}
+      HARNESS_IMAGE: seazn-harness:${{ needs.plan.outputs.sha }}
+      SOAK_IMAGE: seazn-relay-soak:${{ needs.plan.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      # CEF's build tree and three images do not fit the runner's free disk otherwise (image.yml).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: gstcefsrc pin (F-001)
+        id: pin
+        run: |
+          commit=$(tr -d '[:space:]' < docker/GSTCEF_COMMIT)
+          if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::docker/GSTCEF_COMMIT is not a 40-hex commit: '$commit'"
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      # chaos.yml's cache choice, unchanged: GHCR alone when warm, GitHub's cache as well when cold,
+      # a failed login read as cold, and nothing written.
+      - name: Log in to GHCR (read)
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build cache (GHCR, read)
+        id: cache
+        run: |
+          ref=
+          if key=$(scripts/cef-cache-key.sh 2> "$RUNNER_TEMP/cache-key.err"); then
+            ref="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/seazn-relay-cache:cef-$key"
+          else
+            echo "::warning::no cache key, so a cold cache: $(head -c 300 "$RUNNER_TEMP/cache-key.err")"
+          fi
+          if [ -n "$ref" ] \
+            && docker buildx imagetools inspect --raw "$ref" > "$RUNNER_TEMP/cache.json" 2> "$RUNNER_TEMP/cache-probe.err" \
+            && scripts/cef-cache-holds-tree.sh "$RUNNER_TEMP/cache.json" 2>> "$RUNNER_TEMP/cache-probe.err"; then
+            state=warm; from="type=registry,ref=$ref"
+          else
+            state=cold
+            [ -z "$ref" ] || echo "cache probe: $(head -c 300 "$RUNNER_TEMP/cache-probe.err" 2> /dev/null)"
+            from="type=gha"
+            [ -z "$ref" ] || from="type=registry,ref=$ref"$'\n'"type=gha"
+          fi
+          echo "build cache: ${ref:-none} ($state)"
+          { echo "from<<EOF"; echo "$from"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+      - name: Build the relay image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          tags: ${{ env.RELAY_IMAGE }}
+          load: true
+          push: false
+          cache-from: ${{ steps.cache.outputs.from }}
+      - name: Build the harness image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: harness
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          tags: ${{ env.HARNESS_IMAGE }}
+          load: true
+          push: false
+          cache-from: ${{ steps.cache.outputs.from }}
+      # On the docker driver, which sees the harness image just loaded (setup-buildx's builder does
+      # not).
+      - name: Build the soak harness image
+        run: |
+          docker buildx build --builder default --load -f harness/soak/Dockerfile \
+            --build-arg HARNESS_IMAGE="$HARNESS_IMAGE" -t "$SOAK_IMAGE" .
+      - name: flyctl
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/flyctl.tgz" \
+            "https://github.com/superfly/flyctl/releases/download/v${FLYCTL_VERSION}/flyctl_${FLYCTL_VERSION}_Linux_x86_64.tar.gz"
+          echo "$FLYCTL_SHA256  $RUNNER_TEMP/flyctl.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin" && tar -xzf "$RUNNER_TEMP/flyctl.tgz" -C "$RUNNER_TEMP/bin" flyctl
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Push to Fly's registry
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
+        run: |
+          flyctl auth docker
+          for pair in "relay $RELAY_IMAGE" "harness $SOAK_IMAGE"; do
+            set -- $pair
+            ref="registry.fly.io/$FLY_APP:$1-$SHA"
+            docker tag "$2" "$ref"
+            docker push -q "$ref"
+            echo "pushed $ref"
+          done
+
+  soak:
+    needs: [plan, images]
+    if: needs.plan.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04
+    # minutes + soak.json's timeout_after_min (40), made by the plan job.
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.timeout) }}
+    env:
+      SHA: ${{ needs.plan.outputs.sha }}
+      MINUTES: ${{ inputs.minutes }}
+      DRIVE_MIN: ${{ needs.plan.outputs.drive }}
+      PAGE: ${{ inputs.page }}
+      CAMERA: ${{ inputs.camera }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - name: flyctl
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/flyctl.tgz" \
+            "https://github.com/superfly/flyctl/releases/download/v${FLYCTL_VERSION}/flyctl_${FLYCTL_VERSION}_Linux_x86_64.tar.gz"
+          echo "$FLYCTL_SHA256  $RUNNER_TEMP/flyctl.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin" && tar -xzf "$RUNNER_TEMP/flyctl.tgz" -C "$RUNNER_TEMP/bin" flyctl
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          mkdir -p "$RUNNER_TEMP/out"
+
+      # The harness Machine first (the compositor fetches its session from it), then the compositor
+      # Machine, on the production guest. Both: --restart no (a restart would invalidate criterion 3;
+      # the soak reports it rather than hides it) and --rm (a Machine that exits is destroyed).
+      - name: Launch the Machines
+        id: launch
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
+          SOAK_OVERLAY_URL: ${{ secrets.SOAK_OVERLAY_URL }}
+        run: |
+          umask 077
+          s=harness/soak/soak.json
+          job_token="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+          [[ "$job_token" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::no job token"; exit 1; }
+          echo "::add-mask::$job_token"
+          printf '%s\n' "$job_token" > "$RUNNER_TEMP/job-token"
+          session_id="$(python3 -I -c 'import uuid; print(uuid.uuid4())')"
+          now_ms=$(($(date +%s%3N)))
+          deadline_ms=$((now_ms + 10#$MINUTES * 60000))
+          hard_stop_ms=$((now_ms + (10#$MINUTES + $(jq -r .hard_stop_after_min "$s")) * 60000))
+          deadline_at="$(python3 -I -c 'import datetime,sys; print(datetime.datetime.fromtimestamp(int(sys.argv[1]) / 1000, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")' "$deadline_ms")"
+          overlay=""
+          if [ "$PAGE" = real ]; then
+            [ -n "$SOAK_OVERLAY_URL" ] || { echo "::error::page real needs the SOAK_OVERLAY_URL secret"; exit 1; }
+            overlay="$SOAK_OVERLAY_URL"
+          fi
+          name_h="soak-harness-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          name_c="soak-compositor-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          echo "name_h=$name_h" >> "$GITHUB_OUTPUT"
+          echo "name_c=$name_c" >> "$GITHUB_OUTPUT"
+          echo "deadline_ms=$deadline_ms" >> "$GITHUB_OUTPUT"
+          # The configs: every value through jq's environment, never its argv.
+          JOB_TOKEN="$job_token" SESSION_ID="$session_id" DRIVE="$DRIVE_MIN" DEADLINE="$deadline_ms" \
+            HARD_STOP="$hard_stop_ms" OVERLAY="$overlay" jq -n '{
+              auto_destroy: true, restart: {policy: "no"},
+              guest: {cpu_kind: "performance", cpus: 4, memory_mb: 8192},
+              env: ({SESSION_ID: $ENV.SESSION_ID, JOB_TOKEN: $ENV.JOB_TOKEN, SOAK_DRIVE_MIN: $ENV.DRIVE,
+                     SOAK_DEADLINE_MS: $ENV.DEADLINE, SOAK_HARD_STOP_MS: $ENV.HARD_STOP,
+                     SOAK_PAGE: $ENV.PAGE, CAMERA_PATTERN: $ENV.CAMERA}
+                    + (if $ENV.OVERLAY == "" then {} else {SOAK_OVERLAY_URL: $ENV.OVERLAY} end))}' \
+            > "$RUNNER_TEMP/harness.machine.json"
+          machine_id() {
+            flyctl machine list -a "$FLY_APP" --json | jq -r --arg n "$1" '(. // [])[] | select(.name == $n) | .id' | head -n 1
+          }
+          run_machine() {
+            # $1 name, $2 image, $3 config; the output stays in a file (it echoes the config's image only,
+            # but nothing of a Machine's config is printed here).
+            local rc=0
+            flyctl machine run "$2" -a "$FLY_APP" -r "$FLY_REGION" --name "$1" --restart no --rm --detach \
+              --vm-cpu-kind performance --vm-cpus 4 --vm-memory 8192 --machine-config "$3" "${@:4}" \
+              > "$RUNNER_TEMP/$1.run.log" 2>&1 || rc=$?
+            rm -f "$3"
+            grep -a -E "Machine ID|State|Image:" "$RUNNER_TEMP/$1.run.log" || true
+            return "$rc"
+          }
+          # The harness: room for 3 h of recordings.
+          run_machine "$name_h" "registry.fly.io/$FLY_APP:harness-$SHA" "$RUNNER_TEMP/harness.machine.json" --rootfs-size 30 \
+            || { tail -n 20 "$RUNNER_TEMP/$name_h.run.log"; exit 1; }
+          hid="$(machine_id "$name_h")"
+          [[ "$hid" =~ ^[0-9a-z]+$ ]] || { echo "::error::no harness Machine id"; exit 1; }
+          echo "harness=$hid" >> "$GITHUB_OUTPUT"
+          echo "harness Machine $hid"
+          flyctl machine wait "$hid" -a "$FLY_APP" --state started --wait-timeout 5m
+          # fake-control up (the driver's phase leaves booting once /healthz answers) and the private
+          # name resolving, before the compositor's first fetch.
+          host="$hid.vm.$FLY_APP.internal"
+          up=0
+          for _ in $(seq 1 60); do
+            st="$(flyctl machine exec "$hid" 'cat /out/status.json' -a "$FLY_APP" --timeout 20 2>/dev/null | grep -a '^{' | tail -n 1 || true)"
+            ph="$(jq -r '.phase // ""' <<<"$st" 2>/dev/null || true)"
+            if [ "$ph" = waiting_live ] && flyctl machine exec "$hid" "getent ahosts $host" -a "$FLY_APP" --timeout 20 > /dev/null 2>&1; then
+              up=1; break
+            fi
+            case "$ph" in error | done) break ;; esac
+            sleep 5
+          done
+          [ "$up" -eq 1 ] || { echo "::error::the harness never came up (phase '${ph:-none}')"; exit 1; }
+          JOB_TOKEN="$job_token" SESSION_ID="$session_id" APP_URL="http://$host:7000" DEADLINE_AT="$deadline_at" jq -n '{
+              auto_destroy: true, restart: {policy: "no"},
+              guest: {cpu_kind: "performance", cpus: 4, memory_mb: 8192},
+              stop_config: {signal: "SIGTERM", timeout: "20s"},
+              env: {COMPOSITOR_DRIVERS: "live", SESSION_ID: $ENV.SESSION_ID, JOB_TOKEN: $ENV.JOB_TOKEN,
+                    APP_URL: $ENV.APP_URL, RELAY_DEADLINE_AT: $ENV.DEADLINE_AT}}' \
+            > "$RUNNER_TEMP/compositor.machine.json"
+          run_machine "$name_c" "registry.fly.io/$FLY_APP:relay-$SHA" "$RUNNER_TEMP/compositor.machine.json" \
+            || { tail -n 20 "$RUNNER_TEMP/$name_c.run.log"; exit 1; }
+          cid="$(machine_id "$name_c")"
+          [[ "$cid" =~ ^[0-9a-z]+$ ]] || { echo "::error::no compositor Machine id"; exit 1; }
+          echo "compositor=$cid" >> "$GITHUB_OUTPUT"
+          echo "compositor Machine $cid, deadline $deadline_at"
+          # The compositor's log, for the whole run, restarted if the stream drops (flylog.py drops the
+          # replayed entries). In its own process group, so one kill stops the loop and its flyctl.
+          setsid bash -c 'while :; do flyctl logs -a "$0" --machine "$1" --json; sleep 2; done' "$FLY_APP" "$cid" \
+            >> "$RUNNER_TEMP/compositor.stream.json" 2>> "$RUNNER_TEMP/compositor.stream.err" < /dev/null &
+          echo "$!" > "$RUNNER_TEMP/stream.pid"
+
+      # The driver's status every minute, until /out/done or minutes + soak.json's poll_after_min. Once
+      # the driver has ended the run (phase awaiting_log) and the compositor Machine has exited, its log
+      # goes to the harness (/out/compositor.log, then /out/log-ready) for the checker.
+      - name: Watch the run
+        id: watch
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
+          HID: ${{ steps.launch.outputs.harness }}
+          CID: ${{ steps.launch.outputs.compositor }}
+        run: |
+          OUT="$RUNNER_TEMP/out"
+          deadline=$(($(date +%s) + (10#$MINUTES + $(jq -r .poll_after_min harness/soak/soak.json)) * 60))
+          send_log() {
+            local state=""
+            for _ in $(seq 1 36); do
+              state="$(flyctl machine list -a "$FLY_APP" --json | jq -r --arg id "$CID" '(. // [])[] | select(.id == $id) | .state' || true)"
+              case "$state" in "" | stopped | destroying | destroyed | failed) break ;; esac
+              sleep 5
+            done
+            echo "compositor Machine: ${state:-gone}; the stream's lag, then the log"
+            sleep 30
+            kill -- "-$(cat "$RUNNER_TEMP/stream.pid")" 2> /dev/null || true
+            python3 -I harness/soak/flylog.py --in "$RUNNER_TEMP/compositor.stream.json" --machine "$CID" \
+              --log "$OUT/compositor.log" --scan "$OUT/logscan.json" || echo "::warning::the compositor's log stream was empty"
+            [ -f "$OUT/compositor.log" ] || : > "$OUT/compositor.log"
+            flyctl ssh sftp put "$OUT/compositor.log" /out/compositor.log -a "$FLY_APP" --machine "$HID" -q \
+              || echo "::warning::the log upload failed: the checker runs without it"
+            flyctl machine exec "$HID" 'touch /out/log-ready' -a "$FLY_APP" --timeout 20 > /dev/null || true
+          }
+          sent=0
+          phase=""
+          while :; do
+            st="$(flyctl machine exec "$HID" 'cat /out/status.json' -a "$FLY_APP" --timeout 30 2>/dev/null | grep -a '^{' | tail -n 1 || true)"
+            phase="$(jq -r '.phase // ""' <<<"$st" 2>/dev/null || true)"
+            echo "$(date -u +%H:%M:%S) $(jq -c '{phase, note, actions, beats}' <<<"$st" 2>/dev/null || echo 'no status')"
+            if [ "$sent" -eq 0 ] && [ "$phase" = awaiting_log ]; then send_log; sent=1; continue; fi
+            case "$phase" in done | error) break ;; esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::no /out/done within minutes + poll_after_min (phase '${phase:-none}')"
+              break
+            fi
+            sleep 60
+          done
+          echo "phase=$phase" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch the outputs
+        if: always() && steps.launch.outputs.harness != ''
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
+          HID: ${{ steps.launch.outputs.harness }}
+        run: |
+          OUT="$RUNNER_TEMP/out"
+          got=0
+          for f in report.json actions.jsonl heartbeats.jsonl control-state.json timeline.json done status.json \
+                   secrets.json ended driver.log checker.log fake-control.log fake-camera.log mediamtx.log; do
+            rm -f "$OUT/$f.part"
+            if flyctl ssh sftp get "/out/$f" "$OUT/$f.part" -a "$FLY_APP" --machine "$HID" -q > /dev/null 2>> "$OUT/fetch.err"; then
+              mv "$OUT/$f.part" "$OUT/$f"; got=$((got + 1))
+            else
+              rm -f "$OUT/$f.part"; echo "not fetched: $f"
+            fi
+          done
+          flyctl machine exec "$HID" 'ls -l /out/rec/live/dest' -a "$FLY_APP" --timeout 30 > "$OUT/recordings.txt" 2>&1 || true
+          echo "fetched $got files; $(grep -c 'mp4' "$OUT/recordings.txt" || true) recording segments"
+          [ "$got" -gt 0 ] || { echo "::error::nothing fetched from the harness"; head -c 600 "$OUT/fetch.err"; exit 1; }
+
+      # The job token in nothing this job keeps, and the harness's own scan of its /out (secrets.json:
+      # the job token and the SRT passphrase) clean. A harness that failed before its scan (phase
+      # error) has none; its files are uploaded on this job's scan alone, for the diagnosis. Any leak
+      # uploads nothing.
+      - name: Leak gate
+        id: leaks
+        if: always() && steps.launch.outputs.harness != ''
+        run: |
+          OUT="$RUNNER_TEMP/out"
+          n="$(find "$OUT" -type f | wc -l)"
+          [ -s "$RUNNER_TEMP/job-token" ] || { echo "::error::no job token file to scan with"; exit 1; }
+          [ "$n" -gt 0 ] || { echo "::error::nothing to scan"; exit 1; }
+          if grep -rqF -f "$RUNNER_TEMP/job-token" "$OUT" "$RUNNER_TEMP/compositor.stream.json" 2> /dev/null; then
+            echo "::error::the job token is in a fetched file: nothing is uploaded"
+            exit 1
+          fi
+          if [ -f "$OUT/secrets.json" ]; then
+            jq -e '.scanned > 0 and .leaks == 0' "$OUT/secrets.json" > /dev/null \
+              || { echo "::error::the harness's scan is not clean ($(jq -c . "$OUT/secrets.json")): nothing is uploaded"; exit 1; }
+            echo "secrets: $n files here clean; the harness's scan $(jq -c . "$OUT/secrets.json")"
+          else
+            echo "::warning::no harness scan (the driver stopped before it): $n files uploaded on this job's scan"
+          fi
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verdict
+        id: verdict
+        if: always() && steps.leaks.outputs.ok == 'true'
+        run: |
+          OUT="$RUNNER_TEMP/out"
+          rc=0
+          harness/soak/verdict.sh --dir "$OUT" --page "$PAGE" --drive-min "$DRIVE_MIN" > "$OUT/verdict.json" 2> "$OUT/verdict.txt" || rc=$?
+          cat "$OUT/verdict.txt"
+          { echo '```'; cat "$OUT/verdict.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          status="$(jq -r '.status // "none"' "$OUT/verdict.json" 2> /dev/null || echo none)"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          if [ "$status" = plumbing ]; then
+            echo "::warning::PLUMBING ONLY: page=test, so checks (a) to (d) are pending; this run is not a soak pass"
+          fi
+          # The driver's own word too: it finished, the checker ran clean, nothing leaked.
+          if ! jq -e '.ok and .checker_exit == 0 and .ended_early == null' "$OUT/done" > /dev/null 2>&1; then
+            echo "::error::the driver did not finish clean: $(jq -c . "$OUT/done" 2> /dev/null || echo 'no done')"
+            [ "$rc" -ne 0 ] || rc=1
+          fi
+          exit "$rc"
+
+      - name: Upload the outputs
+        if: always() && steps.leaks.outputs.ok == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 30
+
+      # A cancelled, failed or timed-out run must never leave Machines billing: every Machine in the
+      # app is destroyed (the concurrency group keeps it to this run's), and the list must then read
+      # empty, or this step fails.
+      - name: Destroy every Machine
+        id: destroy
+        if: always()
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
+        run: |
+          [ ! -f "$RUNNER_TEMP/stream.pid" ] || kill -- "-$(cat "$RUNNER_TEMP/stream.pid")" 2> /dev/null || true
+          rm -f "$RUNNER_TEMP/job-token" "$RUNNER_TEMP"/*.machine.json
+          if ! command -v flyctl > /dev/null; then
+            curl -fsSL -o "$RUNNER_TEMP/flyctl.tgz" \
+              "https://github.com/superfly/flyctl/releases/download/v${FLYCTL_VERSION}/flyctl_${FLYCTL_VERSION}_Linux_x86_64.tar.gz"
+            echo "$FLYCTL_SHA256  $RUNNER_TEMP/flyctl.tgz" | sha256sum -c -
+            mkdir -p "$RUNNER_TEMP/bin" && tar -xzf "$RUNNER_TEMP/flyctl.tgz" -C "$RUNNER_TEMP/bin" flyctl
+            export PATH="$RUNNER_TEMP/bin:$PATH"
+          fi
+          left=""
+          for attempt in 1 2 3 4 5 6; do
+            ids="$(flyctl machine list -a "$FLY_APP" --json | jq -r '(. // [])[] | select(.state != "destroyed") | .id')" || { sleep 10; continue; }
+            left="$(printf '%s' "$ids" | grep -c . || true)"
+            [ "$left" -eq 0 ] && break
+            for id in $ids; do flyctl machine destroy "$id" -a "$FLY_APP" --force || true; done
+            sleep 10
+          done
+          flyctl machine list -a "$FLY_APP"
+          if [ "$left" != 0 ]; then
+            echo "::error::Machines left in $FLY_APP after the cleanup (${left:-the list never answered}): destroy them by hand"
+            exit 1
+          fi
+          echo "$FLY_APP: no Machines"
+
+      - name: Fail on a red verdict
+        if: always() && steps.verdict.outcome != 'success'
+        env:
+          STATUS: ${{ steps.verdict.outputs.status }}
+          WATCH: ${{ steps.watch.outcome }}
+        run: |
+          echo "::error::the soak is red (verdict: ${STATUS:-not judged}, watch: ${WATCH:-not run})"
           exit 1
