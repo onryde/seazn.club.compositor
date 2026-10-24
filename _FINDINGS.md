@@ -1938,3 +1938,56 @@ types.
   each reconnect, each reconnect's recording starts up to 2 s late, which counts against C14's
   `output_reconnect` (Owed 84) and not against `output_lost`.
 - Not checked: MediaMTX's source, or what it receives on the wire, and Cloudflare's start.
+
+## F-026: a GPU crash loop between two child polls, leg by leg (C14 case 15, chaos runs 40051995233, 40056474269 and 40056388445, 2026-10-24)
+
+C14's F-024 (PR #52, branch `feat/c14-chaos`) records the fast loop's headline. This finding is its
+9 `fast` legs (3 per run) read one by one from `marks.jsonl` and `compositor.log`, for Owed 70 (a).
+
+- **Measured:**
+  - Every leg killed 5 distinct GPU pids, 69 to 88 ms apart; the 5 kills took 288 to 337 ms.
+  - The `cef health` lines counted `gpu_process_deaths=1` in 7 legs and 2 in 2 (run 40056474269's
+    r2 and r3). No leg restarted.
+  - 40 to 97 pids were born between two kills.
+  - From the deciding `cef health` line to `exit code=75`: 4.5 to 14.1 ms, median 7.5 ms, in 21 legs
+    of the same 3 runs (amended 2026-10-24, the PR #55 review's m6; it first read one leg, 7 ms). The
+    21 are every `cef-gpu-deaths` `threshold` leg (r1 to r3) and every `cef-gpu-zygote-killed` and
+    `cef-renderer-zygote-killed` leg, in each run. The exception is run 40051995233's 6 zygote legs,
+    which logged no zygote verdict, so no restart.
+  - From the deciding line to the container's `die`: 127 to 177 ms (one `threshold` leg and 3
+    `cef-gpu-zygote-killed` legs); the rest is the entrypoint's teardown.
+- **How the loop kills** (`harness/in-container.sh`, `cmd_gpu_loop`, read, not run): each pass walks
+  `/proc` and forks one subshell per pid to read its `--type`, then kills the first GPU pid of the
+  walk. A pass that finds no new GPU pid sleeps 50 ms. So a killed GPU process was born before the
+  walk that listed it began, and died after that walk ended: it lived at least one whole walk.
+- **Estimate (not measured):** 69 to 88 ms between kills fits one pass that found no relaunch, the
+  50 ms sleep, and one pass that found it, so a walk took about (69 − 50) / 2 to (88 − 50) / 2 ms,
+  10 to 19 ms. The walk was not timed.
+- **The estimate bounds existence, not visibility** (amended 2026-10-24, the PR #55 review's m5). A
+  zygote's fresh fork reads `--type=zygote` until it is renamed `--type=gpu-process`. The watch
+  lists it as a GPU process only from the rename, and the harness's walk reads the newest pids near
+  its end. So the window in which the watch can see a relaunch may be much shorter than one walk.
+  The margin is measured only by a kill-to-count latency per death: the image test prints one (PR
+  #55), and C14's re-run owes one per leg.
+- **So:** the 1 s child poll sees at most one relaunch of such a loop, and a pid-gap or start-time
+  inference cannot recover the rest (most of the gap is likely the walk's own forks, one per pid it
+  reads, and start times tick at 10 ms). The adapter now runs a GPU watch between polls (decision
+  log "Owed 70 (a): the GPU watch"). It misses a GPU process visible for less than its listing pace:
+  ~~one 5 ms step while a listing costs under 250 us, and 20 times a listing's cost above that (review
+  round 1)~~ in a wait, 5 to 8 ms: 20 times a listing's CPU, held to `GPU_LISTING_GAP_MAX_MS`, which is
+  this estimate's 10 ms less a 2 ms margin (amended 2026-10-24, review round 2).
+- **A listing's cost in the image** (amended 2026-10-24, the PR #55 confirm pass's I3; image runs
+  40080601547 and 40085739077): with up to 6 CEF children, a listing took 1 439 us on the clock over 21
+  processes in a debug build. Over 11 processes it took 370 us of the thread's CPU on the release profile,
+  the compositor's (431 us on the clock), and 632 us on the debug one. ~~At 5% of a core the release cost
+  paces a wait's listings 7.4 ms apart.~~ (amended 2026-10-24, the PR #55 confirm pass 2's r2-m1 and
+  r2-m3; image run 40087528576.) The next run's release listings averaged 483 and 516 us of CPU, over
+  the 400 us at which the 8 ms ceiling binds, so 9 of its 11 release waits held a gap there, and its held
+  death waits listed at 5.2 to 7.5% of a core. The coordinator accepted 7.5% of one of 4 cores for at
+  most 2 s per death. The worst case: a listing whose CPU reaches the ceiling is followed as it returns,
+  so a wait lists back to back, one full core for each death's 2 s wait.
+- **The exit's margin** (m6): the fast variant's `gpu_death_split` and `last_kill_not_before_die`
+  checks go red when the browser outlives the deciding line long enough for further relaunches to be
+  killed. That is one kill interval (69 to 88 ms) less the count and the driver's tick (about 5 to
+  40 ms, the review's figure): about 30 to 80 ms from the decision to `exit code=75`. The 21 legs
+  measured 14.1 ms at the most.

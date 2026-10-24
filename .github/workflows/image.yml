@@ -181,12 +181,28 @@ jobs:
             Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp > /dev/null 2>&1 &
             for _ in $(seq 1 50); do [ -e /tmp/.X11-unix/X99 ] && break; sleep 0.1; done
             cargo test --locked -p adapters --features cef --test graphics -- --test-threads=1 --show-output
+            debug=$?
+            # Owed 70 (a), the PR #55 review I3: the GPU crash loops again on the release profile, the
+            # one the compositor is built with (docker/Dockerfile: `cargo build --release`), for the
+            # listing cost the production GPU watch paces on (the debug run above prints its own).
+            cargo test --release --locked -p adapters --features cef --test graphics a_gpu_crash_loop \
+              -- --test-threads=1 --show-output
+            release=$?
+            exit $(( debug || release ))
           ' 2>&1 | tee graphics.log
           passed=$({ grep -Eo 'test result: ok\. [0-9]+ passed' graphics.log || true; } | awk '{s+=$4} END {print s+0}')
           echo "graphics tests passed: $passed"
           # The brief's floor (C11's eight, amended 2026-10-15); the file holds more.
           if [ "$passed" -lt 8 ]; then
             echo "::error::$passed graphics tests passed, fewer than 8"
+            exit 1
+          fi
+          # A filter that matched nothing passes 0 tests: the release run must have run both loops
+          # (the 40 ms one and the shortest relaunch life's).
+          loops=$({ grep -E '^gpu loop child \(release build\)' graphics.log || true; } | wc -l)
+          echo "GPU crash loops on the release profile: $loops"
+          if [ "$loops" -lt 2 ]; then
+            echo "::error::$loops GPU crash loops ran on the release profile, fewer than 2"
             exit 1
           fi
       - name: Smoke budget
