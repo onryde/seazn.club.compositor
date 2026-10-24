@@ -2765,6 +2765,92 @@ fn a_not_runnable_case_is_reported_never_faked_and_never_a_pass() {
     assert!(cases >= 17, "the sweep read too few case files ({cases})");
 }
 
+/// The PR #71 review's m1: only case 16 runs on the relay-test-hooks image. Every leg's environment
+/// carries `RELAY_TEST_HOOKS_IMAGE` (chaos.yml), and no other verdict reads which image ran, so a
+/// case that copied case 16's pattern, or a shared helper that picked the variable up, would run
+/// the hooks binary while its verdict claims the relay image. Every file under harness/ (out/
+/// aside) is swept: the image's variable, the hold key and case 16's overlay are named only by
+/// case 16's files, and only cef-leaks.sh assigns `RELAY_IMAGE` outside a comment.
+#[test]
+fn only_case_16_names_the_test_hooks_image_or_reassigns_the_relay_image() {
+    fn walk(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                if p.file_name().is_some_and(|n| n != "out") {
+                    walk(&p, files);
+                }
+            } else {
+                files.push(p);
+            }
+        }
+    }
+    // An assignment outside a comment: `RELAY_IMAGE=`, `export RELAY_IMAGE=` or `${RELAY_IMAGE:=`,
+    // never a longer name that ends in it.
+    fn assigns_relay_image(text: &str) -> bool {
+        text.lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .any(|l| {
+                ["RELAY_IMAGE=", "RELAY_IMAGE:="].iter().any(|n| {
+                    l.match_indices(n).any(|(i, _)| {
+                        !l[..i]
+                            .chars()
+                            .next_back()
+                            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                    })
+                })
+            })
+    }
+    let harness = repo().join("harness");
+    let mut files = Vec::new();
+    walk(&harness, &mut files);
+    let case16 = ["cases/cef-leaks.sh", "compose.cef-leaks.yml"];
+    let names = [
+        ("RELAY_TEST_HOOKS_IMAGE", &case16[..]),
+        ("COMPOSITOR_TEST_HOLD_TEARDOWNS", &case16[..]),
+        ("compose.cef-leaks.yml", &case16[..1]),
+    ];
+    let (mut swept, mut naming, mut assigning) = (0, Vec::new(), Vec::new());
+    for p in &files {
+        let rel = p.strip_prefix(&harness).unwrap().to_string_lossy().into_owned();
+        let text = String::from_utf8_lossy(&std::fs::read(p).unwrap()).into_owned();
+        swept += 1;
+        for (name, allowed) in names {
+            if text.contains(name) {
+                assert!(
+                    allowed.contains(&rel.as_str()),
+                    "harness/{rel} names {name}: only case 16 runs on the relay-test-hooks image"
+                );
+                naming.push(format!("{rel}: {name}"));
+            }
+        }
+        if assigns_relay_image(&text) {
+            assert_eq!(
+                rel, case16[0],
+                "harness/{rel} reassigns RELAY_IMAGE: only case 16 points it at another image"
+            );
+            assigning.push(rel);
+        }
+    }
+    eprintln!("harness files swept: {swept}; names: {naming:?}; RELAY_IMAGE assigned in: {assigning:?}");
+    assert!(swept >= 25, "the sweep read too few harness files ({swept})");
+    // The positive pair: case 16 itself still names all three and points RELAY_IMAGE at the image,
+    // and its overlay carries the key, so a renamed variable cannot pass this vacuously.
+    for (name, allowed) in names {
+        for f in allowed {
+            assert!(
+                naming.contains(&format!("{f}: {name}")),
+                "harness/{f} no longer names {name}"
+            );
+        }
+    }
+    assert_eq!(
+        assigning,
+        [case16[0]],
+        "cef-leaks.sh points RELAY_IMAGE at the image"
+    );
+}
+
 /// Owed 82's arming line, before a process's `compositor started` (boot()'s, at +200).
 fn arm(w: &mut World, start: i64, n: u64) {
     w.line(
