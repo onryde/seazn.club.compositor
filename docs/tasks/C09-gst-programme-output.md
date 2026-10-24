@@ -258,8 +258,10 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
   the encoder's appsink counts one, `None` before the first, and `push` feeds `Stats` no count.
   `stats_encoded_frames_are_the_frames_the_output_carries` (90 paced ticks to a file decode to 90
   frames, and the count reads 90) replaces `stats_fps_counts_pushes_per_second`, and
-  `the_beats_fps_is_the_programmes_real_output_rate_and_falls_when_starved` reads a healthy beat inside
-  the band, a 1.5 s starvation under the floor, and the resumed rate.
+  `the_beats_fps_falls_while_the_encoder_hangs_though_every_push_keeps_its_pace` (the PR #69 review's
+  I1) hangs the encoder 2 s while every tick is pushed on time: a healthy window holds the band, the
+  hung one reads under the floor, and after a whole window of real pace the next holds the band again;
+  the push count (the frame counted at the tick) goes red on it.
 
 ## Audio (C00 audio A/B, 2026-10-15; F-004 verdict, overrides anything above)
 

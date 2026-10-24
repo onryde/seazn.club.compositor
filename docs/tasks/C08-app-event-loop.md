@@ -711,7 +711,7 @@ decision log "Owed 86: the honest beat", where the floor, the clear level and th
 recorded as the implementer's medium choices).
 - **The domain** gains (additions; no existing API changes): `config::OUTPUT_FPS_FLOOR_SHARE`
   (= `ENCODER_SPEED_REALTIME_MIN`, 0.95), `OUTPUT_FPS_RECOVERED_SHARE` (29.5/30, C00 Step 4 and C14
-  cases 6 and 10), `OUTPUT_FPS_MIN_WINDOW_MS` (1 000), `OutputProfile::fps_floor` and `fps_recovered`,
+  cases 6 and 10), `OUTPUT_FPS_MIN_WINDOW_MS` (2 500, half the spec's beat), `OutputProfile::fps_floor` and `fps_recovered`,
   and `starvation::StarvationAlarm` (`on_reading(fps, profile) -> Option<Alarm>`: raised below the
   floor, cleared at or above the recovery level once raised, each change once; a reading that is not
   finite or is negative changes nothing).

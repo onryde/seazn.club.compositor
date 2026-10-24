@@ -301,8 +301,10 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
 - (Amended 2026-10-24, Owed 86) `ProcMetrics::sample`'s `fps` is the programme's real output rate: the frames out of
   the encoder since the last sample over the wall time since it (`adapters::stats::BeatRate`), `None` on the first
   sample and while `encoded_frames` is absent, the last reading again on a sample under `OUTPUT_FPS_MIN_WINDOW_MS`
-  (1 s) after it, and `None` on a lower total, which opens a new window. `metrics_proc.rs`'s
-  `the_beats_fps_is_the_frames_out_of_the_encoder_over_the_beat_window` (a real `Stats`, real 1.3 s windows) and
+  (2.5 s, half the beat) after it, and `None` on a lower total, which opens a new window; the counters are read
+  before the `/proc` walk. `metrics_proc.rs`'s
+  `the_beats_fps_is_the_frames_out_of_the_encoder_over_the_beat_window` (a real `Stats`, real windows past the
+  minimum) and
   `wiring.rs`'s `the_real_output_fps_reaches_the_log_and_the_beat_through_the_real_sampler` pass, and the nominal
   fps put in `BeatRate` or in `ProcMetrics` goes red on both.
 
@@ -860,9 +862,11 @@ recorded as the implementer's medium choices).
 `ProcMetrics` holds a `BeatRate` and samples it with `Stats::snapshot()`'s `encoded_frames` (C09's
 amendment of this date). The driver samples once a beat, so the window between two samples is the
 beat's: 5 s on the grid, and shorter only for the off-grid beats (the hold's first, the drain's), which
-repeat the last reading when they come under 1 s after it. The first sample after a start reads `None`:
-the window has one end, and the encoder's start-up is not a rate. The wire's `fps` key is unchanged;
-only what it carries is (Owed 91 is web's half).
+repeat the last reading when they come under 2.5 s after it (half the beat: a catch-up burst can leave
+a short window 2 to 3 frames short, the PR #69 review's m4). The first sample after a start reads
+`None`: the window has one end, and the encoder's start-up is not a rate. The wire's `fps` key is
+unchanged; only what it carries is, sent to one decimal (`heartbeat_wire`, the PR #69 review's I2;
+Owed 91 is web's half).
 
 ## Do not touch
 
