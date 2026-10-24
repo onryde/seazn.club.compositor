@@ -575,7 +575,9 @@ pub(crate) struct GpuWatch {
 }
 
 /// One wait's listings by the GPU watch's steps: how many, their CPU and clock time (us), the gap
-/// the last one set before the next (us), and whether any gap was held at `GPU_LISTING_GAP_MAX_MS`.
+/// the last one set before the next (us), whether any gap was held at `GPU_LISTING_GAP_MAX_MS`, when
+/// the wait began (us), and, once its listings are over, the wait's time on the clock (us: from its
+/// start to the instant they are over).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WaitListings {
     listings: u64,
@@ -583,6 +585,8 @@ pub(crate) struct WaitListings {
     clock_us: u64,
     gap_us: u64,
     held: bool,
+    began_us: u64,
+    span_us: u64,
 }
 
 impl GpuWatch {
@@ -609,9 +613,13 @@ impl GpuWatch {
         self.listing_share(now).is_some() && now >= self.next_listing_us
     }
 
-    /// A wait for a GPU process from `now`.
+    /// A wait for a GPU process from `now`, which its numbers start from (a wait that has listed
+    /// keeps its own start).
     fn arm(&mut self, now: u64) {
         self.wait_ends_us = Some(now + GPU_RELAUNCH_WAIT_MS * 1_000);
+        if self.waited.listings == 0 {
+            self.waited.began_us = now;
+        }
     }
 
     /// After a step's listing that started at `start` and cost `cpu` us of the thread's CPU and
@@ -641,7 +649,11 @@ impl GpuWatch {
     /// zero.
     fn wait_over(&mut self, now: u64) -> Option<WaitListings> {
         let over = !self.live.is_empty() || !self.in_wait(now);
-        (over && self.waited.listings > 0).then(|| std::mem::take(&mut self.waited))
+        (over && self.waited.listings > 0).then(|| {
+            let mut w = std::mem::take(&mut self.waited);
+            w.span_us = now.saturating_sub(w.began_us);
+            w
+        })
     }
 
     /// How long the child poll thread sleeps after a step at `now` (us): `GPU_WATCH_MS`, or less when
@@ -735,7 +747,7 @@ fn gpu_step(shared: &Shared) -> bool {
         watch.gpu.arm(start);
     }
     watch.gpu.paced(start, cpu, clock);
-    let over = watch.gpu.wait_over(start);
+    let over = watch.gpu.wait_over(start + clock);
     let deaths = watch.gpu.deaths;
     drop(watch);
     log_gpu_gone(shared, died, deaths);
@@ -756,22 +768,25 @@ fn gpu_sleep_us(shared: &Shared) -> u64 {
 }
 
 /// One INFO line for a wait whose listings are over (none for `None`; the PR #55 review's I3): how
-/// many listings, their mean CPU and clock cost, the gap the last set and the share of a core that
-/// makes, so a run's log shows the pace the watch kept.
+/// many listings over how long, their mean CPU and clock cost, the last gap, and the wait's share of
+/// a core: all its listings' CPU over its time on the clock (the confirm pass's r2-m2; a death's
+/// wait whose first listing finds the relaunch was that one listing, so it reads 100%), so a run's
+/// log shows what the watch spent.
 fn log_wait(shared: &Shared, over: Option<WaitListings>) {
     let Some(w) = over else { return };
     let n = w.listings.max(1);
     let (cpu, clock) = (w.cpu_us / n, w.clock_us / n);
-    let gap_ms = w.gap_us as f64 / 1_000.0;
-    let pct = (w.cpu_us as f64 / n as f64) * 100.0 / w.gap_us.max(1) as f64;
+    let (span_ms, gap_ms) = (w.span_us as f64 / 1_000.0, w.gap_us as f64 / 1_000.0);
+    let pct = w.cpu_us as f64 * 100.0 / w.span_us.max(1) as f64;
     let held = if w.held {
         format!(", a gap held at the {GPU_LISTING_GAP_MAX_MS} ms ceiling")
     } else {
         String::new()
     };
     shared.log(&format!(
-        "INFO: the GPU watch's wait listed {} time(s) at {cpu} us of CPU each ({clock} us on the \
-         clock), {gap_ms:.1} ms apart: {pct:.1}% of a core{held} (Owed 70 (a))",
+        "INFO: the GPU watch's wait listed {} time(s) in {span_ms:.1} ms at {cpu} us of CPU each \
+         ({clock} us on the clock), the last {gap_ms:.1} ms apart: {pct:.1}% of a core{held} (Owed \
+         70 (a))",
         w.listings
     ));
 }
@@ -3188,20 +3203,32 @@ mod tests {
         lines
     }
 
-    /// The GPU watch's wait lines among `lines`, as (listings, CPU each, gap in tenths of a ms,
-    /// held at the ceiling).
+    /// The GPU watch's wait lines among `lines`, as (listings, CPU each, last gap in tenths of a
+    /// ms, held at the ceiling).
     fn wait_lines(lines: &[String]) -> Vec<(u64, u64, u64, bool)> {
+        wait_parts(lines)
+            .into_iter()
+            .map(|w| (w.0, w.1, w.2, w.3))
+            .collect()
+    }
+
+    /// The GPU watch's wait lines among `lines`, as `wait_lines` and then the wait's time on the
+    /// clock (ms) and its share of a core (%), as the line prints them.
+    fn wait_parts(lines: &[String]) -> Vec<(u64, u64, u64, bool, String, String)> {
         lines
             .iter()
             .filter_map(|l| {
                 let rest = l.strip_prefix("INFO: the GPU watch's wait listed ")?;
-                let (n, rest) = rest.split_once(" time(s) at ")?;
+                let (n, rest) = rest.split_once(" time(s) in ")?;
+                let (span, rest) = rest.split_once(" ms at ")?;
                 let (cpu, rest) = rest.split_once(" us of CPU each (")?;
-                let (_, rest) = rest.split_once("clock), ")?;
-                let (gap, _) = rest.split_once(" ms apart")?;
+                let (_, rest) = rest.split_once("clock), the last ")?;
+                let (gap, rest) = rest.split_once(" ms apart: ")?;
+                let (pct, _) = rest.split_once("% of a core")?;
                 let tenths = gap.replace('.', "").parse().ok()?;
                 let held = l.contains(&format!("held at the {GPU_LISTING_GAP_MAX_MS} ms ceiling"));
-                Some((n.parse().ok()?, cpu.parse().ok()?, tenths, held))
+                let (n, cpu) = (n.parse().ok()?, cpu.parse().ok()?);
+                Some((n, cpu, tenths, held, span.to_owned(), pct.to_owned()))
             })
             .collect()
     }
@@ -3301,6 +3328,7 @@ mod tests {
         let deaths = CHROMIUM_GPU_DEATHS_ABORT - 1;
         let (first, life) = (2_500_000, GPU_RELAUNCH_LIFE_MIN_MS * 1_000);
         let (mut instants, mut at_threshold, mut counted, mut runs) = (0, 0, 0, 0);
+        let mut single = 0;
         for cost in [0, 250, 375, 1_439] {
             let paced = (GPU_WATCH_MS * 1_000).max(cost * 100 / GPU_WAIT_SHARE_PCT);
             let gap = paced.min(GPU_LISTING_GAP_MAX_MS * 1_000);
@@ -3357,6 +3385,15 @@ mod tests {
                     let held = paced > GPU_LISTING_GAP_MAX_MS * 1_000;
                     assert_eq!((w.1, w.2, w.3), (cost, gap / 100, held), "{case}: wait {k}");
                 }
+                // A death's wait whose first listing (the one that saw the death) found the
+                // relaunch: that listing is the wait's whole time on the clock, so all of a core
+                // (none when a listing costs nothing), whatever the gap after it would have been.
+                for w in wait_parts(&locked(&lines)).iter().filter(|w| w.0 == 1) {
+                    let share = if cost > 0 { "100.0" } else { "0.0" };
+                    let span = format!("{:.1}", cost as f64 / 1_000.0);
+                    assert_eq!((&w.4, &w.5), (&span, &share.to_owned()), "{case}: {w:?}");
+                    single += 1;
+                }
                 runs += 1;
             }
             eprintln!(
@@ -3366,9 +3403,10 @@ mod tests {
         }
         eprintln!(
             "runs checked: {runs}, instants: {instants}, at the threshold: {at_threshold}, deaths \
-             counted: {counted}"
+             counted: {counted}, one-listing waits: {single}"
         );
         assert!(runs == 24 && instants > 0 && at_threshold > 0 && counted == 24 * deaths);
+        assert!(single > 0, "no wait found its relaunch at its first listing");
     }
 
     // Owed 70 (a), when the watch lists: between two child polls it lists CEF's children only while
@@ -3568,7 +3606,7 @@ mod tests {
         let ceiling = GPU_LISTING_GAP_MAX_MS * 1_000;
         let in_wait = |cost: u64| step.max(cost * 100 / GPU_WAIT_SHARE_PCT).min(ceiling);
         let late_pace = |cost: u64| step.max(cost * 100 / GPU_LATE_SHARE_PCT);
-        let (mut gaps, mut exact, mut runs) = (0, 0, 0);
+        let (mut gaps, mut exact, mut runs, mut shares) = (0, 0, 0, 0);
         for seen_by in ["a step", "the poll"] {
             for cost in [0, 250, 400, 1_000, 3_075, 10_000] {
                 let case = format!("{seen_by}, a {cost} us listing");
@@ -3584,10 +3622,17 @@ mod tests {
                     let shared = Arc::clone(&g.shared);
                     let lines = capture_log(&shared);
                     let to = late + 2 * CHILD_POLL_MS * 1_000;
-                    let polls = drive_paced(&shared, &cef, to, |_, _| {});
+                    // The steps' instants (us): each starts with `gpu_step`'s reading of the clock.
+                    let mut stepped = Vec::new();
+                    let polls = drive_paced(&shared, &cef, to, |at, poll| {
+                        if !poll {
+                            stepped.push(at);
+                        }
+                    });
                     let all = locked(&cef).listed_at_us.clone();
-                    let waits = wait_lines(&locked(&lines));
-                    (g.health().gpu_process_deaths, polls, all, waits, late)
+                    let waits = wait_parts(&locked(&lines));
+                    let counted = g.health().gpu_process_deaths;
+                    (counted, polls, all, waits, late, stepped)
                 };
                 // The poll's death: at the instant of the fourth poll, about 3 s in (a first run's,
                 // which a death there does not move).
@@ -3596,7 +3641,7 @@ mod tests {
                 } else {
                     run(10_000_000).1[3]
                 };
-                let (counted, polls, all, waits, late) = run(death);
+                let (counted, polls, all, waits, late, stepped) = run(death);
                 let by_poll = polls.contains(&death);
                 assert_eq!(by_poll, seen_by == "the poll", "{case}: polls at {polls:?}");
                 let steps: Vec<u64> = step_listings(&all, &polls)
@@ -3656,14 +3701,45 @@ mod tests {
                         "{case}: {in_wait_n} listings in the wait"
                     );
                 }
-                // Its one INFO line: those listings, at this cost, the wait's gap, and whether the
-                // ceiling held it.
+                // Its one INFO line: those listings, at this cost, the wait's gap, whether the
+                // ceiling held it, and the wait's share of a core (the confirm pass's r2-m2): their
+                // CPU over the wait's time on the clock, from its start (the death's reading) to
+                // the instant the watch saw it over (the end of its last listing, when that ends
+                // past the wait, or else the first step after it). Past the ceiling, the share is
+                // more than `GPU_WAIT_SHARE_PCT`, and back to back (a listing longer than the
+                // ceiling) it is the whole core.
                 let held = cost * 100 / GPU_WAIT_SHARE_PCT > ceiling;
+                let last = *steps.iter().rfind(|t| **t < wait_ends).expect("a wait listing");
+                let over = if last + cost >= wait_ends {
+                    last + cost
+                } else {
+                    *stepped
+                        .iter()
+                        .find(|t| **t >= wait_ends)
+                        .expect("a step after the wait")
+                };
+                let span = over - (wait_ends - wait);
+                let share = (in_wait_n * cost) as f64 * 100.0 / span as f64;
+                let want = (span as f64 / 1_000.0, share);
+                let want = (format!("{:.1}", want.0), format!("{:.1}", want.1));
+                eprintln!(
+                    "{case}: {in_wait_n} listings in {} ms, {}% of a core",
+                    want.0, want.1
+                );
                 assert_eq!(
                     waits,
-                    vec![(in_wait_n, cost, in_wait(cost) / 100, held)],
+                    vec![(in_wait_n, cost, in_wait(cost) / 100, held, want.0, want.1)],
                     "{case}"
                 );
+                if cost * 100 / GPU_WAIT_SHARE_PCT <= ceiling {
+                    assert!(share <= GPU_WAIT_SHARE_PCT as f64 + 0.1, "{case}: {share}%");
+                } else if cost > ceiling {
+                    // The rest of the core: the polls' listings and the step after each.
+                    assert!(share > 95.0, "{case}: back to back at {share}%");
+                } else {
+                    assert!(share > GPU_WAIT_SHARE_PCT as f64, "{case}: held at {share}%");
+                }
+                shares += 1;
                 // The late relaunch: listed by the first listing after its birth (a step's or a
                 // poll's), after which no step lists.
                 let found = all
@@ -3683,8 +3759,11 @@ mod tests {
                 runs += 1;
             }
         }
-        eprintln!("runs checked: {runs}, gaps checked: {gaps} ({exact} at exactly the pace)");
-        assert!(runs == 12 && gaps > 0 && exact > 0);
+        eprintln!(
+            "runs checked: {runs}, gaps checked: {gaps} ({exact} at exactly the pace), shares: \
+             {shares}"
+        );
+        assert!(runs == 12 && gaps > 0 && exact > 0 && shares == 12);
     }
 
     // Owed 70 (a), the PR #55 review's I3: a listing paces the next on its CPU, not on its time on the
