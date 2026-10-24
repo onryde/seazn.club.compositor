@@ -21,8 +21,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use adapters::cef_graphics::{
-    cef_children, thread_cpu_us, CefGraphics, ReaperPath, CEF_NICE, CHILD_POLL_MS, GPU_WAIT_SHARE_PCT,
-    GPU_WATCH_MS, REAPER_KILL_AFTER_MS, SPARE_RENDERER_OFF, TEARDOWN_LEAK_AFTER_MS,
+    cef_children, thread_cpu_us, CefGraphics, ReaperPath, CEF_NICE, CHILD_POLL_MS, GPU_LISTING_GAP_MAX_MS,
+    GPU_RELAUNCH_LIFE_MIN_MS, GPU_WAIT_SHARE_PCT, GPU_WATCH_MS, REAPER_KILL_AFTER_MS, SPARE_RENDERER_OFF,
+    TEARDOWN_LEAK_AFTER_MS,
 };
 use adapters::frame_store::FrameStore;
 use adapters::gst_programme::GstProgramme;
@@ -1505,25 +1506,44 @@ fn gpu_deaths_case() {
 
 // Owed 70 (a), from real kills: a GPU crash loop faster than one child poll (F-026: C14's fast loop
 // killed each relaunch 69 to 88 ms after the kill before, and the 1 s poll counted 1 or 2 of 5). The GPU
-// process is killed, then each relaunch `LOOP_LIFE_MS` after this test first lists it, never waiting
-// for a poll to list it: C14's fast leg's `CHROMIUM_GPU_DEATHS_ABORT` - 1 deaths, one under the abort.
-// The GPU watch counts each one between polls, within half a poll and once, and the restart cause
-// comes at `cef_gpu_deaths_to_restart`, never at one fewer. It also times this test's own
-// `cef_children()` calls, the walk the watch's listings make, with CEF's children present (the PR #55
-// review's I2: CI's check runner had listed none). It spends the process's GPU deaths, so it runs in
-// a child of its own.
+// process is killed, then each relaunch 40 ms (about half of F-026's 69 to 88 ms) after this test
+// first lists it, never waiting for a poll to list it: C14's fast leg's `CHROMIUM_GPU_DEATHS_ABORT` - 1
+// deaths, one under the abort. The GPU watch counts each one between polls, within half a poll and
+// once, and the restart cause comes at `cef_gpu_deaths_to_restart`, never at one fewer. It also times
+// this test's own `cef_children()` calls, the walk the watch's listings make, with CEF's children
+// present (the PR #55 review's I2: CI's check runner had listed none), in CPU and on the clock (I3).
+// It spends the process's GPU deaths, so it runs in a child of its own.
 #[test]
 fn a_gpu_crash_loop_faster_than_a_poll_is_counted_from_real_kills() {
+    gpu_loop_test(
+        "a_gpu_crash_loop_faster_than_a_poll_is_counted_from_real_kills",
+        40,
+    );
+}
+
+// Owed 70 (a), the PR #55 review's I3, from real kills: the same loop, each relaunch killed
+// `GPU_RELAUNCH_LIFE_MIN_MS` (F-026's shortest estimated relaunch life) after this test first lists
+// it. Every death is counted, each kill-to-count time printed.
+#[test]
+fn a_gpu_crash_loop_at_the_shortest_relaunch_life_is_counted_from_real_kills() {
+    gpu_loop_test(
+        "a_gpu_crash_loop_at_the_shortest_relaunch_life_is_counted_from_real_kills",
+        GPU_RELAUNCH_LIFE_MIN_MS,
+    );
+}
+
+/// A GPU crash loop test `name` whose relaunches live `life_ms`, run in a child (`gpu_loop_case`):
+/// its one line, and the GPU watch's INFO line for each wait.
+fn gpu_loop_test(name: &str, life_ms: u64) {
     let _s = serial();
-    let name = "a_gpu_crash_loop_faster_than_a_poll_is_counted_from_real_kills";
     if std::env::var_os("C11_CHILD").is_some() {
-        return gpu_loop_case();
+        return gpu_loop_case(life_ms);
     }
     let out = rerun_in_child(name, &[]);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let reached: Vec<&str> = stderr
         .lines()
-        .filter(|l| l.starts_with("gpu loop child:"))
+        .filter(|l| l.starts_with("gpu loop child ("))
         .collect();
     assert!(
         out.status.success(),
@@ -1532,11 +1552,12 @@ fn a_gpu_crash_loop_faster_than_a_poll_is_counted_from_real_kills() {
     );
     assert_eq!(reached.len(), 1, "{stderr}");
     eprintln!("{}", reached[0]);
+    for l in stderr.lines().filter(|l| l.contains("GPU watch's wait")) {
+        eprintln!("  {l}");
+    }
 }
 
-fn gpu_loop_case() {
-    // About half of F-026's 69 to 88 ms between kills.
-    const LOOP_LIFE_MS: u64 = 40;
+fn gpu_loop_case(life_ms: u64) {
     let t = Thresholds::default();
     let n = t.cef_gpu_deaths_to_restart;
     let kills = CHROMIUM_GPU_DEATHS_ABORT - 1;
@@ -1557,14 +1578,14 @@ fn gpu_loop_case() {
     });
     let (started, polls_before) = (Instant::now(), r.g.polls());
     let mut killed: Vec<i32> = Vec::new();
-    let mut counted_ms: Vec<u128> = Vec::new();
+    let mut counted_ms: Vec<f64> = Vec::new();
     // This test's listings: how many, their summed and longest time on the clock and in this
     // thread's CPU (us), the most CEF children.
     let (mut listings, mut most) = (0_u32, 0_usize);
     let (mut listed_us, mut longest_us, mut cpu_us, mut cpu_longest_us) = (0_f64, 0_f64, 0_u64, 0_u64);
     for k in 1..=kills {
         // The GPU process now: the first one (the polls above listed it), then each relaunch, looked
-        // for every 2 ms so its life is about `LOOP_LIFE_MS`.
+        // for every 2 ms so its life is about `life_ms`.
         let end = Instant::now() + hang_bound();
         let pid = loop {
             let (t0, c0) = (Instant::now(), thread_cpu_us());
@@ -1584,7 +1605,7 @@ fn gpu_loop_case() {
             }
         };
         if k > 1 {
-            thread::sleep(Duration::from_millis(LOOP_LIFE_MS));
+            thread::sleep(Duration::from_millis(life_ms));
         }
         let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).status();
         let at = Instant::now();
@@ -1593,7 +1614,7 @@ fn gpu_loop_case() {
         while r.g.health().gpu_process_deaths < k && Instant::now() < bound {
             thread::sleep(Duration::from_millis(1));
         }
-        counted_ms.push(at.elapsed().as_millis());
+        counted_ms.push((at.elapsed().as_secs_f64() * 10_000.0).round() / 10.0);
         let h = r.g.health();
         assert!(
             h.gpu_process_deaths >= k,
@@ -1612,23 +1633,38 @@ fn gpu_loop_case() {
     assert_eq!(h.gpu_process_deaths, kills, "{h:?}");
     assert_eq!(h.unrecoverable, None, "the zygotes live: {h:?}");
     assert!(listings > 0 && most > 0, "no listing with CEF's children");
+    // The watch's INFO line per wait that listed: CEF's start's, and one per death's.
+    let waits = lines(&r)
+        .iter()
+        .filter(|l| l.contains("GPU watch's wait"))
+        .count();
+    assert!(
+        waits >= kills,
+        "{waits} wait lines for {kills} deaths: {:?}",
+        lines(&r)
+    );
     let mean_us = listed_us / f64::from(listings);
     let cpu_mean_us = cpu_us as f64 / f64::from(listings);
-    let pace_ms = (GPU_WATCH_MS as f64).max(cpu_mean_us * 100.0 / GPU_WAIT_SHARE_PCT as f64 / 1_000.0);
-    // The share of a core one listing per F-026's estimated relaunch life (10 to 19 ms) would take.
-    let share = |life_ms: f64| cpu_mean_us / (life_ms * 10.0);
+    // The wait's gap at that cost: the share's pace, within the floor and the ceiling.
+    let paced_ms = cpu_mean_us * 100.0 / GPU_WAIT_SHARE_PCT as f64 / 1_000.0;
+    let pace_ms = paced_ms.clamp(GPU_WATCH_MS as f64, GPU_LISTING_GAP_MAX_MS as f64);
+    // The share of a core one listing every `every_ms` takes at that cost: at the pace, and once per
+    // F-026's estimated relaunch life (10 to 19 ms).
+    let share = |every_ms: f64| cpu_mean_us / (every_ms * 10.0);
     let profile = if cfg!(debug_assertions) {
         "debug"
     } else {
         "release"
     };
     eprintln!(
-        "gpu loop child ({profile} build): {kills} GPU processes killed {killed:?} in {took} ms, {polls} \
-         child polls, each counted {counted_ms:?} ms after its kill; {listings} listings with up to \
+        "gpu loop child ({profile} build): {kills} GPU processes, each killed {life_ms} ms after this \
+         test listed it, {killed:?} in {took} ms, {polls} child polls, each counted {counted_ms:?} ms \
+         after its kill; {waits} wait lines; {listings} listings with up to \
          {most} CEF children over {procs} processes at {cpu_mean_us:.0} us of CPU each (the longest \
          {cpu_longest_us} us), {mean_us:.0} us on the clock (the longest {longest_us:.0} us): a wait \
-         lists every {pace_ms:.1} ms at that cost, and a listing every 10 ms would take {:.1}% of a \
-         core, every 19 ms {:.1}%; {h:?}",
+         lists every {pace_ms:.1} ms at that cost ({:.1}% of a core; the share's pace {paced_ms:.1} \
+         ms), and a listing every 10 ms would take {:.1}% of a core, every 19 ms {:.1}%; {h:?}",
+        share(pace_ms),
         share(10.0),
         share(19.0)
     );

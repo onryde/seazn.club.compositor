@@ -197,11 +197,12 @@ jobs:
             echo "::error::$passed graphics tests passed, fewer than 8"
             exit 1
           fi
-          # A filter that matched nothing passes 0 tests: the release run must have run each loop.
+          # A filter that matched nothing passes 0 tests: the release run must have run both loops
+          # (the 40 ms one and the shortest relaunch life's).
           loops=$({ grep -E '^gpu loop child \(release build\)' graphics.log || true; } | wc -l)
           echo "GPU crash loops on the release profile: $loops"
-          if [ "$loops" -lt 1 ]; then
-            echo "::error::$loops GPU crash loops ran on the release profile, fewer than 1"
+          if [ "$loops" -lt 2 ]; then
+            echo "::error::$loops GPU crash loops ran on the release profile, fewer than 2"
             exit 1
           fi
       - name: Smoke budget
