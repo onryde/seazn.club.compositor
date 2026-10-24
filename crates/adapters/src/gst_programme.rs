@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
+#[cfg(feature = "test-hooks")]
+use std::time::Instant;
 
 use app::ports::{Inbound, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::Sender;
@@ -67,6 +69,32 @@ const NOISE_PEAK: f32 = 0.001;
 /// The layers, by the index `Running::failing` keeps them at (for the push-failure lines).
 const LAYERS: [&str; 3] = ["base", "overlay", "audio"];
 
+/// Owed 94, a test hook (C14's output-hung case): how sink generation 1 stalls once it has run a
+/// while (`stall_first_sink`). Either way its total stops while the encoders keep delivering, and no
+/// sink error comes: the egress backstop's shape.
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkStall {
+    /// `hold_sink_writes`: its writes are held until its teardown flushes them.
+    Hold,
+    /// `hang_sink(SINK_HANG_HOLD)`: its next write sleeps holding its streaming lock, so its teardown
+    /// hangs as well (F-001), on a reaper thread.
+    Hang,
+}
+
+/// How long a planted hang holds: twice F-004's budget, past the backstop and a whole recovery.
+#[cfg(feature = "test-hooks")]
+pub const SINK_HANG_HOLD: Duration = Duration::from_millis(2 * domain::config::OUTPUT_GAP_BUDGET_MS);
+
+/// A planned stall: what, how long after sink generation 1's build, and that build's instant.
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Clone, Copy)]
+struct PlannedStall {
+    stall: SinkStall,
+    after: Duration,
+    built_at: Option<Instant>,
+}
+
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -95,6 +123,9 @@ pub struct GstProgramme {
     /// Test hook (`refuse_key_requests`): keyframe requests still to refuse.
     #[cfg(feature = "test-hooks")]
     key_refusals: Arc<AtomicU32>,
+    /// Test hook (`stall_first_sink`): the stall still to plant on sink generation 1.
+    #[cfg(feature = "test-hooks")]
+    sink_stall: Option<PlannedStall>,
 }
 
 /// Everything `start()` built.
@@ -147,6 +178,8 @@ impl GstProgramme {
             running: None,
             #[cfg(feature = "test-hooks")]
             key_refusals: Arc::new(AtomicU32::new(0)),
+            #[cfg(feature = "test-hooks")]
+            sink_stall: None,
         }
     }
 
@@ -220,9 +253,13 @@ impl GstProgramme {
         self.key_refusals.load(Ordering::SeqCst)
     }
 
-    /// Test hook: holds every write of the current output's sink (a blocking probe on its sink pad),
-    /// standing in for a destination that accepts and then stops reading. A flush (the teardown)
-    /// lets it go. False if there is no output.
+    /// Test hook: holds every write of the current output's sink (a blocking probe on its sink pad):
+    /// a hang inside the output pipeline (Owed 94 (ii)). The sink has no write pending, so rtmp2sink
+    /// never errors and its total stays flat while the encoders keep delivering into the ring: the
+    /// shape the egress backstop exists for. (Before Owed 87 it stood in for a destination that
+    /// accepts and then stops reading; that destination now fails the sink's socket wait instead,
+    /// which this hook never reaches.) A flush (the teardown) lets it go. False if there is no
+    /// output.
     #[cfg(feature = "test-hooks")]
     pub fn hold_sink_writes(&self) -> bool {
         let Some(pad) = self.current_sink_pad() else {
@@ -232,6 +269,50 @@ impl GstProgramme {
             gst::PadProbeReturn::Ok
         })
         .is_some()
+    }
+
+    /// Test hook (Owed 94; C14's output-hung case, through the compositor's
+    /// `COMPOSITOR_TEST_HOLD_SINK_AFTER_MS` and `COMPOSITOR_TEST_HANG_SINK_AFTER_MS`): sink generation
+    /// 1 stalls `after` its build, at the first push past it. Once, and only on generation 1, so the
+    /// sink the swap builds next is healthy. The line saying so is the case's witness and its clock.
+    #[cfg(feature = "test-hooks")]
+    pub fn stall_first_sink(&mut self, stall: SinkStall, after: Duration) {
+        self.sink_stall = Some(PlannedStall {
+            stall,
+            after,
+            built_at: None,
+        });
+        self.shared.log(&format!(
+            "test hook (Owed 94): sink gen=1 stalls ({}) {} ms after its build",
+            stall_name(stall),
+            after.as_millis()
+        ));
+    }
+
+    /// Plants the planned stall once its moment has come (called on every push).
+    #[cfg(feature = "test-hooks")]
+    fn plant_due_stall(&mut self) {
+        let Some(plan) = self.sink_stall else {
+            return;
+        };
+        if plan.built_at.is_none_or(|at| at.elapsed() < plan.after) {
+            return;
+        }
+        self.sink_stall = None;
+        let current = self
+            .running
+            .as_ref()
+            .and_then(|r| r.output.as_ref())
+            .map(|o| o.gen());
+        let planted = current == Some(1)
+            && match plan.stall {
+                SinkStall::Hold => self.hold_sink_writes(),
+                SinkStall::Hang => self.hang_sink(SINK_HANG_HOLD),
+            };
+        self.shared.log(&format!(
+            "test hook (Owed 94): sink stall={} gen=1 planted={planted}",
+            stall_name(plan.stall)
+        ));
     }
 
     /// Test hook: the current output sink's next write sleeps `hold` holding its streaming lock, so
@@ -670,6 +751,8 @@ impl ProgrammeOutput for GstProgramme {
     }
 
     fn push(&mut self, index: u64, choice: FrameChoice) {
+        #[cfg(feature = "test-hooks")]
+        self.plant_due_stall();
         let Some(r) = self.running.as_mut() else {
             self.refused_pushes += 1;
             return;
@@ -782,7 +865,13 @@ impl ProgrammeOutput for GstProgramme {
             parser_src.send_event(ev)
         });
         match gst_output::build(&self.shared, gen, target, request_key) {
-            Ok(out) => r.output = Some(out),
+            Ok(out) => {
+                r.output = Some(out);
+                #[cfg(feature = "test-hooks")]
+                if let Some(plan) = self.sink_stall.as_mut().filter(|_| gen == 1) {
+                    plan.built_at = Some(Instant::now());
+                }
+            }
             Err(text) => {
                 self.shared.log(&format!("swap_sink gen={gen}: {text}"));
                 self.send_now(Event::OutputError { gen });
@@ -997,6 +1086,15 @@ fn running_time_entry(sample: &gst::Sample, video: bool) -> Option<Entry> {
 /// BGRA zeros: alpha 0 everywhere.
 fn transparent_frame(info: &gst_video::VideoInfo) -> gst::Buffer {
     gst::Buffer::from_mut_slice(vec![0u8; info.size()])
+}
+
+/// Owed 94: the hook's word for a stall, in its log lines.
+#[cfg(feature = "test-hooks")]
+fn stall_name(s: SinkStall) -> &'static str {
+    match s {
+        SinkStall::Hold => "hold",
+        SinkStall::Hang => "hang",
+    }
 }
 
 /// The test hooks' sleeping probe: `hold` inside the streaming thread, once.

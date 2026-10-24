@@ -28,8 +28,10 @@ use domain::config::{
     OutputProfile, Thresholds, ENCODER_SPEED_REALTIME_MIN, OUTPUT_FPS_MIN_WINDOW_MS, OUTPUT_SINK_TIMEOUT_MS,
 };
 use domain::ladder::Rung;
+use domain::output_link::{Encoded, OutputLink, OutputState, SwapReason};
 use domain::programme::{FrameChoice, SlateKind};
 use domain::supervisor::Event;
+use domain::time::Ms;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -889,7 +891,7 @@ fn file_target_reports_progress_with_its_generation() {
     let progress: Vec<(u64, u64)> = seen
         .iter()
         .filter_map(|e| match e {
-            Event::OutputProgress { gen, total_bytes } => Some((*gen, *total_bytes)),
+            Event::OutputProgress { gen, total_bytes, .. } => Some((*gen, *total_bytes)),
             _ => None,
         })
         .collect();
@@ -1245,7 +1247,7 @@ fn progress_of(events: &[Event], want: u64) -> Vec<u64> {
     events
         .iter()
         .filter_map(|e| match e {
-            Event::OutputProgress { gen, total_bytes } if *gen == want => Some(*total_bytes),
+            Event::OutputProgress { gen, total_bytes, .. } if *gen == want => Some(*total_bytes),
             _ => None,
         })
         .collect()
@@ -1920,6 +1922,131 @@ fn a_held_sink_backs_up_into_the_bounded_ring_not_the_output() {
         "the output never filled to the feeder's bound"
     );
     assert!(ring * 10 >= ring_bound() * 8, "the ring never filled: {ring}");
+}
+
+/// Owed 94 (the owner, 2026-10-24, "B"), the seam through its real producer and consumer. The hook
+/// that holds the sink's writes (the hang shape the backstop exists for) leaves the sink's total flat
+/// while both encoders' totals keep growing on every reading; and those very readings, folded through
+/// the domain's `OutputLink` at the instants they arrived, back the sink off as `EgressStalled` at
+/// `output_egress_flat_ms` after its last growth and not 1 ms before. The clock is time (P-6), so
+/// the readings need not run the whole threshold: two seconds of the hang show its shape.
+#[test]
+fn a_held_sink_reads_flat_while_the_encoders_deliver_and_the_link_backs_it_off() {
+    let _s = serial();
+    let dir = Tmp::new("held-backstop");
+    let (mut p, rx, _f, _l) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    let t0 = Instant::now();
+    let mut readings: Vec<(Ms, u64, Encoded)> = Vec::new();
+    let take = |readings: &mut Vec<(Ms, u64, Encoded)>| {
+        while let Ok(m) = rx.try_recv() {
+            if let Inbound::Event(Event::OutputProgress {
+                gen: 1,
+                total_bytes,
+                encoded,
+            }) = m
+            {
+                readings.push((t0.elapsed().as_millis() as Ms, total_bytes, encoded));
+            }
+        }
+    };
+    let fps = u64::from(P720.fps);
+    pace_with(
+        &mut p,
+        0..fps,
+        |_| FrameChoice::Slate(SlateKind::Waiting),
+        |_| take(&mut readings),
+    );
+    assert!(p.hold_sink_writes(), "the hook found the sink");
+    let held_at = t0.elapsed().as_millis() as Ms;
+    pace_with(
+        &mut p,
+        fps..3 * fps,
+        |_| FrameChoice::Slate(SlateKind::Waiting),
+        |_| take(&mut readings),
+    );
+    take(&mut readings);
+    // The adapter's half: the sink's total stops at the hold, and the encoders keep delivering.
+    let high = readings.iter().map(|r| r.1).max().expect("readings");
+    let last = readings.iter().find(|r| r.1 == high).expect("the high").0;
+    let after: Vec<_> = readings.iter().filter(|r| r.0 > last).collect();
+    let grew = after
+        .windows(2)
+        .filter(|w| w[1].2.video > w[0].2.video && w[1].2.audio > w[0].2.audio)
+        .count();
+    eprintln!(
+        "held-sink readings: {} ({} after the last growth at {last} ms, hold at {held_at} ms; {grew} \
+         pairs with both encoders grown)",
+        readings.len(),
+        after.len()
+    );
+    assert!(after.len() >= 5, "{} readings after the last growth", after.len());
+    assert!(
+        after.iter().all(|r| r.1 == high),
+        "the total moved after its high: {after:?}"
+    );
+    assert_eq!(
+        grew,
+        after.len() - 1,
+        "an encoder stopped behind the held sink: {after:?}"
+    );
+    // The domain's half, on the same readings.
+    let t = Thresholds::default();
+    let mut link = OutputLink::new();
+    assert!(link.on_tick(0, &t));
+    for &(at, total, encoded) in &readings {
+        link.on_progress(at, 1, total, &t);
+        link.on_delivery(at, 1, encoded);
+        assert!(!link.on_tick(at, &t), "built at {at} ms");
+    }
+    let flat = t.output_egress_flat_ms;
+    assert!(!link.on_tick(last + flat - 1, &t), "1 ms early");
+    assert!(
+        matches!(link.state(), OutputState::Proving { .. }),
+        "{:?}",
+        link.state()
+    );
+    link.on_tick(last + flat, &t);
+    let OutputState::Backoff { attempt: 1, until } = link.state() else {
+        panic!("the backstop did not back off: {:?}", link.state());
+    };
+    assert!(link.on_tick(until, &t));
+    assert_eq!(link.swap_reason(), SwapReason::EgressStalled);
+}
+
+/// Owed 94 (the PR #73 review's P-5): the backstop's swap away from a sink whose teardown hangs
+/// (F-001: `set_state(NULL)` held by a write sleeping on its streaming lock) returns at once, and the
+/// new sink's bytes flow while the old teardown is still held by the reaper.
+#[test]
+fn a_swap_away_from_a_hung_sink_does_not_wait_for_its_teardown() {
+    let _s = serial();
+    let dir = Tmp::new("swap-hung");
+    let (mut p, rx, _f, _l) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    pace(&mut p, 0..15, FrameChoice::Slate(SlateKind::Waiting));
+    assert!(p.hang_sink(Duration::from_secs(3)), "the sink hook");
+    pace(&mut p, 15..20, FrameChoice::Slate(SlateKind::Waiting));
+    thread::sleep(Duration::from_millis(300));
+    let teardowns = p.teardown_counter();
+    let t = Instant::now();
+    p.swap_sink(2, &file_target(&dir.file("b.flv")));
+    let took = t.elapsed();
+    let in_flight = teardowns.load(Ordering::SeqCst);
+    pace(&mut p, 20..65, FrameChoice::Slate(SlateKind::Waiting));
+    let grown = progress_of(&events_for(&rx, Duration::from_millis(600)), 2);
+    eprintln!(
+        "swap took {took:?}; teardowns in flight after it: {in_flight}; gen-2 totals read: {}",
+        grown.len()
+    );
+    assert!(took < Duration::from_millis(500), "{took:?}");
+    assert_eq!(
+        in_flight, 1,
+        "the old sink's teardown is still held, so the hang was real"
+    );
+    assert!(
+        grown.iter().any(|&b| b > 0),
+        "the new sink sent nothing: {grown:?}"
+    );
 }
 
 #[test]

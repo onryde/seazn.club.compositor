@@ -264,3 +264,84 @@ fn test_hook_hold_teardowns_is_not_read_without_the_feature() {
     }
     assert_eq!(checked, 2, "anti-vacuity");
 }
+
+/// Owed 94 (the owner, 2026-10-24, "B"), a `test-hooks` build: each sink-stall key takes ms of ASCII
+/// digits, in both modes (C14's output-hung case); unset, empty or 0 plants nothing; anything else,
+/// or both keys at once, is refused naming a key, never the value.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn test_hook_sink_stall_takes_ms_on_one_key_and_refuses_anything_else() {
+    use env::SinkStallHook::{Hang, Hold};
+    let (hold, hang) = (
+        env::COMPOSITOR_TEST_HOLD_SINK_AFTER_MS,
+        env::COMPOSITOR_TEST_HANG_SINK_AFTER_MS,
+    );
+    let mut checked = 0;
+    for mode in ["live", "fake"] {
+        for (key, kind) in [(hold, Hold), (hang, Hang)] {
+            let mut m = base();
+            m.insert(env::COMPOSITOR_DRIVERS, mode.to_owned());
+            assert_eq!(parse(&m, true).unwrap().hooks.sink_stall, None, "{mode}: unset");
+            checked += 1;
+            for (v, want) in [
+                ("", None),
+                ("0", None),
+                ("12000", Some((kind, 12_000))),
+                ("015000", Some((kind, 15_000))),
+            ] {
+                m.insert(key, v.to_owned());
+                assert_eq!(
+                    parse(&m, true).unwrap().hooks.sink_stall,
+                    want,
+                    "{mode} {key} {v:?}"
+                );
+                checked += 1;
+            }
+            for bad in ["ten", "-1", "+5", " 5", "5 ", "5.0", "99999999999999999999999"] {
+                m.insert(key, bad.to_owned());
+                let err = parse(&m, true).expect_err(bad);
+                assert_eq!(err, EnvError::Invalid(key), "{mode} {key} {bad:?}");
+                let text = err.to_string();
+                assert!(text.contains(key), "{text:?} does not name {key}");
+                assert!(!text.contains(bad.trim()), "{text:?} carries the value {bad:?}");
+                checked += 1;
+            }
+        }
+        // One stall at a time: both set is refused; one of them 0 is unset, and the other plants.
+        let mut m = base();
+        m.insert(env::COMPOSITOR_DRIVERS, mode.to_owned());
+        m.insert(hold, "12000".to_owned());
+        m.insert(hang, "12000".to_owned());
+        assert_eq!(
+            parse(&m, true).expect_err("both"),
+            EnvError::Invalid(hang),
+            "{mode}"
+        );
+        m.insert(hang, "0".to_owned());
+        assert_eq!(
+            parse(&m, true).unwrap().hooks.sink_stall,
+            Some((Hold, 12_000)),
+            "{mode}"
+        );
+        checked += 2;
+    }
+    eprintln!("sink-stall values checked: {checked}");
+    assert_eq!(checked, 2 * (2 * (1 + 4 + 7) + 2), "anti-vacuity");
+}
+
+/// Owed 94: a build without the feature does not read the sink-stall keys at all, so values it would
+/// refuse parse, and nothing is armed.
+#[cfg(not(feature = "test-hooks"))]
+#[test]
+fn test_hook_sink_stall_is_not_read_without_the_feature() {
+    let mut checked = 0;
+    for v in ["12000", "ten"] {
+        let mut m = base();
+        m.insert("COMPOSITOR_TEST_HOLD_SINK_AFTER_MS", v.to_owned());
+        m.insert("COMPOSITOR_TEST_HANG_SINK_AFTER_MS", v.to_owned());
+        let e = parse(&m, true).unwrap_or_else(|err| panic!("{v:?} refused: {err}"));
+        assert_eq!(e.hooks, env::TestHooks::default(), "{v:?}");
+        checked += 1;
+    }
+    assert_eq!(checked, 2, "anti-vacuity");
+}
