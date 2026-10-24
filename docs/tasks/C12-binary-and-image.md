@@ -60,7 +60,7 @@ records whether it works). CEF children get `1000` (C11).
 |---|---|
 | `cpu_pct` | `/proc/self/stat` + children (`utime+stime` delta ÷ wall delta ÷ ncpu × 100), summed over the process tree |
 | `mem_mb` | sum of `VmRSS` over the tree |
-| `fps`, `bitrate_kbps`, `egress_bytes`, `encoder_speed` | `adapters::stats::Stats::snapshot()`, shared as `Arc<Stats>`. C09 defines and tests every field's arithmetic; C12 only wires the `Arc` into `ProcMetrics`. A field C09 reports as `None` stays absent on the wire. |
+| `fps`, `bitrate_kbps`, `egress_bytes`, `encoder_speed` | `adapters::stats::Stats::snapshot()`, shared as `Arc<Stats>` (amended 2026-10-24, Owed 86: `fps` is `BeatRate` over the snapshot's `encoded_frames`, see the amendment of that date). C09 defines and tests every field's arithmetic; C12 only wires the `Arc` into `ProcMetrics`. A field C09 reports as `None` stays absent on the wire. |
 | `measured_latency_ms` | **None** in R2 (needs SEI; F-003). Omitted, never 0. |
 
 The first sample after start returns `cpu_pct: None`, because there's no delta yet.
@@ -298,6 +298,15 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
   --restarts 6`, each kind twice, every restart made whatever an earlier check found, exactly 6 checked or a failure).
   `start_xvfb` (`docker/xvfb.sh`) is ready only on Xvfb's own `-displayfd` line, logs `Xvfb ready after N ms`, and
   fails at once (70) on an Xvfb that exits first or names another display (`scripts/xvfb_start_test.py`, check.yml).
+- (Amended 2026-10-24, Owed 86) `ProcMetrics::sample`'s `fps` is the programme's real output rate: the frames out of
+  the encoder since the last sample over the wall time since it (`adapters::stats::BeatRate`), `None` on the first
+  sample and while `encoded_frames` is absent, the last reading again on a sample under `OUTPUT_FPS_MIN_WINDOW_MS`
+  (2.5 s, half the beat) after it, and `None` on a lower total, which opens a new window; the counters are read
+  before the `/proc` walk. `metrics_proc.rs`'s
+  `the_beats_fps_is_the_frames_out_of_the_encoder_over_the_beat_window` (a real `Stats`, real windows past the
+  minimum) and
+  `wiring.rs`'s `the_real_output_fps_reaches_the_log_and_the_beat_through_the_real_sampler` pass, and the nominal
+  fps put in `BeatRate` or in `ProcMetrics` goes red on both.
 
 
 ## Final heartbeat with the exit reason (owner ruling 2026-10-15)
@@ -841,6 +850,23 @@ removal is gone.)
 - **Fly:** its docs say a restart wipes the ephemeral file system (`persist_rootfs` defaults to `never`, and web sets
   none; cited, not measured across an `on-failure` restart: F-018's correction), so the change is a no-op there; it is
   owed to any host whose restart keeps the writable layer (ADR 0007 item 5's Docker equivalent).
+
+## Amendment 2026-10-24 (Owed 86: the honest beat)
+
+The coordinator's recommendation, approved by the owner 2026-10-24 (in chat, relayed by the
+coordinator: "Ok"): the beat reports the programme's REAL output frame rate, measured from the
+frames actually put out over the beat window and never the nominal configured fps, and raises a
+starvation alarm when it falls below a floor; the ladder does not change (`docs/_INDEX.md` Owed 86,
+decision log "Owed 86: the honest beat", where the floor, the clear level and the minimum window are
+recorded as the implementer's medium choices).
+`ProcMetrics` holds a `BeatRate` and samples it with `Stats::snapshot()`'s `encoded_frames` (C09's
+amendment of this date). The driver samples once a beat, so the window between two samples is the
+beat's: 5 s on the grid, and shorter only for the off-grid beats (the hold's first, the drain's), which
+repeat the last reading when they come under 2.5 s after it (half the beat: a catch-up burst can leave
+a short window 2 to 3 frames short, the PR #69 review's m4). The first sample after a start reads
+`None`: the window has one end, and the encoder's start-up is not a rate. The wire's `fps` key is
+unchanged; only what it carries is, sent to one decimal (`heartbeat_wire`, the PR #69 review's I2;
+Owed 91 is web's half).
 
 ## Do not touch
 

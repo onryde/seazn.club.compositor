@@ -127,6 +127,30 @@ pub struct Thresholds {
 /// not a `Thresholds` field, because `Thresholds` derives `Eq`. C09's band and C14 case 6 both read it.
 pub const ENCODER_SPEED_REALTIME_MIN: f64 = 0.95;
 
+/// Owed 86 (the owner's "Ok", 2026-10-24, in chat, relayed by the coordinator, to the coordinator's
+/// recommendation of a starvation alarm when the real output frame rate falls below a floor). The
+/// floor, as a share of the profile's `fps`: the encoder's real-time floor (`ENCODER_SPEED_REALTIME_MIN`,
+/// the C00 cost gate), read in frames rather than in PTS. No spec line or brief names a frame-rate
+/// floor for the beat, so this share is a coordinator-medium decision, recommended in the Owed 86 PR.
+/// `OutputProfile::fps_floor` applies it, and `crate::starvation` raises the alarm below it.
+pub const OUTPUT_FPS_FLOOR_SHARE: f64 = ENCODER_SPEED_REALTIME_MIN;
+
+/// Owed 86: the alarm's hysteresis. Once raised, it clears only on a beat at or above this share of
+/// the profile's `fps`: C00 Step 4's gate (`fps ≥ 29.5` for its 30 fps page), which C14 cases 6 and
+/// 10 also hold (`fps_mean ≥ 29.5`, "the clock holds"). Between the floor and this level the alarm
+/// keeps its state, so a rate hovering at the floor does not raise and clear on alternate beats.
+pub const OUTPUT_FPS_RECOVERED_SHARE: f64 = 29.5 / 30.0;
+
+/// Owed 86: the shortest window the output's frame rate is read over, half the spec's 5 s beat
+/// (§5.3). The first build took `ENCODER_SPEED_REALTIME_MIN`'s 1 s, which covers only the one-frame
+/// quantum; the PR #69 review's m4 found an off-grid beat (the hold's first, the drain's) can close a
+/// window just after the driver's catch-up burst, 2 to 3 frames short, which over 1 s reads 27 to 28,
+/// under the floor on a healthy clock. Over 2.5 s, 3 frames short reads 28.8 (a 4th reads 28.4). A
+/// beat sooner than this after the last reading repeats that reading and leaves the window open, so
+/// the next beat reads over all of it (with a shorter bootstrap `heartbeatIntervalMs`, every other
+/// beat reads).
+pub const OUTPUT_FPS_MIN_WINDOW_MS: Ms = 2_500;
+
 /// F-004 (owner-observed; docs/_INDEX.md decision log, the C00 owner session): YouTube kept the
 /// organiser's broadcast through 5 s and 15 s output gaps and started a new broadcast after a 30 s
 /// one. So every recovery path the broadcast must survive finishes its output gap UNDER this. A const,
@@ -208,6 +232,18 @@ impl OutputProfile {
 
     pub fn frame_period_ms(&self) -> f64 {
         1_000.0 / f64::from(self.fps)
+    }
+
+    /// Owed 86: the real output frame rate below which the output is starved
+    /// (`OUTPUT_FPS_FLOOR_SHARE` of this profile's `fps`).
+    pub fn fps_floor(&self) -> f64 {
+        f64::from(self.fps) * OUTPUT_FPS_FLOOR_SHARE
+    }
+
+    /// Owed 86: the real output frame rate at or above which a raised starvation alarm clears
+    /// (`OUTPUT_FPS_RECOVERED_SHARE` of this profile's `fps`).
+    pub fn fps_recovered(&self) -> f64 {
+        f64::from(self.fps) * OUTPUT_FPS_RECOVERED_SHARE
     }
 }
 
@@ -445,5 +481,84 @@ mod tests {
         assert!((floor - 0.95).abs() < 1e-12, "C00 gate, got {floor}");
         assert!(29.0 / 30.0 >= floor, "a 29-frame second fails a {floor} floor");
         assert!(0.9963 >= floor, "F-005's worst window fails a {floor} floor");
+    }
+
+    // Owed 86, each share against its source: the floor is the C00 cost gate's 0.95 (the encoder's
+    // real-time floor, read in frames), and the recovery level is C00 Step 4's `fps ≥ 29.5` for its
+    // 30 fps page, which C14 cases 6 and 10 also hold (`fps_mean ≥ 29.5`). At ADR 0005's 30 fps that
+    // is 28.5 and 29.5 in both modes.
+    #[test]
+    fn the_output_fps_floor_and_recovery_match_their_sources() {
+        assert!((OUTPUT_FPS_FLOOR_SHARE - 0.95).abs() < 1e-12, "C00 cost gate");
+        assert!(
+            (OUTPUT_FPS_RECOVERED_SHARE - 29.5 / 30.0).abs() < 1e-12,
+            "C00 Step 4"
+        );
+        for p in BOTH_MODES {
+            assert!((p.fps_floor() - 28.5).abs() < 1e-9, "{p:?}: {}", p.fps_floor());
+            assert!(
+                (p.fps_recovered() - 29.5).abs() < 1e-9,
+                "{p:?}: {}",
+                p.fps_recovered()
+            );
+        }
+    }
+
+    // Owed 86: a band, not a line. The floor is under the recovery level, which is under the profile's
+    // own rate, so a healthy clock clears the alarm and a rate between the two keeps its state.
+    #[test]
+    fn the_starvation_band_lies_below_the_profiles_rate() {
+        for p in BOTH_MODES {
+            let fps = f64::from(p.fps);
+            assert!(
+                p.fps_floor() < p.fps_recovered(),
+                "{p:?}: no band between floor and recovery"
+            );
+            assert!(p.fps_recovered() < fps, "{p:?}: a healthy clock never clears");
+        }
+    }
+
+    // Owed 86 (the PR #69 review's m4): the minimum window is half the spec's beat (§5.3). An off-grid
+    // beat (the hold's first, the drain's) can close a window just after the driver's catch-up burst,
+    // the review's 2 to 3 frames short. Over the minimum, a healthy clock 3 frames short still passes
+    // the floor; over the first build's 1 s window it fails it, so the minimum is what keeps a healthy
+    // clock unalarmed. And over the 5 s beat, one frame short, a healthy clock reaches the recovery
+    // level, so the alarm clears on a healthy beat.
+    #[test]
+    fn the_minimum_window_keeps_a_healthy_clock_above_the_floor() {
+        // The PR #69 review's m4: a catch-up burst leaves an off-grid window 2 to 3 frames short.
+        const CATCH_UP_SHORT: f64 = 3.0;
+        const FIRST_BUILD_WINDOW_MS: f64 = 1_000.0;
+        let t = Thresholds::default();
+        let beat = t.heartbeat_interval_ms as f64;
+        assert_eq!(beat, 5_000.0, "spec §5.3");
+        assert_eq!(
+            OUTPUT_FPS_MIN_WINDOW_MS * 2,
+            t.heartbeat_interval_ms,
+            "half the spec's beat"
+        );
+        let mut checked = 0;
+        for p in BOTH_MODES {
+            let fps = f64::from(p.fps);
+            let short_by =
+                |frames: f64, window_ms: f64| (fps * window_ms / 1_000.0 - frames) * 1_000.0 / window_ms;
+            let min = OUTPUT_FPS_MIN_WINDOW_MS as f64;
+            assert!(
+                short_by(CATCH_UP_SHORT, min) >= p.fps_floor(),
+                "{p:?}: {} over the minimum",
+                short_by(CATCH_UP_SHORT, min)
+            );
+            assert!(
+                short_by(CATCH_UP_SHORT, FIRST_BUILD_WINDOW_MS) < p.fps_floor(),
+                "{p:?}: 1 s passes too, so the minimum is not the bound"
+            );
+            assert!(
+                short_by(1.0, beat) >= p.fps_recovered(),
+                "{p:?}: a healthy beat {} never clears",
+                short_by(1.0, beat)
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, BOTH_MODES.len());
     }
 }
