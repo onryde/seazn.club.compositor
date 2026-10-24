@@ -14,7 +14,13 @@
 # stop. Run 6 (page=real) fails in the page source after its signing key reached /out: the error
 # path's scan names it before anything is fetched. Run 7 (page=real) fails the same way with a jar
 # that also holds a cookie the scan was never told about (planted in /out) and a short one, and the
-# session cookie planted: three leaks by name, the inert cookies named as not scanned.
+# session cookie planted: three leaks by name, the inert cookies named as not scanned. Run 8
+# (page=real) finishes with a jar of inert cookies only: the strict scan has no cookie to scan with
+# and fails by name (WEB_COOKIES), never passes on nothing. Runs 9 and 10 are cost legs B and C
+# (SOAK_LEG): the leg's session fixture (720p, 1080p), sport and template reach the page source and
+# fake-control, the camera's size follows the output, no dropout or disconnect is scheduled, the
+# leg's score driver runs at its pace (rally.mjs every 3 s; score.mjs --boundaries every 6 s), and
+# done names the leg and its stills. Runs 11 and 12 refuse an unknown leg and a leg on page=test.
 #
 #   HARNESS_BASH=<bash 5> harness/soak/test-driver.sh     (driver.sh needs bash 5: mapfile, EPOCHREALTIME)
 #
@@ -35,7 +41,7 @@ trap cleanup EXIT
 # The driver's files, as the image lays them out, with a compressed schedule.
 mkdir -p "$W/soak/pages" "$W/out" "$W/bin" "$W/state"
 cp "$HERE/driver.sh" "$HERE/schedule.jq" "$HERE/mediamtx.yml" "$HERE/sampler.py" "$W/soak/"
-cp "$ROOT/contracts/fixtures/relay-job.v1/session-composed-720p.json" "$W/soak/"
+cp "$ROOT/contracts/fixtures/relay-job.v1/session-composed-720p.json" "$ROOT/contracts/fixtures/relay-job.v1/session-composed-1080p.json" "$W/soak/"
 cp "$ROOT/harness/pages/overlay-test.html" "$W/soak/pages/"
 jq '. + {min_drive_min: 1, dropout_every_s: 6, dropout_phase_s: 3, dropout_pause_s: 1, disconnect_hold_s: 2,
          control_wait_s: 3, live_wait_s: 20, end_wait_s: 10, log_wait_s: 20, lost_beats_end_s: 5,
@@ -143,12 +149,16 @@ cat >"$W/soak/web/up.sh" <<'STUB'
 # The stub page source: the files the real up.sh leaves, with random credentials.
 set -euo pipefail
 echo "up.sh $(env | cut -d= -f1 | sort | tr '\n' ' ')" >>"$STATE/calls"
+echo "up.sh-leg sport=${WEB_SPORT:-} template=${WEB_TEMPLATE:-} delay=${WEB_DELAY_MS:-}" >>"$STATE/calls"
 mkdir -p "$WEB_STATE"; chmod 700 "$WEB_STATE"
 r() { od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; }
 r >"$WEB_STATE/auth-secret"
 # The jar as the web leaves it: the session, the org, and the signed-in hint, whose value is "1"
 # (rehearsal 40131252539 read that "1" as a leak in every file).
-if [ -e "$STATE/jar-extra" ]; then
+if [ -e "$STATE/jar-inert" ]; then
+  # Only the inert cookies (soak.json's web_cookies_inert): nothing in the jar to scan with.
+  printf '{"seazn_org":"%s","seazn_signed_in":"1"}' "org$(r)" >"$WEB_STATE/cookies.json"
+elif [ -e "$STATE/jar-extra" ]; then
   # A cookie no list names (a credential the web might add) and a short one.
   printf '{"seazn_session":"%s","seazn_org":"%s","seazn_signed_in":"1","seazn_future":"fut%s","seazn_lang":"en"}' \
     "ses$(r)" "org$(r)" "$(r)" >"$WEB_STATE/cookies.json"
@@ -162,9 +172,9 @@ fi
 # A page source that fails before the signed URL.
 if [ -e "$STATE/web-fail" ]; then echo "soak-web: FAIL (stub)"; exit 1; fi
 st="eyJ$(r).eyJ$(r).$(r)"
-printf 'http://%s:%s/overlay/fixtures/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee?sid=%s&st=%s&host=compositor&delay=%s&template=bar\n' \
-  "$HOST" "$WEB_PORT" "$SESSION_ID" "$st" "$WEB_DELAY_MS" >"$WEB_STATE/overlay-url"
-echo '{"cricket":{"fixture_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}}' >"$OUT/seed.json"
+printf 'http://%s:%s/overlay/fixtures/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee?sid=%s&st=%s&host=compositor&delay=%s&template=%s\n' \
+  "$HOST" "$WEB_PORT" "$SESSION_ID" "$st" "$WEB_DELAY_MS" "${WEB_TEMPLATE:-bar}" >"$WEB_STATE/overlay-url"
+echo '{"cricket":{"fixture_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"},"badminton":{"fixture_id":"bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"}}' >"$OUT/seed.json"
 sleep 300 &
 echo "$!" >"$WEB_STATE/server.pid"
 [ ! -e "$STATE/leak" ] || echo "GET /overlay?st=$st" >>"$OUT/web.log"
@@ -184,6 +194,7 @@ while (!stop && Date.now() < Number(a("until-ms"))) {
 }
 console.log(`score: ${seq - 1} attempts`);
 STUB
+sed 's/score\.mjs /rally.mjs /; s/The stub score driver/The stub rally driver/' "$W/soak/web/score.mjs" >"$W/soak/web/rally.mjs"
 chmod +x "$W/soak/web/up.sh"
 stub_run() { # <out> <state>: the stub compositor and the stub job, for one run
   (
@@ -203,13 +214,13 @@ stub_run() { # <out> <state>: the stub compositor and the stub job, for one run
   ) &
   stub_pids="$stub_pids $!"
 }
-real_run() { # <n>: page=real, under the stub page source
+real_run() { # <n> [VAR=value...]: page=real, under the stub page source, with the extra environment
   local n="$1" t rc=0
   t="$(now_ms)"
   env -i PATH="$PATH_STUB" HOME="$W" STATE="$W/state$n" SOAK_ROOT="$W/soak" SOAK_OUT="$W/out$n" SOAK_WEB_STATE="$W/web$n" \
-    SESSION_ID="11111111-2222-4333-8444-55555555555$n" JOB_TOKEN="$JOB_TOKEN" SOAK_DRIVE_MIN=1 \
+    SESSION_ID="11111111-2222-4333-8444-5555555555$(printf '%02d' "$n")" JOB_TOKEN="$JOB_TOKEN" SOAK_DRIVE_MIN=1 \
     SOAK_DEADLINE_MS=$((t + 600000)) SOAK_HARD_STOP_MS=$((t + 100000)) SOAK_PAGE=real \
-    FLY_MACHINE_ID=m0 FLY_APP_NAME=soak-test "$BASH5" "$W/soak/driver.sh" >"$W/driver$n.out" 2>&1 || rc=$?
+    FLY_MACHINE_ID=m0 FLY_APP_NAME=soak-test "${@:2}" "$BASH5" "$W/soak/driver.sh" >"$W/driver$n.out" 2>&1 || rc=$?
   echo "$rc" >"$W/rc$n"
 }
 for n in 3 4; do mkdir -p "$W/out$n" "$W/state$n"; stub_run "$W/out$n" "$W/state$n"; done
@@ -217,6 +228,15 @@ touch "$W/state4/leak"
 real_run 3 &
 real_pids="$!"
 real_run 4 &
+real_pids="$real_pids $!"
+# Run 8: the inert-only jar. Runs 9 and 10: cost legs B (noise) and C (snow).
+for n in 8 9 10; do mkdir -p "$W/out$n" "$W/state$n"; stub_run "$W/out$n" "$W/state$n"; done
+touch "$W/state8/jar-inert"
+real_run 8 &
+real_pids="$real_pids $!"
+real_run 9 SOAK_LEG=B CAMERA_PATTERN=noise &
+real_pids="$real_pids $!"
+real_run 10 SOAK_LEG=C CAMERA_PATTERN=snow &
 real_pids="$real_pids $!"
 # Run 5: page=test, the checker hangs. Its start and end times recorded, against its hard stop.
 mkdir -p "$W/out5" "$W/state5"
@@ -435,10 +455,78 @@ if jq -r '.seazn_session, .seazn_future' "$W/web7/cookies.json" | grep -qF -f - 
   echo "FAIL jar: the report printed a cookie it found"; failures=$((failures + 1)); else
   echo "PASS jar: the report (the log, secrets.json) never prints a cookie"; fi
 
+# Run 8: a jar of inert cookies only. The strict scan has nothing to scan the jar with: it fails by
+# name, the inert cookies named as not scanned, and done is not ok.
+checked=$((checked + 1))
+if grep -q "FAIL WEB_COOKIES is empty: nothing to scan with" "$W/driver8.out" \
+  && grep -q "secrets: inert cookies not scanned (soak.json web_cookies_inert): seazn_org, seazn_signed_in" "$W/driver8.out"; then
+  echo "PASS inert jar: the strict scan fails WEB_COOKIES by name (nothing to scan with), the inert cookies named"
+else
+  echo "FAIL inert jar: no WEB_COOKIES line"; grep -E 'secrets|FAIL' "$W/driver8.out"; failures=$((failures + 1)); fi
+check "inert jar: secrets.json counts the leak, skips nothing" '.[0] | .scanned > 0 and .leaks == 1 and .skipped == []' "$W/out8/secrets.json"
+check "inert jar: done not ok, with the leak" '.[0] | .ok == false and .leaks == 1 and .checker_exit == 0' "$W/out8/done"
+
+# Runs 9 and 10: cost legs B (720p, bug on badminton, camera noise) and C (1080p, bar on cricket, snow).
+for n in 9 10; do
+  checked=$((checked + 1))
+  if [ "$(cat "$W/rc$n")" -eq 0 ]; then echo "PASS leg run $n: the driver exited 0"; else
+    echo "FAIL leg run $n: the driver exited $(cat "$W/rc$n")"; tail -n 20 "$W/driver$n.out"; failures=$((failures + 1)); fi
+done
+check "leg B: the page source gets badminton, bug, the 720p session's delay" \
+  ".[0] == \"up.sh-leg sport=badminton template=bug delay=$(jq -r .overlayDelayMs "$ROOT/contracts/fixtures/relay-job.v1/session-composed-720p.json")\"" \
+  <(grep '^up.sh-leg ' "$W/state9/calls" | jq -R .)
+check "leg C: the page source gets cricket, bar, the 1080p session's delay" \
+  ".[0] == \"up.sh-leg sport=cricket template=bar delay=$(jq -r .overlayDelayMs "$ROOT/contracts/fixtures/relay-job.v1/session-composed-1080p.json")\"" \
+  <(grep '^up.sh-leg ' "$W/state10/calls" | jq -R .)
+checkx "leg B: fake-control serves the 720p fixture's output on the badminton fixture" \
+  '(.[0]) as $s | $s.output == $want[0].output and $s.fixtureId == "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+   and ($s.overlayUrl | contains("template=bug"))' \
+  --slurpfile want "$ROOT/contracts/fixtures/relay-job.v1/session-composed-720p.json" "$W/web9/session.json"
+checkx "leg C: fake-control serves the 1080p fixture's output on the cricket fixture" \
+  '(.[0]) as $s | $s.output == $want[0].output and $s.output.height == 1080 and $s.fixtureId == "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"' \
+  --slurpfile want "$ROOT/contracts/fixtures/relay-job.v1/session-composed-1080p.json" "$W/web10/session.json"
+check "leg B: the camera at the output's size, its picture as asked" '.[0] | test("--size 1280x720 --pattern noise( |$)")' \
+  <(grep '^fake-camera ' "$W/state9/calls" | jq -R .)
+check "leg C: the camera at 1920x1080, snow" '.[0] | test("--size 1920x1080 --pattern snow( |$)")' \
+  <(grep '^fake-camera ' "$W/state10/calls" | jq -R .)
+check "leg B: no dropout or disconnect on a leg (the soak's schedule would hold some in this drive), one start and one end" \
+  '[.[] | .kind] == ["start", "end"]' "$W/out9/actions.jsonl"
+checked=$((checked + 1))
+if grep -q '^rally.mjs .*--every-s 3 --until-ms [0-9]\{13\} ' "$W/state9/calls" && ! grep -q '^score.mjs ' "$W/state9/calls" \
+  && grep -q '^score.mjs .*--every-s 6 --boundaries --until-ms [0-9]\{13\} ' "$W/state10/calls" && ! grep -q '^rally.mjs ' "$W/state10/calls"; then
+  echo "PASS legs: badminton's rally driver every cost_rally_every_s (3), cricket's boundaries every cost_ball_every_s (6)"
+else
+  echo "FAIL legs: the score drivers"; grep -hE '^(score|rally)\.mjs' "$W/state9/calls" "$W/state10/calls"; failures=$((failures + 1)); fi
+check "leg B: done ok, naming the leg and its stills' exit (no recordings here: none written, 1)" \
+  '.[0] | .ok and .leg == "B" and .stills_exit == 1 and .checker_exit == 0' "$W/out9/done"
+checked=$((checked + 1))
+if grep -q "cost leg B (bug on badminton, session-composed-720p.json)" "$W/driver9.out" && grep -q "stills: 0 written" "$W/out9/stills.log"; then
+  echo "PASS leg B: the boot line names the leg; the stills were tried at the leg's instants"
+else
+  echo "FAIL leg B: the boot or stills line"; grep -E 'boot|stills' "$W/driver9.out"; failures=$((failures + 1)); fi
+check "the soak names no leg in done" '.[0] | has("leg") | not' "$W/out3/done"
+# Runs 11 and 12: an unknown leg, and a leg on page=test, refused before anything starts.
+for case in "11 E real" "12 A test"; do
+  set -- $case
+  rc=0
+  env -i PATH="$PATH_STUB" HOME="$W" STATE="$W/state$1" SOAK_ROOT="$W/soak" SOAK_OUT="$W/out$1" SOAK_WEB_STATE="$W/web$1" \
+    SESSION_ID="11111111-2222-4333-8444-5555555555$1" JOB_TOKEN="$JOB_TOKEN" SOAK_DRIVE_MIN=1 SOAK_DEADLINE_MS=1 \
+    SOAK_HARD_STOP_MS=1 SOAK_PAGE="$3" SOAK_LEG="$2" FLY_MACHINE_ID=m0 FLY_APP_NAME=soak-test \
+    "$BASH5" "$W/soak/driver.sh" >"$W/driver$1.out" 2>&1 || rc=$?
+  echo "$rc" >"$W/rc$1"
+done
+checked=$((checked + 1))
+if [ "$(cat "$W/rc11")" -eq 64 ] && grep -q "FAIL SOAK_LEG 'E' is not one of soak.json's legs" "$W/driver11.out" \
+  && [ "$(cat "$W/rc12")" -eq 64 ] && grep -q "FAIL a cost leg runs on the production page (SOAK_PAGE=real)" "$W/driver12.out"; then
+  echo "PASS legs: an unknown leg and a leg on page=test are refused (64), by name"
+else
+  echo "FAIL legs: the refusals"; tail -n 3 "$W/driver11.out" "$W/driver12.out"; failures=$((failures + 1)); fi
+
 checked=$((checked + 1))
 if printf '%s\n' "$JOB_TOKEN" | grep -rqF -f - "$W/out" "$W/out2" "$W/out3" "$W/out4" "$W/out5" "$W/out6" "$W/driver.out" "$W/driver2.out" \
   "$W/driver3.out" "$W/driver4.out" "$W/driver5.out" "$W/driver6.out" "$W/driver7.out" "$W/out7" "$STATE/calls" "$W/state3/calls" \
-  "$W/state4/calls" "$W/state5/calls" "$W/state6/calls" "$W/state7/calls"; then
+  "$W/state4/calls" "$W/state5/calls" "$W/state6/calls" "$W/state7/calls" "$W/out8" "$W/out9" "$W/out10" "$W/driver8.out" \
+  "$W/driver9.out" "$W/driver10.out" "$W/driver11.out" "$W/driver12.out" "$W/state8/calls" "$W/state9/calls" "$W/state10/calls"; then
   echo "FAIL the job token reached a file"
   failures=$((failures + 1))
 else

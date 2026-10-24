@@ -16,6 +16,8 @@
 # programme segment); the floor (median band difference) near zero where on air. Then: an all-noise
 # camera has no stable band (every sample an error, never on air), a programme 8 luma brighter than
 # the camera with no bar is a level shift (never on air), and a run with no start action is refused.
+# Last, the cost legs' stills: a JPEG at each asked instant, taken at that instant, a missed one where
+# there is no segment, and the refusals.
 #
 #   harness/soak/test-sampler.sh        (needs ffmpeg and python3; prints `checked: N`)
 set -euo pipefail
@@ -91,6 +93,38 @@ rc=0
 python3 -I "$HERE/sampler.py" --programme "$W/prog" --camera "$W/cam" --actions "$W/nostart.jsonl" --soak "$W/soak.json" \
   --out "$W/x.jsonl" >/dev/null 2>&1 || rc=$?
 [ "$rc" -eq 1 ] && pass "no start action: refused" || fail "no start action" "exit $rc"
+
+# The cost legs' stills (--stills/--still-at): a JPEG at each instant, at the programme's own size,
+# taken at that instant (the bar shows at 5 s and is gone at 15 s: its region's mean luma says so),
+# and a missed one where there is no segment (30-40 s).
+luma() { # <jpeg>: the mean luma of the bar's region, 0-255
+  ffmpeg -v error -nostdin -i "$1" -vf "crop=400:40:440:560,scale=1:1:flags=area" -f rawvideo -pix_fmt gray - | od -An -tu1 | tr -d ' \n'
+}
+rc=0
+python3 -I "$HERE/sampler.py" --programme "$W/prog" --soak "$W/soak.json" --stills "$W/stills" \
+  --still-at "bar:$((t0 + 5000)),nobar:$((t0 + 15000)),gone:$((t0 + 35000))" >"$W/stills.out" 2>&1 || rc=$?
+n_jpg=$(find "$W/stills" -name '*.jpg' | wc -l | tr -d ' ')
+if [ "$rc" -eq 0 ] && [ "$n_jpg" -eq 2 ] && grep -qx 'stills: 2 written' "$W/stills.out" \
+  && grep -qF "stills: gone at $((t0 + 35000)): missed (no segment)" "$W/stills.out"; then
+  pass "stills: 2 of 3 written (exit 0), the one with no segment named missed"
+else fail "stills: the run" "exit $rc, $n_jpg jpg: $(cat "$W/stills.out")"; fi
+dims="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height -of csv=p=0 "$W/stills/bar-$((t0 + 5000)).jpg" 2>/dev/null || true)"
+[ "$dims" = "mjpeg,1280,720" ] && pass "stills: a JPEG at the programme's size (1280x720)" || fail "stills: the format" "$dims"
+on="$(luma "$W/stills/bar-$((t0 + 5000)).jpg" 2>/dev/null || echo x)" off="$(luma "$W/stills/nobar-$((t0 + 15000)).jpg" 2>/dev/null || echo x)"
+[[ "$on" =~ ^[0-9]+$ && "$off" =~ ^[0-9]+$ ]] && [ "$on" -gt 100 ] && [ "$off" -lt 40 ] \
+  && pass "stills: each at its instant (the bar's region reads $on with the bar at 5 s, $off without it at 15 s)" \
+  || fail "stills: the instants" "bar $on, no bar $off"
+rc=0
+python3 -I "$HERE/sampler.py" --programme "$W/prog" --soak "$W/soak.json" --stills "$W/stills2" --still-at "gone:$((t0 + 35000))" \
+  >"$W/stills2.out" 2>&1 || rc=$?
+[ "$rc" -eq 1 ] && grep -qx 'stills: 0 written' "$W/stills2.out" && pass "stills: none written is exit 1" || fail "stills: none written" "exit $rc"
+rc=0
+python3 -I "$HERE/sampler.py" --programme "$W/prog" --soak "$W/soak.json" --stills "$W/stills3" --still-at "Bad:$t0" >"$W/stills3.out" 2>&1 || rc=$?
+[ "$rc" -eq 64 ] && grep -qF 'stills: FAIL bad instant' "$W/stills3.out" && pass "stills: a bad instant is refused (64)" || fail "stills: a bad instant" "exit $rc"
+rc=0
+python3 -I "$HERE/sampler.py" --programme "$W/prog" --soak "$W/soak.json" --stills "$W/stills4" >"$W/stills4.out" 2>&1 || rc=$?
+[ "$rc" -eq 2 ] && grep -qF -- '--stills and --still-at go together' "$W/stills4.out" && pass "stills: --stills without --still-at is a usage error" \
+  || fail "stills: the pair" "exit $rc"
 
 echo "checked: $checked, $failures failures"
 [ "$checked" -gt 0 ] && [ "$failures" -eq 0 ]

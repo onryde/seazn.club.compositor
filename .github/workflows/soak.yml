@@ -1,6 +1,6 @@
 name: soak
 # The run list reads what the run can prove: a page=test run is PLUMBING ONLY, never a soak pass.
-run-name: soak page=${{ inputs.page }} ${{ inputs.minutes }} min${{ inputs.page == 'test' && ' (PLUMBING ONLY)' || '' }}
+run-name: ${{ inputs.legs != '' && format('cost legs {0} on {1}, {2} min', inputs.legs, inputs.guest, inputs.minutes) || format('soak page={0} {1} min{2}{3}', inputs.page, inputs.minutes, inputs.page == 'test' && ' (PLUMBING ONLY)' || '', inputs.guest != 'performance-4x' && format(' on {0}', inputs.guest) || '') }}
 # The soak (C15, docs/tasks/C15-soak.md, spec 9.5): the real relay image on the production guest, as
 # one Fly Machine, against a harness Machine beside it (harness/soak: MediaMTX, fake-camera,
 # fake-control, the checker and driver.sh), in the dedicated app seazn-relay-soak. This job drives
@@ -10,6 +10,18 @@ run-name: soak page=${{ inputs.page }} ${{ inputs.minutes }} min${{ inputs.page 
 #
 #   gh workflow run soak.yml --ref <branch> -f minutes=30 -f sha=<40-hex head>     (the rehearsal)
 #   gh workflow run soak.yml --ref <branch> -f sha=<40-hex head>                   (the 3 h soak)
+#   gh workflow run soak.yml --ref <branch> -f page=real -f minutes=16 -f legs=A:snow,A:noise   (the cost
+#     legs' picture, once each on the production guest)
+#   gh workflow run soak.yml --ref <branch> -f page=real -f minutes=16 -f legs=A,B,C,D -f camera=<heavier>
+#     [-f guest=performance-8x]                                                      (the cost legs)
+#
+# legs (C15's cost legs, harness/soak/cost): one job per leg, one at a time (max-parallel 1, since each
+# destroys every Machine in the app at its end), each its own pair of Machines: soak.json's legs
+# (720p or 1080p, bar on cricket or bug on badminton), no dropout or disconnect, a sampler a second on
+# the compositor Machine and one renderer kill at the drive's midpoint (cost/leg.sh), judged by the
+# size rule (cost/verdict.sh) and tabled by the cost-table job in F-005's shape. guest moves the
+# compositor Machine to another performance size (soak.json's compositor_guest), for the legs or the
+# soak: the size rule's next step is performance-8x.
 #
 # page=test (the default) serves C14's overlay-test.html: PLUMBING ONLY. Checks (a) to (d) read
 # pending, and the run's best verdict is "plumbing", never "pass". page=real points the compositor
@@ -42,10 +54,19 @@ on:
         # onryde/seazn.club main, 2026-10-24: R2005 (#982, e0608604c5) and R2007 PR A (#974) in.
         default: "7dcb3c42e23eb44ef69d7c564d4e9e0c5970d569"
       camera:
-        description: "fake-camera's picture"
+        description: "fake-camera's picture (a cost leg's default: snow or noise)"
         type: choice
         options: [ball, snow, noise]
         default: ball
+      legs:
+        description: "Cost legs instead of the soak (page=real): A,B,C,D, each optionally :snow or :noise (else camera). Empty: the soak"
+        required: false
+        default: ""
+      guest:
+        description: "The compositor Machine's guest (soak.json compositor_guest; production's is performance-4x)"
+        type: choice
+        options: [performance-4x, performance-8x]
+        default: performance-4x
 permissions: { contents: read }
 concurrency:
   # One soak at a time: the cleanup destroys every Machine in the app, and a second run's would be
@@ -70,6 +91,10 @@ jobs:
       web_sha: ${{ steps.args.outputs.web_sha }}
       drive: ${{ steps.plan.outputs.drive }}
       timeout: ${{ steps.plan.outputs.timeout }}
+      runs: ${{ steps.runs.outputs.runs }}
+      mode: ${{ steps.runs.outputs.mode }}
+      c_cpus: ${{ steps.runs.outputs.c_cpus }}
+      c_mem: ${{ steps.runs.outputs.c_mem }}
     steps:
       - name: The Fly token
         id: gate
@@ -103,16 +128,54 @@ jobs:
         with:
           ref: ${{ steps.args.outputs.sha }}
       # GitHub's expressions have no arithmetic: the numbers are made here, from soak.json.
+      # The soak, or one run per cost leg: [{leg, camera}] for the soak job's matrix ({leg: ""} is the
+      # soak), and the compositor's guest.
+      - name: The runs
+        id: runs
+        env:
+          LEGS: ${{ inputs.legs }}
+          CAMERA: ${{ inputs.camera }}
+          PAGE: ${{ inputs.page }}
+          GUEST: ${{ inputs.guest }}
+        run: |
+          s=harness/soak/soak.json
+          jq -e --arg g "$GUEST" '.compositor_guest | has($g)' "$s" > /dev/null || { echo "::error::guest '$GUEST' is not in soak.json's compositor_guest"; exit 1; }
+          echo "c_cpus=$(jq -r --arg g "$GUEST" '.compositor_guest[$g].cpus' "$s")" >> "$GITHUB_OUTPUT"
+          echo "c_mem=$(jq -r --arg g "$GUEST" '.compositor_guest[$g].memory_mb' "$s")" >> "$GITHUB_OUTPUT"
+          if [ -z "$LEGS" ]; then
+            echo "mode=soak" >> "$GITHUB_OUTPUT"
+            echo "runs=$(jq -cn --arg c "$CAMERA" '[{leg: "", camera: $c}]')" >> "$GITHUB_OUTPUT"
+            echo "the soak, camera $CAMERA, compositor on $GUEST"
+            exit 0
+          fi
+          [ "$PAGE" = real ] || { echo "::error::the cost legs run the production page: page=real"; exit 1; }
+          runs="$(LEGS="$LEGS" jq -cn --slurpfile s "$s" --arg c "$CAMERA" '
+            $s[0] as $s | $ENV.LEGS | split(",") | map(
+              capture("^(?<leg>[A-Z])(:(?<camera>[a-z]+))?$") // error("legs: \(.) is not <leg>[:<camera>]")
+              | .camera //= $c
+              | . as $r
+              | if ($s.legs | has($r.leg)) | not then error("legs: no leg \($r.leg) in soak.json")
+                elif ($s.leg_cameras | index($r.camera)) == null then error("legs: camera \($r.camera) for leg \($r.leg): one of \($s.leg_cameras | join(", "))")
+                else {leg, camera} end)
+            | if length != (unique | length) then error("legs: a leg and camera twice") else . end')" \
+            || { echo "::error::legs '$LEGS': each A to D, optionally :snow or :noise, no repeat (camera $CAMERA)"; exit 1; }
+          echo "mode=legs" >> "$GITHUB_OUTPUT"
+          echo "runs=$runs" >> "$GITHUB_OUTPUT"
+          echo "cost legs $runs, compositor on $GUEST"
       - name: The run's numbers
         id: plan
         env:
           MINUTES: ${{ inputs.minutes }}
+          LEGS: ${{ inputs.legs }}
         run: |
           s=harness/soak/soak.json
           drive=$((10#$MINUTES - $(jq -r .deadline_margin_min "$s")))
           timeout=$((10#$MINUTES + $(jq -r .timeout_after_min "$s")))
-          min=$(jq -r .min_drive_min "$s")
-          [ "$drive" -ge "$min" ] || { echo "::error::a $MINUTES-minute run drives $drive min, under soak.json's min_drive_min ($min)"; exit 1; }
+          # A cost leg drives at least leg_min_drive_min (the brief's 10 minutes); the soak min_drive_min.
+          key=min_drive_min
+          [ -z "$LEGS" ] || key=leg_min_drive_min
+          min=$(jq -r ".$key" "$s")
+          [ "$drive" -ge "$min" ] || { echo "::error::a $MINUTES-minute run drives $drive min, under soak.json's $key ($min)"; exit 1; }
           # GitHub's job cap is 360 minutes.
           [ "$timeout" -le 350 ] || { echo "::error::minutes + $(jq -r .timeout_after_min "$s") is $timeout, over the job cap"; exit 1; }
           echo "drive=$drive" >> "$GITHUB_OUTPUT"
@@ -356,6 +419,14 @@ jobs:
     # Explicit: a skipped web job (page=test) upstream of images must not skip this one.
     if: >-
       !cancelled() && needs.plan.outputs.enabled == 'true' && needs.images.result == 'success'
+    name: ${{ matrix.run.leg == '' && 'soak' || format('cost leg {0} ({1})', matrix.run.leg, matrix.run.camera) }}
+    # The soak is one run; the cost legs one each, never two at once: each run's cleanup destroys
+    # every Machine in the app.
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        run: ${{ fromJSON(needs.plan.outputs.runs) }}
     runs-on: ubuntu-24.04
     # minutes + soak.json's timeout_after_min (40), made by the plan job.
     timeout-minutes: ${{ fromJSON(needs.plan.outputs.timeout) }}
@@ -364,7 +435,11 @@ jobs:
       MINUTES: ${{ inputs.minutes }}
       DRIVE_MIN: ${{ needs.plan.outputs.drive }}
       PAGE: ${{ inputs.page }}
-      CAMERA: ${{ inputs.camera }}
+      CAMERA: ${{ matrix.run.camera }}
+      LEG: ${{ matrix.run.leg }}
+      GUEST: ${{ inputs.guest }}
+      C_CPUS: ${{ needs.plan.outputs.c_cpus }}
+      C_MEM: ${{ needs.plan.outputs.c_mem }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -379,8 +454,9 @@ jobs:
           mkdir -p "$RUNNER_TEMP/out"
 
       # The harness Machine first (the compositor fetches its session from it), then the compositor
-      # Machine, on the production guest. Both: --restart no (a restart would invalidate criterion 3;
-      # the soak reports it rather than hides it) and --rm (a Machine that exits is destroyed).
+      # Machine, on the guest asked for (the production guest unless guest says otherwise). Both:
+      # --restart no (a restart would invalidate criterion 3; the soak reports it rather than hides it)
+      # and --rm (a Machine that exits is destroyed). A cost leg then starts cost/leg.sh.
       - name: Launch the Machines
         id: launch
         env:
@@ -401,15 +477,18 @@ jobs:
           hard_stop_ms=$((now_ms + (10#$MINUTES + $(jq -r .hard_stop_after_min "$s")) * 60000))
           iso() { python3 -I -c 'import datetime,sys; print(datetime.datetime.fromtimestamp(int(sys.argv[1]) / 1000, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")' "$1"; }
           # The harness's image and guest by page: on page=real it also carries the web server and
-          # its Postgres (soak.json's harness_guest). The compositor's guest never changes.
+          # its Postgres (soak.json's harness_guest). The compositor's guest is the plan's (guest).
           h_image="registry.fly.io/$FLY_APP:harness-$SHA"
           [ "$PAGE" != real ] || h_image="registry.fly.io/$FLY_APP:harness-web-$SHA"
           h_cpus="$(jq -r --arg p "$PAGE" '.harness_guest[$p].cpus' "$s")"
           h_mem="$(jq -r --arg p "$PAGE" '.harness_guest[$p].memory_mb' "$s")"
           [[ "$h_cpus" =~ ^[0-9]+$ && "$h_mem" =~ ^[0-9]+$ ]] || { echo "::error::no harness_guest for page $PAGE"; exit 1; }
           echo "harness guest: performance-${h_cpus}x, $h_mem MB ($h_image)"
-          name_h="soak-harness-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          name_c="soak-compositor-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          leg_tag="${LEG:+-${LEG,,}-$CAMERA}"
+          name_h="soak-harness-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT$leg_tag"
+          name_c="soak-compositor-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT$leg_tag"
+          [[ "$C_CPUS" =~ ^[0-9]+$ && "$C_MEM" =~ ^[0-9]+$ ]] || { echo "::error::no compositor guest from the plan"; exit 1; }
+          echo "compositor guest: $GUEST ($C_CPUS CPUs, $C_MEM MB)${LEG:+; cost leg $LEG, camera $CAMERA}"
           echo "name_h=$name_h" >> "$GITHUB_OUTPUT"
           echo "name_c=$name_c" >> "$GITHUB_OUTPUT"
           # The configs: every value through jq's environment, never its argv.
@@ -419,7 +498,7 @@ jobs:
               guest: {cpu_kind: "performance", cpus: ($ENV.H_CPUS | tonumber), memory_mb: ($ENV.H_MEM | tonumber)},
               env: {SESSION_ID: $ENV.SESSION_ID, JOB_TOKEN: $ENV.JOB_TOKEN, SOAK_DRIVE_MIN: $ENV.DRIVE,
                     SOAK_DEADLINE_MS: $ENV.DEADLINE, SOAK_HARD_STOP_MS: $ENV.HARD_STOP,
-                    SOAK_PAGE: $ENV.PAGE, CAMERA_PATTERN: $ENV.CAMERA}}' \
+                    SOAK_PAGE: $ENV.PAGE, CAMERA_PATTERN: $ENV.CAMERA, SOAK_LEG: $ENV.LEG}}' \
             > "$RUNNER_TEMP/harness.machine.json"
           machine_id() {
             flyctl machine list -a "$FLY_APP" --json | jq -r --arg n "$1" '(. // [])[] | select(.name == $n) | .id' | head -n 1
@@ -466,12 +545,12 @@ jobs:
           echo "deadline_ms=$deadline_c_ms" >> "$GITHUB_OUTPUT"
           JOB_TOKEN="$job_token" SESSION_ID="$session_id" APP_URL="http://$host:7000" DEADLINE_AT="$deadline_at" jq -n '{
               auto_destroy: true, restart: {policy: "no"},
-              guest: {cpu_kind: "performance", cpus: 4, memory_mb: 8192},
+              guest: {cpu_kind: "performance", cpus: ($ENV.C_CPUS | tonumber), memory_mb: ($ENV.C_MEM | tonumber)},
               stop_config: {signal: "SIGTERM", timeout: "20s"},
               env: {COMPOSITOR_DRIVERS: "live", SESSION_ID: $ENV.SESSION_ID, JOB_TOKEN: $ENV.JOB_TOKEN,
                     APP_URL: $ENV.APP_URL, RELAY_DEADLINE_AT: $ENV.DEADLINE_AT}}' \
             > "$RUNNER_TEMP/compositor.machine.json"
-          run_machine "$name_c" "registry.fly.io/$FLY_APP:relay-$SHA" "$RUNNER_TEMP/compositor.machine.json" 4 8192 \
+          run_machine "$name_c" "registry.fly.io/$FLY_APP:relay-$SHA" "$RUNNER_TEMP/compositor.machine.json" "$C_CPUS" "$C_MEM" \
             || { tail -n 20 "$RUNNER_TEMP/$name_c.run.log"; exit 1; }
           cid="$(machine_id "$name_c")"
           [[ "$cid" =~ ^[0-9a-z]+$ ]] || { echo "::error::no compositor Machine id"; exit 1; }
@@ -482,6 +561,14 @@ jobs:
           setsid bash -c 'while :; do flyctl logs -a "$0" --machine "$1" --json; sleep 2; done' "$FLY_APP" "$cid" \
             >> "$RUNNER_TEMP/compositor.stream.json" 2>> "$RUNNER_TEMP/compositor.stream.err" < /dev/null &
           echo "$!" > "$RUNNER_TEMP/stream.pid"
+          # A cost leg's runner side (cost/leg.sh: the sampler a second on the compositor Machine, the
+          # renderer kill at the drive's midpoint), in its own process group, bounded by the hard stop.
+          if [ -n "$LEG" ]; then
+            setsid harness/soak/cost/leg.sh --app "$FLY_APP" --harness "$hid" --compositor "$cid" \
+              --out "$RUNNER_TEMP/out" --until-ms "$hard_stop_ms" < /dev/null > /dev/null 2>&1 &
+            echo "$!" > "$RUNNER_TEMP/leg.pid"
+            echo "cost leg $LEG: leg.sh started (its log: cost-leg.log)"
+          fi
 
       # The driver's status every minute, until /out/done or minutes + soak.json's poll_after_min. Once
       # the driver has ended the run (phase awaiting_log) and the compositor Machine has exited, its log
@@ -538,7 +625,8 @@ jobs:
           got=0
           for f in report.json actions.jsonl heartbeats.jsonl control-state.json timeline.json done status.json \
                    secrets.json ended overlay-samples.jsonl driver.log checker.log sampler.log fake-control.log \
-                   fake-camera.log mediamtx.log deliveries.jsonl score.log seed.json web-up.log web.log postgres.log; do
+                   fake-camera.log mediamtx.log deliveries.jsonl score.log seed.json web-up.log web.log postgres.log \
+                   stills.log stills.tar; do
             rm -f "$OUT/$f.part"
             if flyctl ssh sftp get "/out/$f" "$OUT/$f.part" -a "$FLY_APP" --machine "$HID" -q > /dev/null 2>> "$OUT/fetch.err"; then
               mv "$OUT/$f.part" "$OUT/$f"; got=$((got + 1))
@@ -601,6 +689,24 @@ jobs:
         run: |
           OUT="$RUNNER_TEMP/out"
           rc=0
+          # A cost leg is judged by the size rule (cost/verdict.sh), its F-005 column in the summary.
+          if [ -n "$LEG" ]; then
+            harness/soak/cost/verdict.sh --dir "$OUT" --leg "$LEG" --camera "$CAMERA" --guest "$GUEST" \
+              > "$OUT/cost.json" 2> "$OUT/cost.txt" || rc=$?
+            cat "$OUT/cost.txt"
+            status="$(jq -r '.status // "none"' "$OUT/cost.json" 2> /dev/null || echo none)"
+            echo "status=$status" >> "$GITHUB_OUTPUT"
+            {
+              echo "# cost leg $LEG: $status (camera $CAMERA, $GUEST, $DRIVE_MIN min drive)"
+              harness/soak/cost/table.sh "$OUT/cost.json" || echo "(no table)"
+              echo '```'; cat "$OUT/cost.txt"; echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            if ! jq -e '.ok and .checker_exit == 0 and .ended_early == null' "$OUT/done" > /dev/null 2>&1; then
+              echo "::error::the driver did not finish clean: $(jq -c . "$OUT/done" 2> /dev/null || echo 'no done')"
+              [ "$rc" -ne 0 ] || rc=1
+            fi
+            exit "$rc"
+          fi
           harness/soak/verdict.sh --dir "$OUT" --page "$PAGE" --drive-min "$DRIVE_MIN" > "$OUT/verdict.json" 2> "$OUT/verdict.txt" || rc=$?
           cat "$OUT/verdict.txt"
           status="$(jq -r '.status // "none"' "$OUT/verdict.json" 2> /dev/null || echo none)"
@@ -624,7 +730,7 @@ jobs:
         if: always() && steps.leaks.outputs.ok == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: soak-${{ github.run_id }}-${{ github.run_attempt }}
+          name: soak-${{ github.run_id }}-${{ github.run_attempt }}${{ matrix.run.leg != '' && format('-{0}-{1}', matrix.run.leg, matrix.run.camera) || '' }}
           path: ${{ runner.temp }}/out/
           if-no-files-found: error
           retention-days: 30
@@ -639,6 +745,7 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
         run: |
           [ ! -f "$RUNNER_TEMP/stream.pid" ] || kill -- "-$(cat "$RUNNER_TEMP/stream.pid")" 2> /dev/null || true
+          [ ! -f "$RUNNER_TEMP/leg.pid" ] || kill -- "-$(cat "$RUNNER_TEMP/leg.pid")" 2> /dev/null || true
           rm -f "$RUNNER_TEMP/job-token" "$RUNNER_TEMP"/*.machine.json
           if ! command -v flyctl > /dev/null; then
             curl -fsSL -o "$RUNNER_TEMP/flyctl.tgz" \
@@ -668,5 +775,30 @@ jobs:
           STATUS: ${{ steps.verdict.outputs.status }}
           WATCH: ${{ steps.watch.outcome }}
         run: |
-          echo "::error::the soak is red (verdict: ${STATUS:-not judged}, watch: ${WATCH:-not run})"
+          what=soak
+          [ -z "$LEG" ] || what="cost leg $LEG"
+          echo "::error::the $what is red (verdict: ${STATUS:-not judged}, watch: ${WATCH:-not run})"
           exit 1
+
+  # The cost legs' table: every leg's verdict (its artifact's cost.json) in one F-005-shaped table,
+  # for F-0xx "real overlay cost". A leg whose outputs were not uploaded (a leak) is missing from it.
+  cost-table:
+    needs: [plan, soak]
+    if: ${{ !cancelled() && needs.plan.outputs.mode == 'legs' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: soak-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/legs
+      - name: The cost table
+        env:
+          GUEST: ${{ inputs.guest }}
+        run: |
+          mapfile -t f < <(find "$RUNNER_TEMP/legs" -name cost.json | sort)
+          [ "${#f[@]}" -gt 0 ] || { echo "::error::no leg's verdict (cost.json) among the artifacts"; exit 1; }
+          { echo "# cost legs on $GUEST: ${#f[@]} leg(s)"; harness/soak/cost/table.sh "${f[@]}"; } | tee -a "$GITHUB_STEP_SUMMARY"

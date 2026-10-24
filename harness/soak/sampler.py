@@ -28,6 +28,15 @@ honest frame), and decodes three frames: the programme at T, the camera at T, an
 Writes one JSON line per minute: {minute, at_ms, differs, region_diff, median_diff, stable_bands,
 moving_bands, programme, camera} or {minute, at_ms, differs: false, error}. Exit 0 (the verdict judges), 64 on a usage error,
 1 when the run has no start action (nothing to sample).
+
+The cost legs' stills (C15: "screenshots of each leg's programme are looked at, and never committed"):
+
+    python3 -I harness/soak/sampler.py --programme <dir> --soak <soak.json> --stills <dir>
+        --still-at <label>:<epoch ms>[,<label>:<epoch ms>...]
+
+writes the programme at each instant as <dir>/<label>-<ms>.jpg (its own size, in colour) and prints
+one line per still; an instant with no segment or no frame is printed as missed. Exit 0 when at
+least one still was written, 1 when none was.
 """
 
 import argparse
@@ -113,6 +122,39 @@ def frame(ffmpeg, path, offset_s):
     return p.stdout
 
 
+def still(ffmpeg, path, offset_s, out):
+    """The frame at offset_s into path as a JPEG at out; True when written."""
+    try:
+        p = subprocess.run(
+            [ffmpeg, "-v", "error", "-nostdin", "-y", "-ss", f"{offset_s:.3f}", "-i", path, "-frames:v", "1",
+             "-q:v", "3", out],
+            capture_output=True, timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return p.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0
+
+
+def stills(a, soak):
+    os.makedirs(a.stills, exist_ok=True)
+    prog = segments(a.programme)
+    max_len = soak["sample_segment_max_s"] * 1000
+    wrote = 0
+    for item in a.still_at.split(","):
+        label, _, ms = item.partition(":")
+        if not re.fullmatch(r"[a-z0-9-]+", label) or not ms.isdigit():
+            print(f"stills: FAIL bad instant {item!r} (<label>:<epoch ms>)", file=sys.stderr)
+            return 64
+        loc = locate(prog, int(ms), max_len, a.ffprobe)
+        out = os.path.join(a.stills, f"{label}-{ms}.jpg")
+        if loc is not None and still(a.ffmpeg, loc[0], loc[1], out):
+            wrote += 1
+            print(f"stills: {label} at {ms}: {os.path.basename(out)}")
+        else:
+            print(f"stills: {label} at {ms}: missed ({'no segment' if loc is None else 'no frame'})")
+    print(f"stills: {wrote} written")
+    return 0 if wrote > 0 else 1
+
+
 def bands(a, b, rows):
     """The mean absolute difference of each band of `rows` rows."""
     out = []
@@ -157,13 +199,21 @@ def plan(actions, soak):
 
 def main(argv):
     p = argparse.ArgumentParser()
-    for k in ("programme", "camera", "actions", "soak", "out"):
+    for k in ("programme", "soak"):
         p.add_argument("--" + k, required=True)
+    for k in ("camera", "actions", "out", "stills", "still-at"):
+        p.add_argument("--" + k)
     p.add_argument("--ffmpeg", default="ffmpeg")
     p.add_argument("--ffprobe", default="ffprobe")
     a = p.parse_args(argv)
     with open(a.soak, encoding="utf-8") as f:
         soak = json.load(f)
+    if a.stills is not None or a.still_at is not None:
+        if not (a.stills and a.still_at):
+            p.error("--stills and --still-at go together")
+        return stills(a, soak)
+    if not (a.camera and a.actions and a.out):
+        p.error("--camera, --actions and --out are required (or --stills and --still-at)")
     actions = []
     if os.path.exists(a.actions):
         with open(a.actions, encoding="utf-8") as f:

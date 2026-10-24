@@ -22,6 +22,13 @@
 #                           Machine, web/up.sh; its URL carries a signed token and stays under
 #                           SOAK_WEB_STATE, never /out)
 #   CAMERA_PATTERN          fake-camera's picture (ball, snow or noise; default ball)
+#   SOAK_LEG                empty for the soak; A, B, C or D for one of C15's cost legs (soak.json's
+#                           legs: the output, the template and the sport). A leg runs on page=real
+#                           with no dropout and no disconnect: its only fault is the renderer kill
+#                           at its midpoint, which soak.yml's cost/leg.sh does on the compositor
+#                           Machine. Its score driver records a moment-making event at the page's
+#                           pace (cost_ball_every_s for cricket, cost_rally_every_s for badminton),
+#                           and the run ends with programme stills for a person to look at
 #   FLY_MACHINE_ID, FLY_APP_NAME   set by the platform: this Machine's private name
 #
 # Every scheduled action is a line of /out/actions.jsonl with its wall time (ms, this Machine's
@@ -54,6 +61,21 @@ action() { jq -cn "$@" >>"$OUT/actions.jsonl"; }
 : "${FLY_MACHINE_ID:?}" "${FLY_APP_NAME:?}"
 SOAK_PAGE="${SOAK_PAGE:-test}"
 CAMERA_PATTERN="${CAMERA_PATTERN:-ball}"
+SOAK_LEG="${SOAK_LEG:-}"
+# The session fake-control hands out (a vendored relay-job fixture: the output profile), and the
+# overlay's sport and template. The soak: 720p, bar on cricket.
+SESSION_SRC="$SOAK/session-composed-720p.json"
+LEG_SPORT=cricket
+LEG_TEMPLATE=bar
+if [ -n "$SOAK_LEG" ]; then
+  leg_spec="$(jq -c --arg l "$SOAK_LEG" '.legs[$l] // empty' "$SOAK/soak.json")"
+  [ -n "$leg_spec" ] || { log "FAIL SOAK_LEG '$SOAK_LEG' is not one of soak.json's legs"; exit 64; }
+  [ "$SOAK_PAGE" = real ] || { log "FAIL a cost leg runs on the production page (SOAK_PAGE=real)"; exit 64; }
+  SESSION_SRC="$SOAK/session-composed-$(jq -r .output <<<"$leg_spec").json"
+  LEG_SPORT="$(jq -r .sport <<<"$leg_spec")"
+  LEG_TEMPLATE="$(jq -r .template <<<"$leg_spec")"
+  [ -f "$SESSION_SRC" ] || { log "FAIL leg $SOAK_LEG: no session fixture $SESSION_SRC"; exit 64; }
+fi
 case "$SOAK_PAGE" in
   test) ;;
   real) [ -x "$SOAK/web/up.sh" ] || { log "FAIL SOAK_PAGE=real needs the page source ($SOAK/web/up.sh: the web image)"; exit 64; } ;;
@@ -66,13 +88,18 @@ WEB_STATE="${SOAK_WEB_STATE:-/run/soak-web}"
 HOST="$FLY_MACHINE_ID.vm.$FLY_APP_NAME.internal"
 DRIVE_S=$((SOAK_DRIVE_MIN * 60))
 soak() { jq -r --arg k "$1" '.[$k]' "$SOAK/soak.json"; }
-PLAN="$(jq -c -n -L "$SOAK" --slurpfile soak "$SOAK/soak.json" --argjson d "$DRIVE_S" \
-  'include "schedule"; soak_plan($soak[0]; $d)')"
+if [ -n "$SOAK_LEG" ]; then
+  PLAN='{"dropouts":[],"disconnects":[]}'
+else
+  PLAN="$(jq -c -n -L "$SOAK" --slurpfile soak "$SOAK/soak.json" --argjson d "$DRIVE_S" \
+    'include "schedule"; soak_plan($soak[0]; $d)')"
+fi
+CAMERA_SIZE="$(jq -r '.output | "\(.width)x\(.height)"' "$SESSION_SRC")"
 : >"$OUT/actions.jsonl"
 : >"$OUT/heartbeats.jsonl"
 : >"$OUT/emit.jsonl"
 status booting "plan $(jq -c '{dropouts: (.dropouts | length), disconnects}' <<<"$PLAN")"
-log "boot: drive $SOAK_DRIVE_MIN min, page $SOAK_PAGE, camera $CAMERA_PATTERN, host $HOST, plan $(jq -c '{dropouts: (.dropouts | length), disconnects}' <<<"$PLAN")"
+log "boot: drive $SOAK_DRIVE_MIN min, page $SOAK_PAGE, camera $CAMERA_PATTERN $CAMERA_SIZE, ${SOAK_LEG:+cost leg $SOAK_LEG ($LEG_TEMPLATE on $LEG_SPORT, $(basename "$SESSION_SRC")), }host $HOST, plan $(jq -c '{dropouts: (.dropouts | length), disconnects}' <<<"$PLAN")"
 log "disk: $(df -h "$OUT" | tail -n 1 | awk '{print $2" total, "$4" free"}')"
 
 # The SRT passphrase: made here, handed to MediaMTX, fake-camera and fake-control (which puts it in
@@ -234,7 +261,8 @@ if [ "$SOAK_PAGE" = real ]; then
   status booting "page source"
   web_rc=0
   env -u JOB_TOKEN -u HARNESS_SRT_PASSPHRASE OUT="$OUT" WEB_STATE="$WEB_STATE" HOST="$HOST" \
-    WEB_PORT="$(soak web_port)" WEB_DELAY_MS="$(jq -r .overlayDelayMs "$SOAK/session-composed-720p.json")" \
+    WEB_PORT="$(soak web_port)" WEB_DELAY_MS="$(jq -r .overlayDelayMs "$SESSION_SRC")" \
+    WEB_SPORT="$LEG_SPORT" WEB_TEMPLATE="$LEG_TEMPLATE" \
     "$SOAK/web/up.sh" >"$OUT/web-up.log" 2>&1 || web_rc=$?
   cat "$OUT/web-up.log"
   [ -f "$WEB_STATE/server.pid" ] && pids+=("$(cat "$WEB_STATE/server.pid")")
@@ -252,14 +280,14 @@ if [ "$SOAK_PAGE" = real ]; then
   # The URL and its token go through files (jq --rawfile), never argv; the session carries the
   # token, so it stays under WEB_STATE.
   SESSION_FILE="$WEB_STATE/session.json"
-  jq --rawfile u "$WEB_STATE/overlay-url" --slurpfile seed "$OUT/seed.json" \
-    '($u | rtrimstr("\n")) as $url | .overlayUrl = $url | .fixtureId = $seed[0].cricket.fixture_id
+  jq --rawfile u "$WEB_STATE/overlay-url" --slurpfile seed "$OUT/seed.json" --arg sport "$LEG_SPORT" \
+    '($u | rtrimstr("\n")) as $url | .overlayUrl = $url | .fixtureId = $seed[0][$sport].fixture_id
      | .pageToken = ($url | capture("[?&]st=(?<t>[^&]+)").t)' \
-    "$SOAK/session-composed-720p.json" >"$SESSION_FILE"
+    "$SESSION_SRC" >"$SESSION_FILE"
   OVERLAY_ORIGIN="http://$HOST:$(soak web_port)"
 else
   SESSION_FILE="$OUT/session.json"
-  cp "$SOAK/session-composed-720p.json" "$SESSION_FILE"
+  cp "$SESSION_SRC" "$SESSION_FILE"
   OVERLAY_ORIGIN="http://$HOST:7000"
 fi
 
@@ -268,7 +296,7 @@ TZ=UTC MTX_PATHS_CAM_SRTREADPASSPHRASE="$HARNESS_SRT_PASSPHRASE" MTX_PATHS_CAM_S
 pids+=($!)
 mtx_pid=$!
 XDG_CACHE_HOME=/tmp env -u JOB_TOKEN -u SESSION_ID fake-camera --emit "$OUT/emit.jsonl" --listen 127.0.0.1:7001 --srt-host 127.0.0.1 \
-  --srt-port 8890 --stream-id publish:cam --size 1280x720 --pattern "$CAMERA_PATTERN" \
+  --srt-port 8890 --stream-id publish:cam --size "$CAMERA_SIZE" --pattern "$CAMERA_PATTERN" \
   >"$OUT/fake-camera.log" 2>&1 &
 pids+=($!)
 fake-control --fixture "$SESSION_FILE" --page "$SOAK/pages/overlay-test.html" --score "$OUT/score.json" \
@@ -327,11 +355,21 @@ if [ "$went_live" -eq 1 ]; then
   action --argjson at "$start_ms" --argjson d "$DRIVE_S" '{kind: "start", at_ms: $at, drive_s: $d}'
   read_last_beat
   log "live: the drive starts, $DRIVE_S s, ${#steps[@]} actions"
-  # Check (c)'s deliveries, through the standalone app's API, for the whole drive.
+  # Check (c)'s deliveries, through the standalone app's API, for the whole drive. A cost leg's: a
+  # moment-making event at the page's pace (cricket: a boundary every cost_ball_every_s; badminton:
+  # a rally every cost_rally_every_s), each row carrying the moments the page's feed makes of it.
   if [ "$SOAK_PAGE" = real ]; then
-    env -u JOB_TOKEN -u SESSION_ID -u HARNESS_SRT_PASSPHRASE node "$SOAK/web/score.mjs" \
+    score_js=score.mjs
+    score_args=(--every-s "$(soak score_every_s)")
+    if [ -n "$SOAK_LEG" ] && [ "$LEG_SPORT" = badminton ]; then
+      score_js=rally.mjs
+      score_args=(--every-s "$(soak cost_rally_every_s)")
+    elif [ -n "$SOAK_LEG" ]; then
+      score_args=(--every-s "$(soak cost_ball_every_s)" --boundaries)
+    fi
+    env -u JOB_TOKEN -u SESSION_ID -u HARNESS_SRT_PASSPHRASE node "$SOAK/web/$score_js" \
       --base "http://127.0.0.1:$(soak web_port)" --cookies "$WEB_STATE/cookies.json" --seed "$OUT/seed.json" \
-      --every-s "$(soak score_every_s)" --until-ms "$end_ms" --out "$OUT/deliveries.jsonl" >"$OUT/score.log" 2>&1 &
+      "${score_args[@]}" --until-ms "$end_ms" --out "$OUT/deliveries.jsonl" >"$OUT/score.log" 2>&1 &
     score_pid=$!
     pids+=("$score_pid")
   fi
@@ -499,11 +537,26 @@ status sampling
 bounded sampler "$OUT/sampler.log" python3 -I "$SOAK/sampler.py" --programme "$OUT/rec" --camera "$OUT/camrec" \
   --actions "$OUT/actions.jsonl" --soak "$SOAK/soak.json" --out "$OUT/overlay-samples.jsonl" || sampler_exit=$?
 tail -n 2 "$OUT/sampler.log" 2>/dev/null || true
+# A cost leg's stills, for a person to look at (never committed): six a second apart at a quarter of
+# the drive (the moments running), one 45 s after the midpoint's renderer kill (the reloaded page),
+# and one 30 s before the end. In /out/stills.tar, which the job fetches.
+stills_exit=""
+if [ -n "$SOAK_LEG" ] && [ "$went_live" -eq 1 ]; then
+  q=$((start_ms + DRIVE_S * 250))
+  at="$(for i in 0 1 2 3 4 5; do printf 'moment%s:%s,' "$i" $((q + i * 1000)); done)reload:$((start_ms + DRIVE_S * 500 + 45000)),end:$((end_ms - 30000))"
+  stills_exit=0
+  bounded stills "$OUT/stills.log" python3 -I "$SOAK/sampler.py" --programme "$OUT/rec" --soak "$SOAK/soak.json" \
+    --stills "$OUT/stills" --still-at "$at" || stills_exit=$?
+  tail -n 1 "$OUT/stills.log" 2>/dev/null || true
+  if [ -d "$OUT/stills" ]; then tar -cf "$OUT/stills.tar" -C "$OUT" stills && rm -rf "$OUT/stills"; fi
+fi
 
 scan_secrets strict
 
 jq -cn --argjson c "$checker_exit" --argjson sx "$sampler_exit" --argjson live "$went_live" --arg why "$ended_early" --argjson l "$leaks" \
-  '{ok: ($l == 0), checker_exit: $c, sampler_exit: $sx, went_live: ($live == 1), ended_early: (if $why == "" then null else $why end), leaks: $l}' \
+  --arg leg "$SOAK_LEG" --arg stx "$stills_exit" \
+  '{ok: ($l == 0), checker_exit: $c, sampler_exit: $sx, went_live: ($live == 1), ended_early: (if $why == "" then null else $why end), leaks: $l}
+   + (if $leg == "" then {} else {leg: $leg, stills_exit: (if $stx == "" then null else ($stx | tonumber) end)} end)' \
   >"$OUT/done"
 done_written=1
 status done "checker exit $checker_exit"

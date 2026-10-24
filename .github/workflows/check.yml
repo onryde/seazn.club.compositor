@@ -184,8 +184,9 @@ jobs:
   # on its fixtures (the green, the brief's reds and each guard's red, by reason), the driver under
   # stubs on a 1-minute schedule, its error path and page=real (about 2 minutes), soak.yml's shape
   # (the token gate, --restart no, the masked job token, the always() destroy, the page source's
-  # job) with its log converter, the page source's bundle check and signed URL, and the overlay
-  # sampler on synthetic recordings (ffmpeg, about 1 minute).
+  # job) with its log converter, the page source's bundle check and signed URL, the cost legs'
+  # sampler, runner and verdict on fake trees and fixtures, and the overlay sampler on synthetic
+  # recordings (ffmpeg, about 1 minute).
   soak:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -200,6 +201,7 @@ jobs:
           harness/soak/test-workflow.sh
           harness/soak/web/test-bundle-check.sh
           harness/soak/web/test-overlay-url.sh
+          HARNESS_BASH=/bin/bash harness/soak/cost/test-cost.sh
       - name: Soak overlay sampler
         if: ${{ !cancelled() }}
         run: |
