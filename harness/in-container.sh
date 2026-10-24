@@ -6,24 +6,37 @@
 # The relay image is never changed for the harness (the dispatch's ruling: no package is added to
 # the shipped image), and it carries no procps, so everything here reads /proc with bash builtins:
 # no pkill, no ps. A process's type is its `--type=` argument (CEF's children: zygote, gpu-process,
-# renderer, utility; F-013), its parent and start time come from /proc/<pid>/stat.
+# renderer, utility; F-013), its parent and start time come from /proc/<pid>/stat. Processes run
+# from here (the burn's workers) are in the container's cgroup, as every `docker exec` is.
 #
 # Every line printed is one JSON object, stamped with this host's wall clock in ms (the kernel's
-# CLOCK_REALTIME, the clock `docker logs --timestamps` and `docker events` use).
+# CLOCK_REALTIME, the clock `docker logs --timestamps` and `docker events` use). A kill prints its
+# targets BEFORE it kills (`at_ms`: the container may die under the exec before anything after),
+# then its status (`rc_at_ms`, `rc`).
 #
 # Commands:
 #   tree                       one line per process: pid, ppid, start_ms, comm, type (or null)
-#   kill-cef                   SIGKILL every CEF child at once (case 8)
+#   kill-cef                   SIGKILL every CEF child at once (case 8); fails when it finds none
 #   kill-compositor            SIGKILL the compositor process (case 9)
 #   kill-zygote gpu|renderer   SIGKILL the compositor's zygote that parents the GPU process, or a
 #                              renderer (cases 13 and 14); prints the zygote's children first
-#   gpu-loop N SPACING_MS      SIGKILL the GPU process N times, each once a NEW pid has replaced the
-#                              last and at least SPACING_MS after the previous kill; SPACING_MS 0
-#                              is the fast loop (case 15): a tight /proc loop, no wait. Stops when
-#                              the compositor is gone (the exec dies with its container)
+#   gpu-loop N SPACING_MS DEADLINE_MS
+#                              SIGKILL the GPU process N times, each once a NEW pid has replaced the
+#                              last and at least SPACING_MS after the previous kill; SPACING_MS 0 is
+#                              the fast loop (case 15): no wait but a 50 ms look-again while no new
+#                              pid is there. Ends when N are done, when the compositor is gone (the
+#                              exec dies with its container), or at DEADLINE_MS (this host's epoch
+#                              ms), and then FAILS (`timed_out`): no leg may wait out the relay's own
+#                              deadline. Prints one `done_at_ms` line at its end
+#   burn WORKERS SECONDS       WORKERS busy loops for SECONDS each, in this container's cgroup (case
+#                              6); prints its start (`at_ms`) and, once every worker has stopped
+#                              itself, its end (`done_at_ms`, `elapsed_ms`)
+#
+# IN_CONTAINER_PROC moves /proc (the harness's own test, crates/harness/tests/in_container.rs, runs
+# this on a fake tree); the cases never set it.
 set -euo pipefail
 
-PROC=/proc
+PROC="${IN_CONTAINER_PROC:-/proc}"
 
 now_ms() {
   local t=$EPOCHREALTIME
@@ -34,15 +47,22 @@ now_ms() {
 CLK_TCK=$(getconf CLK_TCK)
 BTIME=$(awk '/^btime/ { print $2 }' "$PROC/stat")
 
-# The --type= argument of a process (empty when none), read with builtins only.
+# The --type= argument of a process (empty when none), read with builtins only. The product's own
+# rule (`split_cmdline` in crates/adapters/src/cef_graphics.rs, mirrored, never imported): the
+# command line splits on NUL AND on whitespace, because Chromium's renamed children (setproctitle)
+# hold ONE space-joined string, padded with NULs. A NUL-only split finds no `--type=` in them (the
+# PR #52 review's C1). The first argument that starts with `--type=` wins (`flag_value`).
 type_of() {
-  local a args=()
-  mapfile -d '' -t args <"$PROC/$1/cmdline" 2>/dev/null || return 0
-  for a in "${args[@]}"; do
-    if [[ $a == --type=* ]]; then
-      printf '%s' "${a#--type=}"
-      return 0
-    fi
+  local field a fields=() words=()
+  mapfile -d '' -t fields <"$PROC/$1/cmdline" 2>/dev/null || return 0
+  for field in "${fields[@]}"; do
+    IFS=$' \t\n\r\f\v' read -r -d '' -a words <<<"$field" || true
+    for a in "${words[@]}"; do
+      if [[ $a == --type=* ]]; then
+        printf '%s' "${a#--type=}"
+        return 0
+      fi
+    done
   done
 }
 
@@ -58,7 +78,10 @@ read_stat() {
 
 pids() {
   local d
-  for d in "$PROC"/[0-9]*; do printf '%s\n' "${d#"$PROC"/}"; done
+  for d in "$PROC"/[0-9]*; do
+    [ -d "$d" ] && printf '%s\n' "${d#"$PROC"/}"
+  done
+  return 0
 }
 
 compositor_pid() {
@@ -92,6 +115,11 @@ json_strs() {
   printf '[%s]' "$out"
 }
 
+# The kill's status, after it: `rc_at_ms`, never `at_ms` (run-case.sh's mark_lines keeps them apart).
+print_rc() {
+  printf '{"rc_at_ms":%s,"rc":%s}\n' "$(now_ms)" "$1"
+}
+
 cmd_tree() {
   local p c t
   for p in $(pids); do
@@ -114,30 +142,45 @@ cmd_kill_cef() {
       types+=("$t")
     fi
   done
-  local at
-  at=$(now_ms)
-  if [ "${#victims[@]}" -gt 0 ]; then kill -KILL "${victims[@]}" || rc=$?; else rc=1; fi
-  printf '{"at_ms":%s,"killed":%s,"types":%s,"rc":%s}\n' "$at" "$(json_list "${victims[@]}")" \
-    "$(json_strs "${types[@]}")" "$rc"
+  printf '{"at_ms":%s,"killed":%s,"types":%s}\n' "$(now_ms)" "$(json_list "${victims[@]}")" \
+    "$(json_strs "${types[@]}")"
+  if [ "${#victims[@]}" -eq 0 ]; then
+    print_rc 1
+    exit 1
+  fi
+  kill -KILL "${victims[@]}" || rc=$?
+  print_rc "$rc"
+  [ "$rc" -eq 0 ]
 }
 
 cmd_kill_compositor() {
-  local p rc=0 at
+  local p rc=0
   p=$(compositor_pid)
-  at=$(now_ms)
-  if [ -n "$p" ]; then kill -KILL "$p" || rc=$?; else rc=1; fi
-  printf '{"at_ms":%s,"pid":%s,"rc":%s}\n' "$at" "${p:-null}" "$rc"
+  printf '{"at_ms":%s,"pid":%s}\n' "$(now_ms)" "${p:-null}"
+  if [ -z "$p" ]; then
+    print_rc 1
+    exit 1
+  fi
+  kill -KILL "$p" || rc=$?
+  print_rc "$rc"
+  [ "$rc" -eq 0 ]
 }
 
 cmd_kill_zygote() {
-  local want="$1" comp z c chosen="" child_types=() kids=() rc=0 at
+  local want="$1" comp z c chosen="" child_types=() kids=() rc=0
   case "$want" in
     gpu) want=gpu-process ;;
     renderer) want=renderer ;;
-    *) echo '{"error":"kill-zygote gpu|renderer"}'; exit 64 ;;
+    *)
+      echo '{"error":"kill-zygote gpu|renderer"}'
+      exit 64
+      ;;
   esac
   comp=$(compositor_pid)
-  [ -n "$comp" ] || { echo '{"error":"no compositor process"}'; exit 1; }
+  if [ -z "$comp" ]; then
+    printf '{"at_ms":%s,"pid":null,"want":"%s","error":"no compositor process"}\n' "$(now_ms)" "$want"
+    exit 1
+  fi
   for z in $(pids_of_type zygote); do
     read_stat "$z" 2>/dev/null || continue
     [ "$STAT_PPID" = "$comp" ] || continue
@@ -159,29 +202,37 @@ cmd_kill_zygote() {
     done
   done
   if [ -z "$chosen" ]; then
-    printf '{"at_ms":%s,"pid":null,"want":"%s","rc":1}\n' "$(now_ms)" "$want"
+    printf '{"at_ms":%s,"pid":null,"want":"%s"}\n' "$(now_ms)" "$want"
     exit 1
   fi
-  local ztype
+  local ztype zppid
   ztype=$(type_of "$chosen")
   read_stat "$chosen"
-  local zppid=$STAT_PPID
-  at=$(now_ms)
+  zppid=$STAT_PPID
+  printf '{"at_ms":%s,"pid":%s,"ppid":%s,"compositor":%s,"type":"%s","want":"%s","children":%s,"child_types":%s}\n' \
+    "$(now_ms)" "$chosen" "$zppid" "$comp" "$ztype" "$want" "$(json_list "${kids[@]}")" \
+    "$(json_strs "${child_types[@]}")"
   kill -KILL "$chosen" || rc=$?
-  printf '{"at_ms":%s,"pid":%s,"ppid":%s,"compositor":%s,"type":"%s","want":"%s","children":%s,"child_types":%s,"rc":%s}\n' \
-    "$at" "$chosen" "$zppid" "$comp" "$ztype" "$want" "$(json_list "${kids[@]}")" \
-    "$(json_strs "${child_types[@]}")" "$rc"
+  print_rc "$rc"
+  [ "$rc" -eq 0 ]
 }
 
 cmd_gpu_loop() {
-  local n="$1" spacing="$2" last="" kills=0 p t at prev_at=0 comp
+  local n="$1" spacing="$2" deadline="$3" last="" kills=0 p t at prev_at=0 comp timed_out=false
   comp=$(compositor_pid)
   while [ "$kills" -lt "$n" ]; do
     [ -n "$comp" ] && [ -d "$PROC/$comp" ] || break
+    if [ "$(now_ms)" -ge "$deadline" ]; then
+      timed_out=true
+      break
+    fi
     p=""
-    for t in $(pids_of_type gpu-process); do p=$t; break; done
+    for t in $(pids_of_type gpu-process); do
+      p=$t
+      break
+    done
     if [ -z "$p" ] || [ "$p" = "$last" ]; then
-      [ "$spacing" -gt 0 ] && sleep 0.05
+      sleep 0.05
       continue
     fi
     if [ "$spacing" -gt 0 ]; then
@@ -199,8 +250,36 @@ cmd_gpu_loop() {
       last=$p
     fi
   done
-  printf '{"done_at_ms":%s,"done":%s,"compositor_alive":%s}\n' "$(now_ms)" "$kills" \
-    "$([ -n "$comp" ] && [ -d "$PROC/$comp" ] && echo true || echo false)"
+  local alive=false
+  if [ -n "$comp" ] && [ -d "$PROC/$comp" ]; then alive=true; fi
+  printf '{"done_at_ms":%s,"done":%s,"wanted":%s,"compositor_alive":%s,"timed_out":%s}\n' \
+    "$(now_ms)" "$kills" "$n" "$alive" "$timed_out"
+  # Success is N kills, or the compositor gone after at least one (it exited under the loop).
+  [ "$timed_out" = false ] || exit 1
+  [ "$kills" -eq "$n" ] || { [ "$alive" = false ] && [ "$kills" -ge 1 ]; }
+}
+
+cmd_burn() {
+  local workers="$1" seconds="$2" i start
+  if ! [[ "$workers" =~ ^[1-9][0-9]*$ && "$seconds" =~ ^[1-9][0-9]*$ ]]; then
+    echo '{"error":"burn WORKERS SECONDS"}'
+    exit 64
+  fi
+  start=$(now_ms)
+  printf '{"at_ms":%s,"workers":%s,"seconds":%s}\n' "$start" "$workers" "$seconds"
+  # Each worker stops itself at its own deadline (EPOCHREALTIME, no fork per turn): an exec killed
+  # with its container leaves no spin.
+  local end=$((start + seconds * 1000))
+  for ((i = 0; i < workers; i++)); do
+    (
+      t=${EPOCHREALTIME//[.,]/}
+      while ((10#$t / 1000 < end)); do t=${EPOCHREALTIME//[.,]/}; done
+    ) &
+  done
+  wait
+  local done_at
+  done_at=$(now_ms)
+  printf '{"done_at_ms":%s,"workers":%s,"elapsed_ms":%s}\n' "$done_at" "$workers" $((done_at - start))
 }
 
 case "${1:-}" in
@@ -208,9 +287,10 @@ case "${1:-}" in
   kill-cef) cmd_kill_cef ;;
   kill-compositor) cmd_kill_compositor ;;
   kill-zygote) cmd_kill_zygote "${2:?gpu|renderer}" ;;
-  gpu-loop) cmd_gpu_loop "${2:?N}" "${3:?SPACING_MS}" ;;
+  gpu-loop) cmd_gpu_loop "${2:?N}" "${3:?SPACING_MS}" "${4:?DEADLINE_MS}" ;;
+  burn) cmd_burn "${2:?WORKERS}" "${3:?SECONDS}" ;;
   *)
-    echo '{"error":"usage: tree | kill-cef | kill-compositor | kill-zygote gpu|renderer | gpu-loop N SPACING_MS"}'
+    echo '{"error":"usage: tree | kill-cef | kill-compositor | kill-zygote gpu|renderer | gpu-loop N SPACING_MS DEADLINE_MS | burn WORKERS SECONDS"}'
     exit 64
     ;;
 esac
