@@ -1,0 +1,18 @@
+{
+  "about": "DO NOT MERGE. Owed 87's m9 (the owner, 2026-10-24, \"A\": the stall rule retired, rtmp2sink's own timeout the one detector, set from domain::config::OUTPUT_SINK_TIMEOUT_MS). Retargeted from output_stall_after_ms (removed) to the sink timeout: at 20 000 ms a stalled sink in case 17 (dest-stall-rule) cannot be swapped within output_sink_timeout_ms + output_backoff_base_ms + frame_period_ms of its last growth (the committed thresholds.json's 5 000), or is not swapped in the fault at all, so stall_swap must red with buffer_capped and trickled still passing: m9 must end KILLED. An exact-text replace that must match once; the case runs unmutated first (stall_swap must PASS), then mutated.",
+  "mutants": {
+    "m9": {
+      "kind": "product",
+      "file": "crates/domain/src/config.rs",
+      "old": "pub const OUTPUT_SINK_TIMEOUT_MS: Ms = 5_000;",
+      "new": "pub const OUTPUT_SINK_TIMEOUT_MS: Ms = 20_000 /*MUT9*/;",
+      "case": "dest-stall-rule",
+      "variant": "",
+      "check": "stall_swap",
+      "controls": [
+        "buffer_capped",
+        "trickled"
+      ]
+    }
+  }
+}

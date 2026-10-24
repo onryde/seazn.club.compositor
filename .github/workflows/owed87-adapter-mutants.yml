@@ -1,0 +1,56 @@
+name: owed87-adapter-mutants
+# DO NOT MERGE. Owed 87's adapter mutants, from mutants/owed87.json, one leg each. The named test in
+# crates/adapters/tests/programme_output.rs runs unmutated first and must pass; then the mutant is
+# applied by an exact-text replace that must match once, and the same test must FAIL by name.
+on:
+  pull_request: {}
+  workflow_dispatch: {}
+permissions: { contents: read }
+defaults:
+  run: { shell: bash }
+jobs:
+  mutant:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    name: ${{ matrix.id }}
+    strategy:
+      fail-fast: false
+      matrix:
+        id: [A1, A2, A3]
+    env:
+      ID: ${{ matrix.id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: GStreamer
+        timeout-minutes: 10
+        run: scripts/apt-install.sh libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.91.0" }
+      - uses: Swatinem/rust-cache@v2
+      - name: Baseline (unmutated; the named test must pass)
+        run: |
+          name=$(python3 -I mutants/owed87.py "$ID" field test)
+          set +e
+          cargo test -p adapters --test programme_output -- --exact "$name" --show-output > base.log 2>&1
+          code=$?
+          set -e
+          grep -E "^test |test result:|checked" base.log || true
+          echo "baseline exit: $code"
+          grep -Eq "^test $name \.\.\. ok$" base.log || { echo "::error::baseline: $name did not pass"; exit 1; }
+          grep -Eq "test result: ok\. 1 passed" base.log || { echo "::error::baseline: not exactly one test ran"; exit 1; }
+      - name: Apply the mutant
+        run: python3 -I mutants/owed87.py "$ID" apply
+      - name: The mutant must red its named test
+        run: |
+          name=$(python3 -I mutants/owed87.py "$ID" field test)
+          set +e
+          cargo test -p adapters --test programme_output -- --exact "$name" --show-output > mut.log 2>&1
+          code=$?
+          set -e
+          grep -E "^test |test result:|panicked|left:|right:|^error" mut.log || true
+          echo "mutant exit: $code"
+          if [ "$code" -eq 0 ]; then echo "::error::$ID SURVIVED ($name passed)"; exit 1; fi
+          if ! grep -Eq "^test $name \.\.\. FAILED$" mut.log; then
+            echo "::error::$ID: no 'test $name ... FAILED' line (a build error is not a kill)"; exit 1
+          fi
+          echo "$ID KILLED by FAIL $name"

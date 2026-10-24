@@ -1,0 +1,17 @@
+{
+  "about": "DO NOT MERGE. Owed 87's adapter mutants (the owner, 2026-10-24, \"A\": the stall rule retired, rtmp2sink's own timeout the one detector, set from domain::config::OUTPUT_SINK_TIMEOUT_MS). Each is an exact-text replace that must match once. The named test runs unmutated first (it must pass), then mutated (it must FAIL by name). A1 removes the set: only the non-default readback can see it, since the production value equals rtmp2sink's default. A2 moves the constant to 20 s: the default's pin reds (C14's m9 runs the same change on case 17, in c14-mutants). A3 hands the programme a timeout other than the domain's: the per-sink readback reds.",
+  "mutants": {
+    "A1": {"file": "crates/adapters/src/gst_output.rs",
+      "old": "            s.set_property(\"timeout\", shared.sink_timeout_s);",
+      "new": "            let _ = shared.sink_timeout_s; /*MUTA1*/",
+      "test": "a_sink_timeout_other_than_the_default_reaches_every_later_sink"},
+    "A2": {"file": "crates/domain/src/config.rs",
+      "old": "pub const OUTPUT_SINK_TIMEOUT_MS: Ms = 5_000;",
+      "new": "pub const OUTPUT_SINK_TIMEOUT_MS: Ms = 20_000 /*MUTA2*/;",
+      "test": "the_sink_timeout_is_rtmp2sinks_own_default"},
+    "A3": {"file": "crates/adapters/src/gst_programme.rs",
+      "old": "                sink_timeout_s: OUTPUT_SINK_TIMEOUT_S,",
+      "new": "                sink_timeout_s: OUTPUT_SINK_TIMEOUT_S + 2, /*MUTA3*/",
+      "test": "every_rtmp_sink_gets_the_domains_timeout"}
+  }
+}
