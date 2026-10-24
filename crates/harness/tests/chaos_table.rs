@@ -117,8 +117,17 @@ fn the_plan_names_every_chaos_case_and_expands_the_repeats() {
                 .strip_suffix(".sh")
                 .map(str::to_owned)
         })
-        .filter(|c| c != "smoke") // C13's own end-to-end case (harness.yml), not a chaos case
         .collect();
+    // The case files that are not chaos cases (case_verdicts.rs's NOT_CHAOS, the same list): C13's
+    // smoke and Owed 81's two probe controls, each run by hand from harness.yml. Each must be a file.
+    let not_chaos = ["smoke", "owed81-noaudio", "owed81-align1"];
+    let before = files.len();
+    files.retain(|c| !not_chaos.contains(&c.as_str()));
+    assert_eq!(
+        before - files.len(),
+        not_chaos.len(),
+        "a non-chaos name with no case file"
+    );
     files.sort();
     let mut sorted = cases.clone();
     sorted.sort();

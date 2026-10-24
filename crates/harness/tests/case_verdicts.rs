@@ -2063,18 +2063,23 @@ fn cef_leaks_is_reported_not_runnable_never_faked_and_never_a_pass() {
     }
 }
 
+/// The case files that are not chaos cases, each run by hand from harness.yml: C13's smoke case
+/// (the harness's own end-to-end run) and Owed 81's two probe controls (F-029). The same list is in
+/// chaos_table.rs.
+const NOT_CHAOS: [&str; 3] = ["smoke", "owed81-noaudio", "owed81-align1"];
+
 /// Every case file in harness/cases has a test here: a new case cannot ship unjudged.
 #[test]
 fn every_case_file_is_judged_here() {
     let me = include_str!("case_verdicts.rs");
-    let mut n = 0;
+    let (mut n, mut not_chaos) = (0, 0);
     for e in std::fs::read_dir(repo().join("harness/cases")).unwrap() {
         let name = e.unwrap().file_name().into_string().unwrap();
         let Some(case) = name.strip_suffix(".sh") else {
             continue;
         };
-        // C13's smoke case, the harness's own end-to-end run (harness.yml), is not a chaos case.
-        if case == "smoke" {
+        if NOT_CHAOS.contains(&case) {
+            not_chaos += 1;
             continue;
         }
         n += 1;
@@ -2083,6 +2088,8 @@ fn every_case_file_is_judged_here() {
             "harness/cases/{name} has no verdict test in case_verdicts.rs"
         );
     }
-    eprintln!("case files checked: {n}");
+    eprintln!("case files checked: {n}; not chaos cases: {not_chaos}");
     assert_eq!(n, 16, "the brief's 16 cases (amended 2026-10-20)");
+    // Every name excused is a file, so the list cannot hide a renamed or a deleted case.
+    assert_eq!(not_chaos, NOT_CHAOS.len(), "a NOT_CHAOS name with no case file");
 }
