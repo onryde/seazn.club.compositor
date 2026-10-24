@@ -218,11 +218,45 @@ impl World {
         self.log.push((at, msg.into()));
     }
 
+    /// A sink swap as the compositor logs it: the driver's reason line, then the decorator's swap
+    /// line (Owed 87, PR #57).
+    fn swap(&mut self, at: i64, gen: u64, reason: &str) {
+        self.line(at, format!("sink swap reason={reason} gen={gen}"));
+        self.line(at, format!("sink swap gen={gen} target=rtmp"));
+    }
+
+    /// Generation `from`'s reason line named generation `to` instead.
+    fn relabel_reason(&mut self, from: u64, to: u64) {
+        let line = format!(" gen={from}");
+        let at = self
+            .log
+            .iter()
+            .position(|(_, m)| m.starts_with("sink swap reason=") && m.ends_with(&line))
+            .unwrap_or_else(|| panic!("no reason line for gen {from}"));
+        self.log[at].1 = self.log[at].1.replace(&line, &format!(" gen={to}"));
+    }
+
+    /// Generation `gen`'s reason line read `reason` instead, or was never logged (`None`).
+    fn reason_line(&mut self, gen: u64, reason: Option<&str>) {
+        let line = format!(" gen={gen}");
+        let at = self
+            .log
+            .iter()
+            .position(|(_, m)| m.starts_with("sink swap reason=") && m.ends_with(&line))
+            .unwrap_or_else(|| panic!("no reason line for gen {gen}"));
+        match reason {
+            Some(r) => self.log[at].1 = format!("sink swap reason={r} gen={gen}"),
+            None => {
+                self.log.remove(at);
+            }
+        }
+    }
+
     /// A compositor process's boot lines from `start`, and its alive lines until the next die.
     fn boot(&mut self, start: i64) {
         self.line(start + 200, "compositor started drivers=gst,cef");
         self.line(start + 1_500, "cef ready gen=1");
-        self.line(start + 2_400, "sink swap gen=1 target=rtmp");
+        self.swap(start + 2_400, 1, "first");
         self.line(start + 2_500, "programme started");
     }
 
@@ -800,66 +834,218 @@ fn dest_cut(back_ms: i64, stats: Value) -> World {
     w
 }
 
-/// [`dest_cut`], with the sink swapped every `every_ms` through the fault, the last one
-/// `last_before_clear_ms` before the clear mark: each new sink's connect timing out under the cut
-/// and the back-off building the next (CI's case 4: gen=5 3.97 s before the clear).
-fn dest_cut_swapping(back_ms: i64, stats: Value, every_ms: i64, last_before_clear_ms: i64) -> World {
-    let mut w = dest_cut(back_ms, stats);
-    let (cut, clear) = (w.at(20.0), w.at(50.0) + 50);
-    let mut at = clear - last_before_clear_ms;
+/// The output's reconnect cycle under the fault (cases 4, 5 and 12): a sink built every
+/// OUTPUT_CONNECT_TIMEOUT_MS + OUTPUT_BACKOFF_CAP_MS (CI: gen=3, 4, 5 seven seconds apart), each
+/// failing its connect at the timeout with its own error line, numbered from `first_gen` and all
+/// after `after`; the last is placed so the clear mark lands in `phase`: "pending" half a connect
+/// timeout after it (no error of its own yet), "backoff" just after its error. The clear mark's
+/// value names `driven`, the phase the drive meant (`clear_out_in_phase`).
+fn with_cycle(w: &mut World, after: i64, first_gen: u64, phase: &str, driven: &str) {
+    let connect = w.ms("output_connect_timeout_ms");
+    let every = connect + w.ms("output_backoff_cap_ms");
+    let clear = w.marks.iter().find(|m| m.0 == "clear").expect("a clear mark").1;
+    let mut at = match phase {
+        "pending" => clear - connect / 2,
+        "backoff" => clear - connect - 200,
+        _ => panic!("phase {phase}"),
+    };
     let mut swaps = vec![];
-    while at > cut {
+    while at > after + 1_000 {
         swaps.push(at);
-        at -= every_ms;
+        at -= every;
     }
     swaps.reverse();
+    let last = swaps.len().saturating_sub(1);
     for (i, at) in swaps.into_iter().enumerate() {
-        w.line(at, format!("sink swap gen={} target=rtmp", i + 2));
+        let gen = first_gen + i as u64;
+        // The first after the Connected sink failed follows its error; each next one a connect
+        // that timed out under the fault.
+        let reason = if gen == 2 { "error" } else { "connect_timeout" };
+        w.swap(at, gen, reason);
+        if i < last || phase == "backoff" {
+            w.line(
+                at + connect + 7,
+                format!("output gen={gen} error: Failed to connect: Socket I/O timed out (gstrtmp2sink.c)"),
+            );
+        }
     }
+    for m in &mut w.marks {
+        if m.0 == "clear" {
+            m.2 = json!({"phase": driven, "swap_ms": null, "swap_gen": null, "error_ms": null});
+        }
+    }
+}
+
+/// [`dest_cut`] with the reconnect cycle from the cut, the clear landing in `phase` as driven.
+fn dest_disc(back_ms: i64, stats: Value, phase: &str) -> World {
+    let mut w = dest_cut(back_ms, stats);
+    let cut = w.at(20.0);
+    with_cycle(&mut w, cut, 2, phase, phase);
     w
+}
+
+/// The variant a phase runs as (`dest_phase`, run-case.sh).
+fn variant_of(phase: &str) -> &'static str {
+    if phase == "backoff" {
+        "backoff"
+    } else {
+        ""
+    }
 }
 
 #[test]
 fn dest_disconnect_recovers_and_reds_when_nothing_was_dropped_or_the_return_is_late() {
-    let w = dest_cut(2_500, netem(true, 900_000, 700, 4_000));
-    let v = judge(&w, "dest-disconnect", "", "disc-good");
-    assert_pass(&v, "disc-good");
-    // The re-review's I-5: the clear's phase against the last sink swap is printed, and a connect
-    // is pending only when that swap is under OUTPUT_CONNECT_TIMEOUT_MS before the clear. Here the
-    // last swap is the boot's, 50 s back.
-    let phase = &v.json["measures"]["clear_phase"];
-    assert_eq!(phase["swap_gen"], 1, "disc-good: {phase}");
-    assert_eq!(phase["swaps_in_fault"], 0, "disc-good: {phase}");
-    assert_eq!(phase["connect_pending"], false, "disc-good: {phase}");
-    let connect = w.ms("output_connect_timeout_ms");
-    let every = connect + w.ms("output_backoff_base_ms");
+    // The re-review's I-5: each phase is its own leg, and the clear must land in it. With no
+    // variant the last sink built is still connecting at the clear; with `backoff` it has failed.
+    let connect = dest_cut(0, Value::Null).ms("output_connect_timeout_ms");
     let mut checked = 0;
-    for (tag, ago, pending) in [
-        ("disc-burst-phase", connect - 1_030, true),
-        ("disc-pending-edge", connect - 1, true),
-        ("disc-timed-out", connect, false),
-        ("disc-after-timeout", connect + 200, false),
+    for phase in ["pending", "backoff"] {
+        let tag = format!("disc-good-{phase}");
+        let w = dest_disc(2_500, netem(true, 900_000, 700, 4_000), phase);
+        let v = judge(&w, "dest-disconnect", variant_of(phase), &tag);
+        assert_pass(&v, &tag);
+        let m = &v.json["measures"]["clear_phase_driven"];
+        assert_eq!(
+            (m["phase"].as_str(), m["driven"].as_str()),
+            (Some(phase), Some(phase)),
+            "{tag}: {m}"
+        );
+        assert_eq!(m["connect_pending"], phase == "pending", "{tag}: {m}");
+        assert!(m["swaps_in_fault"].as_u64().is_some_and(|n| n >= 3), "{tag}: {m}");
+        checked += 1;
+    }
+    // A clear that missed its phase, or a drive that never found the cycle, reds the leg.
+    for (tag, variant, landed, driven) in [
+        ("disc-pending-landed-backoff", "", "backoff", "pending"),
+        ("disc-backoff-landed-pending", "backoff", "pending", "backoff"),
+        ("disc-drive-missed", "", "pending", "none"),
+        ("disc-drive-said-backoff", "", "pending", "backoff"),
     ] {
-        let w = dest_cut_swapping(2_500, netem(true, 900_000, 700, 4_000), every, ago);
-        let v = judge(&w, "dest-disconnect", "", tag);
-        assert_pass(&v, tag);
-        let phase = &v.json["measures"]["clear_phase"];
-        assert_eq!(phase["swap_to_clear_ms"], ago, "{tag}: {phase}");
-        assert_eq!(phase["connect_pending"], pending, "{tag}: {phase}");
-        assert!(
-            phase["swaps_in_fault"].as_u64().is_some_and(|n| n >= 1),
-            "{tag}: {phase}"
+        let mut w = dest_cut(2_500, netem(true, 900_000, 700, 4_000));
+        let cut = w.at(20.0);
+        with_cycle(&mut w, cut, 2, landed, driven);
+        assert_fails(
+            &judge(&w, "dest-disconnect", variant, tag),
+            "clear_phase_driven",
+            tag,
         );
         checked += 1;
     }
-    assert_eq!(checked, 4);
-    let w = dest_cut(2_500, netem(true, 900_000, 700, 0));
+    // No sink built in the fault: the boot's swap, 50 s back, is no phase.
+    let mut w = dest_cut(2_500, netem(true, 900_000, 700, 4_000));
+    for m in &mut w.marks {
+        if m.0 == "clear" {
+            m.2 = json!({"phase": "pending"});
+        }
+    }
+    let v = judge(&w, "dest-disconnect", "", "disc-no-cycle");
+    assert_fails(&v, "clear_phase_driven", "disc-no-cycle");
+    assert_eq!(v.json["measures"]["clear_phase_driven"]["swaps_in_fault"], 0);
+    checked += 1;
+    // The pending edge: the last sink built just under a connect timeout before the clear is
+    // pending; one built a connect timeout before, with no error line, is neither phase.
+    for (tag, ago, pass) in [
+        ("disc-pending-edge", connect - 1, true),
+        ("disc-neither", connect, false),
+    ] {
+        let mut w = dest_cut(2_500, netem(true, 900_000, 700, 4_000));
+        let cut = w.at(20.0);
+        let clear = w.marks.iter().find(|m| m.0 == "clear").unwrap().1;
+        w.swap(cut + 6_000, 2, "error");
+        w.line(
+            cut + 6_000 + connect + 7,
+            "output gen=2 error: Failed to connect: Socket I/O timed out (gstrtmp2sink.c)",
+        );
+        w.swap(clear - ago, 3, "connect_timeout");
+        for m in &mut w.marks {
+            if m.0 == "clear" {
+                m.2 = json!({"phase": "pending"});
+            }
+        }
+        let v = judge(&w, "dest-disconnect", "", tag);
+        if pass {
+            assert_pass(&v, tag);
+        } else {
+            assert_fails(&v, "clear_phase_driven", tag);
+        }
+        assert_eq!(
+            v.json["measures"]["clear_phase_driven"]["swap_to_clear_ms"], ago,
+            "{tag}"
+        );
+        checked += 1;
+    }
+    // A connect refused at once: the last sink built errored a second after its build, under a
+    // connect timeout before the clear. That is the back-off, never pending.
+    let mut w = dest_cut(2_500, netem(true, 900_000, 700, 4_000));
+    let cut = w.at(20.0);
+    let clear = w.marks.iter().find(|m| m.0 == "clear").unwrap().1;
+    w.swap(cut + 6_000, 2, "error");
+    w.line(
+        cut + 6_000 + connect + 7,
+        "output gen=2 error: Failed to connect: Socket I/O timed out (gstrtmp2sink.c)",
+    );
+    w.swap(clear - 2_000, 3, "connect_timeout");
+    w.line(
+        clear - 1_000,
+        "output gen=3 error: Failed to connect: Connection refused (gstrtmp2sink.c)",
+    );
+    for m in &mut w.marks {
+        if m.0 == "clear" {
+            m.2 = json!({"phase": "backoff"});
+        }
+    }
+    let v = judge(&w, "dest-disconnect", "backoff", "disc-backoff-refused");
+    assert_pass(&v, "disc-backoff-refused");
+    assert_eq!(
+        v.json["measures"]["clear_phase_driven"]["phase"], "backoff",
+        "disc-backoff-refused"
+    );
+    checked += 1;
+    // The Connected sink errored at the cut and nothing was built after it: the boot's sink and its
+    // error are no phase, whatever the drive said.
+    let mut w = dest_cut(2_500, netem(true, 900_000, 700, 4_000));
+    let cut = w.at(20.0);
+    w.line(
+        cut + 5_000,
+        "output gen=1 error: Connection error: Socket I/O timed out (gstrtmp2sink.c)",
+    );
+    for m in &mut w.marks {
+        if m.0 == "clear" {
+            m.2 = json!({"phase": "backoff"});
+        }
+    }
+    let v = judge(&w, "dest-disconnect", "backoff", "disc-no-rebuild");
+    assert_fails(&v, "clear_phase_driven", "disc-no-rebuild");
+    assert_eq!(v.json["measures"]["clear_phase_driven"]["swaps_in_fault"], 0);
+    checked += 1;
+    // Driven as the back-off, but the last sink built, a connect timeout and more before the clear,
+    // logged no error: it never failed, so this is no back-off.
+    let mut w = dest_cut(2_500, netem(true, 900_000, 700, 4_000));
+    let cut = w.at(20.0);
+    let clear = w.marks.iter().find(|m| m.0 == "clear").unwrap().1;
+    w.swap(cut + 6_000, 2, "error");
+    w.line(
+        cut + 6_000 + connect + 7,
+        "output gen=2 error: Failed to connect: Socket I/O timed out (gstrtmp2sink.c)",
+    );
+    w.swap(clear - connect - 200, 3, "connect_timeout");
+    for m in &mut w.marks {
+        if m.0 == "clear" {
+            m.2 = json!({"phase": "backoff"});
+        }
+    }
+    let v = judge(&w, "dest-disconnect", "backoff", "disc-backoff-no-error");
+    assert_fails(&v, "clear_phase_driven", "disc-backoff-no-error");
+    checked += 1;
+    eprintln!("dest-disconnect phase sims checked: {checked}");
+    assert_eq!(checked, 12);
+    let w = dest_disc(2_500, netem(true, 900_000, 700, 0), "pending");
     assert_fails(
         &judge(&w, "dest-disconnect", "", "disc-nodrop"),
         "fault_applied",
         "disc-nodrop",
     );
-    let w = dest_cut(7_000, netem(true, 900_000, 700, 4_000));
+    let w = dest_disc(7_000, netem(true, 900_000, 700, 4_000), "pending");
     assert_fails(
         &judge(&w, "dest-disconnect", "", "disc-late"),
         "output_reconnect",
@@ -879,6 +1065,11 @@ fn dest_stall(trickle: i64, stall_x: i64, stats: Value) -> World {
 /// and mutant 9's case 12, where rtmp2sink's own socket timeout failed sink 1 and the back-off
 /// (`output_backoff_base_ms`) came before the swap (C14 fix round 3, item 2).
 fn dest_stall_err(trickle: i64, stall_x: i64, stats: Value, err: Option<(u64, i64)>) -> World {
+    dest_stall_in(trickle, stall_x, stats, err, "pending")
+}
+
+/// [`dest_stall_err`], the clear landing in `phase` of the reconnect cycle that follows the swap.
+fn dest_stall_in(trickle: i64, stall_x: i64, stats: Value, err: Option<(u64, i64)>, phase: &str) -> World {
     let mut w = dest_cut(2_500, stats);
     let cut = w.at(20.0);
     let clear = w.at(50.0) + 50;
@@ -903,7 +1094,13 @@ fn dest_stall_err(trickle: i64, stall_x: i64, stats: Value, err: Option<(u64, i6
         body["sinkSwaps"] = json!(i64::from(swaps && *at >= swap));
     }
     if swaps {
-        w.line(swap, "sink swap gen=2 target=rtmp");
+        // The driver names the path: the back-off's build after sink 1's own error, else the rule.
+        let reason = match err {
+            Some((1, before)) if before > 0 => "error",
+            _ => "stall",
+        };
+        w.swap(swap, 2, reason);
+        with_cycle(&mut w, swap, 3, phase, phase);
     }
     if let Some((gen, before)) = err {
         w.line(
@@ -937,15 +1134,104 @@ fn dest_stall_swaps_the_sink_and_reds_without_a_swap_or_a_slow_one() {
         "stall_swap",
         "stall-slow",
     );
-    // CI's case 5 (run 40056474269): sink 1's own socket timeout, then the back-off, then the swap,
-    // inside the bound. The stall rule never fired, so the swap is not its witness (Owed 87).
-    let base = dest_stall(0, 1, stalled()).ms("output_backoff_base_ms");
+    // CI's case 5 (runs 40056474269, 40106770881): sink 1's own socket timeout, then the back-off,
+    // then the swap, its reason line `error`. The coordinator's decision on Owed 87 (2026-10-24):
+    // that recovery inside the spec's output budget is a pass here.
+    let probe = dest_stall(0, 1, stalled());
+    let base = probe.ms("output_backoff_base_ms");
+    let budget = probe.ms("budget_output_reconnect_ms");
     let w = dest_stall_err(0, 1, stalled(), Some((1, base + 20)));
-    assert_fails(
-        &judge(&w, "dest-stall", "", "stall-socket"),
-        "stall_swap",
-        "stall-socket",
+    let v = judge(&w, "dest-stall", "", "stall-socket");
+    assert_pass(&v, "stall-socket");
+    let m = &v.json["measures"]["stall_swap"];
+    assert_eq!(
+        (
+            m["reason"].as_str(),
+            m["cause"].as_str(),
+            m["reasons_paired"].as_bool()
+        ),
+        (Some("error"), Some("output_error"), Some(true)),
+        "stall-socket: {m}"
     );
+    assert_eq!(m["error_to_swap_ms"], base + 20, "stall-socket: {m}");
+    // The backoff leg: the same swap, the clear after the last sink's connect failed.
+    let w = dest_stall_in(0, 1, stalled(), Some((1, base + 20)), "backoff");
+    let v = judge(&w, "dest-stall", "backoff", "stall-socket-backoff");
+    assert_pass(&v, "stall-socket-backoff");
+    assert_eq!(v.json["measures"]["clear_phase_driven"]["phase"], "backoff");
+    let v = judge(&w, "dest-stall", "", "stall-backoff-as-pending");
+    assert_fails(&v, "clear_phase_driven", "stall-backoff-as-pending");
+    // The error path's reds: a swap before the back-off could end (no product can beat it), one
+    // past the spec's 5 s after the error, and a socket timeout twice as slow as the rule's budget.
+    let mut checked = 0;
+    for (tag, stall_x, before) in [
+        ("stall-err-early", 1, base - 1),
+        ("stall-err-late", 1, budget + 1),
+        ("stall-err-slow", 2, base + 20),
+    ] {
+        let w = dest_stall_err(0, stall_x, stalled(), Some((1, before)));
+        assert_fails(&judge(&w, "dest-stall", "", tag), "stall_swap", tag);
+        checked += 1;
+    }
+    // The edges: the back-off itself and the budget itself pass.
+    for (tag, before) in [("stall-err-floor", base), ("stall-err-budget", budget)] {
+        let w = dest_stall_err(0, 1, stalled(), Some((1, before)));
+        assert_pass(&judge(&w, "dest-stall", "", tag), tag);
+        checked += 1;
+    }
+    // The reason line is read, never assumed: it must name the path the error line shows, name a
+    // path the case accepts, and be there at all for every swap.
+    for (tag, err, reason) in [
+        ("stall-says-error", None, Some("error")),
+        ("stall-says-stall", Some((1, base + 20)), Some("stall")),
+        (
+            "stall-says-timeout",
+            Some((1, base + 20)),
+            Some("connect_timeout"),
+        ),
+        ("stall-no-reason", None, None),
+    ] {
+        let mut w = dest_stall_err(0, 1, stalled(), err);
+        w.reason_line(2, reason);
+        assert_fails(&judge(&w, "dest-stall", "", tag), "stall_swap", tag);
+        checked += 1;
+    }
+    // The reason lines must number the swap lines: one missing for the boot's swap, one more than
+    // the swaps (a reason logged and its swap never), and as many but one naming the wrong swap.
+    for (tag, change) in [
+        ("stall-unpaired", 0),
+        ("stall-extra-reason", 1),
+        ("stall-wrong-gen", 2),
+    ] {
+        let mut w = dest_stall(0, 1, stalled());
+        match change {
+            0 => w.reason_line(1, None),
+            1 => {
+                let at = w.at(70.0);
+                w.line(at, "sink swap reason=stall gen=3");
+            }
+            _ => w.relabel_reason(1, 2),
+        }
+        let v = judge(&w, "dest-stall", "", tag);
+        assert_fails(&v, "stall_swap", tag);
+        assert_eq!(v.json["measures"]["stall_swap"]["reasons_paired"], false, "{tag}");
+        checked += 1;
+    }
+    // A report from before the reason was read reads reason "unknown", a red.
+    let mut w = dest_stall(0, 1, stalled());
+    w.report_patch = Some(|r| {
+        r["log"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sink_swap_reasons")
+            .expect("the field to drop");
+    });
+    let v = judge(&w, "dest-stall", "", "stall-noreasons");
+    assert_fails(&v, "stall_swap", "stall-noreasons");
+    assert_eq!(v.json["measures"]["stall_swap"]["reason"], "unknown");
+    checked += 1;
+    eprintln!("dest-stall reason and error-path sims checked: {checked}");
+    assert_eq!(checked, 13);
     // The re-review's m-3: a report from before fix round 3 has no `output_errors`, which reads as
     // cause "unknown" (a red), never as "no error" and so the stall rule's.
     let mut w = dest_stall(0, 1, stalled());
@@ -984,15 +1270,22 @@ fn dest_trickle_swaps_under_a_trickle_and_reds_when_nothing_trickled() {
     let trickling = || netem_queued(true, 19_271, 16, 0, 65_536, 1);
     let w = dest_stall(5_000, 1, trickling());
     assert_pass(&judge(&w, "dest-trickle", "", "trickle-good"), "trickle-good");
-    // Mutant 9 in CI (run 40056471001): the stall threshold at 20 s, and the swap 6.1 s after the
-    // cut anyway, through sink 1's socket timeout and the back-off: inside the bound, by the wrong
-    // rule.
+    // CI's case 12 (run 40106770881): sink 1's socket timeout first, the reason line `error`, and
+    // the back-off's swap. A pass by the coordinator's decision on Owed 87; mutant 9 (the threshold
+    // at 20 s), which swapped the same way, is judged on case 17 now.
     let base = w.ms("output_backoff_base_ms");
     let w = dest_stall_err(5_000, 1, trickling(), Some((1, base + 20)));
+    assert_pass(&judge(&w, "dest-trickle", "", "trickle-socket"), "trickle-socket");
+    let w = dest_stall_in(5_000, 1, trickling(), Some((1, base + 20)), "backoff");
+    assert_pass(
+        &judge(&w, "dest-trickle", "backoff", "trickle-socket-backoff"),
+        "trickle-socket-backoff",
+    );
+    let w = dest_stall_err(5_000, 1, trickling(), Some((1, base - 1)));
     assert_fails(
-        &judge(&w, "dest-trickle", "", "trickle-socket"),
+        &judge(&w, "dest-trickle", "", "trickle-err-early"),
         "stall_swap",
-        "trickle-socket",
+        "trickle-err-early",
     );
     // Mutant 5: the netem line commented out: nothing trickles (a plain stall), and the qdisc is a
     // pass-through that never existed.
@@ -1023,6 +1316,113 @@ fn dest_trickle_swaps_under_a_trickle_and_reds_when_nothing_trickled() {
         "trickled",
         "trickle-noswap",
     );
+}
+
+/// Case 17: [`dest_stall_in`]'s stall under a trickle, with the drive's send-buffer marks: the cap
+/// compose set (`wanted`), what the namespace read back (`read`), and each RTMP socket's buffer
+/// (`tb`) before the cut. CI's figures are owed by the case's first run; these are its design's.
+fn dest_stall_rule(stall_x: i64, err: Option<(u64, i64)>, read: Value, tb: Value, stats: Value) -> World {
+    // The total stays flat between beats: a message that cannot leave counts nothing.
+    let mut w = dest_stall_in(0, stall_x, stats, err, "pending");
+    let session: Value = serde_json::from_str(
+        &std::fs::read_to_string(repo().join("contracts/fixtures/relay-job.v1/session-composed-720p.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let frame_bits =
+        session["output"]["videoKbps"].as_i64().unwrap() * 1000 / session["output"]["fps"].as_i64().unwrap();
+    let rate = frame_bits * 1000 / (2 * w.ms("output_stall_after_ms"));
+    let at = w.at(0.5);
+    w.mark(
+        "send_buffer",
+        at,
+        json!({"wanted": [4096, 8192, 8192], "read": read,
+            "before_cut": {"sockets": tb.as_array().map_or(0, Vec::len), "tb": tb, "send_q": [0]}}),
+    );
+    w.mark(
+        "rate",
+        at,
+        json!({"frame_bits": frame_bits, "bit_per_s": rate, "drain_x": 2}),
+    );
+    let at = w.at(23.0);
+    w.mark(
+        "sockets_in_fault",
+        at,
+        json!({"sockets": 1, "tb": [8192], "send_q": [6_400]}),
+    );
+    w
+}
+
+#[test]
+fn dest_stall_rule_swaps_by_the_rule_and_reds_on_the_sockets_error_a_slow_rule_or_no_cap() {
+    let capped = || json!([4096, 8192, 8192]);
+    let trickling = || netem_queued(true, 4_344, 6, 0, 8_688, 6);
+    let w = dest_stall_rule(1, None, capped(), json!([8192]), trickling());
+    let v = judge(&w, "dest-stall-rule", "", "rule-good");
+    assert_pass(&v, "rule-good");
+    let m = &v.json["measures"]["stall_swap"];
+    assert_eq!(
+        (m["reason"].as_str(), m["cause"].as_str()),
+        (Some("stall"), Some("stall")),
+        "rule-good: {m}"
+    );
+    let base = w.ms("output_backoff_base_ms");
+    let mut checked = 0;
+    // The socket timed out first after all (the cases 5 and 12 path): a pass there, a red here.
+    // Mutant 9 (output_stall_after_ms at 20 s, four thresholds): the swap far past the budget. And
+    // no swap at all in the fault.
+    for (tag, stall_x, err) in [
+        ("rule-socket", 1, Some((1, base + 20))),
+        ("rule-slow", 4, None),
+        ("rule-noswap", 0, None),
+    ] {
+        let w = dest_stall_rule(stall_x, err, capped(), json!([8192]), trickling());
+        assert_fails(&judge(&w, "dest-stall-rule", "", tag), "stall_swap", tag);
+        checked += 1;
+    }
+    // The cap never applied: the namespace reads the kernel's default, a socket's buffer is past
+    // the cap, or no RTMP socket was seen at all.
+    for (tag, read, tb) in [
+        ("rule-default", json!([4096, 16384, 4194304]), json!([8192])),
+        ("rule-big-socket", capped(), json!([87_040])),
+        ("rule-no-socket", capped(), json!([])),
+    ] {
+        let w = dest_stall_rule(1, None, read, tb, trickling());
+        assert_fails(&judge(&w, "dest-stall-rule", "", tag), "buffer_capped", tag);
+        checked += 1;
+    }
+    // A socket whose buffer ss could not read.
+    let w = dest_stall_rule(1, None, capped(), json!([null]), trickling());
+    assert_fails(
+        &judge(&w, "dest-stall-rule", "", "rule-unread-socket"),
+        "buffer_capped",
+        "rule-unread-socket",
+    );
+    checked += 1;
+    // A rate netem reads as no limit (0), and one that lets a frame out inside half a stall
+    // threshold: neither is the trickle the rule needs, whatever netem sent.
+    for (tag, rate) in [("rule-zero-rate", Some(0)), ("rule-fast-rate", None)] {
+        let mut w = dest_stall_rule(1, None, capped(), json!([8192]), trickling());
+        let half = w.ms("output_stall_after_ms") / 2;
+        for m in &mut w.marks {
+            if m.0 == "rate" {
+                let frame_bits = m.2["frame_bits"].as_i64().unwrap();
+                m.2["bit_per_s"] = json!(rate.unwrap_or(frame_bits * 1000 / half));
+            }
+        }
+        assert_fails(&judge(&w, "dest-stall-rule", "", tag), "trickled", tag);
+        checked += 1;
+    }
+    // Nothing trickled: a plain stall (case 5's), not this case.
+    let w = dest_stall_rule(1, None, capped(), json!([8192]), stalled());
+    assert_fails(
+        &judge(&w, "dest-stall-rule", "", "rule-stalled"),
+        "trickled",
+        "rule-stalled",
+    );
+    checked += 1;
+    eprintln!("dest-stall-rule sims checked: {checked}");
+    assert_eq!(checked, 10);
 }
 
 /// What the starvation did to the compositor (case 6).
@@ -2089,7 +2489,50 @@ fn every_case_file_is_judged_here() {
         );
     }
     eprintln!("case files checked: {n}; not chaos cases: {not_chaos}");
-    assert_eq!(n, 16, "the brief's 16 cases (amended 2026-10-20)");
+    assert_eq!(
+        n, 17,
+        "the brief's 16 cases (amended 2026-10-20) and case 17 (2026-10-24)"
+    );
     // Every name excused is a file, so the list cannot hide a renamed or a deleted case.
     assert_eq!(not_chaos, NOT_CHAOS.len(), "a NOT_CHAOS name with no case file");
+}
+
+/// Each case excused as NOT_CHAOS other than smoke is one of Owed 81's controls: smoke's run with
+/// one camera knob changed, so it must drive exactly what smoke drives, for as long (the PR #59
+/// review's m-r2). A control whose drive drifted would no longer compare with a smoke run. Each
+/// file is sourced by bash and its `case_drive` printed by `declare -f`, so a comment or a
+/// re-indent is no difference and a changed command is.
+#[test]
+fn every_not_chaos_control_drives_what_smoke_drives() {
+    let drive = |case: &str| {
+        let file = repo().join(format!("harness/cases/{case}.sh"));
+        let out = Command::new(bash())
+            .args([
+                "-c",
+                r#"set -eu; source "$1"; declare -f case_drive; echo "CASE_LIVE_S=$CASE_LIVE_S""#,
+                "drive",
+            ])
+            .arg(&file)
+            .env_remove("CASE_LIVE_S")
+            .output()
+            .expect("bash runs");
+        assert!(
+            out.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let smoke = drive("smoke");
+    assert!(
+        smoke.contains("case_drive ()") && smoke.contains("netem.sh") && smoke.contains("CASE_LIVE_S=60"),
+        "smoke's drive did not print: {smoke}"
+    );
+    let mut checked = 0;
+    for case in NOT_CHAOS.iter().filter(|c| **c != "smoke") {
+        assert_eq!(drive(case), smoke, "{case}'s drive is not smoke's");
+        checked += 1;
+    }
+    eprintln!("not-chaos controls checked against smoke's drive: {checked}");
+    assert_eq!(checked, NOT_CHAOS.len() - 1);
 }

@@ -1,11 +1,13 @@
 # shellcheck shell=bash disable=SC2034,SC2016 # sourced by run-case.sh; jq filters keep their $ (SC2016)
 # Case 12, dest-trickle (C14 brief, amendment 2026-10-18; Owed 16(b)): `netem out rate 8kbit` at
-# 20 s (the link stays open and bytes still trickle), cleared at 50 s; 80 s live.
+# 20 s (the link stays open and bytes still trickle), cleared about 50 s in, in the variant's phase
+# (case 4's); 80 s live.
 #
-# A trickle is a stall, not progress: a swap within case 5's bound (`stall_swap`), by the stall
-# rule (its `cause`: mutant 9's 20 s threshold swapped 6.1 s after the cut through rtmp2sink's own
-# socket timeout, so a bound alone cannot witness the rule; Owed 87). Then the output recovers as in
-# case 4. Anti-vacuity: the netem qdisc sent at least 2 packets through the open
+# A trickle is a stall, not progress: a swap within case 5's bound, by either path case 5 accepts
+# (`stall_swap_judged`: the stall rule, or the sink's own socket timeout first and the back-off's
+# swap; the coordinator's decision on Owed 87, 2026-10-24). In CI the socket errors first. The rule
+# is witnessed by case 17, and mutant 9 (the threshold at 20 s) is judged there. Then the output
+# recovers as in case 4. Anti-vacuity: the netem qdisc sent at least 2 packets through the open
 # link, so the bytes really trickled and this is not case 5 again (case 5's qdisc sends none), and
 # the swap came. The trickle is witnessed where it is injected, as case 10's loss is. The brief's
 # "compositor log OutputProgress totals" do not exist (the compositor logs no progress total: a
@@ -17,16 +19,17 @@
 
 CASE_LIVE_S=80
 CASE_KEY=stall_swap
+# The clear's phase (the re-review's I-5; Owed 84): the variant's (`dest_phase`), from 45 s on, so
+# it lands 47-57 s in (one reconnect cycle at most); `require_clear_phase` reds a missed phase.
+CLEAR_PHASE="$(dest_phase)"
+CLEAR_FROM_S=45
 NETEM_RATE=8kbit
 
 case_drive() {
   at_s 20
   mark cut
   "$HERE/netem.sh" out rate "$NETEM_RATE"
-  at_s 50
-  mark netem_out "$("$HERE/netem.sh" stats out)"
-  "$HERE/netem.sh" clear out
-  mark clear
+  clear_out_in_phase "$CLEAR_PHASE" "$CLEAR_FROM_S"
   at_s "$CASE_LIVE_S"
 }
 
@@ -35,10 +38,10 @@ case_verdict() {
   require trickled 'mark_value("netem_out") as $n | $n.sent_pkts >= 2
     and stall_swap(mark_at("cut")).swap_ms != null' \
     '{netem: mark_value("netem_out"), swap_ms: stall_swap(mark_at("cut")).swap_ms}'
-  require stall_swap 'stall_swap(mark_at("cut")) | .swap_ms != null and .swap_beat_ms != null and .last_growth_ms != null
-    and .from_growth_ms <= .bound_ms and .cause == "stall"' 'stall_swap(mark_at("cut"))'
+  require stall_swap 'stall_swap_judged(mark_at("cut"); ["stall", "error"])' 'stall_swap(mark_at("cut"))'
   measure swap_log_from_cut_ms '[.log.sink_swaps[] | select(.at_ms > mark_at("cut"))] | first | .at_ms - mark_at("cut")'
   measure netem_out 'mark_value("netem_out")'
   require_output_recovers
+  require_clear_phase
   require_no_false_restart
 }
