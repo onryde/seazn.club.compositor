@@ -671,6 +671,9 @@ the same list.
 
 ## Amendment 2026-10-24, wave-gate-3 follow-ups (branch `feat/c14-wg3-followups`)
 
+*Superseded for Owed 87 by the amendment "Owed 87 decided" below (the PR #73 review's m-6): the
+`stall` path, case 17's premise and m9's old target are retired there.*
+
 The coordinator's dispatch after #52 merged at 7beb540; rebased onto main b606d1b (#59: its two
 Owed 81 controls are NOT_CHAOS; #60). Harness only; no product crate changed. Decision log "C14
 wave-gate-3 follow-ups".
@@ -769,7 +772,10 @@ socket timeout is the only detector of a destination stall (`docs/_INDEX.md` Owe
   - the swap came output_backoff_base_ms to budget_output_reconnect_ms (§6, 5 s) after the error,
     and within `bound_ms` (output_sink_timeout_ms + output_backoff_base_ms + frame_period_ms) of the
     last growth;
-  - the error came no sooner than output_sink_timeout_ms − frame_period_ms after the cut.
+  - the error came no sooner than output_sink_timeout_ms − frame_period_ms after the cut, and no
+    later than output_sink_timeout_ms + budget_output_lost_max_ms (review round 1's m-1: what the
+    sink writes after the cut goes into a socket nothing drains, and §6 lets a stall lose at most 2 s
+    of programme; the growth bound alone, anchored on a beat, passes a timeout up to about 8–9 s).
   thresholds.json gains `output_sink_timeout_ms` and loses `output_stall_after_ms` and
   `output_progress_poll_ms`.
 - **Case 17 (`dest-stall-rule`) witnesses the error path under its capped send buffer.** Its premise
@@ -783,13 +789,20 @@ socket timeout is the only detector of a destination stall (`docs/_INDEX.md` Owe
   signature and its title. A red on those checks reads NOT OWED.
 - **m9** now sets `OUTPUT_SINK_TIMEOUT_MS` to 20 000 in a scratch relay build, on case 17, with
   target `stall_swap` and controls `buffer_capped` and `trickled`. The verdict reads the committed
-  thresholds.json. It must end KILLED.
+  thresholds.json. It must end KILLED. **KILLED on CI (run 40136067430, PR #74), by the destination
+  rather than the 20 s wait** (the PR #73 review's I-3; `docs/_INDEX.md` false premises): MediaMTX
+  closed each publisher whose message could not complete (gen 1 `connection closed remotely`
+  10 998 ms after the cut, swapped at 11 511 ms), and `stall_swap` red on the bound
+  (`from_growth_ms` 6 732 against 5 533). `case_verdicts.rs` `rule-m9-ci` models that shape;
+  `rule-m9`'s four timeouts model the sink's own 20 s wait, which CI did not show.
 - **Host mutants, each with a named FAIL in a `case_verdicts.rs` sim:** lib.jq's `reason == "error"`,
   the back-off floor, the output budget, the bound from growth and the floor from the cut, each
-  replaced by `true` (or the floor by 0). `error_to_swap_ms != null` is dropped as equivalent: jq sorts
-  null below every number, so the floor reds a null.
-- **Expected reds of the next run:** cef-leaks ×2 (NOT RUNNABLE until case 16's PR, Owed 82) and
-  cpu-starved (Owed 86, still in chaos.json). Anything else is NOT OWED.
+  replaced by `true` (or the floor by 0); and review round 1's ceiling from the cut, replaced by
+  `true`, red in `rule-late-error`. `error_to_swap_ms != null` is dropped as equivalent: jq sorts null
+  below every number, so the floor reds a null.
+- **Expected reds of the next run:** cpu-starved (Owed 86, still in chaos.json); and cef-leaks ×2,
+  NOT RUNNABLE until case 16's PR (#71) merges, then whatever case 16 reads (review round 1's m-5).
+  No Owed 87 red is expected. Anything else is NOT OWED.
 
 ## Files
 
@@ -846,8 +859,9 @@ socket timeout is the only detector of a destination stall (`docs/_INDEX.md` Owe
   only on the sink's own error: `reason=error`, the error line before the swap, the swap
   output_backoff_base_ms to budget_output_reconnect_ms after it and within output_sink_timeout_ms +
   output_backoff_base_ms + frame_period_ms of the last growth, and the error no sooner than
-  output_sink_timeout_ms − frame_period_ms after the cut, each read from `thresholds.json`. m9
-  (`OUTPUT_SINK_TIMEOUT_MS` 20 s) is KILLED on case 17.
+  output_sink_timeout_ms − frame_period_ms after the cut and no later than output_sink_timeout_ms +
+  budget_output_lost_max_ms, each read from `thresholds.json`. m9 (`OUTPUT_SINK_TIMEOUT_MS` 20 s) is
+  KILLED on case 17.
 - (Amended 2026-10-18, Owed 20) Case 6 asserts the score stays on air through the stress and
   after it, and every beat's `rung` is `full`/`overlay_half_rate`, never back to `full` after a step.
 - (Amended 2026-10-20, C11b; Owed 62, 68, 69) Case 8 takes case 9's shape, with a non-zero, non-75 exit and no core

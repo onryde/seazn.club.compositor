@@ -493,8 +493,11 @@ happen" turned into a tested guard.
 - (Amended 2026-10-19.) A generation change mid-window restarts the proof: the old sink's bytes never
   count toward the new one.
 - ~~(Amended 2026-10-19.) Growth that stops before the bound is a stall that counts as a failure, never
-  Connected.~~ (Amended 2026-10-24, Owed 87.) Growth that stops before the bound waits for the sink's
-  error, which counts as a failure; it is never Connected.
+  Connected.~~ (Amended 2026-10-24, Owed 87; corrected by the PR #73 review's m-2.) Growth that stops
+  before the bound is not Connected while it is silent: the sink's error ends it as a failure, and a
+  growth that resumes at or past the bound, counted from the first growth, connects. A silence inside
+  the proof is no failure and does not restart it
+  (`a_proving_sink_that_grows_again_after_a_silence_connects_at_the_bound`).
 - (Amended 2026-10-19.) Every sweep prints its count and fails on 0. Each guard's mutant goes red: the
   bound's `>=`, the reset placement, and the generation checks.
 - (Amended 2026-10-24, Owed 87.) No stall rule: `output_stall_after_ms` and `SwapReason::Stall` are
@@ -597,7 +600,9 @@ won once, by about 1 ms. rtmp2 counts bytes only when a whole message is written
 **As built (branch `feat/owed87-retire-stall`).**
 - `OutputState` is `Connecting { attempt, since }`, `Proving { attempt, first_progress, sent }`,
   `Connected` and `Backoff { attempt, until }`. No state keeps a last progress. Proving still earns
-  Connected only by growth (Owed 38), and a repeated or backwards total is no progress.
+  Connected only by growth (Owed 38), and a repeated or backwards total is no progress. A silence
+  inside the proof no longer fails it: the first growth at or past the bound connects, however long
+  the sink was silent before it (the PR #73 review's m-2).
 - `on_tick` keeps two timers: a due back-off builds, and a Connecting sink past
   `output_connect_timeout_ms` backs off (`SwapReason::ConnectTimeout`). Proving and Connected have
   no timer: only `on_error` ends them (`SwapReason::Error`; from Connected it is failure 1, so the
