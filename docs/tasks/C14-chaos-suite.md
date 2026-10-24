@@ -751,7 +751,7 @@ review-round-1 amendment.
   - Every `$t.<key>` and `$(threshold <key>)` read in lib.jq, run-case.sh and the case files is a
     thresholds.json key; a key missing, or no reads at all, fails.
   - The checker's outage count is counted.
-- **lost_ms (I-3)** is Owed 91, not fixed here: the dating step moves it by about −2 s in 11 of 15
+- **lost_ms (I-3)** is Owed 92, not fixed here: the dating step moves it by about −2 s in 11 of 15
   destination legs, the size of `output_lost`'s budget.
 - **Expected reds of the next run:** cef-leaks ×2 (Owed 82, NOT RUNNABLE), cpu-starved (86) and
   dest-stall-rule (87, both checks). Anything else is NOT OWED.
