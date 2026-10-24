@@ -1,12 +1,16 @@
 # shellcheck shell=bash disable=SC2034 # sourced by run-case.sh, which reads CASE_CHECKS
-# Owed 81's fix candidate: the smoke case's run (60 s live, pass-through netem on both legs, audio
-# on) with the camera's mux at one packet a buffer, so no frame's last packets wait for the next
-# frame's to fill a buffer of seven (F-029). Compare its `camera.cadence` and its wire.jsonl /
-# tap.jsonl with a smoke run's. Measured (dispatch 40090232700): not the fix. The mux still held
-# 37.5 % of the frames, waiting for the audio, and no reader decoded a video frame (F-029).
+# Owed 81's alignment-1 control (red: it loses the video, F-029): the smoke case's run (60 s live,
+# pass-through netem on both legs, audio on) with the camera's mux at one packet a buffer, so no
+# frame's last packets wait to fill a buffer of seven. Measured (dispatch 40090232700): the mux
+# still held 37.5 % of the frames, waiting for the audio, and no reader got a video frame:
+# MediaMTX sends a reader no H264 until it has seen a random-access unit, and here it never did,
+# for a reason not read (its publisher's SRT loss counters would tell). It never goes live, so the
+# verdict below fails by design; read its wire.jsonl with scripts/cadence_stages.py.
 # Sourced by run-case.sh.
 
 CASE_LIVE_S=60
+# Owed 81's input-tap (compose's `probe` profile): tap.jsonl, read by scripts/cadence_stages.py.
+export COMPOSE_PROFILES=probe
 export CAMERA_TS_ALIGNMENT=1
 
 case_drive() {

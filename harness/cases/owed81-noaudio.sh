@@ -5,6 +5,8 @@
 # Sourced by run-case.sh.
 
 CASE_LIVE_S=60
+# Owed 81's input-tap (compose's `probe` profile): tap.jsonl, read by scripts/cadence_stages.py.
+export COMPOSE_PROFILES=probe
 export CAMERA_AUDIO=off
 
 case_drive() {
