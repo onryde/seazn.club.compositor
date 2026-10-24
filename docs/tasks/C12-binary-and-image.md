@@ -290,11 +290,14 @@ The first sample after start returns `cpu_pct: None`, because there's no delta y
   the control `SESSION_ID`.
 - (Amended 2026-10-23, the PR #36 final review's m1) `supervise_test.py`'s 500 races draw 400 INTs from +0 to +3 ms
   after the child's exit and 100 from ±15 ms; mutant 37 (round 1's trapped `wait`) goes red on the races 3 runs of 3.
-- (Amended 2026-10-24, Owed 85) After a restart in place that keeps the container's writable layer (Docker's
+- (Amended 2026-10-24, Owed 85; corrected the same day by the PR #54 review's C1: this said "the X lock naming
+  it", which `-displayfd` switches off) After a restart in place that keeps the container's writable layer (Docker's
   `--restart on-failure:2`, ADR 0007 item 5), CEF is ready again in the new life after each of 75, 133 and 137, with
-  exactly one Xvfb and the X lock naming it: image.yml's in-place restart probe (`image_probe.py --restarts 6`, each
-  kind twice, 0 checked is a failure). `start_xvfb` (`docker/xvfb.sh`) is ready only on Xvfb's own `-displayfd` line
-  and fails at once (70) on an Xvfb that exits first (`scripts/xvfb_start_test.py`, check.yml).
+  exactly one Xvfb, started with `-displayfd`; no `/tmp/.X99-lock` (`-displayfd` sets Xvfb's `nolock`, xorg-server's
+  os/utils.c); and that Xvfb listening on `/tmp/.X11-unix/X99`: image.yml's in-place restart probe (`image_probe.py
+  --restarts 6`, each kind twice, every restart made whatever an earlier check found, exactly 6 checked or a failure).
+  `start_xvfb` (`docker/xvfb.sh`) is ready only on Xvfb's own `-displayfd` line, logs `Xvfb ready after N ms`, and
+  fails at once (70) on an Xvfb that exits first or names another display (`scripts/xvfb_start_test.py`, check.yml).
 
 
 ## Final heartbeat with the exit reason (owner ruling 2026-10-15)
@@ -815,7 +818,10 @@ The final review at `341ae7a` (Needs fixes: I-1, m1–m8) and the coordinator's 
 ## Amendment 2026-10-24 (Owed 85: CEF never initialised after a container restart)
 
 C14's second round (F-024) found CEF failing `init_cef` after 13 of 18 container restarts. F-025 proves the cause on the
-real Xvfb and `docs/_INDEX.md`'s decision row "Owed 85 fixed" holds the choices.
+real Xvfb and `docs/_INDEX.md`'s decision rows "Owed 85" and "Owed 85, review round 1" hold the choices. (Corrected the
+same day by the PR #54 review's C1 and I1: this first said the start removes the display's lock and socket, and that
+the removal is what makes a restart safe. Under `-displayfd` there is no lock, and Xvfb replaces the socket itself; the
+removal is gone.)
 
 - **The cause** (F-025): a restart that keeps the writable layer leaves `/tmp/.X99-lock` and `/tmp/.X11-unix/X99`. The
   restarted container's new pid namespace gives the new Xvfb its predecessor's pid, so Xvfb's lock check finds that
@@ -823,14 +829,18 @@ real Xvfb and `docs/_INDEX.md`'s decision row "Owed 85 fixed" holds the choices.
   found no X server. Step 7's entrypoint snippet ("start Xvfb", then wait for `/tmp/.X11-unix/X99`) is superseded
   by the next bullet.
 - **The X server start moves to `docker/xvfb.sh`** (sourced after `supervise.sh`, installed beside it): `start_xvfb 99
-  /tmp` removes the display's lock and socket (nothing of an earlier life can own them), starts Xvfb without the job
-  token and with `-displayfd`, and returns once Xvfb writes its display number, or 70 with the reason: "it exited before
-  it was ready" at once, "not ready after 5 s" after the old wait's 5 s.
-- **Tests:** `scripts/xvfb_start_test.py` (check.yml's "Entrypoint X server start", a stub Xvfb that refuses a lock it finds,
-  as the real one does on a restart) and image.yml's "In-place restart probe" (the real Xvfb; `scripts/xvfb_witness.sh`, test only, records each
-  Xvfb start's pid, the lock it found and Xvfb's stderr). The acceptance bullet above (Amended 2026-10-24, Owed 85).
-- **Fly** keeps nothing across a start (F-018), so the change is a no-op there; it is owed to any host whose restart
-  keeps the writable layer (ADR 0007 item 5's Docker equivalent).
+  /tmp` starts Xvfb without the job token and with `-displayfd`, which sets Xvfb's `nolock` (no lock is read or
+  written, so none is left for a later life), and returns once Xvfb writes its display number to that fd, logging
+  `Xvfb ready after N ms`, or 70 with the reason: "it exited before it was ready" at once, "its ready line named a
+  display other than :99" at once, "not ready after 5 s" after the old wait's 5 s. Nothing is removed first: an earlier
+  life's socket is unlinked by Xvfb's own transport before it binds.
+- **Tests:** `scripts/xvfb_start_test.py` (check.yml's "Entrypoint X server start", a stub Xvfb that, as the real one,
+  takes no lock under `-displayfd`, refuses a lock it finds without it, and replaces its socket) and image.yml's
+  "In-place restart probe" (the real Xvfb; `scripts/xvfb_witness.sh`, test only, records each Xvfb start's pid, the
+  lock and socket it met, and Xvfb's stderr). The acceptance bullet above (Amended 2026-10-24, Owed 85).
+- **Fly:** its docs say a restart wipes the ephemeral file system (`persist_rootfs` defaults to `never`, and web sets
+  none; cited, not measured across an `on-failure` restart: F-018's correction), so the change is a no-op there; it is
+  owed to any host whose restart keeps the writable layer (ADR 0007 item 5's Docker equivalent).
 
 ## Do not touch
 
