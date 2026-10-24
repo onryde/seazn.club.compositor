@@ -2,11 +2,16 @@
 # Case 5, dest-stall (C14 brief, amended 2026-10-18 for Owed 13/15): `netem out rate 1kbit` at
 # 20 s (the link accepts, nothing moves), cleared at 50 s; 80 s live.
 #
-# A sinkSwaps rise appears in a beat within output_stall_after_ms + output_progress_poll_ms +
-# heartbeat_interval_ms (all from thresholds.json), timed from the last beat whose egressBytes grew:
-# Owed 39, the kernel's send buffer keeps the total growing ~4 s after the cut, so a bound timed
-# from the cut is wrong by the drain (`stall_swap`, harness/cases/lib.jq). The cut-timed figure and
-# the log's swap line are printed. The output then recovers as in case 4.
+# The log's `sink swap` line comes within output_stall_after_ms + output_progress_poll_ms (both from
+# thresholds.json) of the last beat whose egressBytes grew, and a beat carries the raised sinkSwaps:
+# Owed 39, the kernel's send buffer keeps the total growing after the cut, so a bound timed from the
+# cut is wrong by the drain (`stall_swap`, harness/cases/lib.jq; the PR #52 review's I4: a bound
+# that also took a beat interval let a detector twice as slow pass). The cut-timed figure is
+# printed. The output then recovers as in case 4.
+#
+# Anti-vacuity (the review's I1): the netem qdisc holds a backlog at the clear, so the rate limit
+# held the leg's packets. Its Sent count is no witness: CI read 0 sent and 0 dropped in 30 s at
+# 1 kbit while the stall applied (the TSO/GSO segments already queued each take minutes).
 
 CASE_LIVE_S=80
 CASE_KEY=stall_swap
@@ -25,9 +30,9 @@ case_drive() {
 
 CASE_CHECKS=11
 case_verdict() {
-  require fault_applied 'mark_value("netem_out") | .present and .sent_pkts > 0' 'mark_value("netem_out")'
-  require stall_swap 'stall_swap(mark_at("cut")) | .swap_ms != null and .last_growth_ms != null and .from_growth_ms <= .bound_ms' \
-    'stall_swap(mark_at("cut")) | del(.egress_between)'
+  require fault_applied 'mark_value("netem_out") | .backlog_bytes > 0' 'mark_value("netem_out")'
+  require stall_swap 'stall_swap(mark_at("cut")) | .swap_ms != null and .swap_beat_ms != null and .last_growth_ms != null
+    and .from_growth_ms <= .bound_ms' 'stall_swap(mark_at("cut"))'
   measure swap_log_from_cut_ms '[.log.sink_swaps[] | select(.at_ms > mark_at("cut"))] | first | .at_ms - mark_at("cut")'
   require_output_recovers
   require_no_false_restart

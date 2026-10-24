@@ -28,7 +28,8 @@ case_drive() {
 
 CASE_CHECKS=19
 case_verdict() {
-  require kill_applied 'mark_value("kill") | .rc == 0 and .pid != null' 'mark_value("kill")'
+  require kill_applied 'mark_value("kill").pid != null and (mark("kill_rc") | all(.value.rc == 0))' \
+    '{target: mark_value("kill"), rc: [mark("kill_rc")[] | .value.rc]}'
   require died_non_zero '(dies_after(mark_at("kill")) | first) as $d | $d != null and $d.exit_code != 0' \
     '(dies_after(mark_at("kill")) | first | .exit_code)'
   require_run restarted_once '.compositor.restarts - .restarts_at_live == 1' '{at_live: .restarts_at_live, at_end: .compositor.restarts}'

@@ -9,11 +9,11 @@
 # `overlay hidden reason=hang gen=g`, then `graphics restart gen=g+1`, then `cef ready gen=g+1`, and no
 # other hide. The strip, frame-exact: the overlay holds one index from the hang while the timeline
 # schedules a change (the frame is held, not idle), then shows no overlay for at least one frame,
-# then the overlay again after the new generation's ready. The hide lands within cef_hang_after_ms
-# + one frame period of the page's last `seazn:alive`, + BUDGET_FRAME_TO_ENCODER_MS: the strip's
-# frame reaches the recording after the decision (the log line's clock is not the recording's; a
-# deviation from the brief's bound, which has no transport term). Camera frames continue, the output
-# never drops, and every beat in the span reads ready, restarting or starting, never failed.
+# then the overlay again after the new generation's ready. The strip's gap starts within
+# cef_hang_after_ms + one frame period of the page's last `seazn:alive` (the brief's bound: CI run
+# 40045826841 read the strip 6 ms behind the log, so no transport term is owed; the PR #52 review's
+# m1). Camera frames continue, the output never drops, and every beat in the span (at least one)
+# reads ready, restarting or starting, never failed.
 # Anti-vacuity: the page's own hang line, at least 2 alive lines before it and none after.
 
 CASE_LIVE_S=60
@@ -52,9 +52,9 @@ case_verdict() {
     and ([scheduled[] | select(.due_ms > $h.at_ms and .due_ms < $gap.from_ms)] | length) >= 1' \
     "$HUNG"' | {held: [.overlay.runs[] | select(.to_ms > $h.at_ms and .from_ms < $gap.from_ms) | .index],
       scheduled_meanwhile: ([scheduled[] | select(.due_ms > $h.at_ms and .due_ms < $gap.from_ms)] | length)}'
-  require detect_ms "$HUNG"' | $alive != null and ($gap.from_ms - $alive.at_ms) <= ($t.cef_hang_after_ms + $t.frame_period_ms + $t.budget_frame_to_encoder_ms)' \
+  require detect_ms "$HUNG"' | $alive != null and ($gap.from_ms - $alive.at_ms) <= ($t.cef_hang_after_ms + $t.frame_period_ms)' \
     "$HUNG"' | {strip_from_last_alive_ms: ($gap.from_ms - $alive.at_ms), log_from_last_alive_ms: ($hid.at_ms - $alive.at_ms),
-      bound: ($t.cef_hang_after_ms + $t.frame_period_ms + $t.budget_frame_to_encoder_ms)}'
+      bound: ($t.cef_hang_after_ms + $t.frame_period_ms)}'
   require overlay_back "$HUNG"' | $ready != null and $gap.to_ms >= $ready.at_ms
     and ([.overlay.runs[] | select(.from_ms >= $gap.to_ms and .index != null)] | length) >= 1' \
     "$HUNG"' | {gap_to_ms: $gap.to_ms, ready_ms: $ready.at_ms}'
@@ -62,7 +62,7 @@ case_verdict() {
     "$HUNG"' | [.camera.freezes[] | select(.from_ms >= $h.at_ms and .from_ms <= $gap.to_ms + $t.budget_return_to_live_ms) | .frames]'
   require no_output_outages '.output_outages == []' '.output_outages | length'
   require beats_never_failed "$HUNG"' | beats_between($h.at_ms; $ready.at_ms + 1)
-    | all(.body.graphics == "ready" or .body.graphics == "restarting" or .body.graphics == "starting")' \
+    | length >= 1 and all(.body.graphics == "ready" or .body.graphics == "restarting" or .body.graphics == "starting")' \
     "$HUNG"' | beats_between($h.at_ms; $ready.at_ms + 1) | map(.body.graphics)'
   require_no_false_restart
 }

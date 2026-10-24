@@ -9,7 +9,9 @@
 # the output returns within BUDGET_PROCESS_RESTART_OUTPUT_MS of the kill, the same session, no
 # counter regression, and no core (Owed 68). The outage and its parts are measured (3 runs; the
 # table prints the worst). The restart evidence of Owed 19 is the new process's own `cef ready`
-# after the start, and every beat after the kill reads graphics ready, restarting or starting.
+# after the start, the first beat after that ready reads graphics ready, and every beat after the
+# kill reads ready, restarting or starting. Anti-vacuity: the kill's targets (printed before it
+# kills) name at least one CEF child, and its status, when the exec lived to print it, is 0.
 
 CASE_LIVE_S=70
 CASE_KEY=outage_ms
@@ -23,8 +25,9 @@ case_drive() {
 CASE_CHECKS=17
 case_verdict() {
   # Anti-vacuity: the kill reached CEF's children, and the container died.
-  require kill_applied 'mark_value("kill") | .rc == 0 and (.killed | length) >= 1' \
-    'mark_value("kill") | {killed: (.killed | length), types: (.types | group_by(.) | map({(.[0]): length}) | add)}'
+  require kill_applied '(mark_value("kill") | (.killed | length) >= 1) and (mark("kill_rc") | all(.value.rc == 0))' \
+    '{killed: (mark_value("kill").killed | length), types: (mark_value("kill").types | group_by(.) | map({(.[0]): length}) | add),
+      rc: [mark("kill_rc")[] | .value.rc]}'
   require died_not_in_place '(dies_after(mark_at("kill")) | first) as $d | $d != null and $d.exit_code != 0 and $d.exit_code != 75' \
     '(dies_after(mark_at("kill")) | first | .exit_code)'
   require_run restarted_once '.compositor.restarts - .restarts_at_live == 1' '{at_live: .restarts_at_live, at_end: .compositor.restarts}'
@@ -33,8 +36,10 @@ case_verdict() {
     '(dies_after(mark_at("kill")) | first | .at_ms) as $die | (starts_after($die) | first | .at_ms) as $start | restart_outage($die; $start).to_wall_ms - mark_at("kill")'
   measure gpu_unusable_lines '.log.gpu_unusable | length'
   require cef_ready_after_restart '(starts_after(mark_at("kill")) | first | .at_ms) as $s
-    | $s != null and ([.log.cef_ready[] | select(.at_ms > $s)] | length) >= 1' \
-    '(starts_after(mark_at("kill")) | first | .at_ms) as $s | [.log.cef_ready[] | select(.at_ms > $s) | .at_ms - $s]'
+    | ([.log.cef_ready[] | select(.at_ms > $s)] | first | .at_ms) as $r
+    | $s != null and $r != null and ([beats[] | select(.received_ms > $r)] | first | .body.graphics) == "ready"' \
+    '(starts_after(mark_at("kill")) | first | .at_ms) as $s | ([.log.cef_ready[] | select(.at_ms > $s)] | first | .at_ms) as $r
+      | {ready_after_start_ms: ($r - $s), first_beat_after: ([beats[] | select(.received_ms > $r)] | first | .body.graphics)}'
   require beats_never_failed 'beats_between(mark_at("kill"); $run.end_request_ms + 1)
     | length >= 1 and all(.body.state != "playing" or .body.graphics == "ready" or .body.graphics == "restarting" or .body.graphics == "starting")' \
     'beats_between(mark_at("kill"); $run.end_request_ms + 1) | map(.body.graphics) | unique'

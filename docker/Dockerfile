@@ -65,17 +65,15 @@ RUN useradd --uid 10001 --create-home tester && chown -R 10001:10001 /src /opt/c
 USER tester
 
 # The harness (C13, harness/compose.yml): fake-camera, fake-control and the checker on the same
-# GStreamer as the runtime, plus tc (netem.sh's sidecars), curl (the cases' controls) and stress-ng
-# (C14's cpu-starved case, run from this image beside the stack). No CEF: the harness only feeds and
-# reads the relay image, and nothing here reaches the runtime stage below.
+# GStreamer as the runtime, plus tc (netem.sh's sidecars) and curl (the cases' controls). No CEF:
+# the harness only feeds and reads the relay image.
 FROM rust-build AS harness-build
 RUN cargo build --release --locked -p harness --bins \
  && install -m 0755 target/release/fake-camera target/release/fake-control target/release/checker /usr/local/bin/
 
 FROM gst-base AS harness
-RUN apt-get update && apt-get install -y --no-install-recommends iproute2 curl stress-ng \
-    && rm -rf /var/lib/apt/lists/* \
-    && stress-ng --version
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 curl \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=harness-build /usr/local/bin/fake-camera /usr/local/bin/fake-control /usr/local/bin/checker /usr/local/bin/
 RUN for e in appsrc x264enc h264parse mpegtsmux srtsink audioconvert voaacenc aacparse queue filesrc \
       decodebin qtdemux avdec_h264 avdec_aac videoconvert audioresample appsink fakesink; do \
