@@ -132,6 +132,35 @@ jobs:
             fi
           done
           exit "$fail"
+      # Owed 82 (owner option A, 2026-10-24): the compositor's `test-hooks` build, C14 case 16's binary
+      # (the Dockerfile's relay-test-hooks stage). No workspace member turns the feature on, so the run
+      # above built the compositor without it and ran the no-feature twins; here, the feature's own
+      # tests. Every hook test must have run AND passed by name, in whichever run owns it.
+      - name: The test-hooks build (Owed 82)
+        run: |
+          cargo clippy -p compositor --features test-hooks --all-targets -- -D warnings
+          cargo test -p compositor --features test-hooks --test env --test fake_run -- test_hook --show-output 2>&1 | tee test-hooks.log
+          fail=0
+          checked=0
+          for pair in \
+            test.log:test_hook_the_held_teardown_budget_is_taken_once_each \
+            test.log:test_hook_two_held_teardowns_leak_two_and_restart_nothing \
+            test.log:test_hook_three_held_teardowns_restart_in_place_with_exit_75 \
+            test.log:test_hook_hold_teardowns_is_not_read_without_the_feature \
+            test.log:test_hook_a_build_without_the_feature_arms_nothing \
+            test-hooks.log:test_hook_hold_teardowns_takes_a_count_and_refuses_anything_else \
+            test-hooks.log:test_hook_a_live_run_arms_the_held_teardowns_it_is_given; do
+            log=${pair%%:*} name=${pair#*:}
+            checked=$((checked + 1))
+            if grep -Eq "^test ([a-z_]+::)*$name \.\.\. ok$" "$log"; then
+              echo "passed ($log): $name"
+            else
+              echo "::error::did not pass ($log): $name"
+              fail=1
+            fi
+          done
+          echo "hook tests checked by name: $checked"
+          exit "$fail"
       # docker/xvfb.sh, the image's X server start (Owed 85, F-025), with a stub Xvfb under the image's
       # bash: an earlier life's lock and socket removed first, ready on Xvfb's own word (-displayfd), an
       # Xvfb that exits first refused at once. About 15 s. The real Xvfb across real in-place restarts is

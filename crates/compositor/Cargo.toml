@@ -12,6 +12,12 @@ workspace = true
 name = "compositor"
 path = "src/main.rs"
 
+[features]
+# Owed 82 (owner option A, 2026-10-24): C14 case 16's held-teardown hook (`COMPOSITOR_TEST_HOLD_TEARDOWNS`,
+# `CefGraphics::hold_next_teardowns`). Only the Dockerfile's `relay-test-hooks` stage builds it; the
+# default `relay` image is built without it, and image.yml checks that its binary carries none of it.
+test-hooks = ["adapters/test-hooks"]
+
 [dependencies]
 domain = { path = "../domain" }
 app = { path = "../app" }

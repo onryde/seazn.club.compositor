@@ -795,3 +795,97 @@ fn the_compositor_runs_non_dumpable_with_a_one_byte_core_limit() {
     let (code, _) = run.wait_exit(Duration::from_secs(15));
     assert_eq!(code, Some(0), "{}", run.stderr());
 }
+
+// ---- Owed 82: the held-teardown test hook ----
+
+/// An APP_URL nothing listens on: a live run's session fetch fails and it retries, so it runs on
+/// (until the test kills it) with no web and no session.
+fn closed_app_url() -> String {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = l.local_addr().expect("addr").port();
+    drop(l);
+    format!("http://127.0.0.1:{port}")
+}
+
+/// A live run's environment, `COMPOSITOR_TEST_HOLD_TEARDOWNS` set to `hold` if given.
+fn live_env(hold: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut v = scripted_env(deadline_in(3_600_000));
+    v.retain(|(k, _)| *k != env::APP_URL && *k != env::COMPOSITOR_DRIVERS);
+    v.push((env::APP_URL, closed_app_url()));
+    v.push((env::COMPOSITOR_DRIVERS, "live".to_owned()));
+    if let Some(h) = hold {
+        v.push(("COMPOSITOR_TEST_HOLD_TEARDOWNS", h.to_owned()));
+    }
+    v
+}
+
+/// The live run's lines from the test hook, once it has started.
+fn hook_lines(hold: Option<&str>) -> Vec<String> {
+    let run = Run::spawn(&live_env(hold));
+    run.wait_line("msg=compositor started drivers=live", Duration::from_secs(20))
+        .unwrap_or_else(|| panic!("{hold:?}: never started:\n{}", run.stderr()));
+    assert_no_secret(&run);
+    run.stderr()
+        .lines()
+        .filter(|l| l.contains("test hook") || l.contains("COMPOSITOR_TEST_HOLD_TEARDOWNS"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Owed 82 (owner option A, 2026-10-24), the `test-hooks` binary: a live run arms exactly the held
+/// teardowns `COMPOSITOR_TEST_HOLD_TEARDOWNS` asks for, in one line, C14 case 16's witness that the
+/// run carries the hook; unset or 0 arms nothing; a value it does not take exits 78 before the loop.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn test_hook_a_live_run_arms_the_held_teardowns_it_is_given() {
+    let _s = serial();
+    let mut checked = 0;
+    for (hold, armed) in [
+        (None, None),
+        (Some("0"), None),
+        (Some("2"), Some(2)),
+        (Some("3"), Some(3)),
+    ] {
+        let lines = hook_lines(hold);
+        match armed {
+            None => assert!(lines.is_empty(), "{hold:?}: {lines:?}"),
+            Some(n) => {
+                let want = format!("msg=WARN test hook (Owed 82): the next {n} CEF teardowns never return");
+                assert_eq!(lines.len(), 1, "{hold:?}: {lines:?}");
+                assert!(lines[0].ends_with(&want), "{hold:?}: {lines:?}");
+            }
+        }
+        checked += 1;
+    }
+    let mut run = Run::spawn(&live_env(Some("two")));
+    let (code, _) = run.wait_exit(Duration::from_secs(10));
+    assert_eq!(code, Some(78), "{}", run.stderr());
+    let e = run.stderr();
+    assert!(
+        e.contains("msg=COMPOSITOR_TEST_HOLD_TEARDOWNS is not a valid value"),
+        "{e}"
+    );
+    assert!(
+        !e.contains("compositor started") && !e.contains("test hook"),
+        "{e}"
+    );
+    checked += 1;
+    eprintln!("hook runs checked: {checked}");
+    assert_eq!(checked, 5, "anti-vacuity");
+}
+
+/// Owed 82: the binary built without the feature (the release image's) arms nothing and says nothing
+/// of the key, whatever it is set to: the hook is not in it.
+#[cfg(not(feature = "test-hooks"))]
+#[test]
+fn test_hook_a_build_without_the_feature_arms_nothing() {
+    let _s = serial();
+    let mut checked = 0;
+    for hold in ["3", "two"] {
+        let lines = hook_lines(Some(hold));
+        assert!(lines.is_empty(), "{hold:?}: {lines:?}");
+        checked += 1;
+    }
+    eprintln!("hook runs checked: {checked}");
+    assert_eq!(checked, 2, "anti-vacuity");
+}

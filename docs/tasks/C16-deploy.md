@@ -35,7 +35,9 @@ config is the app itself. `fly/stg.toml` and `fly/prod.toml` record app name, or
      then exit 0.
   2. `flyctl auth docker`
   3. Build `docker/Dockerfile` (same `GSTCEF_COMMIT` build-arg as `image.yml`, read from one place:
-     `docker/GSTCEF_COMMIT`, a one-line file C12 creates, which **both** workflows read)
+     `docker/GSTCEF_COMMIT`, a one-line file C12 creates, which **both** workflows read). (Amended
+     2026-10-24, Owed 82: build the default target or `--target relay`, never `relay-test-hooks`;
+     see the amendment "Owed 82" below.)
   4. Tag `registry.fly.io/seazn-relay-stg:${{ github.sha }}`, and push.
   5. Write to the job summary: the image ref, plus the exact promote command (step 6 of
      `promote.yml`), not run.
@@ -99,6 +101,9 @@ config is the app itself. `fly/stg.toml` and `fly/prod.toml` record app name, or
 - (Amended 2026-10-23, the PR #47 review's I-1) No deploy workflow reads or writes
   `ghcr.io/onryde/seazn-relay-cache` (no `cache-from`, no `cache-to`, no `build-contexts` naming it),
   `check-workflows.sh` refuses the name in all three, and mutant 5 went red, so 5 mutants are red in all.
+- (Amended 2026-10-24, Owed 82, the PR #62 review's m5) The deploy builds use the default target or
+  `--target relay`. `check-workflows.sh` refuses `relay-test-hooks`, `rust-build-test-hooks` and
+  `test-hooks` in the three workflows, and mutant 6 went red, so 6 mutants are red in all.
 
 ## Amendment 2026-10-18 (a CEF bump is gated on C11 Step 0)
 
@@ -156,6 +161,30 @@ cached layer without rebuilding it, so whatever manifest sits at the tag becomes
 - **New mutant:**
   5. Add `cache-from: type=registry,ref=ghcr.io/onryde/seazn-relay-cache:cef-x` to `deploy-stg.yml`.
      Expected: `check-workflows.sh` red.
+
+## Amendment 2026-10-24 (Owed 82: a deploy builds the relay target, never the test-hooks one)
+
+The PR #62 review's m5 (compositor `_INDEX.md` decision log "Owed 82: the held-teardown hook").
+PR #62 adds two stages to `docker/Dockerfile`: `rust-build-test-hooks` and `relay-test-hooks`.
+The second is the relay image with a compositor built with its `test-hooks` feature, for C14 case
+16 only: `COMPOSITOR_TEST_HOLD_TEARDOWNS` makes that binary hold CEF teardowns for good. Its last
+line is `FROM relay`, so a build with no target is still the relay image. image.yml proves its
+build carries no hook. A deploy build is a separate build of the same Dockerfile, so it is pinned
+too. This is defense in depth: no deploy workflow exists yet.
+
+- **The rule.** `deploy-stg.yml` and `deploy-prod.yml` build the default target or
+  `--target relay`. Neither names any other target. `promote.yml` builds nothing, and is checked
+  anyway.
+- **The gate.** `check-workflows.sh` gains a sixth static grep: `relay-test-hooks`,
+  `rust-build-test-hooks` and `test-hooks` appear in no deploy or promote workflow.
+- **Optional.** The deploy job runs image.yml's two-marker check, "The relay image carries no test
+  hook (Owed 82)", on the image it pushes. The check reads `/usr/local/bin/compositor`, checks the
+  ELF magic, and requires 0 of `COMPOSITOR_TEST_HOLD_TEARDOWNS` and of `test hook (Owed 82)`. Its
+  positive pair needs a `relay-test-hooks` build. If the deploy job adds this check, it builds that
+  image beside the pushed one and never pushes it.
+- **New mutant:**
+  6. Add `target: relay-test-hooks` to `deploy-stg.yml`'s build. Expected: `check-workflows.sh`
+     red.
 
 ## Do not touch
 

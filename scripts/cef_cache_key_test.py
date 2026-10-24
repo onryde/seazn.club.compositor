@@ -117,6 +117,7 @@ FULL_IMAGE_STEPS = [
     "Plugin check", "Runs as non-root, with no CEF log override", "C11's graphics tests beside cefsrc",
     "Smoke budget", "60 s fake smoke", "Exit 75 smoke (C11b, a dead CEF zygote)",
     "Live-mode probe (no core, TMPDIR, 32 live exits)", "Image size",
+    "Build the relay-test-hooks stage (Owed 82)", "The relay image carries no test hook (Owed 82)",
     "In-place restart probe (Owed 85, CEF ready after 75, 133 and 137)", "Logs",
 ]
 LAST_BUILD_STEP = "Build the cef-test stage"

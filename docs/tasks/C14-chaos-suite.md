@@ -193,7 +193,7 @@ and not 75 (an abort: SIGTRAP, which tini reports as 128 + 5 = 133), and **no co
 | 13 | `cef-gpu-zygote-killed` | At 20 s, SIGKILL the compositor's child zygote that parents the `--type=gpu-process` child (read from `/proc` in the container: `ppid` = the compositor, `--type=zygote`). Run 60 s | The log has `cef health zygote_gone=<g>` within 2 s of the kill (the 1 s child poll, a tick, slack); the final beat carries `exitDetail` `restart in place: a CEF zygote is gone (gen <g>)`; the `die` event's `exitCode` is 75 and `RestartCount` rises by exactly 1; the log has no `GPU process isn't usable` (the process must not abort); output resumes, the same `SESSION_ID`, `counter_regressions == 0`; the outage (below) is recorded and judged; no core file. **Anti-vacuity:** the killed pid was a zygote that parented the GPU process at the kill |
 | 14 | `cef-renderer-zygote-killed` | As 13, the zygote that parents the renderer | As 13; after the restart no process from the old tree is left (every `--type=` process is younger than the restart) |
 | 15 | `cef-gpu-deaths` | From 20 s, SIGKILL the `--type=gpu-process` child `$t.cef_gpu_deaths_to_restart` times (amended: was 4), each time once a NEW pid has replaced the last (Chromium's relaunch), at least 2 s apart. A second run kills it one time fewer. A third run, **the fast loop** (the PR #34 review's gap; amended 2026-10-20, its N1: ~~`$t.cef_gpu_deaths_to_restart` kills~~, which stopped at the threshold, so the lag it measures was always 0): kills, each the moment a new pid appears (a tight `/proc` loop, no wait), until the process exits or 5 are done (one short of Chromium's abort at the 6th death). Run 90 s | At the threshold: `cef health … gpu_process_deaths=<n>`, the restart as in 13 (`restart in place: <n> CEF GPU-process deaths`), never a `GPU process isn't usable`. One fewer: no restart and no exit in the run, `gpu_process_deaths=<n−1>` logged. The fast loop: the restart, never an abort. Each kill is stamped on the clock `docker logs --timestamps` uses, and the verdict splits the kills at the `cef health … gpu_process_deaths=<n>` line that decided the restart: **unread** = the kills at or before that line − n (how far the 1 s child poll lags a real loop), and **at the exit** = the kills after that line and before the `die` (deaths during the final beat's flush, while CEF still runs and Chromium relaunches). Both are printed. Owed 70 (a) budgets one survivable death to each, so each of these is a red and a finding for the owner: unread over 1; at the exit over 1; the loop's 5th kill before the `die` (`at the exit` is then a floor, and an uncapped loop's next death is Chromium's abort at the 6th); 5 kills with no restart; unread below 0 (the log counted a death no kill made). (Amended 2026-10-20, the PR #35 review's m5: the first wording judged the kills before the `die` against the deaths named, which adds the exit's deaths to the lag, and its "lag over 2" could never fire, a restart naming at least 3 of at most 5 kills.) **Anti-vacuity:** each kill's pid differs from the one before |
-| 16 | `cef-leaks` | 3 leaked teardowns at once, then 2 (a second run). It needs C11's `hold_teardowns` test hook, which a release image does not carry: a harness-only build with the `test-hooks` feature and a control to hold every teardown, or the case is reported as not runnable and the owner told (never faked) | 3: the restart as in 13 (`restart in place: 3 CEF teardowns leaked`); 2: no restart, `leaked_teardowns=2` logged |
+| 16 | `cef-leaks` | 3 leaked teardowns at once, then 2 (a second run). ~~It needs C11's `hold_teardowns` test hook, which a release image does not carry: a harness-only build with the `test-hooks` feature and a control to hold every teardown, or the case is reported as not runnable and the owner told (never faked)~~ (amended 2026-10-24, Owed 82: C11's `hold_teardowns` cannot hold a teardown for this case, docs/_INDEX.md false premise "C11's `hold_teardowns` hook holds a teardown for case 16". The case runs on the `relay-test-hooks` image with `COMPOSITOR_TEST_HOLD_TEARDOWNS`, driven and judged as the amendment "Owed 82's handoff" below sets out; Owed 82's row has the same list) | 3: the restart as in 13 (`restart in place: 3 CEF teardowns leaked`); 2: no restart, `leaked_teardowns=2` logged |
 
 **The false-positive sweep** (the PR #34 review's m4; Owed 70 (f)): since C11b a false zygote verdict, or a GPU death
 counted that did not happen, costs an outage and (until Owed 66) a web crash, where before it cost a log line. Every
@@ -583,6 +583,92 @@ and F-024.
   - Anything else is NOT OWED, including case 4, 5 or 12's `output_lost` (84's prediction says
     green) and case 15's `fast` leg (70 (a)'s says green).
 
+## Amendment 2026-10-24, Owed 82's handoff (PR #62, the held-teardown hook; its review's I2, I3 and m1)
+
+PR #62 (branch `feat/owed82-hold-teardowns`) adds the hook case 16 needs (Owner, 2026-10-24, option
+A, in chat, relayed by the coordinator; docs/_INDEX.md decision log "Owed 82: the held-teardown
+hook"). This amendment is what C14 wires once it merges. Owed 82's row in docs/_INDEX.md carries
+the same list.
+
+- **The image and the key.** Build the two cef-leaks legs' `RELAY_IMAGE` with
+  `--target relay-test-hooks`; chaos.yml builds the default target, the relay image, today. Pass
+  `COMPOSITOR_TEST_HOLD_TEARDOWNS: ${COMPOSITOR_TEST_HOLD_TEARDOWNS:-}` in compose's compositor
+  `environment`, set to 3 for `three` and 2 for `two`. The relay image ignores the key.
+- **The arming line is a precondition.** `WARN test hook (Owed 82): the next <N> CEF teardowns
+  never return` appears once, before `compositor started`, with N equal to the leg's. If it is
+  missing, the leg is a red, never a pass and never NOT RUNNABLE. Otherwise a leg built on the
+  plain relay image reads as "0 leaked".
+- **The driver is `kill-renderer`.** It is new in `harness/in-container.sh` (C14's code). Today
+  the script has only `kill-cef` and `kill-zygote gpu|renderer`.
+  - It SIGKILLs the `--type=renderer` child with the highest `--renderer-client-id`.
+  - The highest id is the newest build's renderer. Client ids only grow, and a page's reload keeps
+    its id (crates/adapters/src/cef_graphics.rs module doc, "Renderer attribution", F-013).
+  - It prints its targets as JSON: the pid killed, its client id, and every renderer seen.
+  - **Anti-vacuity:** exactly 1 killed per drive.
+  - Before each kill, wait for the current gen's `cef ready gen=<g>`, where `<g>` is the gen of the
+    newest `gen=<g>: loading` line. Never wait for any `cef ready`: a held page's reload also logs
+    `cef ready gen=<old>` (below).
+  - Killing every renderer would also work, because any extra target belongs to a retired build.
+    It is not needed.
+- **The chain from a renderer kill to a retirement is established.** Do not measure it. A renderer's
+  exit reaches cefsrc's `OnRenderProcessTerminated`, which the adapter reads as `RendererGone` and
+  then `Crashed`. That is CefCrashed, proven on real cefsrc by `crash_of_the_renderer_reports_cefcrashed`
+  (crates/adapters/tests/graphics.rs). The domain counts it as a Failure, backs off, and sends
+  `RestartGraphics`, and `restart` retires the old build: one held teardown.
+  - The third crash in 5 minutes is Failed, then Hide(Failed), then `graphics.stop()`. That stop is
+    the third retirement.
+  - `three` is therefore three kills, and `two` is two.
+- **Never the page-hang driver.** `POST /control/page-hang` is one-shot: a second POST answers 409
+  `ALREADY_ARMED` (crates/harness/src/control.rs). It is also served to the first page that polls.
+  A held build's reloaded page still polls `/page-control.json`, so it can take the arm, and then
+  the current page never hangs.
+- **Verdicts are keyed on gen.** Read these lines for each held teardown:
+  - `WARN test hook (Owed 82) gen=<g>: this CEF teardown never returns (<left> more to hold)`, with
+    `<left>` counting down from N−1 to 0;
+  - the reaper's `WARN gen=<g>: teardown has not returned after <ms> ms; SIGKILL sent to renderer
+    pids [..] (of [..])`;
+  - `... (<k> leaked; Owed 55)` about 6 s after the retirement (`REAPER_KILL_AFTER_MS` +
+    `TEARDOWN_LEAK_AFTER_MS`, the adapters' constants, 3 s each today). thresholds.json does not
+    carry them yet. Every number comes from it, so `dump-thresholds` gains both.
+- **Each held teardown's reaper line lists at least 1 killed pid.** This is a required verdict (the
+  PR #62 review's I2). The hook parks before `set_state(NULL)`, so cefsrc is still live and the
+  reaper kills its renderer, exactly as for a real stuck teardown. A hold after the NULL would close
+  the browser first, and the line would read `pids [] (of [])`. The adapters' unit tests have no
+  renderer. They witness only the hold's place: the held build's pipeline is still PLAYING at its
+  leak count. So this verdict is the only witness of the fidelity claim on the real image.
+- **A held page lives on after the kill** (the review's m1).
+  - The held build is still PLAYING, so the reaper's SIGKILL makes cefsrc reload its page under the
+    same client id, and nothing kills it again.
+  - Every held teardown leaves a live overlay page for the rest of the process. It renders at nice
+    10, polls fake-control, and its frames stay off air.
+  - Its reload logs `gen=<old>: ready (retired or crashed: its frames stay off air)` and
+    `cef ready gen=<old>`. These are expected, not a red.
+  - This is the product's own leak model ("its thread, pipeline and renderer stay"). The PSS cap
+    does not count another build's renderer, so the cap is not inflated.
+  - **Report the CEF children's CPU in `two`**, from `/proc` (the container's `cpu-usage` is only a
+    ceiling). Print it, never judge it: no budget exists for it.
+- **Count retirements, not driver kills.** Every retirement takes one from N, whatever its cause.
+  A load timeout before the first kill eats one. Judge "held lines == N" and the leak count, never
+  "held lines == driver kills", and print both.
+- **`three`:** exit 75 (the `die` event), and the final beat's `restart in place: 3 CEF teardowns
+  leaked`, read as in case 13. **Stop driving after the exit.** The restarted container arms N
+  again, because the budget is per process, and a second 75 counts against `on-failure:2`.
+- **`two`:** on air to its end at `cef health zygote_gone=- leaked_teardowns=2
+  gpu_process_deaths=0`, with no exit 75.
+- **Leave room before the session ends** (the review's gap hunt). A session-end `stop()` takes any
+  budget left. If a leg achieves fewer than N retirements before the end, the last hold is the
+  session-end stop, and its leak lands about 6 s later, inside the final hold and the drain, where
+  the domain's answer to `LeakedTeardowns{3}` is pinned by no test. Drive all N with at least
+  `REAPER_KILL_AFTER_MS` + `TEARDOWN_LEAK_AFTER_MS` + 10 s left before the session's end. If that
+  outcome is seen anyway, record it as a finding.
+- **`CASE_NOT_RUNNABLE` leaves `harness/cases/cef-leaks.sh`**, with verdicts for the lines above.
+  Owed 82's tags leave chaos.json when both legs are green.
+- **Mutant 8 (Step 5).** In a scratch `relay-test-hooks` build, move the hook's hold in `run_build`
+  to after `set_state(NULL)`.
+  - Expected red: both legs, on the "at least 1 killed pid" verdict.
+  - The adapters' unit tests kill the same mutant on the held pipeline's state (PR #62's mutant
+    run). This one proves that the case's own verdict is not vacuous.
+
 ## Files
 
 - Create: `harness/cases/{camera-stop,camera-flap,reader-kicked,dest-disconnect,dest-stall,cpu-starved,score-down,cef-killed,process-killed,input-impaired}.{sh,jq}` (amended 2026-10-24: all 16, cases 11–16 too, as `.sh` files with `require` lines over `harness/cases/lib.jq`; and `harness/chaos.json`, the legs)
@@ -643,6 +729,12 @@ and F-024.
   (no verdict, no GPU death, no exit 75); the outage of every restart is measured and judged against
   `BUDGET_PROCESS_RESTART_OUTPUT_MS` in 3 runs; mutants 6 and 7 red. A case that cannot run (16 without the hook) is
   reported, never faked.
+- (Amended 2026-10-24, Owed 82, PR #62) Case 16 runs on the `relay-test-hooks` image (the amendment
+  "Owed 82's handoff"). The arming line is a precondition, and a missing one is a red. The driver is
+  `kill-renderer`, with exactly 1 killed per drive, each after the current gen's `cef ready`. The
+  held lines number N, counted by retirement. Each held teardown's reaper line lists at least 1
+  killed pid. `three` exits 75 with its detail, and `two` stays on air at `leaked_teardowns=2` with
+  its CEF CPU printed. Mutant 8 is red.
 
 ## Do not touch
 

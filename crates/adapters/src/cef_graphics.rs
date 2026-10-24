@@ -1611,6 +1611,9 @@ struct Shared {
     write_hold: Arc<WriteHold>,
     #[cfg(feature = "test-hooks")]
     js_signals: AtomicBool,
+    /// Owed 82: retirements whose teardown is still to be held for good (`hold_next_teardowns`).
+    #[cfg(feature = "test-hooks")]
+    teardowns_to_hold: AtomicUsize,
 }
 
 impl Shared {
@@ -1711,6 +1714,16 @@ impl Shared {
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
+    }
+
+    /// Test hook (`hold_next_teardowns`): takes one held teardown from the budget, if any is left.
+    /// `Some(n)`: this teardown is held, and `n` more will be.
+    #[cfg(feature = "test-hooks")]
+    fn take_teardown_hold(&self) -> Option<usize> {
+        self.teardowns_to_hold
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .ok()
+            .map(|was| was - 1)
     }
 }
 
@@ -1849,6 +1862,8 @@ impl CefGraphics {
             write_hold: Arc::default(),
             #[cfg(feature = "test-hooks")]
             js_signals: AtomicBool::new(false),
+            #[cfg(feature = "test-hooks")]
+            teardowns_to_hold: AtomicUsize::new(0),
         });
         let g = Self {
             shared,
@@ -1996,6 +2011,27 @@ impl CefGraphics {
     pub fn hold_teardowns(&self, on: bool) {
         *locked(&self.shared.teardown_hold) = on;
         self.shared.teardown_cv.notify_all();
+    }
+
+    /// Test hook (Owed 82; owner option A, 2026-10-24): the next `n` retired builds' teardowns never
+    /// return, as a teardown stuck in `set_state(NULL)` does not: each build's thread parks for good
+    /// before its `set_state(NULL)`, so the reaper's kill and its leak count run exactly as for a real
+    /// one, and the process carries the leak until it exits (C14 case 16). Unlike `hold_teardowns`,
+    /// no cap lets it go. A second call replaces what is left of the first; 0 holds none.
+    ///
+    /// The held build stays PLAYING, so the reaper's SIGKILL makes cefsrc reload its page under the
+    /// same client id, and nothing kills it again: each held teardown leaves a live overlay page for
+    /// the rest of the process (at `CEF_NICE`, its page's polls running, its ready and alive lines an
+    /// old gen's, its frames off air), as a real leak leaves its renderer. The unit tests have no
+    /// renderer, so they witness only that the hold comes before `set_state(NULL)` (the pipeline is
+    /// still PLAYING at the leak count); that the kill reaches a renderer, at least one pid in each
+    /// held teardown's reaper line, is C14 case 16's witness on the real image.
+    #[cfg(feature = "test-hooks")]
+    pub fn hold_next_teardowns(&self, n: usize) {
+        self.shared.teardowns_to_hold.store(n, Ordering::SeqCst);
+        self.shared.log(&format!(
+            "WARN test hook (Owed 82): the next {n} CEF teardowns never return"
+        ));
     }
 
     /// Test hook: while on, the child poll waits before each listing (at most 60 s), so the only
@@ -2248,6 +2284,13 @@ fn run_build(shared: &Shared, pipeline: &gst::Pipeline, life: &Life, build: u64,
     }
     life.wait_stop();
     #[cfg(feature = "test-hooks")]
+    if let Some(left) = shared.take_teardown_hold() {
+        shared.log(&format!(
+            "WARN test hook (Owed 82) gen={gen}: this CEF teardown never returns ({left} more to hold)"
+        ));
+        park_for_good();
+    }
+    #[cfg(feature = "test-hooks")]
     {
         let end = Instant::now() + Duration::from_secs(60);
         let mut held = locked(&shared.teardown_hold);
@@ -2271,6 +2314,14 @@ fn run_build(shared: &Shared, pipeline: &gst::Pipeline, life: &Life, build: u64,
         ));
     }
     shared.teardowns.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// Test hook (`hold_next_teardowns`): the calling thread never returns, and never runs again.
+#[cfg(feature = "test-hooks")]
+fn park_for_good() -> ! {
+    loop {
+        thread::park();
+    }
 }
 
 /// The reaper's watch on one retired build: the kill fallback after `REAPER_KILL_AFTER_MS`, then
@@ -4245,6 +4296,8 @@ mod tests {
             write_hold: Arc::default(),
             #[cfg(feature = "test-hooks")]
             js_signals: AtomicBool::new(false),
+            #[cfg(feature = "test-hooks")]
+            teardowns_to_hold: AtomicUsize::new(0),
         })
     }
 
@@ -4511,6 +4564,258 @@ mod tests {
         assert!(!life.finish(Duration::from_millis(5), &leaked));
         assert_eq!(life.leaked_after(Duration::from_millis(10), &leaked), None);
         assert_eq!(leaked.load(Ordering::SeqCst), 0);
+    }
+
+    // Owed 82 (owner option A, 2026-10-24): the held-teardown hook's budget. Each held teardown takes
+    // one, none is taken past it, a second arming replaces what is left (it does not add), 0 holds
+    // none, and every arming says so in one line with its count.
+    #[test]
+    fn test_hook_the_held_teardown_budget_is_taken_once_each() {
+        let (tx, _rx) = crossbeam_channel::bounded(8);
+        let shared = unit_shared(tx, ProcTree::live());
+        let lines = capture_log(&shared);
+        let g = unit_adapter(Arc::clone(&shared));
+        let mut checked = 0;
+        assert_eq!(shared.take_teardown_hold(), None, "unarmed: no teardown is held");
+        checked += 1;
+        // C14 case 16's two legs (`two`, `three`), then one over a budget left unspent.
+        for n in [2usize, 3] {
+            g.hold_next_teardowns(n);
+            for left in (0..n).rev() {
+                assert_eq!(shared.take_teardown_hold(), Some(left), "n={n}");
+                checked += 1;
+            }
+            assert_eq!(shared.take_teardown_hold(), None, "n={n}: past the budget");
+            checked += 1;
+        }
+        g.hold_next_teardowns(3);
+        g.hold_next_teardowns(1);
+        assert_eq!(shared.take_teardown_hold(), Some(0), "re-armed at 1 over 3 left");
+        assert_eq!(shared.take_teardown_hold(), None, "re-armed at 1: one, not four");
+        g.hold_next_teardowns(2);
+        g.hold_next_teardowns(0);
+        assert_eq!(shared.take_teardown_hold(), None, "0 holds none");
+        checked += 3;
+        let armed: Vec<String> = locked(&lines)
+            .iter()
+            .filter(|l| l.contains("test hook (Owed 82)"))
+            .cloned()
+            .collect();
+        let want: Vec<String> = [2, 3, 3, 1, 2, 0]
+            .iter()
+            .map(|n| format!("WARN test hook (Owed 82): the next {n} CEF teardowns never return"))
+            .collect();
+        assert_eq!(armed, want);
+        checked += 1;
+        drop(g);
+        eprintln!("held-teardown budget checks: {checked}");
+        assert_eq!(checked, 12, "anti-vacuity");
+    }
+
+    /// Owed 82: one build on an empty pipeline, started on its own thread (`run_build`) as `restart`
+    /// starts a page's, then retired (`retire_current`) with the reaper's watch behind it. CI's
+    /// GStreamer has no cefsrc; the path under test, from the retirement to the leak count, is the
+    /// same with one. The pipeline is returned too, so the caller can read the state it was left in.
+    fn retire_one(g: &mut CefGraphics, gen: u64) -> (Arc<Life>, gst::Pipeline) {
+        gst::init().expect("gstreamer");
+        let mut live = Live {
+            gen,
+            build: gen,
+            pipeline: gst::Pipeline::new(),
+            life: Arc::new(Life::default()),
+            running: false,
+        };
+        g.start(&mut live);
+        assert!(live.running, "setup: gen={gen}'s thread started");
+        let life = Arc::clone(&live.life);
+        let pipeline = live.pipeline.clone();
+        g.current = Some(live);
+        g.retire_current();
+        (life, pipeline)
+    }
+
+    /// Owed 82: `held` of `builds` retirements held by the hook, one at a time (the hook takes its
+    /// budget in the order the teardowns start), each held one's line seen before the next. Then
+    /// the leak count settles: the lines, the gauge and the domain's cause. A held build's pipeline is
+    /// still PLAYING at its leak count, as a teardown stuck inside `set_state(NULL)` leaves cefsrc
+    /// live for the reaper's kill (the PR #62 review's I2: a hold after the NULL would close the
+    /// browser first, and the reaper would kill nothing); a returned one's is NULL.
+    fn held_teardowns_run(held: usize, builds: u64) -> (CefHealth, Vec<String>) {
+        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let shared = unit_shared(tx, ProcTree::live());
+        let lines = capture_log(&shared);
+        let mut g = unit_adapter(Arc::clone(&shared));
+        // 1 s, so a returning build's thread under a loaded `cargo test` wakes and runs its empty NULL
+        // well inside the reaper's wait (the PR #62 review's m2: at 100 ms it could be reported killed).
+        let kill_after = Duration::from_secs(1);
+        g.set_reaper_kill_after(kill_after);
+        g.hold_next_teardowns(held);
+        let mut lives = Vec::new();
+        for gen in 1..=builds {
+            lives.push(retire_one(&mut g, gen));
+            let holds = |l: &Vec<String>| l.iter().filter(|l| l.contains("never returns (")).count();
+            if (gen as usize) <= held {
+                assert!(
+                    wait_until(Duration::from_secs(5), || holds(&locked(&lines)) == gen as usize),
+                    "gen={gen}: its teardown was not held"
+                );
+            }
+        }
+        // Every reaper's watch is over by its kill plus `TEARDOWN_LEAK_AFTER_MS`; wait for both
+        // outcomes, the held ones counted and the others torn down (a returned teardown's thread
+        // counts itself down just after the reaper sees it return).
+        let settle = kill_after + Duration::from_millis(TEARDOWN_LEAK_AFTER_MS + 5_000);
+        assert!(
+            wait_until(settle, || locked(&shared.reports).len() == builds as usize
+                && shared.leaked.load(Ordering::SeqCst) == held
+                && shared.teardowns.load(Ordering::SeqCst) == held),
+            "the reaper's watches did not settle: {:?}",
+            locked(&lines)
+        );
+        let mut checked = 0;
+        for (i, (life, pipeline)) in lives.iter().enumerate() {
+            let returned = life.wait_done(Duration::ZERO).is_some();
+            assert_eq!(returned, i >= held, "gen={}: returned={returned}", i + 1);
+            // The reaper's kill reached the held ones only (no renderer here, so no pid: on the real
+            // image, C14 case 16 requires at least one per held teardown, Owed 82).
+            let path = locked(&shared.reports).get(&(i as u64 + 1)).cloned();
+            let killed = matches!(path, Some(ReaperPath::Killed { .. }));
+            assert_eq!(killed, i < held, "gen={}: {path:?}", i + 1);
+            let want = if i < held {
+                gst::State::Playing
+            } else {
+                gst::State::Null
+            };
+            assert_eq!(
+                pipeline.current_state(),
+                want,
+                "gen={}: a held teardown parks before its set_state(NULL); a returned one ran it",
+                i + 1
+            );
+            checked += 3;
+        }
+        assert!(
+            checked > 0 && checked == 3 * builds as usize,
+            "anti-vacuity: every build read ({checked})"
+        );
+        assert_eq!(g.teardowns_in_flight(), held, "the held ones never count down");
+        let h = g.health();
+        let out = locked(&lines).clone();
+        drop(g);
+        (h, out)
+    }
+
+    /// The domain's decision on `h`, from a supervisor on air (booted, Running).
+    fn decided_on_air(h: CefHealth) -> Vec<domain::supervisor::Effect> {
+        use domain::config::Thresholds;
+        use domain::supervisor::Supervisor;
+        let s = Supervisor::new(Thresholds::default()).decide(Event::Tick, 0).next;
+        let s = s
+            .decide(
+                Event::BootstrapOk {
+                    heartbeat_interval_ms: 5_000,
+                    deadline_at: 3_600_000,
+                },
+                1,
+            )
+            .next;
+        s.decide(Event::CefHealth(h), 2).effects
+    }
+
+    // Owed 82 through the real path, C14 case 16's `two` leg: owner ruling 4A (2026-10-20) accepts
+    // one or two leaked teardowns until the session ends. One under `cef_leaks_to_restart` held, and
+    // a retirement past the budget that returns: each held one is killed after, counted leaked with
+    // its WARN and count, and the domain asks no restart of the gauge.
+    #[test]
+    fn test_hook_two_held_teardowns_leak_two_and_restart_nothing() {
+        use domain::config::Thresholds;
+        let t = Thresholds::default();
+        assert_eq!(t.cef_leaks_to_restart, 3, "owner ruling 4A: restart at 3");
+        let held = t.cef_leaks_to_restart - 1;
+        let (h, lines) = held_teardowns_run(held, held as u64 + 1);
+        let mut checked = 0;
+        for k in 1..=held {
+            let gen_held = format!("WARN test hook (Owed 82) gen={k}: this CEF teardown never returns");
+            assert!(
+                lines.iter().any(|l| l.starts_with(&gen_held)),
+                "{gen_held}: {lines:?}"
+            );
+            let counted = format!("({k} leaked; Owed 55)");
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|l| l.starts_with("WARN gen=") && l.ends_with(&counted))
+                    .count(),
+                1,
+                "{counted}: {lines:?}"
+            );
+            checked += 2;
+        }
+        let past = format!("gen={}: this CEF teardown never returns", held + 1);
+        assert!(
+            !lines.iter().any(|l| l.contains(&past)),
+            "held past the budget: {lines:?}"
+        );
+        assert_eq!(h.leaked_teardowns, held);
+        assert_eq!(h.restart_cause(&t), None, "4A: no restart under 3");
+        let effects = decided_on_air(h);
+        assert!(
+            effects.is_empty(),
+            "on air, the gauge at {held} decides {effects:?}"
+        );
+        checked += 4;
+        eprintln!("held-teardown checks (two): {checked}");
+        assert_eq!(checked, 2 * held + 4, "anti-vacuity");
+    }
+
+    // Owed 82 through the real path, C14 case 16's `three` leg: `cef_leaks_to_restart` held. The
+    // third leak is the domain's restart in place, exit 75 (EX_TEMPFAIL, C11b) with its declared
+    // detail on the final beat.
+    #[test]
+    fn test_hook_three_held_teardowns_restart_in_place_with_exit_75() {
+        use domain::cef_health::RestartCause;
+        use domain::config::Thresholds;
+        use domain::health::BeatState;
+        use domain::lifecycle::ExitReason;
+        use domain::supervisor::Effect;
+        let t = Thresholds::default();
+        assert_eq!(t.cef_leaks_to_restart, 3, "owner ruling 4A: restart at 3");
+        let held = t.cef_leaks_to_restart;
+        let (h, lines) = held_teardowns_run(held, held as u64);
+        let mut checked = 0;
+        for k in 1..=held {
+            let counted = format!("({k} leaked; Owed 55)");
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|l| l.starts_with("WARN gen=") && l.ends_with(&counted))
+                    .count(),
+                1,
+                "{counted}: {lines:?}"
+            );
+            checked += 1;
+        }
+        assert_eq!(h.leaked_teardowns, 3);
+        assert_eq!(
+            h.restart_cause(&t),
+            Some(RestartCause::LeakedTeardowns { live: 3 })
+        );
+        let effects = decided_on_air(h);
+        assert_eq!(effects.len(), 2, "{effects:?}");
+        let Effect::SendHeartbeat(beat) = &effects[0] else {
+            panic!("the final beat first: {effects:?}");
+        };
+        assert_eq!(beat.state, BeatState::Stopped);
+        let exit = beat.exit.as_ref().expect("the final beat carries the exit");
+        assert_eq!(exit.reason, ExitReason::Restart);
+        assert_eq!(
+            exit.detail.as_ref().map(|d| d.as_str()),
+            Some("restart in place: 3 CEF teardowns leaked")
+        );
+        assert_eq!(effects[1], Effect::Exit(75), "EX_TEMPFAIL");
+        checked += 7;
+        eprintln!("held-teardown checks (three): {checked}");
+        assert_eq!(checked, held + 7, "anti-vacuity");
     }
 
     // PR #32 review I1: the profile directory is private, and a dead process's is swept. The

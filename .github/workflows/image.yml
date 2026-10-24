@@ -1,15 +1,16 @@
 name: image
 # The relay image (C12 Step 8): build it, check its plugins, run C11's graphics tests beside a real
-# cefsrc, smoke the binary in fake mode (exit 0, and C11b's exit 75), probe one live-mode run, and cap
-# the size. This workflow never pushes an image: pushing is C16's job. The one thing it pushes is
-# BuildKit's layer cache (decision log "CI: CEF layer from GHCR"): the `cache` job, on a push to main
-# or a fill dispatch only, writes the cache manifest and the layers of the runtime target's stages
-# (gst-base, cef-build, rust-build, the runtime; never cef-test's own, never a runnable image) to
+# cefsrc, smoke the binary in fake mode (exit 0, and C11b's exit 75), probe one live-mode run, cap
+# the size, and check that its binary carries no test hook (Owed 82). This workflow never pushes an
+# image: pushing is C16's job. The one thing it pushes is BuildKit's layer cache (decision log "CI:
+# CEF layer from GHCR"): the `cache` job, on a push to main or a fill dispatch only, writes the
+# cache manifest and the layers of the runtime target's stages (gst-base, cef-build, rust-build, the
+# runtime; never cef-test's own, never a runnable image) to
 # ghcr.io/<owner>/seazn-relay-cache:cef-<key> (the key: scripts/cef-cache-key.sh). `image` reads it
 # with a read-only token wherever that token may (the package is private; a fork PR's read is
-# unverified); a cache that is missing, unreadable or without the CEF tree is a miss, never a failure.
-# The cache is CI-only and untrusted for shipping: any repository writer can write the tag (C16 never
-# reads it).
+# unverified); a cache that is missing, unreadable or without the CEF tree is a miss, never a
+# failure. The cache is CI-only and untrusted for shipping: any repository writer can write the tag
+# (C16 never reads it).
 on:
   push: { branches: [main] }
   pull_request: {}
@@ -46,6 +47,7 @@ jobs:
     env:
       IMAGE: seazn-relay:${{ github.sha }}
       TEST_IMAGE: seazn-relay-cef-test:${{ github.sha }}
+      HOOKS_IMAGE: seazn-relay-test-hooks:${{ github.sha }}
       # The fake runs' dummy job facts: a token that is no secret, so the log check means something.
       DUMMY_TOKEN: dummy-job-token-not-a-secret-4c1e
       DUMMY_SID: 3f8a2c1e-7b4d-4e9a-9c2f-5d6e7f8a9b0c
@@ -270,6 +272,54 @@ jobs:
             echo "::error::the image is $bytes bytes, over the 2.5 GB cap"
             exit 1
           fi
+      # Owed 82 (owner option A, 2026-10-24): C14 case 16's image, the relay image with the binary
+      # built with its `test-hooks` feature (the held-teardown hook). Built here so the check below has
+      # its positive pair; rust-build's layers come from "Build the image".
+      - name: Build the relay-test-hooks stage (Owed 82)
+        if: env.TIMING != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: relay-test-hooks
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          tags: ${{ env.HOOKS_IMAGE }}
+          load: true
+          push: false
+          cache-from: ${{ steps.cache.outputs.from }}
+      # The shipped binary has no test hook: no byte of the hook's env key or of its log line is in
+      # the relay image's compositor, and both are in relay-test-hooks' (so the read is not vacuous:
+      # a marker the hooks build lacks is a red, not a pass).
+      - name: The relay image carries no test hook (Owed 82)
+        if: env.TIMING != 'true'
+        run: |
+          docker run --rm --entrypoint cat "$IMAGE" /usr/local/bin/compositor > relay.bin
+          docker run --rm --entrypoint cat "$HOOKS_IMAGE" /usr/local/bin/compositor > hooks.bin
+          for b in relay.bin hooks.bin; do
+            magic=$(head -c 4 "$b" | od -An -tx1 | tr -d ' \n')
+            echo "$b: $(wc -c < "$b") bytes, magic $magic"
+            if [ "$magic" != 7f454c46 ]; then
+              echo "::error::$b is not an ELF binary"
+              exit 1
+            fi
+          done
+          checked=0
+          for marker in COMPOSITOR_TEST_HOLD_TEARDOWNS 'test hook (Owed 82)'; do
+            relay=$(grep -a -F -c -- "$marker" relay.bin || true)
+            hooks=$(grep -a -F -c -- "$marker" hooks.bin || true)
+            echo "marker '$marker': relay ${relay:-?}, relay-test-hooks ${hooks:-?}"
+            if ! [ "${hooks:-0}" -ge 1 ]; then
+              echo "::error::the relay-test-hooks binary has no '$marker': this check would read nothing"
+              exit 1
+            fi
+            if [ "${relay:-1}" != 0 ]; then
+              echo "::error::the relay image's binary carries the test hook ('$marker')"
+              exit 1
+            fi
+            checked=$((checked + 1))
+          done
+          echo "test-hook markers checked: $checked"
+          [ "$checked" -eq 2 ]
       # Owed 85 (F-025): Docker's restart in place (`--restart on-failure`, ADR 0007 item 5) keeps the
       # container's writable layer, /tmp included, as compose's does in C14. Each exit C14 saw restarted
       # (75, 133, 137) must come back with CEF ready, one Xvfb with -displayfd, no X lock and its socket

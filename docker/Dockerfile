@@ -5,7 +5,10 @@
 # Stages: gst-base (the runtime libraries), cef-build (gstcefsrc + CEF), rust-build (the binary),
 # cef-test (rust-build plus the plugin: image.yml runs C11's graphics tests there), harness-build
 # and harness (C13's fakes and checker, `--target harness`; test tooling the runtime never
-# carries), and the runtime, last and unnamed, so a build with no target is the relay image.
+# carries), rust-build-test-hooks (the binary with its `test-hooks` feature, Owed 82), relay (the
+# runtime), relay-test-hooks (relay with that binary instead: C14 case 16's image, never shipped),
+# and last an unnamed `FROM relay`, so a build with no target is the relay image. image.yml checks
+# that relay's binary carries no test hook and relay-test-hooks' does.
 #
 # Never set GST_CEF_LOG_SEVERITY or GST_DEBUG here (Owed 52, F-013): the first overrides the
 # element's log-severity=disable and CEF then writes every console line, the job token included, to
@@ -82,7 +85,15 @@ RUN for e in appsrc x264enc h264parse mpegtsmux srtsink audioconvert voaacenc aa
       srtsrc tsdemux videoconvertscale capsfilter; do \
       gst-inspect-1.0 "$e" >/dev/null 2>&1 || { echo "missing element $e"; exit 1; }; done
 
-FROM gst-base
+# Owed 82 (owner option A, 2026-10-24): the held-teardown hook (`COMPOSITOR_TEST_HOLD_TEARDOWNS`) is
+# compiled in only here. Built from rust-build's tree, so only the two crates the feature changes
+# (adapters, compositor) build again.
+FROM rust-build AS rust-build-test-hooks
+RUN cargo build --release --locked -p compositor --features test-hooks \
+ && install -m 0755 target/release/compositor /usr/local/bin/compositor-test-hooks \
+ && strip /usr/local/bin/compositor-test-hooks
+
+FROM gst-base AS relay
 COPY --from=cef-build /src/gstcefsrc/build/Release /opt/gstcef
 COPY --from=rust-build /usr/local/bin/compositor /usr/local/bin/compositor
 COPY docker/entrypoint.sh /entrypoint.sh
@@ -110,3 +121,11 @@ RUN for e in cefsrc srtsrc tsdemux queue h264parse avdec_h264 videoconvertscale 
 # unformatted lines on every boot (the PR #36 review's m5). No `-g`: tini signals the entrypoint
 # alone, which forwards the stops (F-016).
 ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/entrypoint.sh"]
+
+# C14 case 16 only (Owed 82): the relay image with the test-hooks binary. `--target relay-test-hooks`;
+# never pushed, never deployed.
+FROM relay AS relay-test-hooks
+COPY --from=rust-build-test-hooks /usr/local/bin/compositor-test-hooks /usr/local/bin/compositor
+
+# Last, so a build with no target is the relay image (harness.yml, chaos.yml, C16).
+FROM relay

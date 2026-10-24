@@ -31,7 +31,11 @@ tiny_http = "0.12"
 
 [features]
 # C09: `Stats::force_snapshot` and the pipeline stand-ins the C09 tests drive (a held sink write, a
-# teardown that hangs). Only dev-dependencies enable it, so a release build never carries it.
+# teardown that hangs); C11's and Owed 82's CEF hooks too. Two things enable it: this crate's own
+# dev-dependency on itself (its tests), and the compositor's `test-hooks` feature (Owed 82, the
+# Dockerfile's relay-test-hooks image). The relay image stays without it because its build
+# (`cargo build --release -p compositor`, docker/Dockerfile's rust-build) names no feature and takes
+# no dev-dependency, and image.yml checks its binary for the hooks' markers (PR #62 review m4).
 test-hooks = []
 # C11: the graphics tests need cefsrc (F-001's gstcefsrc build), which only the C12 image and the
 # C00 spike image carry. CI's GStreamer has none, so `tests/graphics.rs` is built only with this
