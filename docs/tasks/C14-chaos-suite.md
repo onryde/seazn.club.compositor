@@ -802,9 +802,103 @@ socket timeout is the only detector of a destination stall (`docs/_INDEX.md` Owe
   replaced by `true` (or the floor by 0); and review round 1's ceiling from the cut, replaced by
   `true`, red in `rule-late-error`. `error_to_swap_ms != null` is dropped as equivalent: jq sorts null
   below every number, so the floor reds a null.
-- **Expected reds of the next run:** cpu-starved (Owed 86, still in chaos.json); and cef-leaks ×2,
+- ~~**Expected reds of the next run:** cpu-starved (Owed 86, still in chaos.json); and cef-leaks ×2,
   NOT RUNNABLE until case 16's PR (#71) merges, then whatever case 16 reads (review round 1's m-5).
-  No Owed 87 red is expected. Anything else is NOT OWED.
+  No Owed 87 red is expected.~~ (Amended 2026-10-25, when #71 was rebased onto this: case 16 runs,
+  so the one expected red is cpu-starved, Owed 86. See the amendment "case 16 wired".) Anything
+  else is NOT OWED.
+
+## Amendment 2026-10-24, case 16 wired (branch `feat/c14-case16-leaks`)
+
+The coordinator's dispatch after #65 merged (832b3f1), rebased onto 67986ce (#69). Harness only.
+Owed 82's handoff (the amendment of that name) as built, with four choices of the implementer's,
+none an owner ruling. Decision log "C14 case 16 wired".
+
+- **The image and the key.**
+  - chaos.yml's images job also builds `--target relay-test-hooks`
+    (`seazn-relay-test-hooks:<sha>`) and ships it beside the other two. Every leg gets
+    `RELAY_TEST_HOOKS_IMAGE`; only case 16 reads it, by pointing `RELAY_IMAGE` at it. run-case.sh's
+    `up: relay …` line then names the image the leg really ran.
+  - **Deviation:** the key is passed by `harness/compose.cef-leaks.yml`, case 16's own overlay
+    (`CASE_COMPOSE`, `${COMPOSITOR_TEST_HOLD_TEARDOWNS:?}`), not compose.yml's `:-` pass-through.
+    So no other leg's compositor sees the variable at all, and a case that forgot to set it
+    refuses to start.
+  - `three` holds `cef_leaks_to_restart` (3) and `two` one fewer, both read from thresholds.json.
+- **The driver** is `harness/in-container.sh kill-renderer`.
+  - It SIGKILLs the renderer with the highest numeric `--renderer-client-id` (10 beats 9), and
+    nothing else. It prints the pid, its id and every renderer seen (pid, id or null) first, and
+    fails with `pid` null when no renderer has an id.
+  - Each kill waits for the newest `gen=<g>: loading` above the last killed gen, then that gen's
+    `cef ready`, within the back-off cap plus the load timeout. The drive ends after N kills, or
+    once N held lines are in.
+  - It stops without killing on a restart, a missing build or no room. The room is
+    `REAPER_KILL_AFTER_MS` + `TEARDOWN_LEAK_AFTER_MS` + 10 s before the end, plus
+    BUDGET_PROCESS_RESTART_OUTPUT_MS in `three`. The stop is marked (`drive_done`).
+  - `cef-cpu` prints each CEF child's utime plus stime, and `two` samples it at 40 s and 55 s.
+- **Verdicts** (`three` 24 checks, `two` 16), keyed on gen, in the first process's window (the
+  restarted process arms N again, and its session-end stop is held):
+  - `armed`: one arming line per boot, N each, each before its boot and after the one before.
+  - `killed_one_current`: 1 to N kills, each the highest id among the renderers seen. Each came
+    after the `cef ready` of the build its newest `loading` named, and each status is 0.
+  - `held_n`: the held lines count N−1 down to 0, of distinct gens, every killed gen among them.
+    Retirements are counted, not kills: a load timeout's retirement passes.
+  - `reaper_killed`: each held gen's reaper line kills at least 1 pid, at
+    `reaper_kill_after_ms`.
+  - `leaks_counted`: the leak count reads 1..N over the held gens in order, each leak after its
+    reaper line and before the end request.
+  - `restart_as_ruled`: exit 75 exactly when N reaches cef_leaks_to_restart (owner ruling 4A).
+  - The measure `retirements` (held, kills, gens, the drive's stop).
+  - `three`: `leaks_health` (the deciding `cef health` line reads N, no zygote, no GPU death), the
+    in-place restart with `restart in place: <N> CEF teardowns leaked`, its outage, and the same
+    session.
+  - `two`: `leaked_logged` (the last line before the end reads N), `overlay_on_air` (the build
+    after the last kill ready, every score change due after it shown, graphics never failed),
+    `on_air_to_end`, no restart, no abort, an ended beat, no counter regression, no core, and the
+    measure `cef_cpu` (ms per s per child between the samples, never judged).
+- **Thresholds.** `reaper_kill_after_ms` and `teardown_leak_after_ms`, from the adapters'
+  constants through `dump-thresholds`.
+- **NOT RUNNABLE.** No case is NOT RUNNABLE now. The mechanism stays, probed on a copy of the
+  harness with a case of its own (case_verdicts.rs), and every real case file is checked to
+  declare no reason. run-chaos.sh's gate line no longer names Owed 82. chaos.json carried no
+  Owed 82 tag, so none leaves.
+- **The PR #65 confirm pass's n-3.** A shown value cut at 300 characters ends `[cut at 300 of
+  <n> characters; verdict.json's measures has it whole]`, never silently. n-1, n-2 and n-4 are the
+  Owed 87 agent's (the coordinator).
+- **Mutants.** 50 local, all killed, each by its named sim: the verdict 38, kill-renderer and
+  cef-cpu 6, the parsers 5, the cut 1. CI, on the throwaway draft PR #72 (`mut/c14-case16`), a–f
+  (amended 2026-10-24, the PR #71 review's I1: the six as run; f is mutant 8, and d and e, the
+  product-side twins of b and c, were added). All six were KILLED on mutant run 40135507971, each
+  on its named check with its controls passing, after an unmutated baseline:
+  - (a) `two` on the plain relay image (its `RELAY_IMAGE` not switched): `armed` red, with
+    `killed_one_current` passing;
+  - (b) `three` holding cef_leaks_to_restart + 1: `held_n` red, with `armed` and
+    `killed_one_current` passing;
+  - (c) the verdict expecting a restart at 2 in `two`: `restart_as_ruled` red, with `armed`,
+    `held_n`, `leaks_counted` and `no_restart` passing;
+  - (d) the product restarting one leak later (`>` for `>=` in `cef_health.rs`), in `three`:
+    `restart_as_ruled` red, with `armed`, `held_n` and `leaks_counted` passing;
+  - (e) the product restarting at 2 (`cef_leaks_to_restart: 2`), in `two`: `restart_as_ruled`
+    red, with the same controls;
+  - (f), mutant 8: the hold after `set_state(NULL)` on a rebuilt relay-test-hooks image, in `two`.
+    `reaper_killed` is red (its reaper lines read `pids [] (of [])`), with `armed` and `held_n`
+    passing.
+- **The CI witness** (amended 2026-10-24, the PR #71 review). On PR chaos run 40134655269,
+  `cef-leaks-three` passed 24 of 24 checks and `cef-leaks-two` passed 16 of 16, so Owed 82 is
+  closed. `two`'s `cef_cpu` read each held page at about the live page's renderer CPU (Owed 93).
+- **Only case 16 runs on the hooks image** (amended 2026-10-24, the review's m1).
+  case_verdicts.rs sweeps every file under harness/. Only case 16's two files may name
+  `RELAY_TEST_HOOKS_IMAGE`, the hold key or case 16's overlay, and only cef-leaks.sh may assign
+  `RELAY_IMAGE`.
+  - Amended 2026-10-25, the #71 confirm pass's n1 and n2. The sweep also reads chaos.yml: the leg
+    job's `RELAY_IMAGE` must equal the images job's and name no `test-hooks`. Its positive pair
+    asks the image's name only of cef-leaks.sh, and pins only the overlay's `environment` line for
+    the key, never a comment.
+- **Rebased onto f43c1de, 2026-10-25** (#73 merged, Owed 87 "A"). thresholds.json was regenerated
+  by dump-thresholds on the merged tree, never merged by hand. It adds `reaper_kill_after_ms` and
+  `teardown_leak_after_ms` to main's, and `output_stall_after_ms` and `output_progress_poll_ms`
+  stay retired. thresholds.rs now counts `pairs + 4 + retired`. Both C14 amendments and both
+  _INDEX rows are kept. **Expected reds of the next run:** cpu-starved (Owed 86) only. Both
+  cef-leaks legs must pass, and no Owed 87 red is expected. Anything else is NOT OWED.
 
 ## Files
 
@@ -871,13 +965,17 @@ socket timeout is the only detector of a destination stall (`docs/_INDEX.md` Owe
   negative run where the brief has one, and case 15's fast loop; cases 1–7 and 9–12 carry the false-positive sweep
   (no verdict, no GPU death, no exit 75); the outage of every restart is measured and judged against
   `BUDGET_PROCESS_RESTART_OUTPUT_MS` in 3 runs; mutants 6 and 7 red. A case that cannot run (16 without the hook) is
-  reported, never faked.
+  reported, never faked (amended 2026-10-24, case 16 wired: no case is NOT RUNNABLE now, and the
+  mechanism is probed on a case of its own).
 - (Amended 2026-10-24, Owed 82, PR #62) Case 16 runs on the `relay-test-hooks` image (the amendment
   "Owed 82's handoff"). The arming line is a precondition, and a missing one is a red. The driver is
   `kill-renderer`, with exactly 1 killed per drive, each after the current gen's `cef ready`. The
   held lines number N, counted by retirement. Each held teardown's reaper line lists at least 1
   killed pid. `three` exits 75 with its detail, and `two` stays on air at `leaked_teardowns=2` with
-  its CEF CPU printed. Mutant 8 is red.
+  its CEF CPU printed. Mutant 8 is red. (Amended 2026-10-24, case 16 wired: as built, its own
+  amendment; mutants a, b and c red too, each on its named check. Amended again 2026-10-24, the
+  PR #71 review's I1: mutants a–f, f being mutant 8, all KILLED on mutant run 40135507971, and
+  both legs green on chaos run 40134655269.)
 
 ## Do not touch
 

@@ -54,7 +54,9 @@ impl CefHealth {
     ///   process, and with the GPU zygote gone the next GPU-process death aborts the process, so the
     ///   fallback of staying on air without the overlay is not safe there (the final C11 review's G3);
     /// - `cef_gpu_deaths_to_restart` GPU-process deaths: each brings Chromium's abort closer;
-    /// - `cef_leaks_to_restart` teardowns leaked at once: memory only, the least urgent.
+    /// - `cef_leaks_to_restart` teardowns leaked at once, the least urgent: memory, and CPU while a
+    ///   held page keeps painting (C14 case 16 measured each held page at about the live page's
+    ///   renderer CPU under its hook, the worst case; Owed 93: owner ruling 4A kept, 2026-10-24).
     pub fn restart_cause(&self, t: &Thresholds) -> Option<RestartCause> {
         if let Some(gen) = self.unrecoverable {
             return Some(RestartCause::ZygoteGone { gen });

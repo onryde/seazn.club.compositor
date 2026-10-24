@@ -113,6 +113,12 @@ impl FakeProc {
 
     /// A process with `comm`, `cmdline` and parent `ppid`, started `start_ticks` after boot.
     fn add(&mut self, comm: &str, cmdline: &[u8], ppid: u32, start_ticks: u64) -> u32 {
+        self.add_cpu(comm, cmdline, ppid, start_ticks, (0, 0))
+    }
+
+    /// As `add`, with `(utime, stime)` in clock ticks (proc(5)'s fields 14 and 15).
+    fn add_cpu(&mut self, comm: &str, cmdline: &[u8], ppid: u32, start_ticks: u64, cpu: (u64, u64)) -> u32 {
+        let (utime, stime) = cpu;
         let child = Command::new("sleep").arg("120").spawn().expect("sleep");
         let pid = child.id();
         let d = self.dir.join(pid.to_string());
@@ -124,7 +130,7 @@ impl FakeProc {
         std::fs::write(
             d.join("stat"),
             format!(
-                "{pid} ({comm}) S {ppid} 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {start_ticks} 1000 10\n"
+                "{pid} ({comm}) S {ppid} 1 1 0 -1 4194560 0 0 0 0 {utime} {stime} 0 0 20 0 1 0 {start_ticks} 1000 10\n"
             ),
         )
         .unwrap();
@@ -464,6 +470,164 @@ fn cpu_usage_reads_the_cgroups_cpu_time_from_v2_or_v1_and_fails_on_neither() {
         checked += 1;
     }
     assert_eq!(checked, 5);
+}
+
+/// A renderer's command line with `--renderer-client-id=<id>`: renamed (one space-joined string,
+/// NUL-padded) or not (one argument per NUL), the two shapes CI met.
+fn renderer(id: &str, renamed: bool) -> Vec<u8> {
+    let args = [
+        "/usr/lib/x86_64-linux-gnu/gstreamer-1.0/gstcefsubprocess",
+        "--type=renderer",
+        "--no-sandbox",
+        &format!("--renderer-client-id={id}"),
+        "--launch-time-ticks=4215678901",
+    ];
+    if renamed {
+        let mut v = args.join(" ").into_bytes();
+        v.extend_from_slice(b"\0\0\0\0");
+        v
+    } else {
+        let mut v = args.join("\0").into_bytes();
+        v.push(0);
+        v
+    }
+}
+
+fn clk_tck() -> u64 {
+    String::from_utf8_lossy(&Command::new("getconf").arg("CLK_TCK").output().unwrap().stdout)
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// Case 16's driver (the C14 brief's amendment "Owed 82's handoff"): the renderer with the highest
+/// `--renderer-client-id` is the newest build's (client ids only grow, and a reload keeps its id),
+/// so it alone is killed, its targets printed first, every renderer seen beside it. Ids compare as
+/// numbers (10 beats 9), and a renderer with no readable id is listed and never chosen.
+#[test]
+fn kill_renderer_kills_the_renderer_with_the_highest_client_id_and_only_it() {
+    let mut p = FakeProc::new("kill-renderer");
+    let compositor = p.add("compositor", COMPOSITOR_ARGV, 1, 1_000);
+    let zygote = p.add("gstcefsubproces", ZYGOTE_ARGV, compositor, 1_100);
+    let gpu = p.add("gstcefsubproces", GPU_RENAMED, compositor, 1_150);
+    let held = p.add("gstcefsubproces", &renderer("9", true), zygote, 1_200);
+    let newest = p.add("gstcefsubproces", &renderer("10", false), zygote, 1_300);
+    let spare = p.add("gstcefsubproces", &renderer("x", true), zygote, 1_400);
+    let python = p.add("python3", PYTHON_ARGV, 1, 900);
+    let (out, lines) = p.run(&["kill-renderer"]);
+    assert!(out.status.success());
+    assert_eq!(lines.len(), 2, "the targets, then the status: {lines:?}");
+    let l = &lines[0];
+    assert_eq!(l["pid"].as_u64(), Some(u64::from(newest)), "{l}");
+    assert_eq!(l["client_id"].as_u64(), Some(10), "{l}");
+    assert!(l["at_ms"].as_i64().is_some());
+    let mut seen: Vec<(u64, Option<u64>)> = l["renderers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["pid"].as_u64().unwrap(), r["client_id"].as_u64()))
+        .collect();
+    seen.sort_unstable();
+    let mut want = vec![
+        (u64::from(held), Some(9)),
+        (u64::from(newest), Some(10)),
+        (u64::from(spare), None),
+    ];
+    want.sort_unstable();
+    assert_eq!(seen, want, "every renderer, with its id or null");
+    assert_eq!(lines[1]["rc"].as_i64(), Some(0));
+    assert!(p.was_killed(newest), "the newest build's renderer survived");
+    let mut spared = 0;
+    for pid in [held, spare, gpu, zygote, compositor, python] {
+        assert!(!p.was_killed(pid), "{pid} was killed too");
+        spared += 1;
+    }
+    eprintln!(
+        "renderers seen: {}, killed: 1, others spared: {spared}",
+        seen.len()
+    );
+    assert_eq!(spared, 6);
+}
+
+#[test]
+fn kill_renderer_with_no_renderer_to_choose_fails_with_a_null_pid() {
+    let mut checked = 0;
+    for (tag, with_unnamed) in [("kill-renderer-none", false), ("kill-renderer-noid", true)] {
+        let mut p = FakeProc::new(tag);
+        let compositor = p.add("compositor", COMPOSITOR_ARGV, 1, 1_000);
+        let gpu = p.add("gstcefsubproces", GPU_RENAMED, compositor, 1_150);
+        let unnamed = with_unnamed.then(|| p.add("gstcefsubproces", &renderer("", false), compositor, 1_200));
+        let (out, lines) = p.run(&["kill-renderer"]);
+        assert!(!out.status.success(), "{tag}: a kill with no target must fail");
+        assert!(lines[0]["pid"].is_null(), "{tag}: {lines:?}");
+        assert_eq!(
+            lines[0]["renderers"].as_array().map(Vec::len),
+            Some(usize::from(with_unnamed)),
+            "{tag}"
+        );
+        assert!(!p.was_killed(gpu), "{tag}");
+        if let Some(u) = unnamed {
+            assert!(!p.was_killed(u), "{tag}: a renderer with no id is never chosen");
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 2);
+}
+
+/// Case 16's `two` prints the CEF children's CPU (the brief: from /proc, never judged): each child
+/// with a `--type=`, its type, its client id (a renderer's) and its user plus system time in ms.
+#[test]
+fn cef_cpu_reads_each_cef_childs_cpu_time_and_nothing_else() {
+    let mut p = FakeProc::new("cef-cpu");
+    let compositor = p.add_cpu("compositor", COMPOSITOR_ARGV, 1, 1_000, (5_000, 900));
+    let gpu = p.add_cpu("gstcefsubproces", GPU_RENAMED, compositor, 1_150, (300, 100));
+    let r9 = p.add_cpu(
+        "gstcefsubproces",
+        &renderer("9", true),
+        compositor,
+        1_200,
+        (150, 50),
+    );
+    let r10 = p.add_cpu(
+        "gstcefsubproces",
+        &renderer("10", false),
+        compositor,
+        1_300,
+        (40, 2),
+    );
+    p.add_cpu("python3", PYTHON_ARGV, 1, 900, (7, 7));
+    let before = wall_ms();
+    let (out, lines) = p.run(&["cef-cpu"]);
+    assert!(out.status.success());
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let l = &lines[0];
+    assert!(l["sample_ms"]
+        .as_i64()
+        .is_some_and(|t| t >= before && t <= wall_ms()));
+    assert!(l.get("at_ms").is_none(), "a reading is no mark");
+    let tck = clk_tck();
+    let mut got: Vec<(u64, String, Option<u64>, u64)> = l["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["pid"].as_u64().unwrap(),
+                c["type"].as_str().unwrap().to_owned(),
+                c["client_id"].as_u64(),
+                c["cpu_ms"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    got.sort_unstable();
+    let mut want = vec![
+        (u64::from(gpu), "gpu-process".to_owned(), None, 400 * 1000 / tck),
+        (u64::from(r9), "renderer".to_owned(), Some(9), 200 * 1000 / tck),
+        (u64::from(r10), "renderer".to_owned(), Some(10), 42 * 1000 / tck),
+    ];
+    want.sort_unstable();
+    eprintln!("CEF children read: {}", got.len());
+    assert_eq!(got, want, "utime + stime, CEF children only");
 }
 
 #[test]

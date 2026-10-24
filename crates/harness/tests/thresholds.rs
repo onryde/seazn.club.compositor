@@ -9,6 +9,8 @@ fn live() -> AdapterConsts {
     AdapterConsts {
         cef_child_poll_ms: adapters::cef_graphics::CHILD_POLL_MS,
         encoded_ring_span_ms: adapters::gst_output::ENCODED_RING_SPAN.as_millis() as u64,
+        reaper_kill_after_ms: adapters::cef_graphics::REAPER_KILL_AFTER_MS,
+        teardown_leak_after_ms: adapters::cef_graphics::TEARDOWN_LEAK_AFTER_MS,
     }
 }
 

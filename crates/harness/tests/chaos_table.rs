@@ -3,7 +3,7 @@
 //! The plan must name every chaos case file, expand each leg into its repeats, and refuse an
 //! unknown leg. The table goes red on a FAIL, an ERROR, a MISSING verdict, a false-positive sweep
 //! that some leg calling it did not run, and a NOT RUNNABLE leg (the PR #52 review's I6: an unrun leg
-//! is never green; case 16's hold wave gate 3 BLOCKED until the owner rules Owed 82). Its last line
+//! is never green, and blocks wave gate 3). Its last line
 //! says whether the run counts toward wave gate 3. The expected legs come from chaos.json and the
 //! case files, never from the script's output. Needs bash 4 or later (HARNESS_BASH, as in
 //! case_verdicts.rs) and jq.
@@ -178,15 +178,15 @@ fn the_plan_names_every_chaos_case_and_expands_the_repeats() {
 }
 
 /// A verdict.json for every leg, as run-case.sh writes it: passing, with the sweep where the case
-/// calls it, and an outage on the restart cases. Case 16's legs are NOT RUNNABLE, as they are today,
-/// unless `leaks_run` (a run after the owner's ruling on Owed 82, so that a red elsewhere is the only
-/// red).
-fn verdicts(dir: &Path, leaks_run: bool) {
+/// calls it, and an outage on the restart cases. Unless `all_run`, case 16's legs stand in as NOT
+/// RUNNABLE legs (no case is since case 16 was wired to Owed 82's hook; the mechanism stays, and
+/// case_verdicts.rs probes run-case.sh's side of it), so that a red elsewhere is the only red.
+fn verdicts(dir: &Path, all_run: bool) {
     let _ = std::fs::remove_dir_all(dir);
     for (k, (name, case)) in expected_legs().into_iter().enumerate() {
         let d = dir.join(format!("verdict-{name}"));
         std::fs::create_dir_all(&d).unwrap();
-        let v = if case == "cef-leaks" && !leaks_run {
+        let v = if case == "cef-leaks" && !all_run {
             json!({"name": name, "case": case, "status": "not_runnable", "checks_declared": 1,
                 "checks_run": 0, "failed": [], "measures": {}, "key": "", "fp_swept": false,
                 "not_runnable_reason": "needs the hold_teardowns hook"})
@@ -224,7 +224,7 @@ fn the_table_holds_wave_gate_3_blocked_while_a_leg_is_not_runnable() {
     let d = dir.to_str().unwrap();
     let legs = expected_legs();
     let unrun = not_runnable_legs();
-    assert_eq!(unrun.len(), 2, "case 16's two variants");
+    assert_eq!(unrun.len(), 2, "case 16's two variants, standing in");
 
     verdicts(&dir, false);
     let out = run(&["--table", d]);
@@ -248,7 +248,7 @@ fn the_table_holds_wave_gate_3_blocked_while_a_leg_is_not_runnable() {
     )));
     assert!(
         s.contains(&format!(
-            "WAVE GATE 3: BLOCKED: {} NOT RUNNABLE ({}; Owed 82",
+            "WAVE GATE 3: BLOCKED: {} NOT RUNNABLE ({}; an unrun leg blocks the gate",
             unrun.len(),
             unrun.join(" ")
         )),
@@ -275,7 +275,7 @@ fn the_table_reds_on_a_fail_an_error_a_missing_verdict_or_a_missed_sweep() {
     eprintln!("legs that call the sweep: {}", sweeps.len());
     assert!(!sweeps.is_empty());
 
-    // Every leg passes (case 16's too, as after the owner's ruling): the only run that counts.
+    // Every leg passes (case 16's too): the only run that counts.
     verdicts(&dir, true);
     let out = run(&["--table", d]);
     let s = stdout(&out);
