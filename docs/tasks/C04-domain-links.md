@@ -492,10 +492,17 @@ happen" turned into a tested guard.
   `output_connected_after_ms` after the first growth (inclusive), and not 1 ms sooner.
 - (Amended 2026-10-19.) A generation change mid-window restarts the proof: the old sink's bytes never
   count toward the new one.
-- (Amended 2026-10-19.) Growth that stops before the bound is a stall that counts as a failure, never
-  Connected.
+- ~~(Amended 2026-10-19.) Growth that stops before the bound is a stall that counts as a failure, never
+  Connected.~~ (Amended 2026-10-24, Owed 87.) Growth that stops before the bound waits for the sink's
+  error, which counts as a failure; it is never Connected.
 - (Amended 2026-10-19.) Every sweep prints its count and fails on 0. Each guard's mutant goes red: the
   bound's `>=`, the reset placement, and the generation checks.
+- (Amended 2026-10-24, Owed 87.) No stall rule: `output_stall_after_ms` and `SwapReason::Stall` are
+  gone, and no tick ends a Proving or Connected sink, only its error
+  (`a_connected_sink_that_sends_nothing_is_swapped_only_by_its_error`,
+  `a_proving_sink_that_goes_silent_waits_for_its_error`). A destination stall swaps one base back-off
+  after the sink's own error at `OUTPUT_SINK_TIMEOUT_MS` (`a_destination_stall_swaps_on_the_sinks_timeout_error`).
+  Each mutant went red: a stall path re-added in Proving, one in Connected, and the constant at 20 s.
 
 ## Amendment 2026-10-19 (Owed 38: Connected is earned by sustained growth)
 
@@ -576,10 +583,42 @@ C04b dispatch). Connected is earned by SUSTAINED progress, not by the first byte
   `frames_count_only_from_the_current_live_generation`; `tests/links.rs`'s pair matrix has an abandon
   column and its generated schedules check every abandon.
 
+## Amendment 2026-10-24 (Owed 87: the stall rule is retired)
+
+**The ruling.** Owner, 2026-10-24, in chat, relayed by the coordinator: "A", choosing between the coordinator's (A) retire
+the stall rule, so rtmp2sink's own socket timeout is the only detector of a destination stall, and
+(B) keep the rule and raise the sink's timeout (`docs/_INDEX.md` Owed 87, decision log "Owed 87
+decided").
+
+**Why.** On CI, rtmp2sink's own 5 s socket timeout swapped 17 of 17 destination stalls; the rule
+won once, by about 1 ms. rtmp2 counts bytes only when a whole message is written, so "no growth for
+5 s" and "one 5 s socket wait" start at the same write.
+
+**As built (branch `feat/owed87-retire-stall`).**
+- `OutputState` is `Connecting { attempt, since }`, `Proving { attempt, first_progress, sent }`,
+  `Connected` and `Backoff { attempt, until }`. No state keeps a last progress. Proving still earns
+  Connected only by growth (Owed 38), and a repeated or backwards total is no progress.
+- `on_tick` keeps two timers: a due back-off builds, and a Connecting sink past
+  `output_connect_timeout_ms` backs off (`SwapReason::ConnectTimeout`). Proving and Connected have
+  no timer: only `on_error` ends them (`SwapReason::Error`; from Connected it is failure 1, so the
+  base back-off comes first).
+- `Thresholds::output_stall_after_ms` and `SwapReason::Stall` are removed. `config::OUTPUT_SINK_TIMEOUT_MS`
+  (5 000, GStreamer 1.24.2's rtmp2 default) is the adapter's sink timeout (C09's amendment of this
+  date). The domain reads it only in tests, to time a stall's error.
+- Owed 38's amendment above, read again: "no growth for `output_stall_after_ms` while proving" is now
+  the sink's error while proving, still a failure; "a Connected sink's stall still swaps at once with
+  attempt 0" is now an error from Connected, failure 1.
+- The 15 s budget (`tests/links.rs`): a stall's recovery from the last bytes is the sink's timeout
+  plus the recovery from an error, 10 499 ms, then 16 499 ms through one failed connect.
+- **Not covered any more** (the implementer's note): a sink that sends nothing and never errors stays
+  Connected.
+
 ## Do not touch
 
 `config.rs` values, `programme.rs`. (Amended 2026-10-19: Owed 38's ruling adds
-`output_connected_after_ms`; every existing value is unchanged.)
+`output_connected_after_ms`; every existing value is unchanged.) (Amended 2026-10-24: Owed 87's
+ruling removes `output_stall_after_ms` and adds `OUTPUT_SINK_TIMEOUT_MS`; every other value is
+unchanged.)
 
 ## Output cap
 

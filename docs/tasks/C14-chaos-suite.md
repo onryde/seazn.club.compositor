@@ -757,6 +757,40 @@ review-round-1 amendment.
   dest-stall-rule (87, both checks). Anything else is NOT OWED.
 - **Case 16** (Owed 82's hook) is the next C14 task, in its own PR.
 
+## Amendment 2026-10-24, Owed 87 decided (branch `feat/owed87-retire-stall`)
+
+Owner, 2026-10-24, in chat, relayed by the coordinator: "A": the stall rule is retired, and rtmp2sink's own
+socket timeout is the only detector of a destination stall (`docs/_INDEX.md` Owed 87, decision log
+"Owed 87 decided"; C04's and C09's amendments of this date).
+- **`stall_swap` judges one path.** `stall_swap_judged($cut)` (lib.jq) loses its `$paths`, the
+  `stall` path and `stall_swap_shown`. In cases 5, 12 and 17 it passes when:
+  - the swap reads `reason=error`, and the reason lines pair the swap lines;
+  - the outgoing sink's `output gen=<g> error:` line came before the swap;
+  - the swap came output_backoff_base_ms to budget_output_reconnect_ms (§6, 5 s) after the error,
+    and within `bound_ms` (output_sink_timeout_ms + output_backoff_base_ms + frame_period_ms) of the
+    last growth;
+  - the error came no sooner than output_sink_timeout_ms − frame_period_ms after the cut.
+  thresholds.json gains `output_sink_timeout_ms` and loses `output_stall_after_ms` and
+  `output_progress_poll_ms`.
+- **Case 17 (`dest-stall-rule`) witnesses the error path under its capped send buffer.** Its premise
+  (only the rule can swap) is withdrawn. It stays to show that the sink's own timeout still catches a
+  socket the cap holds open; if a kernel ever honours the cap inside a message, the sink stops
+  erroring there and `stall_swap` reds. `trickled` bounds its rate per sink timeout. `buffer_capped`
+  keeps the cap read and the sockets' buffers before the cut; the in-fault Send-Q is measured, not
+  judged. That clause leaves by the ruling, not to get green: the queue past the cap is the measured
+  physics (the PR #65 review's C-1) that the ruling rests on.
+- **Owed 87 leaves chaos.json**: its tags on the 4 legs of cases 5 and 12 and on case 17, its
+  signature and its title. A red on those checks reads NOT OWED.
+- **m9** now sets `OUTPUT_SINK_TIMEOUT_MS` to 20 000 in a scratch relay build, on case 17, with
+  target `stall_swap` and controls `buffer_capped` and `trickled`. The verdict reads the committed
+  thresholds.json. It must end KILLED.
+- **Host mutants, each with a named FAIL in a `case_verdicts.rs` sim:** lib.jq's `reason == "error"`,
+  the back-off floor, the output budget, the bound from growth and the floor from the cut, each
+  replaced by `true` (or the floor by 0). `error_to_swap_ms != null` is dropped as equivalent: jq sorts
+  null below every number, so the floor reds a null.
+- **Expected reds of the next run:** cef-leaks ×2 (NOT RUNNABLE until case 16's PR, Owed 82) and
+  cpu-starved (Owed 86, still in chaos.json). Anything else is NOT OWED.
+
 ## Files
 
 - Create: `harness/cases/{camera-stop,camera-flap,reader-kicked,dest-disconnect,dest-stall,cpu-starved,score-down,cef-killed,process-killed,input-impaired}.{sh,jq}` (amended 2026-10-24: all 16, cases 11–16 too, as `.sh` files with `require` lines over `harness/cases/lib.jq`; and `harness/chaos.json`, the legs)
@@ -807,8 +841,13 @@ review-round-1 amendment.
 - (Amended 2026-10-18, Owed 19) Case 8 asserts restart evidence (generations in the compositor
   log) and accepts `ready`/`restarting`/`starting` before the new ready. Case 9 reads
   `RestartCount` + 1 and a non-zero `die` exit code.
-- (Amended 2026-10-18, Owed 13/15) Case 5's bound is `output_stall_after_ms + poll + beat`, read
-  from `thresholds.json`.
+- ~~(Amended 2026-10-18, Owed 13/15) Case 5's bound is `output_stall_after_ms + poll + beat`, read
+  from `thresholds.json`.~~ (Amended 2026-10-24, Owed 87) In cases 5, 12 and 17, `stall_swap` passes
+  only on the sink's own error: `reason=error`, the error line before the swap, the swap
+  output_backoff_base_ms to budget_output_reconnect_ms after it and within output_sink_timeout_ms +
+  output_backoff_base_ms + frame_period_ms of the last growth, and the error no sooner than
+  output_sink_timeout_ms − frame_period_ms after the cut, each read from `thresholds.json`. m9
+  (`OUTPUT_SINK_TIMEOUT_MS` 20 s) is KILLED on case 17.
 - (Amended 2026-10-18, Owed 20) Case 6 asserts the score stays on air through the stress and
   after it, and every beat's `rung` is `full`/`overlay_half_rate`, never back to `full` after a step.
 - (Amended 2026-10-20, C11b; Owed 62, 68, 69) Case 8 takes case 9's shape, with a non-zero, non-75 exit and no core
