@@ -20,7 +20,13 @@
 //! - C11's dispatcher: `gen=<g>: page console: hang starts` (the harness page's hang, its own line)
 //!   and `gen=<g>: score stale=<true|false>`;
 //! - `docker/supervise.sh`: `the compositor was killed by SIG<name> (status <n>)`;
-//! - Chromium, unformatted: `GPU process isn't usable` (its abort, F-013).
+//! - Chromium, unformatted: `GPU process isn't usable` (its abort, F-013);
+//! - `adapters::cef_graphics` (C14 case 16, Owed 82): each build's `gen=<g>: loading <origin>`, and
+//!   from a `test-hooks` build the arming line `WARN test hook (Owed 82): the next <n> CEF teardowns
+//!   never return` and each held teardown's `WARN test hook (Owed 82) gen=<g>: this CEF teardown
+//!   never returns (<left> more to hold)`; the reaper's `WARN gen=<g>: teardown has not returned
+//!   after <ms> ms; SIGKILL sent to renderer pids [..] (of [..])` and its leak count
+//!   `WARN gen=<g>: teardown still has not returned <ms> ms after the kill: … (<n> leaked; Owed 55)`.
 use serde::Serialize;
 
 use crate::clock::{log_ts_ms, rfc3339_utc_ms};
@@ -115,6 +121,43 @@ pub struct Health {
     pub gpu_process_deaths: u64,
 }
 
+/// `WARN test hook (Owed 82): the next <n> CEF teardowns never return`: a `test-hooks` build armed
+/// (once per process, before `compositor started`).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct Armed {
+    pub at_ms: i64,
+    pub n: u64,
+}
+
+/// `WARN test hook (Owed 82) gen=<g>: this CEF teardown never returns (<left> more to hold)`: one
+/// retirement held for good.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct HeldTeardown {
+    pub at_ms: i64,
+    pub gen: u64,
+    pub left: u64,
+}
+
+/// `WARN gen=<g>: teardown has not returned after <ms> ms; SIGKILL sent to renderer pids [..] (of
+/// [..])`: the reaper's kill of a retired build's renderers, the pids it signalled of those it found.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ReaperKill {
+    pub at_ms: i64,
+    pub gen: u64,
+    pub after_ms: u64,
+    pub killed: Vec<u64>,
+    pub of: Vec<u64>,
+}
+
+/// `WARN gen=<g>: teardown still has not returned <ms> ms after the kill: … (<n> leaked; Owed 55)`:
+/// the teardown counted leaked, and how many are leaked at once.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct TeardownLeak {
+    pub at_ms: i64,
+    pub gen: u64,
+    pub leaked: u64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct Stale {
     pub at_ms: i64,
@@ -167,6 +210,16 @@ pub struct LogFacts {
     pub sink_publishes: Vec<GenAt>,
     pub page_hangs: Vec<GenAt>,
     pub score_stale: Vec<Stale>,
+    /// `gen=<g>: loading <origin>`: each build's load, so a case can tell the newest gen (case 16).
+    pub cef_loading: Vec<GenAt>,
+    /// Owed 82's arming line (a `test-hooks` build; case 16's precondition).
+    pub hold_armed: Vec<Armed>,
+    /// Each teardown the hook held (case 16).
+    pub teardowns_held: Vec<HeldTeardown>,
+    /// The reaper's kill of each retired build whose teardown had not returned.
+    pub reaper_kills: Vec<ReaperKill>,
+    /// Each teardown counted leaked, with the count at once.
+    pub teardown_leaks: Vec<TeardownLeak>,
     /// Chromium's abort line (`GPU process isn't usable`).
     pub gpu_unusable: Vec<i64>,
     pub exits: Vec<Exit>,
@@ -231,6 +284,72 @@ fn sink_publish(msg: &str) -> Option<u64> {
     let (ms, _) = rest.split_once(" ms; ")?;
     ms.parse::<u64>().ok()?;
     g.parse().ok()
+}
+
+/// Digits only (`u64::from_str` also takes a leading `+`).
+fn num(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// `[a, b]` as Rust's `{:?}` prints a `Vec<i32>` of pids; `[]` is empty.
+fn pid_list(s: &str) -> Option<Vec<u64>> {
+    let inner = s.strip_prefix('[')?.strip_suffix(']')?;
+    if inner.is_empty() {
+        return Some(vec![]);
+    }
+    inner.split(", ").map(num).collect()
+}
+
+fn armed(msg: &str, at_ms: i64) -> Option<Armed> {
+    let n = msg
+        .strip_prefix("WARN test hook (Owed 82): the next ")?
+        .strip_suffix(" CEF teardowns never return")?;
+    Some(Armed { at_ms, n: num(n)? })
+}
+
+fn held(msg: &str, at_ms: i64) -> Option<HeldTeardown> {
+    let (g, rest) = msg
+        .strip_prefix("WARN test hook (Owed 82) gen=")?
+        .split_once(": this CEF teardown never returns (")?;
+    let left = rest.strip_suffix(" more to hold)")?;
+    Some(HeldTeardown {
+        at_ms,
+        gen: num(g)?,
+        left: num(left)?,
+    })
+}
+
+fn reaper_kill(msg: &str, at_ms: i64) -> Option<ReaperKill> {
+    let (g, rest) = msg
+        .strip_prefix("WARN gen=")?
+        .split_once(": teardown has not returned after ")?;
+    let (ms, rest) = rest.split_once(" ms; SIGKILL sent to renderer pids ")?;
+    let (killed, of) = rest.split_once(" (of ")?;
+    Some(ReaperKill {
+        at_ms,
+        gen: num(g)?,
+        after_ms: num(ms)?,
+        killed: pid_list(killed)?,
+        of: pid_list(of.strip_suffix(')')?)?,
+    })
+}
+
+fn teardown_leak(msg: &str, at_ms: i64) -> Option<TeardownLeak> {
+    let (g, rest) = msg
+        .strip_prefix("WARN gen=")?
+        .split_once(": teardown still has not returned ")?;
+    let (ms, rest) = rest.split_once(
+        " ms after the kill: its thread, pipeline and renderer stay until the process restarts (",
+    )?;
+    num(ms)?;
+    Some(TeardownLeak {
+        at_ms,
+        gen: num(g)?,
+        leaked: num(rest.strip_suffix(" leaked; Owed 55)")?)?,
+    })
 }
 
 /// `output gen=<g> error: <text>` (gst_output.rs's bus error): the generation.
@@ -317,6 +436,14 @@ pub fn log_facts(text: &str) -> LogFacts {
             });
         } else if let Some(k) = killed(m, at_ms) {
             f.killed.push(k);
+        } else if let Some(a) = armed(m, at_ms) {
+            f.hold_armed.push(a);
+        } else if let Some(h) = held(m, at_ms) {
+            f.teardowns_held.push(h);
+        } else if let Some(r) = reaper_kill(m, at_ms) {
+            f.reaper_kills.push(r);
+        } else if let Some(l) = teardown_leak(m, at_ms) {
+            f.teardown_leaks.push(l);
         } else if let Some((g, what)) = dispatcher(m) {
             match what {
                 "page console: hang starts" => f.page_hangs.push(ga(g)),
@@ -330,6 +457,7 @@ pub fn log_facts(text: &str) -> LogFacts {
                     gen: g,
                     value: false,
                 }),
+                w if w.starts_with("loading ") => f.cef_loading.push(ga(g)),
                 _ => {}
             }
         }
@@ -618,6 +746,119 @@ mod tests {
 
     /// The publish gate's line (gst_output.rs, Owed 84), as case 17's measure reads it: CI's lines
     /// (PR #65, dest-stall-rule), with near misses.
+    /// Case 16's lines (Owed 82, PR #62's hook; `adapters::cef_graphics`): the arming line, each held
+    /// teardown, the reaper's kill and its leak count, and each build's load, all by gen.
+    #[test]
+    fn the_held_teardown_lines_are_read_by_their_gen() {
+        let mut log = String::new();
+        let lines = [
+            (0, "WARN test hook (Owed 82): the next 3 CEF teardowns never return"),
+            (100, "gen=1: loading http://fake-control:7000"),
+            (20_000, "WARN test hook (Owed 82) gen=1: this CEF teardown never returns (2 more to hold)"),
+            (20_010, "gen=2: loading http://fake-control:7000"),
+            (23_000, "WARN gen=1: teardown has not returned after 3000 ms; SIGKILL sent to renderer pids [412, 418] (of [412, 418, 420])"),
+            (26_000, "WARN gen=1: teardown still has not returned 3000 ms after the kill: its thread, pipeline and renderer stay until the process restarts (1 leaked; Owed 55)"),
+            (26_500, "WARN gen=2: teardown has not returned after 3000 ms; SIGKILL sent to renderer pids [] (of [])"),
+            // Near misses: none is one of these facts.
+            (27_000, "WARN test hook (Owed 82): the next +3 CEF teardowns never return"),
+            (27_100, "WARN test hook (Owed 82): the next 3 CEF teardowns never return now"),
+            (27_200, "WARN test hook (Owed 82) gen=x: this CEF teardown never returns (2 more to hold)"),
+            (27_300, "WARN test hook (Owed 82) gen=4: this CEF teardown never returns (2 more)"),
+            (27_400, "WARN gen=5: teardown has not returned after 3000 ms; SIGKILL sent to renderer pids [1,] (of [1])"),
+            (27_500, "WARN gen=6: teardown has not returned after soon ms; SIGKILL sent to renderer pids [1] (of [1])"),
+            (27_510, "WARN gen=10: teardown has not returned after 3000 ms; SIGKILL sent to renderer pids [1] (of [1]"),
+            (27_520, "WARN gen=11: teardown has not returned after 3000 ms; SIGKILL sent to renderer pids [1] (of [x])"),
+            (27_600, "WARN gen=7: teardown still has not returned 3000 ms after the kill: its thread, pipeline and renderer stay until the process restarts (one leaked; Owed 55)"),
+            (27_700, "gen=8: page console: loading http://x"),
+            (27_800, "gen=9: ready (retired or crashed: its frames stay off air)"),
+        ];
+        for (at, m) in lines {
+            log.push_str(&line(at, m));
+        }
+        let f = log_facts(&log);
+        assert_eq!(f.hold_armed, vec![Armed { at_ms: NOON_MS, n: 3 }]);
+        assert_eq!(
+            f.cef_loading,
+            vec![
+                GenAt {
+                    at_ms: NOON_MS + 100,
+                    gen: 1
+                },
+                GenAt {
+                    at_ms: NOON_MS + 20_010,
+                    gen: 2
+                }
+            ]
+        );
+        assert_eq!(
+            f.teardowns_held,
+            vec![HeldTeardown {
+                at_ms: NOON_MS + 20_000,
+                gen: 1,
+                left: 2
+            }]
+        );
+        assert_eq!(
+            f.reaper_kills,
+            vec![
+                ReaperKill {
+                    at_ms: NOON_MS + 23_000,
+                    gen: 1,
+                    after_ms: 3_000,
+                    killed: vec![412, 418],
+                    of: vec![412, 418, 420]
+                },
+                ReaperKill {
+                    at_ms: NOON_MS + 26_500,
+                    gen: 2,
+                    after_ms: 3_000,
+                    killed: vec![],
+                    of: vec![]
+                }
+            ]
+        );
+        assert_eq!(
+            f.teardown_leaks,
+            vec![TeardownLeak {
+                at_ms: NOON_MS + 26_000,
+                gen: 1,
+                leaked: 1
+            }]
+        );
+        // The producers, each once, in the adapter's source: a reworded line reds here, not on CI.
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../adapters/src/cef_graphics.rs"
+        ))
+        .expect("cef_graphics.rs");
+        let mut pinned = 0;
+        for producer in [
+            // The producer's line, not the adapter's own test of it (`"))` there).
+            "\"WARN test hook (Owed 82): the next {n} CEF teardowns never return\"\n",
+            "\"WARN test hook (Owed 82) gen={gen}: this CEF teardown never returns ({left} more to hold)\"",
+            "\"WARN gen={gen}: teardown has not returned after {} ms; SIGKILL sent to renderer pids \\\n         {killed:?} (of {pids:?})\"",
+            "\"WARN gen={gen}: teardown still has not returned {TEARDOWN_LEAK_AFTER_MS} ms after the \\\n             kill: its thread, pipeline and renderer stay until the process restarts ({n} leaked; \\\n             Owed 55)\"",
+            "\"gen={gen}: loading {}\"",
+        ] {
+            assert_eq!(
+                src.matches(producer).count(),
+                1,
+                "cef_graphics.rs's line changed: update logfacts ({producer})"
+            );
+            pinned += 1;
+        }
+        eprintln!(
+            "log lines checked: {}, producers pinned: {pinned}, facts read: {}",
+            f.lines,
+            f.hold_armed.len()
+                + f.cef_loading.len()
+                + f.teardowns_held.len()
+                + f.reaper_kills.len()
+                + f.teardown_leaks.len()
+        );
+        assert_eq!(pinned, 5);
+    }
+
     #[test]
     fn a_publish_is_read_with_its_generation() {
         let mut log = String::new();

@@ -1,0 +1,13 @@
+# Case 16 (harness/cases/cef-leaks.sh) only, added to compose.yml by run-case.sh (CASE_COMPOSE).
+# The compositor is asked to hold its next COMPOSITOR_TEST_HOLD_TEARDOWNS retired CEF teardowns for
+# good (Owed 82, owner option A, 2026-10-24: the hook in crates/adapters/src/cef_graphics.rs's
+# `hold_next_teardowns`, compiled in only by the Dockerfile's `relay-test-hooks` stage). The case
+# points RELAY_IMAGE at that image (RELAY_TEST_HOOKS_IMAGE); the relay image ignores the variable,
+# and the case's `armed` check then fails (its arming line is a required precondition).
+#
+# Here and not in compose.yml, so no other leg's compositor sees the variable at all; `:?`, so a
+# case that forgot to set it refuses to start rather than run unarmed.
+services:
+  compositor:
+    environment:
+      COMPOSITOR_TEST_HOLD_TEARDOWNS: ${COMPOSITOR_TEST_HOLD_TEARDOWNS:?case 16 sets how many teardowns to hold}

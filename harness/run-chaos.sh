@@ -12,11 +12,12 @@
 #       repeated case, how many legs ran the false-positive sweep, and the wave gate 3 line: a run
 #       counts toward the gate only when every selected leg PASSED. Exits 1 on any FAIL, ERROR or
 #       MISSING, on an empty selection, on a sweep that some leg calling it did not run, and on any
-#       NOT RUNNABLE leg: an unrun leg is never green (the PR #52 review's I6; case 16's are
-#       Owed 82, which only the owner's ruling closes). Only a whole manifest's run, on its first
-#       attempt (GITHUB_RUN_ATTEMPT 1), over harness/chaos.json itself, with every leg PASS, counts:
-#       a selection, a re-run or another manifest (CHAOS_MANIFEST) is green for what it ran and says
-#       it never counts (the re-review's I-2 and m-7; the confirm pass's CHAOS_MANIFEST minor).
+#       NOT RUNNABLE leg: an unrun leg is never green (the PR #52 review's I6; no case is NOT
+#       RUNNABLE since case 16 was wired to Owed 82's hook, 2026-10-24). Only a whole manifest's
+#       run, on its first attempt (GITHUB_RUN_ATTEMPT 1), over harness/chaos.json itself, with
+#       every leg PASS, counts: a selection, a re-run or another manifest (CHAOS_MANIFEST) is green
+#       for what it ran and says it never counts (the re-review's I-2 and m-7; the confirm pass's
+#       CHAOS_MANIFEST minor).
 #
 # A FAIL row names, beside each failed check, the docs/_INDEX.md Owed row chaos.json's `owed` puts
 # behind it for that leg (a row, or a list tried in order), or NOT OWED; under the table, the red
@@ -212,7 +213,7 @@ table() {
     return 0
   fi
   if [ "$not_runnable" -gt 0 ]; then
-    echo "WAVE GATE 3: BLOCKED: $not_runnable NOT RUNNABLE (${unrun[*]}; Owed 82, the owner's ruling)"
+    echo "WAVE GATE 3: BLOCKED: $not_runnable NOT RUNNABLE (${unrun[*]}; an unrun leg blocks the gate until it can run)"
   fi
   echo "WAVE GATE 3: this run does not count ($passed of $n legs PASS)"
   exit 1

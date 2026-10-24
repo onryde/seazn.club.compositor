@@ -246,11 +246,24 @@ record_measure() {
   jq -cn --arg n "$1" --argjson v "${v:-null}" '{name: $n, value: $v}' >>"$OUT/measures.jsonl" 2>/dev/null ||
     jq -cn --arg n "$1" '{name: $n, value: null}' >>"$OUT/measures.jsonl"
 }
+# A shown value on one line, cut at 300 characters (a FAIL line's evidence stays readable) and
+# marked when cut, with its whole length: measures.jsonl and verdict.json's measures keep it whole
+# (the PR #65 confirm pass's n-3: a cut value read as the whole one).
+one_line_cut() {
+  local v
+  v="$(cat)"
+  v="${v//$'\n'/ }"
+  if [ "${#v}" -gt 300 ]; then
+    printf '%s [cut at 300 of %s characters; verdict.json'"'"'s measures has it whole]' "${v:0:300}" "${#v}"
+  else
+    printf '%s' "$v"
+  fi
+}
 judge() {
   local input="$1" name="$2" filter="$3" shown="${4:-}" m=""
   checks_run=$((checks_run + 1))
   if [ -n "$shown" ]; then
-    m="$(jq_case "$shown" "$input" -c 2>&1 | tr '\n' ' ' | cut -c1-300 || true)"
+    m="$(jq_case "$shown" "$input" -c 2>&1 | one_line_cut || true)"
     record_measure "$name" "$shown" "$input"
   fi
   if jq_case "$filter" "$input" -e >/dev/null 2>&1; then
@@ -266,7 +279,7 @@ require_run() { judge "$OUT/run.json" "$@"; }
 measure() {
   checks_run=$((checks_run + 1))
   record_measure "$1" "$2" "$OUT/report.json"
-  echo "MEASURE $1: $(jq_case "$2" "$OUT/report.json" -c 2>&1 | tr '\n' ' ' | cut -c1-300 || true)"
+  echo "MEASURE $1: $(jq_case "$2" "$OUT/report.json" -c 2>&1 | one_line_cut || true)"
 }
 owed_lines=()
 owed() {
