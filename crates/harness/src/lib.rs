@@ -9,17 +9,21 @@
 //! - [`camera`]: fake-camera's controls and schedule;
 //! - [`control`]: fake-control's routes (the session, the heartbeats, the score feed, the page);
 //! - [`inputs`] and [`checker`]: the checker's inputs and its analysis;
-//! - [`media`] (feature `media`): everything that runs GStreamer.
+//! - [`logfacts`]: the compositor log's facts (C14), parsed into the report;
+//! - [`media`] (feature `media`): everything that runs GStreamer;
+//! - [`thresholds`]: `harness/thresholds.json`, the numbers C14's verdicts read (`$t`).
 //!
-//! The harness reads `domain::config::Thresholds` (the one authority for the programme's numbers)
-//! and nothing else of the domain.
+//! The harness reads `domain::config` (the one authority for the programme's numbers) and C08's
+//! `app::ports::FINAL_BEAT_TIMEOUT_MS`, and nothing else of the domain or the app.
 pub mod audio;
 pub mod camera;
 pub mod checker;
 pub mod clock;
 pub mod control;
 pub mod inputs;
+pub mod logfacts;
 #[cfg(feature = "media")]
 pub mod media;
 pub mod score;
 pub mod strip;
+pub mod thresholds;
