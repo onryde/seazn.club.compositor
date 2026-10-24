@@ -555,7 +555,8 @@ jobs:
       # driver runs it on its error path too. Any leak uploads nothing, and prints the harness's
       # redacted report (kind, file:line, the line with every credential replaced by its name). With
       # no harness scan at all: page=test uploads on this job's scan alone, for the diagnosis; page=real
-      # keeps only status.json and done (nothing here can scan for the page source's credentials).
+      # keeps only status.json and done (nothing here can scan for the page source's credentials), and
+      # its compositor log goes up only when the harness scanned those exact bytes (sha256).
       - name: Leak gate
         id: leaks
         if: always() && steps.launch.outputs.harness != ''
@@ -573,6 +574,17 @@ jobs:
               echo "::error::the harness's scan is not clean ($(jq -c '{scanned, leaks, skipped}' "$OUT/secrets.json")): nothing is uploaded"
               jq -r '.leaked[]? | "leaked: \(.kind) in \(.where | join("; "))"' "$OUT/secrets.json"
               exit 1
+            fi
+            # The compositor's log here is this job's own copy (the watch step converted it and sent it to
+            # the harness). On page=real it goes up only when the harness scanned those very bytes:
+            # a failed or partial upload leaves the harness a different file, and this copy unscanned
+            # for the page source's credentials.
+            if [ "$PAGE" = real ] && [ -f "$OUT/compositor.log" ]; then
+              here="$(python3 -I -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$OUT/compositor.log")"
+              if [ "$(jq -r '.compositor_log_sha256 // ""' "$OUT/secrets.json")" != "$here" ]; then
+                rm -f "$OUT/compositor.log"
+                echo "::warning::the harness did not scan this compositor log (its upload failed or differs): not uploaded"
+              fi
             fi
             echo "secrets: $n files here clean; the harness's scan $(jq -c '{scanned, leaks, skipped}' "$OUT/secrets.json")"
           elif [ "$PAGE" = real ]; then

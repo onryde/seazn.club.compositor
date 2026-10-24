@@ -141,6 +141,11 @@ comes from `thresholds.json`, `soak.json` or the drive.
 | 5d | An on-air sample per `sample_every_s` slot (the sampler's own unit). |
 | 6 | Every beat's rung is `full`. A stepped beat fails with "sizing alarm: the guest is short of CPU (C17 runbook)". |
 
+`scoreStale` is the page's feed health: its last live-data poll succeeded within its stale budget.
+It does not say the payload advanced. A page polling an answer that never changes reads false all
+the same. What shows the score moving is (c)'s deliveries landing (the ledger's seq advancing) and
+(d)'s overlay on air; a witness that the painted score follows the ledger is owed (below).
+
 On `page=test`, checks 5a–5d read `pending: page source`, and the best status is `plumbing`, not
 `pass`. The workflow then prints `::warning::PLUMBING ONLY`, heads the step summary "PLUMBING ONLY —
 NOT A SOAK PASS", and the run list names the run `soak page=test <N> min (PLUMBING ONLY)`.
@@ -203,9 +208,12 @@ from the ledger and tries again at once.
 
 ODI rather than T20: T20's 240 balls would end the match at minute 120 of a 180-minute drive, while
 ODI's first innings alone is 300 balls. The secrets scan adds the signing key, the page token and
-the credential cookies (`soak.json` `web_credential_cookies`: `seazn_session`) to `/out`'s list.
-The jar's other cookies carry no authority and are named in the log as not scanned:
-`seazn_org` (an id) and `seazn_signed_in` (its value is `1`). The fetch takes `deliveries.jsonl`, `score.log`, `seed.json`,
+every cookie in the jar to `/out`'s list, except the inert ones named in `soak.json`
+`web_cookies_inert` (`seazn_org`, an id, and `seazn_signed_in`, whose value is `1`: no authority),
+which the log names as not scanned. A cookie the web adds later is scanned, so the scan fails closed.
+A value under `scan_min_chars` (16) cannot be scanned without matching everything, so it fails by
+name ("too short to scan") and is never skipped. `secrets.json` names the compositor log it scanned
+by its sha256, and the leak gate uploads the job's own copy on page=real only when it is that file. The fetch takes `deliveries.jsonl`, `score.log`, `seed.json`,
 `web-up.log`, `web.log` and `postgres.log`.
 
 **Harness Machine size, page=real: performance-8x, 16384 MB** (soak.json `harness_guest.real`).
@@ -268,7 +276,8 @@ page=test stays at performance-4x, 8192 MB. The compositor Machine is alone on t
    token (the relay token in the signed URL), the signing key, the job token and the SRT passphrase.
    So the compositor's log did not carry the relay token. Whether the session cookie was also in a
    file the evidence cannot say (the `1` matched first); the next run scans it on its own. The scan
-   now takes the credential cookies only, and reports a leak by kind, file and line, redacted.
+   now takes every cookie but the named inert ones, refuses a value too short to scan, and reports
+   a leak by kind, file and line, redacted.
    `test-driver.sh`'s stub jar carries the hint, so the old scan reds.
 10. **The review's positive witness for the real page (M8) has no line to read yet.** It proposed
     requiring the compositor's `gen=N: loading <origin>` line (`cef_graphics.rs`, `restart`). In
@@ -285,6 +294,9 @@ page=test stays at performance-4x, 8192 MB. The compositor Machine is alone on t
   origin names the web port). The line has to reach the platform log first (finding 10).
 - **M10**: `serve.sh`'s environment allowlist is advisory while node runs as root, which can read
   `/proc/1/environ` (the job token). Run node, `seed.mjs` and `score.mjs` as an unprivileged user.
+- **N4, a frozen-payload witness**: `scoreStale` false means the page's polls succeed, not that the
+  score it paints advanced. Compare the overlay poll's score (or the programme's score region) with
+  the ledger at a few instants.
 - **The 3 h timing**: multiply the page=real rehearsal's checker and sampler wall times
   (`driver.log`: `checking` to `done`) by 7.2 against the post-check time (about 19 min after the
   drive's end) before the 3 h run.

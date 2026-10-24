@@ -12,7 +12,9 @@
 # plants the page token in /out, and must read as a leak). Run 5 (in parallel too) hangs the checker:
 # the driver stops it at the hard stop's reserve, skips the sampler, and still exits by the hard
 # stop. Run 6 (page=real) fails in the page source after its signing key reached /out: the error
-# path's scan names it before anything is fetched.
+# path's scan names it before anything is fetched. Run 7 (page=real) fails the same way with a jar
+# that also holds a cookie the scan was never told about (planted in /out) and a short one, and the
+# session cookie planted: three leaks by name, the inert cookies named as not scanned.
 #
 #   HARNESS_BASH=<bash 5> harness/soak/test-driver.sh     (driver.sh needs bash 5: mapfile, EPOCHREALTIME)
 #
@@ -146,9 +148,19 @@ r() { od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; }
 r >"$WEB_STATE/auth-secret"
 # The jar as the web leaves it: the session, the org, and the signed-in hint, whose value is "1"
 # (rehearsal 40131252539 read that "1" as a leak in every file).
-printf '{"seazn_session":"%s","seazn_org":"%s","seazn_signed_in":"1"}' "ses$(r)" "org$(r)" >"$WEB_STATE/cookies.json"
-# A page source that fails after its signing key reached /out (and before the signed URL).
-if [ -e "$STATE/web-fail" ]; then echo "AUTH_SECRET=$(cat "$WEB_STATE/auth-secret")" >>"$OUT/web.log"; echo "soak-web: FAIL (stub)"; exit 1; fi
+if [ -e "$STATE/jar-extra" ]; then
+  # A cookie no list names (a credential the web might add) and a short one.
+  printf '{"seazn_session":"%s","seazn_org":"%s","seazn_signed_in":"1","seazn_future":"fut%s","seazn_lang":"en"}' \
+    "ses$(r)" "org$(r)" "$(r)" >"$WEB_STATE/cookies.json"
+else
+  printf '{"seazn_session":"%s","seazn_org":"%s","seazn_signed_in":"1"}' "ses$(r)" "org$(r)" >"$WEB_STATE/cookies.json"
+fi
+# Plants in /out, by the run's state: the signing key, the session cookie, the unnamed cookie.
+[ ! -e "$STATE/plant-key" ] || echo "AUTH_SECRET=$(cat "$WEB_STATE/auth-secret")" >>"$OUT/web.log"
+[ ! -e "$STATE/plant-session" ] || echo "cookie: seazn_session=$(jq -r .seazn_session "$WEB_STATE/cookies.json")" >>"$OUT/web.log"
+[ ! -e "$STATE/plant-future" ] || echo "set-cookie: seazn_future=$(jq -r .seazn_future "$WEB_STATE/cookies.json")" >>"$OUT/score.log"
+# A page source that fails before the signed URL.
+if [ -e "$STATE/web-fail" ]; then echo "soak-web: FAIL (stub)"; exit 1; fi
 st="eyJ$(r).eyJ$(r).$(r)"
 printf 'http://%s:%s/overlay/fixtures/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee?sid=%s&st=%s&host=compositor&delay=%s&template=bar\n' \
   "$HOST" "$WEB_PORT" "$SESSION_ID" "$st" "$WEB_DELAY_MS" >"$WEB_STATE/overlay-url"
@@ -222,7 +234,7 @@ stub_run "$W/out5" "$W/state5"
 real_pids="$real_pids $!"
 # Run 6: page=real, the page source fails after leaking its key into /out; the hard stop is near.
 mkdir -p "$W/out6" "$W/state6"
-touch "$W/state6/web-fail"
+touch "$W/state6/web-fail" "$W/state6/plant-key"
 (
   t="$(now_ms)"
   rc=0
@@ -231,6 +243,19 @@ touch "$W/state6/web-fail"
     SOAK_DEADLINE_MS=$((t + 600000)) SOAK_HARD_STOP_MS=$((t + 8000)) SOAK_PAGE=real \
     FLY_MACHINE_ID=m0 FLY_APP_NAME=soak-test "$BASH5" "$W/soak/driver.sh" >"$W/driver6.out" 2>&1 || rc=$?
   echo "$rc" >"$W/rc6"
+) &
+real_pids="$real_pids $!"
+# Run 7: page=real, the page source fails with the extra jar, the session and the unnamed cookie in /out.
+mkdir -p "$W/out7" "$W/state7"
+touch "$W/state7/web-fail" "$W/state7/jar-extra" "$W/state7/plant-session" "$W/state7/plant-future"
+(
+  t="$(now_ms)"
+  rc=0
+  env -i PATH="$PATH_STUB" HOME="$W" STATE="$W/state7" SOAK_ROOT="$W/soak" SOAK_OUT="$W/out7" SOAK_WEB_STATE="$W/web7" \
+    SESSION_ID="11111111-2222-4333-8444-555555555558" JOB_TOKEN="$JOB_TOKEN" SOAK_DRIVE_MIN=1 \
+    SOAK_DEADLINE_MS=$((t + 600000)) SOAK_HARD_STOP_MS=$((t + 8000)) SOAK_PAGE=real \
+    FLY_MACHINE_ID=m0 FLY_APP_NAME=soak-test "$BASH5" "$W/soak/driver.sh" >"$W/driver7.out" 2>&1 || rc=$?
+  echo "$rc" >"$W/rc7"
 ) &
 real_pids="$real_pids $!"
 
@@ -276,6 +301,8 @@ check "the checker ran on the uploaded log" '.[0] | test("--compositor-log [^ ]*
   <(grep '^checker ' "$STATE/calls" | jq -R .)
 check "done: ok, live, checker 0, no leak" '.[0] | .ok and .went_live and .checker_exit == 0 and .leaks == 0 and .ended_early == null' "$W/out/done"
 check "secrets scanned" '.[0] | .scanned > 5 and .leaks == 0' "$W/out/secrets.json"
+checkx "secrets.json names the compositor log it scanned by its sha256" '.[0].compositor_log_sha256 == $want' \
+  --arg want "$(python3 -I -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$W/out/compositor.log")" "$W/out/secrets.json"
 # No recording under stubs: the sampler ran, and its one minute says it had no segment.
 check "the sampler ran: one minute, unsampled for want of a segment" \
   'length == 1 and (.[0] | .minute == 0 and .differs == false and (.error | test("no programme segment")))' "$W/out/overlay-samples.jsonl"
@@ -340,8 +367,8 @@ checked=$((checked + 1))
 if grep -q "secrets checked" "$W/driver3.out" && ! grep -q "is empty: nothing to scan with" "$W/driver3.out"; then echo "PASS real: every credential had a value to scan with"; else
   echo "FAIL real: a credential was empty"; failures=$((failures + 1)); fi
 checked=$((checked + 1))
-if grep -q "secrets: cookies not scanned (no authority, not credentials): seazn_org, seazn_signed_in" "$W/driver3.out"; then
-  echo "PASS real: the session cookie scanned, the org and the hint named as not credentials"; else
+if grep -q "secrets: inert cookies not scanned (soak.json web_cookies_inert): seazn_org, seazn_signed_in" "$W/driver3.out"; then
+  echo "PASS real: the jar scanned but its inert cookies, named (the org, the hint)"; else
   echo "FAIL real: no cookies-not-scanned line"; grep 'secrets' "$W/driver3.out"; failures=$((failures + 1)); fi
 check "real leak: the page token in /out reads as a leak, done not ok" '.[0] | .leaks == 1 and .ok == false' "$W/out4/done"
 checked=$((checked + 1))
@@ -389,10 +416,29 @@ check "web error: secrets.json has the leak and skips the token it never made" \
   '.[0] | .scanned > 0 and .leaks == 1 and .skipped == ["WEB_PAGE_TOKEN"]' "$W/out6/secrets.json"
 check "web error: done not ok, with the leak" '.[0] | .ok == false and .leaks == 1' "$W/out6/done"
 
+# Run 7: every cookie but the inert ones is scanned; the short one fails; the planted session reds.
+check "jar: three leaks by kind, the session and the unnamed cookie in /out, the short one refused" \
+  '.[0] | .leaks == 3 and ([.leaked[].kind] | sort) == ["WEB_COOKIE[seazn_future]", "WEB_COOKIE[seazn_lang]", "WEB_COOKIE[seazn_session]"]
+   and .skipped == ["WEB_PAGE_TOKEN"]' "$W/out7/secrets.json"
+check "jar: the planted session cookie found in web.log, the line redacted" \
+  '.[0] | [.leaked[] | select(.kind == "WEB_COOKIE[seazn_session]") | .where] == [["web.log:1 \"cookie: seazn_session=<WEB_COOKIE[seazn_session]>\""]]' "$W/out7/secrets.json"
+checked=$((checked + 1))
+if [ "$(cat "$W/rc7")" -eq 1 ] && grep -q 'FAIL WEB_COOKIE\[seazn_lang\] is too short to scan (2 characters, at least 16)' "$W/driver7.out" \
+  && grep -q 'FAIL WEB_COOKIE\[seazn_future\] appears in /out: score.log:1' "$W/driver7.out" \
+  && grep -q 'inert cookies not scanned (soak.json web_cookies_inert): seazn_org, seazn_signed_in' "$W/driver7.out"; then
+  echo "PASS jar: the short cookie fails by name, the unnamed one is scanned, the inert ones named"
+else
+  echo "FAIL jar: the scan's lines"; grep -E 'secrets|FAIL' "$W/driver7.out"; failures=$((failures + 1)); fi
+check "jar: done not ok, with the three leaks" '.[0] | .ok == false and .leaks == 3' "$W/out7/done"
+checked=$((checked + 1))
+if jq -r '.seazn_session, .seazn_future' "$W/web7/cookies.json" | grep -qF -f - "$W/driver7.out" "$W/out7/secrets.json"; then
+  echo "FAIL jar: the report printed a cookie it found"; failures=$((failures + 1)); else
+  echo "PASS jar: the report (the log, secrets.json) never prints a cookie"; fi
+
 checked=$((checked + 1))
 if printf '%s\n' "$JOB_TOKEN" | grep -rqF -f - "$W/out" "$W/out2" "$W/out3" "$W/out4" "$W/out5" "$W/out6" "$W/driver.out" "$W/driver2.out" \
-  "$W/driver3.out" "$W/driver4.out" "$W/driver5.out" "$W/driver6.out" "$STATE/calls" "$W/state3/calls" "$W/state4/calls" \
-  "$W/state5/calls" "$W/state6/calls"; then
+  "$W/driver3.out" "$W/driver4.out" "$W/driver5.out" "$W/driver6.out" "$W/driver7.out" "$W/out7" "$STATE/calls" "$W/state3/calls" \
+  "$W/state4/calls" "$W/state5/calls" "$W/state6/calls" "$W/state7/calls"; then
   echo "FAIL the job token reached a file"
   failures=$((failures + 1))
 else

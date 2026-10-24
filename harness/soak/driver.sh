@@ -82,9 +82,11 @@ export HARNESS_SRT_PASSPHRASE
 
 # The secrets scan: no credential in any file this run wrote (the recordings are binary and hold
 # none: skipped). The values go to grep on a pipe, never in argv. On page=real, the page source's
-# too: its signing key, the page token in the signed URL, and the seed account's credential cookies
-# (soak.json's web_credential_cookies: the session; the jar's other cookies carry no authority, the
-# signed-in hint's value is "1", and are named as not scanned).
+# too: its signing key, the page token in the signed URL, and every cookie in the seed account's jar
+# but soak.json's web_cookies_inert (the org id and the signed-in hint, whose value is "1": no
+# authority), named as not scanned. So a credential cookie the web adds later is scanned, never
+# missed. A value under scan_min_chars (16) cannot be scanned without matching everything: it FAILS,
+# by name, and is never skipped.
 # `scan_secrets strict` (the success path, where every credential was made): an empty one counts as
 # a leak, since there is nothing to scan with. `scan_secrets made` (the error path, which may have
 # stopped before the page source made its credentials): an empty one is skipped, by name. A leak is
@@ -131,8 +133,9 @@ print("%s:%d \"%s\"" % (os.path.basename(path), want, text[max(at - 60, 0):at + 
   done < <(printf '%s\n' "${vals[$1]}" | grep -nF -f - "${files[@]}" 2>/dev/null | cut -d: -f1,2 | head -n 5)
 }
 scan_secrets() {
-  local mode="$1" name skipped=() leaked=() where k
+  local mode="$1" name skipped=() leaked=() inert=() where k min
   leaks=0
+  min="$(soak scan_min_chars)"
   mapfile -t files < <(find "$OUT" \( -path "$OUT/rec" -o -path "$OUT/camrec" \) -prune -o -type f -print)
   scanned="${#files[@]}"
   vals=([JOB_TOKEN]="$JOB_TOKEN" [HARNESS_SRT_PASSPHRASE]="${HARNESS_SRT_PASSPHRASE:-}")
@@ -141,15 +144,20 @@ scan_secrets() {
     vals[WEB_SIGNING_KEY]="$(cat "$WEB_STATE/auth-secret" 2>/dev/null || true)"
     vals[WEB_PAGE_TOKEN]="$(sed -nE 's/.*[?&]st=([^&]+).*/\1/p' "$WEB_STATE/overlay-url" 2>/dev/null || true)"
     scan_names+=(WEB_SIGNING_KEY WEB_PAGE_TOKEN)
-    for k in $(jq -r '.web_credential_cookies[]' "$SOAK/soak.json"); do
-      vals["WEB_COOKIE[$k]"]="$(jq -r --arg k "$k" '.[$k] // ""' "$WEB_STATE/cookies.json" 2>/dev/null || true)"
-      scan_names+=("WEB_COOKIE[$k]")
-    done
-    if [ -s "$WEB_STATE/cookies.json" ]; then
-      local others
-      others="$(jq -r --slurpfile s "$SOAK/soak.json" '[keys[] | select(. as $k | $s[0].web_credential_cookies | index($k) | not)] | join(", ")' "$WEB_STATE/cookies.json" 2>/dev/null || true)"
-      [ -z "$others" ] || log "secrets: cookies not scanned (no authority, not credentials): $others"
-    fi
+    while IFS= read -r k; do
+      [ -n "$k" ] || continue
+      if jq -e --arg k "$k" '.web_cookies_inert | index($k) != null' "$SOAK/soak.json" >/dev/null; then
+        inert+=("$k")
+      else
+        vals["WEB_COOKIE[$k]"]="$(jq -r --arg k "$k" '.[$k] | tostring' "$WEB_STATE/cookies.json")"
+        scan_names+=("WEB_COOKIE[$k]")
+      fi
+    done < <(jq -r 'keys[]' "$WEB_STATE/cookies.json" 2>/dev/null || true)
+    [ "${#inert[@]}" -eq 0 ] || log "secrets: inert cookies not scanned (soak.json web_cookies_inert): $(printf '%s\n' "${inert[@]}" | paste -sd ',' - | sed 's/,/, /g')"
+    # No cookie to scan: the jar was never made (the error path skips it) or holds no session.
+    k=0
+    for name in "${scan_names[@]}"; do [[ "$name" != WEB_COOKIE\[* ]] || k=1; done
+    [ "$k" = 1 ] || scan_names+=(WEB_COOKIES)
   fi
   if [ "$scanned" -eq 0 ]; then
     log "FAIL no file in /out to scan"
@@ -163,6 +171,10 @@ scan_secrets() {
       else
         skipped+=("$name")
       fi
+    elif [ "${#vals[$name]}" -lt "$min" ]; then
+      log "FAIL $name is too short to scan (${#vals[$name]} characters, at least $min): it would match anything"
+      leaks=$((leaks + 1))
+      leaked+=("$(jq -cn --arg n "$name" --arg w "${#vals[$name]} characters: too short to scan" '{kind: $n, where: [$w]}')")
     elif [ "$scanned" -gt 0 ] && printf '%s\n' "${vals[$name]}" | grep -qF -f - "${files[@]}"; then
       where="$(leak_where "$name")"
       log "FAIL $name appears in /out: $(paste -sd ';' - <<<"$where" | sed 's/;/; /g')"
@@ -171,8 +183,13 @@ scan_secrets() {
       leaked+=("$(jq -cn --arg n "$name" --arg w "$where" '{kind: $n, where: ($w | split("\n") | map(select(. != "")))}')")
     fi
   done
-  printf '%s\n' "${leaked[@]}" | jq -cs --argjson s "$scanned" --argjson l "$leaks" --arg skipped "${skipped[*]:-}" \
-    '{scanned: $s, leaks: $l, skipped: ($skipped | split(" ") | map(select(. != ""))), leaked: .}' >"$OUT/secrets.json"
+  # The compositor's log, by its bytes: the job uploads its own copy only when it is this one (the
+  # job's upload to here can fail, and then its copy was never scanned).
+  local logsum=""
+  [ ! -f "$OUT/compositor.log" ] || logsum="$(python3 -I -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$OUT/compositor.log")"
+  printf '%s\n' "${leaked[@]}" | jq -cs --argjson s "$scanned" --argjson l "$leaks" --arg skipped "${skipped[*]:-}" --arg logsum "$logsum" \
+    '{scanned: $s, leaks: $l, skipped: ($skipped | split(" ") | map(select(. != ""))), leaked: .,
+      compositor_log_sha256: (if $logsum == "" then null else $logsum end)}' >"$OUT/secrets.json"
   log "secrets checked: $scanned files, $leaks leaks${skipped[*]:+ (not made yet, skipped: ${skipped[*]})}"
 }
 

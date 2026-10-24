@@ -21,7 +21,8 @@
 #   (soak.json's harness_guest); the page source's outputs are fetched; no SOAK_OVERLAY_URL is left;
 # - the run list says PLUMBING ONLY on page=test (run-name, the step summary); the page source's
 #   artifact survives "Re-run failed jobs"; the compositor's deadline is anchored at its launch; the
-#   leak gate run for real four ways (page=real or test with no harness scan, a leak, clean); and
+#   leak gate run for real eight ways (page=real or test with no harness scan, a leak, clean, and the
+#   runner's compositor log kept only when the harness scanned its bytes); and
 #   soak.json's watch, hard stop, timeout and post-check reserve in order;
 # - flylog.py on a recorded-shape stream: pretty-printed entries, a replayed buffer, another
 #   Machine's entry, a cut-off tail, stamps with 9 and 3 fraction digits and an offset, a bare and a
@@ -222,11 +223,18 @@ else
   fail "the compositor's deadline anchor"
 fi
 gate="$(step soak "Leak gate")"
-leakgate() { # <page> <secrets.json content or ""> : runs the step on a fake /out; rc, then what is left
+leakgate() { # <page> <secrets.json content or ""> [compositor.log content]: runs the step on a fake
+  # /out; rc, then what is left. @LOGSUM@ in the secrets is the log's own sha256.
   rm -rf "$W/lg"; mkdir -p "$W/lg/out"
   printf 'tok_%s\n' "$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')" >"$W/lg/job-token"
   for f in status.json done driver.log web.log report.json; do echo '{}' >"$W/lg/out/$f"; done
-  [ -z "$2" ] || printf '%s\n' "$2" >"$W/lg/out/secrets.json"
+  local sec="$2" sum
+  if [ -n "${3:-}" ]; then
+    printf '%s\n' "$3" >"$W/lg/out/compositor.log"
+    sum="$(python3 -I -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$W/lg/out/compositor.log")"
+    sec="${sec//@LOGSUM@/$sum}"
+  fi
+  [ -z "$sec" ] || printf '%s\n' "$sec" >"$W/lg/out/secrets.json"
   : >"$W/lg/gh-out"
   local rc=0
   RUNNER_TEMP="$W/lg" PAGE="$1" GITHUB_OUTPUT="$W/lg/gh-out" bash -eo pipefail -c "$gate" >"$W/lg/log" 2>&1 || rc=$?
@@ -244,6 +252,20 @@ got="$(leakgate real '{"scanned":24,"leaks":1,"skipped":[],"leaked":[{"kind":"WE
   && pass "leak gate: a leak uploads nothing and prints the harness's redacted report" || fail "leak gate, a leak" "$got: $(head -c 400 "$W/lg/log")"
 got="$(leakgate real '{"scanned":24,"leaks":0,"skipped":[],"leaked":[]}')"
 [ "${got%% *}" = 0 ] && grep -qx 'ok=true' "$W/lg/gh-out" && pass "leak gate: a clean scan uploads" || fail "leak gate, clean" "$got"
+# The runner's own compositor log (page=real): up only when the harness scanned those bytes.
+clog='ts=2026-10-24T12:00:00.000Z level=info msg=cef alive gen=1'
+got="$(leakgate real '{"scanned":24,"leaks":0,"skipped":[],"leaked":[],"compositor_log_sha256":"@LOGSUM@"}' "$clog")"
+[ "$got" = "0 compositor.log done driver.log report.json secrets.json status.json web.log " ] \
+  && pass "leak gate: page=real uploads the compositor log the harness scanned (same sha256)" || fail "leak gate, scanned log" "$got"
+got="$(leakgate real '{"scanned":24,"leaks":0,"skipped":[],"leaked":[],"compositor_log_sha256":"0000"}' "$clog")"
+[ "$got" = "0 done driver.log report.json secrets.json status.json web.log " ] && grep -qF 'did not scan this compositor log' "$W/lg/log" \
+  && pass "leak gate: page=real drops a compositor log the harness never scanned (its upload failed)" || fail "leak gate, unscanned log" "$got"
+got="$(leakgate real '{"scanned":24,"leaks":0,"skipped":[],"leaked":[]}' "$clog")"
+[ "$got" = "0 done driver.log report.json secrets.json status.json web.log " ] \
+  && pass "leak gate: page=real drops the compositor log when the scan names none" || fail "leak gate, no log sum" "$got"
+got="$(leakgate test '{"scanned":24,"leaks":0,"skipped":[],"leaked":[]}' "$clog")"
+[ "$got" = "0 compositor.log done driver.log report.json secrets.json status.json web.log " ] \
+  && pass "leak gate: page=test keeps its compositor log (no page-source credential exists)" || fail "leak gate, test log" "$got"
 jq -e '.poll_after_min >= 20 and .poll_after_min < .hard_stop_after_min and .hard_stop_after_min < .timeout_after_min
        and .post_check_reserve_s > 60 and .post_check_reserve_s < (.hard_stop_after_min - .poll_after_min) * 60' "$HERE/soak.json" >/dev/null \
   && pass "soak.json: watch 20+ min past the run, then the hard stop, then the job's timeout; the post-check reserve fits" \
