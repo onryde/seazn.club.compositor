@@ -1,0 +1,11 @@
+{"kind":"start","at_ms":1792800000000,"drive_s":1800}
+{"kind":"dropout","slot":0,"planned_ms":1792800150000,"at_ms":1792800150003,"end_ms":1792800160005,"ok":true,"pause":200,"resume":200}
+{"kind":"disconnect","slot":0,"planned_ms":1792800300000,"at_ms":1792800300004,"end_ms":1792800330006,"ok":true,"dropped_packets":412,"families":["ipv4","ipv6"]}
+{"kind":"dropout","slot":1,"planned_ms":1792800450000,"at_ms":1792800450003,"end_ms":1792800460005,"ok":true,"pause":200,"resume":200}
+{"kind":"dropout","slot":2,"planned_ms":1792800750000,"at_ms":1792800750003,"end_ms":1792800760005,"ok":true,"pause":200,"resume":200}
+{"kind":"disconnect","slot":1,"planned_ms":1792800900000,"at_ms":1792800900004,"end_ms":1792800930006,"ok":true,"dropped_packets":412,"families":["ipv4","ipv6"]}
+{"kind":"dropout","slot":3,"planned_ms":1792801050000,"at_ms":1792801050003,"end_ms":1792801060005,"ok":true,"pause":200,"resume":200}
+{"kind":"dropout","slot":4,"planned_ms":1792801350000,"at_ms":1792801350003,"end_ms":1792801360005,"ok":true,"pause":200,"resume":200}
+{"kind":"disconnect","slot":2,"planned_ms":1792801500000,"at_ms":1792801500004,"end_ms":1792801530006,"ok":true,"dropped_packets":412,"families":["ipv4","ipv6"]}
+{"kind":"dropout","slot":5,"planned_ms":1792801650000,"at_ms":1792801650003,"end_ms":1792801660005,"ok":true,"pause":200,"resume":200}
+{"kind":"end","at_ms":1792801800000}

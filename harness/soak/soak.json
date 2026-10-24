@@ -1,0 +1,21 @@
+{
+  "source": "C15 (docs/tasks/C15-soak.md, spec 9.5): the soak's own schedule and pass criteria. The domain's numbers stay in harness/thresholds.json; verdict.jq and driver.sh read both, and type no number of their own.",
+  "deadline_margin_min": 5,
+  "min_drive_min": 20,
+  "parts": 3,
+  "dropout_every_s": 300,
+  "dropout_phase_s": 150,
+  "dropout_pause_s": 10,
+  "disconnect_hold_s": 30,
+  "memory_drift_max": 0.10,
+  "dropped_frames_max_ratio": 0.001,
+  "heartbeat_min_ratio": 0.95,
+  "cef_alive_min_ratio": 0.95,
+  "deliveries_per_min": 1,
+  "hidden_reasons": ["hang", "crash", "recycle"],
+  "rung_ok": "full",
+  "live_wait_s": 600,
+  "end_wait_s": 120,
+  "log_wait_s": 900,
+  "lost_beats_end_s": 90
+}
