@@ -1751,6 +1751,7 @@ mod tests {
     // the first outage's camera gap is not counted twice (round 3's case 4 read 29 800).
     #[test]
     fn an_outage_after_a_re_dated_burst_reads_its_own_boundary_not_the_outage_before_it() {
+        let (mut recordings, mut outages) = (0, 0);
         // A: 1..=30 from 0 (the cut at 1 000). B, the burst after the reconnect: 35 frames,
         // 240..=274, named at 10 000. C, after the recorder's reset, named at 10 300 with 320..: by
         // name and PTS B overlaps C by 866 ms, and 274 -> 320 is 1 500 ms of camera time C never
@@ -1769,6 +1770,8 @@ mod tests {
             })
             .collect();
         let r = analyze(&i, &settings());
+        recordings += 1;
+        outages += r.output_outages.len();
         let got: Vec<(i64, i64, Option<u32>, Option<u32>)> = r
             .output_outages
             .iter()
@@ -1809,6 +1812,8 @@ mod tests {
             })
             .collect();
         let r = analyze(&i, &settings());
+        recordings += 1;
+        outages += r.output_outages.len();
         let sides: Vec<_> = r
             .output_outages
             .iter()
@@ -1836,6 +1841,8 @@ mod tests {
             })
             .collect();
         let r = analyze(&i, &settings());
+        recordings += 1;
+        outages += r.output_outages.len();
         let mut sides: Vec<(i64, Option<u32>, Option<u32>)> = r
             .output_outages
             .iter()
@@ -1853,7 +1860,12 @@ mod tests {
             "{:?}",
             r.output_outages
         );
-        eprintln!("outages checked: 3 recordings, 6 outages");
+        eprintln!("outages checked: {recordings} recordings, {outages} outages");
+        assert_eq!(
+            (recordings, outages),
+            (3, 6),
+            "every recording read, two outages each"
+        );
     }
 
     #[test]

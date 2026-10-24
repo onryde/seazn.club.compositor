@@ -1319,9 +1319,18 @@ fn dest_trickle_swaps_under_a_trickle_and_reds_when_nothing_trickled() {
 }
 
 /// Case 17: [`dest_stall_in`]'s stall under a trickle, with the drive's send-buffer marks: the cap
-/// compose set (`wanted`), what the namespace read back (`read`), and each RTMP socket's buffer
-/// (`tb`) before the cut. CI's figures are owed by the case's first run; these are its design's.
-fn dest_stall_rule(stall_x: i64, err: Option<(u64, i64)>, read: Value, tb: Value, stats: Value) -> World {
+/// compose set (`wanted`), what the namespace read back (`read`), each RTMP socket's buffer (`tb`)
+/// before the cut, and each one's Send-Q 3 s into the fault (`queue`). With the queue under the
+/// cap this is the world the case demands, never seen on CI; CI's world (3 of 3 runs, PR #65) is
+/// `rule-ci`: the queue at twice the cap and the sink's own error first.
+fn dest_stall_rule(
+    stall_x: i64,
+    err: Option<(u64, i64)>,
+    read: Value,
+    tb: Value,
+    queue: Value,
+    stats: Value,
+) -> World {
     // The total stays flat between beats: a message that cannot leave counts nothing.
     let mut w = dest_stall_in(0, stall_x, stats, err, "pending");
     let session: Value = serde_json::from_str(
@@ -1345,10 +1354,11 @@ fn dest_stall_rule(stall_x: i64, err: Option<(u64, i64)>, read: Value, tb: Value
         json!({"frame_bits": frame_bits, "bit_per_s": rate, "drain_x": 2}),
     );
     let at = w.at(23.0);
+    let sockets = queue.as_array().map_or(0, Vec::len);
     w.mark(
         "sockets_in_fault",
         at,
-        json!({"sockets": 1, "tb": [8192], "send_q": [6_400]}),
+        json!({"sockets": sockets, "tb": vec![8192; sockets], "send_q": queue}),
     );
     w
 }
@@ -1357,7 +1367,8 @@ fn dest_stall_rule(stall_x: i64, err: Option<(u64, i64)>, read: Value, tb: Value
 fn dest_stall_rule_swaps_by_the_rule_and_reds_on_the_sockets_error_a_slow_rule_or_no_cap() {
     let capped = || json!([4096, 8192, 8192]);
     let trickling = || netem_queued(true, 4_344, 6, 0, 8_688, 6);
-    let w = dest_stall_rule(1, None, capped(), json!([8192]), trickling());
+    let held = || json!([6_400]);
+    let w = dest_stall_rule(1, None, capped(), json!([8192]), held(), trickling());
     let v = judge(&w, "dest-stall-rule", "", "rule-good");
     assert_pass(&v, "rule-good");
     let m = &v.json["measures"]["stall_swap"];
@@ -1366,55 +1377,140 @@ fn dest_stall_rule_swaps_by_the_rule_and_reds_on_the_sockets_error_a_slow_rule_o
         (Some("stall"), Some("stall")),
         "rule-good: {m}"
     );
+    assert_eq!(
+        (m["stall_path_passes"].as_bool(), m["error_path_passes"].as_bool()),
+        (Some(true), Some(false)),
+        "rule-good: {m}"
+    );
+    assert_eq!(m["queue_past_cap"], false, "rule-good: the queue held: {m}");
     let base = w.ms("output_backoff_base_ms");
-    let mut checked = 0;
-    // The socket timed out first after all (the cases 5 and 12 path): a pass there, a red here.
-    // Mutant 9 (output_stall_after_ms at 20 s, four thresholds): the swap far past the budget. And
-    // no swap at all in the fault.
+    let mut checked = 1;
+    // CI's world (runs 40121216406, 40121220366 and m9's baseline): the cap set as asked, the queue
+    // at 16 810 B past it, and the sink's own socket timeout 515 ms before the swap. Both the queue
+    // and the swap red, and the error path held in full (Owed 87's evidence).
+    let w = dest_stall_rule(
+        1,
+        Some((1, base + 15)),
+        capped(),
+        json!([8192]),
+        json!([16_810]),
+        trickling(),
+    );
+    let v = judge(&w, "dest-stall-rule", "", "rule-ci");
+    assert_fails(&v, "stall_swap", "rule-ci");
+    assert_fails(&v, "buffer_capped", "rule-ci");
+    let m = &v.json["measures"]["stall_swap"];
+    assert_eq!(
+        (
+            m["reason"].as_str(),
+            m["error_path_passes"].as_bool(),
+            m["stall_path_passes"].as_bool(),
+            m["queue_past_cap"].as_bool()
+        ),
+        (Some("error"), Some(true), Some(false), Some(true)),
+        "rule-ci: {m}"
+    );
+    checked += 1;
+    // The socket timed out first with the queue held (the cases 5 and 12 path): a pass there, a red
+    // here. Mutant 9 (output_stall_after_ms at 20 s, four thresholds): the swap far past the
+    // budget. And no swap at all in the fault.
     for (tag, stall_x, err) in [
         ("rule-socket", 1, Some((1, base + 20))),
         ("rule-slow", 4, None),
         ("rule-noswap", 0, None),
     ] {
-        let w = dest_stall_rule(stall_x, err, capped(), json!([8192]), trickling());
+        let w = dest_stall_rule(stall_x, err, capped(), json!([8192]), held(), trickling());
         assert_fails(&judge(&w, "dest-stall-rule", "", tag), "stall_swap", tag);
         checked += 1;
     }
+    // A rule that fires early (a logic bug, not a value: 2 s after the last growth, within the
+    // bound of it), 3 s after the cut: the bytes flowed at full rate up to the cut, so the rule
+    // cannot have seen 5 s of stall (the PR #65 review's m-3).
+    let mut w = dest_stall_rule(0, None, capped(), json!([8192]), held(), trickling());
+    let cut = w.at(20.0);
+    w.swap(cut + 3_000, 2, "stall");
+    w.beats_in(cut + 3_000, cut + 60_000, |b| b["sinkSwaps"] = json!(1));
+    let v = judge(&w, "dest-stall-rule", "", "rule-early");
+    assert_fails(&v, "stall_swap", "rule-early");
+    let m = &v.json["measures"]["stall_swap"];
+    assert!(
+        m["detect_ms"]
+            .as_i64()
+            .is_some_and(|d| d <= m["bound_ms"].as_i64().unwrap())
+            && m["reasons_paired"] == true
+            && m["swap_beat_ms"].is_i64(),
+        "rule-early must red on the floor alone: {m}"
+    );
+    checked += 1;
     // The cap never applied: the namespace reads the kernel's default, a socket's buffer is past
-    // the cap, or no RTMP socket was seen at all.
+    // the cap, no RTMP socket was seen at all, or ss could not read a buffer.
+    // Each with the queue past the cap, which is not Owed 87's evidence when the cap was not set
+    // as asked.
     for (tag, read, tb) in [
         ("rule-default", json!([4096, 16384, 4194304]), json!([8192])),
         ("rule-big-socket", capped(), json!([87_040])),
         ("rule-no-socket", capped(), json!([])),
+        ("rule-unread-socket", capped(), json!([null])),
     ] {
-        let w = dest_stall_rule(1, None, read, tb, trickling());
-        assert_fails(&judge(&w, "dest-stall-rule", "", tag), "buffer_capped", tag);
+        let w = dest_stall_rule(1, None, read, tb, json!([16_810]), trickling());
+        let v = judge(&w, "dest-stall-rule", "", tag);
+        assert_fails(&v, "buffer_capped", tag);
+        assert_eq!(
+            v.json["measures"]["stall_swap"]["queue_past_cap"], false,
+            "{tag}: the cap not set as asked"
+        );
         checked += 1;
     }
-    // A socket whose buffer ss could not read.
-    let w = dest_stall_rule(1, None, capped(), json!([null]), trickling());
-    assert_fails(
-        &judge(&w, "dest-stall-rule", "", "rule-unread-socket"),
-        "buffer_capped",
-        "rule-unread-socket",
-    );
-    checked += 1;
-    // A rate netem reads as no limit (0), and one that lets a frame out inside half a stall
-    // threshold: neither is the trickle the rule needs, whatever netem sent.
-    for (tag, rate) in [("rule-zero-rate", Some(0)), ("rule-fast-rate", None)] {
-        let mut w = dest_stall_rule(1, None, capped(), json!([8192]), trickling());
-        let half = w.ms("output_stall_after_ms") / 2;
-        for m in &mut w.marks {
-            if m.0 == "rate" {
-                let frame_bits = m.2["frame_bits"].as_i64().unwrap();
-                m.2["bit_per_s"] = json!(rate.unwrap_or(frame_bits * 1000 / half));
-            }
+    // The cap set as asked, and the queue not held by it (the PR #65 review's I-1): past it, not
+    // read, or no socket seen in the fault.
+    // Only a queue read past the cap is Owed 87's evidence.
+    for (tag, queue, past) in [
+        ("rule-queue-over", json!([8_193]), true),
+        ("rule-queue-unread", json!([null]), false),
+        ("rule-queue-none", json!([]), false),
+    ] {
+        let w = dest_stall_rule(1, None, capped(), json!([8192]), queue, trickling());
+        let v = judge(&w, "dest-stall-rule", "", tag);
+        assert_fails(&v, "buffer_capped", tag);
+        assert_eq!(
+            v.json["measures"]["stall_swap"]["queue_past_cap"],
+            json!(past),
+            "{tag}"
+        );
+        checked += 1;
+    }
+    // The trickle's measured rate, netem's bytes over the 30 s fault: one frame per stall threshold
+    // is 6 frames' bytes here. Unlimited (netem's rate 0 sends everything) and 5 % over red; 5 %
+    // under passes.
+    let frame_bytes = w.marks.iter().find(|m| m.0 == "rate").unwrap().2["frame_bits"]
+        .as_i64()
+        .unwrap()
+        / 8;
+    let frames = (w.at(50.0) - w.at(20.0)) / w.ms("output_stall_after_ms");
+    let per_threshold = |x: f64| ((frame_bytes * frames) as f64 * x) as u64;
+    for (tag, sent, red) in [
+        ("rule-unlimited", 15_000_000, true),
+        ("rule-fast", per_threshold(1.05), true),
+        ("rule-edge", per_threshold(0.95), false),
+    ] {
+        let w = dest_stall_rule(
+            1,
+            None,
+            capped(),
+            json!([8192]),
+            held(),
+            netem_queued(true, sent, 900, 0, 8_688, 6),
+        );
+        let v = judge(&w, "dest-stall-rule", "", tag);
+        if red {
+            assert_fails(&v, "trickled", tag);
+        } else {
+            assert_pass(&v, tag);
         }
-        assert_fails(&judge(&w, "dest-stall-rule", "", tag), "trickled", tag);
         checked += 1;
     }
     // Nothing trickled: a plain stall (case 5's), not this case.
-    let w = dest_stall_rule(1, None, capped(), json!([8192]), stalled());
+    let w = dest_stall_rule(1, None, capped(), json!([8192]), held(), stalled());
     assert_fails(
         &judge(&w, "dest-stall-rule", "", "rule-stalled"),
         "trickled",
@@ -1422,7 +1518,7 @@ fn dest_stall_rule_swaps_by_the_rule_and_reds_on_the_sockets_error_a_slow_rule_o
     );
     checked += 1;
     eprintln!("dest-stall-rule sims checked: {checked}");
-    assert_eq!(checked, 10);
+    assert_eq!(checked, 17);
 }
 
 /// What the starvation did to the compositor (case 6).
@@ -2504,16 +2600,24 @@ fn every_case_file_is_judged_here() {
 /// re-indent is no difference and a changed command is.
 #[test]
 fn every_not_chaos_control_drives_what_smoke_drives() {
+    // The drive, and every stack knob a case file may set beside it (run-case.sh's header: the
+    // compose overlay, the teardown hook, the compose profiles, the camera's knobs, the checker's
+    // recordings, the deadline) and every camera variable it exports, so a control cannot inject a
+    // fault through an overlay or a knob with smoke's exact drive (the PR #65 review's m-1).
     let drive = |case: &str| {
         let file = repo().join(format!("harness/cases/{case}.sh"));
         let out = Command::new(bash())
             .args([
                 "-c",
-                r#"set -eu; source "$1"; declare -f case_drive; echo "CASE_LIVE_S=$CASE_LIVE_S""#,
+                r#"set -eu; CASE_COMPOSE=""; CASE_TEARDOWN=""; source "$1"; declare -f case_drive
+                for k in CASE_LIVE_S CASE_COMPOSE CASE_TEARDOWN COMPOSE_PROFILES CASE_DEADLINE_S \
+                  CAMERA_SIZE CAMERA_PATTERN CHECKER_RECORDINGS; do echo "$k=${!k-<unset>}"; done
+                env | grep -E '^CAMERA_' | sort | sed 's/^/env /' || true"#,
                 "drive",
             ])
             .arg(&file)
-            .env_remove("CASE_LIVE_S")
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
             .output()
             .expect("bash runs");
         assert!(
@@ -2525,14 +2629,86 @@ fn every_not_chaos_control_drives_what_smoke_drives() {
     };
     let smoke = drive("smoke");
     assert!(
-        smoke.contains("case_drive ()") && smoke.contains("netem.sh") && smoke.contains("CASE_LIVE_S=60"),
+        smoke.contains("case_drive ()")
+            && smoke.contains("netem.sh")
+            && smoke.contains("CASE_LIVE_S=60\n")
+            && smoke.contains("CASE_COMPOSE=\n")
+            && smoke.contains("COMPOSE_PROFILES=probe\n")
+            && !smoke.contains("\nenv "),
         "smoke's drive did not print: {smoke}"
     );
+    // Each control's documented difference from smoke, and nothing else: its one camera variable
+    // (the case file's header). Smoke already runs compose's `probe` profile (the input tap, Owed
+    // 81), so the profile is no difference.
+    let allowed = |case: &str| -> &str {
+        match case {
+            "owed81-noaudio" => "env CAMERA_AUDIO=off",
+            "owed81-align1" => "env CAMERA_TS_ALIGNMENT=1",
+            other => panic!("{other}: a NOT_CHAOS control with no documented difference from smoke"),
+        }
+    };
     let mut checked = 0;
     for case in NOT_CHAOS.iter().filter(|c| **c != "smoke") {
-        assert_eq!(drive(case), smoke, "{case}'s drive is not smoke's");
+        let mut want: Vec<String> = smoke.lines().map(str::to_owned).collect();
+        want.push(allowed(case).to_owned());
+        let got: Vec<String> = drive(case).lines().map(str::to_owned).collect();
+        assert_eq!(got, want, "{case}'s drive or stack is not smoke's");
         checked += 1;
     }
-    eprintln!("not-chaos controls checked against smoke's drive: {checked}");
+    eprintln!("not-chaos controls checked against smoke's drive and stack: {checked}");
     assert_eq!(checked, NOT_CHAOS.len() - 1);
+}
+
+/// Each `$t.<key>` a verdict filter reads (lib.jq, every case file, run-case.sh) and each
+/// `$(threshold <key>)` a drive reads names a key of harness/thresholds.json. A renamed key would
+/// read null, and jq orders null below every number, so a bound like `x >= $t.k` would pass on null
+/// (the PR #65 review's m-2).
+#[test]
+fn every_threshold_a_verdict_or_a_drive_reads_exists() {
+    let thresholds: Value =
+        serde_json::from_str(&std::fs::read_to_string(repo().join("harness/thresholds.json")).unwrap())
+            .unwrap();
+    let keys = thresholds.as_object().expect("thresholds.json is an object");
+    let mut files = vec![
+        repo().join("harness/cases/lib.jq"),
+        repo().join("harness/run-case.sh"),
+    ];
+    for e in std::fs::read_dir(repo().join("harness/cases")).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_some_and(|x| x == "sh") {
+            files.push(p);
+        }
+    }
+    let key_after = |text: &str, prefix: &str| -> Vec<String> {
+        text.match_indices(prefix)
+            .map(|(i, _)| {
+                text[i + prefix.len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+                    .collect()
+            })
+            .collect()
+    };
+    let (mut reads, mut unknown) = (0, vec![]);
+    for f in &files {
+        let text = std::fs::read_to_string(f).unwrap();
+        for prefix in ["$t.", "$(threshold "] {
+            for k in key_after(&text, prefix) {
+                reads += 1;
+                if k.is_empty() || !keys.contains_key(&k) {
+                    unknown.push(format!("{}: {prefix}{k}", f.display()));
+                }
+            }
+        }
+    }
+    eprintln!(
+        "threshold reads checked: {reads}, in {} files, against {} keys",
+        files.len(),
+        keys.len()
+    );
+    assert!(reads >= 100, "the sweep read too few threshold reads ({reads})");
+    assert!(
+        unknown.is_empty(),
+        "threshold keys thresholds.json does not carry: {unknown:?}"
+    );
 }

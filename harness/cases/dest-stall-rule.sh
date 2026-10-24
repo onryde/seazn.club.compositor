@@ -1,25 +1,31 @@
 # shellcheck shell=bash disable=SC2034,SC2016 # sourced by run-case.sh; jq filters keep their $ (SC2016)
-# Case 17, dest-stall-rule (C14 wave-gate-3 follow-ups; the coordinator's decision on Owed 87,
-# 2026-10-24): a destination that keeps the socket open and takes bytes, too slowly for one video
-# frame to leave within output_stall_after_ms, and never errors. Only the stall rule can swap the
-# sink here, and it must, within its budget: the swap's reason line reads `stall`, the outgoing sink
-# logged no error, and the swap came within output_stall_after_ms + output_progress_poll_ms of the
-# last growth (`stall_swap_judged(...; ["stall"])`, lib.jq). Cases 5 and 12 cannot show this: there
-# rtmp2sink's own 5 s socket timeout fires first (Owed 87).
+# Case 17, dest-stall-rule (C14 wave-gate-3 follow-ups, 2026-10-24): a destination that keeps the
+# socket open and takes bytes, too slowly for one video frame to leave within
+# output_stall_after_ms, and never errors. Only the stall rule could swap the sink there, and the
+# case demands that it does, within its budget: the swap's reason line reads `stall`, the outgoing
+# sink logged no error, and the swap came within output_stall_after_ms + output_progress_poll_ms of
+# the last growth and no sooner than the rule allows after the cut (`stall_swap_judged(...;
+# ["stall"])`, lib.jq).
 #
-# How (harness/compose.stall-rule.yml says why): the compositor's TCP send buffer is capped at 8 KiB
-# in its network namespace, and `netem out rate` from 20 s lets one video frame (the fixture's
-# videoKbps / fps) leave in STALL_DRAIN_X stall thresholds. rtmp2sink counts a message's bytes only
-# once it is all written, so the total stops growing, while the kernel frees room every second or
-# two and the socket's 5 s wait never runs out. Cleared at 50 s; 80 s live; the output then
-# recovers as in case 4.
+# RED ON CI, OWED 87 (3 of 3 runs, PR #65; the PR #65 review's C-1): the design's premise is false.
+# The design capped the compositor's TCP send buffer at 8 KiB in its network namespace
+# (harness/compose.stall-rule.yml) and from 20 s set `netem out rate` so one video frame (the
+# fixture's videoKbps / fps) leaves in STALL_DRAIN_X stall thresholds, expecting the kernel to wake
+# the writer every second or two inside one message while rtmp2's total (counted per whole message)
+# stood still. On CI the socket queued a whole frame past the cap (Send-Q 16 806-16 810 B against
+# 8 192, 3 s into the fault), so each wake completes a message: "no growth for 5 s" and "one socket
+# wait of 5 s" are the same gap, timed from the same write, and rtmp2sink's own 5 s timeout swaps
+# the sink (`reason=error`) as the rule's would. The case stays as the witness the owner's ruling on
+# the rule needs (docs/_INDEX.md Owed 87), and its red reads OWED 87 while that row's signature
+# holds (harness/chaos.json).
 #
-# Anti-vacuity: the cap applied (the namespace's tcp_wmem reads what compose set, and every RTMP
-# socket's send buffer was read and is at most its max: a buffer that compose never set reads null
-# on both sides and fails there), and bytes really trickled (netem sent at least 2 packets, so this
-# is no plain stall), at a rate (netem's 0 is no limit at all) under one frame per stall threshold. A red with reason `error` is the socket timing out after all:
-# the cap or the rate did not hold the path the case needs, and the measures say which.
-# Mutant 9 (output_stall_after_ms at 20 s) must red `stall_swap` here.
+# Anti-vacuity, judged on the effect, not the setting (the PR #65 review's I-1): `buffer_capped`
+# needs the cap set as asked (the namespace's tcp_wmem reads what compose set, every RTMP socket's
+# buffer read and at most the cap) AND at least one RTMP socket in the fault, each one's Send-Q read
+# and at most the cap;
+# `trickled` needs netem to have sent at least 2 packets, at a measured rate (its bytes over the
+# fault window) under one frame per stall threshold. Mutant 9 (output_stall_after_ms at 20 s) is
+# unkillable here while the case reds unmutated (Owed 87).
 
 CASE_LIVE_S=80
 CASE_KEY=stall_swap
@@ -65,19 +71,38 @@ case_drive() {
   at_s "$CASE_LIVE_S"
 }
 
-CASE_CHECKS=14
+CASE_CHECKS=16
 case_verdict() {
-  require buffer_capped 'mark_value("send_buffer") as $b | $b.read == $b.wanted
-    and $b.before_cut.sockets >= 1 and ($b.before_cut.tb | all(. != null and . <= $b.wanted[2]))' \
+  require buffer_capped 'mark_value("send_buffer") as $b | (mark_value("sockets_in_fault").send_q // []) as $q
+    | $b.read == $b.wanted and $b.before_cut.sockets >= 1
+    and ($b.before_cut.tb | all(. != null and . <= $b.wanted[2]))
+    and ($q | length) >= 1 and ($q | all(. != null and . <= $b.wanted[2]))' \
     '{send_buffer: mark_value("send_buffer"), in_fault: mark_value("sockets_in_fault")}'
-  require trickled 'mark_value("rate") as $r | mark_value("netem_out").sent_pkts >= 2 and $r.bit_per_s > 0
-    and $r.bit_per_s * $t.output_stall_after_ms < $r.frame_bits * 1000' \
-    '{netem: mark_value("netem_out"), rate: mark_value("rate")}'
-  require stall_swap 'stall_swap_judged(mark_at("cut"); ["stall"])' 'stall_swap(mark_at("cut"))'
+  # The trickle's measured rate: netem's bytes over the fault (the cut to its stats, read just before
+  # the clear), as bits per stall threshold against one frame's bits. A window of 0 or less reds there
+  # (the bytes are never below 0), and shows no rate.
+  require trickled 'mark_value("netem_out") as $n | (mark_at("netem_out") - mark_at("cut")) as $w
+    | $n.sent_pkts >= 2
+    and $n.sent_bytes * 8 * $t.output_stall_after_ms < mark_value("rate").frame_bits * $w' \
+    '(mark_at("netem_out") - mark_at("cut")) as $w | {netem: mark_value("netem_out"), rate: mark_value("rate"),
+      window_ms: $w, measured_bit_per_s: (if $w > 0 then mark_value("netem_out").sent_bytes * 8000 / $w | floor else null end)}'
+  # Shown with `queue_past_cap`, Owed 87's evidence here (harness/chaos.json): the cap set as asked,
+  # and an in-fault queue still past it (the whole-frame write, the PR #65 review's C-1). An unread
+  # queue is null, and null is never past a number.
+  require stall_swap 'stall_swap_judged(mark_at("cut"); ["stall"])' \
+    'stall_swap_shown(mark_at("cut")) + {queue_past_cap: (mark_value("send_buffer") as $b
+      | $b.read == $b.wanted and ($b.before_cut.tb | length) >= 1
+      and ($b.before_cut.tb | all(. != null and . <= $b.wanted[2]))
+      and (mark_value("sockets_in_fault").send_q // [] | any(. > $b.wanted[2])))}'
   measure swap_log_from_cut_ms '[.log.sink_swaps[] | select(.at_ms > mark_at("cut"))] | first | .at_ms - mark_at("cut")'
   measure sink_errors_in_fault '[.log.output_errors[] | select(.at_ms > mark_at("cut") and .at_ms <= mark_at("clear"))]
     | map({gen, after_cut_ms: (.at_ms - mark_at("cut"))})'
   measure sockets_in_fault 'mark_value("sockets_in_fault")'
+  # A sink that publishes under the trickle (the PR #65 review's m-4) is Owed 88's write-stall path:
+  # the clear's phase, and each publish from the cut, against the clear.
+  measure clear_phase 'clear_phase'
+  measure publishes_from_clear_ms 'if .log.sink_publishes == null then null
+    else [.log.sink_publishes[] | select(.at_ms > mark_at("cut"))] | map({gen, from_clear_ms: (.at_ms - mark_at("clear"))}) end'
   require_output_recovers
   require_no_false_restart
 }

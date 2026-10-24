@@ -15,8 +15,8 @@
 # replacement after the back-off, inside the spec's output budget. Here the socket errors first: in
 # CI (runs 40056474269, 40106770881) rtmp2sink's socket timeout (its `timeout` property, 5 s, never
 # set by the product) logged `output gen=1 error: … Socket I/O timed out` 5.75 s after the cut, the
-# reason line read `error`, and the swap followed 517-520 ms later (the back-off). The stall rule
-# itself is witnessed by case 17 (dest-stall-rule), where the socket never errors.
+# reason line read `error`, and the swap followed 517-520 ms later (the back-off). No case witnesses
+# the stall rule itself: case 17 (dest-stall-rule) was meant to and cannot, as built (Owed 87).
 #
 # Anti-vacuity (the review's I1): the netem qdisc holds a backlog at the clear, so the rate limit
 # held the leg's packets. Its Sent count is no witness: CI read 0 sent and 0 dropped in 30 s at
@@ -41,7 +41,7 @@ case_drive() {
 CASE_CHECKS=12
 case_verdict() {
   require fault_applied 'mark_value("netem_out") | .backlog_bytes > 0' 'mark_value("netem_out")'
-  require stall_swap 'stall_swap_judged(mark_at("cut"); ["stall", "error"])' 'stall_swap(mark_at("cut"))'
+  require stall_swap 'stall_swap_judged(mark_at("cut"); ["stall", "error"])' 'stall_swap_shown(mark_at("cut"))'
   measure swap_log_from_cut_ms '[.log.sink_swaps[] | select(.at_ms > mark_at("cut"))] | first | .at_ms - mark_at("cut")'
   require_output_recovers
   require_clear_phase

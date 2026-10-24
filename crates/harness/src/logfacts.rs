@@ -161,6 +161,10 @@ pub struct LogFacts {
     /// the sink is retired (gst_output.rs's `Watch`), so a swap whose outgoing sink logged none was
     /// not the error path's (C14 fix round 3).
     pub output_errors: Vec<GenAt>,
+    /// `output gen=<g>: the sink can send after <n> ms; …` (gst_output.rs's publish gate, Owed 84):
+    /// the sink's publish was accepted, so it sends from here (case 17's measure, the PR #65
+    /// review's m-4: a publish under a trickle is Owed 88's write-stall path).
+    pub sink_publishes: Vec<GenAt>,
     pub page_hangs: Vec<GenAt>,
     pub score_stale: Vec<Stale>,
     /// Chromium's abort line (`GPU process isn't usable`).
@@ -217,6 +221,16 @@ fn swap_reason(msg: &str, at_ms: i64) -> Option<SwapReasonLine> {
         gen: g.parse().ok()?,
         reason: reason.to_owned(),
     })
+}
+
+/// `output gen=<g>: the sink can send after <n> ms; …`: the generation, with the wait a number.
+fn sink_publish(msg: &str) -> Option<u64> {
+    let (g, rest) = msg
+        .strip_prefix("output gen=")?
+        .split_once(": the sink can send after ")?;
+    let (ms, _) = rest.split_once(" ms; ")?;
+    ms.parse::<u64>().ok()?;
+    g.parse().ok()
 }
 
 /// `output gen=<g> error: <text>` (gst_output.rs's bus error): the generation.
@@ -294,6 +308,8 @@ pub fn log_facts(text: &str) -> LogFacts {
             f.sink_swap_reasons.push(r);
         } else if let Some(g) = output_error(m) {
             f.output_errors.push(ga(g));
+        } else if let Some(g) = sink_publish(m) {
+            f.sink_publishes.push(ga(g));
         } else if let Some(code) = gen_after(m, "exit code=") {
             f.exits.push(Exit {
                 at_ms,
@@ -598,6 +614,54 @@ mod tests {
             );
         }
         eprintln!("log lines checked: {}, reasons read: {}", f.lines, read.len());
+    }
+
+    /// The publish gate's line (gst_output.rs, Owed 84), as case 17's measure reads it: CI's lines
+    /// (PR #65, dest-stall-rule), with near misses.
+    #[test]
+    fn a_publish_is_read_with_its_generation() {
+        let mut log = String::new();
+        let lines = [
+            (0, "output gen=1: the sink can send after 11 ms; the 0 video frames queued before it are dropped, and it starts at the next keyframe"),
+            (40_135, "output gen=3: the sink can send after 2649 ms; the 61 video frames queued before it are dropped, and it starts at the next keyframe"),
+            // Near misses: none is a publish line.
+            (41_000, "output gen=x: the sink can send after 5 ms; the 0 video frames queued"),
+            (41_100, "output gen=4: the sink can send after soon ms; the 0 video frames queued"),
+            (41_200, "output gen=5: the sink can send after 7 ms"),
+            (41_300, "output gen=6 error: the sink can send after 7 ms; no"),
+            (41_400, "output gen=7 the sink can send after 5 ms; the 0 video frames queued"),
+        ];
+        for (at, m) in lines {
+            log.push_str(&line(at, m));
+        }
+        let f = log_facts(&log);
+        let read: Vec<(i64, u64)> = f
+            .sink_publishes
+            .iter()
+            .map(|p| (p.at_ms - NOON_MS, p.gen))
+            .collect();
+        assert_eq!(read, vec![(0, 1), (40_135, 3)]);
+        assert!(
+            f.output_errors.iter().any(|e| e.gen == 6),
+            "an error line stays an error"
+        );
+        // And is no publish on its own (the parse loop reads errors first, which would hide it).
+        assert_eq!(
+            sink_publish("output gen=6 error: the sink can send after 7 ms; no"),
+            None
+        );
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../adapters/src/gst_output.rs"
+        ))
+        .expect("gst_output.rs");
+        assert_eq!(
+            src.matches("\"output gen={}: the sink can send after {} ms; the {held} video frames queued \\")
+                .count(),
+            1,
+            "gst_output.rs's publish line changed: update `sink_publishes`"
+        );
+        eprintln!("log lines checked: {}, publishes read: {}", f.lines, read.len());
     }
 
     #[test]

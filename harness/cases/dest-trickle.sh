@@ -6,7 +6,7 @@
 # A trickle is a stall, not progress: a swap within case 5's bound, by either path case 5 accepts
 # (`stall_swap_judged`: the stall rule, or the sink's own socket timeout first and the back-off's
 # swap; the coordinator's decision on Owed 87, 2026-10-24). In CI the socket errors first. The rule
-# is witnessed by case 17, and mutant 9 (the threshold at 20 s) is judged there. Then the output
+# is witnessed nowhere yet: case 17 was meant to and cannot, as built (Owed 87). Then the output
 # recovers as in case 4. Anti-vacuity: the netem qdisc sent at least 2 packets through the open
 # link, so the bytes really trickled and this is not case 5 again (case 5's qdisc sends none), and
 # the swap came. The trickle is witnessed where it is injected, as case 10's loss is. The brief's
@@ -38,7 +38,7 @@ case_verdict() {
   require trickled 'mark_value("netem_out") as $n | $n.sent_pkts >= 2
     and stall_swap(mark_at("cut")).swap_ms != null' \
     '{netem: mark_value("netem_out"), swap_ms: stall_swap(mark_at("cut")).swap_ms}'
-  require stall_swap 'stall_swap_judged(mark_at("cut"); ["stall", "error"])' 'stall_swap(mark_at("cut"))'
+  require stall_swap 'stall_swap_judged(mark_at("cut"); ["stall", "error"])' 'stall_swap_shown(mark_at("cut"))'
   measure swap_log_from_cut_ms '[.log.sink_swaps[] | select(.at_ms > mark_at("cut"))] | first | .at_ms - mark_at("cut")'
   measure netem_out 'mark_value("netem_out")'
   require_output_recovers

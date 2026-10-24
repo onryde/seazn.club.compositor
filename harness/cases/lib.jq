@@ -97,8 +97,11 @@ def stall_swap($cut):
 # A stall's swap after the cut at $cut, judged by the paths a case accepts ($paths, a list of
 # reasons):
 # - "stall", the stall rule: the reason line reads stall, the outgoing sink logged no error before
-#   it, and the swap came within the rule's budget of the last growth (`bound_ms`:
-#   output_stall_after_ms + output_progress_poll_ms);
+#   it, the swap came within the rule's budget of the last growth (`bound_ms`:
+#   output_stall_after_ms + output_progress_poll_ms), and no sooner than the rule allows after the
+#   cut (the PR #65 review's m-3: the bytes flow at full rate until the cut, so the last growth is
+#   no earlier than one frame before it, and the rule's swap no earlier than output_stall_after_ms
+#   after that);
 # - "error", the sink's own error first (the coordinator's decision on Owed 87, 2026-10-24: in cases
 #   5 and 12 rtmp2sink's 5 s socket timeout fires before the rule can): the reason line reads error,
 #   the outgoing sink's error line came first (`error_to_swap_ms` is set only then: cause
@@ -113,8 +116,15 @@ def stall_swap_judged($cut; $paths):
     and any($paths[]; . == $s.reason)
     and $s.detect_ms != null and $s.detect_ms <= $s.bound_ms
     and (if $s.reason == "stall" then $s.cause == "stall"
+           and $s.from_cut_ms >= $t.output_stall_after_ms - $t.frame_period_ms
          else $s.error_to_swap_ms >= $t.output_backoff_base_ms
            and $s.error_to_swap_ms <= $t.budget_output_reconnect_ms end);
+
+# `stall_swap`'s measure as cases 5, 12 and 17 print it, with each path's verdict beside it, so Owed
+# 87's signature (harness/chaos.json) can read whether the sink's own error path held in full.
+def stall_swap_shown($cut):
+  stall_swap($cut) + {error_path_passes: stall_swap_judged($cut; ["error"]),
+    stall_path_passes: stall_swap_judged($cut; ["stall"])};
 
 # The clear's phase in the output's reconnect cycle (cases 4, 5 and 12; the re-review's I-5, Owed
 # 84). Under the fault a sink is built every 6-7 s (a connect that times out, then the back-off), and
