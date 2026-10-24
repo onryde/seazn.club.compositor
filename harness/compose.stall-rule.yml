@@ -1,0 +1,16 @@
+# Case 17 (harness/cases/dest-stall-rule.sh) only, added to compose.yml by run-case.sh
+# (CASE_COMPOSE). The compositor's TCP send buffer is capped at 8 KiB, in its own network namespace
+# (net.ipv4.tcp_wmem is per namespace; the shipped image is unchanged).
+#
+# Why (Owed 87, the coordinator's decision 2026-10-24): rtmp2sink counts its bytes sent only when a
+# whole RTMP message is written, and its socket times out only when one wait for room lasts 5 s.
+# The kernel wakes a blocked writer once a third of the buffer is free. With the default buffer
+# (hundreds of KiB, autotuned) one wait outlasts the socket's 5 s before a message completes, so
+# the socket errors first (cases 5 and 12). With 8 KiB, a slow destination frees room every second
+# or two, so the socket never times out, while one video frame (about 16.7 KB at 4 Mbit/s and 30
+# fps) still takes longer than output_stall_after_ms to leave: no growth, no error, and only the
+# stall rule can swap the sink. 8 KiB moves 4 Mbit/s on the harness's bridge with room to spare.
+services:
+  compositor:
+    sysctls:
+      net.ipv4.tcp_wmem: "4096 8192 8192"

@@ -578,11 +578,8 @@ mod tests {
         );
         // The producer's own format and its four names, so the parser and the line cannot drift
         // apart unseen.
-        let src = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../app/src/driver.rs"
-        ))
-        .expect("driver.rs");
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../app/src/driver.rs"))
+            .expect("driver.rs");
         assert_eq!(
             src.matches("\"sink swap reason={} gen={gen}\"").count(),
             1,
