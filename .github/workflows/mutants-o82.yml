@@ -1,0 +1,71 @@
+name: mutants-o82
+# Throwaway, never merged (PR #62 fix round 1, the review's m3). Each job applies one mutant to PR
+# #62's head (4a1925e) and passes only if the named test, or image.yml's own Owed 82 check, FAILS
+# with the expected text while its controls ran (.github/mutants-o82/o82.py); `base` passes only
+# when the targeted tests pass unmutated. A green job is a KILL, a red one a survivor or a bad run.
+on: { pull_request: {} }
+permissions: { contents: read, packages: read }
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults: { run: { shell: bash } }
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: [base, C1-hold-deleted, C2-hold-after-null, C3-arm-deleted, C4-arm-ge-0]
+    steps:
+      - uses: actions/checkout@v4
+      - name: GStreamer
+        timeout-minutes: 10
+        env: { APT_INSTALL_RESULT: "${{ runner.temp }}/apt-install-result" }
+        run: scripts/apt-install.sh libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.91.0" }
+      - uses: Swatinem/rust-cache@v2
+        with: { key: "${{ matrix.mutant }}" }
+      - name: Mutate
+        run: python3 .github/mutants-o82/o82.py mutate "${{ matrix.mutant }}"
+      - name: Run and judge
+        run: python3 .github/mutants-o82/o82.py judge "${{ matrix.mutant }}"
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    defaults: { run: { shell: bash } }
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: [C5-relay-with-feature, C6-final-from-deleted]
+    env:
+      IMAGE: seazn-relay:mut
+      HOOKS_IMAGE: seazn-relay-test-hooks:mut
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Mutate
+        run: python3 .github/mutants-o82/o82.py mutate "${{ matrix.mutant }}"
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR (read)
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # image.yml's two builds: the default target as "Build the image", then relay-test-hooks, from
+      # the GHCR cache when it is warm (a cold one builds from source, slower, the same result).
+      - name: Build the default target and relay-test-hooks
+        run: |
+          commit=$(tr -d '[:space:]' < docker/GSTCEF_COMMIT)
+          from=()
+          if key=$(scripts/cef-cache-key.sh); then
+            from=(--cache-from "type=registry,ref=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/seazn-relay-cache:cef-$key")
+          fi
+          docker buildx build --load -f docker/Dockerfile --build-arg "GSTCEF_COMMIT=$commit" "${from[@]}" -t "$IMAGE" .
+          docker buildx build --load -f docker/Dockerfile --build-arg "GSTCEF_COMMIT=$commit" "${from[@]}" \
+            --target relay-test-hooks -t "$HOOKS_IMAGE" .
+      - name: Run image.yml's own check and judge
+        run: python3 .github/mutants-o82/o82.py judge "${{ matrix.mutant }}"
