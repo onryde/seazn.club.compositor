@@ -544,7 +544,7 @@ enum Gate {
     /// sets it only after the publish's `NetStream.Publish.Start` (`start_publish_done`). `stats`
     /// reads that connection's counters, and the null stats (every field 0) before it, so a fresh
     /// sink's `out-bytes-total` leaves 0 exactly when the publish is accepted: the connection has
-    /// sent its `connect` command by then (476 B, F-010). Anything fed before that queues in front of
+    /// sent its `connect` command by then (476 B, F-011). Anything fed before that queues in front of
     /// a sink that cannot send, and goes out in one burst at the connect (F-023).
     Publish(gst::Element),
 }

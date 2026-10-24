@@ -1854,3 +1854,38 @@ The follow-up to F-024's first fact (Owed 85; F-024 is on `feat/c14-chaos`, unme
   decision log): `-displayfd` stays and the removal goes; beside `-displayfd` it changed nothing
   observable (the stub test's hand mutant that puts it back changes no outcome, only what each case's
   Xvfb met), and alone it would keep the socket-file wait that a leftover socket fools.
+
+## F-027: where Owed 84's backlog queued, and how rtmp2sink 1.24.2 connects (source read; a fake destination checked against ffmpeg, 2026-10-24)
+
+The follow-up to F-023 (on `feat/c14-chaos`, unmerged at the time). Source: GStreamer 1.24.2,
+`subprojects/gst-plugins-bad/gst/rtmp2/` (`gstrtmp2sink.c`, `rtmp/rtmpclient.c`,
+`rtmp/rtmpconnection.c`), read at the tag.
+
+- **Where the frames queued** (`gst_output.rs` before the fix): each output generation's feeder
+  started at its build and took the encoded ring from its oldest entry (up to `ENCODED_RING_SPAN`,
+  2 s by PTS). rtmp2sink's `render` waits `while (is_running && !self->connection)`, so whatever the
+  feeder pushed during a pending connect waited in the output appsrcs (`OUTPUT_QUEUE_BYTES`, 512 KiB
+  each), in flvmux's queue and in `render`, and went out at the connect as fast as the socket took
+  it. The swap's force-key event did make a fresh keyframe, but the feeder had started at the ring's
+  oldest keyframe, before it.
+- **When rtmp2sink can send:** `async-connect` defaults to TRUE, so `start()` begins the connect
+  task (with FALSE the connect waits for the first buffer). `self->connection` is set only in
+  `connect_task_done`, after the client's chain (`connect` `_result`, `createStream` `_result`,
+  then `publish`'s `onStatus` `NetStream.Publish.Start`) has finished. `stats` returns that
+  connection's counters, or a structure of zeros before it. So a fresh sink's `out-bytes-total` reads
+  0 until its publish is accepted, and above 0 from then on (the commands it has sent; F-011's
+  476 B).
+- **What rtmp2sink gives up at its 5 s `timeout`:** the TCP connect (`GSocketClient`'s timeout) and
+  the connection's writes (`gst_rtmp_connection_write_buffer_done` emits the error). Not a held
+  reply: the connection's read source retries a read that hit the socket's timeout
+  (`gst_rtmp_connection_input_ready`: `G_IO_ERROR_TIMED_OUT` reads "continuing"). So a destination
+  that takes the TCP connection and holds its `publish` answer holds rtmp2sink's connect until the
+  domain's `output_connect_timeout_ms` swaps it. The handshake's own reads were not checked.
+- **A connection error during the connect fails it at once:** the client's `connection_error`
+  returns the task's error, and `connect_task_done` posts `Failed to connect` on the bus.
+- **The fake destination** (`crates/adapters/tests/support/rtmp.rs`, the gst legs' destination):
+  checked on the host against ffmpeg's RTMP publish (`-re`, H.264 and AAC, the publish held 1.5 s,
+  then released): 1 connection accepted, 1 publish, 312 media messages (120 video, 189 audio), the
+  first video message a keyframe at timestamp 0, no timestamp going back, and the FLV it writes
+  decodes in ffprobe (120 H.264 frames, 189 AAC frames). rtmp2sink against it runs in CI only (no
+  GStreamer on the host).
