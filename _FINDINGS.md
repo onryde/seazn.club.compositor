@@ -1938,3 +1938,29 @@ types.
   each reconnect, each reconnect's recording starts up to 2 s late, which counts against C14's
   `output_reconnect` (Owed 84) and not against `output_lost`.
 - Not checked: MediaMTX's source, or what it receives on the wire, and Cloudflare's start.
+
+## F-026: a GPU crash loop between two child polls, leg by leg (C14 case 15, chaos runs 40051995233, 40056474269 and 40056388445, 2026-10-24)
+
+C14's F-024 (PR #52, branch `feat/c14-chaos`) records the fast loop's headline. This finding is its
+9 `fast` legs (3 per run) read one by one from `marks.jsonl` and `compositor.log`, for Owed 70 (a).
+
+- **Measured:**
+  - Every leg killed 5 distinct GPU pids, 69 to 88 ms apart; the 5 kills took 288 to 337 ms.
+  - The `cef health` lines counted `gpu_process_deaths=1` in 7 legs and 2 in 2 (run 40056474269's
+    r2 and r3). No leg restarted.
+  - 40 to 97 pids were born between two kills.
+  - In a `threshold` leg, `exit code=75` came 7 ms after the `cef health` line that read 3 deaths.
+    From the deciding line to the container's `die`: 127 to 177 ms (that leg and the 3
+    `cef-gpu-zygote-killed` legs); the rest is the entrypoint's teardown.
+- **How the loop kills** (`harness/in-container.sh`, `cmd_gpu_loop`, read, not run): each pass walks
+  `/proc` and forks one subshell per pid to read its `--type`, then kills the first GPU pid of the
+  walk. A pass that finds no new GPU pid sleeps 50 ms. So a killed GPU process was born before the
+  walk that listed it began, and died after that walk ended: it lived at least one whole walk.
+- **Estimate (not measured):** 69 to 88 ms between kills fits one pass that found no relaunch, the
+  50 ms sleep, and one pass that found it, so a walk took about (69 − 50) / 2 to (88 − 50) / 2 ms,
+  10 to 19 ms. The walk was not timed.
+- **So:** the 1 s child poll sees at most one relaunch of such a loop, and a pid-gap or start-time
+  inference cannot recover the rest (most of the gap is likely the walk's own forks, one per pid it
+  reads, and start times tick at 10 ms). The adapter now runs a GPU watch between polls (decision
+  log "Owed 70 (a): the GPU watch"). It misses only a GPU process born and dead between two of its
+  5 ms steps, and the estimate gives each of these two or more.
