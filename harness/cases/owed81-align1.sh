@@ -2,7 +2,8 @@
 # Owed 81's fix candidate: the smoke case's run (60 s live, pass-through netem on both legs, audio
 # on) with the camera's mux at one packet a buffer, so no frame's last packets wait for the next
 # frame's to fill a buffer of seven (F-029). Compare its `camera.cadence` and its wire.jsonl /
-# tap.jsonl with a smoke run's.
+# tap.jsonl with a smoke run's. Measured (dispatch 40090232700): not the fix. The mux still held
+# 37.5 % of the frames, waiting for the audio, and no reader decoded a video frame (F-029).
 # Sourced by run-case.sh.
 
 CASE_LIVE_S=60

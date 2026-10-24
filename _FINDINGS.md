@@ -2054,7 +2054,7 @@ C14's F-024 (PR #52, branch `feat/c14-chaos`) records the fast loop's headline. 
   40 ms, the review's figure): about 30 to 80 ms from the decision to `exit code=75`. The 21 legs
   measured 14.1 ms at the most.
 
-## F-029: Owed 81's judder is made at the fake camera's mux; the compositor passes it on 1:1 (harness runs 40089108946 and 40089107461, 2026-10-24)
+## F-029: Owed 81's judder is made at the fake camera's mux; the compositor passes it on 1:1 (harness runs 40089108946, 40089107461 and 40090232700, 2026-10-24)
 
 Owed 81 (C13 CI round 2): on a clean smoke run about a quarter of the programme's frames repeat the
 camera frame before and about as many camera frames are never shown, while every beat reads
@@ -2089,16 +2089,24 @@ only (no product crate changed) and reads one run stage by stage with `scripts/c
   encoder's output is per frame (x264 `ultrafast`, `zerolatency`, no B-frames). What reaches
   `srtsink` is held back by whole frame periods: sent minus push was 0, 1 and 2 periods for 497,
   1 678 and 250 frames on the smoke run and 0 to 3 periods (661, 842, 715, 219) with the audio off;
-  the smoke run's buffers carried one or two video PES starts (1 325 and 550). The cause is
-  `mpegtsmux alignment=7` (media.rs, C10's 1 316-byte SRT payload): `gst_base_ts_mux_push_packets`
-  (gstbasetsmux.c, GStreamer 1.24.2) returns without pushing while fewer than `alignment` packets
-  are pending, and forces the rest only at EOS. The ball picture's P-frames are two or three TS
-  packets, so a frame's last packets wait for the next frame's (or an audio PES's) to fill the
-  buffer of seven, and frames leave in bunches. The audio-off control is the proof by contrast: one
-  pad, so `GstAggregator`'s wait for every pad cannot be it, and with no audio packets to fill the
-  buffers between frames the bunching gets worse (26 % to 65 %), not better. With the audio on,
-  1 600 samples a frame against AAC's 1 024 make the fill pattern repeat every 32 frames, which is
-  the period the earlier runs' skips locked to (best shift 0 against the camera counter on all five).
+  the smoke run's buffers carried one or two video PES starts (1 325 and 550). The mux holds a
+  frame for two reasons, and each control isolates one (corrected 2026-10-24 by the alignment-1
+  run, below; this entry first named the first reason alone):
+  - **The alignment.** `mpegtsmux alignment=7` (media.rs, C10's 1 316-byte SRT payload):
+    `gst_base_ts_mux_push_packets` (gstbasetsmux.c, GStreamer 1.24.2) returns without pushing
+    while fewer than `alignment` packets are pending, and forces the rest only at EOS. The ball
+    picture's P-frames are two or three TS packets, so a frame's last packets wait for later ones to
+    fill the buffer of seven. The audio-off control shows it alone (one pad, so no wait for another
+    pad): 65 % bunched, worse than with audio (26 %), whose packets fill the buffers sooner.
+  - **The wait for the audio.** GstBaseTsMux gives `GstAggregator` no `get_next_time`, so the
+    aggregator waits until every pad holds a buffer, then muxes the earliest. A video frame
+    therefore leaves only once an AAC frame stamped at or after it is queued, and the camera pushes
+    each frame's 1 600 samples after its video, against AAC frames of 1 024. The alignment-1 run
+    shows it alone: 2 029 of 5 410 video PES bunched (37.5 %), every frame held 0 or 1 period by a
+    pattern that repeats every 32 frames (1 600 and 1 024 samples; 5 409 of 5 410 frames at their
+    residue's value), and the rule above predicts 5 183 of the 5 410 holds (95.8 %). The same
+    32-frame period is the one the earlier runs' skips locked to (best shift 0 against the camera
+    counter on all five).
 - **Nothing after the mux adds to it.** MediaMTX 1.21.2 flushes after every access unit
   (internal/protocols/mpegts/from_stream.go, `bw.Flush()` after each `WriteH264` /
   `WriteMPEG4Audio`), so it holds no partial buffer. Its reader and the compositor's `tsdemux` each
@@ -2120,16 +2128,24 @@ only (no product crate changed) and reads one run stage by stage with `scripts/c
   of p50 33.28, p90 40.44, p99 64.36, max 69.55 ms from a 30 fps source, read at the same
   `srtsrc` → `tsdemux` → `h264parse` shape. That is far smoother than this harness's camera, but not
   smooth, and what it costs on screen has not been measured.
-- **Verdict: HARNESS ARTEFACT.** The judder Owed 81 measured is made by the fake camera's own
-  MPEG-TS packetisation, and the compositor shows it faithfully; the counter (`camera.cadence`) is
-  right, and so are the beats for what they count. **The fix to the harness:** the camera's mux at
-  alignment 1 (`--ts-alignment 1`, one line in compose once proven; case `owed81-align1`, dispatch
-  40090232700 at `7d77141`, read after this entry was written): the sent stage's bunched count and
-  the shown stage's repeats should then fall to about 0, and whatever remains is owed to that run.
-  A cadence gate for C14 and C15 should wait for that run.
+- **The alignment-1 run** (dispatch 40090232700, case `owed81-align1`, at the pre-rebase head
+  `7d77141`; red: "no live heartbeat within 180 s"). Push was clean again (5 411 frames, 0
+  bunched); sent was not (above: 2 029 of 5 410 bunched). And no reader decoded a video frame:
+  `input-tap` wrote 0 frames, and the compositor rebuilt its input 14 times, each generation
+  abandoned by the domain after about 5 s with only audio flushed, so it never went live and there
+  is no shown stage. MediaMTX took the publish (2 tracks, H264 and AAC) and logged nothing else.
+  Why video stopped at 188-byte SRT messages was not read; alignment 1 is not a usable default.
+- **Verdict: HARNESS ARTEFACT.** The judder Owed 81 measured is made by the fake camera's own mux,
+  and the compositor shows it faithfully; the counter (`camera.cadence`) is right, and so are the
+  beats for what they count. **The fix to the harness is not one line, and is unproven:** alignment
+  1 removes neither hold that matters here and loses the video. A fix must keep the 1 316-byte
+  payload and stop both holds, for instance by pushing each frame's audio ahead of its video (so an
+  AAC frame stamped after the video is always queued), with this probe run again to show what the
+  alignment then still holds. Compose keeps alignment 7, and a cadence gate for C14 and C15 waits
+  for that fix.
 - **For the owner (product, not done here):** (i) a beat counter of camera frames replaced unshown
   and ticks that repeat a frame (small: a sequence number on the camera slot, read at each tick),
   so a judder on a real input is visible in the beats at all; (ii) a PTS-paced input buffer of one
   or two frames (medium; costs 33 to 66 ms of latency), only if a measurement of the programme off a
-  real Cloudflare input (fake-camera at alignment 1 into a CF Live Input, read by `input-tap`,
-  `cadence_stages.py`'s input-stage sweep) shows judder worth that.
+  real Cloudflare input (the fake camera, once its mux holds nothing, into a CF Live Input, read
+  by `input-tap`, `cadence_stages.py`'s input-stage sweep) shows judder worth that.

@@ -15,7 +15,8 @@
 #   CAMERA_SIZE, CAMERA_PATTERN       fake-camera's picture (defaults 1280x720, ball)
 #   CAMERA_AUDIO                      on (default) or off: the video alone (Owed 81's control)
 #   CAMERA_TS_ALIGNMENT               packets per buffer at the camera's mux, 1 to 7 (default 7,
-#                                     media.rs's SRT payload; Owed 81's fix candidate is 1)
+#                                     media.rs's SRT payload; 1, Owed 81's candidate, lost the
+#                                     video at every reader: F-029)
 name: seazn-harness
 
 networks:
