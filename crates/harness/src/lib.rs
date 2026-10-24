@@ -11,7 +11,9 @@
 //! - [`inputs`] and [`checker`]: the checker's inputs and its analysis;
 //! - [`logfacts`]: the compositor log's facts (C14), parsed into the report;
 //! - [`media`] (feature `media`): everything that runs GStreamer;
-//! - [`thresholds`]: `harness/thresholds.json`, the numbers C14's verdicts read (`$t`).
+//! - [`thresholds`]: `harness/thresholds.json`, the numbers C14's verdicts read (`$t`);
+//! - [`wire`]: the MPEG-TS read of what fake-camera sends (Owed 81's probe).
+//! - [`silence`]: when input-tap, decoding nothing, says so (Owed 81's probe).
 //!
 //! The harness reads `domain::config` (the one authority for the programme's numbers) and C08's
 //! `app::ports::FINAL_BEAT_TIMEOUT_MS`, and nothing else of the domain or the app.
@@ -25,5 +27,7 @@ pub mod logfacts;
 #[cfg(feature = "media")]
 pub mod media;
 pub mod score;
+pub mod silence;
 pub mod strip;
 pub mod thresholds;
+pub mod wire;

@@ -7,6 +7,8 @@
 # read nothing, fails here.
 
 CASE_LIVE_S=60
+# Owed 81's input-tap (compose's `probe` profile): tap.jsonl, read by scripts/cadence_stages.py.
+export COMPOSE_PROFILES=probe
 
 case_drive() {
   "$HERE/netem.sh" in limit 10000

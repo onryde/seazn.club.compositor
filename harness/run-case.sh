@@ -437,7 +437,11 @@ collect() {
   else
     : >"$OUT/compositor.log"
   fi
-  compose logs --no-color mediamtx fake-camera fake-control >"$OUT/services.log" 2>&1 || true
+  # input-tap runs only under compose's `probe` profile (a case's COMPOSE_PROFILES=probe), and
+  # `compose logs` refuses a service it does not run, which would lose every other service's log.
+  local services=(mediamtx fake-camera fake-control)
+  [[ ",${COMPOSE_PROFILES:-}," == *,probe,* ]] && services+=(input-tap)
+  compose logs --no-color "${services[@]}" >"$OUT/services.log" 2>&1 || true
   if [ -n "$events_pid" ]; then
     kill "$events_pid" 2>/dev/null || true
     wait "$events_pid" 2>/dev/null || true

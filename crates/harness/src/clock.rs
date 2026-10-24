@@ -11,6 +11,13 @@ pub fn now_ms() -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
+/// The same clock in epoch microseconds: Owed 81's probes (`wire.jsonl`, `tap.jsonl`) time frames a
+/// millisecond apart, finer than `now_ms`.
+pub fn now_us() -> i64 {
+    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    i64::try_from(d.as_micros()).unwrap_or(i64::MAX)
+}
+
 /// Days from 1970-01-01 to a proleptic Gregorian date (H. Hinnant's `days_from_civil`).
 pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
@@ -90,6 +97,17 @@ mod tests {
     // 2026-10-23T00:00:00Z is day 20 749 after the epoch (56 years incl. 14 leap days to 2026-01-01
     // = 20 454 days, plus 295 days to 23 October).
     const OCT_23_2026_S: i64 = 20_749 * 86_400;
+
+    #[test]
+    fn now_us_reads_the_same_clock_as_now_ms() {
+        let before = now_ms();
+        let us = now_us();
+        let after = now_ms();
+        assert!(
+            before <= us / 1_000 && us / 1_000 <= after,
+            "{before} <= {us} us <= {after}"
+        );
+    }
 
     #[test]
     fn segment_names_read_as_utc_microseconds() {
