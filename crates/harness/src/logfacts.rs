@@ -13,7 +13,8 @@
 //!   `overlay hidden reason=<r> gen=<g>`, and C11b's
 //!   `cef health zygote_gone=<g|-> leaked_teardowns=<n> gpu_process_deaths=<n>` (on a change only);
 //! - `compositor::logged`: `graphics restart gen=<g>`, `sink swap gen=<g> target=<redacted>`,
-//!   `programme started`;
+//!   `programme started`; and `app::driver`'s `sink swap reason=<r> gen=<g>` just before the swap
+//!   line (Owed 87, PR #57);
 //! - `adapters::gst_output`: `output gen=<g> error: <text>` (a sink's bus error);
 //! - `compositor::wiring` and `main`: `compositor started drivers=…` (a boot), `exit code=<n>`;
 //! - C11's dispatcher: `gen=<g>: page console: hang starts` (the harness page's hang, its own line)
@@ -96,6 +97,15 @@ pub struct Hidden {
     pub gen: u64,
 }
 
+/// `sink swap reason=<r> gen=<g>`: why generation g was built (the domain's `SwapReason`, named
+/// `first`, `error`, `connect_timeout` or `stall` by the driver).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SwapReasonLine {
+    pub at_ms: i64,
+    pub gen: u64,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct Health {
     pub at_ms: i64,
@@ -145,6 +155,8 @@ pub struct LogFacts {
     pub overlay_hidden: Vec<Hidden>,
     pub cef_health: Vec<Health>,
     pub sink_swaps: Vec<GenAt>,
+    /// `sink swap reason=<r> gen=<g>`, one per swap line (lib.jq's `stall_swap` checks they pair).
+    pub sink_swap_reasons: Vec<SwapReasonLine>,
     /// `output gen=<g> error: …`: a sink's bus error, logged before its `OutputError` and never once
     /// the sink is retired (gst_output.rs's `Watch`), so a swap whose outgoing sink logged none was
     /// not the error path's (C14 fix round 3).
@@ -192,6 +204,19 @@ fn dispatcher(msg: &str) -> Option<(u64, &str)> {
     let rest = msg.strip_prefix("gen=")?;
     let (g, what) = rest.split_once(": ")?;
     Some((g.parse().ok()?, what))
+}
+
+/// `sink swap reason=<r> gen=<g>`: the whole message, one word for the reason.
+fn swap_reason(msg: &str, at_ms: i64) -> Option<SwapReasonLine> {
+    let (reason, g) = msg.strip_prefix("sink swap reason=")?.split_once(" gen=")?;
+    if reason.is_empty() || reason.contains(' ') {
+        return None;
+    }
+    Some(SwapReasonLine {
+        at_ms,
+        gen: g.parse().ok()?,
+        reason: reason.to_owned(),
+    })
 }
 
 /// `output gen=<g> error: <text>` (gst_output.rs's bus error): the generation.
@@ -265,6 +290,8 @@ pub fn log_facts(text: &str) -> LogFacts {
             if let Some(Ok(g)) = rest.split(' ').next().map(str::parse) {
                 f.sink_swaps.push(ga(g));
             }
+        } else if let Some(r) = swap_reason(m, at_ms) {
+            f.sink_swap_reasons.push(r);
         } else if let Some(g) = output_error(m) {
             f.output_errors.push(ga(g));
         } else if let Some(code) = gen_after(m, "exit code=") {
@@ -503,6 +530,77 @@ mod tests {
             "gst_output.rs's bus-error line changed: update `output_errors`"
         );
         eprintln!("log lines checked: {}", f.lines);
+    }
+
+    /// A swap's reason (Owed 87, PR #57's `sink swap reason=<r> gen=<g>`, logged just before the
+    /// decorator's `sink swap gen=<g>`): the line cases 5, 12 and 17 read a swap's cause from. The
+    /// lines are case 12's in CI (run 40106770881), keys scrubbed as the compositor writes them.
+    #[test]
+    fn a_swap_reason_is_read_with_its_generation() {
+        let mut log = String::new();
+        let lines = [
+            (0, "sink swap reason=first gen=1"),
+            (0, "sink swap gen=1 target=rtmp://mediamtx:1935/live/****"),
+            (31_066, "sink swap reason=error gen=2"),
+            (31_066, "sink swap gen=2 target=rtmp://mediamtx:1935/live/****"),
+            (37_067, "sink swap reason=connect_timeout gen=3"),
+            (37_067, "sink swap gen=3 target=rtmp://mediamtx:1935/live/****"),
+            (40_000, "sink swap reason=stall gen=4"),
+            // Near misses: none is a reason line.
+            (41_000, "sink swap reason=stall gen=x"),
+            (41_100, "sink swap reason= gen=5"),
+            (41_200, "sink swap reason=stall gen=5 target=x"),
+            (41_300, "gen=1: page console: sink swap reason=stall gen=6"),
+            (41_400, "sink swap reason=two words gen=7"),
+        ];
+        for (at, m) in lines {
+            log.push_str(&line(at, m));
+        }
+        let f = log_facts(&log);
+        let read: Vec<(i64, u64, &str)> = f
+            .sink_swap_reasons
+            .iter()
+            .map(|r| (r.at_ms - NOON_MS, r.gen, r.reason.as_str()))
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                (0, 1, "first"),
+                (31_066, 2, "error"),
+                (37_067, 3, "connect_timeout"),
+                (40_000, 4, "stall")
+            ]
+        );
+        assert_eq!(
+            f.sink_swaps.iter().map(|g| g.gen).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "a reason line is not a swap line"
+        );
+        // The producer's own format and its four names, so the parser and the line cannot drift
+        // apart unseen.
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../app/src/driver.rs"
+        ))
+        .expect("driver.rs");
+        assert_eq!(
+            src.matches("\"sink swap reason={} gen={gen}\"").count(),
+            1,
+            "driver.rs's swap reason line changed: update `sink_swap_reasons`"
+        );
+        let names = [
+            ("First", "first"),
+            ("Error", "error"),
+            ("ConnectTimeout", "connect_timeout"),
+            ("Stall", "stall"),
+        ];
+        for (variant, name) in names {
+            assert!(
+                src.contains(&format!("SwapReason::{variant} => \"{name}\"")),
+                "driver.rs's `swap_name` no longer names {variant} \"{name}\""
+            );
+        }
+        eprintln!("log lines checked: {}, reasons read: {}", f.lines, read.len());
     }
 
     #[test]
