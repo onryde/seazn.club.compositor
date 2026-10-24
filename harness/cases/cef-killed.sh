@@ -14,7 +14,8 @@
 # and a 75 only with C11b's own final beat (`exitReason` "restart"). The outage and its parts are measured (3 runs; the
 # table prints the worst). The restart evidence of Owed 19 is the new process's own `cef ready`
 # after the start, the first beat after that ready reads graphics ready, and every beat after the
-# kill reads ready, restarting or starting. Anti-vacuity: the kill's targets (printed before it
+# kill reads ready, restarting or starting; and the overlay is back on air within
+# BUDGET_PROCESS_RESTART_OUTPUT_MS of the die (`require_overlay_back`, fix round 3). Anti-vacuity: the kill's targets (printed before it
 # kills) name at least one CEF child, and its status, when the exec lived to print it, is 0.
 
 CASE_LIVE_S=70
@@ -26,7 +27,7 @@ case_drive() {
   at_s "$CASE_LIVE_S"
 }
 
-CASE_CHECKS=17
+CASE_CHECKS=18
 case_verdict() {
   # Anti-vacuity: the kill reached CEF's children, and the container died.
   require kill_applied '(mark_value("kill") | (.killed | length) >= 1) and (mark("kill_rc") | all(.value.rc == 0))' \
@@ -48,6 +49,8 @@ case_verdict() {
     | $s != null and $r != null and ([beats[] | select(.received_ms > $r)] | first | .body.graphics) == "ready"' \
     '(starts_after(mark_at("kill")) | first | .at_ms) as $s | ([.log.cef_ready[] | select(.at_ms > $s)] | first | .at_ms) as $r
       | {ready_after_start_ms: ($r - $s), first_beat_after: ([beats[] | select(.received_ms > $r)] | first | .body.graphics)}'
+  require_overlay_back '(dies_after(mark_at("kill")) | first | .at_ms)' \
+    '(starts_after(dies_after(mark_at("kill")) | first | .at_ms) | first | .at_ms)'
   require beats_never_failed 'beats_between(mark_at("kill"); $run.end_request_ms + 1)
     | length >= 1 and all(.body.state != "playing" or .body.graphics == "ready" or .body.graphics == "restarting" or .body.graphics == "starting")' \
     'beats_between(mark_at("kill"); $run.end_request_ms + 1) | map(.body.graphics) | unique'

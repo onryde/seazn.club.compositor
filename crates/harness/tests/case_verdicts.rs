@@ -36,6 +36,9 @@ const LATENCY_MS: f64 = 700.0;
 const OVERLAY_LAG_MS: f64 = 100.0;
 /// Compose's restart of the container after its die (`restart: on-failure`).
 const RESTART_DELAY_MS: i64 = 1_000;
+/// How long before docker's `start` event a restarted container's init started (sims only: the
+/// daemon reports a start it has already made; unmeasured, so case 14 never reads it).
+const INIT_BEFORE_START_EVENT_MS: i64 = 30;
 /// A restarted compositor's start to its first programme packet at MediaMTX (boot, CEF ready, the
 /// output's connect).
 const FIRST_PACKET_MS: i64 = 6_000;
@@ -216,6 +219,7 @@ impl World {
     fn boot(&mut self, start: i64) {
         self.line(start + 200, "compositor started drivers=gst,cef");
         self.line(start + 1_500, "cef ready gen=1");
+        self.line(start + 2_400, "sink swap gen=1 target=rtmp");
         self.line(start + 2_500, "programme started");
     }
 
@@ -812,6 +816,13 @@ fn dest_disconnect_recovers_and_reds_when_nothing_was_dropped_or_the_return_is_l
 /// stall is seen `output_stall_after_ms` after that drain, on the next output poll, and the next beat
 /// carries the swap; 2 is a detector twice as slow (mutant 9, simulated); 0 swaps nothing.
 fn dest_stall(trickle: i64, stall_x: i64, stats: Value) -> World {
+    dest_stall_err(trickle, stall_x, stats, None)
+}
+
+/// [`dest_stall`], with the bus error `(gen, ms before the swap)` logged by sink `gen`: CI's case 5
+/// and mutant 9's case 12, where rtmp2sink's own socket timeout failed sink 1 and the back-off
+/// (`output_backoff_base_ms`) came before the swap (C14 fix round 3, item 2).
+fn dest_stall_err(trickle: i64, stall_x: i64, stats: Value, err: Option<(u64, i64)>) -> World {
     let mut w = dest_cut(2_500, stats);
     let cut = w.at(20.0);
     let clear = w.at(50.0) + 50;
@@ -836,7 +847,13 @@ fn dest_stall(trickle: i64, stall_x: i64, stats: Value) -> World {
         body["sinkSwaps"] = json!(i64::from(swaps && *at >= swap));
     }
     if swaps {
-        w.line(swap, "sink swap gen=1 target=rtmp");
+        w.line(swap, "sink swap gen=2 target=rtmp");
+    }
+    if let Some((gen, before)) = err {
+        w.line(
+            swap - before,
+            format!("output gen={gen} error: Connection error: Socket I/O timed out (gstrtmp2sink.c)"),
+        );
     }
     w
 }
@@ -864,6 +881,21 @@ fn dest_stall_swaps_the_sink_and_reds_without_a_swap_or_a_slow_one() {
         "stall_swap",
         "stall-slow",
     );
+    // CI's case 5 (run 40056474269): sink 1's own socket timeout, then the back-off, then the swap,
+    // inside the bound. The stall rule never fired, so the swap is not its witness (Owed 87).
+    let base = dest_stall(0, 1, stalled()).ms("output_backoff_base_ms");
+    let w = dest_stall_err(0, 1, stalled(), Some((1, base + 20)));
+    assert_fails(
+        &judge(&w, "dest-stall", "", "stall-socket"),
+        "stall_swap",
+        "stall-socket",
+    );
+    // An error of the NEW sink (its first connect failing under the stall) is no cause of the
+    // swap that built it, and neither is the outgoing sink's error logged after the swap.
+    for (tag, err) in [("stall-newerr", (2, -2_000)), ("stall-lateerr", (1, -1))] {
+        let w = dest_stall_err(0, 1, stalled(), Some(err));
+        assert_pass(&judge(&w, "dest-stall", "", tag), tag);
+    }
     // The rate limit held nothing: no backlog, or no netem qdisc at all.
     for (tag, stats) in [
         ("stall-nobacklog", netem(true, 0, 0, 0)),
@@ -880,6 +912,16 @@ fn dest_trickle_swaps_under_a_trickle_and_reds_when_nothing_trickled() {
     let trickling = || netem_queued(true, 19_271, 16, 0, 65_536, 1);
     let w = dest_stall(5_000, 1, trickling());
     assert_pass(&judge(&w, "dest-trickle", "", "trickle-good"), "trickle-good");
+    // Mutant 9 in CI (run 40056471001): the stall threshold at 20 s, and the swap 6.1 s after the
+    // cut anyway, through sink 1's socket timeout and the back-off: inside the bound, by the wrong
+    // rule.
+    let base = w.ms("output_backoff_base_ms");
+    let w = dest_stall_err(5_000, 1, trickling(), Some((1, base + 20)));
+    assert_fails(
+        &judge(&w, "dest-trickle", "", "trickle-socket"),
+        "stall_swap",
+        "trickle-socket",
+    );
     // Mutant 5: the netem line commented out: nothing trickles (a plain stall), and the qdisc is a
     // pass-through that never existed.
     let w = dest_stall(0, 1, netem(false, 0, 0, 0));
@@ -1157,6 +1199,15 @@ fn cef_killed_restarts_the_process_and_reds_when_the_kill_missed_or_the_death_is
         "cef_ready_after_restart",
         "cef-notready",
     );
+    // Fix round 3, item 3: CI's runs 1 and 3 (40056474269): the restart, and no overlay after it.
+    let mut w = cef_killed(good(), 133);
+    let k = w.at(20.0);
+    overlay_lost_after_die(&mut w, k, None);
+    assert_fails(
+        &judge(&w, "cef-killed", "", "cef-nooverlay"),
+        "overlay_back",
+        "cef-nooverlay",
+    );
 }
 
 /// The kill's status line reads a failed `kill`.
@@ -1330,6 +1381,24 @@ fn cef_hung_hides_and_restarts_graphics_and_reds_when_the_hang_is_never_seen() {
     );
 }
 
+/// Owed 85's restart (C14 fix round 3, item 3): the process comes back, CEF never does, so the
+/// overlay strip reads nothing from the first die after `after` on (`late_ms` None), or reads again
+/// only `late_ms` after BUDGET_PROCESS_RESTART_OUTPUT_MS from that die.
+fn overlay_lost_after_die(w: &mut World, after: i64, late_ms: Option<i64>) {
+    let die = w
+        .events
+        .iter()
+        .filter(|e| e.1 == "die" && e.0 > after)
+        .map(|e| e.0)
+        .min()
+        .expect("a die after the fault");
+    let to = match late_ms {
+        Some(l) => die + w.ms("budget_process_restart_output_ms") + l,
+        None => w.end + 60_000,
+    };
+    w.overlay_none.push((die, to));
+}
+
 /// A zygote killed at 20 s; with `in_place`, the compositor names it gone within the budget and
 /// restarts in place (exit 75).
 fn zygote(child: &str, in_place: bool, killed_type: &str) -> World {
@@ -1355,16 +1424,21 @@ fn zygote(child: &str, in_place: bool, killed_type: &str) -> World {
             Some("restart in place: a CEF zygote is gone (gen 1)"),
         );
         if child == "renderer" {
+            // The restarted container as CI's case 14 listed it (fix round 3, on one clock): its
+            // init a little before the daemon's `start` report, the compositor, and CEF's
+            // children 130 to 450 ms after the init.
             let at = w.at(60.0);
+            let init = start - INIT_BEFORE_START_EVENT_MS;
             for (pid, ppid, off, ty) in [
+                (1, 0, 0, Value::Null),
                 (17, 9, 100, Value::Null),
-                (60, 17, 1_200, json!("zygote")),
-                (61, 60, 1_400, json!("gpu-process")),
+                (60, 17, 130, json!("zygote")),
+                (61, 60, 450, json!("gpu-process")),
             ] {
                 w.mark(
                     "tree_after",
                     at,
-                    json!({"at_ms": at, "pid": pid, "ppid": ppid, "start_ms": start + off,
+                    json!({"at_ms": at, "pid": pid, "ppid": ppid, "start_ms": init + off,
                         "comm": "compositor", "type": ty}),
                 );
             }
@@ -1397,6 +1471,31 @@ fn cef_gpu_zygote_killed_restarts_in_place_and_reds_without_the_in_place_restart
         "killed_the_zygote",
         "zyg-rc",
     );
+    // Fix round 3, item 3: the overlay must come back after the restart. Owed 85's CEF that never
+    // starts again; an overlay back 500 ms past the budget; and a restart with no `start` event,
+    // where every frame of the run would count as "after" it.
+    let mut w = zygote("gpu-process", true, "zygote");
+    let k = w.at(20.0);
+    overlay_lost_after_die(&mut w, k, None);
+    assert_fails(
+        &judge(&w, "cef-gpu-zygote-killed", "", "zyg-nooverlay"),
+        "overlay_back",
+        "zyg-nooverlay",
+    );
+    let mut w = zygote("gpu-process", true, "zygote");
+    overlay_lost_after_die(&mut w, k, Some(500));
+    assert_fails(
+        &judge(&w, "cef-gpu-zygote-killed", "", "zyg-overlay-late"),
+        "overlay_back",
+        "zyg-overlay-late",
+    );
+    let mut w = zygote("gpu-process", true, "zygote");
+    w.events.retain(|e| !(e.1 == "start" && e.0 > k));
+    assert_fails(
+        &judge(&w, "cef-gpu-zygote-killed", "", "zyg-overlay-nostart"),
+        "overlay_back",
+        "zyg-overlay-nostart",
+    );
 }
 
 #[test]
@@ -1408,7 +1507,81 @@ fn cef_renderer_zygote_killed_restarts_in_place_and_reds_when_an_old_process_sur
     // CI's jq (1.7.1) refused this object's bare `a - b` value (fix round 2; jq 1.8 takes it).
     let shown = &v.json["measures"]["old_tree_gone"];
     assert_eq!(shown["cef_processes"], 2, "rzyg-good: {shown}");
-    assert_eq!(shown["oldest_ms_after_start"], 1_200, "rzyg-good: {shown}");
+    assert_eq!(shown["oldest_after_init_ms"], 130, "rzyg-good: {shown}");
+    assert_eq!(
+        shown["init_minus_start_event_ms"], -INIT_BEFORE_START_EVENT_MS,
+        "rzyg-good: {shown}"
+    );
+    // Fix round 3: the anchor is the sampled init, never the daemon's `start` report. A report that
+    // lags the init past CEF's first child (130 ms in) is still a clean restart.
+    let mut w = zygote("renderer", true, "zygote");
+    let first_start = w.starts().into_iter().find(|&s| s > w.at(20.0)).unwrap();
+    for e in &mut w.events {
+        if e.0 == first_start && e.1 == "start" {
+            e.0 += 300;
+        }
+    }
+    assert_pass(
+        &judge(&w, "cef-renderer-zygote-killed", "", "rzyg-lagged"),
+        "rzyg-lagged",
+    );
+    // Each conjunct, alone: no start after the kill; a sample taken before the restart; no init in
+    // the sample; an init older than the kill (the old container); no CEF process at all (Owed 85's
+    // CEF that never came back lists none).
+    let tree = |w: &mut World, f: &dyn Fn(&mut Value) -> bool| {
+        let mut kept = vec![];
+        for (name, at, mut v) in std::mem::take(&mut w.marks) {
+            if name != "tree_after" || f(&mut v) {
+                kept.push((name, at, v));
+            }
+        }
+        w.marks = kept;
+    };
+    let mut w = zygote("renderer", true, "zygote");
+    let k = w.at(20.0);
+    w.events.retain(|e| !(e.1 == "start" && e.0 > k));
+    assert_fails(
+        &judge(&w, "cef-renderer-zygote-killed", "", "rzyg-nostart"),
+        "old_tree_gone",
+        "rzyg-nostart",
+    );
+    let mut w = zygote("renderer", true, "zygote");
+    let early = w.starts().into_iter().find(|&s| s > k).unwrap() - 500;
+    tree(&mut w, &|v| {
+        v["at_ms"] = json!(early);
+        true
+    });
+    assert_fails(
+        &judge(&w, "cef-renderer-zygote-killed", "", "rzyg-early"),
+        "old_tree_gone",
+        "rzyg-early",
+    );
+    let mut w = zygote("renderer", true, "zygote");
+    tree(&mut w, &|v| v["pid"] != 1);
+    assert_fails(
+        &judge(&w, "cef-renderer-zygote-killed", "", "rzyg-noinit"),
+        "old_tree_gone",
+        "rzyg-noinit",
+    );
+    let mut w = zygote("renderer", true, "zygote");
+    tree(&mut w, &|v| {
+        if v["pid"] == 1 {
+            v["start_ms"] = json!(k - 1);
+        }
+        true
+    });
+    assert_fails(
+        &judge(&w, "cef-renderer-zygote-killed", "", "rzyg-oldinit"),
+        "old_tree_gone",
+        "rzyg-oldinit",
+    );
+    let mut w = zygote("renderer", true, "zygote");
+    tree(&mut w, &|v| v["type"].is_null());
+    assert_fails(
+        &judge(&w, "cef-renderer-zygote-killed", "", "rzyg-notyped"),
+        "old_tree_gone",
+        "rzyg-notyped",
+    );
     // Fix round 2: with no kill mark, `starts_after(null)` took the run's first start, so every
     // process looked younger than "the restart" and the check passed on nothing.
     let mut w = zygote("renderer", true, "zygote");
@@ -1487,6 +1660,15 @@ fn cef_gpu_deaths_threshold_restarts_in_place_and_reds_when_the_threshold_is_six
         "died_in_place",
         "gpu-six",
     );
+    // Fix round 3, item 3: CI's threshold runs 2 and 3 (40056474269): the restart, then no overlay.
+    let mut w = gpu_deaths(n, 2_000, 800, true, 600);
+    let k = w.at(20.0);
+    overlay_lost_after_die(&mut w, k, None);
+    assert_fails(
+        &judge(&w, "cef-gpu-deaths", "threshold", "gpu-nooverlay"),
+        "overlay_back",
+        "gpu-nooverlay",
+    );
 }
 
 #[test]
@@ -1504,6 +1686,21 @@ fn cef_gpu_deaths_one_fewer_restarts_nothing_and_reds_on_a_restart() {
         &judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-restart"),
         "no_restart",
         "fewer-restart",
+    );
+    // Fix round 3, item 3: no restart, and the overlay gone for good after the last kill.
+    let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
+    let last = w
+        .marks
+        .iter()
+        .filter(|m| m.0 == "kill")
+        .map(|m| m.1)
+        .max()
+        .unwrap();
+    w.overlay_none.push((last, w.end + 60_000));
+    assert_fails(
+        &judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-nooverlay"),
+        "overlay_back",
+        "fewer-nooverlay",
     );
 }
 

@@ -250,10 +250,29 @@ require_output_recovers() {
       or .from_wall_ms > mark_at("clear") + $t.budget_output_reconnect_ms)] == []'
 }
 
+# The overlay is back on air (C14 fix round 3, item 3: the coordinator's decision; spec §9.4 "CEF
+# killed: overlay back", and §6's process-crash target "output back ≤15 s", whose overlay is part of
+# that output): the first recorded frame after <after> (a jq expression) whose score strip reads
+# comes at most BUDGET_PROCESS_RESTART_OUTPUT_MS after <from> (a jq expression). A restart passes its
+# container's `start` as <after> (no frame of the old process is read after it) and its die as
+# <from>. With no <after>, every frame would be "after" it, so it is required; a missing <from> or no
+# frame back fails the subtraction, which is a FAIL. Owed 85's restarts, whose CEF never starts, red
+# here. 1 check.
+require_overlay_back() {
+  local from="$1" after="$2"
+  require overlay_back "($from) as \$from | ($after) as \$after
+    | ([.frames_table[] | select(.[0] > \$after and .[2] != null)] | first | .[0]) as \$back
+    | \$after != null and (\$back - \$from) <= \$t.budget_process_restart_output_ms" \
+    "($from) as \$from | ($after) as \$after
+    | {back_ms: less([.frames_table[] | select(.[0] > \$after and .[2] != null)] | first | .[0]; \$from),
+       budget: \$t.budget_process_restart_output_ms}"
+}
+
 # C11b's in-place restart after <after> (a jq expression): the final beat says why, with
 # `exitReason` "restart" (Owed 66, closed: web's word; the brief's "fatal" is a false premise) and
 # `exitDetail` equal to <detail> (a jq string expression, the domain's `RestartCause::detail`), the
-# container dies 75 once and compose starts it again, and Chromium never aborts. 4 checks.
+# container dies 75 once and compose starts it again, Chromium never aborts, and the overlay is back
+# (`require_overlay_back`, from the die). 5 checks.
 require_in_place_restart() {
   local after="$1" detail="$2"
   require final_beat_detail "($detail) as \$want
@@ -264,6 +283,8 @@ require_in_place_restart() {
   require died_in_place "(dies_after($after) | first | .exit_code) == 75" "dies_after($after) | first | .exit_code"
   require_run restarted_once '.compositor.restarts - .restarts_at_live == 1' '{at_live: .restarts_at_live, at_end: .compositor.restarts}'
   require no_abort '.log.gpu_unusable == []' '.log.gpu_unusable | length'
+  require_overlay_back "(dies_after($after) | first | .at_ms)" \
+    "(starts_after(dies_after($after) | first | .at_ms) | first | .at_ms)"
 }
 
 # After a process restart at <after> (a jq expression): the same session, the beats back, no

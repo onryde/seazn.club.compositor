@@ -2,8 +2,10 @@
 # Case 12, dest-trickle (C14 brief, amendment 2026-10-18; Owed 16(b)): `netem out rate 8kbit` at
 # 20 s (the link stays open and bytes still trickle), cleared at 50 s; 80 s live.
 #
-# A trickle is a stall, not progress: a swap within case 5's bound (`stall_swap`). Then the output
-# recovers as in case 4. Anti-vacuity: the netem qdisc sent at least 2 packets through the open
+# A trickle is a stall, not progress: a swap within case 5's bound (`stall_swap`), by the stall
+# rule (its `cause`: mutant 9's 20 s threshold swapped 6.1 s after the cut through rtmp2sink's own
+# socket timeout, so a bound alone cannot witness the rule; Owed 87). Then the output recovers as in
+# case 4. Anti-vacuity: the netem qdisc sent at least 2 packets through the open
 # link, so the bytes really trickled and this is not case 5 again (case 5's qdisc sends none), and
 # the swap came. The trickle is witnessed where it is injected, as case 10's loss is. The brief's
 # "compositor log OutputProgress totals" do not exist (the compositor logs no progress total: a
@@ -34,7 +36,7 @@ case_verdict() {
     and stall_swap(mark_at("cut")).swap_ms != null' \
     '{netem: mark_value("netem_out"), swap_ms: stall_swap(mark_at("cut")).swap_ms}'
   require stall_swap 'stall_swap(mark_at("cut")) | .swap_ms != null and .swap_beat_ms != null and .last_growth_ms != null
-    and .from_growth_ms <= .bound_ms' 'stall_swap(mark_at("cut"))'
+    and .from_growth_ms <= .bound_ms and .cause == "stall"' 'stall_swap(mark_at("cut"))'
   measure swap_log_from_cut_ms '[.log.sink_swaps[] | select(.at_ms > mark_at("cut"))] | first | .at_ms - mark_at("cut")'
   measure netem_out 'mark_value("netem_out")'
   require_output_recovers
