@@ -6,8 +6,9 @@ dedicated app `seazn-relay-soak` (org seazn-club, region `lhr`). One workflow jo
 `.github/workflows/soak.yml`, drives it end to end.
 
 ```
-gh workflow run soak.yml --ref <branch> -f minutes=30 -f sha=<40-hex head>   # the rehearsal
-gh workflow run soak.yml --ref <branch> -f sha=<40-hex head>                 # the 3 h soak (185)
+gh workflow run soak.yml --ref <branch> -f minutes=30 -f sha=<40-hex head>               # plumbing (test page)
+gh workflow run soak.yml --ref <branch> -f minutes=30 -f sha=<40-hex head> -f page=real  # the rehearsal
+gh workflow run soak.yml --ref <branch> -f sha=<40-hex head> -f page=real                # the 3 h soak (185)
 ```
 
 ## The pieces
@@ -25,9 +26,17 @@ gh workflow run soak.yml --ref <branch> -f sha=<40-hex head>                 # t
 | `test-verdict.sh` | Runs the verdict on `fixtures/green` (a 30-min miniature) and on one jq patch per red. Each case asserts its status, its exact failing ids, its reason and the check list. |
 | `test-driver.sh` | Runs the driver under stubs on a 1-minute compressed schedule. It also covers the error path, which holds `/out` until the hard stop. |
 | `test-sampler.sh` | Runs `sampler.py` on synthetic recordings made with ffmpeg: a moving square and a noise strip, with an overlay bar that goes off air for one minute, a disconnect, and a missing segment. It also covers an all-noise camera and a run with no start. |
-| `test-workflow.sh` | Checks `soak.yml`'s shape: the gate and the plan step, run for real; `--restart no`; the job token; the `always()` destroy. It also runs `flylog.py` on a recorded-shape stream. |
+| `test-workflow.sh` | Checks `soak.yml`'s shape: the gate and the plan step, run for real; `--restart no`; the job token; the `always()` destroy; the page source's job. It also runs `flylog.py` on a recorded-shape stream. |
+| `web.Dockerfile` | page=real's harness image: the soak image plus a standalone seazn.club build, node, and Postgres 16 with the migrated database restored at build time. See "The page source". |
+| `web/up.sh` | page=real's page source on the Machine: Postgres, the web server, the seed, the stream session, the signed URL, a pre-flight. |
+| `web/serve.sh` | Starts the web server with an allowlisted environment and a per-run signing key. |
+| `web/seed.mjs`, `web/score.mjs` | The seed and the score driver (check (c)), through the app's own API. `web/lib.mjs` is their HTTP door and the relay token. |
+| `web/session.sql`, `web/overlay-url.mjs` | The composed stream session the relay door checks, and the door's signed URL. |
+| `web/bundle-check.sh` | Fails when the web build carries a PostHog key, a Sentry DSN or a Stripe key. |
+| `web/smoke.sh` | `up.sh` and three deliveries inside the built image, on the runner, before the push. |
+| `web/test-bundle-check.sh`, `web/test-overlay-url.sh` | The bundle check on synthetic builds; the signed URL against an independent HS256 verifier. |
 
-`check.yml` runs the four tests.
+`check.yml` runs the six tests.
 
 ## The overlay sampler (check (d))
 
@@ -123,26 +132,89 @@ comes from `thresholds.json`, `soak.json` or the drive.
 On `page=test`, checks 5a–5d read `pending: page source`, and the best status is `plumbing`, not
 `pass`. The workflow then prints `::warning::PLUMBING ONLY`.
 
-## The page source (open: owner ruling owed)
+## The page source (page=real)
 
-The driver takes the page as one input: `SOAK_PAGE=test|real` plus `SOAK_OVERLAY_URL`. On a real
-page, fake-control hands the URL to the compositor unchanged. `soak.yml` reads the URL from the repo
-secret `SOAK_OVERLAY_URL`, never from an input, because a relay-door URL carries a signed token.
+The production overlay page comes from a **standalone seazn.club build on the harness Machine**,
+with its own Postgres. Nothing runs against stg or prod, no stg or prod secret is used anywhere, and
+nothing is created on stg. The web commit is `soak.yml`'s `web_sha` input. Its default is
+`7dcb3c42e23eb44ef69d7c564d4e9e0c5970d569` (onryde/seazn.club main, 2026-10-24), which carries
+R2005 (#982, merge `e0608604c5`) and R2007 PR A (#974, `TemplateId = "bar" | "bug"`).
 
-**stg setup: none created.** No org, fixture or account exists yet, so there are no ids to record.
-The stg route as approved does not work; see finding 1.
+**Built.** The `web` job (page=real only) builds it on the runner:
 
-Not built yet, owed once the page source is ruled:
+1. `pnpm install`, then `db:apply` and `sync:sports` against a scratch `postgres:16` service.
+2. A dump of the roles and the database, before anything is seeded.
+3. `SKIP_TYPECHECK=1 npm run build`. The step fails if any PostHog, Sentry or Stripe setting is in
+   its environment, and none is set, so a local server has nothing to send to live PostHog.
+4. `web/bundle-check.sh` over the staged `.next/static` and `.next/server`. It fails on any PostHog
+   project key, Sentry DSN or Stripe key.
 
-- the score driver that writes `deliveries.jsonl` (check 5c);
-- the overlay sampler that writes `overlay-samples.jsonl` (check 5d).
+The images job layers the result onto the soak image (`web.Dockerfile`). Postgres is restored at
+build time, so a dump that does not restore fails the build. It then runs `web/smoke.sh` inside the
+image before it pushes it as `harness-web-<sha>`. The smoke is `up.sh` exactly as the Machine runs
+it, plus three deliveries.
 
-On `page=real`, both checks fail while their files are missing, so a real-page run never passes on
-nothing.
+**On the Machine.** `driver.sh` runs `web/up.sh` before fake-control:
+
+1. **Postgres.** It listens on 127.0.0.1 only, with trust auth.
+2. **The web server.** `serve.sh` starts it with an allowlisted environment: `DATABASE_URL`,
+   `DATABASE_SSL=disable`, `AUTH_SECRET`, `AUTH_DEV_LINKS=1`, `NODE_ENV=production`, `PORT`,
+   `HOSTNAME=::`, `NEXT_TELEMETRY_DISABLED=1`, `LOG_LEVEL`, `PATH`, `HOME`.
+   - `AUTH_SECRET` is made per run. It sits in a mode-600 file under `/run/soak-web`, never in argv
+     or `/out`.
+   - The server's `/proc/<pid>/environ` is checked against the allowlist, by name.
+   - The job token, the SRT passphrase and every telemetry setting stay out.
+3. **The seed.** `seed.mjs` signs in with a dev magic link as `delivered+soak-<sid8>@resend.dev`, an
+   e2e address that is never mailed because Resend is unset. It creates a public competition and a
+   cricket ODI fixture (two teams of six, both lineups set, started). It also creates a badminton
+   fixture for the cost legs.
+4. **The stream session.** `session.sql` inserts a composed `fixture_stream_sessions` row, id
+   `SESSION_ID`, state live, on the cricket fixture, with a placeholder stream target that is never
+   used. This row and the signed token are what the relay door checks.
+5. **The signed URL.** `overlay-url.mjs` builds
+   `http://<harness>.vm.seazn-relay-soak.internal:3000/overlay/fixtures/<fx>?sid&st&host=compositor&delay=3100&template=bar`.
+   `st` is web's relay-page token, signed with the run's key and valid until 30 min past the hard
+   stop. The URL, the session file fake-control serves (`pageToken`, `fixtureId`) and the cookies
+   all stay under `/run/soak-web`.
+6. **The pre-flight.** The URL must answer 200 from the Machine.
+
+During the drive, `score.mjs` records a delivery every `score_every_s` (30 s): two a minute against
+check (c)'s one. Runs are even, with boundaries among them. A refused delivery re-reads the position
+from the ledger and tries again at once.
+
+ODI rather than T20: T20's 240 balls would end the match at minute 120 of a 180-minute drive, while
+ODI's first innings alone is 300 balls. The secrets scan adds the signing key, the page token and
+the session cookies to `/out`'s list. The fetch takes `deliveries.jsonl`, `score.log`, `seed.json`,
+`web-up.log`, `web.log` and `postgres.log`.
+
+**Harness Machine size, page=real: performance-8x, 16384 MB** (soak.json `harness_guest.real`).
+page=test stays at performance-4x, 8192 MB. The compositor Machine is alone on the production guest
+(performance-4x, 8192 MB) either way.
+
+**Verified locally (2026-10-24)** against a standalone build of `7dcb3c42e2`, with no `.env.local`:
+
+- **Bundle.** `bundle-check`: 6987 files, clean. The same check on a build that carries the dev
+  `.env.local` reds on its PostHog key, so the check is not vacuous on the real key's shape.
+- **Server.** It started under `serve.sh` with exactly the allowlist's names.
+- **Seed and page.**
+  - The seed went through.
+  - The page under the signed URL logged `seazn:phase-channel=web`, `seazn:ready` and
+    `seazn:alive`, every 2 s.
+  - It polled `/api/v1/public/fixtures/<id>/overlay` with 200s.
+  - Its only off-origin request was the compositor's own phase channel, `127.0.0.1:7419`.
+- **Negatives.** A token signed with another key gave no `seazn:ready`, and so did a valid token for
+  a sid with no session row.
+- **Dump and restore.** The roles plus a plain-SQL dump, restored into a fresh cluster, served the
+  same page to `seazn:ready`.
+- **Scoring.**
+  - `score.mjs`: 320 of 320 deliveries.
+  - The engine closed innings 1 itself at 300 legal balls, and innings 2 carried on.
+  - A delivery made by a second writer mid-run gave one `409 SEQ_CONFLICT`. The driver re-read the
+    ledger and its next delivery landed on the right ball.
 
 ## Findings (the brief's premises that did not hold)
 
-1. **A public stg page never goes ready under the compositor.** The overlay page passes
+1. **A public page never goes ready under the compositor, on stg or anywhere.** The overlay page passes
    `host=compositor` only behind relay access (`apps/web/src/app/overlay/fixtures/[fixtureId]/page.tsx:177`,
    `access && isCompositorHost(query.host)`). On the public door, the page emits neither
    `seazn:ready` nor `seazn:alive` (`useCompositorSignals`, `overlay-stage.tsx`). The compositor's
@@ -150,7 +222,9 @@ nothing.
 
    Relay access needs two things: a non-terminal composed `fixture_stream_sessions` row and a
    signed relay-page token (`server/overlay/relay-access.ts`). On stg, that means a real stream
-   session, with infrastructure it would launch.
+   session, with infrastructure it would launch. Hence the standalone page source (above), where
+   the session row is seeded in the build's own database. Verified there: no `seazn:ready` without
+   the row, or with a token signed by another key.
 2. **fake-control cannot replay `score.json` every 20 min.** `/control/timeline-start` works once
    only and returns 409 after. The 2026-10-18 amendment replaced the index-drop criterion, so the
    soak needs no replay. The driver gives the test page one score timeline for the whole drive.
@@ -172,3 +246,8 @@ nothing.
 - Whether the log stream is complete. Check 5a's ratio catches lost lines on a real page.
 - Whether `flyctl ssh sftp` works with the soak token.
 - Whether `--rootfs-size 30` is accepted and the disk holds 3 h of recordings.
+- page=real: whether the compositor's CEF loads the page over plain HTTP from the harness's private
+  name, and the page goes `seazn:ready` there. Locally it did, in Chromium, from `localhost`.
+- page=real: the web job's time (install, migrate, build: about 15 min, beside the CEF build), and
+  whether the harness at performance-8x carries fake-camera's encode with the web server and
+  Postgres beside it. Read `web.log`, `postgres.log` and the harness's CPU from the run.

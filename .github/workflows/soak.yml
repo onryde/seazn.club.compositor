@@ -11,8 +11,9 @@ name: soak
 #
 # page=test (the default) serves C14's overlay-test.html: PLUMBING ONLY. Checks (a) to (d) read
 # pending, and the run's best verdict is "plumbing", never "pass". page=real points the compositor
-# at the production page in the repo secret SOAK_OVERLAY_URL (a page URL can carry a signed token,
-# so it is never an input: inputs are printed in the run).
+# at the production overlay page, served by a standalone seazn.club build on the harness Machine
+# (the web job builds it at web_sha, with its own Postgres: harness/soak/web.Dockerfile). Nothing
+# runs against stg or prod, and the build carries no telemetry key (web/bundle-check.sh).
 #
 # Credentials: FLY_API_TOKEN_SOAK (the job skips with a warning when it is empty), set on the steps
 # that call flyctl only. The job token is random per run, masked, kept in mode-600 files under
@@ -29,10 +30,15 @@ on:
         required: true
         default: "185"
       page:
-        description: "test (C14's overlay-test.html, PLUMBING ONLY) or real (the page in the SOAK_OVERLAY_URL secret)"
+        description: "test (C14's overlay-test.html, PLUMBING ONLY) or real (the production page, from a standalone web build at web_sha)"
         type: choice
         options: [test, real]
         default: test
+      web_sha:
+        description: "page=real: the seazn.club commit to build, 40 hex (needs R2005 and R2007 PR A)"
+        required: false
+        # onryde/seazn.club main, 2026-10-24: R2005 (#982, e0608604c5) and R2007 PR A (#974) in.
+        default: "7dcb3c42e23eb44ef69d7c564d4e9e0c5970d569"
       camera:
         description: "fake-camera's picture"
         type: choice
@@ -59,6 +65,7 @@ jobs:
     outputs:
       enabled: ${{ steps.gate.outputs.enabled }}
       sha: ${{ steps.args.outputs.sha }}
+      web_sha: ${{ steps.args.outputs.web_sha }}
       drive: ${{ steps.plan.outputs.drive }}
       timeout: ${{ steps.plan.outputs.timeout }}
     steps:
@@ -79,12 +86,17 @@ jobs:
           SHA_IN: ${{ inputs.sha }}
           MINUTES: ${{ inputs.minutes }}
           PAGE: ${{ inputs.page }}
+          WEB_SHA: ${{ inputs.web_sha }}
         run: |
           sha="${SHA_IN:-$GITHUB_SHA}"
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::sha must be 40 hex: '$sha'"; exit 1; }
           [[ "$MINUTES" =~ ^[0-9]{1,3}$ ]] || { echo "::error::minutes must be whole minutes: '$MINUTES'"; exit 1; }
           case "$PAGE" in test | real) ;; *) echo "::error::page must be test or real"; exit 1 ;; esac
+          if [ "$PAGE" = real ]; then
+            [[ "$WEB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::web_sha must be 40 hex: '$WEB_SHA'"; exit 1; }
+          fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "web_sha=$WEB_SHA" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           ref: ${{ steps.args.outputs.sha }}
@@ -105,9 +117,105 @@ jobs:
           echo "timeout=$timeout" >> "$GITHUB_OUTPUT"
           echo "run $MINUTES min: drive $drive min, job timeout $timeout min"
 
-  images:
+  # page=real's page source: seazn.club at web_sha, built as production builds it (standalone, types
+  # skipped), against a scratch Postgres migrated by db:apply and synced by sync:sports, then dumped.
+  # No secret of any kind: no PostHog, Sentry or Stripe setting reaches the build, and the bundle
+  # check fails the job if a key is in it. Its artifact is web.Dockerfile's input.
+  web:
     needs: plan
-    if: needs.plan.outputs.enabled == 'true'
+    if: needs.plan.outputs.enabled == 'true' && inputs.page == 'real'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions: { contents: read }
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # A scratch database on this runner only, reachable from nothing else.
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: seazn
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      WEB_SHA: ${{ needs.plan.outputs.web_sha }}
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - uses: actions/checkout@v4
+        with:
+          repository: onryde/seazn.club
+          ref: ${{ needs.plan.outputs.web_sha }}
+          path: web
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 26
+      - name: Install
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+      # Dumped before anything else touches it: the schema and the sport catalog, nothing seeded.
+      - name: The database (db:apply, sync:sports)
+        working-directory: web
+        env:
+          DATABASE_URL: postgresql://postgres@localhost:5432/seazn
+          DATABASE_SSL: disable
+          PG: ${{ job.services.postgres.id }}
+        run: |
+          npm run db:apply
+          npm run sync:sports
+          B="$RUNNER_TEMP/build"
+          mkdir -p "$B/db"
+          # The server's own client (the same major as the image's restore); psql's \restrict lines
+          # (16.10+) dropped, so an older psql restores it too.
+          docker exec "$PG" pg_dumpall -U postgres --roles-only \
+            | grep -vE '^(CREATE|ALTER) ROLE postgres( |;)|^\\(un)?restrict ' > "$B/db/roles.sql"
+          docker exec "$PG" pg_dump -U postgres --no-owner seazn | grep -vE '^\\(un)?restrict ' > "$B/db/seazn.sql"
+          echo "dumped: $(grep -c . "$B/db/roles.sql") role lines, $(du -h "$B/db/seazn.sql" | cut -f1) of schema and catalog"
+      - name: Build (no telemetry setting)
+        working-directory: web
+        run: |
+          if env | cut -d= -f1 | grep -E '^(NEXT_PUBLIC_)?(POSTHOG|SENTRY|STRIPE)'; then
+            echo "::error::a PostHog, Sentry or Stripe setting is in the build's environment"
+            exit 1
+          fi
+          SKIP_TYPECHECK=1 npm run build --workspace apps/web
+          cd apps/web
+          rm -rf .next/standalone/apps/web/.next/static
+          cp -R .next/static .next/standalone/apps/web/.next/
+          cp -R public .next/standalone/apps/web/
+          test -f .next/standalone/apps/web/server.js
+      - name: The bundle carries no telemetry key
+        run: |
+          A=web/apps/web/.next/standalone/apps/web/.next
+          harness/soak/web/bundle-check.sh "$A/static" "$A/server" | tee "$RUNNER_TEMP/bundle-check.txt"
+      - name: Pack the page source
+        run: |
+          B="$RUNNER_TEMP/build"
+          tar -czf "$B/app.tgz" -C web/apps/web/.next/standalone .
+          cp "$(command -v node)" "$B/node"
+          jq -n --arg web "$WEB_SHA" --arg node "$(node --version)" --arg check "$(tail -n 1 "$RUNNER_TEMP/bundle-check.txt")" \
+            '{web_sha: $web, node: $node, bundle_check: $check}' > "$B/web.json"
+          cat "$B/web.json"
+          ls -l "$B" "$B/db"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: soak-web-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/build/
+          if-no-files-found: error
+          retention-days: 3
+
+  images:
+    needs: [plan, web]
+    # The web job runs on page=real only: skipped is fine, failed or cancelled is not.
+    if: >-
+      !cancelled() && needs.plan.outputs.enabled == 'true'
+      && (needs.web.result == 'success' || needs.web.result == 'skipped')
     runs-on: ubuntu-24.04
     # A cold CEF build (image.yml's); the soak job's own timeout covers the Machines only.
     timeout-minutes: 90
@@ -118,6 +226,8 @@ jobs:
       RELAY_IMAGE: seazn-relay:${{ needs.plan.outputs.sha }}
       HARNESS_IMAGE: seazn-harness:${{ needs.plan.outputs.sha }}
       SOAK_IMAGE: seazn-relay-soak:${{ needs.plan.outputs.sha }}
+      WEB_IMAGE: seazn-relay-soak-web:${{ needs.plan.outputs.sha }}
+      PAGE: ${{ inputs.page }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -194,6 +304,21 @@ jobs:
         run: |
           docker buildx build --builder default --load -f harness/soak/Dockerfile \
             --build-arg HARNESS_IMAGE="$HARNESS_IMAGE" -t "$SOAK_IMAGE" .
+      # page=real: the page source on top (after the CEF builds, so their context never holds it).
+      - name: The page source (web job)
+        if: inputs.page == 'real'
+        uses: actions/download-artifact@v4
+        with:
+          name: soak-web-${{ github.run_id }}-${{ github.run_attempt }}
+          path: harness/soak/web/build
+      - name: Build and smoke the page-source image
+        if: inputs.page == 'real'
+        run: |
+          docker buildx build --builder default --load -f harness/soak/web.Dockerfile \
+            --build-arg SOAK_IMAGE="$SOAK_IMAGE" -t "$WEB_IMAGE" .
+          # up.sh as the Machine runs it, then three deliveries: a page source that does not come up
+          # fails here, before anything runs on Fly.
+          docker run --rm --entrypoint /soak/web/smoke.sh "$WEB_IMAGE"
       - name: flyctl
         run: |
           curl -fsSL -o "$RUNNER_TEMP/flyctl.tgz" \
@@ -206,7 +331,9 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
         run: |
           flyctl auth docker
-          for pair in "relay $RELAY_IMAGE" "harness $SOAK_IMAGE"; do
+          harness="harness $SOAK_IMAGE"
+          [ "$PAGE" != real ] || harness="harness-web $WEB_IMAGE"
+          for pair in "relay $RELAY_IMAGE" "$harness"; do
             set -- $pair
             ref="registry.fly.io/$FLY_APP:$1-$SHA"
             docker tag "$2" "$ref"
@@ -216,7 +343,9 @@ jobs:
 
   soak:
     needs: [plan, images]
-    if: needs.plan.outputs.enabled == 'true'
+    # Explicit: a skipped web job (page=test) upstream of images must not skip this one.
+    if: >-
+      !cancelled() && needs.plan.outputs.enabled == 'true' && needs.images.result == 'success'
     runs-on: ubuntu-24.04
     # minutes + soak.json's timeout_after_min (40), made by the plan job.
     timeout-minutes: ${{ fromJSON(needs.plan.outputs.timeout) }}
@@ -246,7 +375,6 @@ jobs:
         id: launch
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
-          SOAK_OVERLAY_URL: ${{ secrets.SOAK_OVERLAY_URL }}
         run: |
           umask 077
           s=harness/soak/soak.json
@@ -259,11 +387,14 @@ jobs:
           deadline_ms=$((now_ms + 10#$MINUTES * 60000))
           hard_stop_ms=$((now_ms + (10#$MINUTES + $(jq -r .hard_stop_after_min "$s")) * 60000))
           deadline_at="$(python3 -I -c 'import datetime,sys; print(datetime.datetime.fromtimestamp(int(sys.argv[1]) / 1000, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")' "$deadline_ms")"
-          overlay=""
-          if [ "$PAGE" = real ]; then
-            [ -n "$SOAK_OVERLAY_URL" ] || { echo "::error::page real needs the SOAK_OVERLAY_URL secret"; exit 1; }
-            overlay="$SOAK_OVERLAY_URL"
-          fi
+          # The harness's image and guest by page: on page=real it also carries the web server and
+          # its Postgres (soak.json's harness_guest). The compositor's guest never changes.
+          h_image="registry.fly.io/$FLY_APP:harness-$SHA"
+          [ "$PAGE" != real ] || h_image="registry.fly.io/$FLY_APP:harness-web-$SHA"
+          h_cpus="$(jq -r --arg p "$PAGE" '.harness_guest[$p].cpus' "$s")"
+          h_mem="$(jq -r --arg p "$PAGE" '.harness_guest[$p].memory_mb' "$s")"
+          [[ "$h_cpus" =~ ^[0-9]+$ && "$h_mem" =~ ^[0-9]+$ ]] || { echo "::error::no harness_guest for page $PAGE"; exit 1; }
+          echo "harness guest: performance-${h_cpus}x, $h_mem MB ($h_image)"
           name_h="soak-harness-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           name_c="soak-compositor-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           echo "name_h=$name_h" >> "$GITHUB_OUTPUT"
@@ -271,30 +402,29 @@ jobs:
           echo "deadline_ms=$deadline_ms" >> "$GITHUB_OUTPUT"
           # The configs: every value through jq's environment, never its argv.
           JOB_TOKEN="$job_token" SESSION_ID="$session_id" DRIVE="$DRIVE_MIN" DEADLINE="$deadline_ms" \
-            HARD_STOP="$hard_stop_ms" OVERLAY="$overlay" jq -n '{
+            HARD_STOP="$hard_stop_ms" H_CPUS="$h_cpus" H_MEM="$h_mem" jq -n '{
               auto_destroy: true, restart: {policy: "no"},
-              guest: {cpu_kind: "performance", cpus: 4, memory_mb: 8192},
-              env: ({SESSION_ID: $ENV.SESSION_ID, JOB_TOKEN: $ENV.JOB_TOKEN, SOAK_DRIVE_MIN: $ENV.DRIVE,
-                     SOAK_DEADLINE_MS: $ENV.DEADLINE, SOAK_HARD_STOP_MS: $ENV.HARD_STOP,
-                     SOAK_PAGE: $ENV.PAGE, CAMERA_PATTERN: $ENV.CAMERA}
-                    + (if $ENV.OVERLAY == "" then {} else {SOAK_OVERLAY_URL: $ENV.OVERLAY} end))}' \
+              guest: {cpu_kind: "performance", cpus: ($ENV.H_CPUS | tonumber), memory_mb: ($ENV.H_MEM | tonumber)},
+              env: {SESSION_ID: $ENV.SESSION_ID, JOB_TOKEN: $ENV.JOB_TOKEN, SOAK_DRIVE_MIN: $ENV.DRIVE,
+                    SOAK_DEADLINE_MS: $ENV.DEADLINE, SOAK_HARD_STOP_MS: $ENV.HARD_STOP,
+                    SOAK_PAGE: $ENV.PAGE, CAMERA_PATTERN: $ENV.CAMERA}}' \
             > "$RUNNER_TEMP/harness.machine.json"
           machine_id() {
             flyctl machine list -a "$FLY_APP" --json | jq -r --arg n "$1" '(. // [])[] | select(.name == $n) | .id' | head -n 1
           }
           run_machine() {
-            # $1 name, $2 image, $3 config; the output stays in a file (it echoes the config's image only,
-            # but nothing of a Machine's config is printed here).
+            # $1 name, $2 image, $3 config, $4 cpus, $5 memory; the output stays in a file (it echoes the
+            # config's image only, but nothing of a Machine's config is printed here).
             local rc=0
             flyctl machine run "$2" -a "$FLY_APP" -r "$FLY_REGION" --name "$1" --restart no --rm --detach \
-              --vm-cpu-kind performance --vm-cpus 4 --vm-memory 8192 --machine-config "$3" "${@:4}" \
+              --vm-cpu-kind performance --vm-cpus "$4" --vm-memory "$5" --machine-config "$3" "${@:6}" \
               > "$RUNNER_TEMP/$1.run.log" 2>&1 || rc=$?
             rm -f "$3"
             grep -a -E "Machine ID|State|Image:" "$RUNNER_TEMP/$1.run.log" || true
             return "$rc"
           }
           # The harness: room for 3 h of recordings.
-          run_machine "$name_h" "registry.fly.io/$FLY_APP:harness-$SHA" "$RUNNER_TEMP/harness.machine.json" --rootfs-size 30 \
+          run_machine "$name_h" "$h_image" "$RUNNER_TEMP/harness.machine.json" "$h_cpus" "$h_mem" --rootfs-size 30 \
             || { tail -n 20 "$RUNNER_TEMP/$name_h.run.log"; exit 1; }
           hid="$(machine_id "$name_h")"
           [[ "$hid" =~ ^[0-9a-z]+$ ]] || { echo "::error::no harness Machine id"; exit 1; }
@@ -322,7 +452,7 @@ jobs:
               env: {COMPOSITOR_DRIVERS: "live", SESSION_ID: $ENV.SESSION_ID, JOB_TOKEN: $ENV.JOB_TOKEN,
                     APP_URL: $ENV.APP_URL, RELAY_DEADLINE_AT: $ENV.DEADLINE_AT}}' \
             > "$RUNNER_TEMP/compositor.machine.json"
-          run_machine "$name_c" "registry.fly.io/$FLY_APP:relay-$SHA" "$RUNNER_TEMP/compositor.machine.json" \
+          run_machine "$name_c" "registry.fly.io/$FLY_APP:relay-$SHA" "$RUNNER_TEMP/compositor.machine.json" 4 8192 \
             || { tail -n 20 "$RUNNER_TEMP/$name_c.run.log"; exit 1; }
           cid="$(machine_id "$name_c")"
           [[ "$cid" =~ ^[0-9a-z]+$ ]] || { echo "::error::no compositor Machine id"; exit 1; }
@@ -389,7 +519,7 @@ jobs:
           got=0
           for f in report.json actions.jsonl heartbeats.jsonl control-state.json timeline.json done status.json \
                    secrets.json ended overlay-samples.jsonl driver.log checker.log sampler.log fake-control.log \
-                   fake-camera.log mediamtx.log; do
+                   fake-camera.log mediamtx.log deliveries.jsonl score.log seed.json web-up.log web.log postgres.log; do
             rm -f "$OUT/$f.part"
             if flyctl ssh sftp get "/out/$f" "$OUT/$f.part" -a "$FLY_APP" --machine "$HID" -q > /dev/null 2>> "$OUT/fetch.err"; then
               mv "$OUT/$f.part" "$OUT/$f"; got=$((got + 1))

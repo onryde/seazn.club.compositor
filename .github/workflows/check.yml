@@ -182,9 +182,10 @@ jobs:
 
   # harness/soak (C15), beside the check job so its minutes do not eat that job's bound: the verdict
   # on its fixtures (the green, the brief's reds and each guard's red, by reason), the driver under
-  # stubs on a 1-minute schedule and its error path (about 2 minutes), soak.yml's shape (the token
-  # gate, --restart no, the masked job token, the always() destroy) with its log converter, and the
-  # overlay sampler on synthetic recordings (ffmpeg, about 1 minute).
+  # stubs on a 1-minute schedule, its error path and page=real (about 2 minutes), soak.yml's shape
+  # (the token gate, --restart no, the masked job token, the always() destroy, the page source's
+  # job) with its log converter, the page source's bundle check and signed URL, and the overlay
+  # sampler on synthetic recordings (ffmpeg, about 1 minute).
   soak:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -197,6 +198,8 @@ jobs:
           harness/soak/test-verdict.sh
           HARNESS_BASH=/bin/bash harness/soak/test-driver.sh
           harness/soak/test-workflow.sh
+          harness/soak/web/test-bundle-check.sh
+          harness/soak/web/test-overlay-url.sh
       - name: Soak overlay sampler
         if: ${{ !cancelled() }}
         run: |

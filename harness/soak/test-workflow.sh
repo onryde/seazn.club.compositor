@@ -13,6 +13,12 @@
 #   FLY_API_TOKEN on steps only;
 # - the cleanup: an `if: always()` step destroys every Machine and fails unless the list reads empty;
 # - inputs reach scripts through env only (no `${{ inputs.* }}` inside a run);
+# - page=real's page source: the web job runs on page=real only, holds no secret, builds seazn.club
+#   at a 40-hex web_sha (refused otherwise, the args step run for real), refuses a PostHog, Sentry or
+#   Stripe setting in the build's environment (that guard run for real, both ways), and checks the
+#   bundle before it packs; the images job smokes the page-source image before it pushes it, and
+#   runs when the web job was skipped; the harness Machine's image and guest follow the page
+#   (soak.json's harness_guest); the page source's outputs are fetched; no SOAK_OVERLAY_URL is left;
 # - flylog.py on a recorded-shape stream: pretty-printed entries, a replayed buffer, another
 #   Machine's entry, a cut-off tail, stamps with 9 and 3 fraction digits and an offset, a bare and a
 #   reasoned `overlay hidden`; and an empty stream refused.
@@ -47,8 +53,14 @@ check "dispatch only, inputs sha, minutes 185, page test" \
    and $on.workflow_dispatch.inputs.page.default == "test"'
 check "the gate reads FLY_API_TOKEN_SOAK" \
   '.jobs.plan.steps[] | select(.id == "gate") | .env.FLY_API_TOKEN == "${{ secrets.FLY_API_TOKEN_SOAK }}"'
-check "images and soak run only when the gate said enabled" \
-  '[.jobs.images, .jobs.soak] | all(.if == "needs.plan.outputs.enabled == '"'"'true'"'"'")'
+check "images and soak run only when the gate said enabled, and never after a failed or cancelled job" \
+  '(.jobs.images.if | contains("needs.plan.outputs.enabled == '"'"'true'"'"'") and contains("!cancelled()")
+     and contains("needs.web.result == '"'"'success'"'"' || needs.web.result == '"'"'skipped'"'"'"))
+   and (.jobs.soak.if | contains("needs.plan.outputs.enabled == '"'"'true'"'"'") and contains("!cancelled()")
+     and contains("needs.images.result == '"'"'success'"'"'"))
+   and .jobs.images.needs == ["plan", "web"] and .jobs.soak.needs == ["plan", "images"]'
+check "the web job: page=real only, when enabled" \
+  '.jobs.web.if == "needs.plan.outputs.enabled == '"'"'true'"'"' && inputs.page == '"'"'real'"'"'" and .jobs.web.needs == "plan"'
 gate="$(jq -r '.jobs.plan.steps[] | select(.id == "gate") | .run' "$W/wf.json")"
 : >"$W/gate.out"
 out="$(FLY_API_TOKEN="" GITHUB_OUTPUT="$W/gate.out" bash -eo pipefail -c "$gate" 2>&1)" && rc=0 || rc=$?
@@ -135,6 +147,57 @@ bad="$(jq -r '[.jobs[].steps[]? | .run // empty] | join("\n")' "$W/wf.json" | gr
 verdict="$(step soak "Verdict")"
 grep -qF 'harness/soak/verdict.sh --dir "$OUT" --page "$PAGE" --drive-min "$DRIVE_MIN"' <<<"$verdict" \
   && grep -qF '::warning::PLUMBING ONLY' <<<"$verdict" && pass "the verdict: verdict.sh, PLUMBING ONLY on the test page" || fail "the verdict step"
+
+# --- page=real's page source ---------------------------------------------------------------------
+check "the web job holds no secret" '.jobs.web | tojson | contains("secrets.") | not'
+check "it builds seazn.club at the plan's web_sha, without credentials" \
+  '[.jobs.web.steps[] | select(.with.repository == "onryde/seazn.club")] | length == 1
+   and .[0].with.ref == "${{ needs.plan.outputs.web_sha }}" and .[0].with["persist-credentials"] == false'
+check "web_sha's default is 40 hex" '((.on // .["true"]).workflow_dispatch.inputs.web_sha.default | test("^[0-9a-f]{40}$"))'
+args="$(jq -r '.jobs.plan.steps[] | select(.id == "args") | .run' "$W/wf.json")"
+argrun() { : >"$W/args.out"; SHA_IN="$(printf 'a%.0s' {1..40})" MINUTES=30 PAGE="$1" WEB_SHA="$2" GITHUB_SHA=x GITHUB_OUTPUT="$W/args.out" \
+  bash -eo pipefail -c "$args" >/dev/null 2>&1; }
+argrun real nope && fail "a bad web_sha on page=real" "accepted" || pass "a bad web_sha on page=real is refused"
+argrun test nope && pass "page=test ignores web_sha" || fail "page=test with any web_sha" "refused"
+argrun real "$(printf 'b%.0s' {1..40})" && grep -qx "web_sha=$(printf 'b%.0s' {1..40})" "$W/args.out" \
+  && pass "a 40-hex web_sha reaches the plan's output" || fail "a good web_sha" "$(cat "$W/args.out")"
+build="$(step web "Build (no telemetry setting)")"
+guard="$(sed -n '/^if env | cut/,/^fi$/p' <<<"$build")"
+if [ -n "$guard" ]; then
+  env -i PATH="$PATH" bash -eo pipefail -c "$guard" >/dev/null 2>&1 && pass "the build guard: a clean environment passes" || fail "the build guard" "refused a clean environment"
+  rc=0; for v in NEXT_PUBLIC_POSTHOG_KEY SENTRY_DSN STRIPE_SECRET_KEY POSTHOG_KEY; do
+    env -i PATH="$PATH" "$v=x" bash -eo pipefail -c "$guard" >/dev/null 2>&1 && rc=1
+  done
+  [ "$rc" -eq 0 ] && pass "the build guard: a PostHog, Sentry or Stripe setting is refused (4 names)" || fail "the build guard" "let one through"
+else
+  fail "the build guard" "not found in the build step"
+fi
+check "the bundle check runs after the build and before the pack and the upload" \
+  '[.jobs.web.steps | to_entries[] | select(.value.name == "Build (no telemetry setting)" or .value.name == "The bundle carries no telemetry key"
+     or .value.name == "Pack the page source" or (.value.uses // "" | startswith("actions/upload-artifact"))) | .key]
+   | length == 4 and . == sort'
+grep -qF 'harness/soak/web/bundle-check.sh "$A/static" "$A/server"' <<<"$(step web "The bundle carries no telemetry key")" \
+  && pass "the bundle check scans the staged build's static and server trees" || fail "the bundle check's targets"
+smoke="$(step images "Build and smoke the page-source image")"
+grep -qF 'docker run --rm --entrypoint /soak/web/smoke.sh "$WEB_IMAGE"' <<<"$smoke" && pass "the page-source image is smoked" || fail "the smoke"
+check "the smoke comes before the push, both page=real's image steps conditional" \
+  '. as $wf | [.jobs.images.steps | to_entries[] | select(.value.name == "Build and smoke the page-source image" or .value.name == "Push to Fly'"'"'s registry") | .key]
+     | length == 2 and .[0] < .[1]
+   and ([$wf.jobs.images.steps[] | select(.name == "Build and smoke the page-source image" or .name == "The page source (web job)") | .if]
+     == ["inputs.page == '"'"'real'"'"'", "inputs.page == '"'"'real'"'"'"])'
+grep -qF '[ "$PAGE" != real ] || harness="harness-web $WEB_IMAGE"' <<<"$(step images "Push to Fly's registry")" \
+  && pass "page=real pushes the page-source image as harness-web" || fail "the push by page"
+grep -qF '[ "$PAGE" != real ] || h_image="registry.fly.io/$FLY_APP:harness-web-$SHA"' <<<"$launch" \
+  && grep -qF "jq -r --arg p \"\$PAGE\" '.harness_guest[\$p].cpus'" <<<"$launch" \
+  && grep -qF 'run_machine "$name_h" "$h_image" "$RUNNER_TEMP/harness.machine.json" "$h_cpus" "$h_mem"' <<<"$launch" \
+  && pass "the harness Machine's image and guest follow the page" || fail "the harness by page"
+jq -e '.harness_guest.test == {cpus: 4, memory_mb: 8192} and (.harness_guest.real.cpus >= 4) and (.harness_guest.real.memory_mb >= 8192)' "$HERE/soak.json" >/dev/null \
+  && pass "soak.json: the harness guest per page, page=real at least the test page's" || fail "soak.json's harness_guest"
+fetch="$(step soak "Fetch the outputs")"
+miss=""; for f in deliveries.jsonl score.log seed.json web-up.log web.log postgres.log overlay-samples.jsonl; do
+  grep -qE "(^| )$f( |;|$)" <<<"$fetch" || miss="$miss $f"; done
+[ -z "$miss" ] && pass "the fetch takes the page source's outputs (7 files)" || fail "the fetch" "missing:$miss"
+grep -qF SOAK_OVERLAY_URL "$YML" && fail "no SOAK_OVERLAY_URL is left" "it is" || pass "no SOAK_OVERLAY_URL is left"
 
 # --- flylog.py ---------------------------------------------------------------------------------
 cat >"$W/stream.json" <<'EOF'
