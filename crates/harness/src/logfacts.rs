@@ -104,7 +104,8 @@ pub struct Hidden {
 }
 
 /// `sink swap reason=<r> gen=<g>`: why generation g was built (the domain's `SwapReason`, named
-/// `first`, `error` or `connect_timeout` by the driver; Owed 87 retired `stall`).
+/// `first`, `error`, `connect_timeout` or `egress_stalled` (Owed 94) by the driver; Owed 87 retired
+/// `stall`).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SwapReasonLine {
     pub at_ms: i64,
@@ -690,6 +691,7 @@ mod tests {
             (37_067, "sink swap reason=connect_timeout gen=3"),
             (37_067, "sink swap gen=3 target=rtmp://mediamtx:1935/live/****"),
             (40_000, "sink swap reason=error gen=4"),
+            (50_000, "sink swap reason=egress_stalled gen=5"), // Owed 94's backstop
             // Near misses: none is a reason line.
             (41_000, "sink swap reason=error gen=x"),
             (41_100, "sink swap reason= gen=5"),
@@ -712,7 +714,8 @@ mod tests {
                 (0, 1, "first"),
                 (31_066, 2, "error"),
                 (37_067, 3, "connect_timeout"),
-                (40_000, 4, "error")
+                (40_000, 4, "error"),
+                (50_000, 5, "egress_stalled")
             ]
         );
         assert_eq!(
@@ -720,8 +723,8 @@ mod tests {
             vec![1, 2, 3],
             "a reason line is not a swap line"
         );
-        // The producer's own format and its three names, so the parser and the line cannot drift
-        // apart unseen; and not the name Owed 87 retired.
+        // The producer's own format and its four names (Owed 94 added the backstop's), so the parser
+        // and the line cannot drift apart unseen; and not the name Owed 87 retired.
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../app/src/driver.rs"))
             .expect("driver.rs");
         assert_eq!(
@@ -733,6 +736,7 @@ mod tests {
             ("First", "first"),
             ("Error", "error"),
             ("ConnectTimeout", "connect_timeout"),
+            ("EgressStalled", "egress_stalled"),
         ];
         for (variant, name) in names {
             assert!(

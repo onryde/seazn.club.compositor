@@ -51,7 +51,7 @@ use crate::health::{
 use crate::input_link::{InputAction, InputLink, InputState, LossReason};
 use crate::ladder::{Ladder, Rung};
 use crate::lifecycle::{ExitReason, Lifecycle};
-use crate::output_link::{OutputLink, OutputState, SwapReason};
+use crate::output_link::{Encoded, OutputLink, OutputState, SwapReason};
 use crate::programme::{FrameChoice, Programme, ProgrammePhase};
 use crate::time::{elapsed, Ms};
 
@@ -113,9 +113,12 @@ pub enum Event {
     /// The current sink's bytes-sent total, counted from 0 for each sink (C09: rtmp2sink
     /// `out-bytes-total`). It replaces the brief's `OutputConnected` and `OutputAck`: F-005 found CF
     /// Input B sends no RTMP acknowledgements, and C04's `OutputLink` reads bytes sent (Owed 13).
+    /// `encoded` is what the encoders have delivered by the same reading (Owed 94: the egress backstop
+    /// counts only while both deliver).
     OutputProgress {
         gen: u64,
         total_bytes: u64,
+        encoded: Encoded,
     },
     OutputError {
         gen: u64,
@@ -434,7 +437,11 @@ impl Supervisor {
             Event::InputFrame { gen } => self.on_input_frame(now, gen),
             Event::InputConnected { gen } => self.input.on_connected(now, gen),
             Event::InputLost { gen, reason } => self.input.on_lost(now, gen, reason, &t),
-            Event::OutputProgress { gen, total_bytes } => self.on_output_progress(now, gen, total_bytes),
+            Event::OutputProgress {
+                gen,
+                total_bytes,
+                encoded,
+            } => self.on_output_progress(now, gen, total_bytes, encoded),
             Event::OutputError { gen } => self.output.on_error(now, gen, &t),
             Event::EncoderOverrun => {
                 if let Some(r) = self.ladder.on_overrun(now, &t) {
@@ -492,7 +499,11 @@ impl Supervisor {
             Event::InputFrame { gen } => self.on_input_frame(now, gen),
             Event::InputConnected { gen } => self.input.on_connected(now, gen),
             Event::InputLost { gen, reason: r } => self.input.on_lost(now, gen, r, &t),
-            Event::OutputProgress { gen, total_bytes } => self.on_output_progress(now, gen, total_bytes),
+            Event::OutputProgress {
+                gen,
+                total_bytes,
+                encoded,
+            } => self.on_output_progress(now, gen, total_bytes, encoded),
             Event::OutputError { gen } => self.output.on_error(now, gen, &t),
             Event::CefReady { gen } => self.graphics.on_ready(now, gen),
             // (Amended 2026-10-18, C05b PR #22 review G2.) A crash in the hold is counted, so one at the
@@ -539,8 +550,9 @@ impl Supervisor {
         }
     }
 
-    fn on_output_progress(&mut self, now: Ms, gen: u64, total_bytes: u64) {
+    fn on_output_progress(&mut self, now: Ms, gen: u64, total_bytes: u64, encoded: Encoded) {
         self.output.on_progress(now, gen, total_bytes, &self.t);
+        self.output.on_delivery(now, gen, encoded);
         if self.output.is_connected() {
             self.output_ever_connected = true;
         }
@@ -694,6 +706,7 @@ mod tests {
         Event::OutputProgress {
             gen: s.output_generation(),
             total_bytes,
+            encoded: Encoded::default(),
         }
     }
 
@@ -2187,6 +2200,7 @@ mod tests {
                     let ev = Event::OutputProgress {
                         gen,
                         total_bytes: total,
+                        encoded: Encoded::default(),
                     };
                     s = s.decide(ev, now).next;
                 }
@@ -2254,6 +2268,7 @@ mod tests {
             output_backoff_cap_ms: 2_081,
             output_connect_timeout_ms: 5_087,
             output_connected_after_ms: 5_099,
+            output_egress_flat_ms: 9_011,
             cef_fail_count: 3,
             cef_fail_window_ms: 300_097,
             cef_load_timeout_ms: 10_103,
@@ -2296,6 +2311,7 @@ mod tests {
             th.output_backoff_cap_ms,
             th.output_connect_timeout_ms,
             th.output_connected_after_ms,
+            th.output_egress_flat_ms,
             th.cef_fail_window_ms,
             th.cef_load_timeout_ms,
             th.cef_recycle_every_ms,
@@ -2313,7 +2329,7 @@ mod tests {
         let mut unique = ms.to_vec();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(unique.len(), 25, "setup: every Ms threshold distinct");
+        assert_eq!(unique.len(), 26, "setup: every Ms threshold distinct");
         let base = th.bootstrap_backoff_base_ms;
         assert!(
             2 * base < th.bootstrap_backoff_cap_ms && 4 * base > th.bootstrap_backoff_cap_ms,
@@ -2438,6 +2454,7 @@ mod tests {
                 Event::OutputProgress {
                     gen: 1,
                     total_bytes: 0,
+                    encoded: Encoded::default(),
                 },
             ),
             (
@@ -2445,6 +2462,7 @@ mod tests {
                 Event::OutputProgress {
                     gen: 0,
                     total_bytes: 5_000,
+                    encoded: Encoded::default(),
                 },
             ),
             (
@@ -2452,6 +2470,7 @@ mod tests {
                 Event::OutputProgress {
                     gen: 2,
                     total_bytes: 5_000,
+                    encoded: Encoded::default(),
                 },
             ),
             (
@@ -2459,6 +2478,7 @@ mod tests {
                 Event::OutputProgress {
                     gen: 1,
                     total_bytes: 476,
+                    encoded: Encoded::default(),
                 },
             ),
         ] {
@@ -2493,6 +2513,85 @@ mod tests {
         let b = beats(&d.effects);
         assert_eq!(b.len(), 1, "the hold's first tick beats: {:?}", d.effects);
         assert_eq!((b[0].state, b[0].programme_phase), (BeatState::Stalled, Final));
+    }
+
+    // Owed 94 (the owner, 2026-10-24, "B": the backstop "swaps the sink and makes the beat say so"). A
+    // hung output: the sink's total stops, the encoders keep delivering, no error comes. The beat reads
+    // Playing, and nothing swaps, until 1 ms before `output_egress_flat_ms` (the accepted window); at
+    // it the link backs off and the beat reads Stalled, never Playing over the dead output again; the
+    // swap one base back-off later names the backstop. Under the defaults, and under thresholds that
+    // are all distinct, so a timer that read another field moves.
+    #[test]
+    fn a_hung_output_is_swapped_by_the_backstop_and_the_beat_stops_reading_playing() {
+        let swapped = |fx: &[Effect]| fx.iter().any(|e| matches!(e, Effect::SwapSink { .. }));
+        let mut checked = 0;
+        for th in [t(), distinct()] {
+            let flat = th.output_egress_flat_ms;
+            let s = Supervisor::new(th.clone()).decide(Event::Tick, 0).next;
+            let ok = Event::BootstrapOk {
+                heartbeat_interval_ms: th.heartbeat_interval_ms,
+                deadline_at: FAR,
+            };
+            let mut s = s.decide(ok, 0).next.decide(Event::Tick, 0).next;
+            assert_eq!(
+                s.output_generation(),
+                1,
+                "setup: the first running tick built the sink"
+            );
+            let reading = |s: &Supervisor, total_bytes: u64, k: u64| Event::OutputProgress {
+                gen: s.output_generation(),
+                total_bytes,
+                encoded: Encoded { video: k, audio: k },
+            };
+            // C09's 250 ms poll: the total and both encoders grow until the sink is Connected.
+            let (mut at, mut total, mut k) = (0, 0, 0);
+            while at < 2 * th.output_connected_after_ms {
+                (at, total, k) = (at + 250, total + 1_000, k + 1);
+                s = s.decide(reading(&s, total, k), at).next;
+            }
+            assert_eq!(s.health(at).state, BeatState::Playing, "setup: on air");
+            let last = at;
+            let mut quiet = 0;
+            while at + 250 < last + flat {
+                (at, k) = (at + 250, k + 1);
+                s = s.decide(reading(&s, total, k), at).next;
+                let d = s.decide(Event::Tick, at);
+                assert!(!swapped(&d.effects), "swapped {} ms into the hang", at - last);
+                s = d.next;
+                let h = s.health(at);
+                assert_eq!((h.state, h.output), (BeatState::Playing, LinkStatus::Connected));
+                quiet += 1;
+            }
+            assert!(quiet > 0, "no reading inside the window");
+            let d = s.decide(Event::Tick, last + flat - 1);
+            assert!(!swapped(&d.effects), "{:?}", d.effects);
+            s = d.next;
+            assert_eq!(s.health(last + flat - 1).state, BeatState::Playing, "1 ms early");
+            let s = s.decide(Event::Tick, last + flat).next;
+            let h = s.health(last + flat);
+            assert_eq!(
+                (h.state, h.output),
+                (BeatState::Stalled, LinkStatus::Backoff),
+                "at the threshold"
+            );
+            let swap_at = last + flat + th.output_backoff_base_ms;
+            let d = s.decide(Event::Tick, swap_at);
+            assert!(
+                d.effects.contains(&Effect::SwapSink {
+                    gen: 2,
+                    reason: SwapReason::EgressStalled
+                }),
+                "{:?}",
+                d.effects
+            );
+            let h = d.next.health(swap_at);
+            assert_eq!(
+                (h.state, h.output, h.sink_swaps),
+                (BeatState::Stalled, LinkStatus::Connecting, 1)
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 2);
     }
 
     // PR #29 review I1: after a swap, the new sink reads Stalled until it earns Connected. The beat

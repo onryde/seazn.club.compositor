@@ -3,9 +3,11 @@
 //! recovery paths against F-004's 15 s broadcast budget. They live here, not inline, because the
 //! domain's crate root forbids `clippy::print_stderr`, and a sweep must print the count it checked
 //! (AGENTS.md §5).
-use domain::config::{OutputProfile, Thresholds, OUTPUT_GAP_BUDGET_MS, OUTPUT_SINK_TIMEOUT_MS};
+use domain::config::{
+    OutputProfile, Thresholds, OUTPUT_GAP_BUDGET_MS, OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS,
+};
 use domain::input_link::{InputAction, InputLink, InputState, LossReason, KICK_HISTORY_CAP};
-use domain::output_link::{OutputLink, OutputState};
+use domain::output_link::{Encoded, OutputLink, OutputState, SwapReason};
 use domain::time::Ms;
 
 const BOTH_MODES: [OutputProfile; 2] = [OutputProfile::P720, OutputProfile::P1080];
@@ -252,8 +254,9 @@ fn input_early_ticks_and_other_generations_change_nothing() {
 /// (gen 1's). Proving holds 1 000 bytes, grown 1 ms short of the bound; Connected grew to 1 000 bytes;
 /// Backoff is gen 2 refused while proving. Returns the link and the instant its timer is due: the
 /// connect timeout, the bound (Proving's only instant: growth there connects it, a tick does nothing),
-/// the end of the back-off. Connected has no timer (Owed 87), so its instant is the one where the
-/// retired stall rule swapped it: `OUTPUT_SINK_TIMEOUT_MS` after its last growth.
+/// the end of the back-off. Connected has no timer without the encoders' readings (Owed 87; Owed
+/// 94's backstop needs them, and no reading is sent here), so its instant is the one where the retired
+/// stall rule swapped it: `OUTPUT_SINK_TIMEOUT_MS` after its last growth.
 fn output_in(kind: Kind, t: &Thresholds) -> (OutputLink, Ms) {
     let mut o = OutputLink::new();
     assert!(o.on_tick(0, t));
@@ -332,7 +335,9 @@ fn setup_attempt(kind: Kind) -> Option<u32> {
 
 /// The brief's transitions (Step 6) with the C04 corrections (bytes sent, F-005), Owed 38's
 /// (Connected is earned; every end before it is a failure; only Connected resets the count) and Owed
-/// 87's (no stall rule: no tick ends Proving or Connected, only the sink's error):
+/// 87's (no stall rule: no tick ends Proving or Connected, only the sink's error). No pair here reads
+/// the encoders, so Owed 94's backstop, which needs their readings, never fires (it is swept in
+/// `the_egress_backstop_ends_only_a_flowing_sink_and_only_while_the_encoders_deliver`):
 /// (kind after, built, failures carried after).
 fn brief_output(from: Kind, e: OutputEvent) -> (Kind, bool, Option<u32>) {
     use Kind as K;
@@ -345,7 +350,8 @@ fn brief_output(from: Kind, e: OutputEvent) -> (Kind, bool, Option<u32>) {
         (K::Proving, E::Progress) => (K::Up, false, None),       // growth at or past the bound
         (K::Connecting | K::Proving, E::Error) => (K::Backoff, false, failed),
         (K::Up, E::Error) => (K::Backoff, false, Some(1)), // failure 1 again: Connected reset it
-        // Everything else, a tick on Proving or Connected among it (Owed 87), changes nothing.
+        // Everything else, a tick on Proving or Connected among it (Owed 87; no reading of the
+        // encoders, so no backstop), changes nothing.
         (k, _) => (k, false, setup_attempt(k)),
     }
 }
@@ -397,6 +403,101 @@ fn output_early_ticks_and_other_generations_change_nothing() {
     }
     eprintln!("output no-ops checked: {checked}");
     assert_eq!(checked, OUTPUT_KINDS.len() * (1 + 2 * 2));
+}
+
+/// What the encoders' readings showed before a sweep's ticks (Owed 94).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// Two readings, both tracks grown: the encoders deliver.
+    Delivering,
+    /// Two readings, both tracks repeated: feed starvation.
+    Starving,
+    /// No reading at all.
+    Unread,
+}
+
+const DELIVERIES: [Delivery; 3] = [Delivery::Delivering, Delivery::Starving, Delivery::Unread];
+
+// Owed 94 (the owner, 2026-10-24, "B"): the egress backstop against every output state and every
+// reading of the encoders. Only a sink whose bytes flowed (Proving, Connected), and only while both
+// encoders deliver, backs off at `output_egress_flat_ms` after its last growth, and not 1 ms before:
+// failure 1 from Connected, one more from Proving. Every other pair does what it does with no reading
+// at all (its own timer, or nothing).
+#[test]
+fn the_egress_backstop_ends_only_a_flowing_sink_and_only_while_the_encoders_deliver() {
+    let t = Thresholds::default();
+    let flat = t.output_egress_flat_ms;
+    let (mut checked, mut fired) = (0usize, 0usize);
+    for kind in OUTPUT_KINDS {
+        for delivery in DELIVERIES {
+            let (mut o, _) = output_in(kind, &t);
+            let (mut unread, _) = output_in(kind, &t);
+            // `output_in` builds generation 2 at 100 + base and sends its first bytes 50 ms later:
+            // these two readings come between, so a delivering run is already going at the growth.
+            let built = 100 + t.output_backoff_base_ms;
+            for (i, at) in [built + 10, built + 20].into_iter().enumerate() {
+                let k = match delivery {
+                    Delivery::Delivering => i as u64,
+                    Delivery::Starving | Delivery::Unread => 0,
+                };
+                if delivery != Delivery::Unread {
+                    o.on_delivery(at, 2, Encoded { video: k, audio: k });
+                }
+            }
+            // The last growth `output_in` sent: Proving's at the bound less 1 ms, Connected's at it.
+            let up = built + 50;
+            let last = match kind {
+                Kind::Proving => up + t.output_connected_after_ms - 1,
+                _ => up + t.output_connected_after_ms,
+            };
+            let at = last + flat;
+            let early = o.on_tick(at - 1, &t);
+            unread.on_tick(at - 1, &t);
+            let backstop = matches!(kind, Kind::Proving | Kind::Up) && delivery == Delivery::Delivering;
+            if backstop {
+                assert!(!early, "({kind:?}, {delivery:?}) built 1 ms early");
+                assert_eq!(
+                    output_kind(o.state()),
+                    kind,
+                    "({kind:?}, {delivery:?}) 1 ms early"
+                );
+            }
+            let built_now = o.on_tick(at, &t);
+            unread.on_tick(at, &t);
+            if backstop {
+                let failures = setup_attempt(kind).map_or(1, |a| a + 1);
+                assert_eq!(
+                    (output_kind(o.state()), built_now, output_attempt(o.state())),
+                    (Kind::Backoff, false, Some(failures)),
+                    "({kind:?}, {delivery:?})"
+                );
+                let OutputState::Backoff { until, .. } = o.state() else {
+                    unreachable!("asserted above");
+                };
+                assert!(o.on_tick(until, &t), "({kind:?}) the build after the back-off");
+                assert_eq!(
+                    o.swap_reason(),
+                    SwapReason::EgressStalled,
+                    "({kind:?}, {delivery:?})"
+                );
+                fired += 1;
+            } else {
+                assert_eq!(
+                    (output_kind(o.state()), o.generation(), output_attempt(o.state())),
+                    (
+                        output_kind(unread.state()),
+                        unread.generation(),
+                        output_attempt(unread.state())
+                    ),
+                    "({kind:?}, {delivery:?}) moved where no reading leaves it"
+                );
+            }
+            checked += 1;
+        }
+    }
+    eprintln!("backstop pairs checked: {checked} ({fired} fire)");
+    assert_eq!(checked, OUTPUT_KINDS.len() * DELIVERIES.len());
+    assert_eq!(fired, 2, "Proving and Connected, delivering");
 }
 
 // ---- generated schedules, against facts the harness tracks itself ----
@@ -912,29 +1013,34 @@ fn lost(
 /// it explicitly. So a recovery from an error must fit the budget through this many failed connects.
 const FAILED_CONNECTS_BUDGETED: u32 = 1;
 
-/// The C09 brief: a 1 s timer reads the sink's byte count.
-const POLL_MS: Ms = 1_000;
+/// C09's poll of the sink's total (Owed 15: 250 ms), and of the encoders' totals with it (Owed 94).
+const POLL_MS: Ms = OUTPUT_PROGRESS_POLL_MS;
 
 /// How far past `last_progress` a simulation may run.
 const RUN_MS: Ms = 60_000;
 
-/// The fault: the sink errors `after` ms after its last progress. 0 is a reset that takes the last
-/// bytes with it; `OUTPUT_SINK_TIMEOUT_MS` is a destination stall, which since Owed 87 (the owner,
-/// 2026-10-24, "A") ends only by rtmp2sink's own socket timeout, that long after its last write.
+/// The fault at the sink's last progress.
 #[derive(Debug, Clone, Copy)]
-struct Fault {
-    after: Ms,
+enum Fault {
+    /// The sink errors `after` ms after its last progress. 0 is a reset that takes the last bytes
+    /// with it; `OUTPUT_SINK_TIMEOUT_MS` is a destination stall, which since Owed 87 (the owner,
+    /// 2026-10-24, "A") ends by rtmp2sink's own socket timeout, that long after its last write.
+    Error { after: Ms },
+    /// Owed 94 (ii): the output pipeline hangs. No error ever comes, every poll repeats the total, and
+    /// the encoders keep delivering: only the egress backstop ends the sink.
+    Hung,
 }
 
-const RESET: Fault = Fault { after: 0 };
-const STALL: Fault = Fault {
+const RESET: Fault = Fault::Error { after: 0 };
+const STALL: Fault = Fault::Error {
     after: OUTPUT_SINK_TIMEOUT_MS,
 };
+const HUNG: Fault = Fault::Hung;
 
 #[derive(Debug)]
 struct Recovery {
     last_progress: Ms,
-    /// The sink's error.
+    /// The sink's error; for a hung output, the backstop's back-off.
     fault_at: Ms,
     recovered_at: Ms,
 }
@@ -942,7 +1048,8 @@ struct Recovery {
 /// One output recovery through the real `OutputLink`, millisecond by millisecond. `ticks[ms]` says
 /// whether a tick lands on that millisecond. The sink pushes, its total growing on every poll, the
 /// last one at `last_progress`; it earns Connected `output_connected_after_ms` after its first poll
-/// (Owed 38), well before the fault. The first `failed` sinks built after the fault hang (no bytes
+/// (Owed 38), well before the fault. Every poll also reads the encoders, delivering throughout (Owed
+/// 94), and the polls stop at the sink's error (C09's watch reads a failed sink no more). The first `failed` sinks built after the fault hang (no bytes
 /// and no error, so the domain's connect timeout ends each one). The next one sends its first bytes
 /// `connect_ms` after it was built, and the recovery ends there: the output's bytes flow again, and
 /// the gap the broadcast sees is over, though that sink earns Connected only later.
@@ -960,8 +1067,24 @@ fn recover(
     let mut builds_after_fault = 0u32;
     let mut first_bytes: Option<(u64, Ms)> = None;
     let mut first_poll = None;
+    let mut encoded = 0u64;
     for now in 0..ticks.len() as Ms {
-        if now >= 1 && now <= last_progress && (last_progress - now).is_multiple_of(POLL_MS) {
+        let poll = now >= 1 && now.abs_diff(last_progress).is_multiple_of(POLL_MS) && fault_at.is_none();
+        if poll && now > last_progress {
+            o.on_progress(now, 1, total, t); // the total repeats
+        }
+        if poll {
+            encoded += 1;
+            o.on_delivery(
+                now,
+                1,
+                Encoded {
+                    video: encoded,
+                    audio: encoded,
+                },
+            );
+        }
+        if poll && now <= last_progress {
             total += 64_000;
             o.on_progress(now, 1, total, t);
             let first = *first_poll.get_or_insert(now);
@@ -975,9 +1098,11 @@ fn recover(
                 assert!(o.is_connected(), "setup: the push is Connected before its fault");
             }
         }
-        if now == last_progress + fault.after {
-            o.on_error(now, 1, t);
-            fault_at = Some(now);
+        if let Fault::Error { after } = fault {
+            if now == last_progress + after {
+                o.on_error(now, 1, t);
+                fault_at = Some(now);
+            }
         }
         if let Some((gen, at)) = first_bytes {
             if now == at {
@@ -994,12 +1119,28 @@ fn recover(
                 };
             }
         }
-        if ticks[now as usize] && o.on_tick(now, t) && o.generation() > 1 {
+        let built = ticks[now as usize] && o.on_tick(now, t);
+        if matches!(fault, Fault::Hung) && now > last_progress && fault_at.is_none() && !o.is_connected() {
+            assert!(
+                matches!(o.state(), OutputState::Backoff { attempt: 1, .. }),
+                "a hung output ends only by the backstop: {:?} at {now}",
+                o.state()
+            );
+            fault_at = Some(now);
+        }
+        if built && o.generation() > 1 {
             assert!(
                 fault_at.is_some(),
                 "built generation {} before the fault",
                 o.generation()
             );
+            if o.generation() == 2 {
+                let want = match fault {
+                    Fault::Error { .. } => SwapReason::Error,
+                    Fault::Hung => SwapReason::EgressStalled,
+                };
+                assert_eq!(o.swap_reason(), want, "{fault:?}");
+            }
             builds_after_fault += 1;
             if builds_after_fault > failed {
                 first_bytes = Some((o.generation(), now + connect_ms));
@@ -1029,7 +1170,16 @@ fn output_recovery_paths_against_the_f004_budget_on_a_1_ms_grid() {
     for k in 0..=SHOWN {
         let e = recover(&t, &ticks, last, RESET, k, worst_connect);
         let s = recover(&t, &ticks, last, STALL, k, worst_connect);
-        let row = (k, e.recovered_at - e.fault_at, s.recovered_at - s.last_progress);
+        let h = recover(&t, &ticks, last, HUNG, k, worst_connect);
+        // A hung output's gap runs from its last byte, which may follow the poll before its last
+        // growth by as little as 1 ms: so up to one poll before `last_progress`.
+        let hung = h.recovered_at - (h.last_progress - POLL_MS);
+        let row = (
+            k,
+            e.recovered_at - e.fault_at,
+            s.recovered_at - s.last_progress,
+            hung,
+        );
         assert_eq!(row.1, worst_from_error(&t, k), "from the error, k = {k}");
         assert_eq!(
             e.fault_at, e.last_progress,
@@ -1045,21 +1195,34 @@ fn output_recovery_paths_against_the_f004_budget_on_a_1_ms_grid() {
             OUTPUT_SINK_TIMEOUT_MS,
             "a stall ends at the sink's timeout"
         );
+        // Owed 94: the backstop backs off exactly its threshold after the last growth (the encoders
+        // delivered throughout), then recovers as from an error from Connected.
+        assert_eq!(
+            h.fault_at - h.last_progress,
+            t.output_egress_flat_ms,
+            "the backstop, k = {k}"
+        );
+        assert_eq!(
+            row.3,
+            POLL_MS + t.output_egress_flat_ms + worst_from_error(&t, k),
+            "a hung output, k = {k}"
+        );
         eprintln!(
-            "k = {k} failed connect(s): from the error {} ms; from the last bytes of a stall {} ms \
-             (budget {OUTPUT_GAP_BUDGET_MS} ms)",
-            row.1, row.2
+            "k = {k} failed connect(s): from the error {} ms; from the last bytes of a stall {} ms; of a \
+             hung output {} ms (budget {OUTPUT_GAP_BUDGET_MS} ms)",
+            row.1, row.2, row.3
         );
         rows.push(row);
     }
     let fits =
-        |gap: fn(&(u32, Ms, Ms)) -> Ms| rows.iter().take_while(|r| gap(r) < OUTPUT_GAP_BUDGET_MS).count();
-    let (from_error, stall) = (fits(|r| r.1), fits(|r| r.2));
+        |gap: fn(&(u32, Ms, Ms, Ms)) -> Ms| rows.iter().take_while(|r| gap(r) < OUTPUT_GAP_BUDGET_MS).count();
+    let (from_error, stall, hung) = (fits(|r| r.1), fits(|r| r.2), fits(|r| r.3));
     eprintln!(
-        "failed connects that still fit {OUTPUT_GAP_BUDGET_MS} ms: from the error {}, after a stall {} \
-         (of {} rows)",
+        "failed connects that still fit {OUTPUT_GAP_BUDGET_MS} ms: from the error {}, after a stall {}, \
+         after a hang {} (of {} rows)",
         from_error as i64 - 1,
         stall as i64 - 1,
+        hung as i64 - 1,
         rows.len()
     );
     assert!(!rows.is_empty(), "measured 0 recoveries");
@@ -1072,8 +1235,10 @@ fn output_recovery_paths_against_the_f004_budget_on_a_1_ms_grid() {
             r.1
         );
     }
-    // A single attempt fits on every path.
+    // A single attempt fits on every path, the hung output's included (Owed 94: the threshold is
+    // derived so that it does).
     assert!(rows[0].2 < OUTPUT_GAP_BUDGET_MS, "{:?}", rows[0]);
+    assert!(rows[0].3 < OUTPUT_GAP_BUDGET_MS, "{:?}", rows[0]);
 }
 
 /// Tick instants for an output mode: tick i at ⌊i · frame period⌋ ms (C08 ticks on the frame period).
@@ -1102,7 +1267,7 @@ fn tick_grid(p: OutputProfile, len: Ms) -> (Vec<bool>, Ms) {
 fn the_budget_holds_on_the_frame_tick_grid_at_every_phase() {
     let t = Thresholds::default();
     let worst_connect = t.output_connect_timeout_ms - 1;
-    let (mut cases, mut worst_seen) = (0usize, 0);
+    let (mut cases, mut worst_seen, mut worst_hung) = (0usize, 0, 0);
     for mode in BOTH_MODES {
         let (ticks, widest) = tick_grid(mode, 21_000 + RUN_MS);
         assert!(
@@ -1135,6 +1300,19 @@ fn the_budget_holds_on_the_frame_tick_grid_at_every_phase() {
                     );
                     assert!(gap < OUTPUT_GAP_BUDGET_MS, "{mode:?} φ{phase} stall: {gap} ms");
                     cases += 1;
+                    // Owed 94 (the PR #73 review's P-1): a hung output, from its last byte up to a
+                    // poll before its last growth. Two timed steps wait for a tick: the backstop and
+                    // the build after its back-off.
+                    let h = recover(&t, &ticks, last, HUNG, k, worst_connect);
+                    let gap = h.recovered_at - (h.last_progress - POLL_MS);
+                    let floor = POLL_MS + t.output_egress_flat_ms + worst_from_error(&t, k);
+                    assert!(
+                        (floor..=floor + 2 * widest).contains(&gap),
+                        "{mode:?} φ{phase} hung: {gap}"
+                    );
+                    assert!(gap < OUTPUT_GAP_BUDGET_MS, "{mode:?} φ{phase} hung: {gap} ms");
+                    worst_hung = worst_hung.max(gap);
+                    cases += 1;
                 }
                 cases += 1;
             }
@@ -1142,7 +1320,8 @@ fn the_budget_holds_on_the_frame_tick_grid_at_every_phase() {
     }
     eprintln!(
         "tick-grid recoveries checked: {cases}; worst from an error through {FAILED_CONNECTS_BUDGETED} \
-         failed connect(s): {worst_seen} ms (budget {OUTPUT_GAP_BUDGET_MS} ms)"
+         failed connect(s): {worst_seen} ms; worst hung output: {worst_hung} ms (budget \
+         {OUTPUT_GAP_BUDGET_MS} ms)"
     );
     assert!(cases > 0, "checked 0 recoveries");
 }

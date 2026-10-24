@@ -8,6 +8,7 @@ use domain::health::{BeatState, ExitDetail, ExitInfo, HealthReport, PhaseChannel
 use domain::input_link::LossReason;
 use domain::ladder::Rung;
 use domain::lifecycle::{ExitReason, Lifecycle};
+use domain::output_link::Encoded;
 use domain::programme::{FrameChoice, ProgrammePhase, SlateKind};
 use domain::supervisor::{
     Decision, Desired, Effect, Event, HeartbeatRefusal, Refusal, SignalKind, Supervisor,
@@ -234,6 +235,7 @@ fn sample(kind: Kind, s: &Supervisor) -> Event {
         Kind::OutputProgress => Event::OutputProgress {
             gen: s.output_generation(),
             total_bytes: 1_000,
+            encoded: Encoded::default(),
         },
         Kind::OutputError => Event::OutputError {
             gen: s.output_generation(),
