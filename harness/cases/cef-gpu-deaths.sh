@@ -16,8 +16,11 @@
 # beat's flush). Owed 70 (a) budgets one survivable death to each (BUDGET_GPU_DEATHS_UNREAD,
 # BUDGET_GPU_DEATHS_AT_EXIT): over either is a red and a finding for the owner, as is the loop's
 # last kill before the die, or unread below 0 (the log counted a death no kill made).
-# Anti-vacuity: each kill's pid differs from the one before. Mutant 7 (cef_gpu_deaths_to_restart 6
-# in a scratch build) must red the threshold run's `died_in_place`.
+# Anti-vacuity: each kill's pid differs from the one before. The loop has a deadline (the PR #52
+# review's I8: with no target it ran to the relay's 900 s): BUDGET_PROCESS_RESTART_OUTPUT_MS before
+# the drive's end, so a restart it causes still shows its outage and its beats before the end
+# request. A loop that reaches it fails (`kill_loop_in_time`). Mutant 7 (cef_gpu_deaths_to_restart
+# 6 in a scratch build) must red the threshold run's `died_in_place`.
 
 CASE_LIVE_S=90
 KILL_SPACING_MS=2000
@@ -32,13 +35,14 @@ case "$CASE_VARIANT" in
 esac
 
 case_drive() {
-  local n
+  local n deadline
   n="$(threshold cef_gpu_deaths_to_restart)"
+  deadline=$((DRIVE_START_MS + CASE_LIVE_S * 1000 - $(threshold budget_process_restart_output_ms)))
   at_s 20
   case "$CASE_VARIANT" in
-    threshold) in_compositor gpu-loop "$n" "$KILL_SPACING_MS" | mark_lines kill || true ;;
-    one-fewer) in_compositor gpu-loop $((n - 1)) "$KILL_SPACING_MS" | mark_lines kill || true ;;
-    fast) in_compositor gpu-loop $(($(threshold chromium_gpu_deaths_abort) - 1)) 0 | mark_lines kill || true ;;
+    threshold) in_compositor gpu-loop "$n" "$KILL_SPACING_MS" "$deadline" | mark_lines kill || true ;;
+    one-fewer) in_compositor gpu-loop $((n - 1)) "$KILL_SPACING_MS" "$deadline" | mark_lines kill || true ;;
+    fast) in_compositor gpu-loop $(($(threshold chromium_gpu_deaths_abort) - 1)) 0 "$deadline" | mark_lines kill || true ;;
   esac
   at_s "$CASE_LIVE_S"
 }
@@ -63,11 +67,14 @@ require_restarted() {
 }
 
 case "$CASE_VARIANT" in
-  threshold) CASE_CHECKS=17 ;;
-  one-fewer) CASE_CHECKS=9 ;;
-  fast) CASE_CHECKS=18 ;;
+  threshold) CASE_CHECKS=18 ;;
+  one-fewer) CASE_CHECKS=10 ;;
+  fast) CASE_CHECKS=19 ;;
 esac
 case_verdict() {
+  # The loop's own end line, when the exec lived to print it (a restart kills the exec with its
+  # container): never its deadline.
+  require kill_loop_in_time 'mark("kill_done") | all(.value.timed_out == false)' 'mark("kill_done") | map(.value)'
   case "$CASE_VARIANT" in
     threshold)
       require kills_distinct '(mark("kill") | length) == $t.cef_gpu_deaths_to_restart and (mark("kill") | map(.value.pid) | repeats) == []' \

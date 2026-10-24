@@ -651,15 +651,23 @@ fn camera_stop_slates_and_returns_and_reds_without_its_pause() {
     );
 }
 
-fn camera_flap() -> World {
+/// 12 pauses, one every 10 s from 5 s, each `pause_ms` long (the case's own rule: halfway between
+/// slate_after_ms and input_stall_after_ms, from thresholds.json).
+fn camera_flap_paused(pause_ms: i64) -> World {
     let mut w = World::new(125);
     for i in 0..12 {
-        let (p, r) = (w.at(5.0 + 10.0 * f64::from(i)), w.at(10.0 + 10.0 * f64::from(i)));
-        w.mark("pause", p, Value::Null);
+        let p = w.at(5.0 + 10.0 * f64::from(i));
+        let r = p + pause_ms;
+        w.mark("pause", p, json!({"pause_ms": pause_ms}));
         w.mark("resume", r, Value::Null);
         w.camera_gaps.push((p + 30, r + 30));
     }
     w
+}
+
+fn camera_flap() -> World {
+    let t = World::new(1);
+    camera_flap_paused((t.ms("slate_after_ms") + t.ms("input_stall_after_ms")) / 2)
 }
 
 #[test]
@@ -675,6 +683,13 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
         &judge(&w, "camera-flap", "", "flap-nohold"),
         "flap_hysteresis",
         "flap-nohold",
+    );
+    // The first build's pause: input_stall_after_ms itself, the boundary the review's I5 moved off.
+    let w = camera_flap_paused(World::new(1).ms("input_stall_after_ms"));
+    assert_fails(
+        &judge(&w, "camera-flap", "", "flap-boundary"),
+        "flaps_seen",
+        "flap-boundary",
     );
 }
 
@@ -735,9 +750,22 @@ fn reader_kicked_returns_after_each_kick_and_reds_on_a_missed_kick_or_an_early_a
     );
 }
 
+/// `netem.sh stats out`'s line, with no backlog.
 fn netem(present: bool, sent_bytes: u64, sent_pkts: u64, dropped: u64) -> Value {
+    netem_queued(present, sent_bytes, sent_pkts, dropped, 0, 0)
+}
+
+/// `netem.sh stats out`'s line, with `backlog_bytes` in `backlog_pkts` queued.
+fn netem_queued(
+    present: bool,
+    sent_bytes: u64,
+    sent_pkts: u64,
+    dropped: u64,
+    backlog_bytes: u64,
+    backlog_pkts: u64,
+) -> Value {
     json!({"leg": "out", "present": present, "sent_bytes": sent_bytes, "sent_pkts": sent_pkts,
-        "dropped": dropped})
+        "dropped": dropped, "backlog_bytes": backlog_bytes, "backlog_pkts": backlog_pkts})
 }
 
 /// The output cut at 20 s and cleared at 50 s; MediaMTX has frames again `back_ms` after the clear.
@@ -773,15 +801,16 @@ fn dest_disconnect_recovers_and_reds_when_nothing_was_dropped_or_the_return_is_l
 }
 
 /// A stall from 20 s. The egress total grows once more after the cut (the kernel's send buffer
-/// drains for under a second), then by `trickle` at each beat until the clear. With `swaps`, the
+/// drains for under a second), then by `trickle` at each beat until the clear. With `stall_x` 1, the
 /// stall is seen `output_stall_after_ms` after that drain, on the next output poll, and the next beat
-/// carries the swap.
-fn dest_stall(trickle: i64, swaps: bool, stats: Value) -> World {
+/// carries the swap; 2 is a detector twice as slow (mutant 9, simulated); 0 swaps nothing.
+fn dest_stall(trickle: i64, stall_x: i64, stats: Value) -> World {
     let mut w = dest_cut(2_500, stats);
     let cut = w.at(20.0);
     let clear = w.at(50.0) + 50;
     let drained = cut + 800;
-    let swap = drained + w.ms("output_stall_after_ms") + w.ms("output_progress_poll_ms");
+    let swaps = stall_x > 0;
+    let swap = drained + stall_x * w.ms("output_stall_after_ms") + w.ms("output_progress_poll_ms");
     let mut total = 0;
     let mut drain_seen = false;
     for (at, body) in &mut w.beats {
@@ -805,46 +834,115 @@ fn dest_stall(trickle: i64, swaps: bool, stats: Value) -> World {
     w
 }
 
+/// Case 5 in CI (run 40045826841): at 1 kbit nothing was sent in 30 s, and the queue held the leg.
+fn stalled() -> Value {
+    netem_queued(true, 0, 0, 0, 130_862, 45)
+}
+
 #[test]
-fn dest_stall_swaps_the_sink_and_reds_without_a_swap() {
-    let w = dest_stall(0, true, netem(true, 3_000, 30, 0));
+fn dest_stall_swaps_the_sink_and_reds_without_a_swap_or_a_slow_one() {
+    let w = dest_stall(0, 1, stalled());
     assert_pass(&judge(&w, "dest-stall", "", "stall-good"), "stall-good");
-    let w = dest_stall(0, false, netem(true, 3_000, 30, 0));
+    let w = dest_stall(0, 0, stalled());
     assert_fails(
         &judge(&w, "dest-stall", "", "stall-noswap"),
         "stall_swap",
         "stall-noswap",
     );
+    // Mutant 9: output_stall_after_ms doubled. The first build's bound (a beat interval wide) let it
+    // pass (the PR #52 review's I4).
+    let w = dest_stall(0, 2, stalled());
+    assert_fails(
+        &judge(&w, "dest-stall", "", "stall-slow"),
+        "stall_swap",
+        "stall-slow",
+    );
+    // The rate limit held nothing: no backlog, or no netem qdisc at all.
+    for (tag, stats) in [
+        ("stall-nobacklog", netem(true, 0, 0, 0)),
+        ("stall-noqdisc", netem(false, 0, 0, 0)),
+    ] {
+        let w = dest_stall(0, 1, stats);
+        assert_fails(&judge(&w, "dest-stall", "", tag), "fault_applied", tag);
+    }
 }
 
 #[test]
 fn dest_trickle_swaps_under_a_trickle_and_reds_when_nothing_trickled() {
-    let w = dest_stall(5_000, true, netem(true, 30_000, 300, 0));
+    // Case 12's qdisc in CI: 16 packets through at 8 kbit, one more queued.
+    let trickling = || netem_queued(true, 19_271, 16, 0, 65_536, 1);
+    let w = dest_stall(5_000, 1, trickling());
     assert_pass(&judge(&w, "dest-trickle", "", "trickle-good"), "trickle-good");
     // Mutant 5: the netem line commented out: nothing trickles (a plain stall), and the qdisc is a
     // pass-through that never existed.
-    let w = dest_stall(0, true, netem(false, 0, 0, 0));
+    let w = dest_stall(0, 1, netem(false, 0, 0, 0));
     assert_fails(
         &judge(&w, "dest-trickle", "", "trickle-none"),
         "trickled",
         "trickle-none",
     );
+    // Case 5's stall under case 12's name: the qdisc sent nothing.
+    let w = dest_stall(0, 1, stalled());
+    assert_fails(
+        &judge(&w, "dest-trickle", "", "trickle-stalled"),
+        "trickled",
+        "trickle-stalled",
+    );
+    // One packet through: not a trickle the bytes can be said to have made.
+    let w = dest_stall(0, 1, netem_queued(true, 1_448, 1, 0, 130_862, 45));
+    assert_fails(
+        &judge(&w, "dest-trickle", "", "trickle-onepkt"),
+        "trickled",
+        "trickle-onepkt",
+    );
+    // A trickle with no swap at all.
+    let w = dest_stall(5_000, 0, trickling());
+    assert_fails(
+        &judge(&w, "dest-trickle", "", "trickle-noswap"),
+        "trickled",
+        "trickle-noswap",
+    );
 }
 
-fn cpu_starved(bogo_ops: u64, rung_back: bool, felt: bool) -> World {
+/// What the burn did to the compositor (case 6).
+#[derive(Clone, Copy, PartialEq)]
+enum Felt {
+    /// Nothing: droppedFrames 0 and rung full throughout (CI's first build, a sibling container).
+    No,
+    /// The overruns the ladder's step needs, and no step (the ladder never moves).
+    Drops,
+    /// A step to overlay_half_rate with no overrun counted (droppedFrames never rose).
+    Uncounted,
+    /// Overruns and the step to overlay_half_rate.
+    Step,
+}
+
+/// 16 workers burn from 20 s for 40 s; `done` is the burn's end line (it ran its whole time).
+fn cpu_starved(done: bool, rung_back: bool, felt: Felt) -> World {
     let mut w = World::new(80);
     let (a, b) = (w.at(20.0), w.at(60.0));
-    w.mark("stress_start", a, Value::Null);
-    w.mark("stress_end_seen", b + 200, Value::Null);
-    w.mark("stress_end", b, json!({"exit_code": 0, "bogo_ops": bogo_ops}));
-    if felt {
-        w.beats_in(a, b, |x| {
-            x["droppedFrames"] = json!(40);
-            x["encoderSpeed"] = json!(0.8);
-        });
-        let half = a + 6_000;
-        let end = w.end;
-        w.beats_in(half, end + 1, |x| x["rung"] = json!("overlay_half_rate"));
+    w.mark("stress", a, json!({"at_ms": a, "workers": 16, "seconds": 40}));
+    if done {
+        w.mark(
+            "stress_done",
+            b,
+            json!({"done_at_ms": b, "workers": 16, "elapsed_ms": b - a}),
+        );
+    }
+    let step = w.ms("ladder_overruns_to_step");
+    let end = w.end;
+    // droppedFrames is the session's overrun count (cumulative, the ladder's `overruns`).
+    let dropped = match felt {
+        Felt::No | Felt::Uncounted => 0,
+        Felt::Drops => step,
+        Felt::Step => 40,
+    };
+    w.beats_in(a + 1_000, end + 1, |x| x["droppedFrames"] = json!(dropped));
+    if felt != Felt::No {
+        w.beats_in(a, b, |x| x["encoderSpeed"] = json!(0.8));
+    }
+    if matches!(felt, Felt::Step | Felt::Uncounted) {
+        w.beats_in(a + 6_000, end + 1, |x| x["rung"] = json!("overlay_half_rate"));
         if rung_back {
             w.beats_in(b + 5_000, end + 1, |x| x["rung"] = json!("full"));
         }
@@ -853,29 +951,50 @@ fn cpu_starved(bogo_ops: u64, rung_back: bool, felt: bool) -> World {
 }
 
 #[test]
-fn cpu_starved_holds_its_frame_rate_and_reds_without_stress_or_when_the_rung_climbs() {
+fn cpu_starved_steps_the_ladder_and_holds_its_frame_rate_and_reds_when_nothing_moved() {
     assert_pass(
-        &judge(&cpu_starved(52_000, false, true), "cpu-starved", "", "cpu-good"),
+        &judge(
+            &cpu_starved(true, false, Felt::Step),
+            "cpu-starved",
+            "",
+            "cpu-good",
+        ),
         "cpu-good",
     );
-    let w = cpu_starved(0, false, true);
+    let w = cpu_starved(false, false, Felt::Step);
     assert_fails(
-        &judge(&w, "cpu-starved", "", "cpu-noops"),
+        &judge(&w, "cpu-starved", "", "cpu-notdone"),
         "stress_ran",
-        "cpu-noops",
+        "cpu-notdone",
     );
-    let w = cpu_starved(52_000, true, true);
+    // The burn's workers stopped early (its end line, but a short window).
+    let mut w = cpu_starved(true, false, Felt::Step);
+    let done = w.marks.iter_mut().find(|m| m.0 == "stress_done").unwrap();
+    done.2["elapsed_ms"] = json!(10_000);
+    assert_fails(
+        &judge(&w, "cpu-starved", "", "cpu-short"),
+        "stress_ran",
+        "cpu-short",
+    );
+    let w = cpu_starved(true, true, Felt::Step);
     assert_fails(
         &judge(&w, "cpu-starved", "", "cpu-climbs"),
         "rung_holds",
         "cpu-climbs",
     );
-    let w = cpu_starved(52_000, false, false);
+    // CI's first build: the stress never reached the compositor (the PR #52 review's I3).
+    let w = cpu_starved(true, false, Felt::No);
     assert_fails(
         &judge(&w, "cpu-starved", "", "cpu-unfelt"),
-        "stress_seen_in_beats",
+        "ladder_moved",
         "cpu-unfelt",
     );
+    // Each half of `ladder_moved` alone: overruns enough for a step and no step, then a step with no
+    // overrun counted.
+    for (tag, felt) in [("cpu-nostep", Felt::Drops), ("cpu-uncounted", Felt::Uncounted)] {
+        let w = cpu_starved(true, false, felt);
+        assert_fails(&judge(&w, "cpu-starved", "", tag), "ladder_moved", tag);
+    }
 }
 
 fn score_down(page_says: bool, overlay_drops: bool) -> World {
@@ -925,29 +1044,52 @@ fn score_down_reports_stale_and_holds_the_last_score_and_reds_when_the_page_is_s
     );
 }
 
-fn cef_killed(kill: Value, code: i64) -> World {
+/// `in-container.sh kill-cef` at 20 s: its targets (`kill`, printed before the kill) and, when the
+/// exec lived to print it, its status (`kill_rc`).
+fn cef_killed_rc(kill: Value, rc: Option<i64>, code: i64) -> World {
     let mut w = World::new(70);
     let k = w.at(20.0);
     let mut v = kill;
     v["at_ms"] = json!(k);
     w.mark("kill", k, v);
+    if let Some(rc) = rc {
+        w.mark("kill_rc", k + 5, json!({"rc_at_ms": k + 5, "rc": rc}));
+    }
     w.restart(k + 1_200, code, None);
     w
 }
 
+fn cef_killed(kill: Value, code: i64) -> World {
+    cef_killed_rc(kill, Some(0), code)
+}
+
 #[test]
 fn cef_killed_restarts_the_process_and_reds_when_the_kill_missed_or_the_exit_is_in_place() {
-    let good = || json!({"killed": [201, 202, 203], "types": ["zygote", "zygote", "gpu-process"], "rc": 0});
+    let good = || json!({"killed": [201, 202, 203], "types": ["zygote", "zygote", "gpu-process"]});
     assert_pass(
         &judge(&cef_killed(good(), 133), "cef-killed", "", "cef-good"),
         "cef-good",
     );
-    let w = cef_killed(json!({"killed": [], "types": [], "rc": 1}), 133);
+    // The container died under the exec before its status line: the targets alone.
+    assert_pass(
+        &judge(
+            &cef_killed_rc(good(), None, 133),
+            "cef-killed",
+            "",
+            "cef-good-norc",
+        ),
+        "cef-good-norc",
+    );
+    // Mutant 8 (CI's first build, the PR #52 review's C1): a NUL-only split finds no CEF child (its
+    // failed status aside: the empty target list alone reds).
+    let w = cef_killed_rc(json!({"killed": [], "types": []}), None, 133);
     assert_fails(
         &judge(&w, "cef-killed", "", "cef-missed"),
         "kill_applied",
         "cef-missed",
     );
+    let w = cef_killed_rc(good(), Some(1), 133);
+    assert_fails(&judge(&w, "cef-killed", "", "cef-rc"), "kill_applied", "cef-rc");
     let w = cef_killed(good(), 75);
     assert_fails(
         &judge(&w, "cef-killed", "", "cef-inplace"),
@@ -970,13 +1112,40 @@ fn cef_killed_restarts_the_process_and_reds_when_the_kill_missed_or_the_exit_is_
         "cef_ready_after_restart",
         "cef-noready",
     );
+    // Mutant 3 (the review's m3): the new process logs ready, but its first beat is not ready.
+    let mut w = cef_killed(good(), 133);
+    let start = w.starts()[1];
+    let first = w
+        .beats
+        .iter()
+        .map(|b| b.0)
+        .filter(|&at| at > start + 1_500)
+        .min()
+        .unwrap();
+    w.beats_in(first, first + 1, |x| x["graphics"] = json!("starting"));
+    assert_fails(
+        &judge(&w, "cef-killed", "", "cef-notready"),
+        "cef_ready_after_restart",
+        "cef-notready",
+    );
+}
+
+/// The kill's status line reads a failed `kill`.
+fn fail_kill_rc(w: &mut World) {
+    let m = w
+        .marks
+        .iter_mut()
+        .find(|m| m.0 == "kill_rc")
+        .expect("a kill_rc mark");
+    m.2["rc"] = json!(1);
 }
 
 fn process_killed(pid: Value, restart_delay: i64) -> World {
     let mut w = World::new(70);
     let k = w.at(20.0);
     w.mark("netem_before", w.at(18.0), netem(true, 9_000_000, 8_000, 0));
-    w.mark("kill", k, json!({"at_ms": k, "pid": pid, "rc": 0}));
+    w.mark("kill", k, json!({"at_ms": k, "pid": pid}));
+    w.mark("kill_rc", k + 5, json!({"rc_at_ms": k + 5, "rc": 0}));
     w.line(k + 50, "the compositor was killed by SIGKILL (status 137)");
     let start = w.restart(k + 80, 137, None);
     if restart_delay > 0 {
@@ -1000,6 +1169,13 @@ fn process_killed_restarts_within_budget_and_reds_on_a_missed_kill_or_a_slow_res
         &judge(&w, "process-killed", "", "proc-nopid"),
         "kill_applied",
         "proc-nopid",
+    );
+    let mut w = process_killed(json!(31), 0);
+    fail_kill_rc(&mut w);
+    assert_fails(
+        &judge(&w, "process-killed", "", "proc-rc"),
+        "kill_applied",
+        "proc-rc",
     );
     let w = process_killed(json!(31), 9_000);
     assert_fails(
@@ -1053,6 +1229,11 @@ fn input_impaired_keeps_the_clock_and_reds_when_nothing_was_dropped_or_retransmi
 /// `cef_hang_after_ms` after its last alive line and restarts graphics; without, the overlay holds
 /// to the end.
 fn cef_hung(detected: bool) -> World {
+    cef_hung_late(detected, 0)
+}
+
+/// As `cef_hung`, the hide `late_ms` after the product's rule.
+fn cef_hung_late(detected: bool, late_ms: i64) -> World {
     let mut w = World::new(60);
     let armed = w.at(20.0);
     w.mark("armed", armed, json!({"page_hang_armed": true}));
@@ -1071,10 +1252,16 @@ fn cef_hung(detected: bool) -> World {
         w.overlay_hold.push((hang, end + 1));
         return w;
     }
-    let hide = last_alive + w.ms("cef_hang_after_ms") + 20;
+    // The hide is decided on the programme's frame clock: the first frame at or after
+    // cef_hang_after_ms of no alive line shows no overlay, and the log's line comes 6 ms before that
+    // frame (CI run 40045826841: the log 10 012 ms after the last alive, the strip 10 018 ms).
+    let prog0 = (w.live - 2_000) as f64;
+    let due = (last_alive + w.ms("cef_hang_after_ms") + late_ms) as f64;
+    let gap = (prog0 + ((due - prog0) / PERIOD_MS).ceil() * PERIOD_MS).floor() as i64;
+    let hide = gap - 6;
     let ready = hide + 2_500;
-    w.overlay_hold.push((hang, hide + 80));
-    w.overlay_none.push((hide + 80, ready + 300));
+    w.overlay_hold.push((hang, gap));
+    w.overlay_none.push((gap, ready + 300));
     w.line(hide, "overlay hidden reason=hang gen=1");
     w.line(hide + 50, "graphics restart gen=2");
     w.line(ready, "cef ready gen=2");
@@ -1096,6 +1283,22 @@ fn cef_hung_hides_and_restarts_graphics_and_reds_when_the_hang_is_never_seen() {
         "one_hang_hide",
         "hung-unseen",
     );
+    // Mutant 4's gap (the review's m4): no beat in the span, so `all()` would pass on nothing.
+    let mut w = cef_hung(true);
+    let hang = w.page_hang.unwrap();
+    w.beats.retain(|(at, b)| *at < hang || b["state"] != "playing");
+    assert_fails(
+        &judge(&w, "cef-hung", "", "hung-nobeats"),
+        "beats_never_failed",
+        "hung-nobeats",
+    );
+    // A hide two frames late: the brief's bound has one frame of slack (the review's m1 revert).
+    let late = (2.0 * PERIOD_MS).ceil() as i64;
+    assert_fails(
+        &judge(&cef_hung_late(true, late), "cef-hung", "", "hung-late"),
+        "detect_ms",
+        "hung-late",
+    );
 }
 
 /// A zygote killed at 20 s; with `in_place`, the compositor names it gone within the budget and
@@ -1108,8 +1311,9 @@ fn zygote(child: &str, in_place: bool, killed_type: &str) -> World {
         "kill",
         k,
         json!({"at_ms": k, "pid": 41, "ppid": 17, "compositor": 17, "type": killed_type,
-            "want": want, "children": [52], "child_types": [child], "rc": 0}),
+            "want": want, "children": [52], "child_types": [child]}),
     );
+    w.mark("kill_rc", k + 5, json!({"rc_at_ms": k + 5, "rc": 0}));
     if in_place {
         let verdict = k + w.ms("cef_child_poll_ms") - 100;
         w.line(
@@ -1156,6 +1360,13 @@ fn cef_gpu_zygote_killed_restarts_in_place_and_reds_without_the_in_place_restart
         &judge(&w, "cef-gpu-zygote-killed", "", "zyg-notzygote"),
         "killed_the_zygote",
         "zyg-notzygote",
+    );
+    let mut w = zygote("gpu-process", true, "zygote");
+    fail_kill_rc(&mut w);
+    assert_fails(
+        &judge(&w, "cef-gpu-zygote-killed", "", "zyg-rc"),
+        "killed_the_zygote",
+        "zyg-rc",
     );
 }
 
@@ -1210,6 +1421,15 @@ fn gpu_deaths(kills: u32, spacing_ms: i64, count_lag_ms: i64, restarts: bool, ex
         let detail = format!("restart in place: {n} CEF GPU-process deaths");
         w.restart(d, 75, Some(&detail));
         assert!(line < d);
+    } else {
+        // The loop lived to its end (no restart took its container): its done line.
+        let done = kill_at.last().copied().unwrap_or(k0) + 10;
+        w.mark(
+            "kill_done",
+            done,
+            json!({"done_at_ms": done, "done": kills, "wanted": kills, "compositor_alive": true,
+                "timed_out": false}),
+        );
     }
     w
 }
@@ -1261,14 +1481,43 @@ fn cef_gpu_deaths_fast_restarts_before_the_abort_and_reds_when_the_loop_reaches_
     );
 }
 
+/// The review's I8: a loop that reaches its deadline (no new GPU process to kill) fails, in every
+/// variant, rather than running to the relay's own deadline.
 #[test]
-fn cef_leaks_is_reported_not_runnable_never_faked() {
+fn cef_gpu_deaths_reds_when_the_kill_loop_reaches_its_deadline() {
+    let n = World::new(1).ms("cef_gpu_deaths_to_restart") as u32;
+    let mut checked = 0;
+    for variant in ["threshold", "one-fewer", "fast"] {
+        let mut w = gpu_deaths(1, 2_000, 800, false, 0);
+        w.marks.retain(|m| m.0 != "kill_done");
+        let deadline = w.end - w.ms("budget_process_restart_output_ms");
+        w.mark(
+            "kill_done",
+            deadline,
+            json!({"done_at_ms": deadline, "done": 1, "wanted": n, "compositor_alive": true,
+                "timed_out": true}),
+        );
+        let tag = format!("gpu-deadline-{variant}");
+        assert_fails(
+            &judge(&w, "cef-gpu-deaths", variant, &tag),
+            "kill_loop_in_time",
+            &tag,
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 3);
+}
+
+/// The review's I6: NOT RUNNABLE is never a pass. run-case.sh exits 3 (non-success), chaos.yml's leg
+/// fails on it, and run-chaos.sh's table holds wave gate 3 blocked (chaos_table.rs).
+#[test]
+fn cef_leaks_is_reported_not_runnable_never_faked_and_never_a_pass() {
     for variant in ["three", "two"] {
         let tag = format!("leaks-{variant}");
         let v = judge(&World::new(60), "cef-leaks", variant, &tag);
         eprintln!("{tag}: {}", v.json);
         assert_eq!(v.status, "not_runnable", "{tag}");
-        assert_eq!(v.exit, Some(3), "{tag}");
+        assert_eq!(v.exit, Some(3), "{tag}: NOT RUNNABLE exits non-success");
         assert_eq!(v.json["checks_run"], 0, "{tag}");
         assert!(v.json["not_runnable_reason"]
             .as_str()

@@ -38,22 +38,25 @@ def repeats: . as $v | [range(1; $v | length) | select($v[.] == $v[. - 1])];
 def index_regressions: [.overlay.runs[] | select(.index != null) | .index] as $i
   | [range(1; $i | length) | select($i[.] < $i[. - 1])];
 
-# A destination stall (cases 5 and 12): the first beat after the cut whose sinkSwaps rose, and the
-# anchor Owed 39 asks for: the last beat before it whose egressBytes grew (the kernel's send buffer
-# keeps the total growing after a cut, so a bound timed from the cut is wrong by the drain). The
-# true last growth is at or before that beat, so the bound from it never reds a correct swap.
+# A destination stall (cases 5 and 12), timed on event timestamps (the PR #52 review's I4): the
+# swap is the log's first `sink swap` line after the cut (docker-stamped, ms), and the anchor Owed 39
+# asks for is the last beat before that line whose egressBytes grew (the kernel's send buffer keeps
+# the total growing after a cut, so a bound timed from the cut is wrong by the drain). The true last
+# growth is at or before that beat, so `from_growth_ms <= output_stall_after_ms +
+# output_progress_poll_ms` never reds a correct swap, and a detector one stall threshold slow reds
+# unless the true growth fell in the last poll before the previous beat (under 1 run in 20 by phase,
+# when the threshold doubles). The beat that first carries the raised sinkSwaps must exist too.
 def stall_swap($cut):
   ([beats[] | select(.received_ms <= $cut)] | last | .body.sinkSwaps) as $s0
-  | ([beats[] | select(.received_ms > $cut and (.body.sinkSwaps // -1) > $s0)] | first) as $swap
-  | (if $swap == null then [] else [beats[] | select(.received_ms < $swap.received_ms)] end) as $b
+  | ([beats[] | select(.received_ms > $cut and (.body.sinkSwaps // -1) > $s0)] | first) as $swap_beat
+  | ([.log.sink_swaps[] | select(.at_ms > $cut)] | first | .at_ms) as $swap
+  | (if $swap == null then [] else [beats[] | select(.received_ms < $swap)] end) as $b
   | ([range(1; $b | length) | select(($b[.].body.egressBytes // 0) > ($b[. - 1].body.egressBytes // 0))
       | $b[.].received_ms] | last) as $grow
-  | {swaps_before: $s0, swap_ms: ($swap.received_ms // null), last_growth_ms: $grow,
-     from_cut_ms: (if $swap == null then null else $swap.received_ms - $cut end),
-     from_growth_ms: (if $swap == null or $grow == null then null else $swap.received_ms - $grow end),
-     bound_ms: ($t.output_stall_after_ms + $t.output_progress_poll_ms + $t.heartbeat_interval_ms),
-     egress_between: (if $swap == null then [] else
-       [beats[] | select(.received_ms >= $cut and .received_ms <= $swap.received_ms) | .body.egressBytes] end)};
+  | {swaps_before: $s0, swap_ms: $swap, swap_beat_ms: ($swap_beat.received_ms // null), last_growth_ms: $grow,
+     from_cut_ms: (if $swap == null then null else $swap - $cut end),
+     from_growth_ms: (if $swap == null or $grow == null then null else $swap - $grow end),
+     bound_ms: ($t.output_stall_after_ms + $t.output_progress_poll_ms)};
 
 # The output's return after a fault cleared at $clear (cases 4, 5, 12): the first outage that ends
 # after it.

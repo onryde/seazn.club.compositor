@@ -125,14 +125,21 @@ mark() {
   local at="${MARK_AT_MS:-$(now_ms)}"
   printf '{"name":"%s","at_ms":%s,"value":%s}\n' "$1" "$at" "${2:-null}" >>"$OUT/marks.jsonl"
 }
-# Each JSON line of in_compositor's output as a mark of <name>, stamped with the line's own at_ms
-# (the container's clock is this host's). Prints the lines.
+# Each JSON line of in_compositor's output as a mark, stamped with the line's own time (the
+# container's clock is this host's): an `at_ms` line (a kill's targets, printed before it kills; a
+# tree line; a loop's kill) is a mark of <name>, a `rc_at_ms` line (a kill's status, after it) one
+# of <name>_rc, and a `done_at_ms` line (a loop's or a burn's end) one of <name>_done. Prints them.
 mark_lines() {
-  local name="$1" line at
+  local name="$1" line kind_at
   while IFS= read -r line; do
     printf '%s\n' "$line"
-    at="$(printf '%s\n' "$line" | jq -r '.at_ms // empty' 2>/dev/null || true)"
-    if [ -n "$at" ]; then MARK_AT_MS="$at" mark "$name" "$line"; fi
+    kind_at="$(printf '%s\n' "$line" | jq -r 'if .at_ms then "\(.at_ms)" elif .rc_at_ms then "_rc \(.rc_at_ms)"
+      elif .done_at_ms then "_done \(.done_at_ms)" else empty end' 2>/dev/null || true)"
+    case "$kind_at" in
+      "") ;;
+      _*) MARK_AT_MS="${kind_at#* }" mark "$name${kind_at%% *}" "$line" ;;
+      *) MARK_AT_MS="$kind_at" mark "$name" "$line" ;;
+    esac
   done
 }
 # Sleeps until <seconds> after the case's drive started.
