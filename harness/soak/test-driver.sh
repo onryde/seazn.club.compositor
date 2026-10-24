@@ -9,7 +9,7 @@
 #
 #   HARNESS_BASH=<bash 5> harness/soak/test-driver.sh     (driver.sh needs bash 5: mapfile, EPOCHREALTIME)
 #
-# About 90 s. Prints `checked: N` and fails on zero.
+# About 100 s. Prints `checked: N` and fails on zero.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -29,7 +29,7 @@ cp "$HERE/driver.sh" "$HERE/schedule.jq" "$HERE/mediamtx.yml" "$W/soak/"
 cp "$ROOT/contracts/fixtures/relay-job.v1/session-composed-720p.json" "$W/soak/"
 cp "$ROOT/harness/pages/overlay-test.html" "$W/soak/pages/"
 jq '. + {min_drive_min: 1, dropout_every_s: 6, dropout_phase_s: 3, dropout_pause_s: 1, disconnect_hold_s: 2,
-         live_wait_s: 20, end_wait_s: 10, log_wait_s: 20, lost_beats_end_s: 5}' "$HERE/soak.json" >"$W/soak/soak.json"
+         control_wait_s: 3, live_wait_s: 20, end_wait_s: 10, log_wait_s: 20, lost_beats_end_s: 5}' "$HERE/soak.json" >"$W/soak/soak.json"
 
 STATE="$W/state"
 export STATE
@@ -54,7 +54,7 @@ done
 echo "curl $method $url" >>"$STATE/calls"
 body=""
 case "$method $url" in
-  "GET http://127.0.0.1:7000/healthz") body="ok" ;;
+  "GET http://127.0.0.1:7000/healthz") [ ! -e "$STATE/no-healthz" ] || exit 7; body="ok" ;;
   "POST http://127.0.0.1:7000/control/timeline-start") body='{"start_wall_ms":1}' ;;
   "POST http://127.0.0.1:7000/control/desired?state=ending") touch "$STATE/ending"; body='{"desiredState":"ending"}' ;;
   "GET http://127.0.0.1:7000/control/timeline") body='{"start_wall_ms":1,"delay_ms":3100,"events":[]}' ;;
@@ -160,8 +160,31 @@ check "status done" '.[0].phase == "done"' "$W/out/status.json"
 check "fake-control on every address, the private name in the session's origins" \
   '.[0] | test("--listen \\[::\\]:7000") and test("--input-origin srt://m0.vm.soak-test.internal:8890") and test("--overlay-origin http://m0.vm.soak-test.internal:7000")' \
   <(grep '^fake-control ' "$STATE/calls" | jq -R .)
+
+# Run 2, the error path: fake-control never answers. The driver writes done (not ok, with its exit)
+# and status error, then holds /out until the hard stop (soak.yml fetches on phase error), and exits
+# with its error.
+mkdir -p "$W/out2"
+touch "$STATE/no-healthz"
+t1="$(now_ms)"
+rc2=0
+env -i PATH="$W/bin:/usr/bin:/bin:/usr/sbin:/sbin:$(dirname "$(command -v jq)")" HOME="$W" STATE="$STATE" \
+  SOAK_ROOT="$W/soak" SOAK_OUT="$W/out2" SESSION_ID="11111111-2222-4333-8444-555555555555" JOB_TOKEN="$JOB_TOKEN" \
+  SOAK_DRIVE_MIN=1 SOAK_DEADLINE_MS=$((t1 + 600000)) SOAK_HARD_STOP_MS=$((t1 + 8000)) SOAK_PAGE=test \
+  FLY_MACHINE_ID=m0 FLY_APP_NAME=soak-test "$BASH5" "$W/soak/driver.sh" >"$W/driver2.out" 2>&1 || rc2=$?
+held_ms=$(($(now_ms) - t1))
+check "error: done not ok, with the driver's exit" '.[0] | .ok == false and .driver_exit == 1' "$W/out2/done"
+check "error: status error" '.[0].phase == "error"' "$W/out2/status.json"
 checked=$((checked + 1))
-if printf '%s\n' "$JOB_TOKEN" | grep -rqF -f - "$W/out" "$W/driver.out" "$STATE/calls"; then
+if [ "$rc2" -eq 1 ] && [ "$held_ms" -ge 7500 ]; then
+  echo "PASS error: exit 1, /out held to the hard stop (${held_ms} ms)"
+else
+  echo "FAIL error: exit $rc2 after ${held_ms} ms (want 1, held at least 7500 ms)"
+  tail -n 20 "$W/driver2.out"
+  failures=$((failures + 1))
+fi
+checked=$((checked + 1))
+if printf '%s\n' "$JOB_TOKEN" | grep -rqF -f - "$W/out" "$W/out2" "$W/driver.out" "$W/driver2.out" "$STATE/calls"; then
   echo "FAIL the job token reached a file"
   failures=$((failures + 1))
 else

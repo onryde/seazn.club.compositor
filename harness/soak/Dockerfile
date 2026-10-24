@@ -29,4 +29,6 @@ RUN chmod 0755 /soak/driver.sh \
     && for b in mediamtx fake-camera fake-control checker jq curl iptables ip6tables tini; do \
          command -v "$b" >/dev/null || { echo "missing $b"; exit 1; }; done
 WORKDIR /out
-ENTRYPOINT ["/usr/bin/tini", "--", "/soak/driver.sh"]
+# `-s`: tini is not PID 1 on a Machine (the platform's init is), so it reaps as a subreaper, as the
+# relay image's does.
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/soak/driver.sh"]

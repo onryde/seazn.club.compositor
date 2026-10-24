@@ -14,8 +14,12 @@
   "deliveries_per_min": 1,
   "hidden_reasons": ["hang", "crash", "recycle"],
   "rung_ok": "full",
+  "control_wait_s": 60,
   "live_wait_s": 600,
   "end_wait_s": 120,
   "log_wait_s": 900,
-  "lost_beats_end_s": 90
+  "lost_beats_end_s": 90,
+  "poll_after_min": 10,
+  "hard_stop_after_min": 25,
+  "timeout_after_min": 40
 }

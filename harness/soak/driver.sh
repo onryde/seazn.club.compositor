@@ -75,6 +75,7 @@ export HARNESS_SRT_PASSPHRASE
 
 pids=()
 done_written=0
+stopping=0
 finish() {
   local rc=$?
   set +e
@@ -82,10 +83,16 @@ finish() {
   if [ "$done_written" -eq 0 ]; then
     status error "the driver exited ($rc) before done"
     jq -cn --argjson rc "$rc" '{ok: false, driver_exit: $rc}' >"$OUT/done"
+    # Keep /out for the job's fetch (it reads phase error and fetches at once), unless the Machine is
+    # being stopped: the hard stop still bounds it.
+    if [ "$stopping" -eq 0 ]; then
+      log "error: holding /out for the job until the hard stop"
+      while [ "$(now_ms)" -lt "$SOAK_HARD_STOP_MS" ]; do sleep 2; done
+    fi
   fi
 }
 trap finish EXIT
-trap 'log "TERM: stopping"; exit 143' TERM INT
+trap 'stopping=1; log "TERM: stopping"; exit 143' TERM INT
 
 # The dest disconnect's firewall: whichever iptables backend this kernel takes, for each family.
 FW4=""
@@ -134,8 +141,8 @@ camera() {
   [[ "$code" =~ ^[0-9]{3}$ ]] || code=0
   echo $((10#$code))
 }
-for _ in $(seq 1 60); do control GET /healthz >/dev/null 2>&1 && break; sleep 1; done
-control GET /healthz >/dev/null || { log "FAIL fake-control never answered"; tail -n 20 "$OUT/fake-control.log"; exit 1; }
+for _ in $(seq 1 "$(soak control_wait_s)"); do control GET /healthz >/dev/null 2>&1 && break; sleep 1; done
+control GET /healthz >/dev/null 2>&1 || { log "FAIL fake-control never answered"; tail -n 20 "$OUT/fake-control.log"; exit 1; }
 
 # The last beat's receipt time (LAST_BEAT_MS), kept when the file's last line is still being written.
 LAST_BEAT_MS=0
