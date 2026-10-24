@@ -150,8 +150,8 @@ fn the_beats_fps_is_the_frames_out_of_the_encoder_over_the_beat_window() {
     };
     let (mut before, fps, mut after) = sampled(&mut m);
     assert_eq!(fps, None, "the first total opens the window");
-    // A window comfortably past the 1 s minimum (OUTPUT_FPS_MIN_WINDOW_MS) on a loaded runner.
-    let wait = Duration::from_millis(1_300);
+    // A window comfortably past the minimum (OUTPUT_FPS_MIN_WINDOW_MS) on a loaded runner.
+    let wait = Duration::from_millis(domain::config::OUTPUT_FPS_MIN_WINDOW_MS + 300);
     let mut checked = 0;
     for frames in [40u32, 0, 39] {
         encode(frames);
