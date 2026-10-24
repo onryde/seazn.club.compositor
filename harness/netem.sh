@@ -11,6 +11,10 @@
 #   netem.sh in|out <netem args...>   a prio qdisc (4 bands), the filter to band 4, netem on it
 #   netem.sh clear in|out             removes the leg's qdiscs
 #   netem.sh check in|out             FAILS unless the leg's netem qdisc has carried packets
+#   netem.sh stats in|out             one JSON line: the netem qdisc's Sent bytes and packets and
+#                                     its dropped count (C14: a case's witness that its fault ran;
+#                                     netem counts the packets its `loss` drops there), or
+#                                     "present": false once the leg is cleared
 #
 # `check` is what lets a case claim its fault was applied: the netem qdisc's own packet count is
 # the witness that the filter matched (prints the filter's `success` count too when the kernel
@@ -21,7 +25,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 COMPOSITOR_IP=172.28.0.10
 
 usage() {
-  echo "usage: netem.sh in|out <netem args...> | clear in|out | check in|out" >&2
+  echo "usage: netem.sh in|out <netem args...> | clear in|out | check in|out | stats in|out" >&2
   exit 64
 }
 
@@ -67,6 +71,20 @@ case "$1" in
       echo "netem $leg: FAIL the filter matched nothing, so no fault was applied" >&2
       exit 1
     fi
+    ;;
+  stats)
+    [ "$#" -eq 2 ] || usage
+    leg="$2"
+    stats="$(tc_on "$leg" -s qdisc show dev eth0)"
+    printf '%s\n' "$stats" | awk -v leg="$leg" '
+      /qdisc netem 40:/ { f = 1; next }
+      f && /Sent/ {
+        bytes = $2; pkts = $4; d = $0
+        sub(/.*dropped /, "", d); sub(/,.*/, "", d)
+        printf "{\"leg\":\"%s\",\"present\":true,\"sent_bytes\":%.0f,\"sent_pkts\":%.0f,\"dropped\":%.0f}\n", leg, bytes, pkts, d
+        done = 1; exit
+      }
+      END { if (!done) printf "{\"leg\":\"%s\",\"present\":false,\"sent_bytes\":0,\"sent_pkts\":0,\"dropped\":0}\n", leg }'
     ;;
   in | out)
     leg="$1"
