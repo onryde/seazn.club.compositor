@@ -9,7 +9,13 @@ dedicated app `seazn-relay-soak` (org seazn-club, region `lhr`). One workflow jo
 gh workflow run soak.yml --ref <branch> -f minutes=30 -f sha=<40-hex head>               # plumbing (test page)
 gh workflow run soak.yml --ref <branch> -f minutes=30 -f sha=<40-hex head> -f page=real  # the rehearsal
 gh workflow run soak.yml --ref <branch> -f sha=<40-hex head> -f page=real                # the 3 h soak (185)
+gh workflow run soak.yml --ref <branch> -f sha=<40-hex head> -f page=real -f minutes=15 \
+  -f legs=A:snow,A:noise,C:snow,C:noise                                                  # the cost legs' pictures
+gh workflow run soak.yml --ref <branch> -f sha=<40-hex head> -f page=real -f minutes=15 \
+  -f legs=B:<720p's heavier>,D:<1080p's heavier>                                         # the rest (see "The cost legs")
 ```
+
+`-f guest=performance-8x` puts the compositor Machine on the next size (a soak or a leg).
 
 ## The pieces
 
@@ -24,19 +30,25 @@ gh workflow run soak.yml --ref <branch> -f sha=<40-hex head> -f page=real       
 | `sampler.py` | Check (d): once a minute, compares the programme with the camera-only recording over the camera's still bands (see "The overlay sampler"). |
 | `flylog.py` | Turns the platform's log stream into the `docker logs --timestamps` shape that logfacts reads, plus `logscan.json` for check (b). |
 | `test-verdict.sh` | Runs the verdict on `fixtures/green` (a 30-min miniature) and on one jq patch per red. Each case asserts its status, its exact failing ids, its reason and the check list. |
-| `test-driver.sh` | Runs the driver under stubs on a 1-minute compressed schedule. It also covers the error path, which holds `/out` until the hard stop. |
+| `test-driver.sh` | Runs the driver under stubs on a 1-minute compressed schedule. It also covers the error path, which holds `/out` until the hard stop, the secrets scan's jars, and cost legs B and C. |
 | `test-sampler.sh` | Runs `sampler.py` on synthetic recordings made with ffmpeg: a moving square and a noise strip, with an overlay bar that goes off air for one minute, a disconnect, and a missing segment. It also covers an all-noise camera and a run with no start. |
 | `test-workflow.sh` | Checks `soak.yml`'s shape: the gate and the plan step, run for real; `--restart no`; the job token; the `always()` destroy; the page source's job. It also runs `flylog.py` on a recorded-shape stream. |
 | `web.Dockerfile` | page=real's harness image: the soak image plus a standalone seazn.club build, node, and Postgres 16 with the migrated database restored at build time. See "The page source". |
 | `web/up.sh` | page=real's page source on the Machine: Postgres, the web server, the seed, the stream session, the signed URL, a pre-flight. |
 | `web/serve.sh` | Starts the web server with an allowlisted environment and a per-run signing key. |
-| `web/seed.mjs`, `web/score.mjs` | The seed and the score driver (check (c)), through the app's own API. `web/lib.mjs` is their HTTP door and the relay token. |
+| `web/seed.mjs`, `web/score.mjs` | The seed and the score driver (check (c)), through the app's own API. `web/lib.mjs` is their HTTP door, the relay token and the page feed's moments. `score.mjs --boundaries` is the cricket legs' driver. |
+| `web/rally.mjs` | The badminton legs' driver: a rally every 3 s, each game kept level (see "The cost legs"). |
 | `web/session.sql`, `web/overlay-url.mjs` | The composed stream session the relay door checks, and the door's signed URL. |
 | `web/bundle-check.sh` | Fails when the web build carries a PostHog key, a Sentry DSN or a Stripe key. |
 | `web/smoke.sh` | `up.sh` and three deliveries inside the built image, on the runner, before the push. |
 | `web/test-bundle-check.sh`, `web/test-overlay-url.sh` | The bundle check on synthetic builds; the signed URL against an independent HS256 verifier. |
+| `cost/in-compositor.sh` | On the compositor Machine (bash builtins only: the relay image has no procps or python). `sample <max_s>`: a JSON line a second from `/proc` (the Machine's cores, the process tree's by kind, the busiest compositor thread, memory). `kill-renderer`: SIGKILL to every CEF `--type=renderer` process, once. |
+| `cost/leg.sh` | On the runner, in the background: puts `in-compositor.sh` on the compositor Machine, keeps its sampler running over `flyctl ssh console`, and kills the renderer at the drive's midpoint over `flyctl machine exec`. |
+| `cost/verdict.sh`, `cost/cost.jq` | A leg's verdict (the size rule, the moments, the reload, the samples) and its F-005 column. |
+| `cost/table.sh` | The legs' columns as one F-005-shaped table (the `cost-table` job). |
+| `cost/test-cost.sh`, `cost/fixture.py` | The sampler on fake `/proc` trees worked by hand, the kill on the test's own processes, `leg.sh` on a stub flyctl, the verdict on a green leg and one mutation per red, the table. |
 
-`check.yml` runs the six tests.
+`check.yml` runs the seven tests.
 
 ## The overlay sampler (check (d))
 
@@ -241,6 +253,57 @@ page=test stays at performance-4x, 8192 MB. The compositor Machine is alone on t
   - A delivery made by a second writer mid-run gave one `409 SEQ_CONFLICT`. The driver re-read the
     ledger and its next delivery landed on the right ball.
 
+## The cost legs
+
+C15's legs A to D (`soak.json` `legs`): 720p and 1080p, `bar` on cricket and `bug` on badminton,
+each on the production page from the standalone page source, on the compositor guest `guest` names.
+`legs` turns the soak job into a matrix of `leg:camera` runs, one at a time (`max-parallel: 1`, and
+`fail-fast: false` so one red leg does not cancel the rest). Each run is a whole soak job: its own
+two Machines, named `…-<leg>-<camera>`, its own destroy step and its own artifact. A leg needs
+page=real, a drive of at least `leg_min_drive_min` (`minutes=15` is 10 minutes), and a camera of
+`leg_cameras` per leg (`A:snow`) or from `camera`.
+
+**What a leg drives.** No dropout and no disconnect. The score driver makes a moment at the page's
+pace: cricket a boundary every `cost_ball_every_s` (6 s; fours and sixes alternate, each a doubled
+moment of about 5 s, so the bar's cards run nearly back to back, and the compositor's 5 s poll sees
+each), badminton a rally every `cost_rally_every_s` (3 s; the game kept level, so a fresh game
+point every second rally from 19-19). `leg.sh` kills the CEF renderer once at the drive's midpoint;
+the page reloads in place.
+
+**The verdict** (`cost/verdict.sh`, every number from `soak.json`):
+
+| Check | What it requires |
+|---|---|
+| `run` | One start and one end; the drive at least `leg_min_drive_min`. |
+| `samples` | From +`cost_sample_from_s` (15 s) to the end, at least `cost_samples_min_ratio` of a sample a second, each reading the guest's CPU count (so a leg on the wrong size fails). |
+| `cpu` | The Machine's CPU p95 (nearest rank) at most `cost_cpu_p95_max_share` (50 %) of the guest's cores. |
+| `rung` | Every beat's rung is `full`, the reload included. |
+| `drops` | The final `droppedFrames` is 0. |
+| `moments` | At least `cost_moments_min_per_min` (1) moment a minute, by the page's own feed. A feed that answered for none of the events fails. |
+| `reload` | Exactly one kill, which found a renderer and exited 0, from the midpoint to `cost_kill_late_max_s` after it, inside the drive, and a later beat reads `graphics: ready`. |
+
+The step summary gets the leg's F-005 column: the Machine's cores avg / p95 / max, the tree's and
+each kind's (compositor, renderer + gpu + utility + zygote, Xvfb), the busiest compositor thread,
+encoder speed, fps, the final drops, the rungs, the moments a minute by kind, the kill and the
+page's return, memory, and the Owed 93 projection. The `cost-table` job joins every leg's column
+into one table. Each leg's artifact keeps `cost.json`, the raw samples, the kill's lines and
+`stills.tar`: eight programme stills (six a second apart at a quarter of the drive, one 45 s after
+the kill, one 30 s before the end), to look at and never commit.
+
+**The dispatch.** The 2026-10-23 amendment asks for each pattern once per profile on the
+production guest, then the heavier one. So: `A:snow,A:noise,C:snow,C:noise` first, then B on 720p's
+heavier pattern and D on 1080p's. If B or D measures above A or C, the brief's sport hypothesis
+failed and a football leg is owed before a size is chosen. A leg over the size rule on
+performance-4x reruns with `-f guest=performance-8x`.
+
+**Owed 93** (a held teardown's page keeps painting at about the live renderer's CPU) is measured,
+not judged (owner ruling 4A kept): each column's "p95 + two held pages" adds twice the leg's mean
+renderer cores to its p95 and compares it with the size rule. Its row is on
+`feat/c14-case16-leaks`, not on `main`, so it closes there, from these numbers.
+
+**Owed after the runs:** the F-entry "real overlay cost" in `_FINDINGS.md` (the table, both
+patterns per profile, the sport reason or the football leg), and Owed 93's closure.
+
 ## Findings (the brief's premises that did not hold)
 
 1. **A public page never goes ready under the compositor, on stg or anywhere.** The overlay page passes
@@ -283,11 +346,28 @@ page=test stays at performance-4x, 8192 MB. The compositor Machine is alone on t
     requiring the compositor's `gen=N: loading <origin>` line (`cef_graphics.rs`, `restart`). In
     rehearsal 40124733978's platform log (1155 lines) no `loading` line appears; the first line of
     generation 1 is `gen=1: ready`. Owed below.
+11. **The brief's renderer kill, `pkill -KILL -f cef`, kills the compositor, not the page.** Every
+    CEF child dying aborts the compositor (Owed 62), a process restart, and the soak's compositor
+    Machine runs `--restart no` and `--rm`, so the leg would end there. `kill-renderer` kills only
+    the `--type=renderer` processes: cefsrc logs "Render subprocess terminated, reloading URL!",
+    the compositor reads CefCrashed and the page reloads, which is the reload the brief asks for.
+12. **The page emits no moment signal.** Its console lines are `seazn:ready`, `seazn:alive`,
+    `seazn:score-stale` and the phase channel only (web at `7dcb3c42e2`), so nothing outside the page
+    sees a moment play. The legs count moments from the page's own feed instead: the public overlay
+    route's `recent` item for each event's seq, read through the same moment rules as the page
+    (`lib/overlay-moments.ts`). That counts the moments the page was handed, not the ones it painted;
+    the stills are the visual check. A `seazn:moment` console line would let the compositor's log
+    count what played.
+13. **bwf's best of 3 cannot fill a 10-minute leg at a rally every 3 s.** It lasts at most 3 × 59
+    rallies, about 8.9 minutes. The seed's badminton division is best of 5 (`config: {bestOf: 5}`
+    over the preset), about 14.8 minutes at most.
+14. **A four needs `boundary: 4` to be a moment.** `runs.bat` 4 alone gives none, so
+    `score.mjs --boundaries` sends `boundary` with each four and six.
 
 ## Owed (not in this PR)
 
-- **The cost legs (I5)**: the next PR, with their own acceptance (the brief's cost-leg and
-  snow-versus-noise checks cannot be reached from this one).
+- **The cost legs' numbers**: built here (see "The cost legs"); the F-entry and Owed 93's closure
+  wait for the dispatches.
 - **M7**: a slate outside the scheduled windows (an unplanned input loss) differs from the camera
   and counts as on air. Cross-check the beat's `programmePhase == live` at each sample's instant.
 - **M8**: a positive witness that the real page is the one on air (every generation's `loading`
