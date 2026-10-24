@@ -1,4 +1,4 @@
-# C14: Chaos suite (~~10~~ 12 cases, automated pass/fail; amended 2026-10-18)
+# C14: Chaos suite (~~10~~ ~~12~~ 16 cases, automated pass/fail; amended 2026-10-18, 2026-10-20 and 2026-10-24)
 
 **Repo:** `seazn.club.compositor`. **Depends on:** C13. Read spec §6 (the robustness table and
 budgets) and §9.4 (the cases).
@@ -36,7 +36,7 @@ Add a unit test that each budget is consistent with its threshold. For example,
 `slate_after_ms + one frame period ≤ BUDGET_SLATE_AFTER_LOSS_MS`. A spike-driven threshold change
 that breaks a budget then reds at `cargo test`, not in a 2-minute chaos run.
 
-### The 10 cases (12 with the 2026-10-18 amendment's cases 11 and 12)
+### The 10 cases (12 with the 2026-10-18 amendment's cases 11 and 12; 16 with the 2026-10-20 amendment's cases 13–16)
 
 The PDF's kill-switch case is replaced by "CEF killed".
 
@@ -228,10 +228,365 @@ its `exitCode` clause (the process then aborts at the next GPU death, or runs on
 `cef_gpu_deaths_to_restart` to 6 in the scratch build: expected red, case 15 (the abort comes first). As with mutant
 1, the verdict reads the committed `harness/thresholds.json`.
 
+## Amendment 2026-10-24 (as built: branch `feat/c14-chaos`; the coordinator's dispatch of 2026-10-23)
+
+The suite has **16 cases**. The title, Files, Step 7 and Acceptance said 10 or 12, but cases 13–16
+came with the 2026-10-20 amendment, so those lines are corrected inline. It runs in CI only (owner
+ruling 2026-10-23: no local Docker), so Steps 4 and 6 are `chaos.yml` runs, not local runs.
+
+**What is built** (the coordinator's ruling: C14 owns the harness extensions it needs):
+- `harness/cases/<case>.sh`, one file per case. Each holds the case's drive, its marks and its
+  verdict.
+  - The verdict is a list of `require` lines. Each line is jq over the checker's `report.json`,
+    using `harness/cases/lib.jq`, with `$t`, `$run`, `$case` and `$timeline` bound.
+  - Every number comes from `harness/thresholds.json`.
+  - A case declares its check count, and a verdict that runs fewer checks fails.
+- `harness/run-case.sh <case> [<variant>]` is C13's runner, extended. It adds:
+  - docker events, reduced to die and start with exit codes;
+  - `docker logs --timestamps`;
+  - `RestartCount` at live and at the end, fake-control's `/control/state`, and the cores check;
+  - the case's marks;
+  - `CASE_REJUDGE=1`, which re-judges a downloaded `out/<run>` with no stack;
+  - `CASE_NOT_RUNNABLE`, which reports and exits 3.
+- `harness/in-container.sh` makes every kill from `/proc`, as root in the compositor's container.
+  The relay image has no procps, and it is not changed for the harness.
+- `harness/chaos.json` lists 31 legs: the 16 cases, case 15's three runs and case 16's two. Cases 8,
+  9, 13 and 14, and case 15's `threshold` and `fast` runs, run 3 times each.
+- `.github/workflows/chaos.yml` runs each case, variant and repeat as its own matrix leg, with
+  fail-fast off. It runs on pull requests that touch `harness/**`, `crates/harness/**` or the
+  workflow, and on `workflow_dispatch` (`cases=all`, or a list of legs).
+- `harness/run-chaos.sh --table` prints the table.
+  - It goes red on FAIL, ERROR or MISSING, and on a false-positive sweep that ran on no leg.
+  - It reports NOT RUNNABLE and never counts it red.
+  - It prints the worst outage of each repeated case.
+- `crates/harness/tests/case_verdicts.rs` simulates each case's run from the product's declared
+  behaviour, runs it through `checker::analyze`, and re-judges it with run-case.sh.
+  - Every good run passes, printing every declared check.
+  - Each of 31 red runs fails on its named check.
+  - The two case 16 runs report NOT RUNNABLE.
+  - `crates/harness/tests/chaos_table.rs` checks the plan and the table.
+
+**Wave gate 3 (three consecutive green full runs):** run
+`gh workflow run chaos.yml --ref <branch> -f cases=all` three times. Dispatch each run only after the
+previous one has finished green. Paste the three tables from the table job's summary.
+
+**Deviations** (the implementer's, inside the dispatch; none is an owner ruling):
+1. The budgets live in `crates/harness/src/thresholds.rs`, not `crates/domain/src/config.rs`
+   (Step 1), because the dispatch kept the domain read only. The drift gate is a test
+   (`harness::thresholds` and `tests/thresholds.rs`), not a check.yml step (Step 2), because
+   check.yml was another PR's.
+2. Verdicts are `require` lines in each case file, sharing `lib.jq`, not one `.jq` file per case.
+3. `chaos.yml` runs on harness pull requests and on dispatch, as the dispatch set it. It has no
+   nightly `schedule` (Files).
+4. `run-chaos.sh` tables the verdicts of the parallel legs; it does not run the cases in sequence.
+5. Case 6's stress is a stress-ng container beside the stack. It competes for the host's CPU, not
+   from inside the compositor's cgroup. Only the harness image gains `stress-ng`.
+6. Case 11's detect bound adds `BUDGET_FRAME_TO_ENCODER_MS`. The hide is judged on the recording's
+   strip, and that frame reaches MediaMTX after the decision.
+7. Cases 13 and 14 run for 70 s, not 60, to fit the restart's outage (up to 15 s) and case 14's
+   process-tree read at 60 s.
+8. Case 8's restart evidence (Owed 19) is the new process's own `cef ready`, and every beat after
+   the kill reads `ready`, `restarting` or `starting`. Since Owed 62 the kill takes the whole
+   process, so the old process has no generation g+1.
+9. Case 3's return is timed from the first content gap that ends after the kick's mark. The mark
+   is stamped before the kick lands, so the gap can start just after it.
+
+**False premises:** see `docs/_INDEX.md`, rows dated 2026-10-24.
+
+**Mutants** run on the throwaway draft PR `mut/c14-r1`. Each needs its own named FAIL line, plus a
+control check that proves the stack ran:
+
+| # | Mutant | Case | Required |
+|---|---|---|---|
+| 1 | `resume_after_ms` 0 in a scratch relay build; the verdict reads the committed thresholds.json | `camera-flap` | `FAIL flap_hysteresis` |
+| 2 | Comment out case 8's kill line. Replaces "disable the held overlay frame", which is stale: since Owed 62 the kill takes the process, and no held frame is judged | `cef-killed` | `FAIL kill_applied` |
+| 3 | Comment out case 1's `/pause` | `camera-stop` | `FAIL camera_paused` |
+| 4 | Delete C05b's Ready hang arm (`on_air`'s Ready branch) in a scratch relay build | `cef-hung` | `FAIL one_hang_hide` |
+| 5 | Comment out case 12's `netem` line | `dest-trickle` | `FAIL trickled` |
+| 6 | `restart_cause` returns nothing for a zygote, in a scratch relay build | `cef-gpu-zygote-killed` | `FAIL died_in_place` |
+| 7 | `cef_gpu_deaths_to_restart` 6, in a scratch relay build | `cef-gpu-deaths threshold` | `FAIL died_in_place` |
+
+## Amendment 2026-10-24, fix round 1 (the PR #52 review; chaos run 40045826841)
+
+The review (NEEDS FIXES) read the first CI run: 7 PASS, 2 NOT RUNNABLE, 18 FAIL, 4 hung. This
+section supersedes the lines of "Amendment 2026-10-24" it names. The rows are in `docs/_INDEX.md`
+(decision "C14 fix round 1", false premises dated "C14 fix round 1", Owed 79, 82, 83 and 84) and
+`_FINDINGS.md` F-023.
+
+**What changed:**
+- **Kills (C1).** `harness/in-container.sh` reads a process's `--type=` by the product's rule
+  (`split_cmdline` in `crates/adapters/src/cef_graphics.rs`, mirrored): a NUL-only split found no
+  CEF child, because Chromium's renamed children hold one space-joined string. Every kill prints
+  its targets before it kills (`kill` mark) and its status after (`kill_rc`). A kill with no target
+  fails the leg. `crates/harness/tests/in_container.rs` runs the script on a fake /proc of real
+  space-joined CEF 139 command lines.
+- **Case 5 (I1).** The witness is the netem qdisc's backlog (`netem.sh stats`: `backlog_bytes`,
+  `backlog_pkts`), not its Sent count.
+- **Case 12 (I2).** The witness is the qdisc's sent packets (at least 2) and the swap. The beats'
+  "2 distinct egressBytes" is withdrawn: a correct swap ends that window after one or two beats.
+- **Case 6 (I3).** Replaces deviation 5. The burn runs inside the compositor's container
+  (`in-container.sh burn`, 4 workers per CPU of its quota), so it shares the compositor's cgroup.
+  `ladder_moved` requires a beat at `overlay_half_rate` and droppedFrames up by at least
+  `ladder_overruns_to_step`; a burn that moves nothing is a FAIL. The harness image is unchanged.
+- **Cases 5 and 12 (I4).** `stall_swap` times the swap from the log's `sink swap` line against the
+  last beat whose egressBytes grew, within `output_stall_after_ms + output_progress_poll_ms`. A
+  doubled threshold reds, except in about 1 run in 20 by phase.
+- **Budgets (I4, m7).** Each `BUDGET_*` is pinned to the sentence its source states (spec §6, or
+  this brief), so a budget edited and regenerated reds `cargo test` (Owed 83).
+- **Cases 1 and 2 (I5).** fake-camera sends a key frame at every resume, so `suppressed_ms` no
+  longer counts a decoder's wait for the next key. Case 2 pauses
+  `(slate_after_ms + input_stall_after_ms) / 2` (4 000 ms), one flap every 10 s. Its floor is
+  `resume_after_ms − BUDGET_FRAME_TO_ENCODER_MS`: the hold-off starts at the first frame's arrival,
+  and the frame shown at the switch is up to that much older.
+- **NOT RUNNABLE (I6, the coordinator's ruling).** Replaces "It reports NOT RUNNABLE and never counts
+  it red". A NOT RUNNABLE leg fails in `chaos.yml`. The table ends with a wave gate 3 line, and with
+  case 16 unrun it reads `WAVE GATE 3: BLOCKED: 2 NOT RUNNABLE (...; Owed 82, the owner's ruling)`
+  and exits 1. The false-positive sweep must run on every leg that calls it, not on any one.
+- **Case 15 (I8).** `gpu-loop` has a deadline: the drive's end less
+  BUDGET_PROCESS_RESTART_OUTPUT_MS. A loop that reaches it fails `kill_loop_in_time`.
+- **Cases 4 and 12 (I9).** The two extra outages are product behaviour plus MediaMTX's recorder:
+  a sink that connects after the clear sends its backlog, and the recorder discards it (F-023).
+  The verdicts are not loosened. Owed 84 is for the owner.
+- **Case 11.** Replaces deviation 6. The detect bound is the brief's again (`cef_hang_after_ms` +
+  one frame period): CI read the strip 6 ms behind the log.
+
+**Wave gate 3** cannot count a run while case 16 is NOT RUNNABLE (Owed 82), nor while cases 4 and
+12 are red (Owed 84).
+
+**Mutants**, two added to the table above:
+
+| # | Mutant | Case | Required |
+|---|---|---|---|
+| 8 | `in-container.sh` splits each command-line field on NUL only (CI's first build, C1) | `cef-killed` | `FAIL kill_applied` |
+| 9 | `output_stall_after_ms` 10 000 in a scratch relay build; the verdict reads the committed thresholds.json (I4) | `dest-stall` | `FAIL stall_swap` |
+
+## Amendment 2026-10-24, fix round 2 (chaos runs 40051995233 and 40051902711; mutants 40051985045)
+
+Both chaos runs were on 90f8a5b. Every red was read from its artifacts before anything changed.
+This section supersedes the lines it names. The rows are in `docs/_INDEX.md`: decision "C14 fix
+round 2", false premises dated "C14 fix round 2", Owed 70, 84, 85 and 86. The measurements are in
+`_FINDINGS.md` F-024.
+
+**What changed:**
+- **Kills (items 1 and 3).** `in-container.sh` died before it printed or killed. Under bash 5.2
+  with `set -e`, `$(<"/proc/$pid/stat")` on a vanished pid ends the script, even inside `||`.
+  Every /proc read is a builtin `read` or `mapfile` now. `in_container.rs`'s fake /proc gains a
+  vanished pid that sorts first.
+- **Case 8 (item 4).** Replaces "non-zero and not 75" (amendment 2026-10-20).
+  - Since F-022's listing at ready, C11b's zygote verdict can beat Chromium's abort. CI read 75 in
+    1 run of 6.
+  - The owner's ruling "B" (Owed 56) asks for that restart.
+  - `died_to_restart` accepts any non-zero exit, and accepts 75 only with C11b's own final beat
+    (`exitReason` "restart").
+- **Case 14.** `old_tree_gone` requires the kill mark. Without the mark, `starts_after(null)` is
+  the run's first start, so every tree passed.
+- **Case 15, fast.** `deaths_logged` shows the deciding line and the kills, against the most deaths
+  any line counted. The check itself is unchanged.
+- **chaos.yml (item 6).** The NOT RUNNABLE error line is built by jq from the verdict. The step's
+  source, which GitHub prints in every leg, no longer carries the words.
+- **run-case.sh.** It keeps the names from `docker diff` in `container-diff.txt`, for Owed 85.
+
+**Product findings, not loosened:**
+- **Owed 70 (a).** The fast loop's 5 kills took about 330 ms, and the poll counted 1.
+- **Owed 85.** CEF fails to start in 13 of 18 container restarts, after every kind of exit.
+  - The cause is unproven. What is measured: a restarted entrypoint skips its Xvfb wait, because the
+    previous Xvfb's socket persists on the container's writable layer.
+  - Cases 13–15 never ask for the overlay back. The recommendation is in that row; it is not built.
+- **Owed 86.** Under the burn, the window ran at 11.5 and 24.7 fps, and every beat read fps 30,
+  droppedFrames 0 and rung `full`.
+- **Owed 84 extends to case 5.** It depends on the clear's phase. A clear that lands within a
+  pending connect's 5 s timeout bursts and resets the recorder, and one that lands after the timeout
+  does not.
+
+**Expected reds** until those rows are ruled:
+- cef-leaks-two and cef-leaks-three (Owed 82);
+- dest-disconnect, dest-stall and dest-trickle (Owed 84; green only by phase);
+- cef-gpu-deaths-fast ×3 (Owed 70 (a));
+- cef-killed ×3, wherever the restart's CEF fails (Owed 85);
+- cpu-starved (Owed 86).
+
+**Mutant 9, retargeted.** Under case 5's 1 kbit, rtmp2sink's own socket timeout swaps the sink
+before the stall rule fires, so a doubled threshold passed. Case 12's trickle is the only path to
+the stall rule. 10 000 would survive about 1 run in 20 by the phase of the growth beat, so the
+mutant takes 20 000:
+
+| # | Mutant | Case | Required |
+|---|---|---|---|
+| 9 | `output_stall_after_ms` 20 000 in a scratch relay build; the verdict reads the committed thresholds.json | `dest-trickle` | `FAIL stall_swap` (controls `trickled`, `fp_swept_inputs`) |
+
+## Amendment 2026-10-24, fix round 3 (chaos runs 40056474269 and 40056388445; mutants 40056471001)
+
+The coordinator's fix-round-3 dispatch. Each red was read from its artifacts first.
+
+**Case 14 (`old_tree_gone`, 6 of 6 red): a harness clock, not a surviving tree.**
+- Every typed process in `tree_after` was the new tree's. Each was parented to the new compositor
+  and started 130–450 ms after the new init.
+- in-container.sh's `start_ms` was `btime` plus the start ticks. btime is whole seconds, fixed at
+  boot, and it read 173–1 080 ms early against docker's events.
+- `start_ms` is now the wall clock less the process's age, from /proc/uptime read beside it.
+- The check anchors on the sampled init (pid 1), not on docker's `start` event:
+  - the init must have started after the kill;
+  - the sample must come after the `start` event;
+  - every typed process must be younger than the init.
+- The event is the daemon's report of the start, and CEF's first child starts 130 ms in.
+
+**Cases 5 and 12 (`stall_swap`): the swap's cause (Owed 87).**
+- In 4 of 4 CI swaps, rtmp2sink's own 5 s socket timeout failed the sink first. Its
+  `output gen=1 error:` line came 5.53–5.78 s after the cut, and the swap followed after the
+  500 ms back-off.
+- So a bound alone cannot witness the stall rule: mutant 9's 20 s threshold swapped as fast.
+- The `sink swap` line names no reason. A Connected sink is swapped by the stall rule or by its
+  own bus error, and the error path always logs its error first.
+- `stall_swap` therefore requires `cause` "stall": no `output gen=<g> error` from the outgoing
+  generation before the swap (logfacts' `output_errors`).
+- Both cases red on it until Owed 87's product change.
+- **Mutant 9 is unkillable on a green baseline until then.** Its baseline reds `stall_swap`.
+  It stays in the list, so the run records that.
+
+**Cases 8 and 13–15: the overlay comes back (the coordinator's decision).**
+- `require_overlay_back`: the first recorded frame whose score strip reads, after the restart's
+  `start`, comes within BUDGET_PROCESS_RESTART_OUTPUT_MS of the die. The budget is spec §6's "a
+  process crash's output is back within 15 s", which takes §9.4's "overlay back" with it.
+- It is in `require_in_place_restart` (cases 13, 14, 15 threshold, 15 fast) and in case 8.
+- Case 15 one-fewer has no restart, so it is timed from the last kill.
+- CI's healthy restarts had the overlay back 2.1–2.2 s after the die. Owed 85's never did, so those
+  legs red `overlay_back` until Owed 85 is fixed.
+
+**The table (item 4).**
+- chaos.json's `owed` names the Owed row behind each check a leg is known to fail.
+- run-chaos.sh marks each failed check with its row, or NOT OWED.
+- It lists the red legs whose every failed check is owed, the reds no row explains, and each named
+  row's title.
+- No verdict, exit status or gate line reads it.
+
+**Expected reds:**
+- cef-leaks ×2 (Owed 82, NOT RUNNABLE);
+- dest-disconnect (84);
+- dest-stall and dest-trickle (87, and 84 by phase);
+- cpu-starved (86);
+- cef-gpu-deaths-fast ×3 (70 (a));
+- cef-killed, cef-gpu-zygote-killed, cef-renderer-zygote-killed and cef-gpu-deaths-threshold,
+  wherever the restarted CEF does not come back (85).
+
+## Amendment 2026-10-24, fix round 4 (the re-review of 8b71aef)
+
+The coordinator's fix-round-4 dispatch. Harness only; every new guard mutated once (27 mutants,
+all killed, each by its intended sim).
+
+**Case 11 (`detect_ms`): judged on the log, the strip against the log (I-1).**
+- This amends the 2026-10-18 bound (strip − last alive ≤ `cef_hang_after_ms` + one frame period),
+  which had no term for the strip's dating (false premise row).
+- The product's rule: the hide comes at the first tick at or after `cef_hang_after_ms` past the
+  last alive. So `hide − alive` (both log lines) must lie in [`cef_hang_after_ms` − 1 period,
+  + 2 periods]: the rule's one period, and one more each way for two docker stamps and a late tick.
+- The strip's first overlay-less frame must lie within BUDGET_FRAME_TO_ENCODER_MS of the logged
+  hide, either way: a strip time is a MediaMTX segment name (±17 ms of arrival jitter, F-021)
+  plus the frame's offset.
+- A beat late is +2 000 ms, so both still red any meaningful mutant (m4 among them).
+
+**Wave gate 3 counts whole first attempts only (I-2, m-7).** A selection of legs or a re-run attempt
+is green for what it ran and says it never counts. The table prints the attempt, the head and the
+leg count.
+
+**Owed tags by evidence (I-3).** chaos.json's `owed_signatures` gives each Owed row a jq predicate
+over the leg's verdict.json. A failed check is tagged with a row only when that row's signature
+holds in the run. Otherwise it reads `NOT OWED: Owed <r>'s signature absent`.
+
+**Case 6: a quota, not a burn (I-4).** This amends the 2026-10-18 amendment's burn (and round 1's
+16 workers).
+- The drive reads the container's cgroup CPU time at 15 s and 20 s, and sets `docker update
+  --cpus` to 0.75 of that demand from 20 s for 40 s. Then it puts the quota back.
+- `stress_ran`: the quota was under the demand, held 40 s, and restored.
+- `starvation_applied`, a drive witness: the window under the fps floor, a beat under
+  `encoder_speed_realtime_min`, or an overrun counted. A starvation nothing felt is the harness's
+  own red, and `ladder_moved` passes only on a starved window.
+- The share is a drive parameter. Whether the ladder's one rung below full can hold the clock
+  against it is unmeasured, so the owner sets it (Owed 86).
+
+**Cases 4, 5 and 12: the clear's phase is printed (I-5).** `clear_phase` gives the last sink swap
+at or before the clear, and whether a connect was pending then (under
+OUTPUT_CONNECT_TIMEOUT_MS). It is not driven. Wave gate 3 still needs a burst-phase run among its
+three, or a driven phase.
+
+**Minors.**
+- m-1: case 15 one-fewer's `overlay_back` (vacuous: it passed on the held frame) is replaced by
+  `scheduled_changes_shown` after the last kill.
+- m-2: `overlay_back` is timed from the restart outage's last packet, and searched after the
+  container's start. Searching after the outage's end instead would read an old-process frame as
+  new wherever the outage ends before the start, so that half is not applied.
+- m-3: a report with no `output_errors` reads cause "unknown", a red.
+- m-4: Owed 84 (c) records why case 4's `lost_ms` reads 29 800 (the checker's double count). The
+  measure's fix is owed before wave gate 3.
+- m-5: case 14's `old_tree_gone` cannot see an orphan of the old tree. A restarted container is a
+  new pid namespace, so it fails only without a restart, which `died_in_place` and
+  `restarted_once` judge too. It stays as the sample's anchoring check.
+- m-6: an owed row whose `_INDEX` line carries CLOSED fails chaos_table.
+
+**Mutants.** m10 is added: case 6's `docker update` replaced by `true`. `starvation_applied` must
+red, and `stress_ran` must pass.
+
+**Expected reds:**
+- cef-leaks ×2 (Owed 82, NOT RUNNABLE);
+- dest-disconnect (84 where the clear lands in a pending connect; NOT OWED otherwise);
+- dest-stall and dest-trickle (87, and 84 by phase);
+- cpu-starved (86 when starved; the drive's own red otherwise);
+- cef-gpu-deaths-fast ×3 (70 (a));
+- cef-killed, the two zygote cases and cef-gpu-deaths-threshold, wherever graphics gave up after
+  the restart (85).
+
+## Amendment 2026-10-24, rebase onto main 263b08a (PR #54, Owed 85's fix, merged)
+
+The coordinator's rebase dispatch. `feat/c14-chaos` is rebased onto main 263b08a, never merged.
+
+- **Owed 85 leaves chaos.json.** Its signature, its title and its tags on cef-killed (3 checks),
+  the two zygote cases, cef-gpu-deaths-threshold and the fast leg's `overlay_back` are gone. Every
+  restart leg's `overlay_back` must now pass; a red there reads NOT OWED and is news.
+- **`graphics_failed_after_start` is still measured** beside `overlay_back`. It is the evidence a
+  return of that cause would carry.
+- **A list of rows behind one check** (tried in order) is no longer carried by any leg. chaos_table
+  pins it over a copy of the manifest (`CHAOS_MANIFEST`, read by run-chaos.sh for that test alone;
+  chaos.yml never sets it).
+- **The round-4 expected reds amended:** the last bullet's 85 is withdrawn. Those legs are expected
+  green.
+- **_FINDINGS.** F-023 and F-024 sit before main's F-025, and F-024's unproven cause points at F-025.
+  Row 85 keeps main's text ("IN REVIEW 2026-10-24 …"). The dispatch's "FIXED text" is not on main:
+  closing the row needs a green image run's id, and that is main's to record.
+
+## Amendment 2026-10-24, rebase onto main 567cfcc (PR #57 and PR #55 merged)
+
+The coordinator's dispatch after the confirm pass of a69b6bb (PASS). `feat/c14-chaos` is rebased
+onto main 567cfcc, never merged. Both sides of the docs are kept: #57's F-027, F-028, Owed 84, 87
+and 88 and its decision rows; #55's F-026, Owed 70 (a) and its decision rows; this branch's F-023
+and F-024.
+
+- **Owed 84 and Owed 70 (a) leave chaos.json**, as Owed 85 did. Their signatures, titles and tags
+  are gone: `output_lost` and `no_outage_outside_fault` in cases 4, 5 and 12, and every tag on case
+  15's `fast` leg. A red there now reads NOT OWED. That is the honest result of the re-run, never
+  re-tagged.
+- **What stays owed:** 86 (case 6's four checks), 87 (`stall_swap` in cases 5 and 12) and 82 (case
+  16, NOT RUNNABLE). 84 (c), the checker's double count of the cut (the re-review's m-4), has no row
+  or tag of its own.
+- **Owed 85 is closed FIXED** in docs/_INDEX.md: PR #54 merged as 263b08a, main's image run
+  40079483379 is green, and chaos runs 40087523077 and 40087535051 (a69b6bb) are green on all 24
+  restart legs, `overlay_back` included. This supersedes the previous amendment's last bullet.
+- **`CHAOS_MANIFEST` never counts.** A table over another manifest prints it on the run line, and
+  the gate line reads "a run over another manifest (CHAOS_MANIFEST) never counts", even all green.
+  chaos_table pins it beside the committed manifest's "this run counts" on the same verdicts, and
+  the refusal is mutated once.
+- **The confirm pass's minors.** c-1 (84's signature reads the phase, not the reset) is moot now
+  that the signature is gone. c-2: `stress_ran` reads the drive's own marks, so it is commented as
+  the quota requested, with `starvation_applied` as the witness that it was applied.
+- **Expected reds of the re-run:**
+  - cef-leaks ×2 (Owed 82, NOT RUNNABLE);
+  - cpu-starved (86);
+  - dest-stall and dest-trickle `stall_swap` (87).
+  - Anything else is NOT OWED, including case 4, 5 or 12's `output_lost` (84's prediction says
+    green) and case 15's `fast` leg (70 (a)'s says green).
+
 ## Files
 
-- Create: `harness/cases/{camera-stop,camera-flap,reader-kicked,dest-disconnect,dest-stall,cpu-starved,score-down,cef-killed,process-killed,input-impaired}.{sh,jq}`
-- Create: `harness/run-chaos.sh` (runs all 10 in sequence, prints a table, exits non-zero on any red)
+- Create: `harness/cases/{camera-stop,camera-flap,reader-kicked,dest-disconnect,dest-stall,cpu-starved,score-down,cef-killed,process-killed,input-impaired}.{sh,jq}` (amended 2026-10-24: all 16, cases 11–16 too, as `.sh` files with `require` lines over `harness/cases/lib.jq`; and `harness/chaos.json`, the legs)
+- Create: `harness/run-chaos.sh` (~~runs all 10 in sequence~~ amended 2026-10-24: tables all 16 cases' 31 legs from chaos.yml's parallel runs, prints a table, exits non-zero on any red)
 - Create: `crates/harness/src/bin/dump-thresholds.rs`
 - Modify: `crates/domain/src/config.rs` (the budget consts and their test only)
 - Create: `.github/workflows/chaos.yml`: `workflow_dispatch` plus nightly `schedule`, never on PRs (it
@@ -266,12 +621,12 @@ its `exitCode` clause (the process then aborts at the next GPU death, or runs on
      does not count.
 - [ ] **Step 6: Run `run-chaos.sh` three times in a row**, all green (spec §9.7 item 1). Paste the
   three tables.
-- [ ] **Step 7: Commit and open the PR.** `test(chaos): twelve automated failure cases (C14)` (amended 2026-10-18; was "ten"). Then
+- [ ] **Step 7: Commit and open the PR.** `test(chaos): ~~twelve~~ sixteen automated failure cases (C14)` (amended 2026-10-18; was "ten"; amended 2026-10-24: sixteen, and the dispatch's PR title `feat(harness): the chaos suite (C14)`). Then
   trigger `chaos.yml` once by dispatch, and paste the run URL.
 
 ## Acceptance
 
-- ~~10~~ 12 cases, each with an anti-vacuity clause (amended 2026-10-18: case 11 `cef-hung`, Owed 18; case 12 `dest-trickle`, Owed 16).
+- ~~10~~ ~~12~~ 16 cases, each with an anti-vacuity clause (amended 2026-10-18: case 11 `cef-hung`, Owed 18; case 12 `dest-trickle`, Owed 16; amended 2026-10-24: cases 13–16 of the 2026-10-20 amendment).
 - Every number comes from `thresholds.json`.
 - 3 consecutive local green runs, plus 1 green CI dispatch.
 - ~~3~~ 5 mutants went red (amended 2026-10-18: mutants 4 and 5).

@@ -94,6 +94,52 @@ fn the_cameras_pipeline_round_trips_through_the_checkers_decode() {
     camera_round_trip(Pattern::Ball);
 }
 
+/// C14 (the PR #52 review's I5): fake-camera's resume asks its encoder for a key frame, so the first
+/// frame after a pause is one a decoder shows at once, as a phone's restarted encoder gives. The
+/// control run, with no request, codes the same frame as a delta frame (key-int-max 30): the test can
+/// see the request. The pause before it lets the encoder drain, as the camera's own pause does.
+#[test]
+fn a_forced_key_unit_codes_the_next_frame_as_a_key_frame() {
+    common::init();
+    let mut checked = 0;
+    for force in [false, true] {
+        let dir = std::env::temp_dir().join(format!("harness-key-{}-{force}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ts = dir.join("camera.ts");
+        let mut cam = CameraPipeline::start(&CameraSink::File(ts.clone()), 1280, 720, Pattern::Ball).unwrap();
+        for c in 1..=40u32 {
+            cam.push(c).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        if force {
+            cam.force_key_unit().unwrap();
+        }
+        for c in 41..=50u32 {
+            cam.push(c).unwrap();
+        }
+        cam.finish(60).unwrap();
+        let keys = common::key_frame_indexes(&ts);
+        eprintln!("force {force}: key frames at {keys:?}");
+        assert_eq!(
+            keys.first(),
+            Some(&0),
+            "force {force}: a build's first frame is a key frame"
+        );
+        assert!(
+            keys.contains(&30),
+            "force {force}: the GOP's own key frame (key-int-max 30)"
+        );
+        assert_eq!(
+            keys.contains(&40),
+            force,
+            "force {force}: frame 41 (index 40) is a key frame exactly when asked"
+        );
+        checked += 1;
+    }
+    eprintln!("key-frame runs checked: {checked}");
+    assert_eq!(checked, 2);
+}
+
 #[test]
 fn the_cameras_snow_keeps_its_strip_through_the_checkers_decode() {
     camera_round_trip(Pattern::Snow);

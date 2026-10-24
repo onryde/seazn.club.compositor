@@ -130,11 +130,13 @@ pub fn read_timeline(path: &Path) -> Result<Timeline, String> {
     parse_timeline(&v)
 }
 
-/// The compositor log's graphics crashes (`app::driver`'s `cef crashed gen=N`), as epoch ms.
+/// The compositor log's graphics crashes (`app::driver`'s `cef crashed gen=N`), as epoch ms: the
+/// docker stamp when the log has one (`docker logs --timestamps`, C14), else the line's `ts=`.
 pub fn crash_times(log: &str) -> Vec<i64> {
-    log.lines()
-        .filter(|l| l.contains(" msg=cef crashed gen="))
-        .filter_map(crate::clock::log_ts_ms)
+    crate::logfacts::log_facts(log)
+        .cef_crashed
+        .iter()
+        .map(|g| g.at_ms)
         .collect()
 }
 
@@ -221,5 +223,14 @@ mod tests {
             "a page line that quotes the words is not a crash: {t:?}"
         );
         assert_eq!(t[1] - t[0], 1_500);
+        // The same lines under `docker logs --timestamps`: the docker stamp dates them.
+        let stamped: String = log
+            .lines()
+            .enumerate()
+            .map(|(i, l)| format!("2026-10-23T12:00:0{i}.000000000Z {}\n", l.trim_start()))
+            .collect();
+        let d = crash_times(&stamped);
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert_eq!(d[1] - d[0], 2_000, "lines 1 and 3, by their docker stamps");
     }
 }

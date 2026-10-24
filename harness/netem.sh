@@ -11,6 +11,13 @@
 #   netem.sh in|out <netem args...>   a prio qdisc (4 bands), the filter to band 4, netem on it
 #   netem.sh clear in|out             removes the leg's qdiscs
 #   netem.sh check in|out             FAILS unless the leg's netem qdisc has carried packets
+#   netem.sh stats in|out             one JSON line: the netem qdisc's Sent bytes and packets, its
+#                                     dropped count (netem counts the packets its `loss` drops
+#                                     there) and its backlog, bytes and packets (what it holds now:
+#                                     a rate limit's queue, C14 case 5's witness), or "present":
+#                                     false once the leg is cleared
+#   netem.sh parse-stats in|out       the same line from `tc -s qdisc show` text on stdin (the
+#                                     harness's own test, crates/harness/tests/netem_stats.rs)
 #
 # `check` is what lets a case claim its fault was applied: the netem qdisc's own packet count is
 # the witness that the filter matched (prints the filter's `success` count too when the kernel
@@ -21,7 +28,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 COMPOSITOR_IP=172.28.0.10
 
 usage() {
-  echo "usage: netem.sh in|out <netem args...> | clear in|out | check in|out" >&2
+  echo "usage: netem.sh in|out <netem args...> | clear in|out | check in|out | stats in|out | parse-stats in|out" >&2
   exit 64
 }
 
@@ -48,6 +55,30 @@ tc_on() {
   compose exec -T "$(service_of "$leg")" tc "$@"
 }
 
+# The netem qdisc's counters from `tc -s qdisc show` text on stdin, as one JSON line. tc prints a
+# backlog with iproute2's size format: bytes (`130862b`), or KiB and MiB when the value is near a
+# whole one (`64Kb`, `2Mb`).
+parse_stats() {
+  awk -v leg="$1" '
+    function size(s, n) {
+      n = s + 0
+      if (s ~ /Mb$/) return n * 1048576
+      if (s ~ /Kb$/) return n * 1024
+      return n
+    }
+    /^qdisc / { f = ($0 ~ /^qdisc netem 40:/) }
+    f && /Sent/ {
+      bytes = $2; pkts = $4; d = $0
+      sub(/.*dropped /, "", d); sub(/,.*/, "", d)
+      seen = 1
+    }
+    f && /backlog/ { backlog = size($2); qlen = $3 + 0 }
+    END {
+      if (seen) printf "{\"leg\":\"%s\",\"present\":true,\"sent_bytes\":%.0f,\"sent_pkts\":%.0f,\"dropped\":%.0f,\"backlog_bytes\":%.0f,\"backlog_pkts\":%.0f}\n", leg, bytes, pkts, d, backlog, qlen
+      else printf "{\"leg\":\"%s\",\"present\":false,\"sent_bytes\":0,\"sent_pkts\":0,\"dropped\":0,\"backlog_bytes\":0,\"backlog_pkts\":0}\n", leg
+    }'
+}
+
 [ "$#" -ge 1 ] || usage
 case "$1" in
   clear)
@@ -67,6 +98,17 @@ case "$1" in
       echo "netem $leg: FAIL the filter matched nothing, so no fault was applied" >&2
       exit 1
     fi
+    ;;
+  stats)
+    [ "$#" -eq 2 ] || usage
+    service_of "$2" >/dev/null
+    stats="$(tc_on "$2" -s qdisc show dev eth0)"
+    printf '%s\n' "$stats" | parse_stats "$2"
+    ;;
+  parse-stats)
+    [ "$#" -eq 2 ] || usage
+    service_of "$2" >/dev/null
+    parse_stats "$2"
     ;;
   in | out)
     leg="$1"

@@ -24,6 +24,9 @@ media = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:adapt
 # `Thresholds::default()`, the one authority for the programme's slate threshold and the final hold
 # (AGENTS.md §4). Only `domain::config` is read, never a state machine.
 domain = { path = "../domain" }
+# C14: `app::ports::FINAL_BEAT_TIMEOUT_MS` for `harness/thresholds.json` (no GStreamer: app needs only
+# the domain and crossbeam).
+app = { path = "../app" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # fake-control's routes and fake-camera's control port: blocking, no async runtime (as C12's
@@ -52,6 +55,11 @@ path = "src/bin/fake-control.rs"
 required-features = ["media"]
 
 [[bin]]
+name = "dump-thresholds"
+path = "src/bin/dump-thresholds.rs"
+required-features = ["media"]
+
+[[bin]]
 name = "checker"
 path = "src/bin/checker.rs"
 required-features = ["media"]
@@ -66,4 +74,8 @@ required-features = ["media"]
 
 [[test]]
 name = "fake_control"
+required-features = ["media"]
+
+[[test]]
+name = "thresholds"
 required-features = ["media"]

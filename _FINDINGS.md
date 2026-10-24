@@ -1774,6 +1774,68 @@ INT and TERM also `wait`ed on the compositor, and re-waited after each trap.
   "Zygote watch at ready"); what is left is a zygote that dies between CEF's start and the first
   ready (Owed 70 (e)).
 
+## F-023: a sink that connects after the fault clears delivers its backlog in a burst, and MediaMTX's recorder discards it (chaos run 40045826841, 2026-10-24)
+
+- **Measured** (C14 fix round 1, from the run's `dest-disconnect`, `dest-trickle` and `dest-stall`
+  artifacts; the PR #52 review's I9):
+  - **dest-disconnect (case 4):** `netem out loss 100%` from 00:41:54.188 to the clear at
+    00:42:24.421. The output's last sink before the clear swapped at 00:42:20.409 (gen 5), about 4 s
+    before it. Its connect blocked under the fault; at the clear it delivered the frames queued since
+    its swap: the first recorded frame after the clear is camera counter 1502, the counter on air at
+    the gen 5 swap. About 4.1 s of backlog: the 2 s `ENCODED_RING_SPAN` and the 512 KiB
+    `OUTPUT_QUEUE_BYTES` (about 1–2 s at the programme's rate).
+  - In the same second MediaMTX v1.21.2's recorder logged `WAR [recorder] sample of track 1 received
+    too late, discarding` and `ERR [recorder] detected drift between recording duration and absolute
+    time, resetting`. It closed a 34-frame segment (00:42:24.541) and opened the next at
+    00:42:26.525: camera counters 1505 to 1743 (238, about 7.9 s of content) reached MediaMTX and
+    were not recorded. The checker reads that as outage 2, `lost_ms` 7 082 against
+    BUDGET_OUTPUT_LOST_MAX_MS 2 000.
+  - Outage 3 (00:42:36.525 to 00:42:38.407, counter gap 0, `lost_ms` −1 882) is the checker's
+    dating, not a loss: MediaMTX names a segment by its first sample's arrival (F-021), 11.88 s after
+    a 300-frame (10 s) segment (Owed 80).
+  - **dest-trickle (case 12):** the same shape. Last swap 00:45:18.958, clear 00:45:22.473, the
+    recorder's "too late" and drift reset at 00:45:23; three outages, `lost_ms` [−4 109, 30 366,
+    −1 884] (the 30 366 is outage 2 dated from a burst-named segment that overlaps outage 1).
+  - **dest-stall (case 5):** its last swap (00:42:23.926) came 0.86 s after the clear
+    (00:42:23.064), so no sink sat connecting under the fault. The recorder logged only "too late",
+    no reset, and the run had one outage (`lost_ms` −911).
+- **So:** when a sink's connect outlives the fault, the product sends the stale backlog it queued
+  since the swap at the connect, faster than real time, and this recorder refuses it and resets. A
+  real ingest's answer to the burst (Cloudflare, YouTube) is unmeasured. The verdicts are not
+  loosened: cases 4 and 12 stay red on `output_lost` and `no_outage_outside_fault` until the owner
+  rules Owed 84. The negative `lost_ms` values also show that the checker's `counter_gap − wall_span`
+  is not "programme lost" when a connect replays its backlog (Owed 84 (c)).
+
+## F-024: four facts from C14's second CI round (chaos runs 40051995233 and 40051902711, mutants 40051985045, 2026-10-24)
+
+- **A restarted container's CEF mostly fails to start** (Owed 85). Read from the 18 container
+  restarts in the two runs: cases 8, 9 and 15's threshold variant, 3 runs each, twice.
+  - The restarted compositor's first build logged `init_cef: Failed to initialize CEF`
+    (gstcefsrc.cc:903) in 13 of them, 144–175 ms after the container's `start` event in the 4 timed. Its next two
+    builds failed at once ("the pipeline did not start"), and graphics ended `failed`.
+  - By exit kind: 75 (C11b's restart) 7 of 7; 133 (Chromium's abort) 4 of 5; 137 (the compositor
+    SIGKILLed) 2 of 6. The 2 recoveries timed logged `cef ready gen=1` about 0.83 s after the start.
+  - A restarted container's compositor starts 11–15 ms after the `start` event. A fresh container's
+    starts 115–124 ms after it, which is the entrypoint's wait for Xvfb's socket. Compose restarts
+    the container rather than recreating it, and `/tmp` is on its writable layer, so the previous
+    Xvfb's `/tmp/.X11-unix/X99` passes the wait at once. Whether that is the cause is not proven
+    here: CEF's own log is off (`log-severity=disable`, F-013). F-025 measured the cause: the
+    restarted container's Xvfb refuses its predecessor's lock.
+- **Case 5's swap comes from the sink's own socket timeout, not the stall rule.** Under
+  `netem out rate 1kbit`, rtmp2sink failed with `Connection error: Socket I/O timed out` 5.6 s after
+  the cut in both runs, and the sink was swapped 0.5 s later. With `output_stall_after_ms` doubled
+  (mutant 9), the swap still came 1 332 ms after the last growth beat. Under 8 kbit (case 12) no
+  run logged that error, so the stall rule swapped.
+- **Under CPU starvation the ladder never moved** (Owed 86). 16 busy loops in the compositor's
+  cgroup for 40 s:
+  - The window carried 11.5 fps (dispatch) and 24.7 fps (PR), with encoderSpeed 0.37–0.67 and
+    0.63–1.03.
+  - Every beat read fps 29–31, droppedFrames 0 and rung `full`.
+  - After the burn the encoder caught up at encoderSpeed 2.97 and 15 Mbps (dispatch).
+- **A fast GPU-death loop outruns the 1 s child poll** (Owed 70 (a)). In 6 of 6 runs Chromium
+  relaunched the GPU process in about 80 ms. The loop's 5 kills of 5 distinct pids took 312–337 ms,
+  and `cef health` counted `gpu_process_deaths=1`. No restart followed.
+
 ## F-025: Owed 85's cause: a restarted container's Xvfb refuses its predecessor's lock (image run 40057826178, 2026-10-24)
 
 The follow-up to F-024's first fact (Owed 85; F-024 is on `feat/c14-chaos`, unmerged at the time).

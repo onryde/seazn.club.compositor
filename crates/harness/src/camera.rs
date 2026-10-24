@@ -2,7 +2,8 @@
 //!
 //! The camera's counter advances at 30 fps from its start, whatever it emits, so a gap shows in
 //! `emit.jsonl` as missing counters and a jump in wall time. The controls on `:7001`:
-//! - `POST /pause`: stop emitting (frames due are dropped); `POST /resume`: emit again;
+//! - `POST /pause`: stop emitting (frames due are dropped); `POST /resume`: emit again, the first
+//!   frame a key frame (C14: as a phone's restarted encoder gives, so a decoder can show it at once);
 //! - `POST /burst?ms=3000`: hold every frame due for `ms` (still counting), then emit the backlog as
 //!   fast as the encoder takes it, with the frames' original PTS;
 //! - `POST /size?w=&h=`: change the picture size (the strip scales with it: `strip::cell_size`).
@@ -234,6 +235,8 @@ pub fn frame(l: &Layout, pattern: Pattern, counter: u32) -> Vec<u8> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schedule {
     paused: bool,
+    /// A resume after a pause: the next frame emitted is to be a key frame ([`Self::take_key_due`]).
+    key_due: bool,
     burst_until_ms: Option<i64>,
     backlog: Vec<u32>,
     size: (u32, u32),
@@ -243,6 +246,7 @@ impl Schedule {
     pub fn new(w: u32, h: u32) -> Self {
         Self {
             paused: false,
+            key_due: false,
             burst_until_ms: None,
             backlog: Vec::new(),
             size: (w, h),
@@ -262,11 +266,20 @@ impl Schedule {
         self.backlog.len()
     }
 
+    /// Whether the frame about to be pushed is the first since a resume (asked once: it clears). The
+    /// camera calls it only when [`Self::on_frame`] gave it frames to push.
+    pub fn take_key_due(&mut self) -> bool {
+        std::mem::take(&mut self.key_due)
+    }
+
     /// Applies a control at `now_ms`. A second burst while one runs is refused.
     pub fn command(&mut self, c: Command, now_ms: i64) -> Result<(), String> {
         match c {
             Command::Pause => self.paused = true,
-            Command::Resume => self.paused = false,
+            Command::Resume => {
+                self.key_due |= self.paused;
+                self.paused = false;
+            }
             Command::Burst { ms } => {
                 if self.burst_until_ms.is_some() {
                     return Err("a burst is already holding frames".into());
@@ -352,6 +365,35 @@ mod tests {
         );
         s.command(Command::Resume, 101).unwrap();
         assert_eq!(s.on_frame(5, 133), vec![5], "a second resume changes nothing");
+    }
+
+    // C14 (the PR #52 review's I5): a resume's first frame is a key frame, as a phone's restarted
+    // encoder gives, so "frames return" is a frame a decoder can show at once. The camera asks for
+    // one exactly once per pause-to-resume, on the first frame it emits after it.
+    #[test]
+    fn a_resume_after_a_pause_asks_for_one_key_frame() {
+        let mut s = Schedule::new(1280, 720);
+        assert_eq!(s.on_frame(1, 0), vec![1]);
+        assert!(!s.take_key_due(), "no pause yet: the encoder's own GOP");
+        s.command(Command::Resume, 5).unwrap();
+        assert!(
+            !s.take_key_due(),
+            "a resume with no pause before it asks for nothing"
+        );
+        s.command(Command::Pause, 10).unwrap();
+        assert!(s.on_frame(2, 33).is_empty());
+        assert!(!s.take_key_due(), "paused: nothing to key yet");
+        s.command(Command::Resume, 40).unwrap();
+        s.command(Command::Resume, 41).unwrap();
+        assert_eq!(s.on_frame(3, 66), vec![3]);
+        assert!(s.take_key_due(), "the first frame after the resume");
+        assert_eq!(s.on_frame(4, 100), vec![4]);
+        assert!(!s.take_key_due(), "once: the second resume added nothing");
+        // A pause and a resume between two frames still keys the next one.
+        s.command(Command::Pause, 110).unwrap();
+        s.command(Command::Resume, 120).unwrap();
+        assert_eq!(s.on_frame(5, 133), vec![5]);
+        assert!(s.take_key_due());
     }
 
     #[test]
