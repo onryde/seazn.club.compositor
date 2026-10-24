@@ -15,8 +15,9 @@
 #   SOAK_HARD_STOP_MS       epoch ms: this process exits by then whatever happened, so the Machine
 #                           stops even if the job's cleanup never runs
 #   SOAK_PAGE               test (C14's overlay-test.html, served by fake-control: plumbing) or real
-#   SOAK_OVERLAY_URL        real only: the production overlay page's full URL, which fake-control
-#                           hands the compositor unchanged; the page source is this one input
+#                           (the production overlay page from the standalone web build on this
+#                           Machine, web/up.sh; its URL carries a signed token and stays under
+#                           SOAK_WEB_STATE, never /out)
 #   CAMERA_PATTERN          fake-camera's picture (ball, snow or noise; default ball)
 #   FLY_MACHINE_ID, FLY_APP_NAME   set by the platform: this Machine's private name
 #
@@ -51,10 +52,13 @@ action() { jq -cn "$@" >>"$OUT/actions.jsonl"; }
 SOAK_PAGE="${SOAK_PAGE:-test}"
 CAMERA_PATTERN="${CAMERA_PATTERN:-ball}"
 case "$SOAK_PAGE" in
-  test) [ -z "${SOAK_OVERLAY_URL:-}" ] || { log "FAIL SOAK_OVERLAY_URL is set on the test page"; exit 64; } ;;
-  real) [[ "${SOAK_OVERLAY_URL:-}" =~ ^https?://[^/?#]+/[^?#]*\?[^#]+$ ]] || { log "FAIL SOAK_PAGE=real needs SOAK_OVERLAY_URL with a query"; exit 64; } ;;
+  test) ;;
+  real) [ -x "$SOAK/web/up.sh" ] || { log "FAIL SOAK_PAGE=real needs the page source ($SOAK/web/up.sh: the web image)"; exit 64; } ;;
   *) log "FAIL SOAK_PAGE must be test or real"; exit 64 ;;
 esac
+# The page source's credentials (the signing key, the session cookie, the signed URL) live here,
+# mode 700, outside /out: nothing fetches it.
+WEB_STATE="${SOAK_WEB_STATE:-/run/soak-web}"
 [[ "$SOAK_DRIVE_MIN" =~ ^[0-9]+$ ]] || { log "FAIL SOAK_DRIVE_MIN must be whole minutes"; exit 64; }
 HOST="$FLY_MACHINE_ID.vm.$FLY_APP_NAME.internal"
 DRIVE_S=$((SOAK_DRIVE_MIN * 60))
@@ -105,6 +109,19 @@ for b in ip6tables-nft ip6tables-legacy; do
 done
 log "firewall: ipv4 ${FW4:-none}, ipv6 ${FW6:-none}"
 
+# The page source (page=real): the standalone web app, seeded, with the stream session and the signed
+# URL (web/up.sh). The run's own credentials stay out of its environment.
+if [ "$SOAK_PAGE" = real ]; then
+  status booting "page source"
+  web_rc=0
+  env -u JOB_TOKEN -u HARNESS_SRT_PASSPHRASE OUT="$OUT" WEB_STATE="$WEB_STATE" HOST="$HOST" \
+    WEB_PORT="$(soak web_port)" WEB_DELAY_MS="$(jq -r .overlayDelayMs "$SOAK/session-composed-720p.json")" \
+    "$SOAK/web/up.sh" >"$OUT/web-up.log" 2>&1 || web_rc=$?
+  cat "$OUT/web-up.log"
+  [ -f "$WEB_STATE/server.pid" ] && pids+=("$(cat "$WEB_STATE/server.pid")")
+  [ "$web_rc" -eq 0 ] && [ -s "$WEB_STATE/overlay-url" ] || { log "FAIL the page source did not come up ($web_rc)"; exit 1; }
+fi
+
 # The scripted score timeline the test page shows (fake-control's --score): an event every 3 s, for
 # the drive and the end, so the overlay repaints through the whole run (harness/pages/score.json's
 # pace; its 50 events would end at 150 s).
@@ -113,10 +130,17 @@ jq -n --argjson n $(((DRIVE_S + 900) / 3)) '{events: [range(1; $n + 1) | {index:
 # there is one (fake-control rewrites its origin to itself, so it is passed as the overlay origin
 # and stays unchanged).
 if [ "$SOAK_PAGE" = real ]; then
-  jq --arg u "$SOAK_OVERLAY_URL" '.overlayUrl = $u' "$SOAK/session-composed-720p.json" >"$OUT/session.json"
-  OVERLAY_ORIGIN="$(sed -E 's#^(https?://[^/?#]+).*#\1#' <<<"$SOAK_OVERLAY_URL")"
+  # The URL and its token go through files (jq --rawfile), never argv; the session carries the
+  # token, so it stays under WEB_STATE.
+  SESSION_FILE="$WEB_STATE/session.json"
+  jq --rawfile u "$WEB_STATE/overlay-url" --slurpfile seed "$OUT/seed.json" \
+    '($u | rtrimstr("\n")) as $url | .overlayUrl = $url | .fixtureId = $seed[0].cricket.fixture_id
+     | .pageToken = ($url | capture("[?&]st=(?<t>[^&]+)").t)' \
+    "$SOAK/session-composed-720p.json" >"$SESSION_FILE"
+  OVERLAY_ORIGIN="http://$HOST:$(soak web_port)"
 else
-  cp "$SOAK/session-composed-720p.json" "$OUT/session.json"
+  SESSION_FILE="$OUT/session.json"
+  cp "$SOAK/session-composed-720p.json" "$SESSION_FILE"
   OVERLAY_ORIGIN="http://$HOST:7000"
 fi
 
@@ -128,7 +152,7 @@ XDG_CACHE_HOME=/tmp env -u JOB_TOKEN -u SESSION_ID fake-camera --emit "$OUT/emit
   --srt-port 8890 --stream-id publish:cam --size 1280x720 --pattern "$CAMERA_PATTERN" \
   >"$OUT/fake-camera.log" 2>&1 &
 pids+=($!)
-fake-control --fixture "$OUT/session.json" --page "$SOAK/pages/overlay-test.html" --score "$OUT/score.json" \
+fake-control --fixture "$SESSION_FILE" --page "$SOAK/pages/overlay-test.html" --score "$OUT/score.json" \
   --beats "$OUT/heartbeats.jsonl" --listen "[::]:7000" --input-origin "srt://$HOST:8890" \
   --target-origin "rtmp://$HOST:1935" --overlay-origin "$OVERLAY_ORIGIN" --stream-id read:cam --stream-key dest \
   >"$OUT/fake-control.log" 2>&1 &
@@ -179,10 +203,19 @@ mapfile -t steps < <(jq -c '[(.dropouts | to_entries[] | {kind: "dropout", slot:
   (.disconnects | to_entries[] | {kind: "disconnect", slot: .key, at_s: .value})] | sort_by(.at_s)[]' <<<"$PLAN")
 lost_beats_ms=$(($(soak lost_beats_end_s) * 1000))
 ended_early=""
+score_pid=""
 if [ "$went_live" -eq 1 ]; then
   action --argjson at "$start_ms" --argjson d "$DRIVE_S" '{kind: "start", at_ms: $at, drive_s: $d}'
   read_last_beat
   log "live: the drive starts, $DRIVE_S s, ${#steps[@]} actions"
+  # Check (c)'s deliveries, through the standalone app's API, for the whole drive.
+  if [ "$SOAK_PAGE" = real ]; then
+    env -u JOB_TOKEN -u SESSION_ID -u HARNESS_SRT_PASSPHRASE node "$SOAK/web/score.mjs" \
+      --base "http://127.0.0.1:$(soak web_port)" --cookies "$WEB_STATE/cookies.json" --seed "$OUT/seed.json" \
+      --every-s "$(soak score_every_s)" --until-ms "$end_ms" --out "$OUT/deliveries.jsonl" >"$OUT/score.log" 2>&1 &
+    score_pid=$!
+    pids+=("$score_pid")
+  fi
 else
   ended_early="the compositor never went live"
 fi
@@ -259,7 +292,13 @@ if [ -z "$ended_early" ]; then
   [ -n "$ended_early" ] || wait_until "$end_ms" || true
 fi
 
-# The end: the request, then the compositor's stopped beat.
+# The end: the score driver stopped (its last line written), the request, then the compositor's
+# stopped beat.
+if [ -n "$score_pid" ]; then
+  kill -TERM "$score_pid" 2>/dev/null || true
+  for _ in $(seq 1 30); do kill -0 "$score_pid" 2>/dev/null || break; sleep 1; done
+  tail -n 1 "$OUT/score.log" || true
+fi
 end_request_ms="$(now_ms)"
 [ "$went_live" -eq 1 ] && action --argjson at "$end_request_ms" --arg why "$ended_early" \
   '{kind: "end", at_ms: $at} + (if $why == "" then {} else {ended_early: $why} end)'
@@ -313,13 +352,24 @@ python3 -I "$SOAK/sampler.py" --programme "$OUT/rec" --camera "$OUT/camrec" --ac
 tail -n 2 "$OUT/sampler.log"
 
 # No credential in any file this run wrote (the recordings are binary and hold none: skipped). The
-# values go to grep on a pipe, never in argv.
+# values go to grep on a pipe, never in argv. On page=real, the page source's too: its signing key,
+# the page token in the signed URL, and the seed account's session cookies.
 scanned=0
 leaks=0
 mapfile -t files < <(find "$OUT" \( -path "$OUT/rec" -o -path "$OUT/camrec" \) -prune -o -type f -print)
 scanned="${#files[@]}"
-for name in JOB_TOKEN HARNESS_SRT_PASSPHRASE; do
-  if printf '%s\n' "${!name}" | grep -qF -f - "${files[@]}"; then
+names=(JOB_TOKEN HARNESS_SRT_PASSPHRASE)
+if [ "$SOAK_PAGE" = real ]; then
+  WEB_SIGNING_KEY="$(cat "$WEB_STATE/auth-secret" 2>/dev/null || true)"
+  WEB_PAGE_TOKEN="$(sed -nE 's/.*[?&]st=([^&]+).*/\1/p' "$WEB_STATE/overlay-url" 2>/dev/null || true)"
+  WEB_COOKIES="$(jq -r '.[]' "$WEB_STATE/cookies.json" 2>/dev/null || true)"
+  names+=(WEB_SIGNING_KEY WEB_PAGE_TOKEN WEB_COOKIES)
+fi
+for name in "${names[@]}"; do
+  if [ -z "${!name}" ]; then
+    log "FAIL $name is empty: nothing to scan with"
+    leaks=$((leaks + 1))
+  elif printf '%s\n' "${!name}" | grep -qF -f - "${files[@]}"; then
     log "FAIL $name appears in /out"
     leaks=$((leaks + 1))
   fi

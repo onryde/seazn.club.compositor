@@ -6,6 +6,10 @@
 # exists. What it proves: the driver's own sequence (live, every scheduled action with its wall
 # time and witness, the end request, the log hand-off, the checker, the secrets scan, done), and
 # that the actions it writes are the plan verdict.jq judges against. The media is soak.yml's run.
+# Runs 3 and 4 (in parallel) take page=real with a stub page source (web/up.sh) and a stub score
+# driver: the session fake-control serves carries the page's URL and token and stays out of /out,
+# the deliveries are written, and the secrets scan covers the page source's credentials (run 4
+# plants the page token in /out, and must read as a leak).
 #
 #   HARNESS_BASH=<bash 5> harness/soak/test-driver.sh     (driver.sh needs bash 5: mapfile, EPOCHREALTIME)
 #
@@ -122,9 +126,83 @@ JOB_TOKEN="tjt_$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
 rc=0
 # The driver truncates heartbeats.jsonl at boot: the stub compositor appends after it (>>), so the
 # first second's beats may be lost, as a real compositor's beats before boot would be.
-env -i PATH="$W/bin:/usr/bin:/bin:/usr/sbin:/sbin:$(dirname "$(command -v jq)")" HOME="$W" STATE="$STATE" \
+PATH_STUB="$W/bin:/usr/bin:/bin:/usr/sbin:/sbin:$(dirname "$(command -v jq)"):$(dirname "$(command -v node)")"
+
+# Runs 3 and 4, page=real, started first and in the background (they take as long as run 1): each
+# with its own stub compositor, stub job, state and outputs.
+mkdir -p "$W/soak/web"
+cat >"$W/soak/web/up.sh" <<'STUB'
+#!/usr/bin/env bash
+# The stub page source: the files the real up.sh leaves, with random credentials.
+set -euo pipefail
+echo "up.sh $(env | cut -d= -f1 | sort | tr '\n' ' ')" >>"$STATE/calls"
+mkdir -p "$WEB_STATE"; chmod 700 "$WEB_STATE"
+r() { od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; }
+r >"$WEB_STATE/auth-secret"
+printf '{"seazn_session":"%s","seazn_org":"%s"}' "ses$(r)" "org$(r)" >"$WEB_STATE/cookies.json"
+st="eyJ$(r).eyJ$(r).$(r)"
+printf 'http://%s:%s/overlay/fixtures/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee?sid=%s&st=%s&host=compositor&delay=%s&template=bar\n' \
+  "$HOST" "$WEB_PORT" "$SESSION_ID" "$st" "$WEB_DELAY_MS" >"$WEB_STATE/overlay-url"
+echo '{"cricket":{"fixture_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}}' >"$OUT/seed.json"
+sleep 300 &
+echo "$!" >"$WEB_STATE/server.pid"
+[ ! -e "$STATE/leak" ] || echo "GET /overlay?st=$st" >>"$OUT/web.log"
+echo "soak-web: up (stub)"
+STUB
+cat >"$W/soak/web/score.mjs" <<'STUB'
+// The stub score driver: a delivery every 0.5 s until --until-ms or TERM; its argv recorded.
+import { appendFileSync } from "node:fs";
+const a = (k) => process.argv[process.argv.indexOf(`--${k}`) + 1];
+appendFileSync(`${process.env.STATE}/calls`, `score.mjs ${process.argv.slice(2).join(" ")}\n`);
+let stop = false;
+process.on("SIGTERM", () => { stop = true; });
+let seq = 1;
+while (!stop && Date.now() < Number(a("until-ms"))) {
+  appendFileSync(a("out"), JSON.stringify({ at_ms: Date.now(), ok: true, status: 201, seq: ++seq }) + "\n");
+  await new Promise((r) => setTimeout(r, 500));
+}
+console.log(`score: ${seq - 1} attempts`);
+STUB
+chmod +x "$W/soak/web/up.sh"
+stub_run() { # <out> <state>: the stub compositor and the stub job, for one run
+  (
+    while [ ! -e "$2/ending" ]; do
+      printf '{"received_ms":%s,"body":{"state":"playing","programmePhase":"live","rung":"full"}}\n' \
+        "$(python3 -I -c 'import time; print(int(time.time()*1000))')" >>"$1/heartbeats.jsonl"
+      sleep 1
+    done
+    printf '{"received_ms":%s,"body":{"state":"stopped","exitReason":"ended"}}\n' \
+      "$(python3 -I -c 'import time; print(int(time.time()*1000))')" >>"$1/heartbeats.jsonl"
+  ) &
+  stub_pids="$stub_pids $!"
+  (
+    until [ -e "$1/ended" ]; do sleep 0.5; done
+    printf '2026-10-24T12:00:00.000000000Z ts=2026-10-24T12:00:00.000Z level=info msg=cef alive gen=1\n' >"$1/compositor.log"
+    touch "$1/log-ready"
+  ) &
+  stub_pids="$stub_pids $!"
+}
+real_run() { # <n>: page=real, under the stub page source
+  local n="$1" t rc=0
+  t="$(now_ms)"
+  env -i PATH="$PATH_STUB" HOME="$W" STATE="$W/state$n" SOAK_ROOT="$W/soak" SOAK_OUT="$W/out$n" SOAK_WEB_STATE="$W/web$n" \
+    SESSION_ID="11111111-2222-4333-8444-55555555555$n" JOB_TOKEN="$JOB_TOKEN" SOAK_DRIVE_MIN=1 \
+    SOAK_DEADLINE_MS=$((t + 600000)) SOAK_HARD_STOP_MS=$((t + 100000)) SOAK_PAGE=real \
+    FLY_MACHINE_ID=m0 FLY_APP_NAME=soak-test "$BASH5" "$W/soak/driver.sh" >"$W/driver$n.out" 2>&1 || rc=$?
+  echo "$rc" >"$W/rc$n"
+}
+for n in 3 4; do mkdir -p "$W/out$n" "$W/state$n"; stub_run "$W/out$n" "$W/state$n"; done
+touch "$W/state4/leak"
+real_run 3 &
+real_pids="$!"
+real_run 4 &
+real_pids="$real_pids $!"
+
+# The hard stop from the launch itself (the stubs above took a moment), with room for a slow boot.
+t_run="$(now_ms)"
+env -i PATH="$PATH_STUB" HOME="$W" STATE="$STATE" \
   SOAK_ROOT="$W/soak" SOAK_OUT="$W/out" SESSION_ID="11111111-2222-4333-8444-555555555555" JOB_TOKEN="$JOB_TOKEN" \
-  SOAK_DRIVE_MIN=1 SOAK_DEADLINE_MS=$((t0 + 600000)) SOAK_HARD_STOP_MS=$((t0 + 90000)) SOAK_PAGE=test \
+  SOAK_DRIVE_MIN=1 SOAK_DEADLINE_MS=$((t_run + 600000)) SOAK_HARD_STOP_MS=$((t_run + 100000)) SOAK_PAGE=test \
   FLY_MACHINE_ID=m0 FLY_APP_NAME=soak-test "$BASH5" "$W/soak/driver.sh" >"$W/driver.out" 2>&1 || rc=$?
 
 checked=0
@@ -132,6 +210,11 @@ failures=0
 check() {
   checked=$((checked + 1))
   if jq -e -s "$2" "$3" >/dev/null 2>&1; then echo "PASS $1"; else echo "FAIL $1 ($2): $(jq -c -s . "$3" 2>/dev/null | head -c 400)"; failures=$((failures + 1)); fi
+}
+# check, with jq options before the file: <name> <expr> <option>... <file>
+checkx() {
+  checked=$((checked + 1))
+  if jq -e -s "$2" "${@:3}" >/dev/null 2>&1; then echo "PASS $1"; else echo "FAIL $1 ($2): $(jq -c -s . "${@: -1}" 2>/dev/null | head -c 400)"; failures=$((failures + 1)); fi
 }
 plan="$(jq -c -n -L "$W/soak" --slurpfile soak "$W/soak/soak.json" 'include "schedule"; soak_plan($soak[0]; 60)')"
 echo "driver exit $rc; plan $plan"
@@ -188,8 +271,45 @@ else
   tail -n 20 "$W/driver2.out"
   failures=$((failures + 1))
 fi
+
+# Runs 3 and 4 (page=real).
+wait $real_pids
+R="$W/out3"
 checked=$((checked + 1))
-if printf '%s\n' "$JOB_TOKEN" | grep -rqF -f - "$W/out" "$W/out2" "$W/driver.out" "$W/driver2.out" "$STATE/calls"; then
+if [ "$(cat "$W/rc3")" -eq 0 ]; then echo "PASS real: the driver exited 0"; else
+  echo "FAIL real: the driver exited $(cat "$W/rc3")"; tail -n 30 "$W/driver3.out"; failures=$((failures + 1)); fi
+check "real: the page source ran without the run's credentials in its environment" \
+  '.[0] | test("^up.sh ") and (test(" JOB_TOKEN ") | not) and (test(" HARNESS_SRT_PASSPHRASE ") | not) and test(" SESSION_ID ")' \
+  <(grep '^up.sh ' "$W/state3/calls" | jq -R .)
+check "real: fake-control serves the session under the web state, the page's origin as the overlay's" \
+  ".[0] | test(\"--fixture $W/web3/session.json \") and test(\"--overlay-origin http://m0.vm.soak-test.internal:3000 \")" \
+  <(grep '^fake-control ' "$W/state3/calls" | jq -R .)
+check "real: the session carries the page's URL, its token as pageToken, the seeded fixture" \
+  "(.[0]) as \$s | (\$s.overlayUrl == \"$(tr -d '\n' <"$W/web3/overlay-url")\")
+     and (\$s.overlayUrl | contains(\"st=\" + \$s.pageToken + \"&\")) and (\$s.pageToken | length > 40)
+     and \$s.fixtureId == \"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\" and \$s.overlayDelayMs == 3100" "$W/web3/session.json"
+checked=$((checked + 1))
+if [ ! -e "$R/session.json" ] && ! grep -rqF "st=" "$R" 2>/dev/null; then echo "PASS real: no session or signed URL in /out"; else
+  echo "FAIL real: the session or a signed URL is in /out"; failures=$((failures + 1)); fi
+check "real: the score driver ran on soak.json's cadence to the drive's end, its argv clean" \
+  "(.[0]) as \$a | (\$a | test(\"--every-s 30 \") and test(\"--until-ms [0-9]{13} \") and test(\"--out $R/deliveries.jsonl\"))
+     and (\$a | test(\"st=|eyJ\") | not)" <(grep '^score.mjs ' "$W/state3/calls" | jq -R .)
+checkx "real: deliveries written, every one after the start" \
+  "(\$start[0]) as \$s | length > 10 and all(.ok and .at_ms >= \$s)" --slurpfile start <(jq -c 'select(.kind == "start") | .at_ms' "$R/actions.jsonl") "$R/deliveries.jsonl"
+checkx "real: the score driver stopped before the end request" \
+  "(\$end[0]) as \$e | all(.at_ms <= \$e)" --slurpfile end <(jq -c '.end_request_ms' "$R/ended") "$R/deliveries.jsonl"
+check "real: done ok, no leak" '.[0] | .ok and .leaks == 0 and .checker_exit == 0' "$R/done"
+checked=$((checked + 1))
+if grep -q "secrets checked" "$W/driver3.out" && ! grep -q "is empty: nothing to scan with" "$W/driver3.out"; then echo "PASS real: every credential had a value to scan with"; else
+  echo "FAIL real: a credential was empty"; failures=$((failures + 1)); fi
+check "real leak: the page token in /out reads as a leak, done not ok" '.[0] | .leaks == 1 and .ok == false' "$W/out4/done"
+checked=$((checked + 1))
+if grep -q "FAIL WEB_PAGE_TOKEN appears in /out" "$W/driver4.out"; then echo "PASS real leak: named WEB_PAGE_TOKEN"; else
+  echo "FAIL real leak: no WEB_PAGE_TOKEN line"; tail -n 10 "$W/driver4.out"; failures=$((failures + 1)); fi
+
+checked=$((checked + 1))
+if printf '%s\n' "$JOB_TOKEN" | grep -rqF -f - "$W/out" "$W/out2" "$W/out3" "$W/out4" "$W/driver.out" "$W/driver2.out" \
+  "$W/driver3.out" "$W/driver4.out" "$STATE/calls" "$W/state3/calls" "$W/state4/calls"; then
   echo "FAIL the job token reached a file"
   failures=$((failures + 1))
 else

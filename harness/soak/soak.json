@@ -29,5 +29,8 @@
   "sample_band_rows": 40,
   "control_gap_s": 1,
   "stable_band_max": 2,
-  "overlay_diff_min": 4
+  "overlay_diff_min": 4,
+  "score_every_s": 30,
+  "web_port": 3000,
+  "harness_guest": {"test": {"cpus": 4, "memory_mb": 8192}, "real": {"cpus": 8, "memory_mb": 16384}}
 }
