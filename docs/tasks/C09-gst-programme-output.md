@@ -252,7 +252,8 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
   sticky-flag mutant went red.
 - (Amended 2026-10-24, Owed 81 (i)) `camera_frames_replaced_counts_the_frames_no_tick_showed`
   passes: the camera slot's write count reaches `Stats` on every tick, a camera tick counts the
-  frames written since the tick before it less the one it shows, and a slate tick counts none.
+  frames written since the tick before it less the one it shows (a `Repeat` tick too: it is the
+  camera on air), and a slate tick counts none.
 
 ## Audio (C00 audio A/B, 2026-10-15; F-004 verdict, overrides anything above)
 
@@ -414,13 +415,15 @@ while what it owns is hung (or stands in for hung) and the drop returns within 5
 
 ## Amendment 2026-10-24 (Owed 81 (i): the camera frames no tick showed)
 
-Owner, 2026-10-24, in chat, relayed by the coordinator: build a beat counter for camera frames that
-are replaced before they are shown (`docs/_INDEX.md` Owed 81; no smoothing input buffer, Owed 89).
+The coordinator's recommendation, approved by the owner 2026-10-24 (in chat, relayed by the
+coordinator: "apply your rec in both"): build a beat counter for camera frames that are replaced
+before they are shown (`docs/_INDEX.md` Owed 81; no smoothing input buffer, Owed 89).
 The camera slot counts the frames written to it, and `push` hands that count to
 `Stats::on_camera_tick` on every tick, a slate tick included, so `StatsSnapshot::camera_frames_replaced`
 holds the camera frames no camera tick put on air (`adapters::stats::ReplacedFrames` states the rule).
 It is `None` until the first camera tick. The heartbeat does not carry it (the contract is strict,
-Owed 90): the driver logs it once a beat.
+Owed 90): the driver logs it once a beat. It counts the frames above one a camera tick, so a source
+faster than the programme and a late tick thread raise it too (`ReplacedFrames` says how).
 
 ## Do not touch
 
