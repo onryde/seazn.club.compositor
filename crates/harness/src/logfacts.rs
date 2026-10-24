@@ -14,6 +14,7 @@
 //!   `cef health zygote_gone=<g|-> leaked_teardowns=<n> gpu_process_deaths=<n>` (on a change only);
 //! - `compositor::logged`: `graphics restart gen=<g>`, `sink swap gen=<g> target=<redacted>`,
 //!   `programme started`;
+//! - `adapters::gst_output`: `output gen=<g> error: <text>` (a sink's bus error);
 //! - `compositor::wiring` and `main`: `compositor started drivers=…` (a boot), `exit code=<n>`;
 //! - C11's dispatcher: `gen=<g>: page console: hang starts` (the harness page's hang, its own line)
 //!   and `gen=<g>: score stale=<true|false>`;
@@ -144,6 +145,10 @@ pub struct LogFacts {
     pub overlay_hidden: Vec<Hidden>,
     pub cef_health: Vec<Health>,
     pub sink_swaps: Vec<GenAt>,
+    /// `output gen=<g> error: …`: a sink's bus error, logged before its `OutputError` and never once
+    /// the sink is retired (gst_output.rs's `Watch`), so a swap whose outgoing sink logged none was
+    /// not the error path's (C14 fix round 3).
+    pub output_errors: Vec<GenAt>,
     pub page_hangs: Vec<GenAt>,
     pub score_stale: Vec<Stale>,
     /// Chromium's abort line (`GPU process isn't usable`).
@@ -187,6 +192,12 @@ fn dispatcher(msg: &str) -> Option<(u64, &str)> {
     let rest = msg.strip_prefix("gen=")?;
     let (g, what) = rest.split_once(": ")?;
     Some((g.parse().ok()?, what))
+}
+
+/// `output gen=<g> error: <text>` (gst_output.rs's bus error): the generation.
+fn output_error(msg: &str) -> Option<u64> {
+    let (g, _) = msg.strip_prefix("output gen=")?.split_once(" error: ")?;
+    g.parse().ok()
 }
 
 fn killed(msg: &str, at_ms: i64) -> Option<Killed> {
@@ -254,6 +265,8 @@ pub fn log_facts(text: &str) -> LogFacts {
             if let Some(Ok(g)) = rest.split(' ').next().map(str::parse) {
                 f.sink_swaps.push(ga(g));
             }
+        } else if let Some(g) = output_error(m) {
+            f.output_errors.push(ga(g));
         } else if let Some(code) = gen_after(m, "exit code=") {
             f.exits.push(Exit {
                 at_ms,
@@ -432,6 +445,63 @@ mod tests {
         assert_eq!(f.killed[0].signal, "SIGTRAP");
         assert_eq!(f.killed[0].status, 133);
         assert_eq!(f.gpu_unusable, vec![NOON_MS + 500]);
+        eprintln!("log lines checked: {}", f.lines);
+    }
+
+    /// An output sink's bus error (C14 fix round 3, item 2): the line a swap's cause is read from.
+    /// The lines are case 5's in CI (run 40056474269), keys scrubbed as the compositor writes them.
+    #[test]
+    fn an_output_error_is_read_with_its_generation() {
+        let mut log = String::new();
+        let lines = [
+            (0, "sink swap gen=1 target=rtmp://mediamtx:1935/live/****"),
+            (1, "output gen=1: sink rtmp://mediamtx:1935/live/****"),
+            (
+                5_750,
+                "output gen=1 error: Connection error: Socket I/O timed out (../gst/rtmp2/gstrtmp2sink.c(1085): \
+                 error_callback (): /GstPipeline:pipeline2/GstRtmp2Sink:rtmp2sink0:\\ndomain g-io-error-quark)",
+            ),
+            (6_270, "sink swap gen=2 target=rtmp://mediamtx:1935/live/****"),
+            (
+                11_270,
+                "output gen=2 error: Internal data stream error. (../libs/gst/base/gstbasesrc.c(3177))",
+            ),
+            // Near misses: none is an output error.
+            (12_000, "output gen=3: sink rtmp://mediamtx:1935/live/****"),
+            (12_100, "output gen=3 warning: Could not write (x)"),
+            (12_200, "swap_sink gen=4: output gen=4: did not start: x"),
+            (12_300, "output gen=x error: y (z)"),
+            (12_400, "gen=1: page console: output gen=1 error: z"),
+        ];
+        for (at, m) in lines {
+            log.push_str(&line(at, m));
+        }
+        let f = log_facts(&log);
+        assert_eq!(
+            f.output_errors,
+            vec![
+                GenAt {
+                    at_ms: NOON_MS + 5_750,
+                    gen: 1
+                },
+                GenAt {
+                    at_ms: NOON_MS + 11_270,
+                    gen: 2
+                }
+            ]
+        );
+        assert_eq!(f.sink_swaps.iter().map(|g| g.gen).collect::<Vec<_>>(), vec![1, 2]);
+        // The producer's own format, so the parser and the line cannot drift apart unseen.
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../adapters/src/gst_output.rs"
+        ))
+        .expect("gst_output.rs");
+        assert_eq!(
+            src.matches("\"output gen={} error: {} ({})\"").count(),
+            1,
+            "gst_output.rs's bus-error line changed: update `output_errors`"
+        );
         eprintln!("log lines checked: {}", f.lines);
     }
 
