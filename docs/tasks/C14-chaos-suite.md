@@ -802,9 +802,11 @@ socket timeout is the only detector of a destination stall (`docs/_INDEX.md` Owe
   replaced by `true` (or the floor by 0); and review round 1's ceiling from the cut, replaced by
   `true`, red in `rule-late-error`. `error_to_swap_ms != null` is dropped as equivalent: jq sorts null
   below every number, so the floor reds a null.
-- **Expected reds of the next run:** cpu-starved (Owed 86, still in chaos.json); and cef-leaks ×2,
+- ~~**Expected reds of the next run:** cpu-starved (Owed 86, still in chaos.json); and cef-leaks ×2,
   NOT RUNNABLE until case 16's PR (#71) merges, then whatever case 16 reads (review round 1's m-5).
-  No Owed 87 red is expected. Anything else is NOT OWED.
+  No Owed 87 red is expected.~~ (Amended 2026-10-25, when #71 was rebased onto this: case 16 runs,
+  so the one expected red is cpu-starved, Owed 86. See the amendment "case 16 wired".) Anything
+  else is NOT OWED.
 
 ## Amendment 2026-10-24, case 16 wired (branch `feat/c14-case16-leaks`)
 
@@ -887,6 +889,16 @@ none an owner ruling. Decision log "C14 case 16 wired".
   case_verdicts.rs sweeps every file under harness/. Only case 16's two files may name
   `RELAY_TEST_HOOKS_IMAGE`, the hold key or case 16's overlay, and only cef-leaks.sh may assign
   `RELAY_IMAGE`.
+  - Amended 2026-10-25, the #71 confirm pass's n1 and n2. The sweep also reads chaos.yml: the leg
+    job's `RELAY_IMAGE` must equal the images job's and name no `test-hooks`. Its positive pair
+    asks the image's name only of cef-leaks.sh, and pins only the overlay's `environment` line for
+    the key, never a comment.
+- **Rebased onto f43c1de, 2026-10-25** (#73 merged, Owed 87 "A"). thresholds.json was regenerated
+  by dump-thresholds on the merged tree, never merged by hand. It adds `reaper_kill_after_ms` and
+  `teardown_leak_after_ms` to main's, and `output_stall_after_ms` and `output_progress_poll_ms`
+  stay retired. thresholds.rs now counts `pairs + 4 + retired`. Both C14 amendments and both
+  _INDEX rows are kept. **Expected reds of the next run:** cpu-starved (Owed 86) only. Both
+  cef-leaks legs must pass, and no Owed 87 red is expected. Anything else is NOT OWED.
 
 ## Files
 

@@ -2770,7 +2770,9 @@ fn a_not_runnable_case_is_reported_never_faked_and_never_a_pass() {
 /// case that copied case 16's pattern, or a shared helper that picked the variable up, would run
 /// the hooks binary while its verdict claims the relay image. Every file under harness/ (out/
 /// aside) is swept: the image's variable, the hold key and case 16's overlay are named only by
-/// case 16's files, and only cef-leaks.sh assigns `RELAY_IMAGE` outside a comment.
+/// case 16's files, and only cef-leaks.sh assigns `RELAY_IMAGE` outside a comment. harness/soak/
+/// (C15) is swept for the names but not for that assignment: it never runs run-case.sh, the one
+/// reader of `RELAY_IMAGE`.
 #[test]
 fn only_case_16_names_the_test_hooks_image_or_reassigns_the_relay_image() {
     fn walk(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
@@ -2824,7 +2826,7 @@ fn only_case_16_names_the_test_hooks_image_or_reassigns_the_relay_image() {
                 naming.push(format!("{rel}: {name}"));
             }
         }
-        if assigns_relay_image(&text) {
+        if !rel.starts_with("soak/") && assigns_relay_image(&text) {
             assert_eq!(
                 rel, case16[0],
                 "harness/{rel} reassigns RELAY_IMAGE: only case 16 points it at another image"
@@ -2834,20 +2836,76 @@ fn only_case_16_names_the_test_hooks_image_or_reassigns_the_relay_image() {
     }
     eprintln!("harness files swept: {swept}; names: {naming:?}; RELAY_IMAGE assigned in: {assigning:?}");
     assert!(swept >= 25, "the sweep read too few harness files ({swept})");
-    // The positive pair: case 16 itself still names all three and points RELAY_IMAGE at the image,
-    // and its overlay carries the key, so a renamed variable cannot pass this vacuously.
-    for (name, allowed) in names {
-        for f in allowed {
-            assert!(
-                naming.contains(&format!("{f}: {name}")),
-                "harness/{f} no longer names {name}"
-            );
-        }
+    // The positive pair, read from code and never from a comment (the #71 confirm pass's n2), so a
+    // renamed variable cannot pass this vacuously and a reworded comment cannot red it: cef-leaks.sh
+    // names all three and points RELAY_IMAGE at the image, and the overlay's compositor
+    // `environment` carries the key.
+    let code = |rel: &str| -> Vec<String> {
+        std::fs::read_to_string(harness.join(rel))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .map(str::to_owned)
+            .collect()
+    };
+    let leaks = code(case16[0]);
+    for (name, _) in names {
+        assert!(
+            leaks.iter().any(|l| l.contains(name)),
+            "harness/{} no longer names {name} outside a comment",
+            case16[0]
+        );
     }
     assert_eq!(
         assigning,
         [case16[0]],
         "cef-leaks.sh points RELAY_IMAGE at the image"
+    );
+    let overlay = code(case16[1]);
+    let key = overlay
+        .iter()
+        .position(|l| l.trim_start().starts_with("COMPOSITOR_TEST_HOLD_TEARDOWNS:"));
+    assert!(
+        key.is_some_and(|i| i >= 2
+            && overlay[i - 1].trim() == "environment:"
+            && overlay[i - 2].trim() == "compositor:"),
+        "harness/{}: the compositor's `environment` no longer carries the hold key: {overlay:?}",
+        case16[1]
+    );
+    // The legs' own image (the #71 confirm pass's n1): chaos.yml sets each leg's RELAY_IMAGE, which
+    // the harness/ sweep cannot see. Every job's RELAY_IMAGE is the images job's (the relay image it
+    // builds), none names the test-hooks image, and no step reassigns it.
+    let workflow = std::fs::read_to_string(repo().join(".github/workflows/chaos.yml")).unwrap();
+    let (mut job, mut images) = (String::new(), Vec::new());
+    for l in workflow.lines() {
+        if let Some(name) = l
+            .strip_prefix("  ")
+            .and_then(|r| r.strip_suffix(':'))
+            .filter(|r| !r.starts_with(' ') && !r.contains(' '))
+        {
+            job = name.to_owned();
+        }
+        if let Some(v) = l.trim_start().strip_prefix("RELAY_IMAGE:") {
+            images.push((job.clone(), v.trim().to_owned()));
+        }
+    }
+    eprintln!("chaos.yml's RELAY_IMAGE per job: {images:?}");
+    let built = images
+        .iter()
+        .find(|(j, _)| j == "images")
+        .map(|(_, v)| v.clone())
+        .expect("the images job sets RELAY_IMAGE");
+    assert!(
+        images.iter().any(|(j, _)| j == "leg"),
+        "the leg job sets RELAY_IMAGE"
+    );
+    for (j, v) in &images {
+        assert_eq!(v, &built, "chaos.yml's {j} job runs another RELAY_IMAGE");
+        assert!(!v.contains("test-hooks"), "chaos.yml's {j} job: {v}");
+    }
+    assert!(
+        !assigns_relay_image(&workflow),
+        "a chaos.yml step reassigns RELAY_IMAGE"
     );
 }
 
