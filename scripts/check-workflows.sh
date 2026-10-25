@@ -69,6 +69,10 @@
 #     deploy-prod.yml@refs/tags/$TAG, --source-digest "$GITHUB_SHA" and --deny-self-hosted-runners,
 #     exiting 1 when it does not verify; and promote.yml's step runs `gh attestation verify` with
 #     --cert-identity, --source-digest and --deny-self-hosted-runners before its first call to web.
+# 14. Signing grants (m-11): in every workflow, `id-token: write`, `attestations: write` and
+#     `write-all` (which carries both) appear only on the push job of deploy-stg.yml (environment
+#     relay-stg-push) and of deploy-prod.yml (relay-prod-push), never at workflow level, and each of
+#     those two jobs grants both, as a map: anywhere else a job could sign as that workflow.
 #
 # The deploy workflows are deploy-stg.yml, deploy-prod.yml and promote.yml, each required, plus any
 # other workflow that names the stg or prod relay or web app, or their tokens: a new one is held to
@@ -615,6 +619,38 @@ if [ -f "$dir/promote.yml" ]; then
   done <<< "$out"
 fi
 echo "build records: $records of 2 push jobs attest and verify both paths; promote reads $promote_verifies of 4 before its first call to web"
+
+# 14. Signing grants (the PR #85 review's m-11).
+grants=0
+for f in "${files[@]}"; do
+  b=$(basename "$f")
+  out=$(jq -r --arg b "$b" '
+    def signs: if type == "string" then . == "write-all"
+      elif type == "object" then (.["id-token"] == "write" or .attestations == "write")
+      else false end;
+    def granted: if type == "string" then .
+      else [ to_entries[] | select((.key == "id-token" or .key == "attestations") and .value == "write") | "\(.key): write" ] | join(" and ") end;
+    def envname: if type == "object" then (.name // "") else (. // "" | tostring) end;
+    ({ "deploy-stg.yml": "relay-stg-push", "deploy-prod.yml": "relay-prod-push" })[$b] as $pushenv
+    | (if ((.permissions // null) | signs)
+       then "FAIL the workflow-level permissions grant \(.permissions | granted): every job in it could sign as this workflow"
+       else empty end),
+      ((.jobs // {}) | to_entries[] | .key as $j | .value as $job
+        | if (($job.permissions // null) | signs) | not then empty
+          elif $pushenv == null or $j != "push" or (($job.environment // "") | envname) != $pushenv
+          then "FAIL job \($j) grants \($job.permissions | granted), and only the push job in \($pushenv // "relay-stg-push or relay-prod-push") may"
+          elif ($job.permissions | type) != "object" or $job.permissions["id-token"] != "write" or $job.permissions.attestations != "write"
+          then "FAIL job \($j) in \($pushenv) grants \($job.permissions | granted), not both id-token: write and attestations: write"
+          else "GRANT \($j)" end)' "$(json "$f")")
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL*) failed "$b (signing grants): ${line#FAIL }" ;;
+      GRANT*) grants=$((grants + 1)) ;;
+    esac
+  done <<< "$out"
+done
+[ "$grants" -eq 2 ] || failed "the push jobs grant id-token: write and attestations: write $grants time(s), not 2: an attest step cannot sign"
+echo "signing grants (id-token / attestations: write): $grants of 2, on the push jobs in relay-stg-push and relay-prod-push alone; ${#files[@]} workflows read"
 
 finished=1
 if [ "$fails" -gt 0 ]; then
