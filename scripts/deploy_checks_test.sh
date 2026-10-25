@@ -16,20 +16,26 @@
 #    changed without the record, on each malformed record, and on a record whose finding is no
 #    Step 0 run on its commit (m-8); green again once the record and its finding follow the bump.
 # 3. The deploy workflows' own scripts, extracted as written and run under fake flyctl, docker and gh:
-#    the token guards, the provenance steps, "Already pushed?", the build record checks (pushed,
-#    found, squatted) and the summaries, whose promote command the real scripts/promote.sh accepts.
+#    the token guards, the provenance steps, "Already pushed?", the Push step (its digest is the one its
+#    own push printed, and a tag moved under it is a red: the PR #93 review's C-1), the build record
+#    checks (pushed, found, squatted), the login leaving with each step, and the summaries, whose
+#    promote command the real scripts/promote.sh accepts.
 # 4. scripts/promote.sh, as the operator runs it (from a clone of a scratch "GitHub" repository,
-#    main: z, a, b, c, h; side: d), under the same fakes: every refusal (the arguments and the prod
-#    flag, the tools, main's copy, provenance, the registry, main's build record field by field, the
-#    web app's [env] and staged secrets), no token ever used or printed, the previous RELAY_IMAGE from
-#    the promote log, the deploy and its proof, and a failed promote followed by its rollback.
+#    main: z, a, b, c, h; side: d), under fake flyctl, curl and gh (no docker: the review's I-1): every
+#    refusal (the arguments and the prod flag, the test seams, the tools, main's copy, provenance, the
+#    registry read by digest and its body's hash, main's build record field by field, the web app's
+#    [env] and staged secrets, the secret list after the set and the deploy), the read token never in
+#    argv, the output or an error, the previous RELAY_IMAGE from the promote log, the deploy and its
+#    proof, and a failed promote followed by its rollback.
 #
 # Needs bash, ruby (YAML), jq, python3, git, and the pinned actionlint and shellcheck on PATH
 # (scripts/check-workflows.sh --install DIR). Prints `checked: N` and fails on 0.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-W=$(mktemp -d)
+# Physical (pwd -P): on macOS mktemp says /var/..., a cd reports /private/var/..., and a negative grep
+# on one spelling passes on the other (the PR #93 review's m-10).
+W=$(cd "$(mktemp -d)" && pwd -P)
 # A run that stops before its tally is a red: bash 3.2 exits 0 after a `set -u` abort under an EXIT
 # trap, which would pass a half-run test.
 trap 'rm -rf "$W"; if [ "${finished:-0}" != 1 ]; then echo "deploy_checks_test: FAIL: stopped before its tally" >&2; exit 1; fi' EXIT
@@ -113,8 +119,9 @@ if [ "$rc" -eq 0 ] && grep -qF "checked $n_repo workflows" "$W/check.out" && gre
   && grep -qF 'push jobs behind their ref (hygiene, not a guard): 2 of 2' "$W/check.out" \
   && grep -qF 'build records: 2 of 2 push jobs attest and verify both paths' "$W/check.out" \
   && grep -qF "write grants: 5 of 5 allowed (id-token and attestations on the two push jobs, packages on image.yml's cache job); $n_repo workflows read" "$W/check.out" \
-  && grep -qF "promote workflows: 0 lines changing Fly secrets in $n_repo workflows" "$W/check.out"; then
-  ok "check-workflows green on the repo ($n_repo workflows, 2 deploy, no environment, 2 relay tokens in their push jobs, no web token, 2 provenance steps, 2 main-only ifs, 2 build records, 5 write grants, no promote workflow)"
+  && grep -qF "promote workflows: 0 lines changing Fly secrets in $n_repo workflows" "$W/check.out" \
+  && grep -qF 'logins that leave with their step: 6; actions in the push jobs pinned by commit: 8' "$W/check.out"; then
+  ok "check-workflows green on the repo ($n_repo workflows, 2 deploy, no environment, 2 relay tokens in their push jobs, no web token, 2 provenance steps, 2 main-only ifs, 2 build records, 5 write grants, no promote workflow, 6 logins that leave with their step, 8 pinned actions)"
 else
   bad "check-workflows on the repo: rc $rc"; sed 's/^/    /' "$W/check.out" >&2
 fi
@@ -229,11 +236,9 @@ expect_red "e7 the registry hardcoded" 'deploy-stg.yml hardcodes the registry'
 # e8. Another token as a fallback (`a || X`): prod's token when stg's is empty.
 fresh; edit "$W/wf/$STG" '        env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_STG }}
-        run: |
-          flyctl auth docker' '        env:
+          GH_TOKEN: ${{ github.token }}' '        env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_STG || secrets.FLY_API_TOKEN_RELAY_PROD }}
-        run: |
-          flyctl auth docker'
+          GH_TOKEN: ${{ github.token }}'
 expect_red "e8 a token fallback" 'names two Fly tokens in one expression'
 
 # e10. A job-level env holding the token.
@@ -408,11 +413,9 @@ expect_red "m3g flyctl --access-token" 'hands flyctl a token in argv: flyctl aut
 
 # i1a. A web token in a deploy workflow (it would set seazn-club-stg's secrets).
 fresh; edit "$W/wf/$STG" '          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_STG }}
-        run: |
-          flyctl auth docker' '          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_STG }}
+          GH_TOKEN: ${{ github.token }}' '          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_STG }}
           WEB: ${{ secrets.FLY_API_TOKEN_WEB_STG }}
-        run: |
-          flyctl auth docker'
+          GH_TOKEN: ${{ github.token }}'
 expect_red "i1a deploy-stg names a web token" 'deploy-stg.yml names the secret FLY_API_TOKEN_WEB_STG (push): no web-app token is ever in GitHub'
 
 # i1b. A token of unknown reach (the first round's FLY_API_TOKEN_STG) in a deploy workflow.
@@ -421,10 +424,8 @@ expect_red "i1b deploy-stg names FLY_API_TOKEN_STG" 'deploy-stg.yml names the se
 
 # i1d. A secret named by expression, which no rule can read.
 fresh; edit "$W/wf/$STG" '          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_STG }}
-        run: |
-          flyctl auth docker' "          FLY_API_TOKEN: \${{ secrets['FLY_API_TOKEN_RELAY_STG'] }}
-        run: |
-          flyctl auth docker"
+          GH_TOKEN: ${{ github.token }}' "          FLY_API_TOKEN: \${{ secrets['FLY_API_TOKEN_RELAY_STG'] }}
+          GH_TOKEN: \${{ github.token }}"
 expect_red "i1d secrets[...] in deploy-stg" 'deploy-stg.yml names a secret by expression'
 
 # i4e. deploy-stg's attest step deleted (no build record: promote would refuse every push).
@@ -518,10 +519,8 @@ expect_red "n2 deploy-stg's relay token in a second job" 'deploy-stg.yml names F
 
 # n3. The relay token in another spelling (secret names ignore case; the token rules read one).
 fresh; edit "$W/wf/$STG" '          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_STG }}
-        run: |
-          flyctl auth docker' '          FLY_API_TOKEN: ${{ secrets.fly_api_token_relay_stg }}
-        run: |
-          flyctl auth docker'
+          GH_TOKEN: ${{ github.token }}' '          FLY_API_TOKEN: ${{ secrets.fly_api_token_relay_stg }}
+          GH_TOKEN: ${{ github.token }}'
 expect_red "n3 deploy-stg's relay token in lower case" 'deploy-stg.yml names fly_api_token_relay_stg: spell it FLY_API_TOKEN_RELAY_STG'
 
 # n4. soak.yml's exemption is soak.yml's: its token in chaos.yml.
@@ -600,6 +599,96 @@ fresh; edit "$W/wf/soak.yml" '  plan:
     timeout-minutes: 5
     # flyctl secrets set RELAY_IMAGE=x -a seazn-relay-soak'
 expect_red "n13b a workflow that changes Fly secrets" 'soak.yml changes Fly secrets'
+
+PUSH_TRAP="          trap 'docker logout \"\$RELAY_REGISTRY\" > /dev/null 2>&1 || true' EXIT"
+# n16 (the PR #93 review's m-1). Every secret at once, by toJSON in any case: no rule can read it.
+fresh; edit "$W/wf/$STG" '          DIGEST: ${{ steps.push.outputs.digest || steps.exists.outputs.digest }}
+          FOUND: ${{ steps.exists.outputs.exists }}
+        run: |
+          ref=' '          DIGEST: ${{ steps.push.outputs.digest || steps.exists.outputs.digest }}
+          FOUND: ${{ steps.exists.outputs.exists }}
+          ALL: ${{ toJson(secrets) }}
+        run: |
+          ref='
+expect_red "n16 toJson(secrets) in deploy-stg" 'deploy-stg.yml names a secret by expression'
+fresh; edit "$W/wf/soak.yml" '  plan:
+    runs-on: ubuntu-24.04' '  plan:
+    env:
+      ALL: ${{ tojson( secrets ) }}
+    runs-on: ubuntu-24.04'
+expect_red "n16b tojson( secrets ) in soak.yml" 'soak.yml names a secret by expression'
+
+# n17 (m-1). A reusable workflow outside this repository handed secrets: inherit, or a map.
+fresh; edit "$W/wf/soak.yml" '  plan:
+    runs-on: ubuntu-24.04' '  ext:
+    uses: someone/else/.github/workflows/x.yml@0123456789abcdef0123456789abcdef01234567
+    secrets: inherit
+  plan:
+    runs-on: ubuntu-24.04'
+expect_red "n17 secrets: inherit to another repository's workflow" 'soak.yml: job ext hands secrets (inherit) to a workflow outside this repository: someone/else/.github/workflows/x.yml@'
+fresh; edit "$W/wf/soak.yml" '  plan:
+    runs-on: ubuntu-24.04' '  ext:
+    uses: someone/else/.github/workflows/x.yml@0123456789abcdef0123456789abcdef01234567
+    secrets:
+      T: ${{ secrets.FLY_API_TOKEN_SOAK }}
+  plan:
+    runs-on: ubuntu-24.04'
+expect_red "n17b a secrets map to another repository's workflow" 'soak.yml: job ext hands secrets (a map) to a workflow outside this repository'
+
+# n18 (m-2). A docker login with no logout trap: the token would outlive its step in docker's config.
+fresh; edit "$W/wf/$STG" "$PUSH_TRAP"'
+          flyctl auth docker
+          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          # Only' '          flyctl auth docker
+          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          # Only'
+expect_red "n18 deploy-stg's Already pushed? with no logout" 'push.Already pushed? logs docker in (flyctl auth docker) with no'
+fresh; edit "$W/wf/$PROD" "$PUSH_TRAP"'
+          flyctl auth docker
+          identity=' '          flyctl auth docker
+          identity='
+expect_red "n18b deploy-prod's record check with no logout" 'logs docker in (flyctl auth docker) with no'
+# ... and a trap that logs out of another host is no logout.
+fresh; edit "$W/wf/$STG" "$PUSH_TRAP"'
+          flyctl auth docker
+          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          docker tag' "          trap 'docker logout ghcr.io > /dev/null 2>&1 || true' EXIT"'
+          flyctl auth docker
+          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          docker tag'
+expect_red "n18c deploy-stg's Push logging out of another host" 'push.Push logs docker in (flyctl auth docker) with no'
+
+# n19 (m-2). An action in a push job pinned by tag, not commit.
+fresh; edit "$W/wf/$STG" '      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0' '      - uses: docker/setup-buildx-action@v3'
+expect_red "n19 deploy-stg's setup-buildx by tag" 'uses docker/setup-buildx-action@v3, not pinned by commit'
+
+# n20 to n23 (m-11): each flag the record check must pass, removed in turn.
+fresh; edit "$W/wf/$STG" '.github/workflows/deploy-stg.yml@refs/heads/main"' '.github/workflows/deploy-stg.yml@$GITHUB_REF"'
+expect_red "n20 deploy-stg's record identity at the run's own ref" "deploy-stg.yml (build record): job push: the record check does not read 'deploy-stg.yml@refs/heads/main'"
+fresh; edit "$W/wf/$PROD" '.github/workflows/deploy-prod.yml@refs/tags/$TAG"' '.github/workflows/deploy-prod.yml@$GITHUB_REF"'
+expect_red "n20b deploy-prod's record identity at the run's own ref" "deploy-prod.yml (build record): job push: the record check does not read 'deploy-prod.yml@refs/tags/\$TAG'"
+fresh; edit "$W/wf/$STG" ' --source-ref refs/heads/main --source-digest' ' --source-digest'
+expect_red "n21 deploy-stg's record check without --source-ref" "deploy-stg.yml (build record): job push: the record check does not read '--source-ref refs/heads/main'"
+fresh; edit "$W/wf/$PROD" ' --source-ref "refs/tags/$TAG" --source-digest' ' --source-digest'
+expect_red "n21b deploy-prod's record check without --source-ref" "deploy-prod.yml (build record): job push: the record check does not read '--source-ref \"refs/tags/\$TAG\"'"
+fresh; edit "$W/wf/$STG" " --source-digest \"\$GITHUB_SHA\" \\" " \\"
+expect_red "n22 deploy-stg's record check without --source-digest" "deploy-stg.yml (build record): job push: the record check does not read '--source-digest \"\$GITHUB_SHA\"'"
+fresh; edit "$W/wf/$STG" ' --deny-self-hosted-runners --limit 1000' ' --limit 1000'
+expect_red "n23 deploy-stg's record check without --deny-self-hosted-runners" "deploy-stg.yml (build record): job push: the record check does not read '--deny-self-hosted-runners'"
+
+# n24. A token step's `if` that reads the guard and then widens it (`&& X` is allowed; `|| X` is not).
+fresh; edit "$W/wf/$STG" "      - name: Push
+        id: push
+        if: steps.token.outputs.enabled == 'true' && steps.exists.outputs.exists != 'true'" "      - name: Push
+        id: push
+        if: steps.token.outputs.enabled == 'true' && steps.exists.outputs.exists != 'true' || github.event_name == 'push'"
+expect_red "n24 deploy-stg's Push behind a widened guard" 'push.Push holds FLY_API_TOKEN_RELAY_STG but runs whether or not the guard found it'
+fresh; edit "$W/wf/$STG" "      - name: Free disk space
+        if: steps.token.outputs.enabled == 'true'
+" "      - name: Free disk space
+        if: steps.token.outputs.enabled == 'true' || always()
+"
+expect_red "n24b deploy-stg's Free disk space behind a widened guard" 'push.Free disk space comes after the FLY_API_TOKEN_RELAY_STG guard but does not read it'
 
 # ---------------------------------------------------------------- 2. check-cef-bump.sh
 pin=$(tr -d '[:space:]' < "$root/docker/GSTCEF_COMMIT")
@@ -692,15 +781,20 @@ extract() {
   if grep -qF '${{' "$4"; then bad "$1 $2.$3 holds an expression: inputs must reach it by env"; fi
 }
 mkdir -p "$W/bin" "$W/rt"
+if command -v sha256sum > /dev/null; then sha_hex() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+else sha_hex() { printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1; }; fi
 
 # The scratch "GitHub" repository: main z (no CEF_STEP0_PASS yet), a, b (GSTCEF_COMMIT bumped with no
 # record: fails the gate), c, h (HEAD); side: d off h. Tags: v1.0.0 = a, v1.1.0 = b, v1.2.3 = c,
-# v1.2.4 = d. Every commit carries this tree's scripts/promote.sh and check-cef-bump.sh, so main's
-# copy is the one under test. The operator's checkout ($W/op) is a clone of it.
+# v1.2.4 = d, v1.9.0 = a blob (names no commit). Every commit carries this tree's scripts/promote.sh
+# and check-cef-bump.sh, so main's copy is the one under test. The operator's checkout ($W/op) is a
+# clone of it. Two more "GitHubs", each one commit past h on main: one whose main has no
+# check-cef-bump.sh, one whose main has no promote.sh.
 g="$W/git"
 mkdir -p "$g/docker" "$g/scripts"
 git -C "$g" init -q -b main
-gc() { git -C "$g" add -A && git -C "$g" -c user.email=t@example -c user.name=t commit -q --allow-empty -m "$1" && git -C "$g" rev-parse HEAD; }
+gcin() { local r=$1; shift; git -C "$r" add -A && git -C "$r" -c user.email=t@example -c user.name=t commit -q --allow-empty -m "$1" && git -C "$r" rev-parse HEAD; }
+gc() { gcin "$g" "$1"; }
 cp "$root/scripts/check-cef-bump.sh" "$root/scripts/promote.sh" "$g/scripts/"; cp "$root/_FINDINGS.md" "$g/"; cp "$root/docker/GSTCEF_COMMIT" "$g/docker/"
 Z=$(gc z)
 cp "$root/docker/CEF_STEP0_PASS" "$g/docker/"; A=$(gc a)
@@ -709,13 +803,17 @@ cp "$root/docker/GSTCEF_COMMIT" "$g/docker/"; C=$(gc c)
 H=$(gc h)
 git -C "$g" checkout -q -b side; D=$(gc d); git -C "$g" checkout -q main
 git -C "$g" tag v1.0.0 "$A"; git -C "$g" tag v1.1.0 "$B"; git -C "$g" tag v1.2.3 "$C"; git -C "$g" tag v1.2.4 "$D"
+git -C "$g" tag v1.9.0 "$(printf 'not a commit\n' | git -C "$g" hash-object -w --stdin)"
 git -C "$g" update-ref refs/remotes/origin/main "$H"
 git clone -q "$g" "$W/op"
+git clone -q "$g" "$W/git-nocef"; git -C "$W/git-nocef" rm -q scripts/check-cef-bump.sh; gcin "$W/git-nocef" "no gate" > /dev/null
+git clone -q "$g" "$W/git-nopromote"; git -C "$W/git-nopromote" rm -q scripts/promote.sh; gcin "$W/git-nopromote" "no promote" > /dev/null
 
 # Fakes. State lives in $STATE; every call is logged to $STATE/log. flyctl's secret list is live:
 # `secrets set --stage` stages a value (its digest: the value's cksum), `secrets deploy` deploys
 # every staged one, unless a flag file says otherwise. flyctl logs which token it ran with: none
-# (the stored login, promote's), the push token the test expects (the deploy workflows'), or WRONG.
+# (the stored login, promote's), the push token the test expects (the deploy workflows'), or WRONG,
+# and its working directory. `tokens create` prints $STATE/read-token, the read token promote mints.
 cat > "$W/bin/flyctl" << 'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -727,10 +825,18 @@ s="$STATE/secrets.json"
 put() { jq "$@" "$s" > "$s.tmp" && mv "$s.tmp" "$s"; }
 case "$1 ${2:-}" in
   "auth docker") [ ! -f "$STATE/auth-fails" ] || { echo "Error: no access token available. Please login with 'flyctl auth login' (fake)" >&2; exit 1; } ;;
+  "tokens create")
+    [ ! -f "$STATE/token-fails" ] || { echo "Error: you are not logged in (fake)" >&2; exit 1; }
+    cat "$STATE/read-token"
+    [ ! -f "$STATE/token-odd" ] || echo "a second line" ;;
   "config show") [ ! -f "$STATE/config-fails" ] || { echo "Error: app not found (fake)" >&2; exit 1; }; cat "$STATE/config.json" ;;
-  "secrets list") cat "$s" ;;
+  "secrets list")
+    n=$(( $(cat "$STATE/list-calls" 2> /dev/null || echo 0) + 1 )); echo "$n" > "$STATE/list-calls"
+    if [ -f "$STATE/list-fails-at" ] && [ "$(cat "$STATE/list-fails-at")" = "$n" ]; then echo "Error: timeout (fake)" >&2; exit 1; fi
+    cat "$s" ;;
   "secrets set")
     [ ! -f "$STATE/set-fails" ] || { echo "Error: unauthorized (fake)" >&2; exit 1; }
+    [ ! -f "$STATE/set-noop" ] || exit 0
     name=${3%%=*} value=${3#*=}
     d=$(printf '%s' "$value" | cksum | cut -d' ' -f1)
     put --arg n "$name" --arg d "$d" 'if any(.[]; .name == $n) then map(if .name == $n then .digest = $d | .status = "Staged" else . end)
@@ -744,30 +850,83 @@ case "$1 ${2:-}" in
   *) echo "fake flyctl: unexpected: $*" >&2; exit 2 ;;
 esac
 SH
+# docker, for the deploy workflows' own steps only (promote runs no docker): tags in $STATE/registry
+# (`<repo>:<tag> <digest>`). `push` prints docker's PushResult line for $STATE/push-digest and puts
+# that digest under the tag, or, with $STATE/squat-after-push, another push's right after it (the
+# race of the PR #93 review's C-1).
 cat > "$W/bin/docker" << 'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 echo "docker $*" >> "$STATE/log"
-if [ "$1 ${2:-}" = "buildx version" ]; then
-  [ ! -f "$STATE/no-buildx" ] || { echo "docker: unknown command: docker buildx" >&2; exit 1; }
-  echo "github.com/docker/buildx v0.0.0 fake"
-  exit 0
-fi
+case "$1" in
+  logout | tag) exit 0 ;;
+  push)
+    shift; [ "$1" != -q ] || shift
+    ref=$1 t=${1##*:} d=$(cat "$STATE/push-digest")
+    echo "The push refers to repository [${ref%:*}]"
+    echo "5f70bf18a086: Pushed"
+    [ -f "$STATE/push-no-digest" ] || echo "$t: digest: $d size: 1234"
+    nd=$d; [ ! -f "$STATE/squat-after-push" ] || nd=$(cat "$STATE/squat-after-push")
+    awk -v r="$ref" '$1 != r' "$STATE/registry" > "$STATE/registry.tmp"; echo "$ref $nd" >> "$STATE/registry.tmp"
+    mv "$STATE/registry.tmp" "$STATE/registry"
+    exit 0 ;;
+esac
+if [ "$1 ${2:-}" = "buildx version" ]; then echo "github.com/docker/buildx v0.0.0 fake"; exit 0; fi
 [ "$1 $2 $3" = "buildx imagetools inspect" ] || { echo "fake docker: unexpected: $*" >&2; exit 2; }
 if [ -f "$STATE/registry-down" ]; then echo "ERROR: failed to authorize: 401 Unauthorized (fake)" >&2; exit 1; fi
 d=$(awk -v r="$4" '$1 == r {print $2}' "$STATE/registry")
 [ -n "$d" ] || { echo "ERROR: $4: not found" >&2; exit 1; }
 echo "$d"
 SH
+# curl, for promote's one registry read: GET https://<registry>/v2/<app>/manifests/<digest>, served from
+# $STATE/blobs/<app>/<digest>; 404 when absent; $STATE/status-<digest> forces a status, $STATE/lie a
+# wrong body ($STATE/lie-<digest> for that digest alone), $STATE/curl-fails a curl error whose text
+# carries the credential (it must never be
+# printed). It checks its -K config: mode -rw-------, exactly `user = "x:<the minted token>"`.
+cat > "$W/bin/curl" << 'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "curl $*" >> "$STATE/log"
+cfg='' out='' fmt='' url=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -K) cfg=$2; shift ;;
+    -o) out=$2; shift ;;
+    -w) fmt=$2; shift ;;
+    -H | --proto | --max-time) shift ;;
+    -sS) ;;
+    https://*) url=$1 ;;
+    *) echo "fake curl: unexpected $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+[ "$fmt" = '%{http_code}' ] && [ -n "$out" ] && [ -n "$url" ] || { echo "fake curl: wanted -o, -w %{http_code} and a URL" >&2; exit 2; }
+if [ -f "$cfg" ] && [ "$(ls -l "$cfg" | cut -c 1-10)" = "-rw-------" ] && [ "$(cat "$cfg")" = "user = \"x:$(cat "$STATE/read-token")\"" ]; then
+  echo "curl-config ok $cfg" >> "$STATE/log"
+else
+  echo "curl-config BAD $cfg" >> "$STATE/log"
+  printf '{"errors":[{"code":"UNAUTHORIZED"}]}' > "$out"; printf '401'; exit 0
+fi
+if [ -f "$STATE/curl-fails" ]; then echo "curl: (7) Failed to connect as x:$(cat "$STATE/read-token") (fake)" >&2; printf '000'; exit 7; fi
+path=${url#https://*/v2/} app=${path%%/manifests/*} digest=${path##*/manifests/}
+if [ -f "$STATE/status-$digest" ]; then printf '{}' > "$out"; cat "$STATE/status-$digest"; exit 0; fi
+if [ -f "$STATE/blobs/$app/$digest" ]; then
+  if [ -f "$STATE/lie" ] || [ -f "$STATE/lie-$digest" ]; then printf '{"not":"it"}' > "$out"; else cp "$STATE/blobs/$app/$digest" "$out"; fi
+  printf '200'
+else
+  printf '{"errors":[{"code":"MANIFEST_UNKNOWN"}]}' > "$out"; printf '404'
+fi
+SH
 cat > "$W/bin/gh" << 'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 echo "gh $*" >> "$STATE/log"
-# `gh attestation verify oci://<repo>@<digest> --repo R --cert-identity I ...`, as gh 2.95.0's
+# `gh attestation verify <file | oci://<repo>@<digest>> --repo R --cert-identity I ...`, as gh 2.95.0's
 # verify/policy.go enforces it: --cert-identity matches the signing certificate's SAN exactly,
 # --source-ref, --source-digest and --signer-digest match those extensions when given (an omitted
 # flag enforces nothing), --deny-self-hosted-runners requires a GitHub-hosted runner, and --repo
-# scopes the lookup to that repository. gh reads the manifest by digest from the registry first.
+# scopes the lookup to that repository. A file is hashed (sha256) and its attestations fetched by that
+# digest; an oci:// URI reads the manifest by digest from the registry first.
 # $STATE/attestations: one per line, `digest identity source_ref source_digest signer_digest runner repo`.
 [ "$1 ${2:-}" = "attestation verify" ] || { echo "fake gh: unexpected: $*" >&2; exit 2; }
 subject=$3; shift 3
@@ -779,6 +938,7 @@ while [ $# -gt 0 ]; do
     --source-ref) sref=$2; shift ;;
     --source-digest) sdig=$2; shift ;;
     --signer-digest) gdig=$2; shift ;;
+    --limit) shift ;;
     --deny-self-hosted-runners) deny=yes ;;
     *) echo "fake gh: unexpected attestation flag $1" >&2; exit 2 ;;
   esac
@@ -787,11 +947,17 @@ done
 [ -n "$repo" ] || { echo "fake gh: --repo or --owner is required" >&2; exit 2; }
 [ -n "$ident" ] || { echo "fake gh: this fake models --cert-identity only" >&2; exit 2; }
 if [ -f "$STATE/attest-down" ]; then echo "Error: failed to fetch attestations: HTTP 503 (fake)" >&2; exit 1; fi
-name=${subject#oci://} digest=${subject##*@}; name=${name%@*}
-# A manifest stays addressable by digest after its tag moves: $STATE/manifests lists those.
-{ awk -v n="$name:" -v d="$digest" 'index($1, n) == 1 && $2 == d {f = 1} END {exit !f}' "$STATE/registry" \
-    || { [ -f "$STATE/manifests" ] && awk -v n="$name" -v d="$digest" '$1 == n && $2 == d {f = 1} END {exit !f}' "$STATE/manifests"; }; } \
-  || { echo "Error: $name@$digest: not found (fake)" >&2; exit 1; }
+if [[ "$subject" == oci://* ]]; then
+  name=${subject#oci://} digest=${subject##*@}; name=${name%@*}
+  # A manifest stays addressable by digest after its tag moves: $STATE/manifests lists those.
+  { awk -v n="$name:" -v d="$digest" 'index($1, n) == 1 && $2 == d {f = 1} END {exit !f}' "$STATE/registry" \
+      || { [ -f "$STATE/manifests" ] && awk -v n="$name" -v d="$digest" '$1 == n && $2 == d {f = 1} END {exit !f}' "$STATE/manifests"; }; } \
+    || { echo "Error: $name@$digest: not found (fake)" >&2; exit 1; }
+else
+  [ -f "$subject" ] || { echo "Error: $subject: no such file (fake)" >&2; exit 1; }
+  if command -v sha256sum > /dev/null; then digest="sha256:$(sha256sum < "$subject" | cut -d' ' -f1)"
+  else digest="sha256:$(shasum -a 256 < "$subject" | cut -d' ' -f1)"; fi
+fi
 if awk -v d="$digest" -v i="$ident" -v r="$sref" -v s="$sdig" -v g="$gdig" -v deny="$deny" -v repo="$repo" '
     $1 == d && $2 == i && (r == "" || $3 == r) && (s == "" || $4 == s) && (g == "" || $5 == g) \
       && (deny == "no" || $6 == "github-hosted") && $7 == repo {f = 1} END {exit !f}' "$STATE/attestations"; then
@@ -801,33 +967,50 @@ fi
 echo "Error: verifying with issuer \"sigstore.dev\": no attestation matched the policy (fake)" >&2
 exit 1
 SH
-chmod +x "$W/bin/flyctl" "$W/bin/docker" "$W/bin/gh"
-# A PATH with no flyctl at all (the fakes but flyctl, git and jq, then the system's).
-mkdir -p "$W/bin-nofly"
-cp "$W/bin/docker" "$W/bin/gh" "$W/bin-nofly/"
-ln -s "$(command -v jq)" "$W/bin-nofly/jq"; ln -s "$(command -v git)" "$W/bin-nofly/git"
+chmod +x "$W/bin/flyctl" "$W/bin/docker" "$W/bin/curl" "$W/bin/gh"
+# The tools sweep's PATHs: every system command except the ones promote checks for, and a bin of
+# those (the fakes, git, jq, the sha tool) from which each case removes one.
+mkdir -p "$W/sysbin"
+for f in /bin/* /usr/bin/*; do
+  n=$(basename "$f")
+  case "$n" in git | jq | curl | flyctl | gh | docker | sha256sum | shasum) continue ;; esac
+  [ -e "$W/sysbin/$n" ] || ln -s "$f" "$W/sysbin/$n"
+done
+tools_bin() { # tools_bin MISSING...: a bin of promote's tools without MISSING
+  local d="$W/tools-$1" t
+  rm -rf "$d"; mkdir -p "$d"
+  for t in flyctl curl gh; do ln -s "$W/bin/$t" "$d/$t"; done
+  for t in git jq sha256sum shasum; do command -v "$t" > /dev/null && ln -s "$(command -v "$t")" "$d/$t"; done
+  for t in "$@"; do rm -f "$d/$t"; done
+  echo "$d"
+}
 
 SHA=$C OLD=$A UNPUSHED=$H SIDE=$D BAD=$B PRE=$Z
 SPOOF=5555555555555555555555555555555555555555
-D_NEW=sha256:$(printf 'a%.0s' $(seq 64))
-D_OLD=sha256:$(printf 'b%.0s' $(seq 64))
-D_PROD=sha256:$(printf 'c%.0s' $(seq 64))
-D_ANY=sha256:$(printf 'e%.0s' $(seq 64))
-D_SQ=sha256:$(printf 'd%.0s' $(seq 64))
+# Manifest bodies, and their digests (promote checks sha256(body) == the pin).
+B_NEW='{"m":"main build of c"}' B_OLD='{"m":"main build of a"}' B_PROD='{"m":"release v1.2.3"}'
+B_ANY='{"m":"some other push"}' B_SQ='{"m":"a squat"}' B_GONE='{"m":"deleted since"}' B_MISSING='{"m":"never pushed"}'
+D_NEW=sha256:$(sha_hex "$B_NEW") D_OLD=sha256:$(sha_hex "$B_OLD") D_PROD=sha256:$(sha_hex "$B_PROD")
+D_ANY=sha256:$(sha_hex "$B_ANY") D_SQ=sha256:$(sha_hex "$B_SQ") D_GONE=sha256:$(sha_hex "$B_GONE") D_MISSING=sha256:$(sha_hex "$B_MISSING")
 REPO=onryde/seazn.club.compositor
 WFURL=https://github.com/$REPO/.github/workflows
 ID_STG="$WFURL/deploy-stg.yml@refs/heads/main"
+READ_TOKEN='FlyV1 fm2_fakeReadToken7f3a+/=,x'
 # attest_line DIGEST IDENTITY SOURCE_REF COMMIT: main's own build record, as deploy-<env>.yml signs it.
 attest_line() { echo "$1 $2 $3 $4 $4 github-hosted $REPO"; }
 REG=registry.example
 digest_of() { printf '%s' "$1" | cksum | cut -d' ' -f1; }
 PLOG="$W/home/.local/state/seazn-relay-promote"
+blob() { mkdir -p "$STATE/blobs/$1"; printf '%s' "$2" > "$STATE/blobs/$1/sha256:$(sha_hex "$2")"; }
 state() {
   STATE="$W/state"; rm -rf "$STATE"; mkdir -p "$STATE"; : > "$STATE/log"; : > "$W/summary"; : > "$W/output"
   export STATE
+  printf '%s\n' "$READ_TOKEN" > "$STATE/read-token"
   printf '%s\n' "$REG/seazn-relay-stg:$SHA $D_NEW" "$REG/seazn-relay-stg:$OLD $D_OLD" "$REG/seazn-relay-stg:$SIDE $D_ANY" \
     "$REG/seazn-relay-stg:$BAD $D_ANY" "$REG/seazn-relay-stg:$PRE $D_ANY" \
     "$REG/seazn-relay-prod:v1.2.3 $D_PROD" "$REG/seazn-relay-prod:v1.2.4 $D_ANY" "$REG/seazn-relay-prod:v1.1.0 $D_ANY" > "$STATE/registry"
+  blob seazn-relay-stg "$B_NEW"; blob seazn-relay-stg "$B_OLD"; blob seazn-relay-stg "$B_ANY"
+  blob seazn-relay-prod "$B_PROD"; blob seazn-relay-prod "$B_ANY"
   # Main's build records for what main pushed: deploy-stg at refs/heads/main for $SHA and $OLD,
   # deploy-prod at refs/tags/v1.2.3 for C. Nothing attests the D_ANY images.
   { attest_line "$D_NEW" "$ID_STG" refs/heads/main "$SHA"; attest_line "$D_OLD" "$ID_STG" refs/heads/main "$OLD"
@@ -835,11 +1018,12 @@ state() {
   echo '{"app":"seazn-club-stg","env":{"OAUTH_BASE_URL":"https://stg.example"}}' > "$STATE/config.json"
   echo '[{"name":"FLY_RELAY_APP","digest":"f1","status":"Deployed"},{"name":"RELAY_IMAGE","digest":"d0","status":"Deployed"}]' > "$STATE/secrets.json"
   # The operator's promote log: stg's newest entry is not what RELAY_IMAGE is now (Fly digest d7,
-  # say a later promote's whose deploy failed), the one before it is (d0); prod's names v1.0.0.
-  rm -rf "$W/home"; mkdir -p "$PLOG"
+  # say a later promote's whose deploy failed), the one before it is (d0); prod's names v1.0.0, whose
+  # manifest is gone from the registry.
+  rm -rf "${W:?}/home"; mkdir -p "$PLOG"
   printf '%s\n' "2026-10-20T10:00:00Z stg $OLD@$D_OLD $REG/seazn-relay-stg@$D_OLD d0" \
     "2026-10-22T10:00:00Z stg $SPOOF@$D_ANY $REG/seazn-relay-stg@$D_ANY d7" > "$PLOG/stg.log"
-  echo "2026-10-21T10:00:00Z prod v1.0.0@$D_ANY $REG/seazn-relay-prod@$D_ANY d0" > "$PLOG/prod.log"
+  echo "2026-10-21T10:00:00Z prod v1.0.0@$D_GONE $REG/seazn-relay-prod@$D_GONE d0" > "$PLOG/prod.log"
 }
 # run_step SCRIPT VAR=VALUE...: a workflow's block under the runner's shell (bash -eo pipefail), in
 # the scratch repository, fakes first on PATH.
@@ -852,24 +1036,26 @@ run_step() {
     bash --noprofile --norc -eo pipefail "$script") > "$W/step.out" 2>&1; then rc=0; else rc=$?; fi
 }
 # promote_run [VAR=VALUE...] -- ARG...: scripts/promote.sh as the operator runs it, from their
-# checkout, on their own login (no token in its environment unless a case puts one there). A
-# SCRIPT=<path> pseudo-variable runs another copy.
+# checkout, on their own login (no token in its environment unless a case puts one there), with its
+# test seams on. Pseudo-variables: SCRIPT=<path> runs another copy; NOSEAMS=1 drops the seams.
 promote_run() {
-  local envs=() script="$W/op/scripts/promote.sh"
+  local envs=() script="$W/op/scripts/promote.sh" seams=(PROMOTE_TEST_SEAMS=1 PROMOTE_REMOTE="$g" RELAY_REGISTRY="$REG")
   while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
-    case "$1" in SCRIPT=*) script=${1#SCRIPT=} ;; *) envs+=("$1") ;; esac
+    case "$1" in SCRIPT=*) script=${1#SCRIPT=} ;; NOSEAMS=1) seams=() ;; *) envs+=("$1") ;; esac
     shift
   done
   [ "$#" -eq 0 ] || shift
-  if (cd "$W/op" && env -i PATH="$W/bin:$PATH" HOME="$W/home" STATE="$STATE" PROMOTE_REMOTE="$g" RELAY_REGISTRY="$REG" \
+  if (cd "$W/op" && env -i PATH="$W/bin:$PATH" HOME="$W/home" STATE="$STATE" ${seams[@]+"${seams[@]}"} \
       ${envs[@]+"${envs[@]}"} bash --noprofile --norc "$script" "$@") > "$W/step.out" 2>&1; then rc=0; else rc=$?; fi
 }
 has() { grep -qF -- "$2" "$1"; }
 no_set() { ! grep -qE 'flyctl secrets (set|deploy)' "$STATE/log"; }
-# No Fly or registry call (the tools check's `docker buildx version` reads nothing).
-no_fly() { ! grep -E '^(flyctl|docker) ' "$STATE/log" | grep -vqF 'docker buildx version'; }
+# No Fly or registry call: no flyctl, curl or docker at all.
+no_fly() { ! grep -qE '^(flyctl|docker|curl) ' "$STATE/log"; }
 show() { sed 's/^/    /' "$W/step.out" "$STATE/log" "$W/summary" >&2; }
 refusal() { grep -m 1 -F 'promote: REFUSED: ' "$W/step.out" | cut -c 1-220; }
+# The minted read token appears in no output, no argv (the fakes log theirs) and no error.
+no_token_seen() { ! grep -qF -- "fakeReadToken7f3a" "$W/step.out" && ! grep -qF -- "fakeReadToken7f3a" "$STATE/log"; }
 # refused NAME TEXT [VAR=VALUE...] -- ARG...: promote stops, says TEXT, and made no Fly or registry call.
 refused() {
   local name=$1 text=$2; shift 2
@@ -877,15 +1063,16 @@ refused() {
   if [ "$rc" -ne 0 ] && grep -F 'promote: REFUSED: ' "$W/step.out" | grep -qF -- "$text" && no_fly; then
     ok "promote $name :: $(refusal)"
   else
-    bad "promote $name: rc $rc, expected a refusal before any flyctl or docker call saying: $text"; show
+    bad "promote $name: rc $rc, expected a refusal before any flyctl, curl or docker call saying: $text"; show
   fi
 }
-# refused_before_web NAME TEXT -- ARG...: promote stops, says TEXT, and never called the web app.
+# refused_before_web NAME TEXT -- ARG...: promote stops, says TEXT, never called the web app, and
+# never showed the read token.
 refused_before_web() {
   local name=$1 text=$2; shift 2
   promote_run "$@"
   if [ "$rc" -ne 0 ] && grep -F 'promote: REFUSED: ' "$W/step.out" | grep -qF -- "$text" && no_set \
-    && ! grep -q 'seazn-club-' "$STATE/log"; then
+    && ! grep -q 'seazn-club-' "$STATE/log" && no_token_seen; then
     ok "promote $name :: $(refusal)"
   else
     bad "promote $name: rc $rc, expected a refusal before any call to the web app saying: $text"; show
@@ -924,22 +1111,49 @@ else
   bad "deploy-stg provenance: rc $r1/$r2/$rc"; echo "$o2" >&2
 fi
 
+# logs_out: the step logged docker in on the push token and out again (m-2).
+logs_out() { has "$STATE/log" 'flyctl auth docker (token push)' && has "$STATE/log" "docker logout $REG"; }
+
 # "Already pushed?", stg and prod (m-5): a pushed tag is never pushed again; only "not found" is
-# absent; any other registry error is a red with no exists= written. flyctl runs on the push token.
+# absent; any other registry error is a red with no exists= written. flyctl runs on the push token,
+# and the login leaves with the step.
 for wf in "$STG:seazn-relay-stg:$SHA:fake-stg-push" "$PROD:seazn-relay-prod:v1.2.3:fake-prod-push"; do
   IFS=: read -r file app pushed token <<< "$wf"
   extract "$file" push exists "$W/exists.sh"
   state; run_step "$W/exists.sh" FLY_API_TOKEN="$token" EXPECT_PUSH="$token" RELAY_APP="$app" TAG="$pushed"
-  r1=$rc; out1=$(cat "$W/output"); tok1=$(grep -c 'flyctl auth docker (token push)' "$STATE/log" || true)
+  r1=$rc; out1=$(cat "$W/output"); l1=false; logs_out && l1=true
   state; run_step "$W/exists.sh" FLY_API_TOKEN="$token" EXPECT_PUSH="$token" RELAY_APP="$app" TAG=v7.7.7
   r2=$rc; out2=$(cat "$W/output")
   state; touch "$STATE/registry-down"; run_step "$W/exists.sh" FLY_API_TOKEN="$token" EXPECT_PUSH="$token" RELAY_APP="$app" TAG=v7.7.7
-  if [ "$r1" -eq 0 ] && [ "$tok1" -eq 1 ] && [[ "$out1" == *"exists=true"* && "$out1" == *"digest=sha256:"* ]] \
+  if [ "$r1" -eq 0 ] && [ "$l1" = true ] && [[ "$out1" == *"exists=true"* && "$out1" == *"digest=sha256:"* ]] \
     && [ "$r2" -eq 0 ] && [[ "$out2" == *"exists=false"* ]] \
-    && [ "$rc" -ne 0 ] && has "$W/step.out" "::error::the registry could not be read for $REG/$app:v7.7.7" && [ ! -s "$W/output" ]; then
-    ok "$file Already pushed?: pushed reads exists=true (on the push token); not found exists=false; a registry error is a red"
+    && [ "$rc" -ne 0 ] && has "$W/step.out" "::error::the registry could not be read for $REG/$app:v7.7.7" && [ ! -s "$W/output" ] && logs_out; then
+    ok "$file Already pushed?: pushed reads exists=true (on the push token, logged out after); not found exists=false; a registry error is a red"
   else
     bad "$file Already pushed?: rc $r1/$r2/$rc"; echo "$out1 | $out2" >&2; sed 's/^/    /' "$W/step.out" >&2
+  fi
+done
+
+# Push (the PR #93 review's C-1): the digest attested is the one this push wrote, from docker's own
+# PushResult line, never the tag read back; a tag another push moves under this one is a red with no
+# digest written; a push that prints no digest line is a red. The old step (`docker push -q`, then
+# the digest read back by tag) outputs the squat's digest in the race, so this case reds on it.
+for wf in "$STG:seazn-relay-stg:$UNPUSHED:fake-stg-push" "$PROD:seazn-relay-prod:v7.7.7:fake-prod-push"; do
+  IFS=: read -r file app tag token <<< "$wf"
+  extract "$file" push push "$W/push.sh"
+  args=(FLY_API_TOKEN="$token" EXPECT_PUSH="$token" RELAY_APP="$app" TAG="$tag" LOCAL_IMAGE=seazn-relay:local)
+  state; echo "$D_NEW" > "$STATE/push-digest"; run_step "$W/push.sh" "${args[@]}"
+  r1=$rc; o1=$(cat "$W/output"); l1=false; logs_out && l1=true
+  state; echo "$D_NEW" > "$STATE/push-digest"; echo "$D_SQ" > "$STATE/squat-after-push"; run_step "$W/push.sh" "${args[@]}"
+  r2=$rc; o2=$(cat "$W/output"); e2=$(grep -m 1 -F '::error::' "$W/step.out" || true); l2=false; logs_out && l2=true
+  state; echo "$D_NEW" > "$STATE/push-digest"; touch "$STATE/push-no-digest"; run_step "$W/push.sh" "${args[@]}"
+  if [ "$r1" -eq 0 ] && [ "$o1" = "digest=$D_NEW" ] && [ "$l1" = true ] \
+    && [ "$r2" -ne 0 ] && [ -z "$o2" ] && [ "$l2" = true ] \
+    && [[ "$e2" == *"::error::the tag moved under the push: this run pushed $REG/$app:$tag as $D_NEW, and the tag now names '$D_SQ'"* ]] \
+    && [ "$rc" -ne 0 ] && [ ! -s "$W/output" ] && has "$W/step.out" "::error::docker push printed 0 digest lines for $REG/$app:$tag, not 1"; then
+    ok "$file Push (C-1): outputs the digest its own push wrote; a tag moved under it is a red and no digest ($e2); no digest line is a red; logged out after"
+  else
+    bad "$file Push (C-1): rc $r1/$r2/$rc, out '$o1' / '$o2'"; sed 's/^/    /' "$W/step.out" "$STATE/log" >&2
   fi
 done
 
@@ -949,21 +1163,23 @@ record_case() { # record_case FILE NAME WANT_RC TEXT VAR=VALUE...
   local file=$1 name=$2 want=$3 text=$4; shift 4
   extract "$file" push record "$W/record.sh"
   run_step "$W/record.sh" "$@"
-  if { [ "$want" = 0 ] && [ "$rc" -eq 0 ] && has "$W/step.out" "$text"; } \
+  if { [ "$want" = 0 ] && [ "$rc" -eq 0 ] && has "$W/step.out" "$text" && logs_out; } \
     || { [ "$want" != 0 ] && [ "$rc" -ne 0 ] && grep -F '::error::' "$W/step.out" | grep -qF -- "$text"; }; then
     ok "$file build record $name :: $(head -n 1 "$W/step.out" | cut -c 1-200)"
   else
     bad "$file build record $name: rc $rc, expected rc $want saying: $text"; show
   fi
 }
-# sq_state ROW: the squat in the registry under main's sha, the row (if any) as the only record of D_SQ.
+# sq_state ROW: the squat in the registry under main's sha (and by its digest), the row (if any) as
+# the only record of D_SQ.
 sq_state() {
   state
   sed "s|^$REG/seazn-relay-stg:$SHA .*|$REG/seazn-relay-stg:$SHA $D_SQ|" "$STATE/registry" > "$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/registry"
+  blob seazn-relay-stg "$B_SQ"
   [ -z "$1" ] || echo "$1" >> "$STATE/attestations"
 }
-STG_REC=(RELAY_APP=seazn-relay-stg TAG="$SHA" GITHUB_SHA="$SHA")
-PROD_REC=(RELAY_APP=seazn-relay-prod TAG=v1.2.3 GITHUB_SHA="$C" GITHUB_REF=refs/tags/v1.2.3)
+STG_REC=(RELAY_APP=seazn-relay-stg TAG="$SHA" GITHUB_SHA="$SHA" FLY_API_TOKEN=fake-stg-push)
+PROD_REC=(RELAY_APP=seazn-relay-prod TAG=v1.2.3 GITHUB_SHA="$C" GITHUB_REF=refs/tags/v1.2.3 FLY_API_TOKEN=fake-prod-push EXPECT_PUSH=fake-prod-push)
 state; record_case "$STG" "pushed and attested" 0 "$REG/seazn-relay-stg:$SHA@$D_NEW: attested by $ID_STG for $SHA" "${STG_REC[@]}" FOUND=false DIGEST="$D_NEW"
 state; record_case "$STG" "found, main's own build" 0 "attested by $ID_STG for $SHA" "${STG_REC[@]}" FOUND=true DIGEST="$D_NEW"
 sq_state "$D_SQ $WFURL/deploy-stg.yml@refs/heads/feat/x refs/heads/feat/x $SIDE $SIDE github-hosted $REPO"
@@ -1055,12 +1271,19 @@ fi
 state; promote_run -- stg "$SHA@$D_NEW"
 new_value="$REG/seazn-relay-stg@$D_NEW"  # m-10: the attested digest alone, no tag a squat could move
 set_line="flyctl secrets set RELAY_IMAGE=$new_value -a seazn-club-stg --stage (token none)"
-if [ "$rc" -eq 0 ] && has "$STATE/log" "$set_line" && has "$STATE/log" 'flyctl auth docker (token none)' \
+cfg_path=$(sed -n 's/^curl-config ok //p' "$STATE/log" | head -n 1)
+n_fly=$(grep -c '^flyctl ' "$STATE/log" || true)
+n_cwd=$(grep -cE '^flyctl .* \[cwd [^]]*/cwd\]$' "$STATE/log" || true)
+line_of() { grep -nF -- "$1" "$STATE/log" | head -n 1 | cut -d: -f1; }
+if [ "$rc" -eq 0 ] && has "$STATE/log" "$set_line" \
+  && has "$STATE/log" 'flyctl tokens create deploy -a seazn-relay-stg -n promote-read-stg-' && has "$STATE/log" ' -x 10m (token none)' \
   && has "$STATE/log" 'flyctl config show -a seazn-club-stg (token none)' \
-  && [ "$(grep -nF 'flyctl secrets set' "$STATE/log" | cut -d: -f1)" -lt "$(grep -nF 'flyctl secrets deploy -a seazn-club-stg (token none)' "$STATE/log" | cut -d: -f1)" ] \
-  && ! grep -qE 'token (WRONG|push)' "$STATE/log" && ! has "$STATE/log" "[cwd $W/op" \
-  && has "$STATE/log" "gh attestation verify oci://$REG/seazn-relay-stg@$D_NEW --repo $REPO --cert-identity $ID_STG --source-ref refs/heads/main --source-digest $SHA --signer-digest $SHA --deny-self-hosted-runners" \
-  && [ "$(grep -nF 'gh attestation verify' "$STATE/log" | cut -d: -f1)" -lt "$(grep -nF 'flyctl config show' "$STATE/log" | cut -d: -f1)" ] \
+  && [ -n "$cfg_path" ] && [ ! -e "$cfg_path" ] && has "$STATE/log" "curl -sS --proto =https --max-time 60 -K $cfg_path" \
+  && has "$STATE/log" "https://$REG/v2/seazn-relay-stg/manifests/$D_NEW" && ! grep -q '^docker ' "$STATE/log" && no_token_seen \
+  && [ "$(line_of 'flyctl secrets set')" -lt "$(line_of 'flyctl secrets deploy -a seazn-club-stg (token none)')" ] \
+  && ! grep -qE 'token (WRONG|push)' "$STATE/log" && [ "$n_fly" -gt 0 ] && [ "$n_cwd" -eq "$n_fly" ] && ! has "$STATE/log" "[cwd $W/op" \
+  && grep -qE "^gh attestation verify /[^ ]+/manifest\.json --repo $REPO --cert-identity $ID_STG --source-ref refs/heads/main --source-digest $SHA --signer-digest $SHA --deny-self-hosted-runners --limit 1000$" "$STATE/log" \
+  && [ "$(line_of 'gh attestation verify')" -lt "$(line_of 'flyctl config show')" ] && [ "$(line_of 'curl-config ok')" -lt "$(line_of 'gh attestation verify')" ] \
   && has "$W/step.out" "  commit:                $SHA (on main; the CEF bump gate passed in its tree)" \
   && has "$W/step.out" "  build record:          attested by $ID_STG" \
   && has "$W/step.out" "  new RELAY_IMAGE:       $new_value" \
@@ -1068,19 +1291,30 @@ if [ "$rc" -eq 0 ] && has "$STATE/log" "$set_line" && has "$STATE/log" 'flyctl a
   && has "$W/step.out" "  RELAY_IMAGE's digest:  d0 -> $(digest_of "$new_value") (Deployed)" \
   && has "$W/step.out" "Rollback: scripts/promote.sh stg $OLD@$D_OLD (it refuses" \
   && [ "$(tail -n 1 "$PLOG/stg.log" | cut -d' ' -f2-)" = "stg $SHA@$D_NEW $new_value $(digest_of "$new_value")" ]; then
-  ok "promote P1: stg on the stored login (no token), main's build record verified before any call to web, RELAY_IMAGE set by digest then deployed; previous = the log entry whose Fly digest is live (not the newer d7 one), with its rollback; the promote logged"
+  ok "promote P1: stg on the stored login, no docker; the manifest read by digest on a 10-minute relay-only read token kept in a 0600 curl config (gone after, never in argv or output); main's record verified on that file before any web call; all $n_fly flyctl calls from the empty cwd; RELAY_IMAGE set by digest then deployed; previous = the log entry whose Fly digest is live, with its rollback; logged"
 else
-  bad "promote P1: rc $rc"; show
+  bad "promote P1: rc $rc (flyctl $n_fly, from the empty cwd $n_cwd, config '$cfg_path')"; show
 fi
 
-# P2: the ref was never pushed; P2b: the registry cannot be read (m-5: an error, never "not pushed").
-state; refused_before_web "P2: an unpushed main commit" "not pushed: $REG/seazn-relay-stg:$UNPUSHED" -- stg "$UNPUSHED@$D_ANY"
-state; touch "$STATE/registry-down"
-refused_before_web "P2b (m-5): a registry error, not \"not pushed\"" "the registry could not be read for $REG/seazn-relay-stg:$SHA (only 'not found' means not pushed): ERROR: failed to authorize: 401 Unauthorized" -- stg "$SHA@$D_NEW"
-# P2c: flyctl's docker login fails (no stored login): refused before any registry read.
-state; touch "$STATE/auth-fails"
-refused_before_web "P2c: no stored flyctl login" "flyctl auth docker failed (log in first: flyctl auth login)" -- stg "$SHA@$D_NEW"
-if ! grep -q '^docker buildx imagetools' "$STATE/log"; then ok "promote P2c: no registry read after a failed login"; else bad "promote P2c read the registry"; show; fi
+# P2: the digest is not in the registry; P2b: the registry refuses the read (an error, never "not
+# pushed", m-5); P2d: curl itself fails, and its error text (which here carries the credential) is
+# never printed; P2f: the registry serves a body that is not the pin's.
+state; refused_before_web "P2: a digest not in the registry" "not in the registry: $REG/seazn-relay-stg@$D_MISSING (HTTP 404; deploy-stg.yml pushes it)" -- stg "$SHA@$D_MISSING"
+state; echo 401 > "$STATE/status-$D_NEW"
+refused_before_web "P2b (m-5): a registry refusal, not \"not pushed\"" "the registry could not be read for $REG/seazn-relay-stg@$D_NEW (HTTP 401; only 404 means not pushed)" -- stg "$SHA@$D_NEW"
+state; touch "$STATE/curl-fails"
+refused_before_web "P2d: curl fails, its error text unprinted" "the registry could not be reached for $REG/seazn-relay-stg@$D_NEW (curl failed; its error text is not printed" -- stg "$SHA@$D_NEW"
+state; touch "$STATE/lie"
+refused_before_web "P2f: a body that is not the pin's" "the registry served $REG/seazn-relay-stg@$D_NEW as a body whose sha256 is sha256:$(sha_hex '{"not":"it"}'): nothing promoted" -- stg "$SHA@$D_NEW"
+# P2c: no stored flyctl login: the read token cannot be minted, so nothing is read.
+state; touch "$STATE/token-fails"
+refused_before_web "P2c: no stored flyctl login" "flyctl tokens create deploy -a seazn-relay-stg failed (log in first: flyctl auth login): Error: you are not logged in (fake)" -- stg "$SHA@$D_NEW"
+if ! grep -q '^curl ' "$STATE/log"; then ok "promote P2c: no registry read without a read token"; else bad "promote P2c read the registry"; show; fi
+# P2e: flyctl printed something that is not one token line: refused, and none of it printed.
+state; touch "$STATE/token-odd"
+refused_before_web "P2e: a minted token of the wrong shape" "the token flyctl minted for seazn-relay-stg is not one line of the expected shape (it is not printed)" -- stg "$SHA@$D_NEW"
+state; printf '%s\n' 'FlyV1 fakeReadToken7f3a" -o /tmp/x' > "$STATE/read-token"
+refused_before_web "P2g: one line, not a token's shape (a quote would end curl's config string)" "the token flyctl minted for seazn-relay-stg is not one line of the expected shape (it is not printed)" -- stg "$SHA@$D_NEW"
 
 # P3: RELAY_IMAGE is an [env] entry: refuse and print the seazn.club diff.
 state; echo '{"env":{"RELAY_IMAGE":"registry.example/seazn-relay-stg:old"}}' > "$STATE/config.json"
@@ -1168,18 +1402,40 @@ if [ "$rc" -ne 0 ] && [[ "$(refusal)" == *"flyctl secrets set failed on seazn-cl
 else
   bad "promote P4g: rc $rc"; show
 fi
+# P4h (m-3): the secret list unreadable after the set (call 2) or after the deploy (call 3): each a
+# refusal that says what may be live, never a silent stop; neither is logged as a promote.
+state; echo 2 > "$STATE/list-fails-at"; promote_run -- stg "$SHA@$D_NEW"
+r1=$rc e1=$(grep -m 1 -F 'promote: REFUSED: ' "$W/step.out" || true) d1=$(grep -c 'flyctl secrets deploy' "$STATE/log" || true)
+state; echo 3 > "$STATE/list-fails-at"; promote_run -- stg "$SHA@$D_NEW"
+e2=$(grep -m 1 -F 'promote: REFUSED: ' "$W/step.out" || true)
+if [ "$r1" -ne 0 ] && [[ "$e1" == *"RELAY_IMAGE is staged on seazn-club-stg, and its secret list could not be read after the set: state unproven, nothing deployed"* ]] && [ "$d1" -eq 0 ] \
+  && [ "$rc" -ne 0 ] && [[ "$e2" == *"the deploy ran on seazn-club-stg, and its secret list could not be read after it: RELAY_IMAGE may be live as $new_value, unproven and not logged"* ]] \
+  && [ "$(wc -l < "$PLOG/stg.log" | tr -d ' ')" -eq 2 ]; then
+  ok "promote P4h (m-3): a secret list unreadable after the set, or after the deploy, refuses and says what may be live"
+else
+  bad "promote P4h: rc $r1/$rc :: $e1 :: $e2"; show
+fi
+# P4i (m-7): a set that leaves RELAY_IMAGE off the list is refused before any deploy.
+state; echo '[{"name":"FLY_RELAY_APP","digest":"f1","status":"Deployed"}]' > "$STATE/secrets.json"; touch "$STATE/set-noop"
+promote_run -- stg "$SHA@$D_NEW"
+if [ "$rc" -ne 0 ] && [[ "$(refusal)" == *"RELAY_IMAGE is not on seazn-club-stg's secret list after the set"* ]] && ! has "$STATE/log" 'flyctl secrets deploy'; then
+  ok "promote P4i (m-7): a set that did not land is refused before the deploy"
+else
+  bad "promote P4i: rc $rc"; show
+fi
 
 # P5: prod, with --confirm-prod first (the flag's place does not matter); its previous ref (v1.0.0,
 # from prod's log) is gone from the registry.
 state; promote_run -- --confirm-prod prod "v1.2.3@$D_PROD"
 if [ "$rc" -eq 0 ] && has "$STATE/log" "flyctl secrets set RELAY_IMAGE=$REG/seazn-relay-prod@$D_PROD -a seazn-club-prod --stage (token none)" \
-  && has "$STATE/log" 'flyctl secrets deploy -a seazn-club-prod (token none)' && ! has "$STATE/log" 'seazn-club-stg' \
+  && has "$STATE/log" 'flyctl secrets deploy -a seazn-club-prod (token none)' && ! has "$STATE/log" 'seazn-club-stg' && ! has "$STATE/log" 'seazn-relay-stg' \
   && has "$STATE/log" "--cert-identity $WFURL/deploy-prod.yml@refs/tags/v1.2.3 --source-ref refs/tags/v1.2.3 --source-digest $C --signer-digest $C" \
+  && has "$STATE/log" "https://$REG/v2/seazn-relay-prod/manifests/$D_PROD" \
   && has "$W/step.out" "  commit:                $C (on main" \
-  && has "$W/step.out" "  previous RELAY_IMAGE:  $REG/seazn-relay-prod@$D_ANY (ref v1.0.0@$D_ANY; no longer in the registry)" \
+  && has "$W/step.out" "  previous RELAY_IMAGE:  $REG/seazn-relay-prod@$D_GONE (ref v1.0.0@$D_GONE; no longer in the registry)" \
   && has "$W/step.out" 'Rollback: the previous ref cannot be verified now' \
   && [ "$(tail -n 1 "$PLOG/prod.log" | cut -d' ' -f2-3)" = "prod v1.2.3@$D_PROD" ] && [ "$(wc -l < "$PLOG/stg.log" | tr -d ' ')" -eq 2 ]; then
-  ok "promote P5: prod promotes v1.2.3 (its commit on main) on seazn-club-prod; a vanished previous ref is said; logged in prod's log alone"
+  ok "promote P5: prod promotes v1.2.3 (its commit on main) on seazn-club-prod from seazn-relay-prod; a vanished previous digest is said; logged in prod's log alone"
 else
   bad "promote P5: rc $rc"; show
 fi
@@ -1201,18 +1457,30 @@ refused "F3: an unknown flag" "unknown flag '--force'" -- stg "$SHA@$D_NEW" --fo
 refused "F4: a third argument" "one env and one ref, not 'prod' too" -- stg "$SHA@$D_NEW" prod
 refused "F5: no ref" "no ref: usage: scripts/promote.sh stg" -- stg
 refused "F6: nothing at all" "env must be stg or prod: ''" --
+# M (m-5): a test seam set in the operator's own shell is refused unless the harness turned seams on.
+for v in RELAY_REGISTRY=registry.elsewhere PROMOTE_REMOTE=/tmp/elsewhere PROMOTE_STATE_DIR=/tmp/elsewhere; do
+  refused "M (m-5): ${v%%=*} in the shell, no seams" "${v%%=*} is set in this shell, and promote reads its registry, its remote and its log only from their defaults" NOSEAMS=1 "$v" -- stg "$SHA@$D_NEW"
+done
 
-# T: the tools, before any call.
-state; touch "$STATE/no-buildx"; promote_run -- stg "$SHA@$D_NEW"
-if [ "$rc" -ne 0 ] && [[ "$(refusal)" == *"docker buildx is not available"* ]] && no_fly; then ok "promote T1: refused when buildx is missing :: $(refusal)"; else bad "promote T1 (no buildx): rc $rc"; show; fi
-refused "T2: no flyctl on PATH" "flyctl is not on PATH" PATH="$W/bin-nofly:/usr/bin:/bin" -- stg "$SHA@$D_NEW"
+# T (m-7): the tools, each missing in turn, before any call. All 6 are swept.
+tools_checked=0
+for t in git jq curl flyctl gh; do
+  refused "T: no $t on PATH" "$t is not on PATH" PATH="$(tools_bin "$t"):$W/sysbin" -- stg "$SHA@$D_NEW"
+  tools_checked=$((tools_checked + 1))
+done
+refused "T: neither sha tool on PATH" "neither sha256sum nor shasum is on PATH" PATH="$(tools_bin sha sha256sum shasum):$W/sysbin" -- stg "$SHA@$D_NEW"
+tools_checked=$((tools_checked + 1))
+[ "$tools_checked" -eq 6 ] || bad "promote T swept $tools_checked tools, not 6"
+# ... and the same minimal PATH with nothing removed promotes (the sweep's positive pair).
+state; promote_run PATH="$(tools_bin none):$W/sysbin" -- stg "$SHA@$D_NEW"
+if [ "$rc" -eq 0 ] && has "$W/step.out" 'promoted '; then ok "promote T: the sweep's PATH with every tool promotes"; else bad "promote T positive pair: rc $rc"; show; fi
 
 # K: no token is ever used, required or printed: one left in the shell is dropped, flyctl runs on the
 # stored login, and the value appears nowhere in the output.
 state; promote_run FLY_API_TOKEN=leaked-fly-value FLY_ACCESS_TOKEN=leaked-access-value -- stg "$SHA@$D_NEW"
 if [ "$rc" -eq 0 ] && has "$STATE/log" "$set_line" && ! grep -qE 'token (WRONG|push)' "$STATE/log" \
   && [ "$(grep -c '^flyctl ' "$STATE/log")" -eq "$(grep -c '^flyctl .*(token none)' "$STATE/log")" ] \
-  && ! has "$W/step.out" 'leaked-' && ! has "$STATE/log" 'leaked-' \
+  && ! has "$W/step.out" 'leaked-' && ! has "$STATE/log" 'leaked-' && no_token_seen \
   && has "$W/step.out" 'promote: FLY_API_TOKEN is set in this shell; it is dropped, and flyctl uses your stored login' \
   && has "$W/step.out" 'promote: FLY_ACCESS_TOKEN is set in this shell; it is dropped'; then
   ok "promote K: tokens left in the shell are dropped, unprinted; all $(grep -c '^flyctl ' "$STATE/log") flyctl calls ran on the stored login"
@@ -1220,12 +1488,18 @@ else
   bad "promote K: rc $rc"; show
 fi
 
-# S: main's copy. An edited (or stale) copy of this script refuses; so does a main that cannot be fetched.
+# S: main's copy. An edited (or stale) copy of this script refuses; so does a main that cannot be
+# fetched, a copy outside any checkout, and a main that lacks this script or the CEF bump gate.
 cp "$W/op/scripts/promote.sh" "$W/op/scripts/promote-edited.sh"; echo '# a local edit' >> "$W/op/scripts/promote-edited.sh"
 refused "S1: a copy that is not main's" "$W/op/scripts/promote-edited.sh is not main's copy (main is $H)" SCRIPT="$W/op/scripts/promote-edited.sh" -- stg "$SHA@$D_NEW"
 refused "S2: main cannot be fetched" "main could not be fetched from $W/no-such-repo" PROMOTE_REMOTE="$W/no-such-repo" -- stg "$SHA@$D_NEW"
+mkdir -p "$W/loose"; cp "$W/op/scripts/promote.sh" "$W/loose/promote.sh"
+refused "S4 (m-7): a copy outside any git checkout" "$W/loose/promote.sh is not in a git checkout" SCRIPT="$W/loose/promote.sh" -- stg "$SHA@$D_NEW"
+refused "S5 (m-7): a main with no promote.sh" "has no scripts/promote.sh" PROMOTE_REMOTE="$W/git-nopromote" -- stg "$SHA@$D_NEW"
+refused "S6 (m-7): a main with no CEF bump gate" "has no scripts/check-cef-bump.sh" PROMOTE_REMOTE="$W/git-nocef" -- stg "$SHA@$D_NEW"
+state; promote_run -- stg "$SHA@$D_NEW"
 # S3: main fetched into refs/promote/main, never the operator's own refs.
-if [ "$(git -C "$W/op" rev-parse refs/promote/main)" = "$H" ] && [ "$(git -C "$W/op" rev-parse refs/remotes/origin/main)" = "$H" ] \
+if [ "$rc" -eq 0 ] && [ "$(git -C "$W/op" rev-parse refs/promote/main)" = "$H" ] && [ "$(git -C "$W/op" rev-parse refs/remotes/origin/main)" = "$H" ] \
   && [ -z "$(git -C "$W/op" status --porcelain --untracked-files=no)" ]; then
   ok "promote S3: main fetched into refs/promote/main; the operator's branches and working tree untouched"
 else
@@ -1239,6 +1513,7 @@ refused "G2 (I-2): a sha that is no commit here" "no commit 44444444444444444444
   -- stg "4444444444444444444444444444444444444444@$D_ANY"
 refused "G3 (I-2): a prod tag off main" "v1.2.4 ($SIDE) is not on main: images are promoted from main only" -- prod "v1.2.4@$D_ANY" --confirm-prod
 refused "G4 (I-2): a prod tag that does not exist" "no tag v9.9.9 in $g" -- prod "v9.9.9@$D_ANY" --confirm-prod
+refused "G8 (m-7): a prod tag that names a blob" "the tag v1.9.0 names no commit" -- prod "v1.9.0@$D_ANY" --confirm-prod
 refused "G5 (I-2): a main commit whose own tree fails the CEF bump gate" "$BAD ($BAD) fails the CEF bump gate (Owed 22) in its own tree" -- stg "$BAD@$D_ANY"
 refused "G6 (I-2): a main commit from before the record" "$PRE ($PRE) has no docker/CEF_STEP0_PASS" -- stg "$PRE@$D_ANY"
 refused "G7 (I-2): a prod tag whose tree fails the CEF bump gate" "v1.1.0 ($BAD) fails the CEF bump gate (Owed 22) in its own tree" -- prod "v1.1.0@$D_ANY" --confirm-prod
@@ -1284,14 +1559,23 @@ if [ "$rc" -eq 0 ] && has "$W/step.out" "NOT logged ($W/home/not-a-dir/stg.log c
 else
   bad "promote L4: rc $rc"; show
 fi
-# P15 (m-5): the previous logged ref's tag has moved since: said, and no rollback offered.
-state; sed "s|stg $OLD@$D_OLD $REG/seazn-relay-stg@$D_OLD d0|stg $OLD@$D_PROD $REG/seazn-relay-stg@$D_PROD d0|" "$PLOG/stg.log" > "$PLOG/x" && mv "$PLOG/x" "$PLOG/stg.log"
+# P15: the previous logged digest cannot be read now: said, and no rollback offered.
+state; echo 500 > "$STATE/status-$D_OLD"
 promote_run -- stg "$SHA@$D_NEW"
-if [ "$rc" -eq 0 ] && has "$W/step.out" "  previous RELAY_IMAGE:  $REG/seazn-relay-stg@$D_PROD (ref $OLD@$D_PROD; the tag has moved since, to $D_OLD)" \
+if [ "$rc" -eq 0 ] && has "$W/step.out" "  previous RELAY_IMAGE:  $REG/seazn-relay-stg@$D_OLD (ref $OLD@$D_OLD; the registry could not be read for it)" \
   && has "$W/step.out" 'Rollback: the previous ref cannot be verified now' && ! has "$W/step.out" 'Rollback: scripts/promote.sh'; then
-  ok "promote P15 (m-5): a previous pinned ref whose tag moved is said, with no rollback offered"
+  ok "promote P15: a previous digest the registry cannot serve now is said, with no rollback offered"
 else
   bad "promote P15: rc $rc"; show
+fi
+
+state; touch "$STATE/lie-$D_OLD"
+promote_run -- stg "$SHA@$D_NEW"
+if [ "$rc" -eq 0 ] && has "$W/step.out" "  previous RELAY_IMAGE:  $REG/seazn-relay-stg@$D_OLD (ref $OLD@$D_OLD; the registry could not be read for it)" \
+  && ! has "$W/step.out" 'Rollback: scripts/promote.sh'; then
+  ok "promote P15b: a previous digest whose manifest no longer hashes to it is said, with no rollback offered"
+else
+  bad "promote P15b: rc $rc"; show
 fi
 
 # P11 to P13 (m-7): the deploy's proof. RELAY_IMAGE gone, still Staged, or another digest: each red.
@@ -1314,17 +1598,22 @@ else
   bad "promote P13: rc $rc"; show
 fi
 
-# P14 (m-5): a ref pinned to its digest promotes; pinned to another digest (the tag moved) it refuses.
-state; promote_run -- stg "$SHA@$D_NEW"
-r1=$rc; l1=$(grep -c "flyctl secrets set RELAY_IMAGE=$new_value " "$STATE/log" || true)
-state
-refused_before_web "P14 (m-5): the tag no longer at the pin" "$REG/seazn-relay-stg:$SHA resolves to $D_NEW, not the $D_OLD this promote names: the tag moved, nothing promoted" -- stg "$SHA@$D_OLD"
-if [ "$r1" -eq 0 ] && [ "$l1" -eq 1 ]; then ok "promote P14's positive pair: ref@digest promotes while the tag resolves to it"; else bad "promote P14 positive pair: rc $r1, $l1 set lines"; fi
+# P14 (m-4): promote never reads a tag. With a squat moved in under main's sha, main's own pin still
+# promotes, and every registry read named a digest: a moved tag blocks neither a promote nor a rollback.
+sq_state ""
+promote_run -- stg "$SHA@$D_NEW"
+n_reads=$(grep -c '^curl ' "$STATE/log" || true)
+n_digest=$(grep -cE '^curl .*/manifests/sha256:[0-9a-f]{64}$' "$STATE/log" || true)
+if [ "$rc" -eq 0 ] && has "$STATE/log" "$set_line" && [ "$n_reads" -gt 0 ] && [ "$n_reads" -eq "$n_digest" ]; then
+  ok "promote P14 (m-4): main's pin promotes with the tag moved to a squat; $n_reads of $n_reads registry reads by digest"
+else
+  bad "promote P14: rc $rc, $n_digest of $n_reads reads by digest"; show
+fi
 
-# P17 (I-4): a squatted tag. Some other push (a branch's workflow reads the repository push token)
-# put $D_SQ under main's sha before main's build, and the operator is handed $SHA@$D_SQ: every check
-# before it passes (the commit is on main, its tree passes the gate, the tag resolves to the pin).
-# Only main's build record can refuse it, so the record is swept field by field: each forged
+# P17 (I-4): a squatted image. Some other push (a branch's workflow reads the repository push token)
+# put $D_SQ in the registry, and the operator is handed $SHA@$D_SQ: every check before the record
+# passes (the commit is on main, its tree passes the gate, the manifest is there and hashes to the
+# pin). Only main's build record can refuse it, so the record is swept field by field: each forged
 # attestation differs from main's in ONE field, so each enforcing flag promote passes is needed by
 # one row. The positive pair (main's record for D_SQ) promotes, so the refusals are the fields',
 # not the fake's.
@@ -1347,7 +1636,7 @@ for row in "${sq_rows[@]}"; do
   sq_state "$line"
   [ "$label" != "the attestation service down" ] || touch "$STATE/attest-down"
   sq_checked=$((sq_checked + 1))
-  refused_before_web "P17 (I-4): a squatted digest with $label" "$REG/seazn-relay-stg:$SHA@$D_SQ is not main's own build: no attestation from $ID_STG for $SHA" -- stg "$SHA@$D_SQ"
+  refused_before_web "P17 (I-4): a squatted digest with $label" "$REG/seazn-relay-stg@$D_SQ ($SHA) is not main's own build: no attestation from $ID_STG for $SHA" -- stg "$SHA@$D_SQ"
 done
 sq_state "$GOOD_SQ"
 promote_run -- stg "$SHA@$D_SQ"
@@ -1357,17 +1646,10 @@ else
   bad "promote P17 positive pair: rc $rc"; show
 fi
 [ "$sq_checked" -eq 10 ] || bad "promote P17 swept $sq_checked rows, not 10"
-# P17b (I-4): main pushed and attested $D_NEW, then a squat moved the tag to $D_SQ. The operator
-# holds main's real pin, which verifies; promote must still refuse, or it would ship a digest nobody
-# verified.
-sq_state ""
-echo "$REG/seazn-relay-stg $D_NEW" > "$STATE/manifests"  # main's push, untagged now, still there by digest
-refused_before_web "P17b (I-4): main's own pin once a squat has moved the tag" "$REG/seazn-relay-stg:$SHA resolves to $D_SQ, not the $D_NEW this promote names: the tag moved, nothing promoted" -- stg "$SHA@$D_NEW"
-# Prod: the same commit's stg build record does not serve a release, and neither does a branch's.
-state
-sed "s|^$REG/seazn-relay-prod:v1.2.3 .*|$REG/seazn-relay-prod:v1.2.3 $D_SQ|" "$STATE/registry" > "$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/registry"
+# Prod: the same commit's stg build record does not serve a release.
+state; blob seazn-relay-prod "$B_SQ"
 attest_line "$D_SQ" "$ID_STG" refs/heads/main "$C" >> "$STATE/attestations"
-refused_before_web "P17 (I-4): prod refuses a digest whose only record is stg's build of the same commit" "$REG/seazn-relay-prod:v1.2.3@$D_SQ is not main's own build: no attestation from $WFURL/deploy-prod.yml@refs/tags/v1.2.3 for $C" -- prod "v1.2.3@$D_SQ" --confirm-prod
+refused_before_web "P17 (I-4): prod refuses a digest whose only record is stg's build of the same commit" "$REG/seazn-relay-prod@$D_SQ (v1.2.3) is not main's own build: no attestation from $WFURL/deploy-prod.yml@refs/tags/v1.2.3 for $C" -- prod "v1.2.3@$D_SQ" --confirm-prod
 
 echo "checked: $checked, failed: $failures"
 finished=1

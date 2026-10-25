@@ -9,7 +9,11 @@ name: deploy-prod
 # the checkout, no cache, the relay target, a tag never pushed twice, no GitHub environment), plus: the
 # tag must point at a commit on main. The token is FLY_API_TOKEN_RELAY_PROD, a REPOSITORY secret minted
 # `fly tokens create deploy -a seazn-relay-prod` (it reaches that one app, never seazn-club-prod), added
-# only after C17. The job runs only on a v* tag ref: hygiene, not a guard. A tag push runs the tagged
+# only after C17, and only as the owner decides (the PR #93 review's I-2: whoever holds it drives the
+# prod relay app's Machines API, and a live session's Machine carries that session's JOB_TOKEN in its
+# config.env, which unlocks the session's decrypted publish target, a passthrough customer's stream
+# key; any branch's own workflow can read a repository secret; the prod-token decision is owed to the
+# owner, docs/_INDEX.md). The job runs only on a v* tag ref: hygiene, not a guard. A tag push runs the tagged
 # commit's copy of this file, and any branch's copy can read the repository secret, so what holds is
 # the v* tag ruleset (25833495: creating, moving or deleting a v* tag is admin-only), the attestation's
 # identity (this workflow at refs/tags/<tag>, the tagged commit), and scripts/promote.sh's own checks
@@ -104,6 +108,9 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_PROD }}
         run: |
+          # The login leaves with this step (the PR #93 review's m-2): no later step, and no third-party
+          # action, inherits the token through docker's config.
+          trap 'docker logout "$RELAY_REGISTRY" > /dev/null 2>&1 || true' EXIT
           flyctl auth docker
           ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
           # Only the registry's 404 means absent: containerd's resolver reports it as "<ref>: not
@@ -140,13 +147,32 @@ jobs:
       - name: Push
         id: push
         if: steps.token.outputs.enabled == 'true' && steps.exists.outputs.exists != 'true'
-        # No token here: "Already pushed?"'s `flyctl auth docker` logged docker in for this job.
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_PROD }}
         run: |
+          # The login leaves with this step (the PR #93 review's m-2): no later step, and no third-party
+          # action, inherits the token through docker's config.
+          trap 'docker logout "$RELAY_REGISTRY" > /dev/null 2>&1 || true' EXIT
+          flyctl auth docker
           ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
           docker tag "$LOCAL_IMAGE" "$ref"
-          docker push -q "$ref"
-          digest=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::$ref has no manifest digest after the push: '$digest'"; exit 1; }
+          docker push "$ref" | tee "$RUNNER_TEMP/push.out"
+          # The digest this push wrote, from docker's own PushResult line (`<tag>: digest: <d> size: <n>`),
+          # never read back by tag (the PR #93 review's C-1): any branch holding the repository token can
+          # move the tag between the push and a read, and the attest step signs whatever this outputs.
+          lines=$(grep -cE "^$TAG: digest: sha256:[0-9a-f]{64} size: [0-9]+$" "$RUNNER_TEMP/push.out" || true)
+          if [ "$lines" != 1 ]; then
+            echo "::error::docker push printed $lines digest lines for $ref, not 1: nothing attested"
+            exit 1
+          fi
+          digest=$(sed -nE "s/^$TAG: digest: (sha256:[0-9a-f]{64}) size: [0-9]+$/\1/p" "$RUNNER_TEMP/push.out")
+          # The tag read back only as a race check: if it no longer names this push, another push moved
+          # it under this one, and the run stops before it attests anything.
+          now=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')
+          if [ "$now" != "$digest" ]; then
+            echo "::error::the tag moved under the push: this run pushed $ref as $digest, and the tag now names '$now'. Another push holds the token (a squat): nothing attested; the owner must resolve it"
+            exit 1
+          fi
           echo "pushed $ref ($digest)"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       # The release's build record: signed with this run's OIDC identity (this workflow's path at
@@ -167,16 +193,21 @@ jobs:
         id: record
         if: steps.token.outputs.enabled == 'true'
         env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_PROD }}
           GH_TOKEN: ${{ github.token }}
           DIGEST: ${{ steps.push.outputs.digest || steps.exists.outputs.digest }}
           FOUND: ${{ steps.exists.outputs.exists }}
         run: |
+          # The login leaves with this step (the PR #93 review's m-2): no later step, and no third-party
+          # action, inherits the token through docker's config.
+          trap 'docker logout "$RELAY_REGISTRY" > /dev/null 2>&1 || true' EXIT
+          flyctl auth docker
           identity="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/deploy-prod.yml@refs/tags/$TAG"
           ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
           [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no digest for $ref: '$DIGEST'"; exit 1; }
           if gh attestation verify "oci://$RELAY_REGISTRY/$RELAY_APP@$DIGEST" --repo "$GITHUB_REPOSITORY" \
               --cert-identity "$identity" --source-ref "refs/tags/$TAG" --source-digest "$GITHUB_SHA" \
-              --signer-digest "$GITHUB_SHA" --deny-self-hosted-runners > "$RUNNER_TEMP/attest.out" 2>&1; then
+              --signer-digest "$GITHUB_SHA" --deny-self-hosted-runners --limit 1000 > "$RUNNER_TEMP/attest.out" 2>&1; then
             echo "$ref@$DIGEST: attested by $identity for $GITHUB_SHA"
           elif [ "$FOUND" = true ]; then
             echo "::error::$ref is in the registry ($DIGEST) but is not this release's own build: no attestation from $identity for $GITHUB_SHA. A squat, or a push whose record never landed: nothing pushed, nothing to promote; the owner must resolve it (the next release gets a tag of its own). $(tail -c 300 "$RUNNER_TEMP/attest.out")"
@@ -208,7 +239,7 @@ jobs:
             echo "scripts/promote.sh prod $TAG@$DIGEST --confirm-prod"
             echo '```'
             echo
-            echo "The digest is required: promote refuses unless the tag still resolves to it and this release's attestation of it verifies."
+            echo "The digest is required: promote reads that manifest by its digest, and refuses unless this release's attestation of it verifies."
             echo
             echo "It stages \`RELAY_IMAGE=$RELAY_REGISTRY/$RELAY_APP@$DIGEST\` (the digest alone) on seazn-club-prod, then deploys it."
           } >> "$GITHUB_STEP_SUMMARY"

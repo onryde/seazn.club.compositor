@@ -39,7 +39,9 @@
 #     FLY_API_TOKEN_RELAY_PROD, each minted `fly tokens create deploy -a seazn-relay-<env>`), spelled
 #     so, and only inside its push job; soak.yml may name FLY_API_TOKEN_SOAK (named exemption: the soak
 #     app's, C15); no other workflow names a Fly secret (any spelling: secret names ignore case); and no
-#     workflow names a secret by expression (secrets[...], toJSON(secrets)), which no rule here can read.
+#     workflow names a secret by expression (secrets[...], toJSON(secrets) in any case), which no rule
+#     here can read, or hands secrets (`secrets: inherit` or a map) to a reusable workflow outside this
+#     repository (the PR #93 review's m-1).
 #  6. No web-app token, and no web app, anywhere: no workflow names a secret whose name carries WEB or
 #     CLUB, and no line hands flyctl a seazn-club-* app (-a, --app, FLY_APP). Only scripts/promote.sh,
 #     on the operator's own login, touches the web apps.
@@ -75,6 +77,10 @@
 #     a package. Prints `N of 5`.
 # 14. No promote workflow: no workflow file is named promote*, and no workflow runs `flyctl secrets`
 #     set, deploy, unset, import or sync (a promote by what it does). Promotion is scripts/promote.sh.
+# 15. The login leaves with its step (the PR #93 review's m-2): in each push job, a step that runs
+#     `flyctl auth docker` sets `trap 'docker logout "$RELAY_REGISTRY" …' EXIT`, so no later step or
+#     third-party action finds the token in docker's config, and every action it uses is pinned by
+#     commit.
 #
 # The deploy workflows are deploy-stg.yml and deploy-prod.yml, each required, plus any other workflow
 # that names the stg or prod relay or web app, or their tokens: a new one is held to the deploy rules
@@ -221,6 +227,8 @@ def step_name($i): (.name // .id // .uses // "step \($i)");
 def token_value($x): tostring | strip | test("^\\$\\{\\{ *secrets\\." + $x + " *\\}\\}$");
 # An `if` without its ${{ }}, for an exact comparison.
 def norm_if: tostring | strip | sub("^\\$\\{\\{\\s*"; "") | sub("\\s*\\}\\}$"; "") | strip;
+# An if that reads guard condition $c: exactly $c, or $c && <more>, with no || that could run without it.
+def reads_guard($c): . == $c or (startswith($c + " && ") and (ltrimstr($c + " && ") | test("\\|\\|") | not));
 def has_status_fn: tostring | test("(always|failure|cancelled)\\(\\)");
 # Rule 3: the names that hold a secret, and the names a line assigns.
 def secret_names($keys): ["FLY_API_TOKEN[A-Za-z0-9_]*", "GH_TOKEN", "GITHUB_TOKEN"] + $keys;
@@ -266,7 +274,7 @@ for f in "${files[@]}"; do
                       and (($w.jobs[$g].outputs.enabled // "") | tostring | contains("steps.\($id).outputs.enabled")))
                     | "needs.\(.job).outputs.enabled == '"'"'true'"'"'" ] as $job_gates
                 | (if $strict then
-                     any($step_gates[]; . as $g | (($s.if // "") | norm_if) == $g)
+                     any($step_gates[]; . as $g | (($s.if // "") | norm_if) | reads_guard($g))
                      or (any($job_gates[]; . as $g | (($J.if // "") | norm_if) == $g)
                        and ((($s.if // "") | has_status_fn) | not))
                    else
@@ -282,7 +290,7 @@ for f in "${files[@]}"; do
             | ("steps.\($g.id).outputs.enabled == '"'"'true'"'"'") as $c
             | $w.jobs[$g.job].steps | to_entries[] | select(.key > $g.idx) | .key as $i | .value as $s
             | (($s.if // "") | norm_if) as $if
-            | if $if == $c or ($if | startswith($c + " && ")) then "AFTER \($g.job).\($s | step_name($i))"
+            | if ($if | reads_guard($c)) then "AFTER \($g.job).\($s | step_name($i))"
               else "FAIL \($g.job).\($s | step_name($i)) comes after the \($x) guard but does not read it (its if must be \($c), alone or followed by &&): an unset token would red the push, not skip it" end )
         end' "$(json "$f")")
     while IFS= read -r line; do
@@ -371,9 +379,17 @@ echo "no github environment: $env_jobs jobs read in ${#files[@]} workflows"
 own_tokens=0 secret_refs=0
 for f in "${files[@]}"; do
   b=$(basename "$f")
-  if hits=$(grep -n -E 'secrets *\[|toJSON\( *secrets *\)' "$f"); then
+  # Expression functions ignore case (toJSON, tojson): so does this (the PR #93 review's m-1).
+  if hits=$(grep -n -i -E 'secrets *\[|tojson\( *secrets *\)' "$f"); then
     failed "$b names a secret by expression, which no rule here can read: $hits"
   fi
+  # A job that calls a reusable workflow hands it secrets only from this repository's own files (a
+  # ./ path, held to these rules itself): `secrets: inherit` or a secrets map to anyone else's
+  # workflow hands it every secret named, relay tokens included (m-1).
+  while IFS= read -r line; do
+    [ -n "$line" ] && failed "$b: $line"
+  done < <(jq -r '(.jobs // {}) | to_entries[] | select((.value.uses // "") != "" and ((.value.uses | tostring) | startswith("./") | not) and (.value | has("secrets")))
+    | "job \(.key) hands secrets (\(.value.secrets | if type == "string" then . else "a map" end)) to a workflow outside this repository: \(.value.uses)"' "$(json "$f")")
   case "$b" in
     deploy-stg.yml) own=FLY_API_TOKEN_RELAY_STG ;;
     deploy-prod.yml) own=FLY_API_TOKEN_RELAY_PROD ;;
@@ -625,6 +641,31 @@ for pair in deploy-stg.yml:push deploy-prod.yml:push; do
 done
 echo "write grants: $grants of 5 allowed (id-token and attestations on the two push jobs, packages on image.yml's cache job); ${#files[@]} workflows read"
 [ "$grants" -eq 5 ] || failed "write grants: $grants of 5 allowed grants found: a push job's attest step cannot sign without both, and the grants this rule allows are exactly five"
+
+# 15. The login leaves with its step (the PR #93 review's m-2).
+logins=0 pinned=0
+for b in deploy-stg.yml deploy-prod.yml; do
+  [ -f "$dir/$b" ] || continue
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL*) failed "$b (the login leaves with its step): ${line#FAIL }" ;;
+      LOGIN*) logins=$((logins + 1)) ;;
+      PINNED*) pinned=$((pinned + 1)) ;;
+    esac
+  done < <(jq -r "$JQ_LIB$JQ_PUSH"'
+    push_jobs[] | .key as $j | (.value.steps // []) | to_entries[] | .key as $i | .value as $s
+    | (if ($s.uses // "") != "" then
+         (if ($s.uses | test("@[0-9a-f]{40}$")) then "PINNED"
+          else "FAIL \($j).\($s | step_name($i)) uses \($s.uses), not pinned by commit: it runs in the job that holds the token" end)
+       else empty end),
+      ((($s.run // "") | code_lines) as $r
+       | if ($r | test("flyctl\\s+auth\\s+docker")) then
+           (if ($r | test("trap \u0027docker logout \"\\$RELAY_REGISTRY\"[^\u0027]*\u0027 EXIT")) then "LOGIN"
+            else "FAIL \($j).\($s | step_name($i)) logs docker in (flyctl auth docker) with no `trap \u0027docker logout \"$RELAY_REGISTRY\" …\u0027 EXIT`: the token would stay in docker\u0027s config for every later step and action" end)
+         else empty end)' "$(json "$dir/$b")")
+done
+echo "logins that leave with their step: $logins; actions in the push jobs pinned by commit: $pinned"
+if [ "$logins" -eq 0 ] || [ "$pinned" -eq 0 ]; then failed "the login rule read nothing: $logins logins, $pinned actions"; fi
 
 # 14. No promote workflow.
 promote_lines=0
