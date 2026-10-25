@@ -12,7 +12,9 @@
 //! - `app::driver`: `cef ready gen=<g>`, `cef crashed gen=<g>`, `cef alive gen=<g>`,
 //!   `overlay hidden reason=<r> gen=<g>`, and C11b's
 //!   `cef health zygote_gone=<g|-> leaked_teardowns=<n> gpu_process_deaths=<n>` (on a change only),
-//!   and Owed 96's `cef reload gen=<g> reason=<r> deaths=<n>` (the reload after a GPU-process death);
+//!   and Owed 96's `cef reload gen=<g> reason=<r> deaths=<n>` (the reload after a GPU-process death),
+//!   and Owed 99's `cef painted gen=<g>` (a build's first frame in the slot) and
+//!   `cef reload gen=<g> reason=no_frames blank_pages=<n>` (the reload of a blank page);
 //! - `compositor::logged`: `graphics restart gen=<g>`, `sink swap gen=<g> target=<redacted>`,
 //!   `programme started`; and `app::driver`'s `sink swap reason=<r> gen=<g>` just before the swap
 //!   line (Owed 87, PR #57);
@@ -31,6 +33,10 @@
 //!   never returns (<left> more to hold)`; the reaper's `WARN gen=<g>: teardown has not returned
 //!   after <ms> ms; SIGKILL sent to renderer pids [..] (of [..])` and its leak count
 //!   `WARN gen=<g>: teardown still has not returned <ms> ms after the kill: … (<n> leaked; Owed 55)`;
+//! - `adapters::cef_graphics` (C14 case 19, Owed 99), from a `test-hooks` build: the arming line
+//!   `WARN test hook (Owed 99): the next <n> CEF pages' frames never reach the slot` and each withheld
+//!   build's `WARN test hook (Owed 99) gen=<g>: this CEF page's frames never reach the slot (<left>
+//!   more to withhold)`;
 //! - `adapters::gst_programme` (C14 case 18, Owed 94), from a `test-hooks` build: the arming line
 //!   `WARN test hook (Owed 94): sink gen=1 stalls (<hold|hang>) <ms> ms after its build` and the
 //!   plant `WARN test hook (Owed 94): sink stall=<hold|hang> gen=1 planted=<true|false>`.
@@ -145,6 +151,25 @@ pub struct Reload {
     pub deaths: u64,
 }
 
+/// `cef reload gen=<g> reason=no_frames blank_pages=<n>` (Owed 99): the driver's reload of a blank page
+/// (Ready with no frame of its own by its bound) as generation `gen`, the process's count of blank
+/// pages at `blank_pages`.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct BlankReload {
+    pub at_ms: i64,
+    pub gen: u64,
+    pub blank_pages: u64,
+}
+
+/// `WARN test hook (Owed 99) gen=<g>: this CEF page's frames never reach the slot (<left> more to
+/// withhold)`: one build whose every sample the hook withholds.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct WithheldPage {
+    pub at_ms: i64,
+    pub gen: u64,
+    pub left: u64,
+}
+
 /// `WARN test hook (Owed 82): the next <n> CEF teardowns never return`: a `test-hooks` build armed
 /// (once per process, before `compositor started`).
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -254,6 +279,10 @@ pub struct LogFacts {
     pub cef_health: Vec<Health>,
     /// `cef reload gen=<g> reason=<r> deaths=<n>`: each reload after a GPU-process death (Owed 96).
     pub cef_reloads: Vec<Reload>,
+    /// `cef painted gen=<g>`: each build's first frame in the overlay slot (Owed 99).
+    pub cef_painted: Vec<GenAt>,
+    /// `cef reload gen=<g> reason=no_frames blank_pages=<n>`: each blank page's reload (Owed 99).
+    pub blank_reloads: Vec<BlankReload>,
     pub sink_swaps: Vec<GenAt>,
     /// `sink swap reason=<r> gen=<g>`, one per swap line (lib.jq's `stall_swap` checks they pair).
     pub sink_swap_reasons: Vec<SwapReasonLine>,
@@ -284,6 +313,10 @@ pub struct LogFacts {
     pub reaper_kills: Vec<ReaperKill>,
     /// Each teardown counted leaked, with the count at once.
     pub teardown_leaks: Vec<TeardownLeak>,
+    /// Owed 99's arming line (a `test-hooks` build; case 19's precondition).
+    pub withhold_armed: Vec<Armed>,
+    /// Each build the hook withholds (case 19).
+    pub pages_withheld: Vec<WithheldPage>,
     /// Owed 94's arming line (a `test-hooks` build; case 18's precondition).
     pub sink_stall_armed: Vec<SinkStallArmed>,
     /// Owed 94's plant (case 18's fault).
@@ -321,6 +354,18 @@ fn health(msg: &str, at_ms: i64) -> Option<Health> {
         zygote_gone: zygote?,
         leaked_teardowns: leaked?,
         gpu_process_deaths: gpu?,
+    })
+}
+
+/// `cef reload gen=<g> reason=no_frames blank_pages=<n>`, the whole message, in that order.
+fn blank_reload(msg: &str, at_ms: i64) -> Option<BlankReload> {
+    let (g, n) = msg
+        .strip_prefix("cef reload gen=")?
+        .split_once(" reason=no_frames blank_pages=")?;
+    Some(BlankReload {
+        at_ms,
+        gen: num(g)?,
+        blank_pages: num(n)?,
     })
 }
 
@@ -451,6 +496,25 @@ fn sink_stall_planted(msg: &str, at_ms: i64, ts_ms: i64) -> Option<SinkStallPlan
     })
 }
 
+fn withhold_armed(msg: &str, at_ms: i64) -> Option<Armed> {
+    let n = msg
+        .strip_prefix("WARN test hook (Owed 99): the next ")?
+        .strip_suffix(" CEF pages' frames never reach the slot")?;
+    Some(Armed { at_ms, n: num(n)? })
+}
+
+fn withheld(msg: &str, at_ms: i64) -> Option<WithheldPage> {
+    let (g, rest) = msg
+        .strip_prefix("WARN test hook (Owed 99) gen=")?
+        .split_once(": this CEF page's frames never reach the slot (")?;
+    let left = rest.strip_suffix(" more to withhold)")?;
+    Some(WithheldPage {
+        at_ms,
+        gen: num(g)?,
+        left: num(left)?,
+    })
+}
+
 fn held(msg: &str, at_ms: i64) -> Option<HeldTeardown> {
     let (g, rest) = msg
         .strip_prefix("WARN test hook (Owed 82) gen=")?
@@ -546,6 +610,8 @@ pub fn log_facts(text: &str) -> LogFacts {
             f.cef_crashed.push(ga(g));
         } else if let Some(g) = gen_after(m, "cef alive gen=") {
             f.cef_alive.push(ga(g));
+        } else if let Some(g) = gen_after(m, "cef painted gen=") {
+            f.cef_painted.push(ga(g));
         } else if let Some(g) = gen_after(m, "graphics restart gen=") {
             f.graphics_restart.push(ga(g));
         } else if let Some(rest) = m.strip_prefix("overlay hidden reason=") {
@@ -560,6 +626,8 @@ pub fn log_facts(text: &str) -> LogFacts {
             }
         } else if let Some(h) = health(m, at_ms) {
             f.cef_health.push(h);
+        } else if let Some(r) = blank_reload(m, at_ms) {
+            f.blank_reloads.push(r);
         } else if let Some(r) = reload(m, at_ms) {
             f.cef_reloads.push(r);
         } else if let Some(rest) = m.strip_prefix("sink swap gen=") {
@@ -593,6 +661,10 @@ pub fn log_facts(text: &str) -> LogFacts {
             f.reaper_kills.push(r);
         } else if let Some(l) = teardown_leak(m, at_ms) {
             f.teardown_leaks.push(l);
+        } else if let Some(a) = withhold_armed(m, at_ms) {
+            f.withhold_armed.push(a);
+        } else if let Some(w) = withheld(m, at_ms) {
+            f.pages_withheld.push(w);
         } else if let Some(a) = sink_stall_armed(m, at_ms) {
             f.sink_stall_armed.push(a);
         } else if let Some(p) = sink_stall_planted(m, at_ms, ts_ms) {
@@ -1189,6 +1261,104 @@ mod tests {
                 + f.teardown_leaks.len()
         );
         assert_eq!(pinned, 5);
+    }
+
+    /// Case 19's lines (Owed 99): the hook's arming line and each withheld build, the driver's
+    /// painted reports and its blank-page reloads, all by gen, with near misses; and each producer,
+    /// once, in its source.
+    #[test]
+    fn the_blank_page_lines_are_read_by_their_gen() {
+        let mut log = String::new();
+        let lines = [
+            (0, "WARN test hook (Owed 99): the next 2 CEF pages' frames never reach the slot"),
+            (100, "gen=1: loading http://fake-control:7000"),
+            (110, "WARN test hook (Owed 99) gen=1: this CEF page's frames never reach the slot (1 more to withhold)"),
+            (3_000, "cef ready gen=1"),
+            (13_000, "cef reload gen=2 reason=no_frames blank_pages=1"),
+            (16_000, "cef ready gen=2"),
+            (16_000, "cef painted gen=3"),
+            (26_000, "cef reload gen=3 reason=no_frames blank_pages=2"),
+            // Near misses: none is one of these facts.
+            (27_000, "WARN test hook (Owed 99): the next +2 CEF pages' frames never reach the slot"),
+            (27_100, "WARN test hook (Owed 99): the next 2 CEF pages' frames never reach the slot now"),
+            (27_200, "WARN test hook (Owed 99) gen=x: this CEF page's frames never reach the slot (1 more to withhold)"),
+            (27_300, "WARN test hook (Owed 99) gen=4: this CEF page's frames never reach the slot (1 more)"),
+            (27_400, "cef reload gen=4 reason=no_frames blank_pages=x"),
+            (27_500, "cef reload gen=4 reason=no_frames blank_pages=1 extra=1"),
+            (27_600, "cef reload gen=4 reason=no_frames"),
+            (27_700, "cef painted gen=y"),
+            (27_800, "cef reload gen=4 reason=gpu_process_death deaths=1"),
+        ];
+        for (at, m) in lines {
+            log.push_str(&line(at, m));
+        }
+        let f = log_facts(&log);
+        assert_eq!(f.withhold_armed, vec![Armed { at_ms: NOON_MS, n: 2 }]);
+        assert_eq!(
+            f.pages_withheld,
+            vec![WithheldPage {
+                at_ms: NOON_MS + 110,
+                gen: 1,
+                left: 1
+            }]
+        );
+        assert_eq!(
+            f.blank_reloads,
+            vec![
+                BlankReload {
+                    at_ms: NOON_MS + 13_000,
+                    gen: 2,
+                    blank_pages: 1
+                },
+                BlankReload {
+                    at_ms: NOON_MS + 26_000,
+                    gen: 3,
+                    blank_pages: 2
+                }
+            ]
+        );
+        assert_eq!(
+            f.cef_painted,
+            vec![GenAt {
+                at_ms: NOON_MS + 16_000,
+                ts_ms: NOON_MS,
+                gen: 3
+            }]
+        );
+        assert_eq!(
+            f.cef_reloads
+                .iter()
+                .map(|r| (r.gen, r.reason.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(4, "gpu_process_death")],
+            "a blank reload is never a GPU-death reload, nor the reverse"
+        );
+        assert!(
+            f.hold_armed.is_empty() && f.teardowns_held.is_empty(),
+            "Owed 82's facts"
+        );
+        // The producers, each once in their source: a reworded line reds here, not on CI.
+        let read = |rel: &str| {
+            std::fs::read_to_string(format!("{}/../{rel}", env!("CARGO_MANIFEST_DIR"))).expect(rel)
+        };
+        let adapter = read("adapters/src/cef_graphics.rs");
+        let driver = read("app/src/driver.rs");
+        let mut pinned = 0;
+        for (src, producer) in [
+            (&adapter, "\"WARN test hook (Owed 99): the next {n} CEF pages' frames never reach the slot\"\n"),
+            (&adapter, "\"WARN test hook (Owed 99) gen={gen}: this CEF page's frames never reach the slot ({left} more to withhold)\""),
+            (&driver, "\"cef reload gen={gen} reason=no_frames blank_pages={blank_pages}\""),
+            (&driver, "Event::CefPainted { gen } => Some(format!(\"cef painted gen={gen}\")),"),
+        ] {
+            assert_eq!(src.matches(producer).count(), 1, "the line changed: update logfacts ({producer})");
+            pinned += 1;
+        }
+        eprintln!(
+            "log lines checked: {}, producers pinned: {pinned}, facts read: {}",
+            f.lines,
+            f.withhold_armed.len() + f.pages_withheld.len() + f.blank_reloads.len() + f.cef_painted.len()
+        );
+        assert_eq!(pinned, 4);
     }
 
     #[test]

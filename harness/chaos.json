@@ -27,6 +27,7 @@
     {"n": 16, "case": "cef-leaks", "variant": "two", "runs": 1},
     {"n": 17, "case": "dest-stall-rule", "runs": 1},
     {"n": 18, "case": "output-hung", "variant": "hold", "runs": 1},
-    {"n": 18, "case": "output-hung", "variant": "hang", "runs": 1}
+    {"n": 18, "case": "output-hung", "variant": "hang", "runs": 1},
+    {"n": 19, "case": "cef-blank", "runs": 1}
   ]
 }

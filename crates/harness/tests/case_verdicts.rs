@@ -5133,20 +5133,24 @@ fn only_the_hook_cases_name_the_test_hooks_image_or_reassign_the_relay_image() {
     walk(&harness, &mut files);
     let case16 = ["cases/cef-leaks.sh", "compose.cef-leaks.yml"];
     let case18 = ["cases/output-hung.sh", "compose.output-hung.yml"];
-    let hooked = [case16[0], case16[1], case18[0], case18[1]];
+    let case19 = ["cases/cef-blank.sh", "compose.cef-blank.yml"];
+    let hooked = [case16[0], case16[1], case18[0], case18[1], case19[0], case19[1]];
     // Each hook's keys, in its overlay's order under the compositor's `environment`.
     let keys16 = ["COMPOSITOR_TEST_HOLD_TEARDOWNS"];
     let keys18 = [
         "COMPOSITOR_TEST_HOLD_SINK_AFTER_MS",
         "COMPOSITOR_TEST_HANG_SINK_AFTER_MS",
     ];
-    let names: [(&str, &[&str]); 6] = [
+    let keys19 = ["COMPOSITOR_TEST_WITHHOLD_PAGES"];
+    let names: [(&str, &[&str]); 8] = [
         ("RELAY_TEST_HOOKS_IMAGE", &hooked),
         (keys16[0], &case16),
         ("compose.cef-leaks.yml", &case16[..1]),
         (keys18[0], &case18),
         (keys18[1], &case18),
         ("compose.output-hung.yml", &case18[..1]),
+        (keys19[0], &case19),
+        ("compose.cef-blank.yml", &case19[..1]),
     ];
     let (mut swept, mut naming, mut assigning) = (0, Vec::new(), Vec::new());
     for p in &files {
@@ -5164,7 +5168,7 @@ fn only_the_hook_cases_name_the_test_hooks_image_or_reassign_the_relay_image() {
         }
         if assigns_relay_image(&text) {
             assert!(
-                [case16[0], case18[0]].contains(&rel.as_str()),
+                [case16[0], case18[0], case19[0]].contains(&rel.as_str()),
                 "harness/{rel} reassigns RELAY_IMAGE: only the hook cases point it at another image"
             );
             assigning.push(rel);
@@ -5185,7 +5189,11 @@ fn only_the_hook_cases_name_the_test_hooks_image_or_reassign_the_relay_image() {
             .collect()
     };
     let mut pairs = 0;
-    for (case, keys) in [(case16, &keys16[..]), (case18, &keys18[..])] {
+    for (case, keys) in [
+        (case16, &keys16[..]),
+        (case18, &keys18[..]),
+        (case19, &keys19[..]),
+    ] {
         let file = code(case[0]);
         for name in ["RELAY_TEST_HOOKS_IMAGE", case[1]].iter().chain(keys) {
             assert!(
@@ -5214,14 +5222,14 @@ fn only_the_hook_cases_name_the_test_hooks_image_or_reassign_the_relay_image() {
     assigning.sort();
     assert_eq!(
         assigning,
-        [case16[0], case18[0]],
+        [case19[0], case16[0], case18[0]],
         "each hook case points RELAY_IMAGE at the image"
     );
     eprintln!("hook cases' positive pairs checked: {pairs}");
     assert_eq!(
         pairs,
-        4 + 5,
-        "case 16: three names and its overlay; case 18: four and its overlay"
+        4 + 5 + 4,
+        "case 16: three names and its overlay; case 18: four and its overlay; case 19: three and its overlay"
     );
     // The legs' own image (the #71 confirm pass's n1): chaos.yml sets each leg's RELAY_IMAGE, which
     // the harness/ sweep cannot see. Every job's RELAY_IMAGE is the images job's (the relay image it
@@ -5961,6 +5969,234 @@ fn cef_leaks_three_restarts_in_place_at_the_third_leak_and_reds_without_it() {
     assert_eq!(checked, 9);
 }
 
+// ---- case 19, cef-blank (Owed 99) ----
+
+/// Owed 99's arming line, before a process's `compositor started` (boot()'s, at +200). A build
+/// armed with no page to withhold prints none (`arm_test_hooks`), and neither does the relay image.
+fn arm_withhold(w: &mut World, start: i64, n: u64) {
+    w.line(
+        start + 150,
+        format!("WARN test hook (Owed 99): the next {n} CEF pages' frames never reach the slot"),
+    );
+}
+
+/// The adapter's line for one withheld build, `left` the builds still to withhold after it.
+fn withheld_line(gen: u64, left: u64) -> String {
+    format!("WARN test hook (Owed 99) gen={gen}: this CEF page's frames never reach the slot ({left} more to withhold)")
+}
+
+/// Case 19's world (Owed 99, option B): a compositor armed to withhold every frame of its first
+/// `withhold` CEF pages. Each withheld page loads, is ready (boot()'s `cef ready gen=1` the first)
+/// and beats, and nothing of it reaches the slot. `after_bound_ms` past `cef_hang_after_ms` from its
+/// ready, the driver logs its blank reload as the next gen (`cef reload gen=<g> reason=no_frames
+/// blank_pages=<k>`), then `graphics restart` and the load, and that gen is ready `ready_ms` later.
+/// The page after the last withheld one paints at its ready (the latched first frame: `cef
+/// painted`), and the overlay is off air from the programme's first frame to just after it.
+/// `withhold` 0 is the relay image: no arming line, the first page painting at once.
+fn blank(withhold: u64, after_bound_ms: i64, ready_ms: i64) -> World {
+    let mut w = World::new(60);
+    let hang = w.ms("cef_hang_after_ms");
+    let boot = w.live - 9_000;
+    if withhold > 0 {
+        arm_withhold(&mut w, boot, withhold);
+    }
+    w.line(boot + 1_000, format!("gen=1: loading {LEAK_ORIGIN}"));
+    if withhold > 0 {
+        w.line(boot + 1_001, withheld_line(1, withhold - 1));
+    }
+    let mut ready = boot + 1_500;
+    for k in 1..=withhold {
+        let gen = k + 1;
+        let at = ready + hang + after_bound_ms;
+        w.line(
+            at,
+            format!("cef reload gen={gen} reason=no_frames blank_pages={k}"),
+        );
+        w.line(at + 1, format!("graphics restart gen={gen}"));
+        w.line(at + 2, format!("gen={gen}: loading {LEAK_ORIGIN}"));
+        if gen <= withhold {
+            w.line(at + 3, withheld_line(gen, withhold - gen));
+        }
+        ready = at + ready_ms;
+        w.line(ready, format!("cef ready gen={gen}"));
+    }
+    w.line(ready + 1, format!("cef painted gen={}", withhold + 1));
+    w.overlay_none.push((w.live - 30_000, ready + 100));
+    w
+}
+
+/// The withheld pages case 19 drives: one fewer than the shared page-fault count, so each is
+/// reloaded and none restarts the process.
+fn blank_n() -> u64 {
+    World::new(1).ms("cef_gpu_deaths_to_restart") as u64 - 1
+}
+
+const BLANK: &str = "cef-blank";
+
+#[test]
+fn cef_blank_reloads_each_blank_page_and_reds_without_the_watchdog_or_its_witnesses() {
+    let n = blank_n();
+    let t = World::new(1);
+    let (hang, fp) = (
+        t.ms("cef_hang_after_ms"),
+        t.t["frame_period_ms"].as_f64().unwrap(),
+    );
+    let budget = t.ms("budget_blank_page_reload_ms");
+    assert!(n >= 1, "case 19 withholds at least one page");
+    let w = blank(n, 20, RELOAD_READY_MS);
+    let v = judge(&w, BLANK, "", "blank-good");
+    assert_pass(&v, "blank-good");
+    // Anti-vacuity: every withheld page was judged, frames were read off air while they were, the
+    // back came after the bound (the watchdog's, never a page that painted on its own), and a score
+    // change fell due after it.
+    let m = &v.json["measures"];
+    let pages = m["blank_reloads"]["pages"].as_array().unwrap().len();
+    let off = m["off_air_while_withheld"]["frames_before"].as_u64().unwrap();
+    let back_after = m["overlay_back"]["back_after_ms"].as_i64().unwrap();
+    let due = m["scheduled_changes_shown"]["due_after_back"].as_u64().unwrap();
+    eprintln!(
+        "blank-good: {pages} pages, {off} frames off air, back {back_after} ms (budget {budget}), {due} due"
+    );
+    assert_eq!(pages as u64, n, "blank-good: the pages judged");
+    assert!(off >= 1 && due >= 1, "blank-good: {m}");
+    assert!(
+        back_after > hang && back_after <= budget,
+        "blank-good: {back_after}"
+    );
+    let mut checked = 0;
+    let mut red = |w: World, want: &[&str], tag: &str| {
+        let v = judge(&w, BLANK, "", tag);
+        assert_eq!(v.status, "fail", "{tag}");
+        assert_eq!(v.json["checks_run"], v.json["checks_declared"], "{tag}");
+        assert_eq!(failed_sorted(&v), sorted(want), "{tag}");
+        checked += 1;
+    };
+    // Mutant "no watchdog": the first page is never called blank, so nothing reloads and nothing
+    // is ever on air.
+    let mut w = blank(n, 20, RELOAD_READY_MS);
+    w.log.retain(|(_, m)| {
+        !(m.starts_with("cef reload ")
+            || m.starts_with("graphics restart ")
+            || m.starts_with("cef painted ")
+            || (m.starts_with("cef ready gen=") && m != "cef ready gen=1")
+            || (m.starts_with("gen=") && !m.starts_with("gen=1:"))
+            || (m.starts_with("WARN test hook (Owed 99) gen=") && !m.contains(" gen=1:")))
+    });
+    w.overlay_none = vec![(w.live - 30_000, w.end + 60_000)];
+    red(
+        w,
+        &[
+            "withheld_n",
+            "blank_reloads",
+            "off_air_while_withheld",
+            "painted_once",
+            "overlay_back",
+            "stays_on_air",
+            "scheduled_changes_shown",
+        ],
+        "blank-no-watchdog",
+    );
+    // Mutant "bound flipped": the blank called two frame periods early, or three late.
+    red(
+        blank(n, -2 * fp as i64, RELOAD_READY_MS),
+        &["blank_reloads"],
+        "blank-early",
+    );
+    red(
+        blank(n, 3 * fp as i64, RELOAD_READY_MS),
+        &["blank_reloads"],
+        "blank-late",
+    );
+    // The page that painted is called blank too (the watch never ended): a reload past the count.
+    let mut w = blank(n, 20, RELOAD_READY_MS);
+    let after = w.end - 10_000;
+    w.line(
+        after,
+        format!("cef reload gen={} reason=no_frames blank_pages={}", n + 2, n + 1),
+    );
+    red(w, &["blank_reloads"], "blank-painted-page-reloaded");
+    // The relay image (no hook): no arming line, nothing withheld, the first page on air at once.
+    red(
+        blank(0, 20, RELOAD_READY_MS),
+        &[
+            "armed",
+            "withheld_n",
+            "blank_reloads",
+            "off_air_while_withheld",
+            "overlay_back",
+        ],
+        "blank-unarmed",
+    );
+    // The hook leaked a frame: a withheld page reported painted, or the overlay on air while the
+    // pages were withheld.
+    let mut w = blank(n, 20, RELOAD_READY_MS);
+    w.line(w.live - 7_499, "cef painted gen=1");
+    red(w, &["painted_once"], "blank-withheld-painted");
+    let mut w = blank(n, 20, RELOAD_READY_MS);
+    w.overlay_none = vec![(w.live - 30_000, w.live)];
+    red(w, &["off_air_while_withheld"], "blank-withheld-on-air");
+    // The budget, at its edge: back three frame periods inside it passes, one past it reds.
+    let edge = budget - hang - 20 - 100;
+    assert_pass(
+        &judge(
+            &blank(n, 20, edge - (3.0 * fp) as i64),
+            BLANK,
+            "",
+            "blank-budget-inside",
+        ),
+        "blank-budget-inside",
+    );
+    red(
+        blank(n, 20, edge + fp as i64),
+        &["overlay_back"],
+        "blank-budget-past",
+    );
+    // A blank page hidden on its reload (nothing was on air to hide).
+    let mut w = blank(n, 20, RELOAD_READY_MS);
+    let first = w.live - 9_000 + 1_500 + hang + 20;
+    w.line(first, "overlay hidden reason=reload gen=1");
+    red(w, &["no_hide"], "blank-hidden");
+    // The page after paints one frame and freezes: on air, never fresh.
+    let mut w = blank(n, 20, RELOAD_READY_MS);
+    let back = w.overlay_none[0].1;
+    w.overlay_hold.push((back, w.end + 60_000));
+    red(w, &["scheduled_changes_shown"], "blank-frozen");
+    // A blank counted early: the first blank page restarts the process in place, below the count.
+    let mut w = blank(n, 20, RELOAD_READY_MS);
+    let first = w
+        .log
+        .iter()
+        .find(|(_, m)| m.starts_with("cef reload gen=2 "))
+        .map(|(at, _)| *at)
+        .unwrap();
+    w.log.retain(|(at, m)| {
+        *at < first
+            || ![
+                "cef reload ",
+                "graphics restart ",
+                "gen=",
+                "cef ready ",
+                "cef painted ",
+                "WARN test hook (Owed 99) gen=",
+            ]
+            .iter()
+            .any(|p| m.starts_with(p))
+    });
+    w.overlay_none = vec![(w.live - 30_000, w.end + 60_000)];
+    w.restart(
+        first + 300,
+        75,
+        Some("restart in place: 1 blank CEF pages, 0 GPU-process deaths"),
+    );
+    let v = judge(&w, BLANK, "", "blank-counted-early");
+    for check in ["no_restart", "fp_no_exit_75", "blank_reloads"] {
+        assert_fails(&v, check, "blank-counted-early");
+    }
+    checked += 1;
+    eprintln!("cef-blank's reds checked: {checked}");
+    assert_eq!(checked, 11);
+}
+
 /// The case files that are not chaos cases, each run by hand from harness.yml: C13's smoke case
 /// (the harness's own end-to-end run) and Owed 81's two probe controls (F-029). The same list is in
 /// chaos_table.rs.
@@ -5988,8 +6224,8 @@ fn every_case_file_is_judged_here() {
     }
     eprintln!("case files checked: {n}; not chaos cases: {not_chaos}");
     assert_eq!(
-        n, 18,
-        "the brief's 16 cases (amended 2026-10-20), case 17 (2026-10-24) and case 18 (Owed 94)"
+        n, 19,
+        "the brief's 16 cases (amended 2026-10-20), case 17 (2026-10-24), case 18 (Owed 94) and case 19 (Owed 99)"
     );
     // Every name excused is a file, so the list cannot hide a renamed or a deleted case.
     assert_eq!(not_chaos, NOT_CHAOS.len(), "a NOT_CHAOS name with no case file");
@@ -6147,7 +6383,8 @@ fn stays_on_air_reds_a_page_that_leaves_after_coming_back_in_every_leg_with_a_ba
     let good = || json!({"killed": [201, 202, 203], "types": ["zygote", "zygote", "gpu-process"]});
     let restart_back = |w: &World| *w.starts().last().unwrap() + FIRST_PACKET_MS;
     // Each leg with a back check, its world and its back: the restart legs' first programme frame
-    // after the restart, cef-hung's strip back after the hide, score-down's first good poll.
+    // after the restart, cef-hung's strip back after the hide, score-down's first good poll,
+    // cef-blank's first frame of the page after the withheld ones.
     let legs: Vec<BackLeg> = vec![
         (
             "sty-8",
@@ -6216,6 +6453,13 @@ fn stays_on_air_reds_a_page_that_leaves_after_coming_back_in_every_leg_with_a_ba
             || score_down(true, false),
             |w| w.score_blind.unwrap().1 + w.ms("harness_page_poll_ms"),
         ),
+        (
+            "sty-19",
+            BLANK,
+            "",
+            || blank(blank_n(), 20, RELOAD_READY_MS),
+            |w| w.overlay_none[0].1,
+        ),
     ];
     let mut checked = 0;
     for (tag, case, variant, make, back_of) in &legs {
@@ -6245,7 +6489,7 @@ fn stays_on_air_reds_a_page_that_leaves_after_coming_back_in_every_leg_with_a_ba
         checked += 1;
     }
     eprintln!("legs with a back check judged: {checked}");
-    assert_eq!(checked, 8);
+    assert_eq!(checked, 9);
 
     // A blip the allowance holds passes; one frame more reds (cef-killed, 2 s after back).
     let w = cef_killed(good(), 133);

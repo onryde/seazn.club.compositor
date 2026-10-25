@@ -62,6 +62,18 @@ pub fn budget_gpu_death_reload_ms(cef_child_poll_ms: u64) -> u64 {
         + BUDGET_FRAME_TO_ENCODER_MS
 }
 
+/// Owed 99 (option B, applied by the coordinator 2026-10-25: a blank-overlay watchdog), case 19: the
+/// overlay is on air after a blank page (Ready, and no frame of its own by its bound) within the
+/// watchdog's own terms, summed, from that page's ready. No spec number exists for it, so it is
+/// derived, never typed: the domain calls the page blank at the first tick at or after
+/// `cef_hang_after_ms` past its ready and reloads it (`TICK_WIDEST_MS`), the reloaded page signals
+/// ready before the domain's own load timeout gives up on it (`cef_load_timeout_ms`), and its first
+/// frame reaches the encoder (`BUDGET_FRAME_TO_ENCODER_MS`).
+pub fn budget_blank_page_reload_ms() -> u64 {
+    let t = Thresholds::default();
+    t.cef_hang_after_ms + TICK_WIDEST_MS + t.cef_load_timeout_ms + BUDGET_FRAME_TO_ENCODER_MS
+}
+
 /// The harness page's poll period for `/score.json` and `/page-control.json`
 /// (`harness/pages/overlay-test.html`, which reads it from fake-control). Case 7's recovery bound:
 /// the first poll after the feed returns.
@@ -213,6 +225,10 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     put(
         "budget_gpu_death_reload_ms",
         json!(budget_gpu_death_reload_ms(cef_child_poll_ms)),
+    );
+    put(
+        "budget_blank_page_reload_ms",
+        json!(budget_blank_page_reload_ms()),
     );
     put("harness_page_poll_ms", json!(HARNESS_PAGE_POLL_MS));
     Value::Object(m)
@@ -417,6 +433,29 @@ mod tests {
         assert!(
             budget < BUDGET_PROCESS_RESTART_OUTPUT_MS,
             "a reload ({budget} ms) slower than a process restart"
+        );
+    }
+
+    // Owed 99: the blank page's budget is its four terms, each read from its own declaration, the
+    // committed file carries it, and a reload comes back inside a process restart's own budget (else
+    // restarting would be the better recovery).
+    #[test]
+    fn the_blank_page_reload_budget_is_its_terms() {
+        let t = Thresholds::default();
+        let want = t.cef_hang_after_ms + TICK_WIDEST_MS + t.cef_load_timeout_ms + BUDGET_FRAME_TO_ENCODER_MS;
+        let v = dump(AdapterConsts {
+            cef_child_poll_ms: 2,
+            encoded_ring_span_ms: 3,
+            reaper_kill_after_ms: 4,
+            teardown_leak_after_ms: 5,
+        });
+        assert_eq!(v["budget_blank_page_reload_ms"].as_u64(), Some(want));
+        let (_, committed) = committed();
+        assert_eq!(committed["budget_blank_page_reload_ms"].as_u64(), Some(want));
+        let after_blank = want - t.cef_hang_after_ms;
+        assert!(
+            after_blank < BUDGET_PROCESS_RESTART_OUTPUT_MS,
+            "a blank page's reload ({after_blank} ms after it is called blank) slower than a process restart"
         );
     }
 
