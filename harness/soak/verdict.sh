@@ -3,7 +3,7 @@
 # soak's own numbers (soak.json) and the schedule (schedule.jq) bound. soak.yml and test-verdict.sh
 # both call it, so the run and the fixtures are judged by one command.
 #
-#   harness/soak/verdict.sh --dir <run dir> --page real|test --drive-min <N> [--schedule soak|dropouts]
+#   harness/soak/verdict.sh --dir <run dir> --page real|test --drive-min <N> [--schedule soak|dropouts|none]
 #                           [--thresholds <file>] [--jq <jq>]
 #
 # <run dir> holds report.json, actions.jsonl, control-state.json, deliveries.jsonl,
@@ -36,7 +36,7 @@ done
 [ -d "$DIR" ] || { echo "verdict.sh: --dir names no directory" >&2; exit 64; }
 case "$PAGE" in real | test) ;; *) echo "verdict.sh: --page must be real or test" >&2; exit 64 ;; esac
 case "$DRIVE_MIN" in '' | *[!0-9]*) echo "verdict.sh: --drive-min must be whole minutes" >&2; exit 64 ;; esac
-case "$SCHEDULE" in soak | dropouts) ;; *) echo "verdict.sh: --schedule must be soak or dropouts" >&2; exit 64 ;; esac
+case "$SCHEDULE" in soak | dropouts | none) ;; *) echo "verdict.sh: --schedule must be soak, dropouts or none" >&2; exit 64 ;; esac
 [ -f "$THRESHOLDS" ] || { echo "verdict.sh: no thresholds file $THRESHOLDS" >&2; exit 64; }
 
 EMPTY="$(mktemp)"
@@ -57,13 +57,17 @@ printf '%s\n' "$out"
 "$JQ" -r '"soak verdict: \(.status) (page \(.page), \(.drive_min) min drive, \(.checked) checks)",
   (.checks[] | "  \(.status | ascii_upcase) \(.id) \(.name)\(if .reason then ": \(.reason)" else "" end)  \(.measured | tojson)")' \
   <<<"$out" >&2
-"$JQ" -r '.measures.memory_split as $m | ($m.compositor.growth) as $c | ($m.cef.growth) as $g | ($m.steps) as $st
+"$JQ" -r '.schedule as $schedule | .measures.memory_split as $m | ($m.compositor.growth) as $c | ($m.cef.growth) as $g
+  | ($m.steps) as $st | ($m.control) as $k | ($m.window) as $w | ($st.of | rtrimstr("s")) as $one
   | def mb: if . == null then "-" else "\(if . > 0 then "+" else "" end)\(.) MB" end;
-  "  MEASURE memory split: \($m.lines) lines, \($m.lines_in_drive) in the drive (the last part against the first, medians)",
+  "  MEASURE memory split: \($m.lines) lines, \($m.lines_in_drive) in the drive (growth: the last part against the first, medians)",
   "  MEASURE compositor only: rss \($c.rss_mb | mb), anon \($c.anon_mb | mb), file \($c.file_mb | mb), shmem \($c.shmem_mb | mb), threads \($c.threads // "-")  \($m.compositor | tojson)",
-  "  MEASURE cef only: pss \($g.cef_mb | mb) (renderer \($g.cef_renderer_mb | mb), gpu-process \($g.cef_gpu_process_mb | mb), utility \($g.cef_utility_mb | mb), zygote \($g.cef_zygote_mb | mb), other \($g.cef_other_mb | mb))  \($m.cef | tojson)",
-  "  MEASURE per-dropout step: \($st.measured) of \($st.dropouts) dropouts measured; rss mean \($st.rss_mean_mb | mb), median \($st.rss_median_mb | mb), sum \($st.rss_sum_mb | mb) (first half mean \($st.rss_first_half_mean_mb | mb), second half \($st.rss_second_half_mean_mb | mb)); anon mean \($st.anon_mean_mb | mb); cef mean \($st.cef_mean_mb | mb); input rebuilds \($st.rebuilds // "-")",
-  ($m.dropouts[] | "  MEASURE dropout \(.slot): rss \(.rss_step_mb | mb), anon \(.anon_step_mb | mb), cef \(.cef_step_mb | mb), input_gen \(.gen_before // "-") -> \(.gen_after // "-")")' \
+  "  MEASURE cef only: pss \($g.cef_mb | mb) (renderer \($g.cef_renderer_mb | mb), gpu-process \($g.cef_gpu_process_mb | mb), utility \($g.cef_utility_mb | mb), zygote \($g.cef_zygote_mb | mb), other \($g.cef_other_mb | mb)); children by rss (the tree less the compositor) \($g.cef_children_rss_mb | mb)  \($m.cef | tojson)",
+  "  MEASURE per-\($one) step (the lines): \($st.measured) of \($st.instants) \($st.of) measured, mean span \($st.span_mean_s // "-") s; rss mean \($st.rss_mean_mb | mb), median \($st.rss_median_mb | mb), sum \($st.rss_sum_mb | mb) (first half mean \($st.rss_first_half_mean_mb | mb), second half \($st.rss_second_half_mean_mb | mb)); anon mean \($st.anon_mean_mb | mb); cef mean \($st.cef_mean_mb | mb); children by rss mean \($st.children_mean_mb | mb); input rebuilds \($st.rebuilds // "-")",
+  (if $k.measured == 0 then "  MEASURE control (the lines, between \($st.of)): NO CONTROL: \($k.gaps) gap(s), none with two distinct lines, so the steps above still carry the growth over time"
+   else "  MEASURE control (the lines, between \($st.of)): \($k.measured) of \($k.gaps) gaps with two lines, mean span \($k.span_mean_s) s; rss \($k.rss.rate_mb_per_min // "-") MB/min, \($k.rss.at_step_span_mb | mb) over the steps mean span, so excess \($k.rss.excess_mb | mb) a step (anon excess \($k.anon.excess_mb | mb), cef excess \($k.cef.excess_mb | mb))" end),
+  "  MEASURE windowed step (memMb, the diagnosis: median over [\($w.before_s | map(tostring) | join(", "))) s against [\($w.after_s | map(tostring) | join(", "))) s): \($w.measured) of \($st.instants) measured; mean \($w.mean_mb | mb), median \($w.median_mb | mb), sum \($w.sum_mb | mb) (first half mean \($w.first_half_mean_mb | mb), second half \($w.second_half_mean_mb | mb))\(if $schedule == "none" then "; this run is the control: nothing happened at these instants" elif $schedule == "dropouts" then "; its control is a schedule=none run of the same length (here its windows meet the next dropout)" else "" end)",
+  ($m.dropouts[] | "  MEASURE \($one) \(.slot): rss \(.rss_step_mb | mb) over \(.span_s // "-") s, anon \(.anon_step_mb | mb), cef \(.cef_step_mb | mb), windowed memMb \(.window_step_mb | mb), input_gen \(.gen_before // "-") -> \(.gen_after // "-")")' \
   <<<"$out" >&2 || echo "verdict.sh: the memory split's measures did not print (the verdict above stands)" >&2
 status="$("$JQ" -r '.status' <<<"$out")"
 case "$status" in

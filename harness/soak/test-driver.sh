@@ -25,6 +25,9 @@
 # compressed to a dropout every 4 s from 2 s): every dropout dropout_plan holds, on its planned time,
 # no disconnect and no firewall rule, and the start action names the schedule (run 1's names soak, a
 # leg's names leg). Runs 14 and 15 refuse an unknown schedule and the dropouts schedule on a leg.
+# Run 16 (page=test, in parallel) takes SOAK_SCHEDULE=none (the experiment's control): the start
+# names it, and no dropout, disconnect, camera pause or firewall rule happens in the whole drive.
+# Run 17 refuses the none schedule on a leg.
 #
 #   HARNESS_BASH=<bash 5> harness/soak/test-driver.sh     (driver.sh needs bash 5: mapfile, EPOCHREALTIME)
 #
@@ -268,6 +271,19 @@ stub_run "$W/out13" "$W/state13"
     SOAK_DEADLINE_MS=$((t + 600000)) SOAK_HARD_STOP_MS=$((t + 100000)) SOAK_PAGE=test SOAK_SCHEDULE=dropouts \
     FLY_MACHINE_ID=m0 FLY_APP_NAME=soak-test "$BASH5" "$W/soak/driver.sh" >"$W/driver13.out" 2>&1 || rc=$?
   echo "$rc" >"$W/rc13"
+) &
+real_pids="$real_pids $!"
+# Run 16: page=test on the control schedule (nothing in the drive).
+mkdir -p "$W/out16" "$W/state16"
+stub_run "$W/out16" "$W/state16"
+(
+  t="$(now_ms)"
+  rc=0
+  env -i PATH="$PATH_STUB" HOME="$W" STATE="$W/state16" SOAK_ROOT="$W/soak" SOAK_OUT="$W/out16" \
+    SESSION_ID="11111111-2222-4333-8444-555555555516" JOB_TOKEN="$JOB_TOKEN" SOAK_DRIVE_MIN=1 \
+    SOAK_DEADLINE_MS=$((t + 600000)) SOAK_HARD_STOP_MS=$((t + 100000)) SOAK_PAGE=test SOAK_SCHEDULE=none \
+    FLY_MACHINE_ID=m0 FLY_APP_NAME=soak-test "$BASH5" "$W/soak/driver.sh" >"$W/driver16.out" 2>&1 || rc=$?
+  echo "$rc" >"$W/rc16"
 ) &
 real_pids="$real_pids $!"
 # Run 6: page=real, the page source fails after leaking its key into /out; the hard stop is near.
@@ -547,6 +563,21 @@ elif grep -q '^curl POST http://127.0.0.1:7001/pause' "$W/state13/calls"; then
 else
   echo "FAIL dropouts: no camera pause reached fake-camera"; failures=$((failures + 1))
 fi
+# Run 16: the control schedule: the whole drive with nothing in it.
+checked=$((checked + 1))
+if [ "$(cat "$W/rc16")" -eq 0 ] && grep -q "schedule none" "$W/driver16.out"; then echo "PASS none run 16: exit 0, the boot line names the schedule"; else
+  echo "FAIL none run 16: exit $(cat "$W/rc16")"; tail -n 20 "$W/driver16.out"; failures=$((failures + 1)); fi
+check "none: one start naming the schedule and the drive, then only the end: no dropout, no disconnect" \
+  '(.[0]) as $st | $st.kind == "start" and $st.schedule == "none" and $st.drive_s == 60
+   and ([.[] | .kind] == ["start", "end"]) and (last | has("ended_early") | not)' "$W/out16/actions.jsonl"
+checked=$((checked + 1))
+if grep -q ' -I INPUT ' "$W/state16/calls" || grep -q '^curl POST http://127.0.0.1:7001/pause' "$W/state16/calls"; then
+  echo "FAIL none: a fault reached the control run"; grep -E -- '-I INPUT|7001/pause' "$W/state16/calls"; failures=$((failures + 1))
+elif [ -s "$W/state16/calls" ]; then
+  echo "PASS none: no camera pause and no firewall rule ($(wc -l <"$W/state16/calls" | tr -d ' ') stub calls read)"
+else
+  echo "FAIL none: no stub call was recorded (nothing read)"; failures=$((failures + 1))
+fi
 # Runs 11 and 12: an unknown leg, and a leg on page=test, refused before anything starts.
 for case in "11 E real" "12 A test"; do
   set -- $case
@@ -565,7 +596,7 @@ else
   echo "FAIL legs: the refusals"; tail -n 3 "$W/driver11.out" "$W/driver12.out"; failures=$((failures + 1)); fi
 # Runs 14 and 15: an unknown schedule, and the dropouts schedule on a cost leg, refused before
 # anything starts.
-for case in "14 weekly -" "15 dropouts A"; do
+for case in "14 weekly -" "15 dropouts A" "17 none A"; do
   set -- $case
   leg="$3"
   [ "$leg" != - ] || leg=""
@@ -577,19 +608,21 @@ for case in "14 weekly -" "15 dropouts A"; do
   echo "$rc" >"$W/rc$1"
 done
 checked=$((checked + 1))
-if [ "$(cat "$W/rc14")" -eq 64 ] && grep -q "FAIL SOAK_SCHEDULE must be soak or dropouts" "$W/driver14.out" \
+if [ "$(cat "$W/rc14")" -eq 64 ] && grep -q "FAIL SOAK_SCHEDULE must be soak, dropouts or none" "$W/driver14.out" \
   && [ "$(cat "$W/rc15")" -eq 64 ] && grep -q "FAIL a cost leg runs no schedule: SOAK_SCHEDULE=dropouts with SOAK_LEG" "$W/driver15.out" \
-  && [ ! -s "$W/out14/actions.jsonl" ] && [ ! -s "$W/out15/actions.jsonl" ]; then
-  echo "PASS schedules: an unknown schedule and the dropouts schedule on a leg are refused (64), by name, before any action"
+  && [ "$(cat "$W/rc17")" -eq 64 ] && grep -q "FAIL a cost leg runs no schedule: SOAK_SCHEDULE=none with SOAK_LEG" "$W/driver17.out" \
+  && [ ! -s "$W/out14/actions.jsonl" ] && [ ! -s "$W/out15/actions.jsonl" ] && [ ! -s "$W/out17/actions.jsonl" ]; then
+  echo "PASS schedules: an unknown schedule, and the dropouts and none schedules on a leg, are refused (64), by name, before any action"
 else
-  echo "FAIL schedules: the refusals"; tail -n 3 "$W/driver14.out" "$W/driver15.out"; failures=$((failures + 1)); fi
+  echo "FAIL schedules: the refusals"; tail -n 3 "$W/driver14.out" "$W/driver15.out" "$W/driver17.out"; failures=$((failures + 1)); fi
 
 checked=$((checked + 1))
 if printf '%s\n' "$JOB_TOKEN" | grep -rqF -f - "$W/out" "$W/out2" "$W/out3" "$W/out4" "$W/out5" "$W/out6" "$W/driver.out" "$W/driver2.out" \
   "$W/driver3.out" "$W/driver4.out" "$W/driver5.out" "$W/driver6.out" "$W/driver7.out" "$W/out7" "$STATE/calls" "$W/state3/calls" \
   "$W/state4/calls" "$W/state5/calls" "$W/state6/calls" "$W/state7/calls" "$W/out8" "$W/out9" "$W/out10" "$W/driver8.out" \
   "$W/driver9.out" "$W/driver10.out" "$W/driver11.out" "$W/driver12.out" "$W/state8/calls" "$W/state9/calls" "$W/state10/calls" \
-  "$W/out13" "$W/driver13.out" "$W/state13/calls" "$W/driver14.out" "$W/driver15.out"; then
+  "$W/out13" "$W/driver13.out" "$W/state13/calls" "$W/driver14.out" "$W/driver15.out" "$W/out16" "$W/driver16.out" \
+  "$W/state16/calls" "$W/driver17.out"; then
   echo "FAIL the job token reached a file"
   failures=$((failures + 1))
 else

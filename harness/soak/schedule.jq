@@ -2,7 +2,8 @@
 # verdict.jq (what must have been done). `soak_plan($soak; $drive_s)` takes harness/soak/soak.json
 # and the drive in seconds, and answers {drive_s, part_s, dropouts: [s...], disconnects: [s...]},
 # each an offset from the drive's start. `schedule_plan($soak; $schedule; $drive_s)` picks the
-# schedule by name: `soak` (this one) or `dropouts` (`dropout_plan`, the memory experiment's).
+# schedule by name: `soak` (this one), `dropouts` (`dropout_plan`, the memory experiment's) or
+# `none` (the experiment's control: the same drive with nothing in it).
 #
 # - The drive is `parts` (3) equal parts: the hours of a 3-hour soak. A shorter rehearsal is the
 #   same run scaled, so it has every action kind (the brief's "scaled anti-vacuity counts").
@@ -37,11 +38,14 @@ def soak_plan($soak; $drive_s):
 
 # The dropout-only experiment (soak 40139563554's memory drift, 2026-10-25): camera dropouts and
 # nothing else, so each step in the compositor's memory can be tied to one. A dropout every
-# `dropout_only.every_s` (2 min: 30 an hour, against the soak's 12) from `dropout_only.phase_s`
+# `dropout_only.every_s` (125 s: 28.8 an hour, against the soak's 12) from `dropout_only.phase_s`
 # (1 min), each `dropout_pause_s` long, and no destination disconnect. Each dropout owns a whole
-# period (the last one's ends a period before the drive does), so the minute-apart memory split
-# lines land in every gap between two dropouts, and after the last: 12 dropouts in a 25-minute
-# drive. A drive under `min_drive_min` is an error, as for the soak.
+# period (the last one's ends a period before the drive does): 35 dropouts in a 75-minute drive.
+# The period is deliberately not a whole number of minutes. The memory split's lines come a minute
+# apart, on the compositor's own beat grid, so a 120 s period would pin every dropout to the same
+# place between two lines for the whole run: either every gap between dropouts would hold two lines
+# (a control) or none would. At 125 s the lines walk 5 s a period through the gap. A drive under
+# `min_drive_min` is an error, as for the soak.
 def dropout_plan($soak; $drive_s):
   ($soak.dropout_only.every_s) as $p
   | ($soak.dropout_only.phase_s) as $phase
@@ -54,8 +58,12 @@ def dropout_plan($soak; $drive_s):
        dropouts: [range(0; (($drive_s - $phase) / $p | floor)) | $phase + . * $p], disconnects: []}
     end;
 
+# The experiment's control (`none`): the dropout schedule's drive with no dropout and no disconnect,
+# so growth with time alone can be told from growth per dropout. verdict.jq measures the same steps
+# at dropout_plan's instants, where nothing happened.
 def schedule_plan($soak; $schedule; $drive_s):
   if $schedule == "soak" then soak_plan($soak; $drive_s)
   elif $schedule == "dropouts" then dropout_plan($soak; $drive_s)
-  else error("schedule_plan: no schedule \($schedule | tojson) (soak or dropouts)")
+  elif $schedule == "none" then dropout_plan($soak; $drive_s) | .dropouts = []
+  else error("schedule_plan: no schedule \($schedule | tojson) (soak, dropouts or none)")
   end;

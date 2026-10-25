@@ -3,14 +3,19 @@
 
 Only the report fields verdict.jq reads, under the checker's own names (harness::checker::Report).
 With `dropouts`, the same run on the memory experiment's schedule (schedule.jq's dropout_plan):
-camera dropouts every 2 minutes from minute 1, no disconnect, so no output outage.
+camera dropouts every 125 s from minute 1, no disconnect, so no output outage. With `none`, its
+control: the same drive with nothing in it.
 
 The compositor log (compositor.log, flylog.py's shape) carries a `memory split` line a minute,
 from before the drive to after it, with a planted step at every dropout: the compositor's RSS
-STEP_RSS_KB and its anon STEP_ANON_KB, CEF's renderer STEP_CEF_KB, and the input generation one
-higher, after each dropout has ended (file, shmem and threads stay put).
+STEP_RSS_KB and its anon STEP_ANON_KB, CEF's renderer STEP_CEF_KB, the tree STEP_TREE_MB, and the
+input generation one higher, after each dropout has ended (file, shmem and threads stay put). Every
+kind names how many children were listed and read. The beats' memMb carries the same tree step,
+over an alternating 0/2 MB noise whose median over any even run of beats is exactly 1, so the
+diagnosis's windowed step reads STEP_TREE_MB exactly.
 Run: python3 -I harness/soak/fixtures/make-green.py harness/soak/fixtures/green
      python3 -I harness/soak/fixtures/make-green.py harness/soak/fixtures/green-dropouts dropouts
+     python3 -I harness/soak/fixtures/make-green.py harness/soak/fixtures/green-none none
 """
 import datetime
 import json
@@ -19,7 +24,7 @@ import sys
 
 OUT = sys.argv[1]
 SCHEDULE = sys.argv[2] if len(sys.argv) > 2 else "soak"
-assert SCHEDULE in ("soak", "dropouts"), SCHEDULE
+assert SCHEDULE in ("soak", "dropouts", "none"), SCHEDULE
 os.makedirs(OUT, exist_ok=True)
 
 S = 1792800000000  # the drive's start (epoch ms)
@@ -28,12 +33,32 @@ HB = 5000  # heartbeat_interval_ms
 ALIVE = 2000  # cef_alive_every_ms
 PHASE, EVERY, PAUSE, HOLD = 150, 300, 10, 30
 DISCONNECTS = [300, 900, 1500]  # schedule.jq's plan for a 30-minute drive
-if SCHEDULE == "dropouts":
-    PHASE, EVERY = 60, 120  # soak.json's dropout_only
+if SCHEDULE in ("dropouts", "none"):
+    PHASE, EVERY = 60, 125  # soak.json's dropout_only
     DISCONNECTS = []
-STEP_RSS_KB, STEP_ANON_KB, STEP_CEF_KB = 9216, 8192, 1024
+STEP_RSS_KB, STEP_ANON_KB, STEP_CEF_KB, STEP_TREE_MB = 9216, 8192, 1024, 10
+TREE_MB = 1400  # the beats' memMb before any dropout, less the noise
 LINE_FROM_MS, LINE_EVERY_MS = S - 55000, 60000  # the memory split's lines: drive start + 5 s, + k min
 CRASH_S = 720  # one CEF crash at minute 12: its hide is printed, never failed
+
+# The dropouts' times, first: the beats' memMb steps when one ends.
+DROPOUTS = []
+k = 0
+# soak_plan's count, or dropout_plan's (each dropout owns a whole period); none has no dropout.
+while SCHEDULE != "none" and ((PHASE + k * EVERY + PAUSE <= D) if SCHEDULE == "soak" else (PHASE + (k + 1) * EVERY <= D)):
+    at = S + (PHASE + k * EVERY) * 1000
+    DROPOUTS.append((k, at, at + 3, at + PAUSE * 1000 + 5))
+    k += 1
+ENDS = [d[3] for d in DROPOUTS]
+
+
+def ended(t):
+    return sum(1 for e in ENDS if e <= t)
+
+
+def mem_mb(i, t):
+    return TREE_MB + (i % 2) * 2 + ended(t) * STEP_TREE_MB
+
 
 beats = []
 t = S - 60000
@@ -49,7 +74,7 @@ while t <= S + D * 1000 + 10000:
         "body": {
             "state": "playing", "videoState": "running", "fps": 30.0, "bitrateKbps": 4010,
             "droppedFrames": dropped, "encoderSpeed": 1.0, "cpuPct": 52.0,
-            "memMb": 910 + (i % 7), "programmePhase": "live", "input": "connected",
+            "memMb": mem_mb(i, t), "programmePhase": "live", "input": "connected",
             "output": "connected", "graphics": graphics, "pipelineRebuilds": 0, "sinkSwaps": 0,
             "rung": "full", "scoreStale": False,
         },
@@ -88,13 +113,9 @@ with open(os.path.join(OUT, "report.json"), "w") as f:
     f.write("\n")
 
 actions = [{"kind": "start", "at_ms": S, "drive_s": D, "schedule": SCHEDULE}]
-k = 0
-# soak_plan's count, or dropout_plan's (each dropout owns a whole period).
-while (PHASE + k * EVERY + PAUSE <= D) if SCHEDULE == "soak" else (PHASE + (k + 1) * EVERY <= D):
-    at = S + (PHASE + k * EVERY) * 1000
-    actions.append({"kind": "dropout", "slot": k, "planned_ms": at, "at_ms": at + 3, "end_ms": at + PAUSE * 1000 + 5,
+for k, planned, at, end in DROPOUTS:
+    actions.append({"kind": "dropout", "slot": k, "planned_ms": planned, "at_ms": at, "end_ms": end,
                     "ok": True, "pause": 200, "resume": 200})
-    k += 1
 for n, d in enumerate(DISCONNECTS):
     at = S + d * 1000
     actions.append({"kind": "disconnect", "slot": n, "planned_ms": at, "at_ms": at + 4, "end_ms": at + HOLD * 1000 + 6,
@@ -132,15 +153,16 @@ def stamp(ms, digits):
     return t.strftime("%Y-%m-%dT%H:%M:%S.") + f"{t.microsecond:06d}"[:digits] + "Z"
 
 
-ends = [a["end_ms"] for a in actions if a["kind"] == "dropout"]
 lines = []
 t = LINE_FROM_MS
 while t <= S + D * 1000 + 60000:
-    n = sum(1 for e in ends if e <= t)
-    msg = (f"memory split input_gen={1 + n} tree_mb={910 + n * 10} rss_kb={612000 + n * STEP_RSS_KB} "
+    n = ended(t)
+    msg = (f"memory split input_gen={1 + n} tree_mb={mem_mb((t - (S - 60000)) // HB, t)} rss_kb={612000 + n * STEP_RSS_KB} "
            f"anon_kb={500000 + n * STEP_ANON_KB} file_kb=100000 shmem_kb=12000 threads=87 cef_poll={(t - S) // 1000 + 600} "
-           f"cef_renderer_kb={200000 + n * STEP_CEF_KB} cef_renderer_n=1 cef_gpu_process_kb=90000 cef_gpu_process_n=1 "
-           f"cef_utility_kb=40000 cef_utility_n=2 cef_zygote_kb=15000 cef_zygote_n=2 cef_other_kb=- cef_other_n=0")
+           f"cef_renderer_kb={200000 + n * STEP_CEF_KB} cef_renderer_n=1 cef_renderer_listed=1 "
+           f"cef_gpu_process_kb=90000 cef_gpu_process_n=1 cef_gpu_process_listed=1 "
+           f"cef_utility_kb=40000 cef_utility_n=2 cef_utility_listed=2 cef_zygote_kb=15000 cef_zygote_n=2 cef_zygote_listed=2 "
+           f"cef_other_kb=- cef_other_n=0 cef_other_listed=0")
     lines.append(f"{stamp(t + 2, 6)} ts={stamp(t, 3)} level=info msg={msg}")
     lines.append(f"{stamp(t + 3002, 6)} ts={stamp(t + 3000, 3)} level=info msg=output fps beat=29.97 floor=27.00")
     t += LINE_EVERY_MS

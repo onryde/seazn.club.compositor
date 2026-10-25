@@ -29,10 +29,11 @@
 #                           Machine. Its score driver records a moment-making event at the page's
 #                           pace (cost_ball_every_s for cricket, cost_rally_every_s for badminton),
 #                           and the run ends with programme stills for a person to look at
-#   SOAK_SCHEDULE           soak (the default: schedule.jq's soak_plan) or dropouts (dropout_plan:
-#                           the memory experiment's camera dropouts every 2 minutes and no
-#                           disconnect; soak 40139563554's drift). A cost leg runs no schedule, so
-#                           dropouts with SOAK_LEG is refused
+#   SOAK_SCHEDULE           soak (the default: schedule.jq's soak_plan), dropouts (dropout_plan:
+#                           the memory experiment's camera dropouts every 125 s and no disconnect;
+#                           soak 40139563554's drift) or none (the experiment's control: the same
+#                           drive with nothing in it). A cost leg runs no schedule, so dropouts or
+#                           none with SOAK_LEG is refused
 #   FLY_MACHINE_ID, FLY_APP_NAME   set by the platform: this Machine's private name
 #
 # Every scheduled action is a line of /out/actions.jsonl with its wall time (ms, this Machine's
@@ -68,8 +69,8 @@ CAMERA_PATTERN="${CAMERA_PATTERN:-ball}"
 SOAK_LEG="${SOAK_LEG:-}"
 SOAK_SCHEDULE="${SOAK_SCHEDULE:-soak}"
 case "$SOAK_SCHEDULE" in
-  soak | dropouts) ;;
-  *) log "FAIL SOAK_SCHEDULE must be soak or dropouts"; exit 64 ;;
+  soak | dropouts | none) ;;
+  *) log "FAIL SOAK_SCHEDULE must be soak, dropouts or none"; exit 64 ;;
 esac
 if [ -n "$SOAK_LEG" ] && [ "$SOAK_SCHEDULE" != soak ]; then
   log "FAIL a cost leg runs no schedule: SOAK_SCHEDULE=$SOAK_SCHEDULE with SOAK_LEG"
