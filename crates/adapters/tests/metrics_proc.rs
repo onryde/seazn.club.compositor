@@ -12,8 +12,16 @@ fn a_cef_poll() -> CefPoll {
     CefPoll {
         poll: 7,
         pss: CefPss {
-            renderer: Some(KindPss { kb: 61_000, n: 1 }),
-            zygote: Some(KindPss { kb: 9_000, n: 2 }),
+            renderer: Some(KindPss {
+                kb: 61_000,
+                n: 1,
+                listed: 1,
+            }),
+            zygote: Some(KindPss {
+                kb: 9_000,
+                n: 2,
+                listed: 2,
+            }),
             ..CefPss::default()
         },
     }

@@ -916,7 +916,11 @@ fn the_memory_split_reaches_the_log_through_the_real_sampler() {
     let poll = CefPoll {
         poll: 7,
         pss: CefPss {
-            renderer: Some(KindPss { kb: 61_000, n: 1 }),
+            renderer: Some(KindPss {
+                kb: 61_000,
+                n: 1,
+                listed: 1,
+            }),
             ..CefPss::default()
         },
     };
@@ -952,7 +956,10 @@ fn the_memory_split_reaches_the_log_through_the_real_sampler() {
             .expect("an rss_kb field");
         assert!(rss.parse::<u64>().is_ok_and(|kb| kb > 0), "{line}");
         assert!(
-            line.contains(" cef_poll=7 cef_renderer_kb=61000 cef_renderer_n=1 cef_gpu_process_kb=- cef_gpu_process_n=0 "),
+            line.contains(
+                " cef_poll=7 cef_renderer_kb=61000 cef_renderer_n=1 cef_renderer_listed=1 cef_gpu_process_kb=- \
+                 cef_gpu_process_n=0 cef_gpu_process_listed=0 "
+            ),
             "{line}"
         );
     } else {

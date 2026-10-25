@@ -37,12 +37,15 @@
 //!   `fps`. The ladder is not told: its only input stays the encoder queue's overruns.
 //! - **The memory split** (soak 40139563554's drift, 2026-10-25): a beat whose metrics have a
 //!   memory split (`Metrics::memory`, read after the beat's sample) writes `memory split input_gen=<g> tree_mb=<n> rss_kb=… anon_kb=… file_kb=…
-//!   shmem_kb=… threads=… cef_poll=<n> cef_<kind>_kb=… cef_<kind>_n=…` (`memory_line`, the kinds
-//!   `renderer`, `gpu_process`, `utility`, `zygote`, `other`) on the first such beat and then on the
-//!   first beat at least a minute after the last line. `input_gen` is the last input generation the
-//!   domain rebuilt, so a step in the soak's memory can be tied to a rebuild; `tree_mb` is the beat's
-//!   own `memMb`, unchanged. An absent value writes `-`, never 0; a kind CEF's poll found no child
-//!   of writes `kb=-` and `n=0`. A sample without it writes nothing.
+//!   shmem_kb=… threads=… cef_poll=<n> cef_<kind>_kb=… cef_<kind>_n=… cef_<kind>_listed=…`
+//!   (`memory_line`, the kinds `renderer`, `gpu_process`, `utility`, `zygote`, `other`) on the first
+//!   such beat and then on the first beat at least a minute after the last line. `input_gen` is the
+//!   last input generation the domain rebuilt, so a step in the soak's memory can be tied to a
+//!   rebuild; `tree_mb` is the beat's own `memMb`, unchanged. Per kind, `listed` is how many children
+//!   of that kind the poll found, `n` how many of them it read the PSS of, and `kb` that PSS's sum,
+//!   `-` when it read none (unknown, never 0). A kind the poll found none of writes `kb=- n=0
+//!   listed=0`; a kind it found and could not read writes `kb=- n=0 listed=<k>`. An absent value
+//!   writes `-`, never 0. A sample without a split writes nothing.
 //! - **CEF's health** (C11b) is read from the graphics port once per `tick_due` that ran a tick, after
 //!   its ticks, and handed to `decide` every time (the domain decides the in-place restart, never the
 //!   driver), with one line when it changes (`cef health zygote_gone=<gen|-> leaked_teardowns=<n>
@@ -461,13 +464,24 @@ pub fn memory_line(split: &MemorySplit, tree_mb: Option<u64>, input_gen: Option<
     );
     let polled = split.cef.map(|c| c.pss);
     for (name, kind) in polled.unwrap_or_default().kinds() {
-        // No poll: nothing is known. A poll that found no child of this kind: none counted.
-        let (kb, n) = match (polled, kind) {
-            (None, _) => ("-".to_owned(), "-".to_owned()),
-            (Some(_), None) => ("-".to_owned(), "0".to_owned()),
-            (Some(_), Some(k)) => (k.kb.to_string(), k.n.to_string()),
+        // No poll: nothing is known. A poll that found no child of this kind: none listed, none read.
+        // Listed with none read: the PSS is unknown, so `-`, never the 0 it sums to.
+        let (kb, n, listed) = match (polled, kind) {
+            (None, _) => ("-".to_owned(), "-".to_owned(), "-".to_owned()),
+            (Some(_), None) => ("-".to_owned(), "0".to_owned(), "0".to_owned()),
+            (Some(_), Some(k)) => (
+                if k.n == 0 {
+                    "-".to_owned()
+                } else {
+                    k.kb.to_string()
+                },
+                k.n.to_string(),
+                k.listed.to_string(),
+            ),
         };
-        line.push_str(&format!(" cef_{name}_kb={kb} cef_{name}_n={n}"));
+        line.push_str(&format!(
+            " cef_{name}_kb={kb} cef_{name}_n={n} cef_{name}_listed={listed}"
+        ));
     }
     line
 }

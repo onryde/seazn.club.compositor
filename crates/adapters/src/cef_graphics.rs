@@ -447,8 +447,9 @@ pub struct Guarded {
     /// The part the memory cap reads: every child but the renderers of other builds (a retiring
     /// or leaked one; PR #32 review G2).
     pub pss_counted_mb: u64,
-    /// The same PSS reads by `--type=`, in kB (the soak's memory split): a child whose PSS was not
-    /// read counts 0 in the sums above and is left out here (`CefPss::add`).
+    /// The same PSS reads by `--type=`, in kB (the soak's memory split): every child listed, and the
+    /// ones whose PSS was read. A child whose PSS was not read counts 0 in the sums above, and here
+    /// is listed but not read, so its kind's PSS reads unknown, never 0 (`CefPss::add`).
     pub pss_by_kind: CefPss,
 }
 
@@ -2624,6 +2625,7 @@ impl fmt::Debug for CefGraphics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use app::ports::KindPss;
 
     #[test]
     fn page_signals_match_exactly() {
@@ -4092,7 +4094,8 @@ mod tests {
 
     // The soak's memory split, through the real child poll thread: absent before the first poll;
     // then each poll's number and its PSS by kind. The fake's children are pids no process has, so
-    // no PSS is read: every kind stays absent (never a 0), with children listed.
+    // no PSS is read: each kind is listed with none read (n 0), never a 0 PSS read and never absent
+    // (PR #82 review I2: a poll that lists children and reads none must say so).
     #[test]
     fn the_child_poll_hands_the_memory_split_its_number_and_pss_by_kind() {
         let cef = FakeCef::with(vec![(FAKE_ROOT + 100, 0, None)]);
@@ -4117,7 +4120,23 @@ mod tests {
             "the poll's number: {first:?} after {} polls",
             polls()
         );
-        assert_eq!(first.pss, CefPss::default(), "no PSS read: every kind absent");
+        assert_eq!(
+            first.pss,
+            CefPss {
+                zygote: Some(KindPss {
+                    kb: 0,
+                    n: 0,
+                    listed: 2
+                }),
+                gpu_process: Some(KindPss {
+                    kb: 0,
+                    n: 0,
+                    listed: 1
+                }),
+                ..CefPss::default()
+            },
+            "no PSS read: two zygotes and a GPU process listed, none read"
+        );
         let listed = g.last_guard().children;
         assert_eq!(listed, 3, "two zygotes and a GPU process listed");
         assert!(
@@ -4158,10 +4177,18 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         let renderer = g.pss_by_kind.renderer.expect("the sleep's PSS was read");
-        assert_eq!(renderer.n, 1, "{g:?}");
+        assert_eq!((renderer.n, renderer.listed), (1, 1), "{g:?}");
         assert!(renderer.kb > 0, "a live process has a PSS: {g:?}");
         assert_eq!(g.pss_mb, renderer.kb / 1024, "the same reads as the sum: {g:?}");
-        assert_eq!(g.pss_by_kind.gpu_process, None, "unread: absent, never 0: {g:?}");
+        assert_eq!(
+            g.pss_by_kind.gpu_process,
+            Some(KindPss {
+                kb: 0,
+                n: 0,
+                listed: 1
+            }),
+            "unread: listed, none read, never a 0 read: {g:?}"
+        );
         assert_eq!(g.children, 2);
     }
 

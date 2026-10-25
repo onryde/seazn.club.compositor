@@ -214,16 +214,18 @@ pub struct ProcStatus {
     pub threads: Option<u64>,
 }
 
-/// One kind of CEF child in one poll: the PSS summed over the children of that kind whose PSS was
-/// read, in kB, and how many they were.
+/// One kind of CEF child in one poll: how many children of that kind the poll listed (`listed`), how
+/// many of them had their PSS read (`n`), and the PSS summed over those, in kB (`kb`). A kind listed
+/// with none read has `n == 0`: its PSS is unknown, never 0 (PR #82 review I2).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KindPss {
     pub kb: u64,
     pub n: u32,
+    pub listed: u32,
 }
 
-/// CEF's child processes' PSS by Chromium's `--type=`, from one child poll. A kind with no child
-/// whose PSS was read is absent, never 0.
+/// CEF's child processes' PSS by Chromium's `--type=`, from one child poll. A kind the poll listed no
+/// child of is absent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CefPss {
     pub renderer: Option<KindPss>,
@@ -235,12 +237,12 @@ pub struct CefPss {
 }
 
 impl CefPss {
-    /// One child's PSS (kB) under its `--type=`. A child whose PSS was not read (`None`: it ended
-    /// between the listing and the read) adds nothing and is not counted.
+    /// One listed child under its `--type=`, with its PSS (kB) when it was read. Every child counts
+    /// as listed. One whose PSS was not read (`None`: it ended between the listing and the read, or
+    /// its `smaps_rollup` could not be read) adds no PSS and is not counted as read, so a kind
+    /// listed with none read stays visible as such: the soak's verdict refuses it rather than read
+    /// CEF as flat.
     pub fn add(&mut self, kind: &str, pss_kb: Option<u64>) {
-        let Some(kb) = pss_kb else {
-            return;
-        };
         let slot = match kind {
             "renderer" => &mut self.renderer,
             "gpu-process" => &mut self.gpu_process,
@@ -249,8 +251,11 @@ impl CefPss {
             _ => &mut self.other,
         };
         let k = slot.get_or_insert_with(KindPss::default);
-        k.kb = k.kb.saturating_add(kb);
-        k.n = k.n.saturating_add(1);
+        k.listed = k.listed.saturating_add(1);
+        if let Some(kb) = pss_kb {
+            k.kb = k.kb.saturating_add(kb);
+            k.n = k.n.saturating_add(1);
+        }
     }
 
     /// Each kind, named as the memory split's line names it, in the line's order.
