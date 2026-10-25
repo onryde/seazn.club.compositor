@@ -1,19 +1,19 @@
 name: deploy-prod
-# C16 (docs/tasks/C16-deploy.md): on a release tag vX.Y.Z, build the relay image at the tagged commit
-# and push it to the prod relay app's registry as <RELAY_REGISTRY>/seazn-relay-prod:<tag>. As on stg,
-# a push changes nothing live; prod's RELAY_IMAGE changes only through promote.yml behind the
-# relay-prod environment's reviewers, and only after C17 passes.
+# C16 (docs/tasks/C16-deploy.md, amendment 2026-10-25): on a release tag vX.Y.Z, build the relay image
+# at the tagged commit and push it to the prod relay app's registry as
+# <RELAY_REGISTRY>/seazn-relay-prod:<tag>. As on stg, a push changes nothing live; prod's RELAY_IMAGE
+# changes only through scripts/promote.sh (with --confirm-prod), run locally on the owner's go-ahead,
+# and only after C17 passes.
 #
-# deploy-stg.yml's rules hold here too (the token guard, the push environment's rule, main's build
-# record, the CEF bump gate after every checkout, no cache, the relay target, a tag never pushed
-# twice), plus: the tag must point at a commit on main. The token is FLY_API_TOKEN_RELAY_PROD_PUSH,
-# minted `fly tokens create deploy -a seazn-relay-prod` (it reaches that one app, never
-# seazn-club-prod), an ENVIRONMENT secret of relay-prod-push, whose deployments are tags v* alone,
-# and never a repository secret (the PR #85 review's I-4). A tag push runs the tagged commit's copy
-# of this file, so the main check holds only for a tagged commit whose copy keeps it: the owner's
-# tag ruleset for v* (docs/_INDEX.md, C16 handoff), the attestation's identity (this workflow at
-# refs/tags/<tag>, the tagged commit) and promote.yml's own check of the tag's commit are what hold.
-# scripts/check-workflows.sh (check.yml) holds this file to them.
+# deploy-stg.yml's rules hold here too (the token guard, main's build record, the CEF bump gate after
+# the checkout, no cache, the relay target, a tag never pushed twice, no GitHub environment), plus: the
+# tag must point at a commit on main. The token is FLY_API_TOKEN_RELAY_PROD, a REPOSITORY secret minted
+# `fly tokens create deploy -a seazn-relay-prod` (it reaches that one app, never seazn-club-prod), added
+# only after C17. The job runs only on a v* tag ref: hygiene, not a guard. A tag push runs the tagged
+# commit's copy of this file, and any branch's copy can read the repository secret, so what holds is
+# the v* tag ruleset (25833495: creating, moving or deleting a v* tag is admin-only), the attestation's
+# identity (this workflow at refs/tags/<tag>, the tagged commit), and scripts/promote.sh's own checks
+# of the tag's commit and its attestation. scripts/check-workflows.sh (check.yml) holds this file to them.
 on:
   push:
     tags: ['v*.*.*']
@@ -31,14 +31,19 @@ env:
   FLYCTL_VERSION: 0.4.116
   FLYCTL_SHA256: ab929c80ef0c1f7d623052267885632f47b4c5dd7c0ed8383d16f42472abe7b9
 jobs:
-  gate:
+  push:
+    # Hygiene, not a guard: see the header.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    # The token is relay-prod-push's: the guard sees it only inside the environment.
-    environment: relay-prod-push
-    outputs:
-      enabled: ${{ steps.token.outputs.enabled }}
+    # A cold CEF build: no cache, by rule.
+    timeout-minutes: 90
+    # id-token and attestations: the release's build record. Nothing else in this repository may sign.
+    permissions: { contents: read, id-token: write, attestations: write }
+    env:
+      TAG: ${{ github.ref_name }}
+      LOCAL_IMAGE: seazn-relay:${{ github.sha }}
     steps:
+      # Actions pinned by commit: this job holds a Fly token (image.yml's cache job, the PR #47 review's m7).
       # The whole history, so origin/main is here for the ancestry check.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { persist-credentials: false, fetch-depth: 0 }
@@ -46,8 +51,6 @@ jobs:
         run: scripts/check-cef-bump.sh
       - name: The tag is a release on main
         id: provenance
-        env:
-          TAG: ${{ github.ref_name }}
         run: |
           if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::'$TAG' is not a release tag vX.Y.Z: nothing pushed"
@@ -62,60 +65,24 @@ jobs:
       - name: The Fly push token
         id: token
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_PROD_PUSH }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_PROD }}
         run: |
           if [ -z "$FLY_API_TOKEN" ]; then
-            echo "::warning::FLY_API_TOKEN_RELAY_PROD_PUSH unset (an environment secret of relay-prod-push) — push skipped"
+            echo "::warning::FLY_API_TOKEN_RELAY_PROD unset (a repository secret, added only after C17: docs/_INDEX.md, the C16 handoff) — push skipped"
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "enabled=true" >> "$GITHUB_OUTPUT"
-
-  push:
-    needs: gate
-    if: needs.gate.outputs.enabled == 'true'
-    runs-on: ubuntu-24.04
-    # A cold CEF build: no cache, by rule.
-    timeout-minutes: 90
-    environment: relay-prod-push
-    # actions: read for relay-prod-push's rules; id-token and attestations for the release's build
-    # record.
-    permissions: { contents: read, actions: read, id-token: write, attestations: write }
-    env:
-      TAG: ${{ github.ref_name }}
-      LOCAL_IMAGE: seazn-relay:${{ github.sha }}
-    steps:
-      # Actions pinned by commit: this job holds a Fly token (image.yml's cache job, the PR #47 review's m7).
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with: { persist-credentials: false }
-      - name: CEF bump gate (Owed 22)
-        run: scripts/check-cef-bump.sh
-      # GitHub creates an environment a job names, with no rules, on its first run: the token is a
-      # release's alone only while relay-prod-push deploys from v* tags alone. Any API error refuses.
-      - name: The push environment
-        id: environment
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          fail() { echo "::error::$*"; exit 1; }
-          envname=relay-prod-push want='tag:v*'
-          env_api="repos/$GITHUB_REPOSITORY/environments/$envname"
-          environment=$(gh api "$env_api" 2> "$RUNNER_TEMP/gh.err") \
-            || fail "the $envname environment could not be read, so the push token is not proven a release's: $(head -c 300 "$RUNNER_TEMP/gh.err")"
-          jq -e '.deployment_branch_policy.custom_branch_policies == true' <<< "$environment" > /dev/null \
-            || fail "$envname does not limit its deployments to a chosen list, so any branch reads its token: nothing pushed; the owner sets it to $want alone"
-          policies=$(gh api "$env_api/deployment-branch-policies" \
-              --jq '[.branch_policies[] | "\(.type):\(.name)"] | sort | join(",")' 2> "$RUNNER_TEMP/gh.err") \
-            || fail "$envname's deployment policies could not be read: $(head -c 300 "$RUNNER_TEMP/gh.err")"
-          [ "$policies" = "$want" ] || fail "$envname deploys from '$policies', not $want alone: nothing pushed; the owner sets it to $want alone"
-          echo "$envname deploys from $want alone"
+      # Every step from here reads the guard, so an unset token skips them all and is never a red.
       # CEF's build tree does not fit the runner's free disk otherwise (image.yml).
       - name: Free disk space
+        if: steps.token.outputs.enabled == 'true'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
       - name: gstcefsrc pin (F-001)
         id: pin
+        if: steps.token.outputs.enabled == 'true'
         run: |
           commit=$(tr -d '[:space:]' < docker/GSTCEF_COMMIT)
           if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
@@ -124,6 +91,7 @@ jobs:
           fi
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
       - name: flyctl
+        if: steps.token.outputs.enabled == 'true'
         run: |
           curl -fsSL -o "$RUNNER_TEMP/flyctl.tgz" \
             "https://github.com/superfly/flyctl/releases/download/v${FLYCTL_VERSION}/flyctl_${FLYCTL_VERSION}_Linux_x86_64.tar.gz"
@@ -132,8 +100,9 @@ jobs:
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - name: Already pushed?
         id: exists
+        if: steps.token.outputs.enabled == 'true'
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_PROD_PUSH }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_PROD }}
         run: |
           flyctl auth docker
           ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
@@ -156,9 +125,9 @@ jobs:
             exit 1
           fi
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-        if: steps.exists.outputs.exists != 'true'
+        if: steps.token.outputs.enabled == 'true' && steps.exists.outputs.exists != 'true'
       - name: Build the relay image
-        if: steps.exists.outputs.exists != 'true'
+        if: steps.token.outputs.enabled == 'true' && steps.exists.outputs.exists != 'true'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
@@ -170,7 +139,7 @@ jobs:
           push: false
       - name: Push
         id: push
-        if: steps.exists.outputs.exists != 'true'
+        if: steps.token.outputs.enabled == 'true' && steps.exists.outputs.exists != 'true'
         # No token here: "Already pushed?"'s `flyctl auth docker` logged docker in for this job.
         run: |
           ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
@@ -185,17 +154,18 @@ jobs:
       # attestation API, never in the registry.
       - name: Attest the push
         id: attest
-        if: steps.exists.outputs.exists != 'true'
+        if: steps.token.outputs.enabled == 'true' && steps.exists.outputs.exists != 'true'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ env.RELAY_REGISTRY }}/${{ env.RELAY_APP }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: false
       # Both paths: the digest this run pushed, or the one it found, must verify as this release's own
-      # build of the tagged commit. A found tag that does not is a squat (or a push whose record never landed),
-      # and nothing downstream may take it.
+      # build of the tagged commit. A found tag that does not is a squat (or a push whose record never
+      # landed), and nothing downstream may take it. Its `if` is the token guard's alone.
       - name: The release's build record
         id: record
+        if: steps.token.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           DIGEST: ${{ steps.push.outputs.digest || steps.exists.outputs.digest }}
@@ -212,11 +182,12 @@ jobs:
             echo "::error::$ref is in the registry ($DIGEST) but is not this release's own build: no attestation from $identity for $GITHUB_SHA. A squat, or a push whose record never landed: nothing pushed, nothing to promote; the owner must resolve it (the next release gets a tag of its own). $(tail -c 300 "$RUNNER_TEMP/attest.out")"
             exit 1
           else
-            echo "::error::this run's push of $ref ($DIGEST) has no attestation that verifies, so promote.yml would refuse it: $(tail -c 300 "$RUNNER_TEMP/attest.out")"
+            echo "::error::this run's push of $ref ($DIGEST) has no attestation that verifies, so scripts/promote.sh would refuse it: $(tail -c 300 "$RUNNER_TEMP/attest.out")"
             exit 1
           fi
       - name: Summary
         id: summary
+        if: steps.token.outputs.enabled == 'true'
         env:
           DIGEST: ${{ steps.push.outputs.digest || steps.exists.outputs.digest }}
           FOUND: ${{ steps.exists.outputs.exists }}
@@ -231,13 +202,13 @@ jobs:
               echo "Pushed and attested as this release's build of $TAG: \`$ref\` (\`$DIGEST\`). Nothing live changed."
             fi
             echo
-            echo "Promote it only after C17 passes (prod's web app takes it for every new session once a relay-prod reviewer approves; not run):"
+            echo "Promote it only after C17 passes, on the owner's go-ahead (prod's web app takes it for every new session; not run), from a checkout of main, logged in to flyctl as yourself:"
             echo
             echo '```'
-            echo "gh workflow run promote.yml --ref main -f env=prod -f ref=$TAG@$DIGEST"
+            echo "scripts/promote.sh prod $TAG@$DIGEST --confirm-prod"
             echo '```'
             echo
             echo "The digest is required: promote refuses unless the tag still resolves to it and this release's attestation of it verifies."
             echo
-            echo "It sets \`RELAY_IMAGE=$RELAY_REGISTRY/$RELAY_APP@$DIGEST\` on seazn-club-prod with \`flyctl secrets set --stage\`, then \`flyctl secrets deploy\`."
+            echo "It stages \`RELAY_IMAGE=$RELAY_REGISTRY/$RELAY_APP@$DIGEST\` (the digest alone) on seazn-club-prod, then deploys it."
           } >> "$GITHUB_STEP_SUMMARY"

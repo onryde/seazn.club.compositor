@@ -54,7 +54,9 @@ Also include:
   score. Add auto-stop guidance from C00's YouTube gap-tolerance measurement.
 - the **post-match health review**: run `seazn.club` `docs/runbooks/relay-health-review.sql` (R2002)
   against the session id
-- the **rollback**: `promote.yml` with the previous ref (C16)
+- the **rollback**: `scripts/promote.sh stg <previous ref>@sha256:<digest>`, run by the owner on their
+  own flyctl login; promote prints that command as its `Rollback:` line (C16, amendment 2026-10-25:
+  promote.yml is removed)
 - **manual stop**: end the session in the organiser UI. **Never** `flyctl machine destroy` a live
   session's Machine, because the sweep would book an `r<n+1>`.
 
@@ -204,7 +206,8 @@ yet merged.
 - [ ] **Step 6: Finish the paperwork.** Finish the runbook with the timings actually seen. Commit the
   acceptance doc, plus the pointer-row update, as a PR in each repo.
 - [ ] **Step 7: Prod.** Prod promotion is **not** part of this task. Ask the owner whether to tag
-  `v0.1.0` and run `promote.yml env=prod`.
+  `v0.1.0` and run `scripts/promote.sh prod v0.1.0@sha256:<digest> --confirm-prod` (C16, amendment
+  2026-10-25), and only after FLY_API_TOKEN_RELAY_PROD exists: the owner mints it after this task passes.
 
 ## Acceptance
 

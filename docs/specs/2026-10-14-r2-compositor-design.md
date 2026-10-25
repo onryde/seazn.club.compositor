@@ -441,7 +441,8 @@ seazn.club.compositor/
 ```
 
 - **Image handoff:** deploy only pushes the image. Moving `RELAY_IMAGE` in the web env is an explicit
-  step, so a compositor push never silently changes what prod runs.
+  step, so a compositor push never silently changes what prod runs. (C16, amended 2026-10-25: that
+  step is `scripts/promote.sh`, run by the owner on their own flyctl login, never a workflow.)
 - **Missing secret:** the job prints `::warning::` with the exact `gh secret set …` fix and does
   nothing, rather than failing (the `seazn.club.workflow` convention).
 

@@ -2,7 +2,8 @@
 # `fly deploy`). The app holds no long-running Machine: web (seazn-club-prod, whose FLY_RELAY_APP names
 # this app) creates one Machine per composed session, from web's RELAY_IMAGE, and destroys it after.
 # deploy-prod.yml pushes the images to this app's registry (RELAY_REGISTRY, default registry.fly.io), and
-# promote.yml points RELAY_IMAGE at one. The Machine's guest, restart and stop settings are web's
+# scripts/promote.sh, run by the owner on their own flyctl login, points RELAY_IMAGE at one by its
+# digest (C16 amendment 2026-10-25). The Machine's guest, restart and stop settings are web's
 # (seazn.club apps/web/src/server/relay/runner-fly.ts), not this file's.
 #
 # Org: seazn-club. Made with (flyctl apps create takes no --config):
