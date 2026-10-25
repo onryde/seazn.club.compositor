@@ -774,8 +774,9 @@ jobs:
             fi
             exit "$rc"
           fi
+          # --memory-mb: the compositor Machine's memory, check 1.projection's budget (soak.json).
           harness/soak/verdict.sh --dir "$OUT" --page "$PAGE" --drive-min "$DRIVE_MIN" --schedule "$SCHEDULE" \
-            > "$OUT/verdict.json" 2> "$OUT/verdict.txt" || rc=$?
+            --memory-mb "$C_MEM" > "$OUT/verdict.json" 2> "$OUT/verdict.txt" || rc=$?
           cat "$OUT/verdict.txt"
           status="$(jq -r '.status // "none"' "$OUT/verdict.json" 2> /dev/null || echo none)"
           echo "status=$status" >> "$GITHUB_OUTPUT"

@@ -24,6 +24,14 @@
 #   measured from the lines or from the beats' windows. A run with steady growth and no dropout
 #   effect reads its steps equal to the control between them (excess 0), and the windowed step the
 #   same on the dropouts run and on the none run.
+# - Check 1's drift bound (owner, 2026-10-25: soak.json's memory_drift_max, read here, never typed):
+#   0.1 percentage point under it and exactly at it pass, 0.1 over it fails (the gate is `>`); the
+#   3 h soak 40139563554's 22.7 % and memory arm 1 40166664556's 13.2 % pass.
+# - Check 1.projection (owner ruling A, 2026-10-25): the drive's memMb fitted against time and
+#   projected to soak.json's session cap, within its budget fraction of the Machine's memory
+#   (--memory-mb, the production guest's from soak.json). A flat run and 104 MB/h from 954 MB pass,
+#   a steep run reds, and too few beats, none, or one (no spread in time) red. The expected fits are
+#   the planted lines' own constants (a perfect line fits itself), never verdict.jq's output.
 #
 # Prints one line per case and `checked: N cases, M checks`; zero of either is a FAIL.
 set -euo pipefail
@@ -32,6 +40,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 JQ="${JQ:-jq}"
 GREEN="$HERE/fixtures/green"
+# The compositor Machine's memory the verdict is told (soak.yml passes its C_MEM): the production
+# guest's, performance-4x (soak.yml's default guest; test-workflow.sh pins that default).
+MEM="$("$JQ" -er '.compositor_guest["performance-4x"].memory_mb' "$HERE/soak.json")"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -72,21 +83,22 @@ run_verdict() {
   "$JQ" -c '.logscan' "$b" >"$d/logscan.json"
   "$JQ" -j '.complog // ""' "$b" >"$d/compositor.log"
   local rc=0
-  "$HERE/verdict.sh" --dir "$d" --page "$page" --drive-min "$drive" --schedule "$SCHEDULE" --jq "$JQ" >"$out" 2>"$out.err" || rc=$?
+  "$HERE/verdict.sh" --dir "$d" --page "$page" --drive-min "$drive" --schedule "$SCHEDULE" --memory-mb "$MEM" --jq "$JQ" >"$out" 2>"$out.err" || rc=$?
   echo "$rc" >"$out.rc"
 }
 
 # Every check verdict.jq declares, in order: a dropped one fails the green. Check 1.split is the
 # memory experiment's (schedules dropouts and none), never the soak's.
-ALL_SOAK='inputs,1,2,3,4,5.beats,5.dropouts,5.disconnects,5a,5b,5c,5d,6'
-ALL_EXPERIMENT='inputs,1,1.split,2,3,4,5.beats,5.dropouts,5.disconnects,5a,5b,5c,5d,6'
+ALL_SOAK='inputs,1,1.projection,2,3,4,5.beats,5.dropouts,5.disconnects,5a,5b,5c,5d,6'
+ALL_EXPERIMENT='inputs,1,1.projection,1.split,2,3,4,5.beats,5.dropouts,5.disconnects,5a,5b,5c,5d,6'
 
 # `case_ <name> <page> <want status> <want failed ids, sorted, comma-joined> <reason> <filter>`
 case_() {
   local name="$1" page="$2" want="$3" want_failed="$4" reason="$5" filter="$6" b out got failed ids n
   cases=$((cases + 1))
   b="$WORK/case-$name.json"
-  if ! "$JQ" "$filter" "$BASE" >"$b" 2>"$WORK/$name.patch.err"; then
+  # A filter may read soak.json as $soak[0] (the drift cases' bound).
+  if ! "$JQ" --slurpfile soak "$HERE/soak.json" "$filter" "$BASE" >"$b" 2>"$WORK/$name.patch.err"; then
     fail "$name: the patch does not apply: $(head -c 300 "$WORK/$name.patch.err")"
     return
   fi
@@ -144,11 +156,19 @@ if ! "$JQ" -e '[.checks[] | select(.status == "pending") | .id] == ["5a","5b","5
 fi
 
 # --- the brief's five reds -------------------------------------------------------------------------
-# Memory: hour 3's beats 25 % above hour 1's (the drive's last third against its first).
-case_ memory-drift real fail '1' 'memory drift' \
-  '(.actions[] | select(.kind == "start") | .at_ms) as $s
-   | .report.heartbeats.series |= map(if .received_ms >= $s + 1200000 and (.body.memMb | type) == "number"
-       then .body.memMb = (.body.memMb * 1.25 | floor) else . end)'
+# Memory (owner, 2026-10-25: the bound is soak.json's memory_drift_max, read here as $max, never
+# typed): every memMb in the drive's first two parts m1 and in its last part m3, so part 1's median
+# is exactly m1 and part 3's exactly m3 (the drive's last third against its first). m1 = 500 MB, so
+# 0.5 MB is 0.1 percentage point, and a step at the bound does not also project over check
+# 1.projection's budget in a 30-minute fixture (the same 40 % step on 1000 MB fits about
+# 1 070 MB/h: 6 200 MB at 5 h). The red is 0.1 point over the bound.
+DRIFT='(.actions[] | select(.kind == "start") | .at_ms) as $s | ($soak[0].memory_drift_max) as $max
+  | .report.heartbeats.series |= map(if (.body.memMb | type) == "number"
+      then .body.memMb = (if .received_ms >= $s + 1200000 then m3($max) else m1 end) else . end)'
+DRIFT_OVER_REASON="$("$JQ" -r '.memory_drift_max as $max
+  | "memory drift: hour 3'"'"'s median \(500 + 500 * $max + 0.5) MB is \($max * 100 + 0.1) % from hour 1'"'"'s 500 MB (at most \($max * 100) %)"' \
+  "$HERE/soak.json")"
+case_ memory-drift real fail '1' "1:$DRIFT_OVER_REASON" 'def m1: 500; def m3($max): m1 + m1 * $max + 0.5; '"$DRIFT"
 # An output outage at minute 10, which no disconnect explains.
 case_ unexplained-gap real fail '2' 'unexplained output gap' \
   '(.actions[] | select(.kind == "start") | .at_ms) as $s
@@ -165,19 +185,20 @@ case_ stepped-beat real fail '6' '6:sizing alarm: the guest is short of CPU' \
 
 # --- guard reds: each other conjunct, alone -------------------------------------------------------
 # No report: every check that reads it fails ("no report"), never passes on nothing.
-case_ no-report real fail '1,2,4,5.beats,5.disconnects,5a,5b,5c,6,inputs' 'inputs:no report' '.report = null'
+case_ no-report real fail '1,1.projection,2,4,5.beats,5.disconnects,5a,5b,5c,6,inputs' 'inputs:no report' '.report = null'
 case_ no-frames real fail 'inputs' 'no frames' '.report.frames = 0'
 # No start action: the drive's windows are unknown, so every windowed check fails too.
-case_ no-start real fail '1,5.beats,5a,5c,inputs' 'inputs:one start and one end action' 'del(.actions[] | select(.kind == "start"))'
+case_ no-start real fail '1,1.projection,5.beats,5a,5c,inputs' 'inputs:one start and one end action' 'del(.actions[] | select(.kind == "start"))'
 case_ drive-mismatch real fail 'inputs' 'drive' '(.actions[] | select(.kind == "start") | .drive_s) = 1500'
 case_ not-ended real fail 'inputs' 'did not end as asked' '.report.heartbeats.series[-1].body.exitReason = "deadline"'
 case_ checker-failure real fail 'inputs' 'checker failed' '.report.checker_failures = ["a rung outside the declared ones"]'
-case_ memory-no-beats real fail '1' 'no memMb' \
+# A third of the drive's beats without memMb is also under check 1.projection's floor of beats.
+case_ memory-no-beats real fail '1,1.projection' '1:no memMb' \
   '(.actions[] | select(.kind == "start") | .at_ms) as $s
    | .report.heartbeats.series |= map(if .received_ms >= $s + 1200000 then del(.body.memMb) else . end)'
 # The three anti-vacuity guards nothing else reaches alone: a renamed beat field must fail, never
 # pass on nothing (hour 1's memMb; droppedFrames and rung on every beat).
-case_ memory-no-beats-hour1 real fail '1' 'no memMb in hour 1' \
+case_ memory-no-beats-hour1 real fail '1,1.projection' '1:no memMb in hour 1' \
   '(.actions[] | select(.kind == "start") | .at_ms) as $s
    | .report.heartbeats.series |= map(if .received_ms < $s + 600000 then del(.body.memMb) else . end)'
 case_ no-dropped-frames-field real fail '4' 'no beat carried droppedFrames' '.report.heartbeats.series |= map(del(.body.droppedFrames))'
@@ -186,7 +207,8 @@ case_ pts-gap real fail '2' 'pts gaps' '.report.pts_gaps = [{at_ms: 179280040000
 case_ late-reconnect real fail '2' 'after its disconnect ended' \
   '.report.output_outages[1].to_wall_ms = ((.actions[] | select(.kind == "disconnect" and .slot == 1) | .end_ms) + 8000)'
 case_ dropped-frames real fail '4' 'dropped frames' '.report.heartbeats.series[-2].body.droppedFrames = 60'
-case_ few-beats real fail '5.beats' 'heartbeats' \
+# Fewer beats than 5.beats's floor are fewer memMb beats than check 1.projection fits too.
+case_ few-beats real fail '1.projection,5.beats' '5.beats:heartbeats' \
   '(.actions[] | select(.kind == "start") | .at_ms) as $s
    | .report.heartbeats.series |= [to_entries[] | select(.key % 4 != 1 or .value.received_ms < $s + 600000 or .value.received_ms >= $s + 1200000) | .value]
    | .report.heartbeats.count = (.report.heartbeats.series | length)'
@@ -216,6 +238,100 @@ case_ score-stale real fail '5c' '5c:score stale: 1 drive beat' \
 case_ score-stale-unreported real fail '5c' 'no drive beat carried scoreStale' '.report.heartbeats.series |= map(del(.body.scoreStale))'
 case_ overlay-off-air real fail '5d' 'overlay' '.samples[9].differs = false'
 case_ overlay-unsampled real fail '5d' 'overlay' 'del(.samples[9])'
+
+# --- check 1's bound and check 1.projection (owner rulings, 2026-10-25) -----------------------------
+# `measured <name> <out> <check id> <jq test>`: one check's `measured`, with soak.json as $soak, the
+# thresholds as $t and the Machine's memory as $mem, against numbers the case planted.
+measured() {
+  local name="$1" out="$2" id="$3" test="$4"
+  cases=$((cases + 1))
+  checks=$((checks + 1))
+  if "$JQ" -e --arg id "$id" --slurpfile soak "$HERE/soak.json" --slurpfile t "$ROOT/harness/thresholds.json" --argjson mem "$MEM" \
+    '$soak[0] as $soak | $t[0] as $t | [.checks[] | select(.id == $id) | .measured] as $m | ($m | length) == 1 and ($m[0] | '"$test"')' \
+    "$out" >/dev/null 2>&1; then
+    echo "PASS measured $name"
+  else
+    fail "measured $name: $test, got $("$JQ" -c --arg id "$id" '.checks[] | select(.id == $id) | .measured' "$out" 2>/dev/null | head -c 600)"
+  fi
+}
+# Check 1 at the bound: 0.1 point under it and exactly at it pass (the gate is `>`), and each reads
+# the drift it was planted with (the red 0.1 over it is the brief's red above).
+case_ drift-under-bound real pass '' '' 'def m1: 500; def m3($max): m1 + m1 * $max - 0.5; '"$DRIFT"
+case_ drift-at-bound real pass '' '' 'def m1: 500; def m3($max): m1 + m1 * $max; '"$DRIFT"
+measured "0.1 point under the bound: part 1 500 MB, part 3 0.5 MB under the bound" "$WORK/case-drift-under-bound.out" 1 \
+  '.hour1_median_mb == 500 and .hour3_median_mb == 500 + 500 * $soak.memory_drift_max - 0.5 and (.drift_pct * 10 | round) == ($soak.memory_drift_max * 1000 - 1 | round)'
+measured "exactly at the bound" "$WORK/case-drift-at-bound.out" 1 \
+  '.hour1_median_mb == 500 and .hour3_median_mb == 500 + 500 * $soak.memory_drift_max and (.drift_pct * 10 | round) == ($soak.memory_drift_max * 1000 | round)'
+measured "0.1 point over the bound" "$WORK/case-memory-drift.out" 1 \
+  '.hour1_median_mb == 500 and .hour3_median_mb == 500 + 500 * $soak.memory_drift_max + 0.5 and (.drift_pct * 10 | round) == ($soak.memory_drift_max * 1000 + 1 | round)'
+# The two readings the owner ruled on: the 3 h soak 40139563554 (hour 1's median 994 MB, hour 3's
+# 1220 MB: 22.7 %) and memory arm 1 40166664556 (13.2 %; its medians are not in this repo, so on
+# 1000 MB). Both pass.
+case_ drift-soak-40139563554 real pass '' '' 'def m1: 994; def m3($max): 1220; '"$DRIFT"
+measured "the 3 h soak's 22.7 % passes" "$WORK/case-drift-soak-40139563554.out" 1 \
+  '.hour1_median_mb == 994 and .hour3_median_mb == 1220 and .drift_pct == 22.7'
+case_ drift-arm1-40166664556 real pass '' '' 'def m1: 1000; def m3($max): 1132; '"$DRIFT"
+measured "memory arm 1's 13.2 % passes" "$WORK/case-drift-arm1-40166664556.out" 1 \
+  '.hour1_median_mb == 1000 and .hour3_median_mb == 1132 and .drift_pct == 13.2'
+
+# Check 1.projection: memMb = a + b * h over the drive (h: hours since the start action), and 99999
+# on the beats outside it (12 before, 4 after), which the fit must not read. A perfect line fits
+# itself, so the fit is (b MB/h, a MB) and the projection a + b * session_cap_min / 60, typed here
+# from the planted constants and soak.json.
+PROJ='(.actions[] | select(.kind == "start") | .at_ms) as $s
+  | .report.heartbeats.series |= map(if (.body.memMb | type) == "number"
+      then .body.memMb = (if .received_ms >= $s and .received_ms < $s + 1800000 then a + b * (.received_ms - $s) / 3600000 else 99999 end)
+      else . end)'
+# The drive's beats carrying memMb in a case's bundle, counted here (never read from the verdict).
+fitted() {
+  "$JQ" '(.actions[] | select(.kind == "start") | .at_ms) as $s
+    | [.report.heartbeats.series[] | select(.received_ms >= $s and .received_ms < $s + 1800000 and (.body.memMb | type) == "number")] | length' "$1"
+}
+# The floor: check 5.beats's (the drive's beats at heartbeat_interval_ms, times heartbeat_min_ratio).
+PROJ_FLOOR='.want_beats == 1800000 / $t.heartbeat_interval_ms * $soak.heartbeat_min_ratio'
+PROJ_BUDGET='.budget_mb == $mem * $soak.memory_projection.memory_budget_fraction and .machine_memory_mb == $mem
+  and .session_cap_min == $soak.memory_projection.session_cap_min'
+# Flat: 0 MB/h, so the projection is the level.
+case_ projection-flat real pass '' '' 'def a: 1000; def b: 0; '"$PROJ"
+measured "a flat run: 0 MB/h from 1000 MB projects 1000 MB, every drive beat fitted" "$WORK/case-projection-flat.out" 1.projection \
+  ".slope_mb_per_h == 0 and .intercept_mb == 1000 and .projected_mb == 1000 and .beats_fitted == $(fitted "$WORK/case-projection-flat.json") and $PROJ_FLOOR and $PROJ_BUDGET"
+# 104 MB/h from 954 MB (the coordinator's example: about 1474 MB at 300 min): under the budget.
+case_ projection-104 real pass '' '' 'def a: 954; def b: 104; '"$PROJ"
+measured "104 MB/h from 954 MB projects 954 + 104 * cap / 60 MB, the beats outside the drive unread" "$WORK/case-projection-104.out" 1.projection \
+  ".slope_mb_per_h == 104 and .intercept_mb == 954 and .projected_mb == 954 + 104 * \$soak.memory_projection.session_cap_min / 60
+   and .beats_fitted == $(fitted "$WORK/case-projection-104.json") and $PROJ_BUDGET"
+# Steep: 600 MB/h from 1500 MB projects over the budget, while check 1 still passes (part 1's median
+# about 1550 MB, part 3's about 1750: 12.9 %), so only the projection reds.
+STEEP_REASON="$("$JQ" -r --argjson mem "$MEM" '.memory_projection as $p
+  | "reaches \(1500 + 600 * $p.session_cap_min / 60) MB at the session cap of \($p.session_cap_min) min, over the budget of \($mem * $p.memory_budget_fraction) MB"' \
+  "$HERE/soak.json")"
+case_ projection-steep real fail '1.projection' "1.projection:$STEEP_REASON" 'def a: 1500; def b: 600; '"$PROJ"
+measured "a steep run: 600 MB/h from 1500 MB, its projection over the budget" "$WORK/case-projection-steep.out" 1.projection \
+  '.slope_mb_per_h == 600 and .intercept_mb == 1500 and .projected_mb == 1500 + 600 * $soak.memory_projection.session_cap_min / 60
+   and .projected_mb > .budget_mb and '"$PROJ_BUDGET"
+# Anti-vacuity: memMb on every fourth drive beat only (check 1 still has both parts' medians) is
+# under the floor; none fits nothing; one has no spread in time to fit (and check 1 has no part 3).
+case_ projection-few real fail '1.projection' '1.projection:drive beats carry memMb, want at least' \
+  '(.actions[] | select(.kind == "start") | .at_ms) as $s
+   | .report.heartbeats.series |= [to_entries[] | if .value.received_ms >= $s and .value.received_ms < $s + 1800000 and .key % 4 != 0
+       then del(.value.body.memMb) else . end | .value]'
+measured "every fourth beat: the beats fitted counted, under the floor" "$WORK/case-projection-few.out" 1.projection \
+  ".beats_fitted == $(fitted "$WORK/case-projection-few.json") and .beats_fitted > 0 and .beats_fitted < .want_beats and $PROJ_FLOOR"
+case_ projection-none real fail '1,1.projection' '1.projection:0 drive beats carry memMb' \
+  '(.actions[] | select(.kind == "start") | .at_ms) as $s
+   | .report.heartbeats.series |= map(if .received_ms >= $s and .received_ms < $s + 1800000 then del(.body.memMb) else . end)'
+measured "no memMb in the drive: 0 fitted, no slope, no projection (null, never 0)" "$WORK/case-projection-none.out" 1.projection \
+  '.beats_fitted == 0 and .slope_mb_per_h == null and .intercept_mb == null and .projected_mb == null'
+case_ projection-one real fail '1,1.projection' '1.projection:no spread in time' \
+  '(.actions[] | select(.kind == "start") | .at_ms) as $s
+   | (.report.heartbeats.series | map(.received_ms >= $s) | index(true)) as $first
+   | .report.heartbeats.series |= [to_entries[] | if .value.received_ms >= $s and .value.received_ms < $s + 1800000 and .key != $first
+       then del(.value.body.memMb) else . end | .value]'
+measured "one memMb beat: 1 fitted, no slope" "$WORK/case-projection-one.out" 1.projection \
+  '.beats_fitted == 1 and .slope_mb_per_h == null and .projected_mb == null'
+# The green's own fit: every drive beat, under the budget.
+measured "the green: every drive beat fitted, under the budget" "$WORK/case-green.out" 1.projection \
+  ".beats_fitted == $(fitted "$WORK/case-green.json") and .projected_mb < .budget_mb and $PROJ_FLOOR and $PROJ_BUDGET"
 
 # --- the memory split (soak 40139563554's drift) ----------------------------------------------------
 # The soak is never gated on the memory split (PR #82 review m1: on page=real the runner withholds a
@@ -371,7 +487,7 @@ case_ split-no-step real fail '1.split' '1.split:no dropout step measured: 0 of 
    | .complog |= ([split("\n")[] | select((test(" msg=memory split ") | not) or (at as $t | any($ds[]; $t > . - 10000 and $t < . + 30000)))] | join("\n"))'
 # No memMb in any instant's window: the windowed step cannot be read (the rest of the drive's beats
 # keep check 1).
-case_ split-no-window real fail '1.split' '1.split:no windowed step measured: 0 of 13 dropouts have memMb beats in both windows' \
+case_ split-no-window real fail '1.projection,1.split' '1.split:no windowed step measured: 0 of 13 dropouts have memMb beats in both windows' \
   '[.actions[] | select(.kind == "dropout") | .at_ms] as $ds
    | .report.heartbeats.series |= map(.received_ms as $t
        | if any($ds[]; ($t >= . - 90000 and $t < . - 10000) or ($t >= . + 30000 and $t < . + 110000)) then del(.body.memMb) else . end)'
@@ -426,7 +542,7 @@ case_ none-with-a-dropout real fail '5.dropouts' '5.dropouts:dropout actions the
   '(.actions[] | select(.kind == "start") | .at_ms) as $s
    | .actions += [{kind: "dropout", slot: 0, planned_ms: ($s + 60000), at_ms: ($s + 60003), end_ms: ($s + 70005), ok: true, pause: 200, resume: 200}]
    | .actions |= sort_by(.at_ms)'
-case_ none-no-start real fail '1,1.split,5.beats,5a,5c,inputs' '1.split:no start action' 'del(.actions[] | select(.kind == "start"))'
+case_ none-no-start real fail '1,1.projection,1.split,5.beats,5a,5c,inputs' '1.split:no start action' 'del(.actions[] | select(.kind == "start"))'
 # Only the drive's first two lines (at 5 and 65 s): no phantom has a line on both sides.
 case_ none-no-step real fail '1.split' '1.split:no phantom step measured: 0 of 13 phantoms' \
   'def at: capture("ts=(?<t>[^ ]+)").t | sub("[.][0-9]+Z$"; "Z") | fromdateiso8601 * 1000;
@@ -439,12 +555,29 @@ SCHEDULE=soak
 cases=$((cases + 1))
 checks=$((checks + 1))
 rc=0
-"$HERE/verdict.sh" --dir "$GREEN" --page real --drive-min 30 --schedule weekly --jq "$JQ" >"$WORK/bad-schedule.out" 2>&1 || rc=$?
+"$HERE/verdict.sh" --dir "$GREEN" --page real --drive-min 30 --memory-mb "$MEM" --schedule weekly --jq "$JQ" >"$WORK/bad-schedule.out" 2>&1 || rc=$?
 if [ "$rc" -eq 64 ] && grep -q 'schedule must be soak, dropouts or none' "$WORK/bad-schedule.out"; then
   echo "PASS verdict.sh --schedule weekly: refused (64)"
 else
   fail "verdict.sh --schedule weekly: exit $rc: $(head -c 300 "$WORK/bad-schedule.out")"
 fi
+# It refuses a run without the Machine's memory, or one that is not whole MB above 0 (64), before
+# any jq: check 1.projection's budget is a fraction of it.
+for bad in none "" 0 08 8192.5 8G; do
+  cases=$((cases + 1))
+  checks=$((checks + 1))
+  rc=0
+  if [ "$bad" = none ]; then
+    "$HERE/verdict.sh" --dir "$GREEN" --page real --drive-min 30 --jq "$JQ" >"$WORK/bad-mem.out" 2>&1 || rc=$?
+  else
+    "$HERE/verdict.sh" --dir "$GREEN" --page real --drive-min 30 --memory-mb "$bad" --jq "$JQ" >"$WORK/bad-mem.out" 2>&1 || rc=$?
+  fi
+  if [ "$rc" -eq 64 ] && grep -q 'memory-mb must be whole MB above 0' "$WORK/bad-mem.out"; then
+    echo "PASS verdict.sh --memory-mb '$bad': refused (64)"
+  else
+    fail "verdict.sh --memory-mb '$bad': exit $rc: $(head -c 300 "$WORK/bad-mem.out")"
+  fi
+done
 
 # --- the schedule ----------------------------------------------------------------------------------
 plan() {

@@ -9,7 +9,12 @@
   "disconnect_hold_s": 30,
   "dropout_only": {"every_s": 125, "phase_s": 60},
   "memory_step": {"before_s": [-90, -10], "after_s": [30, 110]},
-  "memory_drift_max": 0.10,
+  "memory_drift_max": 0.40,
+  "memory_projection": {
+    "source": "Check 1.projection (owner ruling A, 2026-10-25, docs/_INDEX.md): the drive's memMb fitted against time (least squares) and projected to session_cap_min after the drive's start must stay within memory_budget_fraction of the compositor Machine's memory (verdict.sh --memory-mb: soak.yml's C_MEM, from compositor_guest). session_cap_min is a livestream's cap, 5 hours (the context the owner ruled with, 2026-10-25, relayed by the coordinator): relay-job.v1.json's maxDurationMinutes declares no maximum of its own (9007199254740991), and five of its six session fixtures in contracts/fixtures/relay-job.v1/ carry 300 (session-composed-720p, session-passthrough and the three refused or invalid ones; session-composed-1080p carries 120). The fit needs check 5.beats's floor of memMb beats (heartbeat_min_ratio).",
+    "session_cap_min": 300,
+    "memory_budget_fraction": 0.5
+  },
   "dropped_frames_max_ratio": 0.001,
   "heartbeat_min_ratio": 0.95,
   "cef_alive_min_ratio": 0.95,
