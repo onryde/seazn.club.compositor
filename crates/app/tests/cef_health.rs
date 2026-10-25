@@ -1,7 +1,8 @@
 //! C11b through the real driver: CEF's health, read from the graphics port, folded through the real
 //! `Supervisor`, to the in-place restart's final beat and exit (owner ruling 2026-10-19 "B"). Each
 //! trigger reaches the exit exactly once; a report below its threshold, one that counts back down,
-//! and one in the final hold do not. Every threshold comes from `Thresholds::default()`, every text
+//! and one in the final hold do not. A GPU-process death below the restart's count reloads the page
+//! through the graphics port, its line first (Owed 96; owner ruling 2026-10-25 "A"). Every threshold comes from `Thresholds::default()`, every text
 //! is written out, and the exit code is sysexits' EX_TEMPFAIL, written here independently of
 //! `ExitReason::code`.
 use app::driver::Driver;
@@ -90,6 +91,19 @@ fn health(unrecoverable: Option<u64>, leaked: usize, gpu: usize) -> CefHealth {
         leaked_teardowns: leaked,
         gpu_process_deaths: gpu,
     }
+}
+
+/// The reload's line (Owed 96), written from the brief's text: the generation it builds and the
+/// process's GPU-process death count.
+fn reload_line(gen: u64, deaths: usize) -> String {
+    format!("cef reload gen={gen} reason=gpu_process_death deaths={deaths}")
+}
+
+fn reload_lines(log: &Log) -> Vec<String> {
+    log.lines()
+        .into_iter()
+        .filter(|l| l.starts_with("cef reload"))
+        .collect()
 }
 
 fn health_line(h: CefHealth) -> String {
@@ -271,6 +285,107 @@ fn reports_below_their_thresholds_log_each_change_and_never_restart() {
         .filter(|l| l.starts_with("cef health"))
         .collect();
     assert_eq!(got, want);
+    // The GPU-process deaths rose once (to `g - 1`, on air at generation 1): one reload, of the next
+    // generation; the same count read again on every later tick reloads nothing.
+    assert_eq!(reload_lines(&r.log), vec![reload_line(2, g - 1)]);
+}
+
+// Owed 96 through the driver: each GPU-process death below the restart's count, read from the port
+// on the next tick, reloads the page exactly once: the line, then `restart(next gen, the session's
+// page URL)`, in that order, and nothing more however many ticks read the same count. The death AT
+// the count exits 75 and reloads nothing. The number of reloads is the threshold's, from its
+// declaration.
+#[test]
+fn each_gpu_death_below_the_count_reloads_the_page_once_through_the_driver() {
+    let n = th().cef_gpu_deaths_to_restart;
+    let url = session_720p().overlay_url;
+    let mut r = Rig::on_air();
+    r.tick_to(1_000);
+    r.step(Inbound::Event(Event::CefReady { gen: 1 }), 1_001);
+    let mut at = 1_001;
+    let mut checked = 0;
+    for deaths in 1..n {
+        let gen = 1 + deaths as u64;
+        let mark = r.log.len();
+        r.cef.set(health(None, 0, deaths));
+        at += 2_000;
+        r.tick_to(at);
+        let after = r.log.calls_from(mark);
+        let line = after
+            .iter()
+            .position(|c| *c == Call::Log(reload_line(gen, deaths)));
+        let restarts: Vec<usize> = after
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| matches!(c, Call::GraphicsRestart(..)))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(restarts.len(), 1, "death {deaths}: one restart: {after:?}");
+        assert_eq!(after[restarts[0]], Call::GraphicsRestart(gen, url.clone()));
+        assert!(
+            line.is_some_and(|l| l < restarts[0]),
+            "death {deaths}: the line, then the restart: {after:?}"
+        );
+        assert!(
+            !after.contains(&Call::GraphicsStop),
+            "death {deaths}: a reload stops nothing"
+        );
+        // Its page gets ready, so the next death reloads a Ready page again.
+        r.step(Inbound::Event(Event::CefReady { gen }), at + 1);
+        checked += 1;
+    }
+    assert!(r.exits.is_empty(), "{:?}", r.exits);
+    let want: Vec<String> = (1..n).map(|k| reload_line(1 + k as u64, k)).collect();
+    assert_eq!(reload_lines(&r.log), want);
+    // The count: the in-place restart, and no reload with it.
+    let mark = r.log.len();
+    r.cef.set(health(None, 0, n));
+    let next = r.d.next_tick_at();
+    r.tick_to(next);
+    assert_eq!(r.exits, vec![(next, EX_TEMPFAIL)]);
+    let after = r.log.calls_from(mark);
+    assert!(
+        !after.iter().any(|c| matches!(c, Call::GraphicsRestart(..))
+            || matches!(c, Call::Log(l) if l.starts_with("cef reload"))),
+        "the restart reloaded too: {after:?}"
+    );
+    eprintln!("deaths reloaded through the driver: {checked}");
+    assert_eq!(checked, n - 1);
+}
+
+// A Ready page reloaded whose reload never signals ready: its last frame comes off air at its bound,
+// `cef_hang_after_ms` after its ready (its last proof), logged as `reload` naming generation 1, with
+// `hide_overlay()` alone: the reload still loading is not stopped (a hang or Failed hide stops it).
+#[test]
+fn a_reload_that_never_readies_hides_as_reload_and_keeps_loading() {
+    let t = th();
+    let mut r = Rig::on_air();
+    r.tick_to(1_000);
+    r.step(Inbound::Event(Event::CefReady { gen: 1 }), 1_001);
+    r.cef.set(health(None, 0, 1));
+    r.tick_to(1_500);
+    assert_eq!(reload_lines(&r.log), vec![reload_line(2, 1)], "setup");
+    let bound = 1_001 + t.cef_hang_after_ms;
+    let mark = r.log.len();
+    r.tick_to(bound - 1);
+    assert!(
+        !r.log.calls_from(mark).contains(&Call::HideOverlay),
+        "hidden before its bound"
+    );
+    r.tick_to(bound + 100);
+    let after = r.log.calls_from(mark);
+    let hidden = Call::Log("overlay hidden reason=reload gen=1".to_owned());
+    assert_eq!(after.iter().filter(|c| **c == hidden).count(), 1, "{after:?}");
+    assert_eq!(
+        after.iter().filter(|c| **c == Call::HideOverlay).count(),
+        1,
+        "{after:?}"
+    );
+    assert!(
+        !after.contains(&Call::GraphicsStop),
+        "the reload was stopped: {after:?}"
+    );
+    assert!(r.exits.is_empty(), "{:?}", r.exits);
 }
 
 // The final hold already ends the process (exit 0): a report there changes nothing, and the session
@@ -282,6 +397,8 @@ fn the_final_hold_ends_its_own_way_whatever_the_health() {
         health(Some(1), 0, 0),
         health(None, t.cef_leaks_to_restart, 0),
         health(None, 0, t.cef_gpu_deaths_to_restart),
+        // Below the count: a reload would rebuild in the hold, where nothing is rebuilt.
+        health(None, 0, 1),
     ] {
         let mut r = Rig::on_air();
         r.tick_to(1_000);
@@ -302,5 +419,6 @@ fn the_final_hold_ends_its_own_way_whatever_the_health() {
             Some(ExitReason::Ended),
             "{h:?}"
         );
+        assert_eq!(reload_lines(&r.log), Vec::<String>::new(), "{h:?}");
     }
 }

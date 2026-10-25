@@ -4,6 +4,7 @@
   "budget_av_offset_ms": 40,
   "budget_fps_mean_min": 29.5,
   "budget_frame_to_encoder_ms": 150,
+  "budget_gpu_death_reload_ms": 11184,
   "budget_gpu_deaths_at_exit": 1,
   "budget_gpu_deaths_unread": 1,
   "budget_ladder_realtime_ms": 10000,

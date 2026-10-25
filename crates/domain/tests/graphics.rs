@@ -91,14 +91,16 @@ fn reason_index(r: HideReason) -> usize {
         HideReason::Failed => 1,
         HideReason::Crash => 2,
         HideReason::Recycle => 3,
+        HideReason::Reload => 4,
     }
 }
 
-const REASONS: [HideReason; 4] = [
+const REASONS: [HideReason; 5] = [
     HideReason::Hang,
     HideReason::Failed,
     HideReason::Crash,
     HideReason::Recycle,
+    HideReason::Reload,
 ];
 
 /// The instant a state's own timer is due: the load timeout, the recycle, the back-off's end, the
@@ -120,8 +122,9 @@ enum Air {
     Nothing,
     /// The Ready page's own frames: their bound runs from its last beat (its `last_alive`).
     Live,
-    /// Generation `gen`'s last frame, on air through a reload after `ended` (`Crash` or `Recycle`)
-    /// ended that page's life while it was Ready; `proof` was its last proof of life.
+    /// Generation `gen`'s last frame, on air through a reload after `ended` (`Crash`, `Recycle`, or
+    /// `Reload` after a GPU-process death) ended that page's life while it was Ready; `proof` was its
+    /// last proof of life.
     Held { gen: u64, proof: Ms, ended: HideReason },
 }
 
@@ -147,6 +150,11 @@ fn bound_due(s: GraphicsState, air: Air, at: Ms, t: &Thresholds) -> bool {
     bound(s, air, t).is_some_and(|end| at >= end)
 }
 
+/// Whether `s` is a load at or past its timeout at `at`: `cef_load_timeout_ms` after its restart.
+fn load_timed_out(s: GraphicsState, at: Ms, t: &Thresholds) -> bool {
+    matches!(s, GraphicsState::Starting { since } if at >= since + t.cef_load_timeout_ms)
+}
+
 /// The first instant anything is due: the state's own timer, or the bound.
 fn due_with(s: GraphicsState, air: Air, t: &Thresholds) -> Ms {
     bound(s, air, t).map_or(due(s, t), |end| end.min(due(s, t)))
@@ -154,9 +162,10 @@ fn due_with(s: GraphicsState, air: Air, t: &Thresholds) -> Ms {
 
 /// What is on air once `e`, from `from` at generation `gen` with `air`, moved the machine to
 /// `to`: a hide takes everything off; the current generation's Ready shows its own frames; a crash
-/// below the count or a recycle ends a Ready page's life with its last frame on air, held from its
-/// last beat; anything else (a reload's crash or load timeout among it) leaves the frame on air as
-/// it was. Only the current generation's events reach here.
+/// below the count, a recycle or a GPU-process death's reload ends a Ready page's life with its last
+/// frame on air, held from its last beat; anything else (a reload's crash or load timeout, or a
+/// loading page's reload, among it) leaves the frame on air as it was. Only the current generation's
+/// events reach here.
 fn air_after(
     air: Air,
     from: GraphicsState,
@@ -177,6 +186,7 @@ fn air_after(
         (Kind::Starting, GEvent::Ready, _) => Air::Live,
         (Kind::Ready, GEvent::Crashed, _) => ended(HideReason::Crash),
         (Kind::Ready, GEvent::Tick, Some(Restart)) => ended(HideReason::Recycle),
+        (Kind::Ready, GEvent::GpuDeath, Some(Restart)) => ended(HideReason::Reload),
         _ => air,
     }
 }
@@ -187,6 +197,7 @@ struct Probes {
     live: usize,
     held_crash: usize,
     held_recycle: usize,
+    held_reload: usize,
     early: usize,
     off: usize,
 }
@@ -228,6 +239,7 @@ fn probe_air(g: &Graphics, air: Air, at: Ms, t: &Thresholds, p: &mut Probes, ctx
                 HideReason::Hang => p.live += 1,
                 HideReason::Crash => p.held_crash += 1,
                 HideReason::Recycle => p.held_recycle += 1,
+                HideReason::Reload => p.held_reload += 1,
                 HideReason::Failed => panic!("{ctx}: a frame held as Failed"),
             }
         }
@@ -259,6 +271,9 @@ enum Shown {
     Recycled,
     /// The first failure is a crash of a Ready page, so its frame is held.
     Crashed,
+    /// Generation 1 was Ready and reloaded after a GPU-process death a beat's spacing less 1 ms after
+    /// its ready (Owed 96), so its last frame is held.
+    Reloaded,
 }
 
 /// Every reachable (state, failures already in the window, beat, shown) setup. Starting and Ready
@@ -266,13 +281,14 @@ enum Shown {
 /// failure is in the window too; Failed exists only at the count, with nothing on air. A Ready setup
 /// comes in each `Beat`, so a hang lands both below the count and at it, and both with and without
 /// the recycle due beside it. A loading or backing-off setup comes with nothing on air, a recycled
-/// page's frame held, and a crashed page's frame held (which needs one failure, the crash, in its
-/// window), so a crash lands on each and each bound ends both below the count and at it.
+/// or a reloaded page's frame held, and a crashed page's frame held (which needs one failure, the
+/// crash, in its window), so a crash lands on each and each bound ends both below the count and at
+/// it.
 fn setups(t: &Thresholds) -> Vec<(Kind, usize, Beat, Shown)> {
     let count = t.cef_fail_count;
     assert!(count >= 2, "the setups need a back-off below the count");
     let mut s = Vec::new();
-    for shown in [Shown::Never, Shown::Recycled] {
+    for shown in [Shown::Never, Shown::Recycled, Shown::Reloaded] {
         s.push((Kind::Starting, 0, Beat::Silent, shown));
         s.push((Kind::Starting, count - 1, Beat::Silent, shown));
     }
@@ -282,7 +298,7 @@ fn setups(t: &Thresholds) -> Vec<(Kind, usize, Beat, Shown)> {
         s.push((Kind::Ready, 0, beat, Shown::Never));
         s.push((Kind::Ready, count - 1, beat, Shown::Never));
     }
-    for shown in [Shown::Never, Shown::Recycled, Shown::Crashed] {
+    for shown in [Shown::Never, Shown::Recycled, Shown::Crashed, Shown::Reloaded] {
         s.push((Kind::Backoff, 0, Beat::Silent, shown));
         s.push((Kind::Backoff, count - 2, Beat::Silent, shown));
     }
@@ -343,6 +359,17 @@ fn graphics_in(
         };
         now = recycle;
     }
+    if shown == Shown::Reloaded {
+        g.on_ready(now + 50, 1);
+        let death = now + 50 + t.cef_alive_every_ms - 1;
+        assert_eq!(g.on_gpu_death(death, t), Some(Restart), "setup: the reload");
+        air = Air::Held {
+            gen: 1,
+            proof: now + 50,
+            ended: HideReason::Reload,
+        };
+        now = death;
+    }
     for i in 0..prior {
         let ready_first = shown == Shown::Crashed && i == 0;
         let (_, a) = setup_failure(&mut g, &mut stamps, &mut air, now, ready_first, t);
@@ -389,7 +416,7 @@ fn graphics_in(
             at
         }
     };
-    let gens = prior as u64 + 1 + u64::from(shown == Shown::Recycled);
+    let gens = prior as u64 + 1 + u64::from(matches!(shown, Shown::Recycled | Shown::Reloaded));
     assert_eq!(
         (kind(g.state()), g.generation()),
         (kind_want, gens),
@@ -412,6 +439,13 @@ fn graphics_in(
                 ..
             }
         ),
+        (_, Shown::Reloaded) => matches!(
+            air,
+            Air::Held {
+                ended: HideReason::Reload,
+                ..
+            }
+        ),
     };
     assert!(air_ok, "setup {kind_want:?} {shown:?}: {air:?}");
     (g, stamps, last, air)
@@ -423,9 +457,18 @@ enum GEvent {
     Ready,
     Crashed,
     Alive,
+    /// The process counted a GPU-process death below the in-place restart's count (Owed 96): a fact
+    /// about the process, so it carries no generation.
+    GpuDeath,
 }
 
-const G_EVENTS: [GEvent; 4] = [GEvent::Tick, GEvent::Ready, GEvent::Crashed, GEvent::Alive];
+const G_EVENTS: [GEvent; 5] = [
+    GEvent::Tick,
+    GEvent::Ready,
+    GEvent::Crashed,
+    GEvent::Alive,
+    GEvent::GpuDeath,
+];
 
 fn apply(g: &mut Graphics, e: GEvent, now: Ms, gen: u64, t: &Thresholds) -> Option<GraphicsAction> {
     match e {
@@ -439,6 +482,7 @@ fn apply(g: &mut Graphics, e: GEvent, now: Ms, gen: u64, t: &Thresholds) -> Opti
             g.on_alive(now, gen);
             None
         }
+        GEvent::GpuDeath => g.on_gpu_death(now, t),
     }
 }
 
@@ -463,8 +507,10 @@ fn after_failure(n: usize, at: Ms, gen: u64, t: &Thresholds) -> (GraphicsState, 
 /// 2026-10-18), written from their prose: the state and action after `e` at `at`, from `from` at
 /// generation `gen` with `air` on air, where `n` is the failures in the window if `e` is a failure. A
 /// hide names its reason (PR #22 review I2: a hang is `Hang` at the count too; a crash or load timeout
-/// entering Failed is `Failed`, naming the generation that failed; a crashed or recycled page's frame
-/// at its bound is `Crash` or `Recycle`, naming that page). One row is NOT the C05 brief:
+/// entering Failed is `Failed`, naming the generation that failed; a crashed, recycled or reloaded
+/// page's frame at its bound is `Crash`, `Recycle` or `Reload`, naming that page). A GPU-process
+/// death reloads a Ready or loading page at once, records no failure (Owed 96, owner ruling
+/// 2026-10-25 "A"), and never launders a Ready page's hang: at its bound it changes nothing. One row is NOT the C05 brief:
 /// `(Failed, Tick)` encodes C05's deliberate deviation (docs/_INDEX.md, the C05 decision row), so
 /// this matrix is no independent witness of the brief there.
 fn brief(
@@ -498,6 +544,11 @@ fn brief(
         (K::Failed, E::Tick) => restart,
         (K::Starting, E::Tick) => after_failure(n, at, gen, t), // the load timed out
         (K::Starting | K::Ready, E::Crashed) => after_failure(n, at, gen, t),
+        (K::Ready, E::GpuDeath) if bound_due(from, air, at, t) => (from, None),
+        // Its twin (the PR #87 review's m-6): a load at or past its timeout is the next tick's
+        // failure, never a reload.
+        (K::Starting, E::GpuDeath) if load_timed_out(from, at, t) => (from, None),
+        (K::Starting | K::Ready, E::GpuDeath) => restart,
         (K::Starting, E::Ready) => (
             GraphicsState::Ready {
                 since: at,
@@ -590,11 +641,12 @@ fn every_graphics_pair_follows_the_brief() {
         live,
         held_crash,
         held_recycle,
+        held_reload,
         early,
         off,
     } = probes;
     assert!(
-        live > 0 && held_crash > 0 && held_recycle > 0 && early > 0 && off > 0,
+        live > 0 && held_crash > 0 && held_recycle > 0 && held_reload > 0 && early > 0 && off > 0,
         "an air probe never ran: {probes:?}"
     );
 }
@@ -743,6 +795,14 @@ struct GraphicsCounts {
     crash_hides_lifted_by_ready: usize,
     recycle_hides_lifted_by_ready: usize,
     bound_hides_then_failed: usize,
+    reloads_ready: usize,
+    reloads_loading: usize,
+    gpu_deaths_ignored: usize,
+    gpu_deaths_at_a_hang: usize,
+    gpu_deaths_at_a_load_timeout: usize,
+    reload_hides: usize,
+    held_reload_frames_lifted_by_ready: usize,
+    reload_hides_lifted_by_ready: usize,
 }
 
 /// What no tick may leave on air: a frame `cef_hang_after_ms` or more after its page's last proof of
@@ -835,11 +895,13 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
                 if let GraphicsState::Ready { last_alive, .. } = before {
                     shown = Some((gen, last_alive));
                 }
-                let (e, ev_gen) = match r.next(12) {
+                let (e, ev_gen) = match r.next(13) {
                     0..=4 => (GEvent::Tick, gen),
                     5..=6 => (GEvent::Ready, gen),
                     7..=8 => (GEvent::Crashed, gen),
                     9 => (GEvent::Alive, gen),
+                    // A process fact, with no generation: it always reaches the current page.
+                    10 => (GEvent::GpuDeath, gen),
                     _ => {
                         let other = if gen > 0 && r.next(2) == 0 {
                             gen - 1
@@ -894,6 +956,7 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
                         match reason {
                             HideReason::Crash => c.crash_hides += 1,
                             HideReason::Recycle => c.recycle_hides += 1,
+                            HideReason::Reload => c.reload_hides += 1,
                             other => panic!("{ctx}: a {other:?} hide at a held frame's bound"),
                         }
                         c.bound_hides_beside_a_timer += usize::from(now >= due(before, &t));
@@ -913,6 +976,11 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
                     }
                     (Kind::Starting, GEvent::Crashed, _) => c.crashes_loading += 1,
                     (Kind::Ready, GEvent::Crashed, _) => c.crashes_ready += 1,
+                    (Kind::Ready, GEvent::GpuDeath, None) => c.gpu_deaths_at_a_hang += 1,
+                    (Kind::Ready, GEvent::GpuDeath, _) => c.reloads_ready += 1,
+                    (Kind::Starting, GEvent::GpuDeath, None) => c.gpu_deaths_at_a_load_timeout += 1,
+                    (Kind::Starting, GEvent::GpuDeath, _) => c.reloads_loading += 1,
+                    (_, GEvent::GpuDeath, _) => c.gpu_deaths_ignored += 1,
                     (Kind::Starting, GEvent::Ready, _) => c.readies += 1,
                     (_, GEvent::Ready, _) => c.readies_ignored += 1,
                     (Kind::Backoff, GEvent::Crashed, _) => c.crashes_ignored_backing_off += 1,
@@ -948,18 +1016,19 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
                 if k == Kind::Starting && after == Kind::Ready {
                     page = Some(Page::new(&mut r, now, &t));
                     hid_since = None;
-                    match air {
-                        Air::Held {
-                            ended: HideReason::Crash,
-                            ..
-                        } => c.held_crash_frames_lifted_by_ready += 1,
-                        Air::Held { .. } => c.held_recycle_frames_lifted_by_ready += 1,
-                        _ => {}
+                    if let Air::Held { ended, .. } = air {
+                        match ended {
+                            HideReason::Crash => c.held_crash_frames_lifted_by_ready += 1,
+                            HideReason::Recycle => c.held_recycle_frames_lifted_by_ready += 1,
+                            HideReason::Reload => c.held_reload_frames_lifted_by_ready += 1,
+                            other => panic!("{ctx}: a frame held as {other:?}"),
+                        }
                     }
                     match hidden_by.take() {
                         Some(HideReason::Hang) => c.hang_hides_lifted_by_ready += 1,
                         Some(HideReason::Crash) => c.crash_hides_lifted_by_ready += 1,
                         Some(HideReason::Recycle) => c.recycle_hides_lifted_by_ready += 1,
+                        Some(HideReason::Reload) => c.reload_hides_lifted_by_ready += 1,
                         Some(HideReason::Failed) | None => {}
                     }
                 } else if after != Kind::Ready {
@@ -967,13 +1036,13 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
                 }
                 match a {
                     Some(Hide { reason, .. }) => {
-                        // After a `Hang` or `Failed` hide the next action is a restart. Only a `Crash`
-                        // or `Recycle` hide leaves the reload loading, so only it can be followed by
-                        // another hide with neither a restart nor a Ready (which lifts it) between:
-                        // that reload's `Failed`.
+                        // After a `Hang` or `Failed` hide the next action is a restart. Only a `Crash`,
+                        // `Recycle` or `Reload` hide leaves the reload loading, so only it can be
+                        // followed by another hide with neither a restart nor a Ready (which lifts it)
+                        // between: that reload's `Failed`.
                         if let Some(prev) = hid_since {
                             assert!(
-                                matches!(prev, HideReason::Crash | HideReason::Recycle)
+                                matches!(prev, HideReason::Crash | HideReason::Recycle | HideReason::Reload)
                                     && reason == HideReason::Failed,
                                 "{ctx}: {prev:?} then {reason:?} at {now} with no restart or Ready between"
                             );
@@ -1086,9 +1155,27 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
             c.recycle_hides_lifted_by_ready,
         ),
         ("bound hides then the reload's Failed", c.bound_hides_then_failed),
+        ("GPU-death reloads of a Ready page", c.reloads_ready),
+        ("GPU-death reloads of a loading page", c.reloads_loading),
+        (
+            "GPU deaths ignored while backing off or Failed",
+            c.gpu_deaths_ignored,
+        ),
+        ("GPU deaths at a Ready page's hang", c.gpu_deaths_at_a_hang),
+        ("GPU deaths at a load's timeout", c.gpu_deaths_at_a_load_timeout),
+        ("reload hides", c.reload_hides),
+        (
+            "reloaded frames a Ready replaced inside the bound",
+            c.held_reload_frames_lifted_by_ready,
+        ),
+        (
+            "reload hides lifted by the next Ready",
+            c.reload_hides_lifted_by_ready,
+        ),
         ("air probes: the Ready page's frame", probes.live),
         ("air probes: a crashed page's frame", probes.held_crash),
         ("air probes: a recycled page's frame", probes.held_recycle),
+        ("air probes: a reloaded page's frame", probes.held_reload),
         ("air probes: 1 ms before a bound", probes.early),
         ("air probes: nothing on air", probes.off),
     ];
@@ -1273,10 +1360,11 @@ fn a_page_that_stops_beating_hides_on_the_frame_tick_grid() {
     assert!(cases > 0 && beats_delivered > 0, "checked 0 runs or 0 beats");
 }
 
-// The bound on the frame tick grid of both modes, at every phase, for both ways a Ready page's life
+// The bound on the frame tick grid of both modes, at every phase, for every way a Ready page's life
 // ends with its frame on air (PR #22 review G1: its probe held a crashed page's frame ~23 s, and a
-// recycle's ~33 s). A page that is ready and beating off the grid crashes off the grid, or is
-// recycled on the grid, and none of its reloads signals ready. Its frame comes off air on the first
+// recycle's ~33 s; Owed 96 added the reload after a GPU-process death). A page that is ready and
+// beating off the grid crashes off the grid, is recycled on the grid, or is reloaded after a
+// GPU-process death off the grid, and none of its reloads signals ready. Its frame comes off air on the first
 // tick at or after its last beat plus `cef_hang_after_ms` (late by under one tick spacing), naming
 // the path and generation 1, while the reload loads on; the reloads then run out their attempts, and
 // the `cef_fail_count`-th enters Failed and hides again, as `Failed`. The last beat comes well
@@ -1293,8 +1381,8 @@ fn a_crashed_or_recycled_page_whose_reloads_never_ready_hides_on_the_frame_tick_
     let count = t.cef_fail_count as u64;
     let (hang, base, every) = (t.cef_hang_after_ms, t.cef_backoff_base_ms, t.cef_alive_every_ms);
     let (mut cases, mut beats_delivered) = (0usize, 0usize);
-    for ending in [HideReason::Crash, HideReason::Recycle] {
-        // A crash is the first failure; a recycle records none.
+    for ending in [HideReason::Crash, HideReason::Recycle, HideReason::Reload] {
+        // A crash is the first failure; a recycle and a reload record none.
         let before = u64::from(ending == HideReason::Crash);
         let failed_gen = count + 1 - before;
         for mode in BOTH_MODES {
@@ -1302,8 +1390,11 @@ fn a_crashed_or_recycled_page_whose_reloads_never_ready_hides_on_the_frame_tick_
             for phase in 0..spacing {
                 let mut g = Graphics::new();
                 let ready = phase + t.cef_load_timeout_ms / 2 + 7; // off the grid
+                                                                   // `crash` is the off-grid end: the crash, or the GPU-process death.
                 let (last_beat, crash) = match ending {
-                    HideReason::Crash => (ready + 3 * every, Some(ready + 3 * every + 1_511)),
+                    HideReason::Crash | HideReason::Reload => {
+                        (ready + 3 * every, Some(ready + 3 * every + 1_511))
+                    }
                     _ => (ready + t.cef_recycle_every_ms - 1_500, None),
                 };
                 let beats: Vec<Ms> = (1..)
@@ -1334,11 +1425,17 @@ fn a_crashed_or_recycled_page_whose_reloads_never_ready_hides_on_the_frame_tick_
                         beats_delivered += 1;
                     }
                     if let Some(c) = crash.filter(|&c| !crashed && now >= c) {
-                        assert_eq!(
-                            g.on_crashed(c, 1, &t),
-                            None,
-                            "{mode:?} φ{phase}: the first failure"
-                        );
+                        if ending == HideReason::Reload {
+                            // The reload restarts at the death itself, off the grid.
+                            assert_eq!(g.on_gpu_death(c, &t), Some(Restart), "{mode:?} φ{phase}");
+                            acts.push((c, Restart));
+                        } else {
+                            assert_eq!(
+                                g.on_crashed(c, 1, &t),
+                                None,
+                                "{mode:?} φ{phase}: the first failure"
+                            );
+                        }
                         crashed = true;
                     }
                     if let Some(a) = g.on_tick(now, &t) {
@@ -1360,7 +1457,10 @@ fn a_crashed_or_recycled_page_whose_reloads_never_ready_hides_on_the_frame_tick_
                 assert_eq!(kinds, want, "{ctx}");
                 assert_eq!(acts[0].0, phase, "{ctx}: the first tick restarts");
                 let reload = acts[1].0;
-                let reload_due = crash.map_or(ends, |c| c + base);
+                let reload_due = match (ending, crash) {
+                    (HideReason::Crash, Some(c)) => c + base,
+                    _ => ends,
+                };
                 assert!(
                     (reload_due..reload_due + spacing).contains(&reload),
                     "{ctx}: reloaded {} ms after the page's end",
@@ -1378,10 +1478,10 @@ fn a_crashed_or_recycled_page_whose_reloads_never_ready_hides_on_the_frame_tick_
     }
     eprintln!(
         "bound runs checked: {cases} (path × mode × phase), {beats_delivered} beats delivered before the \
-         crash or the recycle; the frame off air within one tick of its last beat + {hang} ms"
+         crash, the recycle or the reload; the frame off air within one tick of its last beat + {hang} ms"
     );
     let phases: usize = BOTH_MODES.iter().map(|&m| widest(m) as usize).sum();
-    assert_eq!(cases, 2 * phases, "every path, mode and phase, once");
+    assert_eq!(cases, 3 * phases, "every path, mode and phase, once");
     assert!(cases > 0 && beats_delivered > 0, "checked 0 runs or 0 beats");
 }
 

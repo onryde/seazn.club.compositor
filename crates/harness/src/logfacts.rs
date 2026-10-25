@@ -11,7 +11,8 @@
 //! The lines (each read by its exact message shape; a page or a URL that quotes the words is not one):
 //! - `app::driver`: `cef ready gen=<g>`, `cef crashed gen=<g>`, `cef alive gen=<g>`,
 //!   `overlay hidden reason=<r> gen=<g>`, and C11b's
-//!   `cef health zygote_gone=<g|-> leaked_teardowns=<n> gpu_process_deaths=<n>` (on a change only);
+//!   `cef health zygote_gone=<g|-> leaked_teardowns=<n> gpu_process_deaths=<n>` (on a change only),
+//!   and Owed 96's `cef reload gen=<g> reason=<r> deaths=<n>` (the reload after a GPU-process death);
 //! - `compositor::logged`: `graphics restart gen=<g>`, `sink swap gen=<g> target=<redacted>`,
 //!   `programme started`; and `app::driver`'s `sink swap reason=<r> gen=<g>` just before the swap
 //!   line (Owed 87, PR #57);
@@ -134,6 +135,16 @@ pub struct Health {
     pub gpu_process_deaths: u64,
 }
 
+/// `cef reload gen=<g> reason=<r> deaths=<n>` (Owed 96; owner ruling 2026-10-25 "A"): the driver's
+/// reload of the page as generation `gen`, the process's GPU-process deaths at `deaths`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Reload {
+    pub at_ms: i64,
+    pub gen: u64,
+    pub reason: String,
+    pub deaths: u64,
+}
+
 /// `WARN test hook (Owed 82): the next <n> CEF teardowns never return`: a `test-hooks` build armed
 /// (once per process, before `compositor started`).
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -241,6 +252,8 @@ pub struct LogFacts {
     pub graphics_restart: Vec<GenAt>,
     pub overlay_hidden: Vec<Hidden>,
     pub cef_health: Vec<Health>,
+    /// `cef reload gen=<g> reason=<r> deaths=<n>`: each reload after a GPU-process death (Owed 96).
+    pub cef_reloads: Vec<Reload>,
     pub sink_swaps: Vec<GenAt>,
     /// `sink swap reason=<r> gen=<g>`, one per swap line (lib.jq's `stall_swap` checks they pair).
     pub sink_swap_reasons: Vec<SwapReasonLine>,
@@ -308,6 +321,27 @@ fn health(msg: &str, at_ms: i64) -> Option<Health> {
         zygote_gone: zygote?,
         leaked_teardowns: leaked?,
         gpu_process_deaths: gpu?,
+    })
+}
+
+fn reload(msg: &str, at_ms: i64) -> Option<Reload> {
+    let rest = msg.strip_prefix("cef reload ")?;
+    let mut gen = None;
+    let mut reason = None;
+    let mut deaths = None;
+    for (k, v) in pairs(rest) {
+        match k {
+            "gen" => gen = Some(v.parse().ok()?),
+            "reason" => reason = Some(v.to_owned()),
+            "deaths" => deaths = Some(v.parse().ok()?),
+            _ => return None,
+        }
+    }
+    Some(Reload {
+        at_ms,
+        gen: gen?,
+        reason: reason?,
+        deaths: deaths?,
     })
 }
 
@@ -526,6 +560,8 @@ pub fn log_facts(text: &str) -> LogFacts {
             }
         } else if let Some(h) = health(m, at_ms) {
             f.cef_health.push(h);
+        } else if let Some(r) = reload(m, at_ms) {
+            f.cef_reloads.push(r);
         } else if let Some(rest) = m.strip_prefix("sink swap gen=") {
             if let Some(Ok(g)) = rest.split(' ').next().map(str::parse) {
                 f.sink_swaps.push(ga(g));
@@ -641,6 +677,7 @@ mod tests {
                 20_000,
                 "cef health zygote_gone=- leaked_teardowns=0 gpu_process_deaths=1",
             ),
+            (20_500, "cef reload gen=3 reason=gpu_process_death deaths=1"),
             (
                 21_000,
                 "cef health zygote_gone=2 leaked_teardowns=0 gpu_process_deaths=1",
@@ -661,6 +698,12 @@ mod tests {
             ),
             (26_300, "overlay hidden reason=hang gen=x"),
             (26_400, "cef ready gen=1 (retired)"),
+            (26_500, "cef reload gen=3 reason=gpu_process_death"),
+            (
+                26_600,
+                "cef reload gen=3 reason=gpu_process_death deaths=1 extra=1",
+            ),
+            (26_700, "cef reload gen=x reason=gpu_process_death deaths=1"),
         ];
         for (at, m) in lines {
             log.push_str(&line(at, m));
@@ -717,6 +760,16 @@ mod tests {
         assert_eq!(f.cef_health[0].zygote_gone, None);
         assert_eq!(f.cef_health[1].zygote_gone, Some(2));
         assert_eq!(f.cef_health[1].gpu_process_deaths, 1);
+        assert_eq!(
+            f.cef_reloads,
+            vec![Reload {
+                at_ms: NOON_MS + 20_500,
+                gen: 3,
+                reason: "gpu_process_death".into(),
+                deaths: 1
+            }],
+            "a reload line missing a key, with an unknown one, or with a bad gen is not one"
+        );
         assert_eq!(
             f.sink_swaps,
             vec![GenAt {

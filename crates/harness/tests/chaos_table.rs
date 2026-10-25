@@ -574,17 +574,18 @@ fn owed_entries_checked(m: &Value, index: &str) -> (usize, usize) {
 
 #[test]
 fn every_owed_entry_names_a_real_check_and_a_real_open_owed_row_with_a_signature() {
-    // The committed manifest: one Owed row is open in chaos.json, Owed 96 (case 15 one-fewer's
-    // `scheduled_changes_shown`, its signature reading that measure 3 times), since Owed 86 left it by
-    // the owner's ruling (2026-10-25, "A": case 6's clock measured, not judged), as Owed 87 did
-    // (2026-10-24, "A"). A row's tags arriving or leaving move this count.
+    // The committed manifest: no Owed row is open in chaos.json. Owed 96 (case 15 one-fewer's
+    // `scheduled_changes_shown`) left it with its fix (the owner, 2026-10-25, "A": reload the page
+    // after each counted GPU-process death), after Owed 86 left it by the owner's ruling (2026-10-25,
+    // "A": case 6's clock measured, not judged), as Owed 87 did (2026-10-24, "A"). A row's tags
+    // arriving or leaving move this count; the probe below keeps the sweep from reading nothing.
     let m = manifest();
     let index = std::fs::read_to_string(repo().join("docs/_INDEX.md")).unwrap();
     let (checked, sig_reads) = owed_entries_checked(&m, &index);
     eprintln!("committed owed entries checked: {checked}; signature reads: {sig_reads}");
     assert_eq!(
         (checked, sig_reads),
-        (1, 3),
+        (0, 0),
         "an Owed row's tags moved in chaos.json: this test's committed count moves with them"
     );
     // The same checks over a probe entry alone, so the sweep is not read on nothing: case 6's
@@ -615,14 +616,15 @@ fn every_owed_entry_names_a_real_check_and_a_real_open_owed_row_with_a_signature
 }
 
 /// The rows decided by a ruling left chaos.json with their tags, so a red on their old checks reads
-/// NOT OWED: Owed 87 (the owner, 2026-10-24, "A": the stall rule retired) and Owed 86 (the owner,
-/// 2026-10-25, "A": case 6's clock measured, not judged, under the induced starvation). No leg names
-/// either, and neither has a signature or a title.
+/// NOT OWED: Owed 87 (the owner, 2026-10-24, "A": the stall rule retired), Owed 86 (the owner,
+/// 2026-10-25, "A": case 6's clock measured, not judged, under the induced starvation) and Owed 96
+/// (the owner, 2026-10-25, "A": the page reloaded after each counted GPU-process death, the fix in).
+/// No leg names any of them, and none has a signature or a title.
 #[test]
 fn the_decided_owed_rows_left_chaos_json_with_their_tags() {
     let m = manifest();
     let mut checked = 0;
-    for row in ["86", "87"] {
+    for row in ["86", "87", "96"] {
         for map in ["owed_signatures", "owed_titles"] {
             assert!(
                 m[map].get(row).is_none(),
@@ -642,105 +644,72 @@ fn the_decided_owed_rows_left_chaos_json_with_their_tags() {
     let legs = m["legs"].as_array().unwrap().len();
     eprintln!("decided-row absences checked: {checked} ({legs} legs)");
     assert!(legs >= 1);
-    assert_eq!(checked, 2 * (2 + legs), "every map and leg read");
+    assert_eq!(checked, 3 * (2 + legs), "every map and leg read");
 }
 
-/// Owed 96 (2026-10-25): case 15 one-fewer's `scheduled_changes_shown` red reads owed only on its
-/// cause's evidence: an off-air run that starts within a child poll of a GPU kill (`at_kill`), with
-/// no deliberate hide after the first kill, that holds every missing change (CI's run 40148980537,
-/// re-judged under the programme bound). A held page, a 2-frame blip at a kill beside one, a red
-/// with nothing missing, an off-air run long after the last kill and a hidden one read NOT OWED.
-/// case_verdicts.rs drives the same signature through the case's own measure.
+/// Owed 96 (2026-10-25) left chaos.json with its fix (the owner, "A": reload the page after each
+/// counted GPU-process death), so case 15 one-fewer's red as CI's run 40148980537 left it reads NOT
+/// OWED, its old signature's evidence (an off-air run within a child poll of the last kill, no hide,
+/// holding every missing change) notwithstanding; and so do the reload and back checks the fix adds,
+/// failing beside it. The table stays red and names no Owed row.
 #[test]
-fn owed_96_names_the_one_fewer_off_air_red_and_nothing_else() {
+fn owed_96_left_chaos_json_and_the_one_fewer_off_air_red_reads_not_owed() {
     let m = manifest();
-    let sig = m["owed_signatures"]["96"].as_str().unwrap().to_owned();
-    // The CI red's off-air run; each shape below breaks one of the signature's three conjuncts.
-    let off_with = |at_kill: bool, hidden: u32, covers: bool| {
-        json!({"from_ms": 1_792_891_584_297_i64, "after_kill_ms": if at_kill { 77 } else { 30_077 },
-            "at_kill": at_kill, "ms": 82_604, "frames": 2_478, "to_end": true,
-            "hidden_after_kill": hidden, "covers_missing": covers})
-    };
-    let off = |covers: bool| off_with(true, 0, covers);
+    assert!(
+        m["owed_signatures"].get("96").is_none() && m["owed_titles"].get("96").is_none(),
+        "Owed 96 is still in chaos.json"
+    );
+    // The CI red's measure, in the shape it was judged in (Owed 96's evidence once).
     let ci = json!({"due_after_last_kill": 22, "missing": (12..=33).collect::<Vec<u16>>(),
-        "lag_ms": {"min": null, "max": null}, "off_air": off(true)});
-    let missing = |off_air: Value| json!({"due_after_last_kill": 22, "missing": (12..=33).collect::<Vec<u16>>(), "off_air": off_air});
-    let mut checked = 0;
-    for (tag, holds, shown) in [
-        ("ci-red", true, ci.clone()),
-        (
-            "held",
-            false,
-            json!({"due_after_last_kill": 22, "missing": [12, 13], "off_air": null}),
-        ),
-        (
-            "blip-held",
-            false,
-            json!({"due_after_last_kill": 22, "missing": [12], "off_air": off(false)}),
-        ),
-        (
-            "nothing-missing",
-            false,
-            json!({"due_after_last_kill": 0, "missing": [], "off_air": off(false)}),
-        ),
-        // Fix round 1's I-1: an off-air run that starts long after the last kill (no child poll ties
-        // it to one), and one the graphics hid on purpose, hold the missing changes and are not
-        // Owed 96's.
-        ("later", false, missing(off_with(false, 0, true))),
-        ("hidden", false, missing(off_with(true, 1, true))),
-    ] {
-        assert_eq!(
-            signature_holds(&sig, &json!({"measures": {"scheduled_changes_shown": shown}})),
-            Some(holds),
-            "Owed 96 on {tag}: {shown}"
-        );
-        checked += 1;
-    }
-    eprintln!("Owed 96 signature cases checked: {checked}");
-    assert_eq!(checked, 6);
-
+        "lag_ms": {"min": null, "max": null},
+        "off_air": {"from_ms": 1_792_891_584_297_i64, "after_kill_ms": 77, "at_kill": true,
+            "ms": 82_604, "frames": 2_478, "to_end": true, "hidden_after_kill": 0,
+            "covers_missing": true}});
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("chaos-table-owed-96");
     let d = dir.to_str().unwrap();
-    let fail = |shown: Value| {
+    let fail = |failed: Value, shown: Value| {
         move |v: &mut Value| {
             v["status"] = json!("fail");
-            v["failed"] = json!(["scheduled_changes_shown"]);
+            v["failed"] = failed.clone();
             v["measures"]["scheduled_changes_shown"] = shown.clone();
         }
     };
-    verdicts(&dir, true);
-    edit(&dir, "cef-gpu-deaths-one-fewer", fail(ci));
-    let out = run(&["--table", d]);
-    let s = stdout(&out);
-    assert_eq!(out.status.code(), Some(1), "an owed red is still red\n{s}");
-    for line in [
-        "| cef-gpu-deaths-one-fewer | FAIL | 4/4 | outage_ms | failed: scheduled_changes_shown (Owed 96) |",
-        "red, every failed check owed: cef-gpu-deaths-one-fewer\n",
-        "red on a check no Owed row names: none\n",
-        &format!("Owed 96: {}\n", m["owed_titles"]["96"].as_str().unwrap()),
-        "this run does not count",
+    let mut checked = 0;
+    for (failed, row, unexplained) in [
+        (
+            json!(["scheduled_changes_shown"]),
+            "failed: scheduled_changes_shown (NOT OWED) |",
+            "cef-gpu-deaths-one-fewer (scheduled_changes_shown)",
+        ),
+        (
+            json!(["overlay_back_after_each_kill", "stays_on_air", "scheduled_changes_shown"]),
+            "failed: overlay_back_after_each_kill (NOT OWED), stays_on_air (NOT OWED), scheduled_changes_shown (NOT OWED) |",
+            "cef-gpu-deaths-one-fewer (overlay_back_after_each_kill, stays_on_air, scheduled_changes_shown)",
+        ),
+        (
+            json!(["gpu_death_reloads"]),
+            "failed: gpu_death_reloads (NOT OWED) |",
+            "cef-gpu-deaths-one-fewer (gpu_death_reloads)",
+        ),
     ] {
-        assert!(s.contains(line), "{line}\n{s}");
+        verdicts(&dir, true);
+        edit(&dir, "cef-gpu-deaths-one-fewer", fail(failed, ci.clone()));
+        let out = run(&["--table", d]);
+        let s = stdout(&out);
+        assert_eq!(out.status.code(), Some(1), "the red is red\n{s}");
+        for line in [
+            &format!("| cef-gpu-deaths-one-fewer | FAIL | 4/4 | outage_ms | {row}"),
+            "red, every failed check owed: none\n",
+            &format!("red on a check no Owed row names: {unexplained}\n"),
+            "this run does not count",
+        ] {
+            assert!(s.contains(line), "{line}\n{s}");
+        }
+        assert!(!s.contains("Owed 96"), "a fixed row is never named\n{s}");
+        checked += 1;
     }
-    verdicts(&dir, true);
-    edit(
-        &dir,
-        "cef-gpu-deaths-one-fewer",
-        fail(json!({"due_after_last_kill": 22, "missing": [12, 13], "off_air": null})),
-    );
-    let out = run(&["--table", d]);
-    let s = stdout(&out);
-    assert_eq!(out.status.code(), Some(1));
-    for line in [
-        "| cef-gpu-deaths-one-fewer | FAIL | 4/4 | outage_ms | failed: scheduled_changes_shown (NOT OWED: Owed 96's signature absent) |",
-        "red on a check no Owed row names: cef-gpu-deaths-one-fewer (scheduled_changes_shown)\n",
-    ] {
-        assert!(s.contains(line), "{line}\n{s}");
-    }
-    assert!(
-        !s.contains("Owed 96:"),
-        "a row whose evidence is absent is not titled\n{s}"
-    );
+    eprintln!("Owed 96 NOT OWED tables checked: {checked}");
+    assert_eq!(checked, 3);
 }
 
 /// Case 17's `stall_swap` measure as CI's run 40121220366 left it (PR #65), in this branch's shape:
@@ -754,7 +723,7 @@ fn ci_rule() -> Value {
 
 /// A red table names each failed check's Owed row when that row's signature holds in the run, and
 /// says which reds no Owed row explains. No verdict is softened: an owed red is as red as any other,
-/// and the run never counts. No row is open in chaos.json since Owed 86's ruling (the owner,
+/// and the run never counts. No row is open in chaos.json since Owed 96's fix (the owner,
 /// 2026-10-25, "A"), so a copy of the manifest gives case 6's leg a probe row, 98, on three of its
 /// checks, its signature a measure of the run; the committed rows' reds read NOT OWED beside it.
 #[test]
@@ -846,7 +815,7 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
         s.contains(&format!("Owed 98: {}\n", title("98"))),
         "Owed 98's title"
     );
-    for gone in ["Owed 70", "Owed 84", "Owed 85", "Owed 86", "Owed 87"] {
+    for gone in ["Owed 70", "Owed 84", "Owed 85", "Owed 86", "Owed 87", "Owed 96"] {
         assert!(
             !s.contains(gone),
             "only the rows this run's reds name, never a fixed or decided one: {gone}"
@@ -926,7 +895,7 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
         "red on a check no Owed row names: dest-disconnect (output_lost); dest-stall (stall_swap); cpu-starved (fps_beats_read, beats_below_floor); dest-trickle (stall_swap); cef-gpu-deaths-fast-r1 (overlay_back); cef-gpu-deaths-fast-r2 (overlay_back); cef-gpu-deaths-fast-r3 (overlay_back); dest-stall-rule (buffer_capped, stall_swap)\n"
     ), "{s}");
     for gone in [
-        "Owed 70", "Owed 84", "Owed 85", "Owed 86:", "Owed 87:", "Owed 98:",
+        "Owed 70", "Owed 84", "Owed 85", "Owed 86:", "Owed 87:", "Owed 96", "Owed 98:",
     ] {
         assert!(
             !s.contains(gone),

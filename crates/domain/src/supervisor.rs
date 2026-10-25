@@ -31,6 +31,13 @@
 //!   final beat, with `Restart`'s own code, so the host starts the process again and the overlay
 //!   comes back. Nothing is drained: the broadcast is to carry on. The hold and the drain ignore it
 //!   (they already end the process, exit 0), and so does booting (no CEF runs before the session).
+//! - **A reload after a GPU-process death** (Owed 96; owner ruling 2026-10-25 "A"): while Running, a
+//!   `CefHealth` whose GPU-process deaths rose since the last one read, and that asks for no in-place
+//!   restart, reloads the page (`Graphics::on_gpu_death`): `ReloadGraphics`, the next generation of
+//!   the same page in the same process, and no failure. One reload a rise, however many deaths it
+//!   counts; a death at the restart's count restarts the process and reloads nothing. The count is
+//!   the process's, never reset (C11), so the threshold restart still comes at the same death (owner
+//!   rulings 2A and 4A stand). The hold ignores it like every `CefHealth`: nothing is rebuilt there.
 //! - **The final beat** (owner ruling 2026-10-15): every path to `Exit` sends a `Stopped` beat that
 //!   carries its reason first. A drain sends it when the drain starts; an immediate exit sends it in
 //!   the same `Decision`, before `Exit`. A fatal error's text rides its beat as `ExitInfo.detail`
@@ -176,6 +183,13 @@ pub enum Effect {
     RestartGraphics {
         gen: u64,
     },
+    /// Build the page of graphics generation `gen` because the process counted a GPU-process death
+    /// (Owed 96; owner ruling 2026-10-25 "A"): applied as `RestartGraphics`, and C08 logs
+    /// `cef reload gen=<g> reason=gpu_process_death deaths=<n>` first, `n` the process's count.
+    ReloadGraphics {
+        gen: u64,
+        gpu_process_deaths: usize,
+    },
     /// The domain hide's reason and generation, unchanged (C05b PR #22 review I2): C12 logs
     /// `overlay hidden reason=<r> gen=<g>`, and C08 maps the reason.
     HideOverlay {
@@ -213,6 +227,9 @@ pub struct Supervisor {
     heartbeat_failures: u32,
     /// The fatal error's text, set only as a fatal error exits (Owed 27, option a).
     exit_detail: Option<ExitDetail>,
+    /// The highest GPU-process death count a Running `CefHealth` has reported (Owed 96): a reload is
+    /// owed only when the count rises above it.
+    gpu_deaths_seen: usize,
 }
 
 impl Supervisor {
@@ -237,6 +254,7 @@ impl Supervisor {
             output_ever_connected: false,
             heartbeat_failures: 0,
             exit_detail: None,
+            gpu_deaths_seen: 0,
         }
     }
 
@@ -297,11 +315,21 @@ impl Supervisor {
         self.exit(now, ExitReason::Fatal, fx);
     }
 
-    /// An in-place restart (C11b): the cause rides the final beat, then `Exit(75)`.
-    fn restart_in_place(&mut self, now: Ms, h: CefHealth, fx: &mut Vec<Effect>) {
+    /// CEF's health while Running: an in-place restart (C11b; the cause rides the final beat, then
+    /// `Exit(75)`), or else, when the GPU-process deaths rose, the reload (Owed 96).
+    fn on_cef_health(&mut self, now: Ms, h: CefHealth, fx: &mut Vec<Effect>) {
         if let Some(cause) = h.restart_cause(&self.t) {
             self.exit_detail = Some(ExitDetail::new(cause.detail()));
             self.exit(now, ExitReason::Restart, fx);
+            return;
+        }
+        let rose = h.gpu_process_deaths > self.gpu_deaths_seen;
+        self.gpu_deaths_seen = self.gpu_deaths_seen.max(h.gpu_process_deaths);
+        if rose && self.graphics.on_gpu_death(now, &self.t) == Some(GraphicsAction::Restart) {
+            fx.push(Effect::ReloadGraphics {
+                gen: self.graphics.generation(),
+                gpu_process_deaths: h.gpu_process_deaths,
+            });
         }
     }
 
@@ -460,7 +488,7 @@ impl Supervisor {
             Event::Signal(SignalKind::Term) => self.start_drain(now, ExitReason::Signalled, fx),
             Event::Fatal { detail } => self.fatal(now, detail, fx),
             Event::HeartbeatRefused(HeartbeatRefusal::Gone) => self.gone(fx),
-            Event::CefHealth(h) => self.restart_in_place(now, h, fx),
+            Event::CefHealth(h) => self.on_cef_health(now, h, fx),
             Event::OutputDrained
             | Event::BootstrapOk { .. }
             | Event::BootstrapFailed
@@ -696,7 +724,10 @@ mod tests {
         fx.iter().any(|e| {
             matches!(
                 e,
-                Effect::RebuildInput { .. } | Effect::SwapSink { .. } | Effect::RestartGraphics { .. }
+                Effect::RebuildInput { .. }
+                    | Effect::SwapSink { .. }
+                    | Effect::RestartGraphics { .. }
+                    | Effect::ReloadGraphics { .. }
             )
         })
     }

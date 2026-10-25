@@ -255,7 +255,8 @@ fn end_stream() -> impl Strategy<Value = (Option<Ms>, bool, Vec<(Ms, u8)>)> {
     // first end request, long enough for an overrun burst, a crash storm, a Ready page or a silence
     // to come first, and the deadline is drawn early enough to come first in a fair share of cases.
     // CEF's health (C11b; the PR #34 review's m7): a healthy report every 40 steps, and a report that
-    // asks for an in-place restart at an eighth of that, so it lands in the hold and the drain too.
+    // asks for an in-place restart or a reload (a GPU-process death below the restart's count; Owed
+    // 96) at an eighth of that, so it lands in the hold and the drain too.
     (
         prop::option::of(1u64..20_000),
         any::<bool>(),
@@ -340,7 +341,7 @@ fn end_events(beating: bool, steps: Vec<(Ms, u8)>, t: &Thresholds) -> Vec<(Ms, E
         let ev = match k {
             0..=13 | 39 => Event::Tick,
             37 => Event::CefHealth(CefHealth::default()),
-            38 if dt < 250 => Event::CefHealth(match dt % 3 {
+            38 if dt < 250 => Event::CefHealth(match dt % 5 {
                 0 => CefHealth {
                     unrecoverable: Some(dt % 5),
                     ..CefHealth::default()
@@ -349,8 +350,15 @@ fn end_events(beating: bool, steps: Vec<(Ms, u8)>, t: &Thresholds) -> Vec<(Ms, E
                     gpu_process_deaths: t.cef_gpu_deaths_to_restart,
                     ..CefHealth::default()
                 },
-                _ => CefHealth {
+                2 => CefHealth {
                     leaked_teardowns: t.cef_leaks_to_restart,
+                    ..CefHealth::default()
+                },
+                // A GPU-process death count below the restart's (Owed 96): 1 up to one short of it,
+                // two buckets of five, since a count rises at most `cef_gpu_deaths_to_restart - 1`
+                // times a stream and only a rise in Running reloads.
+                _ => CefHealth {
+                    gpu_process_deaths: 1 + (dt / 5) as usize % (t.cef_gpu_deaths_to_restart - 1),
                     ..CefHealth::default()
                 },
             }),
@@ -521,6 +529,9 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
             let mut proof: BTreeMap<u64, Ms> = BTreeMap::new();
             // The reason of the last Stopped beat sent, in effect order
             let mut last_final: Option<ExitReason> = None;
+            // The highest GPU-process death count a Running report delivered (Owed 96): a reload is
+            // owed only when a count rises above it.
+            let mut gpu_seen = 0usize;
             for (now, ev) in end_events(beating, steps, &t) {
                 let ev = resolve(ev, &s, &mut sent);
                 let in_final = s.programme_phase() == ProgrammePhase::Final;
@@ -584,20 +595,45 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
                     Event::CefHealth(h) => restart_text(h, &t),
                     _ => None,
                 };
-                if let Event::CefHealth(_) = &ev {
+                // Owed 96 (owner ruling 2026-10-25 "A"): short of every restart, a Running report
+                // whose GPU-process deaths rose reloads a Ready or loading page, once, as the next
+                // generation; a page backing off or Failed is not rebuilt, and the death is seen all
+                // the same. The hold and the drain ignore it, like every report.
+                if let Event::CefHealth(h) = &ev {
                     c.bump("health reports");
                     let acts = restart.is_some() && life == Lifecycle::Running;
+                    let rose =
+                        restart.is_none() && life == Lifecycle::Running && h.gpu_process_deaths > gpu_seen;
+                    if restart.is_none() && life == Lifecycle::Running {
+                        gpu_seen = gpu_seen.max(h.gpu_process_deaths);
+                    }
                     if acts {
                         prop_assert_eq!(next, Lifecycle::Exited(ExitReason::Restart));
                         prop_assert_eq!(d.effects.last(), Some(&Effect::Exit(75)));
                         c.bump("restarts in place");
+                    } else if rose && matches!(g, GraphicsStatus::Ready | GraphicsStatus::Starting) {
+                        prop_assert_eq!(
+                            &d.effects,
+                            &vec![Effect::ReloadGraphics {
+                                gen: gen + 1,
+                                gpu_process_deaths: h.gpu_process_deaths,
+                            }]
+                        );
+                        prop_assert_eq!(next, Lifecycle::Running);
+                        c.bump("reloads after a GPU-process death");
+                    } else if rose {
+                        prop_assert!(d.effects.is_empty(), "{:?} rebuilt with graphics {:?}", ev, g);
+                        prop_assert_eq!(d.next.graphics_generation(), gen);
                     } else if !seen_exit {
                         prop_assert!(d.effects.is_empty(), "{:?} acted in {:?}", ev, life);
                         prop_assert_eq!(&d.next, &s, "{:?} changed {:?}", ev, life);
-                        if restart.is_some()
-                            && matches!(life, Lifecycle::Holding { .. } | Lifecycle::Draining { .. })
-                        {
+                        let in_hold_or_drain =
+                            matches!(life, Lifecycle::Holding { .. } | Lifecycle::Draining { .. });
+                        if restart.is_some() && in_hold_or_drain {
                             c.bump("restart reports ignored in the hold or the drain");
+                        }
+                        if restart.is_none() && h.gpu_process_deaths > 0 && in_hold_or_drain {
+                            c.bump("death reports ignored in the hold or the drain");
                         }
                     }
                 }
@@ -657,6 +693,7 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
                                     | Effect::AbandonInput { .. }
                                     | Effect::SwapSink { .. }
                                     | Effect::RestartGraphics { .. }
+                                    | Effect::ReloadGraphics { .. }
                                     | Effect::StepDown(_)
                             ),
                             "a build after Final: {:?}",
@@ -764,6 +801,8 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
         "restarts in place",
         "restart details checked",
         "restart reports ignored in the hold or the drain",
+        "reloads after a GPU-process death",
+        "death reports ignored in the hold or the drain",
     ] {
         assert!(
             c.0.get(k).copied().unwrap_or(0) > 0,

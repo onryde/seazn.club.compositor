@@ -282,6 +282,38 @@ fn recycle_run(mode: Drivers) -> Vec<String> {
     r.buf.messages()
 }
 
+/// A GPU-process death below the in-place restart's count (Owed 96; owner ruling 2026-10-25 "A"):
+/// the process's health counts it a quarter-beat after the Ready page's last beat, the page is
+/// reloaded, and the reload never readies, so the reloaded page's held frame reaches its bound.
+fn reload_run(mode: Drivers) -> Vec<String> {
+    let t = Thresholds::default();
+    let knob = CefKnob::default();
+    let mut r = Run::new(mode, t.clone(), &knob);
+    let p = page(&t, 1, 200, 6_201);
+    let b = last_alive(&p);
+    let death = b + t.cef_alive_every_ms / 4;
+    r.drive(death, p);
+    let health = CefHealth {
+        gpu_process_deaths: 1,
+        ..CefHealth::default()
+    };
+    assert_eq!(
+        health.restart_cause(&t),
+        None,
+        "test setup: below the in-place restart"
+    );
+    knob.set(health);
+    // The reload restarts on the first tick at or after the death, so its load timeout is no earlier
+    // than `death + cef_load_timeout_ms`.
+    let hide = b + t.cef_hang_after_ms;
+    assert!(
+        hide + 200 < death + t.cef_load_timeout_ms,
+        "test setup: the reload is still loading at the hide"
+    );
+    r.drive(hide + 200, vec![]);
+    r.buf.messages()
+}
+
 /// Every generation times out loading, to the count-th: Failed.
 fn failed_run(mode: Drivers) -> Vec<String> {
     let t = Thresholds::default();
@@ -375,6 +407,30 @@ fn graphics_log_lines_exist_in_both_driver_modes() {
             1,
             "{what}"
         );
+        let reload = reload_run(mode);
+        matched += assert_in_order(
+            &reload,
+            &[
+                "graphics restart gen=1".into(),
+                "cef ready gen=1".into(),
+                "cef health zygote_gone=- leaked_teardowns=0 gpu_process_deaths=1".into(),
+                "cef reload gen=2 reason=gpu_process_death deaths=1".into(),
+                "graphics restart gen=2".into(),
+                "overlay hidden reason=reload gen=1".into(),
+            ],
+            &format!("{what} reload"),
+        );
+        assert_eq!(
+            count(&reload, "cef reload gen=2 reason=gpu_process_death deaths=1"),
+            1,
+            "{what}: one reload for one death"
+        );
+        assert_eq!(count(&reload, "overlay hidden reason=reload gen=1"), 1, "{what}");
+        assert_eq!(
+            count(&reload, "graphics stop"),
+            0,
+            "{what}: the reload was stopped"
+        );
         let failed = failed_run(mode);
         let mut want: Vec<String> = (1..=n).map(|g| format!("graphics restart gen={g}")).collect();
         want.push(format!("overlay hidden reason=failed gen={n}"));
@@ -384,7 +440,7 @@ fn graphics_log_lines_exist_in_both_driver_modes() {
             count(&failed, &format!("overlay hidden reason=failed gen={n}")),
             1
         );
-        for lines in [&hang, &crash, &recycle, &failed] {
+        for lines in [&hang, &crash, &recycle, &reload, &failed] {
             for l in lines.iter().filter(|l| l.starts_with("overlay hidden")) {
                 assert!(
                     l.contains(" reason=") && l.contains(" gen="),
