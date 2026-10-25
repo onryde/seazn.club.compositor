@@ -1051,6 +1051,96 @@ fn blank_pages_and_gpu_deaths_count_together_once_each() {
     assert_eq!(checked, 2 * blank_thresholds().len());
 }
 
+// One report that reaches the count in a jump, after a blank page was counted (the PR #92 review's
+// m-3): the final beat names the blank page with the deaths, even when the deaths alone reach the
+// count, and with leaks at their own count too (a GPU-class cause outranks the leaks). A dead zygote
+// is still the most urgent cause, and leaks at their count below the shared count keep their own
+// text. Nothing reloads at the restart. Each text is written out.
+#[test]
+fn a_restart_after_a_blank_page_names_the_blank_page() {
+    let mut checked = 0;
+    for th in blank_thresholds() {
+        let (n, l) = (th.cef_gpu_deaths_to_restart, th.cef_leaks_to_restart);
+        let p = Pages {
+            ready: every,
+            paints: |g| g != 1,
+            beats: every,
+        };
+        let b1 = first_tick(0, first_tick(0, READY_AFTER) + th.cef_hang_after_ms);
+        let at = b1 + 3_000;
+        let cases: [(&str, CefHealth, String); 5] = [
+            ("deaths alone at the count", health(None, 0, n), blank_text(1, n)),
+            (
+                "deaths past the count",
+                health(None, 0, n + 1),
+                blank_text(1, n + 1),
+            ),
+            (
+                "the shared count, leaks at theirs",
+                health(None, l, n - 1),
+                blank_text(1, n - 1),
+            ),
+            (
+                "a dead zygote",
+                health(Some(2), 0, n),
+                "restart in place: a CEF zygote is gone (gen 2)".into(),
+            ),
+            (
+                "leaks below the shared count",
+                health(None, l, 0),
+                format!("restart in place: {l} CEF teardowns leaked"),
+            ),
+        ];
+        for (name, h, text) in cases {
+            let report = vec![(at, Event::CefHealth(h))];
+            let (_, seen) = drive(on_air_with(th.clone()), 0, at + 1_000, p, report, &th);
+            assert_eq!(seen.blank_reloads, vec![(b1, 2, 1)], "{n} {name}: the blank page");
+            assert_eq!(
+                seen.finals,
+                vec![(at, ExitReason::Restart, Some(text))],
+                "{n} {name}"
+            );
+            assert_eq!(seen.exits, vec![(at, EX_TEMPFAIL)], "{n} {name}");
+            assert!(seen.death_reloads.is_empty(), "{n} {name}: {seen:?}");
+            checked += 1;
+        }
+    }
+    eprintln!("restart texts after a blank page checked: {checked}");
+    assert_eq!(checked, 5 * blank_thresholds().len());
+}
+
+// The PR #92 review's m-4: a page that beat once after its ready and then went silent, with no frame,
+// is blank at its ready's bound, before its own hang bound (its last beat + `cef_hang_after_ms`), and
+// its reload ends it: one count, as a blank page, never also a hang (no hide: it showed nothing).
+#[test]
+fn a_page_that_beat_then_went_silent_unpainted_is_blank_once_and_never_a_hang() {
+    let mut checked = 0;
+    for th in blank_thresholds() {
+        let hang = th.cef_hang_after_ms;
+        let p = Pages {
+            ready: every,
+            paints: |g| g != 1,
+            beats: |g| g != 1,
+        };
+        let r1 = first_tick(0, READY_AFTER);
+        let beat = r1 + th.cef_alive_every_ms;
+        let at = first_tick(0, r1 + hang);
+        assert!(
+            at < beat + hang,
+            "{hang}: the blank bound comes before the hang's"
+        );
+        let report = vec![(beat, Event::CefAlive { gen: 1 })];
+        let (s, seen) = drive(on_air_with(th.clone()), 0, beat + 2 * hang, p, report, &th);
+        assert_eq!(seen.blank_reloads, vec![(at, 2, 1)], "{hang}: {seen:?}");
+        assert!(seen.hides.is_empty(), "{hang}: never a hang: {seen:?}");
+        assert!(seen.death_reloads.is_empty() && seen.exits.is_empty(), "{seen:?}");
+        assert_eq!(s.graphics_generation(), 2);
+        checked += 1;
+    }
+    eprintln!("beat-then-silent pages checked: {checked}");
+    assert_eq!(checked, blank_thresholds().len());
+}
+
 // One page, one count, whichever way it fails, and nothing counts outside a Running Ready page:
 // - silent and unpainted: a hang at the same bound, hidden as a hang, never also blank;
 // - reloaded by a GPU-process death before its bound: one death, no blank page;

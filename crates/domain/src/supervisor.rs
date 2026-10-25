@@ -44,8 +44,11 @@
 //!   toward `cef_gpu_deaths_to_restart` (`cef_health::page_faults_restart`, the one rule): below it the
 //!   page reloads (`ReloadGraphicsNoFrames`, the next generation, no failure); at it the process
 //!   restarts in place and reloads nothing, so a page that never paints costs in-place restarts, which
-//!   owner ruling 2A caps, and cannot reload forever. The count is the process's, never reset. The
-//!   hold runs no blank rule (graphics' bound alone), and its painted reports still replace a held frame.
+//!   owner ruling 2A caps, and cannot reload forever. The count is the process's, never reset. So
+//!   Owed 96's reload count is now the shared one: a GPU-process death below
+//!   `cef_gpu_deaths_to_restart` restarts in place, reloading nothing, once blank pages bring the
+//!   shared count to it (sanctioned by the Owed 99 dispatch). The hold runs no blank rule (graphics'
+//!   bound alone), and its painted reports still replace a held frame.
 //! - **The final beat** (owner ruling 2026-10-15): every path to `Exit` sends a `Stopped` beat that
 //!   carries its reason first. A drain sends it when the drain starts; an immediate exit sends it in
 //!   the same `Decision`, before `Exit`. A fatal error's text rides its beat as `ExitInfo.detail`
@@ -340,11 +343,14 @@ impl Supervisor {
     }
 
     /// CEF's health while Running: an in-place restart (C11b; the cause rides the final beat, then
-    /// `Exit(75)`), or else, when the GPU-process deaths rose, the reload (Owed 96).
+    /// `Exit(75)`), or else, when the GPU-process deaths rose, the reload (Owed 96). With a blank page
+    /// counted, the shared count's cause names it (the PR #92 review's m-3), even when the deaths alone
+    /// reach the count; only a dead zygote outranks it.
     fn on_cef_health(&mut self, now: Ms, h: CefHealth, fx: &mut Vec<Effect>) {
-        let cause = h
-            .restart_cause(&self.t)
-            .or_else(|| page_faults_restart(self.blank_pages, h.gpu_process_deaths, &self.t));
+        let cause = match h.restart_cause(&self.t) {
+            Some(zygote @ RestartCause::ZygoteGone { .. }) => Some(zygote),
+            other => page_faults_restart(self.blank_pages, h.gpu_process_deaths, &self.t).or(other),
+        };
         if let Some(cause) = cause {
             self.restart_in_place(now, cause, fx);
             return;
@@ -786,6 +792,7 @@ mod tests {
                     | Effect::SwapSink { .. }
                     | Effect::RestartGraphics { .. }
                     | Effect::ReloadGraphics { .. }
+                    | Effect::ReloadGraphicsNoFrames { .. }
             )
         })
     }

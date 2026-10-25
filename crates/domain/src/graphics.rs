@@ -111,7 +111,9 @@
 //!   in-place restart's `cef_gpu_deaths_to_restart` (`cef_health::page_faults_restart`), and below
 //!   that count reloads the page (`on_blank_reload`: the next generation, no failure recorded, a held
 //!   frame kept with its page, its bound and its cause, since the blank page never showed one). A page
-//!   that also stopped beating is a hang, which is checked first, so one page is never counted twice.
+//!   silent since its ready is a hang, which is checked first, so one page is never counted twice; a
+//!   page that beat after its ready and then went silent, with no frame, is blank at its ready's
+//!   bound (before its own hang bound), and its reload ends it, so it too counts once.
 //! - **Generations.** Every restart is a new generation, and every adapter event carries the
 //!   generation of the page that sent it. An event from any other generation is ignored.
 use crate::backoff::delay;
@@ -352,9 +354,11 @@ impl Graphics {
         if let Some(hide) = self.on_bound_tick(now, t) {
             return Some(hide);
         }
-        // A blank page next, after the bound: a page that is also silent was a hang there (one page,
-        // one count), and a blank page is a counted fault, so a recycle due on the same tick never
-        // launders it.
+        // A blank page next, after the bound: a page silent since its ready was a hang there (one
+        // page, one count). A page that beat after its ready and then went silent, with no frame, is
+        // blank at its ready's bound, before its own hang bound, and is counted once too (its reload
+        // ends it). A blank and a recycle never share a tick (`cef_hang_after_ms <
+        // cef_recycle_every_ms`, config's own test), so the order after the bound is not load-bearing.
         if let Some(blank) = self.on_blank_tick(now, t) {
             return Some(blank);
         }
