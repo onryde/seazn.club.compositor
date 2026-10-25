@@ -139,7 +139,7 @@ struct Shared {
     frames: FrameStore,
     log: LogFn,
     scrubber: Arc<Mutex<Scrubber>>,
-    /// Retired builds whose teardown (`set_state(NULL)` on the build's own thread) has not returned.
+    /// Retired builds whose teardown (`set_state(NULL)` on its build thread) has not returned.
     reapers: Arc<AtomicUsize>,
     /// `InputFrame` events not delivered: the inbound channel was full.
     frames_dropped: AtomicU64,

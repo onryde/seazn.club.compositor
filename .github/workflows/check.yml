@@ -119,11 +119,13 @@ jobs:
             echo "::error::$ignored test(s) ignored: an ignored guard guards nothing"
             fail=1
           fi
-          # Each layering guard, and the fixture test pinning the graph code two of them share, must
-          # have run AND passed by name, so a renamed, deleted or skipped one cannot hide behind the total.
+          # Each layering guard, the fixture test pinning the graph code two of them share, and Owed
+          # 100's two (the input heap gate and the input's thread reuse, PR #91 review M5) must have
+          # run AND passed by name, so a renamed, deleted or skipped one cannot hide behind the total.
           for guard in domain_source_has_no_clock_env_fs_net_thread_or_process domain_has_no_io_dependencies \
             app_dependency_graph_has_no_adapters app_sources_never_name_adapters \
-            graph_closure_follows_edge_kinds_at_and_past_the_root; do
+            graph_closure_follows_edge_kinds_at_and_past_the_root \
+            input_rebuilds_do_not_grow_the_heap the_generations_reuse_the_adapters_threads; do
             if grep -Fq "test $guard ... ok" test.log; then
               echo "guard passed: $guard"
             else

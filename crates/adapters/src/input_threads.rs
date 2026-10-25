@@ -14,9 +14,11 @@
 //! **What.** [`Workers`]: named threads that run a job, then wait for the next. A job goes to an
 //! idle thread, the most recently idle first, and to a new thread only when none is idle, so a job
 //! that hangs (a resolver inside a start, F-012; a decoder inside a teardown, F-001) never holds up
-//! the next one: it runs on a thread of its own while it runs, as before. Threads never exit, so
-//! their number is the most jobs ever in flight at once (two builds in the steady state: one tearing
-//! down, the next starting), not the number of builds. [`BUILDS`] runs each build from its start to
+//! the next one: it runs on a thread of its own while it runs, as before. A thread exits only if its
+//! job panics, so their number is the most jobs ever in flight at once (two builds in the steady
+//! state: one tearing down, the next starting), not the number of builds. The threads a burst adds
+//! (a start hung on a resolver while the next build begins) stay for the process's life, with their
+//! arenas: bounded by that high-water mark, where before they ended once the hang did. [`BUILDS`] runs each build from its start to
 //! its teardown (`gst_input::run_build`). The pipelines' streaming tasks run through [`task_pool`],
 //! a `GstTaskPool` that `gst_input` hands each task as it is created, one pool and one set of
 //! threads per [`TaskRole`]: from a single shared set, the video task landed on whichever thread was
@@ -56,7 +58,7 @@ pub(crate) struct Workers {
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerCounts {
-    /// Threads started so far (none ever ends).
+    /// Threads started so far (a thread ends only if its job panics).
     pub spawned: usize,
     /// Threads waiting for a job now.
     pub idle: usize,
@@ -95,7 +97,10 @@ impl Workers {
 
     fn spawn(&'static self, first: Job) -> io::Result<()> {
         let (tx, rx) = mpsc::channel::<Job>();
-        thread::Builder::new()
+        // Counted before it starts: a new thread can run its first job and list itself idle before
+        // `Builder::spawn` returns, and `counts` must never read every thread idle while one is busy.
+        self.spawned.fetch_add(1, Ordering::SeqCst);
+        let started = thread::Builder::new()
             .name(self.name.to_owned())
             .stack_size(self.stack)
             .spawn(move || {
@@ -110,8 +115,11 @@ impl Workers {
                         Err(_) => return,
                     }
                 }
-            })?;
-        self.spawned.fetch_add(1, Ordering::SeqCst);
+            });
+        if let Err(e) = started {
+            self.spawned.fetch_sub(1, Ordering::SeqCst);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -427,5 +435,50 @@ mod tests {
         let c = W.counts();
         assert_eq!(c.spawned, 1);
         assert_eq!(c.ran, 1);
+    }
+
+    /// The most recently idle thread takes the next job (module doc). Two jobs in flight start two
+    /// threads, A and B; A goes idle first, then B; the next job runs on B, and so does the one after
+    /// it. Taking the longest-idle thread first would rotate every job through every thread the set
+    /// ever started, and through each of their arenas.
+    #[test]
+    fn the_most_recently_idle_thread_takes_the_next_job() {
+        static W: Workers = Workers::new("t-recent", 1 << 20);
+        let (release_a, hold_a) = mpsc::channel::<()>();
+        let (release_b, hold_b) = mpsc::channel::<()>();
+        let (started, on) = mpsc::channel();
+        let started_b = started.clone();
+        W.run(move || {
+            let _ = started.send(('a', thread::current().id()));
+            let _ = hold_a.recv();
+        })
+        .expect("a thread");
+        W.run(move || {
+            let _ = started_b.send(('b', thread::current().id()));
+            let _ = hold_b.recv();
+        })
+        .expect("a thread");
+        let mut ids = [
+            on.recv_timeout(Duration::from_secs(5)).expect("a job started"),
+            on.recv_timeout(Duration::from_secs(5))
+                .expect("the other started"),
+        ];
+        ids.sort_unstable_by_key(|&(tag, _)| tag);
+        let [(_, a), (_, b)] = ids;
+        assert_ne!(a, b, "two jobs in flight run on two threads");
+        release_a.send(()).expect("A is waiting");
+        assert!(idle_reaches(&W, 1), "A went idle");
+        release_b.send(()).expect("B is waiting");
+        assert!(idle_reaches(&W, 2), "B went idle after A");
+        let next = ran_on(&W);
+        assert!(idle_reaches(&W, 2));
+        let after = ran_on(&W);
+        assert!(idle_reaches(&W, 2));
+        let c = W.counts();
+        eprintln!("checked 4 jobs on 2 threads: {c:?}");
+        assert_eq!(c.spawned, 2);
+        assert_eq!(c.ran, 4);
+        assert_eq!(next, b, "the most recently idle thread, B, took the next job");
+        assert_eq!(after, b, "and the one after it");
     }
 }
