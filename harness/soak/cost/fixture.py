@@ -15,7 +15,7 @@ Each mutation changes one thing:
   cpu-over, cpu-at-max, few-samples, ncpu                 the samples
   stepped, drops, no-rung-field, no-dropped-field         the beats
   no-start, two-starts, no-end, short-drive               the actions
-  no-kill, no-renderer, two-kills, kill-late, kill-rc, kill-no-rc     leg.sh's kill lines
+  no-kill, no-renderer, two-kills, kill-late, kill-early-80ms, kill-rc, kill-no-rc   leg.sh's kill lines
   no-log, no-crash, two-crashes, crash-before-kill, no-ready, ready-same-gen   compositor.log
   few-moments, unread                                     the deliveries
   no-stills                                               the stills
@@ -26,7 +26,7 @@ d, muts = sys.argv[1], set(sys.argv[2:])
 os.makedirs(d, exist_ok=True)
 S, DRIVE = 1_000_000_000, 600
 E = S + DRIVE * 1000
-K = S + DRIVE * 500 + (110_000 if "kill-late" in muts else 2_000)
+K = S + DRIVE * 500 + (110_000 if "kill-late" in muts else -80 if "kill-early-80ms" in muts else 2_000)
 
 
 def w(name, rows):

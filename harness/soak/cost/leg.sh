@@ -7,7 +7,13 @@
 #    the session drops, until the compositor Machine is gone or --until-ms;
 # 2. waits for the driver's drive start (the first line of the harness's /out/actions.jsonl);
 # 3. at the drive's midpoint, kills the CEF renderer once (in-compositor.sh kill-renderer, over
-#    `flyctl machine exec`), and writes its lines to cost-kill.jsonl with the planned time. A kill
+#    `flyctl machine exec`), and writes its lines to cost-kill.jsonl with the planned time. The
+#    midpoint is decided on the compositor Machine, by the clock the kill's at_ms is read from: the
+#    try is sent KILL_LEAD_MS early by this runner's clock with `kill-renderer <planned>`, and the
+#    Machine holds it until its own clock reaches planned, so a kill is never judged early by
+#    construction (run 40153136892's A:noise: this runner's wait, ended up to a second early by an
+#    integer division, sent a kill that landed 80 ms before the midpoint), and the exec's latency
+#    no longer delays it. A kill
 #    that never reached the Machine (no `at_ms` line) is tried again, at most kill_tries times and
 #    only while a try can land inside the verdict's window (soak.json cost_kill_late_max_s, less
 #    the 15 s a try takes to reach the Machine); one that printed its targets never is. A try whose
@@ -42,6 +48,7 @@ POLL_S="${LEG_POLL_S:-5}"
 KILL_TRIES="${LEG_KILL_TRIES:-3}"
 KILL_WINDOW_MS=$((${LEG_KILL_WINDOW_S:-$(jq -r .cost_kill_late_max_s "$HERE/../soak.json")} * 1000))
 KILL_LAND_MS=15000 # a try's exec reaches the Machine within this (flyctl's connect)
+KILL_LEAD_MS=2000  # a try is sent this long before the midpoint; the Machine waits out the rest
 [[ "$UNTIL_MS" =~ ^[0-9]+$ ]] || { echo "leg: --until-ms is epoch ms" >&2; exit 64; }
 mkdir -p "$OUT"
 exec >>"$OUT/cost-leg.log" 2>&1
@@ -110,12 +117,13 @@ drive_s="$(jq -r .drive_s <<<"$start")"
 planned=$((at + drive_s * 500))
 log "drive start $at, $drive_s s: the kill at $planned"
 
-# 3. The kill, at the midpoint.
-while [ "$(now_ms)" -lt "$planned" ]; do
-  w=$(((planned - $(now_ms)) / 1000))
-  [ "$w" -le 0 ] && break
-  [ "$w" -gt "$POLL_S" ] && w="$POLL_S"
-  sleep "$w"
+# 3. The kill, at the midpoint: sent KILL_LEAD_MS ahead of it by this runner's clock (to the ms),
+# held on the Machine until its own clock reaches it.
+while :; do
+  w=$((planned - KILL_LEAD_MS - $(now_ms)))
+  [ "$w" -gt 0 ] || break
+  [ "$w" -le $((POLL_S * 1000)) ] || w=$((POLL_S * 1000))
+  sleep "$((w / 1000)).$(printf '%03d' $((w % 1000)))"
 done
 tries=0
 while [ "$tries" -lt "$KILL_TRIES" ]; do
@@ -124,13 +132,13 @@ while [ "$tries" -lt "$KILL_TRIES" ]; do
     break
   fi
   tries=$((tries + 1))
-  out="$(flyctl machine exec "$CID" 'bash /tmp/seazn-cost.sh kill-renderer' -a "$APP" --timeout 30 2>/dev/null | grep -a '^{' || true)"
+  out="$(flyctl machine exec "$CID" "bash /tmp/seazn-cost.sh kill-renderer $planned" -a "$APP" --timeout 30 2>/dev/null | grep -a '^{' || true)"
   if grep -q '"at_ms"' <<<"$out"; then
     jq -c --argjson p "$planned" --argjson t "$tries" '. + {planned_ms: $p, try: $t}' <<<"$out" >>"$OUT/cost-kill.jsonl"
     log "kill: $(paste -sd ' ' - <<<"$out")"
     break
   fi
-  log "kill try $tries reached nothing"
+  log "kill try $tries reached nothing${out:+ (the Machine: $(paste -sd ' ' - <<<"$out"))}"
   gone && break
   sleep 2
 done
