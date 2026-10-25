@@ -1,0 +1,74 @@
+{
+ "about": "DO NOT MERGE. C14 case 18's mutants (mut/owed94, base feat/owed94-egress-backstop; Owed 94, the owner, 2026-10-24, \"B\"). a: the harness never points the case at the hooks image (the arming precondition must red). b: the product's Connected backstop arm removed (no swap). c: the product's progress readings never carry the encoders' counts (the backstop never counts). d: the product's threshold typed in as the question's \"about 15 s\" instead of the derived one (the window must red). e: the product tears the hung sink down on the swapping thread (the swap waits for the hang; the gap must red). Each is an exact-text replace that must match once; the case runs unmutated first (its target check must PASS), then mutated (that check must FAIL, with the control checks still PASS, so the stack ran). A product mutant rebuilds the relay-test-hooks image from the mutated source; the verdict reads the committed harness/thresholds.json, never one regenerated from the mutant.",
+ "mutants": {
+  "a": {
+   "kind": "case",
+   "file": "harness/cases/output-hung.sh",
+   "old": "  RELAY_IMAGE=\"${RELAY_TEST_HOOKS_IMAGE:?RELAY_TEST_HOOKS_IMAGE names the relay-test-hooks image (case 18)}\"",
+   "new": "  RELAY_IMAGE=\"$RELAY_IMAGE\" # /*MUTa*/ the hook is never armed: the shipped image ignores the variables",
+   "case": "output-hung",
+   "variant": "hold",
+   "check": "armed",
+   "controls": [
+    "no_restarts",
+    "ended_beat"
+   ]
+  },
+  "b": {
+   "kind": "product",
+   "file": "crates/domain/src/output_link.rs",
+   "old": "            OutputState::Connected if self.egress_flat(now, t) => {",
+   "new": "            OutputState::Connected if false && self.egress_flat(now, t) => { /*MUTb*/",
+   "case": "output-hung",
+   "variant": "hold",
+   "check": "backstop_swap",
+   "controls": [
+    "armed",
+    "planted",
+    "planted_in_drive"
+   ]
+  },
+  "c": {
+   "kind": "product",
+   "file": "crates/adapters/src/gst_output.rs",
+   "old": "            encoded: self.shared.ring.encoded(),",
+   "new": "            encoded: Encoded::default(), /*MUTc*/ // the readings never carry the encoders' counts",
+   "case": "output-hung",
+   "variant": "hold",
+   "check": "backstop_swap",
+   "controls": [
+    "armed",
+    "planted",
+    "planted_in_drive"
+   ]
+  },
+  "d": {
+   "kind": "product",
+   "file": "crates/domain/src/config.rs",
+   "old": "            output_egress_flat_ms: output_egress_flat_ms(output_backoff_base_ms, output_connect_timeout_ms),",
+   "new": "            output_egress_flat_ms: 15_000, /*MUTd*/ // the question's \"about 15 s\", typed in",
+   "case": "output-hung",
+   "variant": "hang",
+   "check": "backstop_swap",
+   "controls": [
+    "armed",
+    "planted",
+    "planted_in_drive"
+   ]
+  },
+  "e": {
+   "kind": "product",
+   "file": "crates/adapters/src/gst_output.rs",
+   "old": "        reap(shared, self.pipeline.upcast(), format!(\"output gen={}\", self.gen));",
+   "new": "        let _ = self.pipeline.set_state(gst::State::Null); /*MUTe*/ // the swap waits for the hung sink's teardown",
+   "case": "output-hung",
+   "variant": "hang",
+   "check": "gap_in_budget",
+   "controls": [
+    "armed",
+    "planted",
+    "planted_in_drive"
+   ]
+  }
+ }
+}
