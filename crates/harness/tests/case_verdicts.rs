@@ -4200,8 +4200,10 @@ fn cef_renderer_zygote_killed_restarts_in_place_and_reds_when_an_old_process_sur
     );
 }
 
-/// A reloaded page's ready, after its reload: the C15 cost legs measured a new build ready 4.2 to
-/// 5.2 s after its restart.
+/// A reloaded page's ready, after its reload. The C15 cost legs measured a crashed page ready 4.2 to
+/// 5.2 s after the renderer KILL, which includes the crash path's back-off (`cef_backoff_base_ms`,
+/// 1 s) and its detection; a reload has no back-off, so its own build to ready is about 3.2 to
+/// 4.2 s (the PR #87 review's m-1). 4.5 s keeps the sims on the slow side of that.
 const RELOAD_READY_MS: i64 = 4_500;
 
 /// GPU-process kills from 20 s, `spacing_ms` apart, `kills` of them; the child poll counts each
@@ -4353,15 +4355,11 @@ fn cef_gpu_deaths_threshold_restarts_in_place_and_reds_when_the_threshold_is_six
         "gpu_death_reloads",
         "gpu-noreload",
     );
-    // A reload named for another cause, and one a poll late after its count: each reds.
-    for (tag, from, to) in [
-        (
-            "gpu-reload-cause",
-            "reason=gpu_process_death deaths=1",
-            "reason=recycle deaths=1",
-        ),
-        ("gpu-reload-late", "", ""),
-    ] {
+    // A reload named for another cause, one a poll late after its count, and one 1 ms BEFORE its
+    // count's health line (the PR #87 review's m-3: the driver writes the health line first): each
+    // reds.
+    let mut checked = 0;
+    for tag in ["gpu-reload-cause", "gpu-reload-late", "gpu-reload-early"] {
         let mut w = gpu_deaths(n, 2_000, 800, true, 600);
         let poll = w.ms("cef_child_poll_ms");
         let first = w
@@ -4369,17 +4367,19 @@ fn cef_gpu_deaths_threshold_restarts_in_place_and_reds_when_the_threshold_is_six
             .iter_mut()
             .find(|(_, m)| m.starts_with("cef reload gen=2 "))
             .expect("the first reload");
-        if from.is_empty() {
-            first.0 += poll + 1;
-        } else {
-            first.1 = first.1.replace(from, to);
+        match tag {
+            "gpu-reload-cause" => first.1 = first.1.replace("reason=gpu_process_death", "reason=recycle"),
+            "gpu-reload-late" => first.0 += poll + 1,
+            _ => first.0 -= 1,
         }
         assert_fails(
             &judge(&w, "cef-gpu-deaths", "threshold", tag),
             "gpu_death_reloads",
             tag,
         );
+        checked += 1;
     }
+    assert_eq!(checked, 3);
 }
 
 /// The report.json `judge` wrote under `tag` for the leg `name` (`<case>-<variant>`).
@@ -4618,7 +4618,8 @@ fn cef_gpu_deaths_one_fewer_reloads_after_each_kill_and_reds_on_a_restart() {
     checked += 1;
     // The reload budget, at its edge (a slow ready): back 100 ms inside it is green, 100 ms past it
     // reds on the back alone (no change falls due in the 134 ms between, and the overlay stays on
-    // air from the late back).
+    // air from the late back). The product would have hidden the held frame at its bound before
+    // either ready: fewer-slow-reload adds that hide.
     let lag = 800;
     for (tag, ready_ms, green) in [
         ("fewer-edge-back", budget - lag - 100, true),
@@ -4646,6 +4647,74 @@ fn cef_gpu_deaths_one_fewer_reloads_after_each_kill_and_reds_on_a_restart() {
         }
         checked += 1;
     }
+    // The PR #87 review's m-2: a reload slower than the held frame's bound, back inside the budget.
+    // The domain hides the held frame at its bound (its proof at the latest the first kill, so
+    // `cef_hang_after_ms` after it), with `reason=reload`, and the overlay is off air to the back:
+    // the back budget passes it, and `no_hide_after_kill` alone reds.
+    let mut w = gpu_deaths_reloading(n - 1, 2_000, lag, false, 0, budget - lag - 100);
+    let (k0, ready) = (kills(&w)[0], last_reload_ready(&w).unwrap());
+    let hide_at = k0 + w.ms("cef_hang_after_ms");
+    assert!(
+        hide_at < ready,
+        "fewer-slow-reload: the hide falls before the ready"
+    );
+    w.line(hide_at, "overlay hidden reason=reload gen=1");
+    w.overlay_none.push((hide_at, ready));
+    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-slow-reload");
+    assert_eq!(
+        failed_sorted(&v),
+        sorted(&["no_hide_after_kill"]),
+        "fewer-slow-reload"
+    );
+    assert_eq!(
+        v.json["measures"]["no_hide_after_kill"]["hides"],
+        json!([{"at_ms": hide_at, "reason": "reload", "gen": 1, "after_kill_ms": hide_at - k0}]),
+        "fewer-slow-reload"
+    );
+    checked += 1;
+    // The PR #87 review's m-4: kills spaced past the budget (the case's 2 s spacing never lets a
+    // reload ready before the next kill), so each reload readies before the next kill and each kill
+    // is judged on its own back frame. Green, each kill back within the budget of itself; then the
+    // first reload's page blank until 300 ms past its budget, still before the second kill: that kill
+    // alone reds, which a check of the last kill alone would pass.
+    let spacing = budget + 3_000;
+    let w = gpu_deaths(n - 1, spacing, lag, false, 0);
+    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-spaced");
+    assert_pass(&v, "fewer-spaced");
+    let backs = v.json["measures"]["overlay_back_after_each_kill"]["kills"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let ks = kills(&w);
+    assert_eq!(backs.len(), ks.len(), "fewer-spaced: {backs:?}");
+    for (b, &k) in backs.iter().zip(&ks) {
+        let back = b["back_ms"].as_i64().unwrap();
+        assert!(
+            back > k && back - k <= budget && ks.iter().all(|&o| o <= k || o > back),
+            "fewer-spaced: kill {k} back on its own before the next kill: {b}"
+        );
+    }
+    let mut w = gpu_deaths(n - 1, spacing, lag, false, 0);
+    let ks = kills(&w);
+    let first_ready = w
+        .log
+        .iter()
+        .find(|(_, m)| m == "cef ready gen=2")
+        .map(|l| l.0)
+        .expect("fewer-spaced-late-first: the first reload readied");
+    let blank_to = ks[0] + budget + 300;
+    assert!(
+        first_ready < blank_to && blank_to < ks[1],
+        "fewer-spaced-late-first: late, and before the second kill"
+    );
+    w.overlay_none.push((first_ready, blank_to));
+    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-spaced-late-first");
+    assert_eq!(
+        failed_sorted(&v),
+        sorted(&["overlay_back_after_each_kill"]),
+        "fewer-spaced-late-first"
+    );
+    checked += 2;
     // Back at the reload's ready, then off air 500 ms later for good: one frame's worth of back is no
     // back (on_air_for), and the overlay never stays on air.
     let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
@@ -4790,6 +4859,7 @@ fn cef_gpu_deaths_one_fewer_reloads_after_each_kill_and_reds_on_a_restart() {
     let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-hidden");
     assert_fails(&v, "overlay_back_after_each_kill", "fewer-hidden");
     assert_fails(&v, "scheduled_changes_shown", "fewer-hidden");
+    assert_fails(&v, "no_hide_after_kill", "fewer-hidden");
     checked += 1;
     // A stale page then off air (spaced kills, so the first reload is superseded too): never back.
     let mut w = gpu_deaths(n - 1, 3_800, 800, false, 0);
@@ -4877,7 +4947,7 @@ fn cef_gpu_deaths_one_fewer_reloads_after_each_kill_and_reds_on_a_restart() {
     assert!(shown.is_object(), "fewer-noend: the measure printed: {shown}");
     checked += 1;
     eprintln!("one-fewer worlds checked: {checked}");
-    assert_eq!(checked, 19);
+    assert_eq!(checked, 22);
 }
 
 #[test]

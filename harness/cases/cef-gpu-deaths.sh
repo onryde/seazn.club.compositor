@@ -30,7 +30,8 @@
 # `graphics: ready`): in every variant each count the `cef health` lines rise to below
 # cef_gpu_deaths_to_restart is reloaded once (`gpu_death_reloads`), and the count at it reloads
 # nothing (the in-place restart does). In one-fewer the overlay is back after each kill
-# (`overlay_back_after_each_kill`) and stays on air after the last (`stays_on_air`).
+# (`overlay_back_after_each_kill`), never hidden after the first (`no_hide_after_kill`), and stays on
+# air after the last (`stays_on_air`).
 
 CASE_LIVE_S=90
 KILL_SPACING_MS=2000
@@ -83,11 +84,17 @@ require_reloads() {
 
 # Owed 96, one-fewer: the overlay back after each kill. Per kill: the reload it caused (the first
 # `cef reload` after it), the first `cef ready` of that generation or a later one at or after that
-# reload, and the back frame, the first strip frame at or after that ready (fresh frames, never the
-# held one). Each back frame lies within `budget_gpu_death_reload_ms` (harness::thresholds, derived:
-# the child poll, a tick, the domain's load timeout, the frame to the encoder) of the LAST kill at or
-# before it: a kill while a reload loads reloads again (the domain's rule), so the window restarts
-# at that kill. No reload, no ready or no frame is no back.
+# reload, and the back frame, the first strip frame at or after that ready. That frame can still be
+# the held one (the slot keeps it until the new build's first sample, and `.[2] != null` cannot tell
+# the two apart): that the strip is FRESH is `scheduled_changes_shown`'s to witness, never this
+# check's (the PR #87 review's m-5). Each back frame lies within `budget_gpu_death_reload_ms`
+# (harness::thresholds, derived: the child poll, a tick, the domain's load timeout, the frame to the
+# encoder) of the LAST kill at or before it: a kill while a reload loads reloads again (the domain's
+# rule), so the window restarts at that kill. No reload, no ready or no frame is no back.
+# What it judges (the PR #87 review's m-4): KILL_SPACING_MS (2 s) is shorter than a reload (3 to 5 s),
+# so on the real stack every reload but the last is superseded by the next kill, every kill shares
+# the last back frame, and the check judges the last kill's reload. A kill's own back is judged only
+# when its reload readies before the next kill, which only case_verdicts.rs's spaced worlds drive.
 BACKS='[mark("kill")[] | .at_ms] as $ks
   | [$ks[] as $k
      | ([.log.cef_reloads[] | select(.at_ms > $k)] | first) as $rl
@@ -130,7 +137,7 @@ require_restarted() {
 
 case "$CASE_VARIANT" in
   threshold) CASE_CHECKS=22 ;;
-  one-fewer) CASE_CHECKS=14 ;;
+  one-fewer) CASE_CHECKS=15 ;;
   fast) CASE_CHECKS=23 ;;
 esac
 case_verdict() {
@@ -169,6 +176,18 @@ case_verdict() {
           + hold_evidence($b | last | .back_ms; $t.resume_after_ms)'
       require stays_on_air '('"$BACKS"' | last | .back_ms) as $back | stays_on_air_from($back) | stays_on_air_ok' \
         '('"$BACKS"' | last | .back_ms) as $back | {back_ms: $back} + stays_on_air_from($back)'
+      # No hide from the first kill to the end request (the PR #87 review's m-2): the domain holds a
+      # reloaded page's last frame on air to its bound, and a reload ready inside it never hides, so
+      # any `overlay hidden` line here is a reload that outlasted the bound (`reason=reload`), a hang,
+      # a crash or a failure. The back budget alone would pass a reload ready 8 to 11 s after a kill
+      # that took the overlay off air at the bound on the way.
+      require no_hide_after_kill '(mark("kill") | first | .at_ms) as $k0
+        | $k0 != null and $run.end_request_ms != null
+          and [.log.overlay_hidden[] | select(.at_ms > $k0 and .at_ms <= $run.end_request_ms)] == []' \
+        '(mark("kill") | first | .at_ms) as $k0
+        | {first_kill_ms: $k0, end_request_ms: $run.end_request_ms,
+           hides: [.log.overlay_hidden[] | select($k0 != null and .at_ms > $k0)
+             | {at_ms, reason, gen, after_kill_ms: (.at_ms - $k0)}]}'
       # No restart, and the page paints after the last kill's reload: every score change the
       # timeline schedules after the reload window shows (the re-review's m-1: round 3's
       # `overlay_back` here passed on the held frame, CI's `back_ms` 20 and 22, a frame that never

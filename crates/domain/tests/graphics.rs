@@ -150,6 +150,11 @@ fn bound_due(s: GraphicsState, air: Air, at: Ms, t: &Thresholds) -> bool {
     bound(s, air, t).is_some_and(|end| at >= end)
 }
 
+/// Whether `s` is a load at or past its timeout at `at`: `cef_load_timeout_ms` after its restart.
+fn load_timed_out(s: GraphicsState, at: Ms, t: &Thresholds) -> bool {
+    matches!(s, GraphicsState::Starting { since } if at >= since + t.cef_load_timeout_ms)
+}
+
 /// The first instant anything is due: the state's own timer, or the bound.
 fn due_with(s: GraphicsState, air: Air, t: &Thresholds) -> Ms {
     bound(s, air, t).map_or(due(s, t), |end| end.min(due(s, t)))
@@ -540,6 +545,9 @@ fn brief(
         (K::Starting, E::Tick) => after_failure(n, at, gen, t), // the load timed out
         (K::Starting | K::Ready, E::Crashed) => after_failure(n, at, gen, t),
         (K::Ready, E::GpuDeath) if bound_due(from, air, at, t) => (from, None),
+        // Its twin (the PR #87 review's m-6): a load at or past its timeout is the next tick's
+        // failure, never a reload.
+        (K::Starting, E::GpuDeath) if load_timed_out(from, at, t) => (from, None),
         (K::Starting | K::Ready, E::GpuDeath) => restart,
         (K::Starting, E::Ready) => (
             GraphicsState::Ready {
@@ -791,6 +799,7 @@ struct GraphicsCounts {
     reloads_loading: usize,
     gpu_deaths_ignored: usize,
     gpu_deaths_at_a_hang: usize,
+    gpu_deaths_at_a_load_timeout: usize,
     reload_hides: usize,
     held_reload_frames_lifted_by_ready: usize,
     reload_hides_lifted_by_ready: usize,
@@ -969,6 +978,7 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
                     (Kind::Ready, GEvent::Crashed, _) => c.crashes_ready += 1,
                     (Kind::Ready, GEvent::GpuDeath, None) => c.gpu_deaths_at_a_hang += 1,
                     (Kind::Ready, GEvent::GpuDeath, _) => c.reloads_ready += 1,
+                    (Kind::Starting, GEvent::GpuDeath, None) => c.gpu_deaths_at_a_load_timeout += 1,
                     (Kind::Starting, GEvent::GpuDeath, _) => c.reloads_loading += 1,
                     (_, GEvent::GpuDeath, _) => c.gpu_deaths_ignored += 1,
                     (Kind::Starting, GEvent::Ready, _) => c.readies += 1,
@@ -1152,6 +1162,7 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
             c.gpu_deaths_ignored,
         ),
         ("GPU deaths at a Ready page's hang", c.gpu_deaths_at_a_hang),
+        ("GPU deaths at a load's timeout", c.gpu_deaths_at_a_load_timeout),
         ("reload hides", c.reload_hides),
         (
             "reloaded frames a Ready replaced inside the bound",

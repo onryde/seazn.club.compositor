@@ -254,12 +254,17 @@ impl Graphics {
     /// its bound (`Reload`). A page backing off or Failed has nothing to reload: `None`, nothing moves.
     /// Nor does a Ready page at or past its own bound: it is hung, and the next tick counts the hang
     /// and backs off (its restart builds after the death anyway), so a hang is never laundered as a
-    /// reload, which records no failure.
+    /// reload, which records no failure. Nor, its twin, a loading page at or past
+    /// `cef_load_timeout_ms`: the next tick counts the load timeout. Through the app driver neither
+    /// guard is reached (`tick_due` runs the ticks before it reads `CefHealth`, at the same `now`, so
+    /// the bound and the load timeout have already moved the state); they keep this function right
+    /// on its own, whatever order a caller uses (the PR #87 review's m-6).
     pub fn on_gpu_death(&mut self, now: Ms, t: &Thresholds) -> Option<GraphicsAction> {
         match self.state {
             GraphicsState::Ready { last_alive, .. } if elapsed(now, last_alive) >= t.cef_hang_after_ms => {
                 None
             }
+            GraphicsState::Starting { since } if elapsed(now, since) >= t.cef_load_timeout_ms => None,
             GraphicsState::Starting { .. } | GraphicsState::Ready { .. } => {
                 self.end_life(Ended::Reload);
                 Some(self.restart(now))
@@ -2326,6 +2331,45 @@ mod tests {
                 matches!(h.state(), GraphicsState::Backoff { attempt: 0, .. }),
                 "{:?}",
                 h.state()
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 2);
+    }
+
+    // The hang guard's twin (the PR #87 review's m-6): a death on a loading page at or past its load
+    // timeout reloads nothing, and the next tick counts the timeout as the failure it is; 1 ms inside
+    // the timeout the page reloads.
+    #[test]
+    fn a_gpu_death_never_launders_a_load_timeout_as_a_reload() {
+        let th = t();
+        let mut g = Graphics::new();
+        assert_eq!(g.on_tick(0, &th), Some(Restart));
+        let timeout = th.cef_load_timeout_ms;
+        let mut inside = g.clone();
+        assert_eq!(
+            inside.on_gpu_death(timeout - 1, &th),
+            Some(Restart),
+            "1 ms inside"
+        );
+        assert_eq!(inside.generation(), 2, "the reload is the next generation");
+        let mut checked = 0;
+        for at in [timeout, timeout + 1] {
+            let mut h = g.clone();
+            assert_eq!(h.on_gpu_death(at, &th), None, "at {at}");
+            assert_eq!(h, g, "a death at {at} moved a timed-out load");
+            assert_eq!(
+                h.on_tick(at, &th),
+                None,
+                "a first failure backs off; it does not hide"
+            );
+            assert_eq!(
+                h.state(),
+                GraphicsState::Backoff {
+                    attempt: 0,
+                    until: at + th.cef_backoff_base_ms
+                },
+                "the load timeout, counted"
             );
             checked += 1;
         }
