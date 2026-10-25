@@ -710,9 +710,10 @@ impl GstInput {
 
 /// One build's thread, from its start to its teardown, so the two can never cross (review M1).
 ///
-/// 1. The start. READY→PAUSED is where `srtsrc` resolves its host and opens its socket (F-012: a
-///    hanging resolver held it 10 s); its connect waits for PLAYING. A build retired by then never
-///    goes PLAYING, so a stopped build never reaches the camera. A refused start is lost through
+/// 1. The start. READY→PAUSED is where `srtsrc` resolves its host, opens its socket and issues its
+///    connect (F-012: a hanging resolver held it 10 s); the handshake completes asynchronously, and
+///    the first read waits for PLAYING. A build retired by then never goes PLAYING, so a stopped
+///    build never reaches the camera. A refused start is lost through
 ///    the error its element posts on the bus (measured: "Could not open resource" 20 ms in), the one
 ///    road to `InputLost`, with the domain's connect timeout behind it.
 /// 2. The bus, until the build is retired: every error and warning text is logged after the
