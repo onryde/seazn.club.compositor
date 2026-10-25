@@ -283,7 +283,7 @@ impl GstProgramme {
             built_at: None,
         });
         self.shared.log(&format!(
-            "test hook (Owed 94): sink gen=1 stalls ({}) {} ms after its build",
+            "WARN test hook (Owed 94): sink gen=1 stalls ({}) {} ms after its build",
             stall_name(stall),
             after.as_millis()
         ));
@@ -310,7 +310,7 @@ impl GstProgramme {
                 SinkStall::Hang => self.hang_sink(SINK_HANG_HOLD),
             };
         self.shared.log(&format!(
-            "test hook (Owed 94): sink stall={} gen=1 planted={planted}",
+            "WARN test hook (Owed 94): sink stall={} gen=1 planted={planted}",
             stall_name(plan.stall)
         ));
     }

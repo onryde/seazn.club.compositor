@@ -916,7 +916,7 @@ fn test_hook_a_live_run_arms_the_sink_stall_it_is_given() {
             .filter(|l| l.contains("test hook"))
             .map(str::to_owned)
             .collect();
-        let want = format!("test hook (Owed 94): sink gen=1 stalls ({word}) 12000 ms after its build");
+        let want = format!("WARN test hook (Owed 94): sink gen=1 stalls ({word}) 12000 ms after its build");
         assert_eq!(lines.len(), 1, "{key}: {lines:?}");
         assert!(lines[0].ends_with(&want), "{key}: {lines:?}");
         checked += 1;
