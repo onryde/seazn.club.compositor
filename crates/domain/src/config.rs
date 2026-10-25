@@ -46,7 +46,9 @@ pub struct Thresholds {
     pub output_connect_timeout_ms: Ms,
     /// F-011 (Owed 38; the coordinator's ruling): a sink is Connected at its first growth at least
     /// this long after its first growth, with no error between (since Owed 87 a silence between is no
-    /// failure and does not restart the proof: only the sink's error ends it). The
+    /// failure and does not restart the proof: while the encoders starve or are unread, only the sink's
+    /// error ends it; with both delivering, Owed 94's backstop ends a sink flat for
+    /// `output_egress_flat_ms`). The
     /// first nonzero `out-bytes-total` is the 476 B RTMP `connect` command (22–69 ms after the build,
     /// n = 10 on CF), and a REFUSED publish keeps counting until its refusal arrives: 262 334 B by
     /// 538 ms on CF (a made-up key) and 1 008 779 B over 2 033 ms on mediamtx (a denied path). No byte
@@ -60,8 +62,9 @@ pub struct Thresholds {
     /// output pipeline that no sink error reports (Owed 94 (ii)). Derived, in one place
     /// (`output_egress_flat_ms`), from F-004's 15 s budget: the longest threshold, on the poll's grid,
     /// that still leaves the swap's back-off and one whole connect inside it. The owner's figure was
-    /// "about 15 s"; that would put the viewer's gap near 20 s, past F-004's split (the coordinator
-    /// recommended this derived value to the owner, 2026-10-25; the owner's answer is pending).
+    /// "about 15 s"; that would put the viewer's gap near 20 s, past F-004's split. The owner,
+    /// 2026-10-25, in chat, relayed by the coordinator ("Apply rec", the coordinator's recommendation
+    /// of this derived value): 9 s, keeps the worst outage under 15 s.
     pub output_egress_flat_ms: Ms,
     /// Spec §4.2: 3 CEF failures in 5 min → graphics Failed.
     pub cef_fail_count: usize,
@@ -499,12 +502,14 @@ mod tests {
         assert_eq!(TICK_WIDEST_MS, tick, "the tick the derivation reads");
     }
 
-    // Owed 94: a destination stall reaches the sink's own error first (ruling A's detector), so the
-    // backstop never takes a stall rtmp2sink reports: from the last counted growth the error lands one
-    // socket wait later, seen within a poll, acted on at the next tick. The coordinator's question
-    // bounded it more widely (the timeout, a back-off, a poll); it holds with the capped back-off too.
+    // Owed 94: a socket wait that outlasts the sink's timeout reaches the sink's own error first (ruling
+    // A's detector), so the backstop never takes a stall rtmp2sink reports: from the last counted
+    // growth the error lands one socket wait later, seen within a poll, acted on at the next tick. The
+    // coordinator's question bounded it more widely (the timeout, a back-off, a poll); it holds with the
+    // capped back-off too. Not every destination stall: a multi-wake trickle, whose every wait is under
+    // the timeout, never errors, and only the backstop swaps it (the PR #73 review's P-3; links.rs).
     #[test]
-    fn a_destination_stall_reaches_the_sinks_error_before_the_backstop() {
+    fn a_socket_wait_past_the_timeout_errors_before_the_backstop() {
         let t = Thresholds::default();
         let flat = t.output_egress_flat_ms;
         assert!(

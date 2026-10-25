@@ -593,8 +593,106 @@ fn a_multi_wake_trickle_is_swapped_by_the_backstop_only_where_no_socket_wait_rea
         }
     }
     eprintln!("multi-wake rows checked: {rows} ({by_error} error, {by_backstop} backstop, {none} none)");
-    assert_eq!(rows, 26);
-    assert_eq!((by_error, by_backstop, none), (10, 12, 4));
+    // Each row's class came from the rule above, and the link matched it in every row; the tally
+    // moves with the threshold (the PR #76 review's m-4), so only its anti-vacuity is pinned.
+    assert!(
+        rows > 0 && by_error > 0 && by_backstop > 0 && none > 0,
+        "a class went unchecked"
+    );
+    assert_eq!(by_error + by_backstop + none, rows);
+}
+
+// The PR #76 review's m-2: the steady state of a persistent multi-wake trickle (every socket wait
+// under the timeout, so no error ever) whose messages are slower than the backstop's threshold. The
+// first swap is from Connected (failure 1, the base back-off). Each later sink sends its `connect`
+// command (476 B, F-011) 31 ms after its build and then trickles the same way, so it never earns
+// Connected (its next growth would come a message later, past the threshold) and the backstop swaps
+// it from Proving, one more failure each time: the back-off grows to its cap and the compositor
+// churns sinks every threshold plus back-off, the link never Connected (the beat never reads
+// `playing`). Before Owed 94 the Connected sink was never swapped, and read `playing` over one frame
+// per message. Each interval's window comes from the back-off rule ("0.5, 1, 2, 2 s": the base
+// doubling to the cap) and the grids, never from the link.
+#[test]
+fn a_persistent_multi_wake_trickle_swaps_every_later_sink_from_proving_and_none_connects() {
+    let t = Thresholds::default();
+    let (flat, base, cap, poll, tick) = (
+        t.output_egress_flat_ms,
+        t.output_backoff_base_ms,
+        t.output_backoff_cap_ms,
+        OUTPUT_PROGRESS_POLL_MS,
+        TICK_WIDEST_MS,
+    );
+    const LATER_SINKS: usize = 4;
+    const CONNECT_AT: Ms = 31;
+    let mut checked = 0;
+    for message in [flat + poll, 2 * flat, u64::MAX] {
+        let (mut o, _) = output_in(Kind::Up, &t);
+        let built = 100 + base;
+        let cut = built + 50 + t.output_connected_after_ms;
+        o.on_delivery(cut - 10, 2, Encoded { video: 1, audio: 1 });
+        o.on_delivery(cut - 5, 2, Encoded { video: 2, audio: 2 });
+        let (mut k, mut gen, mut origin) = (2, 2, cut);
+        let mut builds: Vec<(Ms, SwapReason)> = Vec::new();
+        let mut now = cut;
+        while builds.len() <= LATER_SINKS {
+            now += 1;
+            assert!(
+                now < cut + 20 * (flat + cap),
+                "message {message}: stuck at {builds:?}"
+            );
+            if (now - cut) % poll == 0 {
+                let done = match message {
+                    u64::MAX => 0,
+                    m => now.saturating_sub(origin) / m,
+                };
+                let total = match gen {
+                    2 => 1_000 + done,
+                    _ if now >= origin => 476 + done,
+                    _ => 0,
+                };
+                o.on_progress(now, gen, total, &t);
+                k += 1;
+                o.on_delivery(now, gen, Encoded { video: k, audio: k });
+            }
+            if (now - cut) % tick == 0 {
+                if o.on_tick(now, &t) {
+                    builds.push((now, o.swap_reason()));
+                    gen = o.generation();
+                    origin = now + CONNECT_AT;
+                } else if gen > 2 {
+                    assert!(
+                        !o.is_connected(),
+                        "message {message}: gen {gen} connected at {now}"
+                    );
+                }
+            }
+        }
+        let reasons: Vec<SwapReason> = builds.iter().map(|b| b.1).collect();
+        assert!(
+            reasons.iter().all(|r| *r == SwapReason::EgressStalled),
+            "message {message}: {reasons:?}"
+        );
+        let mut cadence = Vec::new();
+        for (i, pair) in builds.windows(2).enumerate() {
+            // The sink built at pair[0] is failure i + 2's: the first later sink follows failure 1.
+            let failure = i as u32 + 2;
+            let wait = (base << (failure - 1)).min(cap);
+            let (lo, hi) = (
+                CONNECT_AT + flat + wait,
+                CONNECT_AT + poll + flat + wait + 2 * tick,
+            );
+            let gap = pair[1].0 - pair[0].0;
+            assert!(
+                (lo..=hi).contains(&gap),
+                "message {message}, failure {failure}: {gap} ms between builds, want {lo}..={hi}"
+            );
+            cadence.push(gap);
+            checked += 1;
+        }
+        eprintln!("persistent trickle, message {message} ms: builds every {cadence:?} ms");
+    }
+    eprintln!("persistent-trickle intervals checked: {checked}");
+    assert_eq!(checked, 3 * LATER_SINKS);
 }
 
 // ---- generated schedules, against facts the harness tracks itself ----
@@ -1336,6 +1434,15 @@ fn output_recovery_paths_against_the_f004_budget_on_a_1_ms_grid() {
     // derived so that it does).
     assert!(rows[0].2 < OUTPUT_GAP_BUDGET_MS, "{:?}", rows[0]);
     assert!(rows[0].3 < OUTPUT_GAP_BUDGET_MS, "{:?}", rows[0]);
+    // The PR #76 review's m-1: the hung path holds F-004 through one connect's worst case with no
+    // failed connect, as the stall path does (Owed 87 (b)), not through the failed connect the error
+    // path keeps: the threshold takes the room a failed connect would need.
+    assert_eq!(
+        hung,
+        1,
+        "failed connects that fit after a hang: {}",
+        hung as i64 - 1
+    );
 }
 
 /// Tick instants for an output mode: tick i at ⌊i · frame period⌋ ms (C08 ticks on the frame period).
