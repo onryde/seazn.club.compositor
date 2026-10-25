@@ -40,8 +40,9 @@
 # (b) every beat whose window lies inside the quota's reads under the floor, in the log and on the
 # wire, at least one does (`fps_beats_read`, the anti-vacuity, names why none did), and the two
 # writers agree on each; (c) the first clear after that raise comes after the quota is lifted,
-# within realtime_after's window (BUDGET_LADDER_REALTIME_MS plus a beat), and every beat whose
-# window lies after the quota in that window reads the recovered level (past the catch-up's burst);
+# within realtime_after's window (BUDGET_LADDER_REALTIME_MS plus a beat), and of the beats whose
+# window lies after the quota in that window none reads under the floor (no re-raise) and one reads
+# the recovered level (past the catch-up's burst; the coordinator, medium, 2026-10-25);
 # (d) the ladder's logic is unchanged (the coordinator, medium, 2026-10-25, reading the ruling): a
 # step its own trigger justifies passes, a step without the overruns its rule needs is a red.
 #
@@ -241,11 +242,13 @@ case_verdict() {
     "$HONEST | {checked: (.wire | length), above: .wire_above, floor, fps: .wire}"
   require wire_agrees_with_log "$HONEST | .checked >= 1 and .missing == 0 and .disagree == 0" \
     "$HONEST | {checked, tolerance, missing, disagree, pairs}"
-  # (c) The alarm clears once the quota is lifted, within realtime_after's window, and every beat
-  # whose window lies after the quota in that window reads the recovered level.
+  # (c) The alarm clears once the quota is lifted, within realtime_after's window. Of the beats
+  # whose window lies after the quota in that window, none reads under the floor (the product
+  # re-raises only there, so a healthy window a few frames short is no red) and at least one reads
+  # the recovered level (the coordinator, medium, 2026-10-25, on #77's confirm pass).
   require alarm_cleared "$HONEST | .clear_from_done_ms >= 0 and .clear_from_done_ms <= .bound_ms
-    and (.after | length >= 1 and all(. >= \$t.output_fps_recovered))" \
-    "$HONEST | {clear_fps, clear_from_done_ms, bound_ms, recovered, after}"
+    and (.after | length >= 1 and all(. >= \$t.output_fps_floor) and any(. >= \$t.output_fps_recovered))" \
+    "$HONEST | {clear_fps, clear_from_done_ms, bound_ms, floor, recovered, after}"
   # (d) The ladder's logic is unchanged (the owner's ruling, no ladder change; the coordinator,
   # medium, 2026-10-25, on the PR #77 review's I3): a step its own trigger justifies passes, a step
   # without the overruns its rule needs is a red. rungs_known and rung_holds judge C05's rungs and

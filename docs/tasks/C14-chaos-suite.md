@@ -1100,9 +1100,11 @@ now runs 23 checks.
     read from them. The rise check is a necessary condition only.
 - **The minors.**
   - m1: recovery is judged on every beat whose window opens past the quota,
-    `[stress_done + heartbeat_interval_ms, stress_done + bound_ms)`, and each must read
-    `output_fps_recovered`. The catch-up burst (CI: 83.67) can no longer satisfy it alone, and a
-    sag after the clear is a red (cpu-sags-after). An empty set is a red (cpu-no-after).
+    `[stress_done + heartbeat_interval_ms, stress_done + bound_ms)`, and ~~each must read
+    `output_fps_recovered`~~ none may read under the floor and one must read
+    `output_fps_recovered` (the confirm pass, below). The catch-up burst (CI: 83.67) can no longer
+    satisfy it alone, and a sag after the clear is a red (cpu-sags-after). An empty set is a red
+    (cpu-no-after).
     **Deferred:** a re-raise after that window. The review's gap hunt found that a fatal error
     during the drain can log a near-zero beat and raise after it (Owed 91's mid-drain gap), so
     "no raise after the clear" would red the drain.
@@ -1173,6 +1175,23 @@ now runs 23 checks.
     `the_decided_owed_rows_left_chaos_json_with_their_tags` and the owed-entry validator.
   - Owed 96's line reverted (the due set to the last overlaid frame): cpu-off-air-later, its red
     run (`missing` read `[]` against the world's 6).
+- **The confirm pass on 68bc6ea (the coordinator: PASS on code; one item, fixed before merge for
+  wave gate 3's flake-free legs).** m1's rule, every judged recovery beat at
+  `output_fps_recovered`, would red a healthy 5 s window three frames short (29.4). The product
+  re-raises only under `output_fps_floor`. The coordinator decided at medium (2026-10-25) that, of
+  the beats whose window opens past the quota inside realtime_after's window:
+  - none may read under `output_fps_floor` (no re-raise);
+  - at least one must read `output_fps_recovered`.
+
+  Both levels come from thresholds.json, and the catch-up burst stays excluded. The two sims:
+  - cpu-healthy-dip, a recovery beat at the recovered level less 0.1 (29.4), PASSES, with the
+    product's single raise.
+  - cpu-sags-after, now at the floor less 0.1 (28.4, was 3 under), reds `alarm_cleared`, with the
+    product's re-raise.
+
+  Each clause was mutated once. Deleting the floor clause is killed by cpu-sags-after; deleting the
+  recovered clause is killed by cpu-clears-at-floor. Under the old rule, cpu-healthy-dip's red run
+  failed `alarm_cleared`.
 - **Expected reds of the next run:** none. Case 6 is expected green. Anything red is NOT OWED. This
   supersedes the line above.
 
@@ -1251,8 +1270,8 @@ now runs 23 checks.
   is raised inside the quota's window. (b) Every judged beat reads under the floor, and at least one
   is judged; zero judged is a red with its reason. Since fix round 1 this holds on the log and on the
   wire, and the two agree on each judged beat. (c) The alarm clears after the quota, within
-  realtime_after's window, and ~~a beat~~ every beat whose window opens past the quota there reads
-  the recovered level. (d) ~~No beat steps off `full`.~~ The ladder's logic is unchanged: a step off
+  realtime_after's window, and ~~a beat~~ of the beats whose window opens past the quota there none
+  reads under the floor and at least one reads the recovered level. (d) ~~No beat steps off `full`.~~ The ladder's logic is unchanged: a step off
   `full` passes only on the overruns its own rule counts (fix round 1; the coordinator, medium).
   `ladder_moved` is gone. ~~The clock's three checks stay judged, owed to 86 (its amendment).~~ The
   clock's three values are measured in case 6, each with its sample count, and never gated (the

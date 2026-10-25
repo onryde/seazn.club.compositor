@@ -2186,9 +2186,12 @@ enum Shape {
     /// One beat before the quota under the floor (the PR #69 review's m4: a short off-grid window
     /// at startup), then the rate back: the alarm raises and clears before the quota.
     StartupDip,
-    /// The rate back after the quota, then a sag under the floor inside realtime_after's window: a
-    /// catch-up that does not hold.
+    /// The rate back after the quota, then a dip 0.1 under the floor inside realtime_after's window:
+    /// the product re-raises, a catch-up that does not hold.
     SagsAfter,
+    /// The rate back after the quota, then one healthy beat a few frames short (0.1 under the
+    /// recovered level, over the floor) inside realtime_after's window: no re-raise, a pass.
+    HealthyDip,
 }
 
 /// The rate CI's case 6 read while the 0.75 quota held (run 40143263604: 17.6 to 20.27 fps over its 7
@@ -2300,14 +2303,16 @@ fn cpu_starved_shaped(done: bool, rung_back: bool, felt: Felt, alarm: AlarmIs, s
         Shape::Quota => None,
         Shape::OneFull => readings.iter().filter(|r| r.0 >= a + hb && r.0 <= b).nth(2),
         Shape::StartupDip => readings.get(1),
-        Shape::SagsAfter => readings.iter().filter(|r| r.0 >= b + hb).nth(1),
+        Shape::SagsAfter | Shape::HealthyDip => readings.iter().filter(|r| r.0 >= b + hb).nth(1),
     }
     .map(|r| r.0);
     if let Some(at) = at {
         let fps = match shape {
             Shape::OneFull => rate,
             Shape::StartupDip => floor - 1.0,
-            _ => floor - 3.0,
+            Shape::SagsAfter => floor - 0.1,
+            Shape::HealthyDip => recovered - 0.1,
+            Shape::Quota => unreachable!("the quota's shape moves no beat"),
         };
         readings.iter_mut().find(|r| r.0 == at).unwrap().1 = fps;
     }
@@ -2497,6 +2502,34 @@ fn cpu_starved_passes_on_an_honest_beat_and_reds_on_each_alarm_regression() {
         m["scheduled_changes_shown"]["due"].as_u64() >= Some(1),
         "cpu-good: {m}"
     );
+    // A healthy beat a few frames short after the clear (0.1 under the recovered level, over the
+    // floor: a 5 s window three frames short) is no re-raise, so no red: the product raises only
+    // under the floor (the coordinator, medium, 2026-10-25, on #77's confirm pass).
+    let (floor, recovered) = (level(&w, "output_fps_floor"), level(&w, "output_fps_recovered"));
+    assert!(
+        floor < recovered - 0.1,
+        "the dip lies between the floor and the recovered level"
+    );
+    let dip = cpu_starved_shaped(true, false, Felt::Honest, AlarmIs::Declared, Shape::HealthyDip);
+    let v = judge(&dip, "cpu-starved", "", "cpu-healthy-dip");
+    assert_pass(&v, "cpu-healthy-dip");
+    let c = &v.json["measures"]["alarm_cleared"];
+    let after: Vec<f64> = c["after"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_f64)
+        .collect();
+    eprintln!("cpu-healthy-dip: the recovery's beats {after:?} against {floor} and {recovered}");
+    assert!(
+        after.iter().any(|&f| f >= floor && f < recovered),
+        "cpu-healthy-dip: the dip is not among the judged beats: {c}"
+    );
+    assert!(after.iter().any(|&f| f >= recovered), "cpu-healthy-dip: {c}");
+    assert_eq!(
+        v.json["measures"]["alarm_raised"]["raises"], 1,
+        "cpu-healthy-dip: the product does not re-raise over the floor"
+    );
     let mut checked = 0;
     for (tag, alarm, shape, check) in [
         (
@@ -2567,6 +2600,23 @@ fn cpu_starved_passes_on_an_honest_beat_and_reds_on_each_alarm_regression() {
     }
     eprintln!("cpu-starved alarm regressions checked: {checked}");
     assert_eq!(checked, 9);
+    // The sag is a re-raise: 0.1 under the floor, inside the judged beats.
+    let sag = cpu_starved_shaped(true, false, Felt::Honest, AlarmIs::Declared, Shape::SagsAfter);
+    let v = judge(&sag, "cpu-starved", "", "cpu-sags-after");
+    let c = &v.json["measures"]["alarm_cleared"];
+    assert!(
+        c["after"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_f64)
+            .any(|f| f < floor),
+        "cpu-sags-after: the sag is not among the judged beats: {c}"
+    );
+    assert!(
+        v.json["measures"]["alarm_raised"]["raises"].as_u64() >= Some(2),
+        "cpu-sags-after: the product re-raises under the floor"
+    );
     // The startup dip is the product's own alarm on a reading under the floor before the quota (its
     // raise is the run's first), and the run's last raise is the starvation's: the verdict reads
     // the first.
