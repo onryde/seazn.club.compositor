@@ -239,5 +239,5 @@ jobs:
             echo
             echo "The digest is required: promote refuses unless the tag still resolves to it and this release's attestation of it verifies."
             echo
-            echo "It sets \`RELAY_IMAGE=$ref@$DIGEST\` on seazn-club-prod with \`flyctl secrets set --stage\`, then \`flyctl secrets deploy\`."
+            echo "It sets \`RELAY_IMAGE=$RELAY_REGISTRY/$RELAY_APP@$DIGEST\` on seazn-club-prod with \`flyctl secrets set --stage\`, then \`flyctl secrets deploy\`."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -39,7 +39,8 @@ run-name: promote ${{ inputs.env }} ${{ inputs.ref }}
 # in seazn.club's fly.stg.toml or fly.toml (nor in either app's deployed config), and stg's relay
 # settings (FLY_RELAY_APP, RELAY_DRIVERS, RELAY_KEK) are secrets. If it ever becomes an [env] entry,
 # promotion is a seazn.club PR: this workflow then refuses and prints the diff. The value is pinned
-# by digest (<image>:<ref>@sha256:...), so nothing but another promote changes what web runs.
+# by digest alone (<image>@sha256:<the attested pin>, no tag: the PR #85 review's m-10), so nothing
+# but another promote changes what web runs, and no tag a squat could move is in the value.
 #
 # The token guard (a token unset is a warning and a skipped promote) and the CEF bump gate after the
 # checkout (Owed 22) hold here as in the deploy workflows; scripts/check-workflows.sh checks them, the
@@ -223,7 +224,7 @@ jobs:
             *) fail "the registry could not be read for $repo:$tag (only 'not found' means not pushed): $(head -c 300 "$RUNNER_TEMP/inspect.err")" ;;
           esac
           [ "$digest" = "$pin" ] || fail "$repo:$tag resolves to $digest, not the $pin this promote names: the tag moved, nothing promoted"
-          new="$repo:$tag@$digest"
+          new="$repo@$pin"  # m-10: the attested digest alone; the tag only named it
 
           # 4b. Main built it (I-4): the pinned digest carries the attestation deploy-<env>.yml signs
           #     for each push, at this commit (stg: from refs/heads/main; prod: from refs/tags/<tag>).
@@ -290,13 +291,13 @@ jobs:
             if [ "$prev" = "$prev_tag" ]; then
               previous="\`$repo:$prev_tag\` (promote run $prev_run; it named no digest, so nothing can be verified now)"
             elif [ "$rc" -eq 2 ]; then
-              previous="\`$repo:$prev\` (promote run $prev_run; no longer in the registry)"
+              previous="\`$repo@${prev#*@}\` (promote run $prev_run, ref \`$prev\`; no longer in the registry)"
             elif [ "$rc" -ne 0 ]; then
-              previous="\`$repo:$prev\` (promote run $prev_run; the registry could not be read for it)"
+              previous="\`$repo@${prev#*@}\` (promote run $prev_run, ref \`$prev\`; the registry could not be read for it)"
             elif [ "${prev#*@}" != "$prev_digest" ]; then
-              previous="\`$repo:$prev\` (promote run $prev_run; the tag has moved since, to $prev_digest)"
+              previous="\`$repo@${prev#*@}\` (promote run $prev_run, ref \`$prev\`; the tag has moved since, to $prev_digest)"
             else
-              previous="\`$repo:$prev\` (promote run $prev_run)"
+              previous="\`$repo@${prev#*@}\` (promote run $prev_run, ref \`$prev\`)"
               rollback=$prev
             fi
           elif [ -n "$prev_note" ]; then

@@ -96,8 +96,9 @@ if [ "$rc" -eq 0 ] && grep -qF "checked $n_repo workflows" "$W/check.out" && gre
   && grep -qF 'provenance steps before a push guard: 2' "$W/check.out" \
   && grep -qF "fly token jobs behind their workflow's environment: 5" "$W/check.out" \
   && grep -qF 'push environment checks before the first push-token step: 2 of 2' "$W/check.out" \
-  && grep -qF 'build records: 2 of 2 push jobs attest and verify both paths; promote reads 4 of 4 before its first call to web' "$W/check.out"; then
-  ok "check-workflows green on the repo ($n_repo workflows, 3 deploy, 5 promote refusals, 2 provenance steps, 5 token jobs behind their environment, 2 push environment checks, 2 build records)"
+  && grep -qF 'build records: 2 of 2 push jobs attest and verify both paths; promote reads 4 of 4 before its first call to web' "$W/check.out" \
+  && grep -qF "signing grants (id-token / attestations: write): 2 of 2, on the push jobs in relay-stg-push and relay-prod-push alone; $n_repo workflows read" "$W/check.out"; then
+  ok "check-workflows green on the repo ($n_repo workflows, 3 deploy, 5 promote refusals, 2 provenance steps, 5 token jobs behind their environment, 2 push environment checks, 2 build records, 2 signing grants)"
 else
   bad "check-workflows on the repo: rc $rc"; sed 's/^/    /' "$W/check.out" >&2
 fi
@@ -538,6 +539,46 @@ expect_red "i4i promote's attestation check after its first call to web" "promot
 fresh; cp "$W/wf/$STG" "$W/wf/ship.yml"; edit "$W/wf/ship.yml" 'name: deploy-stg' 'name: ship'
 expect_red "i4j an unnamed deploy workflow holding a Fly token" "ship.yml: job gate holds a Fly token, and no environment is known for this workflow"
 
+# m-11. id-token: write and attestations: write sign as the workflow: only the two push jobs, inside
+# their push environments, may hold them, and both must (the attest step cannot sign without them).
+fresh; edit "$W/wf/$STG" '
+permissions: { contents: read }
+' '
+permissions: { contents: read, id-token: write }
+'
+expect_red "m11a (Q3) id-token: write at deploy-stg's workflow level" "deploy-stg.yml (signing grants): the workflow-level permissions grant id-token: write: every job in it could sign as this workflow"
+fresh; edit "$W/wf/promote.yml" 'permissions: { contents: read, actions: read, attestations: read }' 'permissions: { contents: read, actions: read, attestations: write }'
+expect_red "m11b attestations: write at promote's workflow level" "promote.yml (signing grants): the workflow-level permissions grant attestations: write: every job in it could sign as this workflow"
+fresh; edit "$W/wf/$PROD" '    # The token is relay-prod-push'"'"'s: the guard sees it only inside the environment.
+    environment: relay-prod-push
+' '    # The token is relay-prod-push'"'"'s: the guard sees it only inside the environment.
+    environment: relay-prod-push
+    permissions: { contents: read, id-token: write }
+'
+expect_red "m11c id-token: write on deploy-prod's guard job" "deploy-prod.yml (signing grants): job gate grants id-token: write, and only the push job in relay-prod-push may"
+fresh; edit "$W/wf/soak.yml" '
+permissions: { contents: read }
+' '
+permissions: write-all
+'
+expect_red "m11d write-all at soak.yml's workflow level" "soak.yml (signing grants): the workflow-level permissions grant write-all: every job in it could sign as this workflow"
+fresh; edit "$W/wf/image.yml" 'permissions: { contents: read, packages: write }' 'permissions: { contents: read, packages: write, id-token: write }'
+expect_red "m11e id-token: write on an image.yml job" "image.yml (signing grants): job"
+fresh; edit "$W/wf/$STG" 'permissions: { contents: read, actions: read, id-token: write, attestations: write }' 'permissions: { contents: read, actions: read, id-token: write }'
+expect_red "m11f deploy-stg's push job without attestations: write" "deploy-stg.yml (signing grants): job push in relay-stg-push grants id-token: write, not both id-token: write and attestations: write"
+fresh; edit "$W/wf/$PROD" 'permissions: { contents: read, actions: read, id-token: write, attestations: write }' 'permissions: { contents: read, actions: read }'
+expect_red "m11g deploy-prod's push job with no signing grant" "the push jobs grant id-token: write and attestations: write 1 time(s), not 2: an attest step cannot sign"
+fresh; edit "$W/wf/$STG" '    permissions: { contents: read, actions: read, id-token: write, attestations: write }' '    permissions: write-all'
+expect_red "m11h write-all on deploy-stg's push job" "deploy-stg.yml (signing grants): job push in relay-stg-push grants write-all, not both id-token: write and attestations: write"
+# m11i: the push job in another environment (relay-stg, promote's) keeps its grants: rule 4 reds the
+# token, and rule 14 must red the grants on its own (the k34 sweep's survivor).
+fresh; edit "$W/wf/$STG" '    timeout-minutes: 90
+    environment: relay-stg-push
+' '    timeout-minutes: 90
+    environment: relay-stg
+'
+expect_red "m11i deploy-stg's push job, grants kept, in relay-stg" "deploy-stg.yml (signing grants): job push grants id-token: write and attestations: write, and only the push job in relay-stg-push may"
+
 # ---------------------------------------------------------------- 2. check-cef-bump.sh
 pin=$(tr -d '[:space:]' < "$root/docker/GSTCEF_COMMIT")
 cef_root() {
@@ -847,7 +888,7 @@ fi
 
 # P1: stg, the happy path.
 state; run_step "$W/promote.sh" RELAY_ENV=stg REF="$SHA@$D_NEW"
-new_value="$REG/seazn-relay-stg:$SHA@$D_NEW"
+new_value="$REG/seazn-relay-stg@$D_NEW"  # m-10: the attested digest alone, no tag a squat could move
 set_line="flyctl secrets set RELAY_IMAGE=$new_value -a seazn-club-stg --stage (token web)"
 if [ "$rc" -eq 0 ] && has "$STATE/log" "$set_line" && has "$STATE/log" 'flyctl auth docker (token push)' \
   && has "$STATE/log" 'flyctl config show -a seazn-club-stg (token web)' \
@@ -859,7 +900,7 @@ if [ "$rc" -eq 0 ] && has "$STATE/log" "$set_line" && has "$STATE/log" 'flyctl a
   && has "$STATE/log" "gh attestation verify oci://$REG/seazn-relay-stg@$D_NEW --repo $REPO --cert-identity $ID_STG --source-ref refs/heads/main --source-digest $SHA --signer-digest $SHA --deny-self-hosted-runners" \
   && [ "$(grep -nF 'gh attestation verify' "$STATE/log" | cut -d: -f1)" -lt "$(grep -nF 'flyctl config show' "$STATE/log" | cut -d: -f1)" ] \
   && has "$W/summary" "| new RELAY_IMAGE | \`$new_value\` |" \
-  && has "$W/summary" "| previous RELAY_IMAGE | \`$REG/seazn-relay-stg:$OLD@$D_OLD\` (promote run 5) |" \
+  && has "$W/summary" "| previous RELAY_IMAGE | \`$REG/seazn-relay-stg@$D_OLD\` (promote run 5, ref \`$OLD@$D_OLD\`) |" \
   && has "$W/summary" "| RELAY_IMAGE's Fly digest | d0 → $(digest_of "$new_value") (Deployed) |" \
   && has "$W/summary" "-f env=stg -f ref=$OLD@$D_OLD\`"; then
   ok "promote P1: stg reads the registry with the push token, verifies main's build record before any call to web, and sets RELAY_IMAGE by digest with the web token, then deploys; previous = run 5 (run 8 is a branch's, run 7 skipped its promote); the rollback pins its digest"
@@ -933,7 +974,7 @@ run_step "$W/promote.sh" RELAY_ENV=stg REF="$SHA@$D_NEW"
 r1=$rc; staged1=$(jq -r '.[] | select(.name == "RELAY_IMAGE") | "\(.digest) \(.status)"' "$STATE/secrets.json")
 : > "$STATE/log"
 run_step "$W/promote.sh" RELAY_ENV=stg REF="$OLD@$D_OLD"
-old_value="$REG/seazn-relay-stg:$OLD@$D_OLD"
+old_value="$REG/seazn-relay-stg@$D_OLD"
 after2=$(jq -r '.[] | select(.name == "RELAY_IMAGE") | "\(.digest) \(.status)"' "$STATE/secrets.json")
 if [ "$r1" -ne 0 ] && [ "$staged1" = "$(digest_of "$new_value") Staged" ] && [ "$rc" -eq 0 ] \
   && has "$STATE/log" "flyctl secrets set RELAY_IMAGE=$old_value -a seazn-club-stg --stage (token web)" \
@@ -945,12 +986,12 @@ fi
 
 # P5: prod, with prod's tokens; its previous ref (run 6) is gone from the registry.
 state; run_step "$W/promote.sh" RELAY_ENV=prod REF="v1.2.3@$D_PROD" "${PROD_TOKENS[@]}"
-if [ "$rc" -eq 0 ] && has "$STATE/log" "flyctl secrets set RELAY_IMAGE=$REG/seazn-relay-prod:v1.2.3@$D_PROD -a seazn-club-prod --stage (token web)" \
+if [ "$rc" -eq 0 ] && has "$STATE/log" "flyctl secrets set RELAY_IMAGE=$REG/seazn-relay-prod@$D_PROD -a seazn-club-prod --stage (token web)" \
   && has "$STATE/log" 'flyctl auth docker (token push)' \
   && has "$STATE/log" 'flyctl secrets deploy -a seazn-club-prod (token web)' && ! has "$STATE/log" 'seazn-club-stg' \
   && has "$STATE/log" "--cert-identity $WFURL/deploy-prod.yml@refs/tags/v1.2.3 --source-ref refs/tags/v1.2.3 --source-digest $C --signer-digest $C" \
   && has "$W/summary" "| commit | $C (on main" \
-  && has "$W/summary" "\`$REG/seazn-relay-prod:v1.0.0@$D_ANY\` (promote run 6; no longer in the registry)" \
+  && has "$W/summary" "\`$REG/seazn-relay-prod@$D_ANY\` (promote run 6, ref \`v1.0.0@$D_ANY\`; no longer in the registry)" \
   && has "$W/summary" 'Rollback: the previous ref cannot be verified now'; then
   ok "promote P5: prod promotes v1.2.3 (its commit on main) on seazn-club-prod with prod's tokens; a vanished previous ref is said"
 else
@@ -1087,7 +1128,7 @@ fi
 state
 jq --arg o "$OLD" --arg d "$D_PROD" '.workflow_runs[3].display_title = "promote stg \($o)@\($d)"' "$STATE/runs.json" > "$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/runs.json"
 run_step "$W/promote.sh" RELAY_ENV=stg REF="$SHA@$D_NEW"
-if [ "$rc" -eq 0 ] && has "$W/summary" "\`$REG/seazn-relay-stg:$OLD@$D_PROD\` (promote run 5; the tag has moved since, to $D_OLD)" \
+if [ "$rc" -eq 0 ] && has "$W/summary" "\`$REG/seazn-relay-stg@$D_PROD\` (promote run 5, ref \`$OLD@$D_PROD\`; the tag has moved since, to $D_OLD)" \
   && has "$W/summary" 'Rollback: the previous ref cannot be verified now' && ! has "$W/summary" '-f ref='; then
   ok "promote P15 (m-5): a previous pinned ref whose tag moved is said, with no rollback offered"
 else
@@ -1135,7 +1176,7 @@ for row in "${sq_rows[@]}"; do
 done
 sq_state "$GOOD_SQ"
 run_step "$W/promote.sh" RELAY_ENV=stg REF="$SHA@$D_SQ"
-if [ "$rc" -eq 0 ] && has "$STATE/log" "flyctl secrets set RELAY_IMAGE=$REG/seazn-relay-stg:$SHA@$D_SQ -a seazn-club-stg --stage (token web)"; then
+if [ "$rc" -eq 0 ] && has "$STATE/log" "flyctl secrets set RELAY_IMAGE=$REG/seazn-relay-stg@$D_SQ -a seazn-club-stg --stage (token web)"; then
   ok "promote P17 (I-4): the positive pair: main's own record of that digest promotes it ($sq_checked forged or missing records refused)"
 else
   bad "promote P17 positive pair: rc $rc"; show
@@ -1299,15 +1340,16 @@ for found in true false; do
   state; run_step "$W/summary.sh" RELAY_APP=seazn-relay-stg TAG="$SHA" FOUND="$found" DIGEST="$D_NEW"
   if [ "$found" = true ]; then
     want="Found in the registry, not built by this run: \`$REG/seazn-relay-stg:$SHA\` (\`$D_NEW\`)"
-    if [ "$rc" -eq 0 ] && has "$W/summary" "$want" && ! has "$W/summary" 'Pushed' && has "$W/summary" "-f env=stg -f ref=$SHA@$D_NEW"; then
+    if [ "$rc" -eq 0 ] && has "$W/summary" "$want" && ! has "$W/summary" 'Pushed' && has "$W/summary" "-f env=stg -f ref=$SHA@$D_NEW" \
+      && has "$W/summary" "It sets \`RELAY_IMAGE=$REG/seazn-relay-stg@$D_NEW\` on seazn-club-stg"; then
       ok "deploy-stg summary, found: says found, not built by this run, and never Pushed"
     else
       bad "deploy-stg summary, found: rc $rc"; sed 's/^/    /' "$W/summary" >&2
     fi
   else
     if [ "$rc" -eq 0 ] && has "$W/summary" "Pushed and attested as main's build of $SHA" && ! has "$W/summary" 'Found in the registry' \
-      && has "$W/summary" "-f env=stg -f ref=$SHA@$D_NEW"; then
-      ok "deploy-stg summary, pushed: says pushed and attested"
+      && has "$W/summary" "-f env=stg -f ref=$SHA@$D_NEW" && has "$W/summary" "It sets \`RELAY_IMAGE=$REG/seazn-relay-stg@$D_NEW\` on seazn-club-stg"; then
+      ok "deploy-stg summary, pushed: says pushed and attested, and RELAY_IMAGE by its digest alone"
     else
       bad "deploy-stg summary, pushed: rc $rc"; sed 's/^/    /' "$W/summary" >&2
     fi
@@ -1316,8 +1358,8 @@ done
 extract "$PROD" push summary "$W/summary.sh"
 state; run_step "$W/summary.sh" RELAY_APP=seazn-relay-prod TAG=v1.2.3 FOUND=true DIGEST="$D_PROD"
 if [ "$rc" -eq 0 ] && has "$W/summary" 'Found in the registry, not built by this run' && ! has "$W/summary" 'Pushed' \
-  && has "$W/summary" "-f env=prod -f ref=v1.2.3@$D_PROD"; then
-  ok "deploy-prod summary, found: says found, not built by this run, and never Pushed"
+  && has "$W/summary" "-f env=prod -f ref=v1.2.3@$D_PROD" && has "$W/summary" "It sets \`RELAY_IMAGE=$REG/seazn-relay-prod@$D_PROD\` on seazn-club-prod"; then
+  ok "deploy-prod summary, found: says found, not built by this run, and never Pushed; RELAY_IMAGE by its digest alone"
 else
   bad "deploy-prod summary, found: rc $rc"; sed 's/^/    /' "$W/summary" >&2
 fi
