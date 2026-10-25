@@ -5,13 +5,15 @@
 #   category of the tree, the renderer by its client id, the compositor's busiest thread, memory,
 #   a process that died, one whose pid was reused, and nothing printed for the first read; the
 #   expected cores are worked by hand from the trees' jiffies (CPU-seconds over wall seconds);
-# - its kill-renderer on this test's own sleeps: the renderers die, the GPU process lives, and a
-#   tree with no renderer fails;
+# - its kill-renderer on this test's own sleeps: the newest renderer (the highest client id) dies,
+#   the other renderers and the GPU process live, a second call repeats the first from its mark and
+#   kills nothing, and a tree with no numbered renderer fails;
 # - leg.sh on a stub flyctl: the script sent after a refused try, the sampler restarted after its
 #   session drops, one kill at the drive's midpoint (an unreachable try is tried again, a reached one
 #   never), and an exit once the compositor Machine is gone;
-# - the verdict (verdict.sh, cost.jq) on fixture.py's green leg, worked by hand, and one red per
-#   check, each red failing that check alone, by its reason; and table.sh over two verdicts;
+# - the verdict (verdict.sh, cost.jq) on fixture.py's green leg, worked by hand, and the reds: one or
+#   more per check (every guard's own), each failing that check alone, by its reason; the reload
+#   judged from the compositor's own log; and table.sh over two verdicts;
 #
 #   HARNESS_BASH=<bash 5> harness/soak/cost/test-cost.sh        (in-compositor.sh needs bash 5)
 #
@@ -157,39 +159,61 @@ rc=0
 [ "$rc" -eq 64 ] && grep -qF '"error"' "$W/usage.out" && pass "sample without max_s: usage, exit 64" || fail "sample without max_s" "exit $rc"
 
 # --- the renderer kill ---------------------------------------------------------------------------
+# The newest page's renderer only (the highest client id, as C14's in-container.sh: client ids only
+# grow), once: a second call (leg.sh's retry when a reply was lost) repeats the first call's lines
+# from the mark and kills nothing.
 K="$W/kill"
 sleep 300 & r1=$!
 sleep 300 & r2=$!
+sleep 300 & r3=$!
 sleep 300 & g=$!
-kids+=("$r1" "$r2" "$g")
+kids+=("$r1" "$r2" "$r3" "$g")
 mkdir -p "$K/0"
 proc "$K/0" "$r1" cefsrc 1 0 60 '--type=renderer\0--renderer-client-id=7\0'
 proc "$K/0" "$r2" cefsrc 1 0 60 '/opt/cef/chrome --type=renderer --renderer-client-id=9\0\0'
+proc "$K/0" "$r3" cefsrc 1 0 60 '--type=renderer\0'
 proc "$K/0" "$g" cefsrc 1 0 60 '--type=gpu-process\0'
 echo 5000 >"$K/0/now_ms"
+MARK="$W/kill-mark.jsonl"
 rc=0
-COST_PROC_SEQ="$K" "$BASH5" "$IN" kill-renderer >"$W/kill.out" 2>&1 || rc=$?
+COST_PROC_SEQ="$K" COST_KILL_MARK="$MARK" "$BASH5" "$IN" kill-renderer >"$W/kill.out" 2>&1 || rc=$?
 sleep 0.3
 alive() { kill -0 "$1" 2>/dev/null; }
 [ "$rc" -eq 0 ] && pass "kill-renderer: exit 0" || fail "kill-renderer: exit $rc" "$(cat "$W/kill.out")"
-if jq -e -s --argjson a "$r1" --argjson b "$r2" '.[0].at_ms == 5000 and (.[0].killed | sort) == ([$a, $b] | sort)
-     and (.[0].clients | sort) == [7, 9] and .[1].rc == 0' "$W/kill.out" >/dev/null; then
-  pass "kill-renderer: the targets by pid and client id, then rc 0"
+if jq -e -s --argjson a "$r1" --argjson b "$r2" --argjson c "$r3" 'length == 2 and .[0].at_ms == 5000
+     and .[0].killed == [$b] and .[0].clients == [9]
+     and (.[0].renderers | sort_by(.pid)) == ([{pid: $a, client: 7}, {pid: $b, client: 9}, {pid: $c, client: null}] | sort_by(.pid))
+     and .[1].rc == 0' "$W/kill.out" >/dev/null; then
+  pass "kill-renderer: the highest client id's renderer (9 of 7, 9, none) by pid, every renderer seen, then rc 0"
 else
-  fail "kill-renderer: the targets" "$(cat "$W/kill.out")"
+  fail "kill-renderer: the target" "$(cat "$W/kill.out")"
 fi
-if ! alive "$r1" && ! alive "$r2" && alive "$g"; then
-  pass "kill-renderer: both renderers dead, the GPU process alive"
+if alive "$r1" && ! alive "$r2" && alive "$r3" && alive "$g"; then
+  pass "kill-renderer: that renderer dead; the other renderers and the GPU process alive"
 else
-  fail "kill-renderer: who died" "r1 $(alive "$r1" && echo alive || echo dead), r2 $(alive "$r2" && echo alive || echo dead), gpu $(alive "$g" && echo alive || echo dead)"
+  fail "kill-renderer: who died" "r1 $(alive "$r1" && echo alive || echo dead), r2 $(alive "$r2" && echo alive || echo dead), r3 $(alive "$r3" && echo alive || echo dead), gpu $(alive "$g" && echo alive || echo dead)"
 fi
-rm -rf "${K:?}/0/$r1" "${K:?}/0/$r2"
+cmp -s <(head -n 2 "$W/kill.out") "$MARK" && pass "kill-renderer: its lines kept in the mark" || fail "kill-renderer: the mark" "$(cat "$MARK" 2>/dev/null)"
+# The retry: the reply was lost, the call is made again on a tree whose newest renderer is r1 now.
+rm -rf "${K:?}/0/$r2"
+echo 9000 >"$K/0/now_ms"
 rc=0
-COST_PROC_SEQ="$K" "$BASH5" "$IN" kill-renderer >"$W/kill2.out" 2>&1 || rc=$?
-if [ "$rc" -ne 0 ] && jq -e -s '.[0].killed == [] and .[1].rc == 1' "$W/kill2.out" >/dev/null && alive "$g"; then
-  pass "kill-renderer with no renderer: fails, rc 1, kills nothing"
+COST_PROC_SEQ="$K" COST_KILL_MARK="$MARK" "$BASH5" "$IN" kill-renderer >"$W/kill-again.out" 2>&1 || rc=$?
+sleep 0.3
+if [ "$rc" -eq 0 ] && cmp -s <(head -n 2 "$W/kill-again.out") "$MARK" && jq -e -s '.[2] == {repeat_at_ms: 9000} and length == 3' "$W/kill-again.out" >/dev/null \
+  && alive "$r1" && alive "$r3"; then
+  pass "kill-renderer again: the first call's lines repeated from the mark, a repeat line, nothing killed (one kill a leg)"
 else
-  fail "kill-renderer with no renderer" "exit $rc, $(cat "$W/kill2.out")"
+  fail "kill-renderer again" "exit $rc, $(cat "$W/kill-again.out"); r1 $(alive "$r1" && echo alive || echo dead)"
+fi
+rm -rf "${K:?}/0/$r1"
+rc=0
+COST_PROC_SEQ="$K" COST_KILL_MARK="$W/kill-mark2.jsonl" "$BASH5" "$IN" kill-renderer >"$W/kill2.out" 2>&1 || rc=$?
+if [ "$rc" -ne 0 ] && jq -e -s '.[0].killed == [] and .[0].renderers == [{pid: '"$r3"', client: null}] and .[1].rc == 1' "$W/kill2.out" >/dev/null \
+  && alive "$r3" && alive "$g" && [ ! -e "$W/kill-mark2.jsonl" ]; then
+  pass "kill-renderer with no renderer that has a client id: fails, rc 1, kills nothing, leaves no mark"
+else
+  fail "kill-renderer with no numbered renderer" "exit $rc, $(cat "$W/kill2.out")"
 fi
 
 # --- leg.sh, on a stub flyctl ---------------------------------------------------------------------
@@ -272,6 +296,34 @@ if jq -e -s --argjson p $((start_at + 2000)) --argjson k "$kill_ms" \
 else
   fail "leg.sh: cost-kill.jsonl" "$(cat "$L/cost-kill.jsonl" 2>/dev/null)"
 fi
+# A try is started only while its kill can land inside the verdict's window (cost_kill_late_max_s,
+# less the 15 s a try's exec takes to reach the Machine): here a 16 s window, every try unreachable,
+# so one try and no second (soak.json's window holds three).
+FS2="$W/fly2"
+mkdir -p "$FS2"
+cp "$FS/bin/flyctl" "$FS2/flyctl"
+echo 5 >"$FS2/kill-unreachable"
+L2="$W/leg-out2"
+t0=$(ms)
+rc=0
+PATH="$FS2:$PATH" STUB_FS="$FS2" LEG_POLL_S=1 LEG_KILL_TRIES=3 LEG_KILL_WINDOW_S=16 \
+  "$BASH5" "$HERE/leg.sh" --app soak --harness h1 --compositor c1 --out "$L2" --until-ms $((t0 + 30000)) &
+leg=$!
+kids+=("$leg")
+echo "{\"kind\":\"start\",\"at_ms\":$((t0 + 1000)),\"drive_s\":4}" >"$FS2/actions-first"
+for _ in $(seq 1 100); do grep -q 'no try left inside the window' "$L2/cost-leg.log" 2>/dev/null && break; sleep 0.1; done
+touch "$FS2/gone"
+for _ in $(seq 1 100); do kill -0 "$leg" 2>/dev/null || break; sleep 0.1; done
+kill "$leg" 2>/dev/null || true
+tries=$(grep -c 'kill-renderer' "$FS2/calls" 2>/dev/null || echo 0)
+if [ "$tries" -eq 1 ] && grep -q 'no try left inside the window' "$L2/cost-leg.log" && grep -q 'FAIL the kill never ran' "$L2/cost-leg.log"; then
+  pass "leg.sh: no kill try past the window (1 try in a 16 s window, then none), the kill named as never run"
+else
+  fail "leg.sh: the window" "$tries tries; $(grep -E 'kill' "$L2/cost-leg.log" 2>/dev/null | tail -n 4)"
+fi
+w=$(jq -r .cost_kill_late_max_s "$HERE/../soak.json")
+[ "$w" -ge $((15 + 2 * (30 + 2))) ] && pass "soak.json: the kill's window ($w s) holds three tries (15 s to land, two failed ones of 30 s + 2 s before it)" \
+  || fail "soak.json: the kill window" "$w s"
 
 # --- the verdict ---------------------------------------------------------------------------------
 # fixture.py's green leg (its docstring: the numbers worked by hand), and one red per mutation.
@@ -281,16 +333,18 @@ legdir "$W/legs/green"
 rc=0
 "$V" --dir "$W/legs/green" --leg A --camera snow --guest performance-4x >"$W/green.json" 2>"$W/green.txt" || rc=$?
 [ "$rc" -eq 0 ] && pass "verdict: the green leg passes (exit 0)" || fail "verdict: the green leg" "exit $rc: $(grep -E 'FAIL|error' "$W/green.txt" | head -n 5)"
-expect "verdict green: 7 checks, all pass; the leg's spec from soak.json" "$W/green.json" \
-  '.[0] | .status == "pass" and .checked == 7 and all(.checks[]; .status == "pass")
+expect "verdict green: 8 checks, all pass; the leg's spec from soak.json" "$W/green.json" \
+  '.[0] | .status == "pass" and .checked == 8 and all(.checks[]; .status == "pass")
    and .output == "720p" and .template == "bar" and .sport == "cricket" and .cpus == 4'
 expect "verdict green: the window's samples only (585 of 585: not the early one, the duplicate, flyctl's line or a cut one)" "$W/green.json" \
   '.[0].row.samples == {n: 585, expected: 585}'
 expect "verdict green: Machine avg 603/585, p95 by nearest rank 1.0 (25 %), max 1.9" "$W/green.json" \
   '.[0].row.machine == {avg: 1.031, p95: 1, max: 1.9, p95_pct: 25}'
-expect "verdict green: 100 moments in 10 min, the kill 302 s in, graphics ready at the first beat after its 10 s (13 s)" "$W/green.json" \
-  '.[0] | .row.moments == {n: 100, per_min: 10, kinds: {four: 100}}
-   and (.checks[] | select(.id == "reload") | .measured) == {kill_at_s: 302, killed: 1, ready_after_s: 13}'
+expect "verdict green: 100 moments in 10 min, never more than 6 s apart; the kill 302 s in, the compositor's own cef crashed gen=1 0.4 s and cef ready gen=2 4 s after it" "$W/green.json" \
+  '.[0] | .row.moments == {n: 100, per_min: 10, kinds: {four: 100}, longest_gap_s: 6}
+   and (.checks[] | select(.id == "reload") | .measured) == {kill_at_s: 302, killed: 1, crashes: 1, crash_gen: 1, crash_after_s: 0.4, ready_after_s: 4}'
+expect "verdict green: one renderer before the kill and one after (no held page painting beside it); 8 stills of 8" "$W/green.json" \
+  '.[0].row | .renderers == {before_max: 1, after_max: 1} and .stills == {written: 8, asked: 8}'
 expect "verdict green: the tree, the renderer, the busiest thread, the encoder" "$W/green.json" \
   '.[0].row | .cats_avg.renderer == 0.05 and .top_thread == {name: "x264enc:src", p95: 0.4, max: 0.4}
    and .encoder_speed == {median: 1, min: 1} and .dropped_final == 0'
@@ -305,7 +359,7 @@ legdir "$W/legs/at-max" cpu-at-max
 "$V" --dir "$W/legs/green" --leg A --camera snow --guest performance-8x >"$W/8x.json" 2>/dev/null && rc=0 || rc=$?
 expect "verdict: the same samples judged as performance-8x fail on the CPU count (4 read, 8 asked)" "$W/8x.json" \
   '.[0] | .status == "fail" and [.checks[] | select(.status == "fail") | .id] == ["samples"]'
-# red <name> <mutation> <failing check id> <reason fragment>
+# red <name> <mutation> <failing check id> <reason fragment>: that check fails, alone, by that reason
 red() {
   local rc=0
   legdir "$W/legs/$2" "$2"
@@ -317,6 +371,18 @@ red() {
     fail "verdict red: $1" "exit $rc, $(jq -c '[.checks[] | select(.status == "fail") | {id, reason}]' "$W/$2.json" 2>/dev/null)"
   fi
 }
+# red_among: that check fails by that reason, whatever else fails with it (no start: no window at all)
+red_among() {
+  local rc=0
+  legdir "$W/legs/$2" "$2"
+  "$V" --dir "$W/legs/$2" --leg A --camera snow --guest performance-4x >"$W/$2.json" 2>"$W/$2.txt" || rc=$?
+  if [ "$rc" -eq 1 ] && jq -e --arg id "$3" --arg r "$4" '.status == "fail" and ((.checks[] | select(.id == $id)) | .status == "fail" and (.reason | contains($r)))' \
+      "$W/$2.json" >/dev/null; then
+    pass "verdict red: $1 ($3, among $(jq -c '[.checks[] | select(.status == "fail") | .id]' "$W/$2.json"))"
+  else
+    fail "verdict red: $1" "exit $rc, $(jq -c '[.checks[] | select(.status == "fail") | {id, reason}]' "$W/$2.json" 2>/dev/null)"
+  fi
+}
 red "a p95 over 2.0 cores" cpu-over cpu "p95 2.1 cores, over 2"
 red "a stepped beat" stepped rung "1 beat(s) off full (overlay_half_rate"
 red "pre-encoder drops" drops drops "droppedFrames reached 3"
@@ -324,14 +390,30 @@ red "fewer than one moment a minute" few-moments moments "9 moments in 10 min"
 red "the feed carried no event's moments" unread moments "the page's feed carried none of the 100 events"
 red "no kill" no-kill reload "no kill ran"
 red "two kills" two-kills reload "2 kills: one a leg"
-red "a kill 70 s after the midpoint" kill-late reload "the kill came 70 s from the midpoint (0 to 60)"
+red "a kill 110 s after the midpoint" kill-late reload "the kill came 110 s from the midpoint (0 to 100)"
 red "a kill that found no renderer" no-renderer reload "the kill found no renderer"
-red "the page never came back" never-ready reload "no beat after the kill reads graphics ready"
+red "a kill whose status is 1" kill-rc reload "the kill's status: [1]"
+red "a kill with no status line" kill-no-rc reload "no status line from the kill"
+# The reload, by the compositor's own log (the beats every 5 s seldom see it).
+red "no compositor log" no-log reload "no compositor.log: the reload cannot be witnessed"
+red "the kill did nothing the compositor saw" no-crash reload 'no `cef crashed` line in the drive'
+red "two crashes (a retried kill, a second reload)" two-crashes reload '2 `cef crashed` lines in the drive (gens 1, 2): one reload a leg'
+red "the drive's one crash came before the kill" crash-before-kill reload 'the only `cef crashed` (gen 1) came 60 s before the kill'
+red "the page never came back" no-ready reload 'no `cef ready gen=2` after `cef crashed gen=1`'
+red "only the old page came back (an in-place reload, no new build)" ready-same-gen reload 'no `cef ready gen=2` after `cef crashed gen=1`'
+# The beats' fields, the actions and the stills.
+red "beats with no rung field" no-rung-field rung "no beat carried a rung"
+red "beats with no droppedFrames field" no-dropped-field drops "no beat carried droppedFrames"
+red "two start actions" two-starts run "want one start and one end action, got 2 and 1"
+red "no end action" no-end run "want one start and one end action, got 1 and 0"
+red "a drive under leg_min_drive_min" short-drive run "a 590 s drive is under leg_min_drive_min (10 min)"
+red_among "no start action" no-start run "want one start and one end action, got 0 and 1"
+red "no still written" no-stills stills "0 of 8 stills written"
 red "a sample missing every fifth second" few-samples samples "468 samples of 585 (under 0.9)"
 # The table: one column per verdict, in leg order; a file that is not a verdict left out, none at all
 # refused.
 "$HERE/table.sh" "$W/green.json" "$W/cpu-over.json" /etc/hosts >"$W/table.md" 2>"$W/table.err" && rc=0 || rc=$?
-if [ "$rc" -eq 0 ] && [ "$(grep -c '^| ' "$W/table.md")" -eq 18 ] && grep -qF '| **Size rule verdict** | **PASS** | **FAIL**: cpu |' "$W/table.md" \
+if [ "$rc" -eq 0 ] && [ "$(grep -c '^| ' "$W/table.md")" -eq 20 ] && grep -qF '| **Size rule verdict** | **PASS** | **FAIL**: cpu |' "$W/table.md" \
   && grep -qF '| **Machine cores avg / p95 / max (of N)** | **1.031 / 1 / 1.9 (of 4; p95 25 %)** |' "$W/table.md" \
   && grep -qF 'is not a cost verdict: left out' "$W/table.err"; then
   pass "table: two legs' columns, F-005's rows, the failing check named, a non-verdict left out"

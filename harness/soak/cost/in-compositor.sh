@@ -8,13 +8,17 @@
 #   in-compositor.sh sample <max_s>   one JSON line a second for at most max_s seconds (F-005's method:
 #                                     the whole Machine from /proc/stat's first line, and the process
 #                                     tree from each /proc/<pid>/stat's utime + stime)
-#   in-compositor.sh kill-renderer    SIGKILL every CEF renderer (`--type=renderer`), once: the page's
-#                                     renderer dies and cefsrc reloads the page (its
-#                                     OnRenderProcessTerminated). Never the GPU process or a zygote:
-#                                     killing every CEF child aborts the compositor (Owed 62), which
-#                                     is a process restart, not a page reload. Prints its targets
-#                                     before it kills (`at_ms`), then its status (`rc_at_ms`, `rc`);
-#                                     fails when it finds none
+#   in-compositor.sh kill-renderer    SIGKILL the CEF renderer (`--type=renderer`) with the highest
+#                                     `--renderer-client-id` (the newest page's: client ids only
+#                                     grow, as C14's in-container.sh kill-renderer), and nothing
+#                                     else: the compositor reads CefCrashed and rebuilds the page.
+#                                     Never the GPU process or a zygote: killing every CEF child
+#                                     aborts the compositor (Owed 62), a process restart, not a page
+#                                     reload. Prints its target and every renderer seen before it
+#                                     kills (`at_ms`), then its status (`rc_at_ms`, `rc`); fails when
+#                                     no renderer has a numeric client id. Once: the lines go to
+#                                     COST_KILL_MARK (/tmp/seazn-cost-kill.jsonl), and a later call
+#                                     prints them again with `repeat_at_ms` and kills nothing
 #
 # A sample line (cores are CPU-seconds a second, three decimals):
 #
@@ -274,27 +278,40 @@ cmd_sample() {
 }
 
 cmd_kill_renderer() {
-  local d p victims=() clients=() rc=0 out=""
+  local d p chosen="" best=-1 seen="" rc=0 mark="${COST_KILL_MARK:-/tmp/seazn-cost-kill.jsonl}" line
+  # One kill a leg: a call after one that killed (leg.sh's retry when the reply was lost) repeats
+  # that call's lines and kills nothing, so the product sees one crash.
+  if [ -s "$mark" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line"; done <"$mark"
+    clock
+    printf '{"repeat_at_ms":%s}\n' "$NOW_MS"
+    return 0
+  fi
   for d in "$PROC"/[0-9]*; do
     p=${d##*/}
     type_of "$p"
-    if [ "$TYPE" = renderer ]; then
-      victims+=("$p")
-      clients+=("${CLIENT:-null}")
+    [ "$TYPE" = renderer ] || continue
+    seen="${seen:+$seen,}{\"pid\":$p,\"client\":${CLIENT:-null}}"
+    if [ -n "$CLIENT" ] && [ "$CLIENT" -gt "$best" ]; then
+      best=$CLIENT
+      chosen=$p
     fi
   done
   clock
-  local IFS=,
-  printf '{"at_ms":%s,"killed":[%s],"clients":[%s]}\n' "$NOW_MS" "${victims[*]}" "${clients[*]}"
-  unset IFS
-  if [ "${#victims[@]}" -eq 0 ]; then
+  if [ -z "$chosen" ]; then
+    printf '{"at_ms":%s,"killed":[],"clients":[],"renderers":[%s]}\n' "$NOW_MS" "$seen"
     clock
     printf '{"rc_at_ms":%s,"rc":1}\n' "$NOW_MS"
     exit 1
   fi
-  kill -KILL "${victims[@]}" || rc=$?
+  line="{\"at_ms\":$NOW_MS,\"killed\":[$chosen],\"clients\":[$best],\"renderers\":[$seen]}"
+  printf '%s\n' "$line" >"$mark"
+  printf '%s\n' "$line"
+  kill -KILL "$chosen" || rc=$?
   clock
-  printf '{"rc_at_ms":%s,"rc":%s}\n' "$NOW_MS" "$rc"
+  line="{\"rc_at_ms\":$NOW_MS,\"rc\":$rc}"
+  printf '%s\n' "$line" >>"$mark"
+  printf '%s\n' "$line"
   [ "$rc" -eq 0 ]
 }
 

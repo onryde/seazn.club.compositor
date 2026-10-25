@@ -8,16 +8,19 @@
 # 2. waits for the driver's drive start (the first line of the harness's /out/actions.jsonl);
 # 3. at the drive's midpoint, kills the CEF renderer once (in-compositor.sh kill-renderer, over
 #    `flyctl machine exec`), and writes its lines to cost-kill.jsonl with the planned time. A kill
-#    that never reached the Machine (no `at_ms` line) is tried again, at most kill_tries times; one
-#    that printed its targets never is (one kill a leg).
+#    that never reached the Machine (no `at_ms` line) is tried again, at most kill_tries times and
+#    only while a try can land inside the verdict's window (soak.json cost_kill_late_max_s, less
+#    the 15 s a try takes to reach the Machine); one that printed its targets never is. A try whose
+#    reply was lost after the kill gets the first kill's lines back (in-compositor.sh's mark), so
+#    the product sees one crash a leg either way.
 #
 # Writes under --out: cost-samples.jsonl, cost-samples.err, cost-kill.jsonl, cost-leg.log. Nothing
 # here reads or writes a credential: flyctl takes FLY_API_TOKEN from the environment.
 #
 #   harness/soak/cost/leg.sh --app <app> --harness <id> --compositor <id> --out <dir> --until-ms <ms>
 #
-# LEG_POLL_S (default 5) and LEG_KILL_TRIES (default 3) move its pace (test-cost.sh, on a stub
-# flyctl); the workflow sets neither.
+# LEG_POLL_S (default 5), LEG_KILL_TRIES (default 3) and LEG_KILL_WINDOW_S (default soak.json's
+# cost_kill_late_max_s) move its pace (test-cost.sh, on a stub flyctl); the workflow sets none.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -37,6 +40,8 @@ OUT="$(arg out)"
 UNTIL_MS="$(arg until-ms)"
 POLL_S="${LEG_POLL_S:-5}"
 KILL_TRIES="${LEG_KILL_TRIES:-3}"
+KILL_WINDOW_MS=$((${LEG_KILL_WINDOW_S:-$(jq -r .cost_kill_late_max_s "$HERE/../soak.json")} * 1000))
+KILL_LAND_MS=15000 # a try's exec reaches the Machine within this (flyctl's connect)
 [[ "$UNTIL_MS" =~ ^[0-9]+$ ]] || { echo "leg: --until-ms is epoch ms" >&2; exit 64; }
 mkdir -p "$OUT"
 exec >>"$OUT/cost-leg.log" 2>&1
@@ -114,6 +119,10 @@ while [ "$(now_ms)" -lt "$planned" ]; do
 done
 tries=0
 while [ "$tries" -lt "$KILL_TRIES" ]; do
+  if [ $(($(now_ms) + KILL_LAND_MS)) -gt $((planned + KILL_WINDOW_MS)) ]; then
+    log "kill: no try left inside the window ($((KILL_WINDOW_MS / 1000)) s from the midpoint)"
+    break
+  fi
   tries=$((tries + 1))
   out="$(flyctl machine exec "$CID" 'bash /tmp/seazn-cost.sh kill-renderer' -a "$APP" --timeout 30 2>/dev/null | grep -a '^{' || true)"
   if grep -q '"at_ms"' <<<"$out"; then

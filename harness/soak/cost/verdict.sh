@@ -4,9 +4,9 @@
 #
 #   harness/soak/cost/verdict.sh --dir <leg dir> --leg A|B|C|D --camera <picture> --guest <guest> [--jq <jq>]
 #
-# <leg dir> holds cost-samples.jsonl, cost-kill.jsonl, heartbeats.jsonl, actions.jsonl and
-# deliveries.jsonl; a missing file reads as empty, so the check that needs it fails (never passes on
-# nothing). Prints the verdict as JSON on stdout and a table on stderr. Exit 0 on pass, 1 on fail, 64
+# <leg dir> holds cost-samples.jsonl, cost-kill.jsonl, heartbeats.jsonl, actions.jsonl,
+# deliveries.jsonl, compositor.log (flylog.py's), stills.log and stills.tar; a missing file reads as
+# empty, so the check that needs it fails (never passes on nothing). Prints the verdict as JSON on stdout and a table on stderr. Exit 0 on pass, 1 on fail, 64
 # on a usage error, 2 when jq itself failed.
 set -euo pipefail
 
@@ -59,8 +59,59 @@ if bad:
 }
 for f in cost-samples.jsonl cost-kill.jsonl heartbeats.jsonl actions.jsonl deliveries.jsonl; do objects "$f"; done
 
+# The compositor's own graphics lines (crates/app/src/driver.rs graphics_line: `cef ready|crashed
+# gen=<n>`; crates/compositor/src/logged.rs: `graphics restart gen=<n>`), each at the compositor's own
+# `ts=` (the clock kill-renderer's at_ms reads too: the same Machine), else the platform's stamp.
+# The log's absence is said, never read as no crash.
+python3 -I -c '
+import datetime, json, re, sys
+LINE = re.compile(r"(?:^|\s)msg=(cef crashed|cef ready|graphics restart) gen=(\d+)(?:\D|$)")
+TS = re.compile(r"(?:^|\s)ts=(\S+)")
+def ms(stamp):
+    try:
+        t = datetime.datetime.fromisoformat(re.sub(r"(\.\d{6})\d*", r"\1", stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int(round(t.timestamp() * 1000))
+out = open(sys.argv[2], "w")
+try:
+    f = open(sys.argv[1], encoding="utf-8", errors="replace")
+except FileNotFoundError:
+    json.dump({"present": False}, out); out.write("\n"); sys.exit(0)
+json.dump({"present": True}, out); out.write("\n")
+for raw in f:
+    m = LINE.search(raw)
+    if not m:
+        continue
+    t = TS.search(raw)
+    at = ms(t.group(1)) if t else None
+    if at is None:
+        at = ms(raw.split(" ", 1)[0])
+    if at is None:
+        continue
+    json.dump({"at_ms": at, "msg": m.group(1).split()[-1], "gen": int(m.group(2))}, out); out.write("\n")
+' "$DIR/compositor.log" "$W/cef.jsonl"
+
+# The stills: the JPEGs in stills.tar, against the instants stills.log says were asked.
+python3 -I -c '
+import json, re, sys, tarfile
+written = 0
+try:
+    with tarfile.open(sys.argv[1]) as t:
+        written = sum(1 for m in t.getmembers() if m.isfile() and m.name.endswith(".jpg"))
+except (FileNotFoundError, tarfile.TarError):
+    pass
+asked = 0
+try:
+    asked = sum(1 for l in open(sys.argv[2]) if re.match(r"stills: [a-z0-9-]+ at \d+:", l))
+except FileNotFoundError:
+    pass
+print(json.dumps({"written": written, "asked": asked}))
+' "$DIR/stills.tar" "$DIR/stills.log" >"$W/stills.json"
+
 out="$("$JQ" -n --slurpfile samples "$W/cost-samples.jsonl" --slurpfile kills "$W/cost-kill.jsonl" \
   --slurpfile beats "$W/heartbeats.jsonl" --slurpfile actions "$W/actions.jsonl" --slurpfile deliveries "$W/deliveries.jsonl" \
+  --slurpfile cef "$W/cef.jsonl" --slurpfile stills "$W/stills.json" \
   --slurpfile soak "$SOAK_JSON" --arg leg "$LEG" --arg camera "$CAMERA" --arg guest "$GUEST" -f "$HERE/cost.jq")" || {
   echo "cost verdict: jq failed" >&2
   exit 2

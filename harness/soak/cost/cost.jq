@@ -8,6 +8,9 @@
 #   $kills     leg.sh's cost-kill.jsonl: the renderer kill's targets (at_ms, killed, planned_ms) and rc
 #   $deliveries the leg's score driver's deliveries.jsonl, each accepted event with the moments the
 #              page's feed makes of it
+#   $cef       the compositor's own graphics lines from compositor.log (verdict.sh): {present}, then
+#              {at_ms, msg: crashed|ready|restart, gen}, at the compositor's clock
+#   $stills    {written, asked}: the JPEGs in stills.tar, the instants stills.log asked for
 #   $soak      harness/soak/soak.json      $leg, $camera, $guest   the leg, its picture, its guest
 # Every number comes from $soak: none is typed here. Each check answers {id, name, status: pass|fail,
 # reason, measured}; a check whose data is missing fails, never passes on nothing. `row` is F-005's
@@ -43,6 +46,9 @@ def check($id; $name; $problems; $measured):
 | ($kill_lines[0] // null) as $k
 | (if $s == null then [] else [$deliveries[] | select(.ok == true and .at_ms >= $s and .at_ms <= $e)] end) as $events
 | [$events[] | .moments | select(type == "array") | .[]] as $moments
+| ([$events[] | select((.moments | type) == "array" and (.moments | length) > 0) | .at_ms] | sort) as $moment_at
+| ($cef[0].present // false) as $log_present
+| [$cef[1:][] | select(type == "object" and (.at_ms | type) == "number")] as $glines
 | (if $drive_s == null then null else (($e - $s) / 60000) end) as $drive_min
 | ($win | map(.machine)) as $m
 | ($win | map(.cats.renderer // empty)) as $rend
@@ -91,19 +97,37 @@ def check($id; $name; $problems; $measured):
        events: ($events | length), unread: $unread}),
 
   # One page reload: the renderer killed once, at the midpoint (within cost_kill_late_max_s), inside
-  # the drive, and a beat after it reads graphics ready (the page is back).
-  ([$all_beats[] | select($k != null and .received_ms > $k.at_ms and .body.graphics == "ready")] | first) as $ready
-  | check("reload"; "one renderer kill at the midpoint, and the page back";
+  # the drive, and the compositor's own word for it: exactly one `cef crashed gen=N` in the drive,
+  # after the kill, then `cef ready gen=N+1` (a new build: a held page's in-place reload says ready
+  # at its old gen). The beats, every 5 s, seldom see a reload, so none is read for it.
+  ([$glines[] | select(.msg == "crashed" and $s != null and .at_ms > $s and .at_ms <= $e)]) as $crashes
+  | ($crashes[0] // null) as $crash
+  | (if $crash == null then null else
+      ([$glines[] | select(.msg == "ready" and .gen == $crash.gen + 1 and .at_ms >= $crash.at_ms and .at_ms <= $e)] | first) end) as $ready
+  | check("reload"; "one renderer kill at the midpoint; the compositor's one crash and the new page ready";
       (if ($kill_lines | length) == 0 then ["no kill ran (leg.sh's cost-kill.jsonl)"]
        elif ($kill_lines | length) > 1 then ["\($kill_lines | length) kills: one a leg"] else [] end)
       + (if $k != null and (($k.killed // []) | length) == 0 then ["the kill found no renderer"] else [] end)
-      + (if $k != null and ($rc_lines | length) > 0 and ($rc_lines | all(.rc == 0) | not) then ["the kill's status: \([$rc_lines[] | .rc])"] else [] end)
+      + (if $k != null and ($rc_lines | length) == 0 then ["no status line from the kill"]
+         elif $k != null and ($rc_lines | all(.rc == 0) | not) then ["the kill's status: \([$rc_lines[] | .rc])"] else [] end)
       + (if $k != null and ($k.at_ms < $k.planned_ms or $k.at_ms > $k.planned_ms + $soak.cost_kill_late_max_s * 1000)
          then ["the kill came \(($k.at_ms - $k.planned_ms) / 1000) s from the midpoint (0 to \($soak.cost_kill_late_max_s))"] else [] end)
       + (if $k != null and $s != null and ($k.at_ms <= $s or $k.at_ms >= $e) then ["the kill fell outside the drive"] else [] end)
-      + (if $k != null and $ready == null then ["no beat after the kill reads graphics ready"] else [] end);
+      + (if $log_present | not then ["no compositor.log: the reload cannot be witnessed"]
+         elif ($crashes | length) == 0 then ["no `cef crashed` line in the drive: the compositor saw no crash"]
+         elif ($crashes | length) > 1 then ["\($crashes | length) `cef crashed` lines in the drive (gens \([$crashes[] | .gen] | map(tostring) | join(", "))): one reload a leg"]
+         elif $k != null and $crash.at_ms < $k.at_ms then ["the only `cef crashed` (gen \($crash.gen)) came \(($k.at_ms - $crash.at_ms) / 1000) s before the kill"]
+         elif $ready == null then ["no `cef ready gen=\($crash.gen + 1)` after `cef crashed gen=\($crash.gen)`"] else [] end);
       {kill_at_s: (if $k == null or $s == null then null else (($k.at_ms - $s) / 1000 | r3) end),
-       killed: (($k.killed // []) | length), ready_after_s: (if $ready == null then null else (($ready.received_ms - $k.at_ms) / 1000 | r3) end)})
+       killed: (($k.killed // []) | length), crashes: ($crashes | length), crash_gen: ($crash.gen // null),
+       crash_after_s: (if $k == null or $crash == null then null else (($crash.at_ms - $k.at_ms) / 1000 | r3) end),
+       ready_after_s: (if $k == null or $ready == null then null else (($ready.at_ms - $k.at_ms) / 1000 | r3) end)}),
+
+  # The stills: something of the programme to look at (the brief: each leg's programme is looked at).
+  check("stills"; "the programme's stills written";
+      (if ($stills[0].asked // 0) == 0 then ["no still asked (stills.log): nothing of the programme to look at"]
+       elif ($stills[0].written // 0) == 0 then ["0 of \($stills[0].asked) stills written"] else [] end);
+      {written: ($stills[0].written // 0), asked: ($stills[0].asked // 0)})
 ]
 | . as $checks
 | ($win | map(.top_thread | select(. != null))) as $tops
@@ -127,7 +151,16 @@ def check($id; $name; $problems; $measured):
       dropped_final: ([$all_beats[] | .body.droppedFrames | numbers] | max),
       rungs: ([$all_beats[] | .body.rung | strings] | group_by(.) | map({(.[0]): length}) | add),
       moments: {n: ($moments | length), per_min: (if $drive_min == null or $drive_min == 0 then null else (($moments | length) / $drive_min | r3) end),
-                kinds: ($moments | group_by(.) | map({(.[0]): length}) | add)},
+                kinds: ($moments | group_by(.) | map({(.[0]): length}) | add),
+                # The mean hides bursts (badminton's game points come late in each game): the longest
+                # stretch of the drive with no moment-making event.
+                longest_gap_s: (if $s == null then null else ([$s] + $moment_at + [$e] | [range(1; length) as $i | .[$i] - .[$i - 1]] | max / 1000 | r3) end)},
+      # Live renderers before the kill, and after it once the new page is up: more than one after is
+      # a page painting beside the live one (the Owed 82/93 shape). Reported, never judged.
+      renderers: (if $k == null then null else
+        {before_max: ([$win[] | select(.t_ms < $k.at_ms) | (.renderers // []) | length] | max),
+         after_max: ([$win[] | select(.t_ms > $k.at_ms + 30000) | (.renderers // []) | length] | max)} end),
+      stills: ($stills[0] // null),
       mem_used_max_mb: ($win | map(.mem_used_mb) | max),
       samples: {n: ($win | length), expected: $expected}
     },
