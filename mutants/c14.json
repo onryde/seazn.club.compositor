@@ -1,0 +1,53 @@
+{
+ "about": "DO NOT MERGE. C14 case 18's mutants b, c and d re-run (mut/owed94-r1, base feat/owed94-egress-backstop, fix round 1 of PR #76). The first run (40149017532) killed them by MediaMTX's idle close at about 9.98 s (reason error), not by the backstop's absence (the PR #76 review's I-1); case 18 now raises MediaMTX's readTimeout above the window. Each leg's target check must PASS unmutated, then FAIL mutated with its controls PASS, and `expect` (jq on the mutated run's verdict.json) must hold: the mechanism, not just the red. b: no Connected backstop arm: no swap after the plant at all (so no destination close either). c: progress readings without the encoded counts: the same. d: the threshold typed in as 15 000: the swap is the backstop's (egress_stalled, no sink 1 error first), past the window's ceiling. A product mutant rebuilds the relay-test-hooks image from the mutated source; the verdict reads the committed harness/thresholds.json.",
+ "mutants": {
+  "b": {
+   "kind": "product",
+   "file": "crates/domain/src/output_link.rs",
+   "old": "            OutputState::Connected if self.egress_flat(now, t) => {",
+   "new": "            OutputState::Connected if false && self.egress_flat(now, t) => { /*MUTb*/",
+   "case": "output-hung",
+   "variant": "hold",
+   "check": "backstop_swap",
+   "controls": [
+    "armed",
+    "planted",
+    "planted_in_drive",
+    "destination_outwaits"
+   ],
+   "expect": ".measures.backstop_swap | .swap_ms == null and .swaps_after == 0 and .errors_before == []"
+  },
+  "c": {
+   "kind": "product",
+   "file": "crates/adapters/src/gst_output.rs",
+   "old": "            encoded: self.shared.ring.encoded(),",
+   "new": "            encoded: Encoded::default(), /*MUTc*/ // the readings never carry the encoders' counts",
+   "case": "output-hung",
+   "variant": "hold",
+   "check": "backstop_swap",
+   "controls": [
+    "armed",
+    "planted",
+    "planted_in_drive",
+    "destination_outwaits"
+   ],
+   "expect": ".measures.backstop_swap | .swap_ms == null and .swaps_after == 0 and .errors_before == []"
+  },
+  "d": {
+   "kind": "product",
+   "file": "crates/domain/src/config.rs",
+   "old": "            output_egress_flat_ms: output_egress_flat_ms(output_backoff_base_ms, output_connect_timeout_ms),",
+   "new": "            output_egress_flat_ms: 15_000, /*MUTd*/ // the question's \"about 15 s\", typed in",
+   "case": "output-hung",
+   "variant": "hang",
+   "check": "backstop_swap",
+   "controls": [
+    "armed",
+    "planted",
+    "planted_in_drive",
+    "destination_outwaits"
+   ],
+   "expect": ".measures.backstop_swap | .reason == \"egress_stalled\" and .errors_before == [] and .planted_to_swap_ms > .ceiling_ms"
+  }
+ }
+}

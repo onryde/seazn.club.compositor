@@ -1,0 +1,258 @@
+name: c14-mutants
+# DO NOT MERGE. C14 case 18's mutants (Owed 94, docs/tasks/C14-chaos-suite.md, amendment 2026-10-25),
+# one leg each, from mutants/c14.json. Branch mut/owed94-r1, base feat/owed94-egress-backstop: b, c and d
+# re-run after PR #76's fix round 1 raised MediaMTX's readTimeout for case 18 (the review's I-1).
+#
+# Each leg runs its case twice. First the case runs unmutated, and its target check must PASS. Then
+# the mutant is applied by an exact-text replace that must match once, and the case runs again. That
+# run must FAIL on the target check, while its control checks still PASS, so a stack that never
+# started cannot count as a kill, and the mutant's `expect` (jq on the mutated run's verdict.json)
+# must hold, so a kill by the wrong mechanism fails the leg. A product mutant rebuilds the
+# relay-test-hooks image (the only image
+# case 18 runs on) from the mutated source.
+# The verdict always reads the committed harness/thresholds.json, never one regenerated from the
+# mutant.
+on:
+  pull_request: {}
+  workflow_dispatch: {}
+permissions: { contents: read }
+defaults:
+  run: { shell: bash }
+jobs:
+  images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions: { contents: read, packages: read }
+    env:
+      RELAY_IMAGE: seazn-relay:${{ github.sha }}
+      RELAY_TEST_HOOKS_IMAGE: seazn-relay-test-hooks:${{ github.sha }}
+      HARNESS_IMAGE: seazn-harness:${{ github.sha }}
+    outputs:
+      commit: ${{ steps.pin.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: gstcefsrc pin (F-001)
+        id: pin
+        run: |
+          commit=$(tr -d '[:space:]' < docker/GSTCEF_COMMIT)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad GSTCEF_COMMIT"; exit 1; }
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR (read)
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build cache (GHCR, read)
+        id: cache
+        run: |
+          ref=
+          if key=$(scripts/cef-cache-key.sh 2> "$RUNNER_TEMP/cache-key.err"); then
+            ref="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/seazn-relay-cache:cef-$key"
+          fi
+          if [ -n "$ref" ] \
+            && docker buildx imagetools inspect --raw "$ref" > "$RUNNER_TEMP/cache.json" 2> /dev/null \
+            && scripts/cef-cache-holds-tree.sh "$RUNNER_TEMP/cache.json" 2> /dev/null; then
+            from="type=registry,ref=$ref"
+          else
+            from="type=gha"
+            [ -z "$ref" ] || from="type=registry,ref=$ref"$'\n'"type=gha"
+          fi
+          echo "build cache: ${ref:-none}"
+          { echo "from<<EOF"; echo "$from"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+      - name: Build the relay image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          tags: ${{ env.RELAY_IMAGE }}
+          load: true
+          push: false
+          cache-from: ${{ steps.cache.outputs.from }}
+      - name: Build the relay-test-hooks image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: relay-test-hooks
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          tags: ${{ env.RELAY_TEST_HOOKS_IMAGE }}
+          load: true
+          push: false
+          cache-from: ${{ steps.cache.outputs.from }}
+      - name: Build the harness image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: harness
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          tags: ${{ env.HARNESS_IMAGE }}
+          load: true
+          push: false
+          cache-from: ${{ steps.cache.outputs.from }}
+      - name: Save the images
+        run: docker save "$RELAY_IMAGE" "$RELAY_TEST_HOOKS_IMAGE" "$HARNESS_IMAGE" | zstd -T0 -3 -q -o "$RUNNER_TEMP/images.tar.zst"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: base-images
+          path: ${{ runner.temp }}/images.tar.zst
+          retention-days: 1
+          compression-level: 0
+
+  mutant:
+    needs: images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions: { contents: read, packages: read }
+    name: ${{ matrix.id }}
+    strategy:
+      fail-fast: false
+      matrix:
+        id: [b, c, d]
+    env:
+      RELAY_IMAGE: seazn-relay:${{ github.sha }}
+      RELAY_TEST_HOOKS_IMAGE: seazn-relay-test-hooks:${{ github.sha }}
+      HARNESS_IMAGE: seazn-harness:${{ github.sha }}
+      ID: ${{ matrix.id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The mutant
+        id: m
+        run: |
+          for f in kind case variant check controls file expect; do
+            echo "$f=$(python3 -I mutants/c14.py "$ID" field "$f")" >> "$GITHUB_OUTPUT"
+          done
+          cat "$GITHUB_OUTPUT"
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/download-artifact@v4
+        with:
+          name: base-images
+          path: ${{ runner.temp }}/images
+      - name: Load the base images
+        run: |
+          zstd -dc "$RUNNER_TEMP/images/images.tar.zst" | docker load
+          rm -f "$RUNNER_TEMP/images/images.tar.zst"
+      - name: Kernel modules for netem
+        run: sudo modprobe -a sch_prio sch_netem cls_u32 || true
+      - name: Baseline (unmutated; the target check must PASS)
+        env:
+          CASE: ${{ steps.m.outputs.case }}
+          VARIANT: ${{ steps.m.outputs.variant }}
+          CHECK: ${{ steps.m.outputs.check }}
+        run: |
+          set +e
+          CASE_RUN=1 harness/run-case.sh "$CASE" ${VARIANT:+"$VARIANT"} > base.log 2>&1
+          code=$?
+          set -e
+          grep -E "^(PASS|FAIL|MEASURE|OWED) |run-case\[" base.log || true
+          echo "baseline exit: $code"
+          if ! grep -qE "^PASS $CHECK( |:|$)" base.log; then
+            echo "::error::baseline: $CHECK did not PASS unmutated, so no kill can be read"
+            exit 1
+          fi
+          echo "baseline: PASS $CHECK"
+      - name: Apply the mutant
+        run: python3 -I mutants/c14.py "$ID" apply
+      - uses: docker/setup-buildx-action@v3
+        if: steps.m.outputs.kind == 'product'
+      - name: Log in to GHCR (read)
+        if: steps.m.outputs.kind == 'product'
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build cache (GHCR, read)
+        if: steps.m.outputs.kind == 'product'
+        id: cache
+        run: |
+          ref=
+          if key=$(scripts/cef-cache-key.sh 2> /dev/null); then
+            ref="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/seazn-relay-cache:cef-$key"
+          fi
+          from="type=gha"
+          [ -z "$ref" ] || from="type=registry,ref=$ref"$'\n'"type=gha"
+          { echo "from<<EOF"; echo "$from"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+      - name: Build the mutated relay-test-hooks image
+        if: steps.m.outputs.kind == 'product'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: relay-test-hooks
+          build-args: GSTCEF_COMMIT=${{ needs.images.outputs.commit }}
+          tags: seazn-relay-test-hooks:mutant
+          load: true
+          push: false
+          cache-from: ${{ steps.cache.outputs.from }}
+      - name: The mutant must red its target check
+        env:
+          KIND: ${{ steps.m.outputs.kind }}
+          CASE: ${{ steps.m.outputs.case }}
+          VARIANT: ${{ steps.m.outputs.variant }}
+          CHECK: ${{ steps.m.outputs.check }}
+          CONTROLS: ${{ steps.m.outputs.controls }}
+          EXPECT: ${{ steps.m.outputs.expect }}
+        run: |
+          [ "$KIND" != product ] || export RELAY_TEST_HOOKS_IMAGE=seazn-relay-test-hooks:mutant
+          echo "relay-test-hooks image: $RELAY_TEST_HOOKS_IMAGE"
+          set +e
+          CASE_RUN=2 harness/run-case.sh "$CASE" ${VARIANT:+"$VARIANT"} > mut.log 2>&1
+          code=$?
+          set -e
+          grep -E "^(PASS|FAIL|MEASURE|OWED) |run-case\[" mut.log || true
+          echo "mutant exit: $code"
+          fail=0
+          if [ "$code" -eq 0 ]; then echo "::error::$ID SURVIVED (the case passed)"; fail=1; fi
+          if ! grep -qE "^FAIL $CHECK \(" mut.log; then echo "::error::$ID: no FAIL $CHECK line"; fail=1; fi
+          for c in $CONTROLS; do
+            if ! grep -qE "^PASS $c( |:|$)" mut.log; then echo "::error::$ID: control $c did not PASS, so the stack's run is in doubt"; fail=1; fi
+          done
+          if [ -n "$EXPECT" ]; then
+            verdict=$(ls harness/out/*-r2/verdict.json 2> /dev/null | head -n 1)
+            if [ -z "$verdict" ]; then echo "::error::$ID: no mutated verdict.json"; fail=1
+            elif jq -e "$EXPECT" "$verdict" > /dev/null; then echo "$ID mechanism holds: $EXPECT"
+            else
+              echo "::error::$ID killed by another mechanism: $EXPECT is false"
+              jq -c '.measures.backstop_swap' "$verdict" || true
+              fail=1
+            fi
+          fi
+          [ "$fail" -eq 0 ] && echo "$ID KILLED by FAIL $CHECK (controls: $CONTROLS)"
+          exit "$fail"
+      - name: Leak gate
+        id: leaks
+        if: always()
+        run: |
+          ok=true
+          for f in harness/out/*/secrets.json; do
+            [ -f "$f" ] || continue
+            jq -e '.scanned > 0 and .leaks == 0' "$f" > /dev/null || { echo "::error::$f"; ok=false; }
+          done
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          [ "$ok" = true ]
+      - name: Out
+        if: always() && steps.leaks.outputs.ok == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutant-${{ matrix.id }}
+          path: |
+            harness/out/*/verdict.json
+            harness/out/*/console.log
+            harness/out/*/report.json
+            harness/out/*/run.json
+            harness/out/*/case.json
+            harness/out/*/compositor.log
+          retention-days: 14
