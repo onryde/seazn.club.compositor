@@ -574,21 +574,30 @@ fn owed_entries_checked(m: &Value, index: &str) -> (usize, usize) {
 
 #[test]
 fn every_owed_entry_names_a_real_check_and_a_real_open_owed_row_with_a_signature() {
-    // The committed manifest: no Owed row is open in chaos.json since Owed 86 left it by the owner's
-    // ruling (2026-10-25, "A": case 6's clock measured, not judged), as Owed 87 did (2026-10-24, "A").
-    // A new row's tags move this count.
+    // The committed manifest: one Owed row is open in chaos.json, Owed 96 (case 15 one-fewer's
+    // `scheduled_changes_shown`, its signature reading that measure 3 times), since Owed 86 left it by
+    // the owner's ruling (2026-10-25, "A": case 6's clock measured, not judged), as Owed 87 did
+    // (2026-10-24, "A"). A row's tags arriving or leaving move this count.
     let m = manifest();
     let index = std::fs::read_to_string(repo().join("docs/_INDEX.md")).unwrap();
     let (checked, sig_reads) = owed_entries_checked(&m, &index);
     eprintln!("committed owed entries checked: {checked}; signature reads: {sig_reads}");
     assert_eq!(
         (checked, sig_reads),
-        (0, 0),
-        "an Owed row's tags are back in chaos.json: this test's committed count moves with them"
+        (1, 3),
+        "an Owed row's tags moved in chaos.json: this test's committed count moves with them"
     );
-    // The same checks over a probe entry, so the sweep is not read on nothing: case 6's alarm_raised
-    // owed to an open test row whose signature reads the case's own measure.
+    // The same checks over a probe entry alone, so the sweep is not read on nothing: case 6's
+    // alarm_raised owed to an open test row whose signature reads the case's own measure. The
+    // committed rows' tags are cleared first, so the probe's count is the probe's.
     let mut probe = m.clone();
+    probe["owed_signatures"] = json!({});
+    probe["owed_titles"] = json!({});
+    for l in probe["legs"].as_array_mut().unwrap() {
+        if let Some(o) = l.as_object_mut() {
+            o.remove("owed");
+        }
+    }
     probe["owed_signatures"]["98"] = json!(".measures.alarm_raised.raises >= 1");
     probe["owed_titles"]["98"] = json!("a probe row");
     let mut legs = 0;
