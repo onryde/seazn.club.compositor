@@ -47,7 +47,7 @@ The PDF's kill-switch case is replaced by "CEF killed".
 | 3 | `reader-kicked` | kick the SRT reader every 20 s, 6 times | after each kick, strip frames return ≤ `BUDGET_RETURN_TO_LIVE_MS + input_backoff_cap_ms`; heartbeats show `inputKickAlert: true` once `kick_alert_count` kicks fall in `kick_window_ms`, and **not before** (assert the first `true` beat comes after kick #`kick_alert_count`); `output_outages == []` |
 | 4 | `dest-disconnect` | at 20 s `netem out loss 100%`; at 50 s `clear`; run 80 s | output resumes ≤ `BUDGET_OUTPUT_RECONNECT_MS` after clear; the programme lost per outage, measured as the counter gap across the outage minus the outage wall span, is ≤ `BUDGET_OUTPUT_LOST_MAX_MS` worth of frames; heartbeats show `input: connected` throughout (input untouched); `pipelineRebuilds` unchanged |
 | 5 | `dest-stall` | at 20 s `netem out rate 1kbit` (accepts, but no acks); at 50 s `clear` | a `sinkSwaps` increase appears in a beat ≤ `output_ack_stall_ms + heartbeat_interval_ms` after 20 s; output recovers after clear as in case 4 |
-| 6 | `cpu-starved` | start a `stress-ng --cpu 4` sidecar in the compositor netns/cgroup at 20 s, for 40 s | `fps_mean` over the window stays ≥ 29.5 (the clock holds); `pts_gaps == []`; ~~heartbeats show `droppedFrames` increase **or** `rung != "full"`, and at least one of them changes~~ (amended 2026-10-25, Owed 86: the honest beat reads under `output_fps_floor` and its alarm raises in the window and clears after it, and the ladder never moves; see "Amendment 2026-10-25, case 6's honest beat"); after stress ends, `encoderSpeed ≥ $t.encoder_speed_realtime_min` within `BUDGET_LADDER_REALTIME_MS` |
+| 6 | `cpu-starved` | start a `stress-ng --cpu 4` sidecar in the compositor netns/cgroup at 20 s, for 40 s | ~~`fps_mean` over the window stays ≥ 29.5 (the clock holds); `pts_gaps == []`;~~ (amended 2026-10-25, the owner's "A": the clock's rate, PTS gaps and score changes are measured in case 6, never gated); ~~heartbeats show `droppedFrames` increase **or** `rung != "full"`, and at least one of them changes~~ (amended 2026-10-25, Owed 86: the honest beat reads under `output_fps_floor` and its alarm raises in the window and clears after it, on the log and on the wire, and the ladder ~~never moves~~ steps only on the overruns its own rule counts; see "Amendment 2026-10-25, case 6's honest beat" and its fix round 1); after stress ends, `encoderSpeed ≥ $t.encoder_speed_realtime_min` within `BUDGET_LADDER_REALTIME_MS` |
 | 7 | `score-down` | `POST fake-control /control/score-down?ms=60000` at 20 s | heartbeats show `scoreStale: true` within 10 s (spec §6, page side) + one beat interval; the overlay index never changes during the outage and never regresses; `scoreStale: false` after the first poll following recovery |
 | 8 | `cef-killed` | at 20 s `docker exec compositor pkill -KILL -f cef` | the overlay strip shows the **same** index (held frame) with no transparent gap; camera strip frames continue (no freeze > 2 frames); ~~heartbeats go `graphics: restarting` → `ready`~~ (amended 2026-10-18, Owed 19: restart evidence, see "Amendment 2026-10-18"); `output_outages == []` |
 | 9 | `process-killed` | at 20 s `docker exec compositor pkill -KILL -x compositor` (tini exits non-zero, compose's `on-failure:2` restarts it) | output resumes ≤ `BUDGET_PROCESS_RESTART_OUTPUT_MS` after the kill; heartbeats resume; fake-control sees the **same** `SESSION_ID`; `counter_regressions == 0` |
@@ -899,8 +899,9 @@ none an owner ruling. Decision log "C14 case 16 wired".
   by dump-thresholds on the merged tree, never merged by hand. It adds `reaper_kill_after_ms` and
   `teardown_leak_after_ms` to main's, and `output_stall_after_ms` and `output_progress_poll_ms`
   stay retired. thresholds.rs now counts `pairs + 4 + retired`. Both C14 amendments and both
-  _INDEX rows are kept. **Expected reds of the next run:** cpu-starved (Owed 86) only. Both
-  cef-leaks legs must pass, and no Owed 87 red is expected. Anything else is NOT OWED.
+  _INDEX rows are kept. ~~**Expected reds of the next run:** cpu-starved (Owed 86) only. Both
+  cef-leaks legs must pass, and no Owed 87 red is expected. Anything else is NOT OWED.~~
+  (Superseded by case 6's amendment and its fix round 1: none.)
 
 ## Amendment 2026-10-25, Owed 94's backstop (branch `feat/owed94-egress-backstop`)
 
@@ -995,8 +996,8 @@ rules out, so it could never pass. The PR #69 review's m1 is answered.
   - `alarm_cleared` (c): the first clear after that raise comes once the quota is lifted, within
     `budget_ladder_realtime_ms` + `heartbeat_interval_ms` (realtime_after's window). A beat in that
     window reads `output_fps_recovered`.
-  - `ladder_unmoved` (d): every beat that carries a rung reads `full`. A step is now a red. This
-    replaces `ladder_moved`.
+  - ~~`ladder_unmoved` (d): every beat that carries a rung reads `full`. A step is now a red.~~
+    This replaces `ladder_moved`. (Fix round 1: `ladder_justified`, the ladder's logic unchanged.)
 - **Levels from the product.** thresholds.json gains `output_fps_floor` (28.5,
   `OutputProfile::P720.fps_floor()`) and `output_fps_recovered` (29.5, `fps_recovered()`). No
   harness file types either number. `starvation_applied` now reads `output_fps_floor` where it read
@@ -1011,7 +1012,8 @@ rules out, so it could never pass. The PR #69 review's m1 is answered.
   clock (`window_fps` 17.8 against 29.5, 5 PTS gaps, 6 of 25 score changes never shown). That run
   was re-judged locally by this verdict, over its own compositor.log, under jq 1.7.1 and 1.8.2. The
   five honest-beat checks pass:
-  - 20 beats were parsed and 7 judged, at 17.6 to 20.5 fps.
+  - 20 beats were parsed and 7 judged, at 17.6 to ~~20.5~~ 20.27 fps (fix round 1, m4: 20.46 is
+    the straddling raise beat, which the window excludes).
   - The alarm was raised 4.6 s into the quota at 20.46 fps.
   - It cleared 4.7 s after the quota ended, at 83.67 fps.
   - The ladder never moved.
@@ -1022,7 +1024,7 @@ rules out, so it could never pass. The PR #69 review's m1 is answered.
   none at or over the floor. A clock lost behind a beat that lied, or behind a ladder that stepped,
   reads NOT OWED. Whether the clock is still owed at this share now that the ladder is ruled out is
   **owed to the owner, via the coordinator**. If it is not, the three become measures and case 6
-  goes green.
+  goes green. (Decided 2026-10-25, the owner's "A": measures. See fix round 1.)
 - **Tests.** case_verdicts.rs folds the domain's own `StarvationAlarm` through the simulation's
   readings. It cross-checks the simulated alarm lines against `domain::starvation` and the levels
   against thresholds.json, so the expected values come from the product's declarations. The three
@@ -1049,9 +1051,130 @@ rules out, so it could never pass. The PR #69 review's m1 is answered.
   pin. logfacts' parse, 4 more, each killed by `the_honest_beat_lines_are_read_with_their_rates`:
   the integer digits or the fraction digits not required, `f64` parsing in place of `decimal` (a
   `floor=NaN` near miss), and the raised line's separator loosened.
-- **Expected reds of the next run:** cpu-starved, on `window_fps`, `pts_gaps` and
+- ~~**Expected reds of the next run:** cpu-starved, on `window_fps`, `pts_gaps` and
   `scheduled_changes_shown` only, each read "Owed 86" by its signature. The five honest-beat checks
-  must pass. Anything else is NOT OWED. This supersedes the case 16 amendment's line.
+  must pass. Anything else is NOT OWED. This supersedes the case 16 amendment's line.~~ (Superseded
+  by fix round 1: none.)
+
+### Fix round 1, 2026-10-25 (the PR #77 review: Needs fixes, 0 Critical, 3 Important, 6 Minor)
+
+The coordinator dispatched this round from the review. Folded into it is the owner's ruling of
+2026-10-25, "A" (given to the coordinator in chat, "Apply rec", relayed by the coordinator). Case 6
+now runs 23 checks.
+
+- **I1: the wire beat is judged too.** The beat has two writers of one number. One is the driver's
+  log line (`{:.2}`). The other is the control plane's `fps` on the wire, which control_http.rs's
+  `fps_wire` rounds to one decimal. (b) now reads both.
+  - `wire_below_floor`: every wire beat whose `received_ms` lies in `[stress +
+    heartbeat_interval_ms, stress_done]` and carries `fps` reads under `output_fps_floor`, and at
+    least one is judged.
+  - `wire_agrees_with_log`: each judged log beat has a wire beat within half a beat of it. The two
+    agree within half the wire's 0.1 plus half the log's 0.01 (0.055).
+  - A test pins `fps_wire`'s rounding in control_http.rs, and CI's pairs from run 40143263604:
+    20.27 against 20.3, and 19.54 against 19.5.
+  - The sims write each beat's wire `fps` with the product's rounding. Five more cover the wire:
+    it lies at the full rate while the log is honest (both wire checks red), it is offset by 1 fps,
+    one judged beat has no `fps`, and there is no wire `fps` at all.
+- **I2: the four surviving semantic mutants.** Each now has a sim whose right answer differs from
+  the mutant's.
+  - `all` in place of `any`: one full-rate judged beat among starved ones, on both writers
+    (cpu-one-full).
+  - `clear_from_done_ms >= 0` in place of `!= null`: a clear while the quota is still on
+    (cpu-clears-early).
+  - First raise in place of last: a raise on a startup dip before the quota, cleared, then the real
+    raise (cpu-startup-dip). `alarm_raised` reads the first raise, so this is a red by design.
+  - Recovery from `stress` in place of from the quota's end: the good run itself.
+- **I3: (d) means the ladder's logic is unchanged, not that the ladder never moves** (the
+  coordinator, medium, 2026-10-25).
+  - `ladder_unmoved` is replaced by `ladder_justified`. The first step off `full` passes when
+    droppedFrames rose by at least `ladder_overruns_to_step` up to the stepped beat. The rise is
+    counted from the last beat a full `ladder_window_ms` before the last `full` beat (C09's rule:
+    the beats count overruns as droppedFrames).
+  - An unjustified step is a red, and so is a step with no overrun counted.
+  - `rungs_known` and `rung_holds` (C05's rungs, and never back to `full` after a step) judge again.
+  - The ladder sims: cpu-step is now a PASS. cpu-uncounted and cpu-unjustified (droppedFrames one
+    short of the rule) red `ladder_justified`. cpu-climbs reds `rung_holds`. A `fast_preset` rung
+    reds `rungs_known`. No rung at all reds `ladder_justified`.
+  - **Deferred:** the other half of the rule, a ladder that should have stepped and did not. The
+    beats carry droppedFrames per beat, not each overrun's time, so "3 within 1000 ms" cannot be
+    read from them. The rise check is a necessary condition only.
+- **The minors.**
+  - m1: recovery is judged on every beat whose window opens past the quota,
+    `[stress_done + heartbeat_interval_ms, stress_done + bound_ms)`, and each must read
+    `output_fps_recovered`. The catch-up burst (CI: 83.67) can no longer satisfy it alone, and a
+    sag after the clear is a red (cpu-sags-after). An empty set is a red (cpu-no-after).
+    **Deferred:** a re-raise after that window. The review's gap hunt found that a fatal error
+    during the drain can log a near-zero beat and raise after it (Owed 91's mid-drain gap), so
+    "no raise after the clear" would red the drain.
+  - m2: `beat_levels_known`. Every beat line and every raise logs `output_fps_floor` as its level,
+    and every clear logs `output_fps_recovered`. A session at another profile reds by name; the
+    other-floor and other-recovered sims cover it.
+  - m3: one comment line in `HONEST` about the `[28.495, 28.5)` rounding boundary.
+  - m4: the judged beats read 17.6 to 20.27 fps; 20.46 is the straddling raise beat, which the
+    window excludes on purpose. Corrected above, in _INDEX row 86 and in the PR body. The case 16
+    amendment's expected-reds line is struck.
+  - m5: moot. Owed 86's signature is gone (below).
+  - m6: a missing `stress` or `stress_done` mark has its own reason line (cpu-nostart).
+  - **Deferred:** the gap hunt's second beat phase (a beat 0.5 s after `stress`). The window's
+    bounds are killed by count assertions; a value witness was not asked for in this round.
+- **The clock, measured: the owner, 2026-10-25, "A" (relayed by the coordinator).** In case 6 only,
+  `window_fps`, `pts_gaps` and `scheduled_changes_shown` are measures, not gates. The case starves
+  the CPU below what performance-4x is sized for, and the ladder and lite mode are ruled out. Viewer
+  quality on real CPU is gated by the soak (overlay on air 25/25) and by C15's cost legs (the size
+  rule; the owner's 2026-10-18 rule, "measure, and raise the CPU size").
+  - Each value carries its sample count: the window's frames and span, the recording's frames, and
+    the changes due. `clock_measured` reds a clock read on nothing: no window, a recording of fewer
+    than two frames, or no change due.
+  - `CASE_KEY` is `clock_measured`, so run-chaos.sh's table shows the three values on case 6's row,
+    and the case's log prints each `MEASURE` line.
+  - Every other case keeps its own clock checks. A sim judges CI's lost clock (6 of 25 changes
+    unshown, 5 PTS gaps, the rate under the bar): case 6 passes, and the same recording still reds
+    input-impaired's `pts_gaps`.
+  - Owed 86's tags leave chaos.json: its signature, its title and case 6's owed map. This follows
+    Owed 87's precedent. A red on case 6 now reads NOT OWED. chaos_table.rs's owed tests run over
+    a probe row, 98, in a copy of the manifest. A new test pins that both decided rows (86 and 87)
+    are gone from every map and leg.
+- **Owed 96 in case 6** (the coordinator, from PR #79's finding). The due set was bounded by the
+  last frame whose overlay read (`map(select(.[2] != null)) | last`). A page that goes off air
+  would then cut the due set short and read 0 unshown. It is now bounded by the programme's last
+  frame (`frames_table | last | .[0]`), less the frame-to-encoder lag. The sim cpu-off-air-later
+  takes the page off air 3 s after the quota. Its expected missing indices come from the world's
+  own schedule: 6 changes unshown of 20 due. `score_on_air` still reds it by name, and
+  `clock_measured` passes. CI's run 40143263604 re-judges unchanged: 25 due, 6 missing.
+- **CI's run 40143263604, re-judged locally** by this verdict over its own compositor.log, under
+  jq 1.7.1 and 1.8.2: PASS, 23 checks, 0 failures.
+  - 7 wire beats judged, at [20.3, 20.0, 19.5, 20.2, 20.0, 19.4, 17.6]; none missing, none
+    disagreeing.
+  - The recovery beats were [58.8, 30.0].
+  - The ladder never stepped, so it is justified.
+  - The measures: `window_fps` 17.8 against 29.5 (713 frames over 40.0 s), 5 PTS gaps over 2,447
+    frames, and 6 of 25 changes unshown.
+- **Mutants, each predicate once** (copy backup, restored byte-identical and touched; jq 1.8.2; the
+  four case 6 tests, or the named suite): 29 of 29 KILLED.
+  - I2, by name: `beats_below_floor` `all` to `any`, cpu-one-full; `alarm_cleared`'s
+    `clear_from_done_ms >= 0` to `!= null`, cpu-clears-early; the first raise to the last,
+    cpu-startup-dip; the recovery window from `stress`, cpu-good (and with it cpu-step and
+    cpu-clock-lost).
+  - The wire: `wire_below_floor` `all` to `any`, cpu-one-full; without its count, cpu-no-wire.
+    `wire_agrees_with_log` without `missing == 0`, cpu-wire-missing-one; without `disagree == 0`,
+    cpu-wire-lies; without `checked >= 1`, cpu-no-beats. The tolerance ×100, cpu-wire-offset.
+  - The recovery: `all` to `any`, cpu-sags-after; without its count, cpu-no-after.
+  - The ladder: the rise `>= ladder_overruns_to_step` to `> 0`, cpu-unjustified; without the rung
+    count, cpu-no-rung; a step required (`$step == null or` deleted), cpu-good and cpu-clock-lost;
+    the baseline without `- ladder_window_ms`, cpu-step.
+  - The levels: without the beat count, cpu-no-beats; the floor clause `true`, cpu-other-floor; the
+    recovered clause `true`, cpu-other-recovered.
+  - m6's reason line deleted: cpu-nostart.
+  - The clock: `sampled` without the window, cpu-clock-nowindow; without the two frames,
+    cpu-clock-oneframe; without a change due, cpu-clock-nochanges. Each of the three measures made a
+    gate again, cpu-clock-lost. input-impaired's `pts_gaps` made `true`, impaired-clock-lost (the
+    cross-case half of the owner's sim).
+  - Owed 86's signature put back in chaos.json:
+    `the_decided_owed_rows_left_chaos_json_with_their_tags` and the owed-entry validator.
+  - Owed 96's line reverted (the due set to the last overlaid frame): cpu-off-air-later, its red
+    run (`missing` read `[]` against the world's 6).
+- **Expected reds of the next run:** none. Case 6 is expected green. Anything red is NOT OWED. This
+  supersedes the line above.
 
 ## Files
 
@@ -1126,9 +1249,14 @@ rules out, so it could never pass. The PR #69 review's m1 is answered.
 - (Amended 2026-10-25, Owed 86, the honest beat) Case 6 judges the beat and its alarm against
   `output_fps_floor` and `output_fps_recovered` from `thresholds.json`, never typed. (a) The alarm
   is raised inside the quota's window. (b) Every judged beat reads under the floor, and at least one
-  is judged; zero judged is a red with its reason. (c) The alarm clears after the quota, within
-  realtime_after's window, and a beat there reads the recovered level. (d) No beat steps off
-  `full`. `ladder_moved` is gone. The clock's three checks stay judged, owed to 86 (its amendment).
+  is judged; zero judged is a red with its reason. Since fix round 1 this holds on the log and on the
+  wire, and the two agree on each judged beat. (c) The alarm clears after the quota, within
+  realtime_after's window, and ~~a beat~~ every beat whose window opens past the quota there reads
+  the recovered level. (d) ~~No beat steps off `full`.~~ The ladder's logic is unchanged: a step off
+  `full` passes only on the overruns its own rule counts (fix round 1; the coordinator, medium).
+  `ladder_moved` is gone. ~~The clock's three checks stay judged, owed to 86 (its amendment).~~ The
+  clock's three values are measured in case 6, each with its sample count, and never gated (the
+  owner, 2026-10-25, "A", relayed by the coordinator). Every other case keeps its clock checks.
 - (Amended 2026-10-20, C11b; Owed 62, 68, 69) Case 8 takes case 9's shape, with a non-zero, non-75 exit and no core
   file. Cases 13–16 prove the in-place restart (exit 75, the final beat's cause, no abort, no core), each with its
   negative run where the brief has one, and case 15's fast loop; cases 1–7 and 9–12 carry the false-positive sweep
