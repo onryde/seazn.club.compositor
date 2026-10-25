@@ -27,22 +27,32 @@ def beats_between($a; $b): [beats[] | select(.received_ms >= $a and .received_ms
 def frames_between($a; $b): [.frames_table[] | select(.[0] >= $a and .[0] < $b)];
 
 # "Back" is held, not one frame (the PR #79 review's gap hunt: a page that paints one frame and goes
-# off air passed every "back" check). On air from $b for $w: the recording reaches $b + $w (a window
-# with no frames proves nothing), and every frame from the first strip frame at or after $b through
-# $b + $w shows the strip. Frame ORDER, not wall time: a restart's catch-up burst lands many frames
-# on one wall ms, the strip-less ones first, so a wall-ms window starting at $b re-reads the outage
-# (every real restart leg of run 40154210504 did). The callers pass $t.resume_after_ms, the domain's
-# own hold-off before a returning source counts as back. A null $b is never back.
+# off air passed every "back" check). On air from $b for $w: every frame from the first strip frame
+# at or after $b through $b + $w shows the strip, and there are at least hold_frames_needed($w) of
+# them: the output's own fps floor (`output_fps_floor`, below which the product raises its
+# starvation alarm) over the window. That count is what makes a window with no frames prove nothing:
+# a recording that ends inside the hold, or an output gap inside it, has too few (the PR #79 confirm
+# pass's C-2; CI's restart legs show 64 to 68, their catch-up burst included). Frame ORDER, not wall
+# time: a restart's catch-up burst lands many frames on one wall ms, the strip-less ones first, so a
+# wall-ms window starting at $b re-reads the outage (every real restart leg of run 40154210504 did),
+# while a strip-less frame AFTER the back frame on its own wall ms is off air after back (C-1). The
+# callers pass $t.resume_after_ms, the domain's own hold-off before a returning source counts as
+# back. A null $b is never back.
 def back_frame($b): .frames_table as $f
   | if $b == null then null
     else first(range(0; $f | length) | select($f[.][0] >= $b and $f[.][2] != null)) // null end;
-def on_air_for($b; $w): .frames_table as $f | back_frame($b) as $i
-  | $i != null and ($f | last | .[0]) >= $b + $w
-  and ($f[$i:] | map(select(.[0] <= $b + $w)) | all(.[2] != null));
+def hold_frames_needed($w): $t.output_fps_floor * $w / 1000 | ceil;
+def hold_window($b; $w): .frames_table as $f | back_frame($b) as $i
+  | if $i == null then null else $f[$i:] | map(select(.[0] <= $b + $w)) end;
+def on_air_for($b; $w): hold_window($b; $w) as $h
+  | $h != null and ($h | length) >= hold_frames_needed($w) and ($h | all(.[2] != null));
 # How long the strip stayed on air from $b: to the first strip-less frame after its back frame, or
 # null when none follows (or $b is null).
 def stayed_ms($b): .frames_table as $f | back_frame($b) as $i
   | if $i == null then null else less(first($f[$i:][] | select(.[2] == null) | .[0]) // null; $b) end;
+# The held window's evidence for a measure: its frames, and how many the hold needs.
+def hold_evidence($b; $w): {stayed_ms: stayed_ms($b), hold_ms: $w,
+  hold_frames: (hold_window($b; $w) | if . == null then null else length end), hold_frames_needed: hold_frames_needed($w)};
 
 # The output outage that spans a process restart: its last packet before the start, its first
 # after the die.

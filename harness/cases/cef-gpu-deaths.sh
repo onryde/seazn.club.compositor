@@ -57,10 +57,11 @@ SPLIT="$DECIDING"' as $line | (dies_after(mark_at("kill")) | first | .at_ms) as 
 
 # The score changes due after the last kill (case 15 one-fewer), as `$due`, with `$k` the last kill:
 # up to the last programme frame or the end request, whichever is first, less the frame-to-encoder
-# budget.
+# budget. With no end request (or no frame) the bound is null and nothing is due: a red that prints
+# `end_request_ms: null`, never a jq error with a null measure (the PR #79 confirm pass's C-3).
 DUE_AFTER_KILL='(mark("kill") | last | .at_ms) as $k
   | ([($r.frames_table | last | .[0]), $run.end_request_ms] | min) as $last
-  | [scheduled[] | select($k != null and .due_ms > $k and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due'
+  | [scheduled[] | select($k != null and $last != null and .due_ms > $k and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due'
 
 require_split() {
   require gpu_death_split "$SPLIT"' | .unread != null and .unread >= 0 and .unread <= $t.budget_gpu_deaths_unread
@@ -128,7 +129,7 @@ case_verdict() {
         | ($due - ($r.overlay.score_index_changes | map(.index))) as $missing
         | (mark("kill") | first | .at_ms) as $k0
         | ([$r.overlay.runs[] | select(.index == null and $k0 != null and .from_ms > $k0)] | max_by(.frames)) as $off
-        | {due_after_last_kill: ($due | length), missing: $missing,
+        | {due_after_last_kill: ($due | length), missing: $missing, end_request_ms: $run.end_request_ms,
            lag_ms: [$r.overlay.score_index_changes[] | select(.due_wall_ms != null and $k != null and .due_wall_ms > $k)
              | .frame_wall_ms - .due_wall_ms] | {min: min, max: max},
            off_air: (if $off == null then null

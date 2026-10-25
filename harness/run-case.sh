@@ -374,8 +374,8 @@ require_overlay_back() {
     and on_air_for(\$back; \$t.resume_after_ms)" \
     "restart_outage($die; $start) as \$o | ($start) as \$s
     | (if \$s == null then null else [.frames_table[] | select(.[0] > \$s and .[2] != null)] | first | .[0] end) as \$back
-    | {back_ms: less(\$back; \$o.from_wall_ms), budget: \$t.budget_process_restart_output_ms,
-       stayed_ms: stayed_ms(\$back), hold_ms: \$t.resume_after_ms}"
+    | {back_ms: less(\$back; \$o.from_wall_ms), budget: \$t.budget_process_restart_output_ms}
+      + hold_evidence(\$back; \$t.resume_after_ms)"
 }
 
 # C11b's in-place restart after <after> (a jq expression): the final beat says why, with

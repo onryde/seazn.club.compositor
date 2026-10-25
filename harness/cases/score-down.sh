@@ -56,8 +56,8 @@ case_verdict() {
   require changes_after_recovery '([.overlay.score_index_changes[] | select(.frame_wall_ms > mark_value("down").score_down_until_ms)] | first | .frame_wall_ms) as $c
     | $c != null and on_air_for($c; $t.resume_after_ms)' \
     '([.overlay.score_index_changes[] | select(.frame_wall_ms > mark_value("down").score_down_until_ms)]) as $c
-    | {changes: ($c | length), first_ms: ($c | first | .frame_wall_ms), stayed_ms: stayed_ms($c | first | .frame_wall_ms),
-       hold_ms: $t.resume_after_ms}'
+    | {changes: ($c | length), first_ms: ($c | first | .frame_wall_ms)}
+      + hold_evidence($c | first | .frame_wall_ms; $t.resume_after_ms)'
   require never_regresses 'index_regressions == []' 'index_regressions | length'
   require_no_false_restart
 }

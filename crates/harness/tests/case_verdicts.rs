@@ -121,6 +121,8 @@ struct World {
     /// The programme records this long past the end request (the final hold's end slate); 0 stops
     /// the recording at the end request.
     tail_ms: i64,
+    /// Changes run.json before it is written (a run whose end request was never recorded).
+    run_patch: Option<fn(&mut Value)>,
 }
 
 impl World {
@@ -184,6 +186,7 @@ impl World {
                 "core_pattern": "core"}),
             report_patch: None,
             tail_ms: 0,
+            run_patch: None,
         };
         let hb = w.ms("heartbeat_interval_ms");
         let mut at = live;
@@ -538,15 +541,16 @@ impl World {
         let mut state = self.control_state.clone();
         state["session_fetches"] = json!(1 + self.restarts);
         let hold = self.ms("final_hold_ms");
-        put(
-            "run.json",
-            &json!({"case": "", "variant": "", "run": "", "name": "", "live_ms": self.live,
-                "drive_start_ms": self.drive, "end_request_ms": self.end,
-                "exit_seen_ms": self.end + hold + 2_000,
-                "compositor": {"status": "exited", "exit_code": 0, "restarts": self.restarts},
-                "restarts_at_live": 0, "last_beat": beats.last().unwrap().1, "events": events,
-                "control_state": state, "cores": self.cores}),
-        );
+        let mut run = json!({"case": "", "variant": "", "run": "", "name": "", "live_ms": self.live,
+            "drive_start_ms": self.drive, "end_request_ms": self.end,
+            "exit_seen_ms": self.end + hold + 2_000,
+            "compositor": {"status": "exited", "exit_code": 0, "restarts": self.restarts},
+            "restarts_at_live": 0, "last_beat": beats.last().unwrap().1, "events": events,
+            "control_state": state, "cores": self.cores});
+        if let Some(patch) = self.run_patch {
+            patch(&mut run);
+        }
+        put("run.json", &run);
         let mut marks = self.marks.clone();
         marks.sort_by_key(|m| m.1);
         let mut case = serde_json::Map::new();
@@ -3411,6 +3415,62 @@ fn cef_killed_restarts_the_process_and_reds_when_the_kill_missed_or_the_death_is
         .count();
     eprintln!("cef-back-burst: {burst} strip-less frames on the back frame's wall ms");
     assert!(burst >= 2, "cef-back-burst: {burst}");
+    // The PR #79 confirm pass's C-1: the same burst, then ONE strip-less frame AFTER the back frame
+    // on the back frame's own wall ms. That frame is off air after back: red (a window that skipped
+    // the back frame's timestamp passed it).
+    let mut w = cef_killed(good(), 133);
+    let start = *w.starts().last().unwrap();
+    w.overlay_none.push((k + 1_200, start + FIRST_PACKET_MS + 900));
+    w.report_patch = Some(|r| {
+        let f = r["frames_table"].as_array_mut().unwrap();
+        let back = (1..f.len())
+            .rev()
+            .find(|&i| !f[i][2].is_null() && f[i - 1][2].is_null())
+            .expect("a strip frame after strip-less ones");
+        let wall = f[back][0].clone();
+        let mut i = back;
+        while i > 0 && f[i - 1][2].is_null() {
+            i -= 1;
+            f[i][0] = wall.clone();
+        }
+        assert!(!f[back + 1][2].is_null(), "the frame after back shows the strip");
+        f[back + 1][0] = wall;
+        f[back + 1][2] = Value::Null;
+    });
+    let v = judge(&w, "cef-killed", "", "cef-back-burst-leaves");
+    assert_fails(&v, "overlay_back", "cef-back-burst-leaves");
+    let back = &v.json["measures"]["overlay_back"];
+    assert_eq!(
+        back["stayed_ms"],
+        json!(0),
+        "cef-back-burst-leaves: off air on the back frame's own wall ms: {back}"
+    );
+    // C-2: back, then an output gap inside the hold (no programme frames for 400 ms) and on air
+    // again. Every frame in the hold shows the strip, but too few frames are in it to call the
+    // output held: red. The floor is the output's own fps floor over the hold, never a literal.
+    let mut w = cef_killed(good(), 133);
+    let start = *w.starts().last().unwrap();
+    let back_at = start + FIRST_PACKET_MS;
+    w.outages.push((back_at + 300, back_at + 700));
+    let v = judge(&w, "cef-killed", "", "cef-back-gap");
+    assert_fails(&v, "overlay_back", "cef-back-gap");
+    let back = &v.json["measures"]["overlay_back"];
+    let floor = w.t["output_fps_floor"].as_f64().unwrap();
+    let hold = w.t["resume_after_ms"].as_f64().unwrap();
+    let needed = (floor * hold / 1000.0).ceil() as u64;
+    let frames = back["hold_frames"].as_u64().unwrap_or(u64::MAX);
+    eprintln!("cef-back-gap: {frames} frames in the hold, {needed} needed: {back}");
+    assert!(
+        frames < needed && back["hold_frames_needed"] == json!(needed) && back["stayed_ms"].is_null(),
+        "cef-back-gap: on air throughout, too few frames: {back}"
+    );
+    // And the healthy restart's hold, for the floor's other side: at least the floor's frames.
+    let v = judge(&cef_killed(good(), 133), "cef-killed", "", "cef-back-held");
+    let back = &v.json["measures"]["overlay_back"];
+    assert!(
+        back["hold_frames"].as_u64().is_some_and(|n| n >= needed),
+        "cef-back-held: {back}"
+    );
 }
 
 /// The kill's status line reads a failed `kill`.
@@ -4396,8 +4456,27 @@ fn cef_gpu_deaths_one_fewer_restarts_nothing_and_reds_on_a_restart() {
         "fewer-nokills: no kill, no Owed 96"
     );
     checked += 1;
+    // The PR #79 confirm pass's C-3: the run never recorded its end request. The bound is null, so
+    // nothing is due: a red whose measure prints the missing end request, never a jq error and a
+    // null measure.
+    let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
+    w.run_patch = Some(|r| r["end_request_ms"] = Value::Null);
+    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-noend");
+    assert_fails(&v, "scheduled_changes_shown", "fewer-noend");
+    let shown = &v.json["measures"]["scheduled_changes_shown"];
+    assert_eq!(
+        (
+            &shown["end_request_ms"],
+            &shown["due_after_last_kill"],
+            &shown["missing"]
+        ),
+        (&Value::Null, &json!(0), &json!([])),
+        "fewer-noend: {shown}"
+    );
+    assert!(shown.is_object(), "fewer-noend: the measure printed: {shown}");
+    checked += 1;
     eprintln!("one-fewer worlds checked: {checked}");
-    assert_eq!(checked, 14);
+    assert_eq!(checked, 15);
 }
 
 #[test]
@@ -5217,6 +5296,17 @@ fn cef_leaks_two_carries_its_leaks_on_air_and_reds_without_the_hold_or_its_witne
         "leaks2-final-hold: the hold is recorded and a change falls due off air in it"
     );
     assert_pass(&v, "leaks2-final-hold");
+    // The PR #79 confirm pass's C-3: no end request recorded. Nothing is due, and the red prints it.
+    let mut w = leaks(hold);
+    w.run_patch = Some(|r| r["end_request_ms"] = Value::Null);
+    let v = judge(&w, "cef-leaks", "two", "leaks2-noend");
+    assert_fails(&v, "overlay_on_air", "leaks2-noend");
+    let on_air = &v.json["measures"]["overlay_on_air"];
+    assert_eq!(
+        (&on_air["end_request_ms"], &on_air["due_after_ready"]),
+        (&Value::Null, &json!(0)),
+        "leaks2-noend: {on_air}"
+    );
     // The newest build ready, then its page holding one frame (a stale score on air).
     let mut w = leaks(hold);
     let ready = w.log.iter().find(|(_, m)| *m == next_ready).map(|l| l.0).unwrap();

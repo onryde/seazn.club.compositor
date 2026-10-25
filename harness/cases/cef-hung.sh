@@ -69,7 +69,7 @@ case_verdict() {
   require overlay_back "$HUNG"' | ([.overlay.runs[] | select(.from_ms >= $gap.to_ms and .index != null)] | first | .from_ms) as $b
     | $ready != null and $gap.to_ms >= $ready.at_ms and $b != null and on_air_for($b; $t.resume_after_ms)' \
     "$HUNG"' | ([.overlay.runs[] | select(.from_ms >= $gap.to_ms and .index != null)] | first | .from_ms) as $b
-    | {gap_to_ms: $gap.to_ms, ready_ms: $ready.at_ms, back_ms: $b, stayed_ms: stayed_ms($b), hold_ms: $t.resume_after_ms}'
+    | {gap_to_ms: $gap.to_ms, ready_ms: $ready.at_ms, back_ms: $b} + hold_evidence($b; $t.resume_after_ms)'
   require camera_continues "$HUNG"' | [.camera.freezes[] | select(.from_ms >= $h.at_ms and .from_ms <= $gap.to_ms + $t.budget_return_to_live_ms and .frames > 2)] == []' \
     "$HUNG"' | [.camera.freezes[] | select(.from_ms >= $h.at_ms and .from_ms <= $gap.to_ms + $t.budget_return_to_live_ms) | .frames]'
   require no_output_outages '.output_outages == []' '.output_outages | length'
