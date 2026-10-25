@@ -36,11 +36,10 @@
 # case_verdicts.rs's to pin: both numbers come from harness/thresholds.json.
 #
 # The programme lost beyond the hang's outage is inside spec §6's output stall row (`output_lost`,
-# budget_output_lost_max_ms; the confirm pass's n-2), as cases 4, 5 and 12 judge theirs. CI read it
-# -2 002, -1 992, +56 and +84 ms (runs 40154724972, 40154728288): sink 2's first segment arrives
-# as a burst the checker re-dates to its name (about 2 s of PTS, as every connection's first
-# segment does, the boot's too), and when the burst shows the camera its first counter is that much
-# older than the date (about -2 s); when it shows the slate, the first counter is the burst's end.
+# budget_output_lost_max_ms; the confirm pass's n-2), as cases 4, 5 and 12 judge theirs, with no
+# floor. CI read -2 002, -1 992, +56 and +84 ms (runs 40154724972, 40154728288): Owed 92's dating of
+# a connection's first segment (F-028), about -2 s when that segment's head shows the camera, about 0
+# when MediaMTX's recorder discarded a sample and its head is the frames before the first keyframe.
 
 case "$CASE_VARIANT" in
   hold | hang) ;;
