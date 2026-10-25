@@ -384,10 +384,11 @@ python3 -I "$HERE/cost/fixture.py" "$W/ctv/g" && python3 -I "$HERE/cost/fixture.
 "$HERE/cost/verdict.sh" --dir "$W/ctv/r" --leg A --camera snow --guest performance-4x >"$W/ctv/red.json" 2>/dev/null || true
 jq -c '.camera = "noise"' "$W/ctv/green.json" >"$W/ctv/green-noise.json"
 two='[{"leg":"A","camera":"snow"},{"leg":"A","camera":"noise"}]'
-if ctab "$two" "soak-77-1-A-snow:$W/ctv/red.json" "soak-77-2-A-snow:$W/ctv/green.json" "soak-77-1-A-noise:$W/ctv/green-noise.json" \
+# Attempt 10 lists before attempt 2 (by name), so taking the last one listed would be wrong.
+if ctab "$two" "soak-77-2-A-snow:$W/ctv/red.json" "soak-77-10-A-snow:$W/ctv/green.json" "soak-77-1-A-noise:$W/ctv/green-noise.json" \
   && grep -qF '# cost legs on performance-4x: 2 of 2 run(s), each its latest attempt' "$W/ct/summary.md" \
   && grep -qF '| **Size rule verdict** | **PASS** | **PASS** |' "$W/ct/summary.md"; then
-  pass "cost table: a re-run leg's latest attempt only (attempt 1's red left out), 2 of 2 runs"
+  pass "cost table: a re-run leg's latest attempt only (attempt 10 over attempt 2's red, by number), 2 of 2 runs"
 else fail "cost table: the latest attempt" "$(head -c 500 "$W/ct/summary.md") $(tail -n 3 "$W/ct/log")"; fi
 if ctab "$two" "soak-77-1-A-snow:$W/ctv/green.json" "soak-77-1-A-noise:"; then fail "cost table: a missing verdict" "exit 0"
 else

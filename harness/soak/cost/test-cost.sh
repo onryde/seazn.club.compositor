@@ -169,8 +169,9 @@ sleep 300 & r3=$!
 sleep 300 & g=$!
 kids+=("$r1" "$r2" "$r3" "$g")
 mkdir -p "$K/0"
-proc "$K/0" "$r1" cefsrc 1 0 60 '--type=renderer\0--renderer-client-id=7\0'
-proc "$K/0" "$r2" cefsrc 1 0 60 '/opt/cef/chrome --type=renderer --renderer-client-id=9\0\0'
+# The highest client id on the LOWER pid, so a pick by listing order (the last one read) is wrong.
+proc "$K/0" "$r1" cefsrc 1 0 60 '/opt/cef/chrome --type=renderer --renderer-client-id=9\0\0'
+proc "$K/0" "$r2" cefsrc 1 0 60 '--type=renderer\0--renderer-client-id=7\0'
 proc "$K/0" "$r3" cefsrc 1 0 60 '--type=renderer\0'
 proc "$K/0" "$g" cefsrc 1 0 60 '--type=gpu-process\0'
 echo 5000 >"$K/0/now_ms"
@@ -181,32 +182,32 @@ sleep 0.3
 alive() { kill -0 "$1" 2>/dev/null; }
 [ "$rc" -eq 0 ] && pass "kill-renderer: exit 0" || fail "kill-renderer: exit $rc" "$(cat "$W/kill.out")"
 if jq -e -s --argjson a "$r1" --argjson b "$r2" --argjson c "$r3" 'length == 2 and .[0].at_ms == 5000
-     and .[0].killed == [$b] and .[0].clients == [9]
-     and (.[0].renderers | sort_by(.pid)) == ([{pid: $a, client: 7}, {pid: $b, client: 9}, {pid: $c, client: null}] | sort_by(.pid))
+     and .[0].killed == [$a] and .[0].clients == [9]
+     and (.[0].renderers | sort_by(.pid)) == ([{pid: $a, client: 9}, {pid: $b, client: 7}, {pid: $c, client: null}] | sort_by(.pid))
      and .[1].rc == 0' "$W/kill.out" >/dev/null; then
   pass "kill-renderer: the highest client id's renderer (9 of 7, 9, none) by pid, every renderer seen, then rc 0"
 else
   fail "kill-renderer: the target" "$(cat "$W/kill.out")"
 fi
-if alive "$r1" && ! alive "$r2" && alive "$r3" && alive "$g"; then
+if ! alive "$r1" && alive "$r2" && alive "$r3" && alive "$g"; then
   pass "kill-renderer: that renderer dead; the other renderers and the GPU process alive"
 else
   fail "kill-renderer: who died" "r1 $(alive "$r1" && echo alive || echo dead), r2 $(alive "$r2" && echo alive || echo dead), r3 $(alive "$r3" && echo alive || echo dead), gpu $(alive "$g" && echo alive || echo dead)"
 fi
 cmp -s <(head -n 2 "$W/kill.out") "$MARK" && pass "kill-renderer: its lines kept in the mark" || fail "kill-renderer: the mark" "$(cat "$MARK" 2>/dev/null)"
-# The retry: the reply was lost, the call is made again on a tree whose newest renderer is r1 now.
-rm -rf "${K:?}/0/$r2"
+# The retry: the reply was lost, the call is made again on a tree whose newest renderer is r2 now.
+rm -rf "${K:?}/0/$r1"
 echo 9000 >"$K/0/now_ms"
 rc=0
 COST_PROC_SEQ="$K" COST_KILL_MARK="$MARK" "$BASH5" "$IN" kill-renderer >"$W/kill-again.out" 2>&1 || rc=$?
 sleep 0.3
 if [ "$rc" -eq 0 ] && cmp -s <(head -n 2 "$W/kill-again.out") "$MARK" && jq -e -s '.[2] == {repeat_at_ms: 9000} and length == 3' "$W/kill-again.out" >/dev/null \
-  && alive "$r1" && alive "$r3"; then
+  && alive "$r2" && alive "$r3"; then
   pass "kill-renderer again: the first call's lines repeated from the mark, a repeat line, nothing killed (one kill a leg)"
 else
-  fail "kill-renderer again" "exit $rc, $(cat "$W/kill-again.out"); r1 $(alive "$r1" && echo alive || echo dead)"
+  fail "kill-renderer again" "exit $rc, $(cat "$W/kill-again.out"); r2 $(alive "$r2" && echo alive || echo dead)"
 fi
-rm -rf "${K:?}/0/$r1"
+rm -rf "${K:?}/0/$r2"
 rc=0
 COST_PROC_SEQ="$K" COST_KILL_MARK="$W/kill-mark2.jsonl" "$BASH5" "$IN" kill-renderer >"$W/kill2.out" 2>&1 || rc=$?
 if [ "$rc" -ne 0 ] && jq -e -s '.[0].killed == [] and .[0].renderers == [{pid: '"$r3"', client: null}] and .[1].rc == 1' "$W/kill2.out" >/dev/null \
