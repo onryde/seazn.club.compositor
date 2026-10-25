@@ -170,7 +170,7 @@ require_common() {
   measure retirements "$RETIREMENTS"
 }
 
-if [ "$RESTART_EXPECTED" = 1 ]; then CASE_CHECKS=24; else CASE_CHECKS=16; fi
+if [ "$RESTART_EXPECTED" = 1 ]; then CASE_CHECKS=25; else CASE_CHECKS=16; fi
 case_verdict() {
   require_common
   if [ "$RESTART_EXPECTED" = 1 ]; then

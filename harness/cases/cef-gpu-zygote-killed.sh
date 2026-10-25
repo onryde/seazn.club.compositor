@@ -38,7 +38,7 @@ zygote_verdict() {
   require_same_session_and_no_core '(starts_after(mark_at("kill")) | first | .at_ms)'
 }
 
-CASE_CHECKS=18
+CASE_CHECKS=19
 case_verdict() {
   zygote_verdict
 }

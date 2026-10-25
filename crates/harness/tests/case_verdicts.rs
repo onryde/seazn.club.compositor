@@ -5643,3 +5643,205 @@ fn every_threshold_a_verdict_or_a_drive_reads_exists() {
         "threshold keys thresholds.json does not carry: {unknown:?}"
     );
 }
+
+/// The verdict ran `check` and it passed (whatever else the world reds).
+fn assert_check_passes(v: &Verdict, check: &str, tag: &str) {
+    assert!(
+        v.lines.iter().any(|l| l.starts_with(&format!("PASS {check}"))),
+        "{tag}: no `PASS {check}` line; failed {:?}",
+        v.json["failed"]
+    );
+}
+
+/// A leg with a back check: (tag, case, variant, its world, its back frame's time).
+type BackLeg = (
+    &'static str,
+    &'static str,
+    &'static str,
+    fn() -> World,
+    fn(&World) -> i64,
+);
+
+/// The PR #79 confirm pass's C-4 (a coordinator decision): a restart that comes back, holds for the
+/// hold and then leaves the air passed every restart leg. `stays_on_air` judges each leg with a back
+/// check from its back frame to the end request: no strip-less run longer than the frames the
+/// frame-to-encoder budget holds, a run at one of the case's own later kills set aside, and an empty
+/// span red.
+#[test]
+fn stays_on_air_reds_a_page_that_leaves_after_coming_back_in_every_leg_with_a_back_check() {
+    let t = World::new(1);
+    let allowance = (t.t["budget_frame_to_encoder_ms"].as_f64().unwrap()
+        / t.t["frame_period_ms"].as_f64().unwrap())
+    .floor() as u64;
+    let good = || json!({"killed": [201, 202, 203], "types": ["zygote", "zygote", "gpu-process"]});
+    let restart_back = |w: &World| *w.starts().last().unwrap() + FIRST_PACKET_MS;
+    // Each leg with a back check, its world and its back: the restart legs' first programme frame
+    // after the restart, cef-hung's strip back after the hide, score-down's first good poll.
+    let legs: Vec<BackLeg> = vec![
+        (
+            "sty-8",
+            "cef-killed",
+            "",
+            || {
+                cef_killed(
+                    json!({"killed": [201, 202, 203], "types": ["zygote", "zygote", "gpu-process"]}),
+                    133,
+                )
+            },
+            |w| *w.starts().last().unwrap() + FIRST_PACKET_MS,
+        ),
+        (
+            "sty-13",
+            "cef-gpu-zygote-killed",
+            "",
+            || zygote("gpu-process", true, "zygote"),
+            |w| *w.starts().last().unwrap() + FIRST_PACKET_MS,
+        ),
+        (
+            "sty-14",
+            "cef-renderer-zygote-killed",
+            "",
+            || zygote("renderer", true, "zygote"),
+            |w| *w.starts().last().unwrap() + FIRST_PACKET_MS,
+        ),
+        (
+            "sty-15t",
+            "cef-gpu-deaths",
+            "threshold",
+            || {
+                let n = World::new(1).ms("cef_gpu_deaths_to_restart") as u32;
+                gpu_deaths(n, 2_000, 800, true, 600)
+            },
+            |w| *w.starts().last().unwrap() + FIRST_PACKET_MS,
+        ),
+        (
+            "sty-15f",
+            "cef-gpu-deaths",
+            "fast",
+            || {
+                let a = World::new(1).ms("chromium_gpu_deaths_abort") as u32;
+                gpu_deaths(a - 1, 700, 350, true, 800)
+            },
+            |w| *w.starts().last().unwrap() + FIRST_PACKET_MS,
+        ),
+        (
+            "sty-16",
+            "cef-leaks",
+            "three",
+            || leaks(World::new(1).ms("cef_leaks_to_restart") as u64),
+            |w| *w.starts().last().unwrap() + FIRST_PACKET_MS,
+        ),
+        (
+            "sty-11",
+            "cef-hung",
+            "",
+            || cef_hung(true),
+            |w| w.overlay_none[0].1,
+        ),
+        (
+            "sty-7",
+            "score-down",
+            "",
+            || score_down(true, false),
+            |w| w.score_blind.unwrap().1 + w.ms("harness_page_poll_ms"),
+        ),
+    ];
+    let mut checked = 0;
+    for (tag, case, variant, make, back_of) in &legs {
+        // Healthy: the span holds frames, none of them off air.
+        let w = make();
+        let v = judge(&w, case, variant, &format!("{tag}-good"));
+        assert_check_passes(&v, "stays_on_air", tag);
+        let m = &v.json["measures"]["stays_on_air"];
+        assert!(
+            m["span_frames"].as_u64().is_some_and(|n| n > 0)
+                && m["longest_frames"] == json!(0)
+                && m["allowance_frames"] == json!(allowance),
+            "{tag}-good: {m}"
+        );
+        // The C-4 probe's shape: back, held 1.5 s (past the hold), then off air to the end.
+        let mut w = make();
+        let back = back_of(&w);
+        w.overlay_none.push((back + 1_500, w.end + 60_000));
+        let v = judge(&w, case, variant, &format!("{tag}-leaves"));
+        assert_fails(&v, "stays_on_air", &format!("{tag}-leaves"));
+        let m = &v.json["measures"]["stays_on_air"];
+        assert!(
+            m["longest_frames"].as_u64().is_some_and(|n| n > allowance),
+            "{tag}-leaves: {m}"
+        );
+        checked += 1;
+    }
+    eprintln!("legs with a back check judged: {checked}");
+    assert_eq!(checked, 8);
+
+    // A blip the allowance holds passes; one frame more reds (cef-killed, 2 s after back).
+    let w = cef_killed(good(), 133);
+    let healthy = judge(&w, "cef-killed", "", "sty-blip-ref");
+    let back = restart_back(&w);
+    let w0 = judged_report("sty-blip-ref", "cef-killed")["frames_table"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f[0].as_i64())
+        .find(|&ms| ms >= back + 2_000)
+        .unwrap();
+    assert_check_passes(&healthy, "stays_on_air", "sty-blip-ref");
+    for (frames, red) in [(allowance, false), (allowance + 1, true)] {
+        let mut w = cef_killed(good(), 133);
+        let from = w0 - 10;
+        w.overlay_none
+            .push((from, from + (frames as f64 * PERIOD_MS) as i64));
+        let tag = format!("sty-blip-{frames}");
+        let v = judge(&w, "cef-killed", "", &tag);
+        let m = &v.json["measures"]["stays_on_air"];
+        assert_eq!(m["longest_frames"], json!(frames), "{tag}: {m}");
+        if red {
+            assert_fails(&v, "stays_on_air", &tag);
+        } else {
+            assert_check_passes(&v, "stays_on_air", &tag);
+        }
+    }
+    // A run at one of the case's own kills after the back frame is set aside (a blip at a later kill
+    // is expected; an off-air run there is Owed 96's shape), however long.
+    let mut w = cef_killed(good(), 133);
+    let later = back + 3_000;
+    w.mark("kill", later, json!({"at_ms": later, "killed": [], "types": []}));
+    w.overlay_none.push((
+        later + 51,
+        later + 51 + ((allowance + 3) as f64 * PERIOD_MS) as i64,
+    ));
+    let v = judge(&w, "cef-killed", "", "sty-later-kill");
+    assert_check_passes(&v, "stays_on_air", "sty-later-kill");
+    let m = &v.json["measures"]["stays_on_air"];
+    assert_eq!(
+        (&m["at_later_kill"], &m["longest_frames"]),
+        (&json!(1), &json!(0)),
+        "sty-later-kill: {m}"
+    );
+    // The span ends at the end request: the final hold's end slate, off air, is not this check's.
+    let mut w = cef_killed(good(), 133);
+    w.tail_ms = w.ms("final_hold_ms");
+    let end = w.end;
+    w.overlay_none.push((end + 500, end + 60_000));
+    let v = judge(&w, "cef-killed", "", "sty-final-hold");
+    assert_check_passes(&v, "stays_on_air", "sty-final-hold");
+    assert!(
+        judged_report("sty-final-hold", "cef-killed")["frames_table"]
+            .as_array()
+            .and_then(|f| f.last())
+            .and_then(|f| f[0].as_i64())
+            .is_some_and(|l| l > end + 500),
+        "sty-final-hold: the hold is recorded"
+    );
+    // Zero frames in the span proves nothing: an end request before the back frame reds.
+    let mut w = cef_killed(good(), 133);
+    w.run_patch = Some(|r| r["end_request_ms"] = json!(0));
+    let v = judge(&w, "cef-killed", "", "sty-empty");
+    assert_fails(&v, "stays_on_air", "sty-empty");
+    assert_eq!(
+        v.json["measures"]["stays_on_air"]["span_frames"],
+        json!(0),
+        "sty-empty"
+    );
+}

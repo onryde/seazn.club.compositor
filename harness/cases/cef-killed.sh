@@ -28,7 +28,7 @@ case_drive() {
   at_s "$CASE_LIVE_S"
 }
 
-CASE_CHECKS=19
+CASE_CHECKS=20
 case_verdict() {
   # Anti-vacuity: the kill reached CEF's children, and the container died.
   require kill_applied '(mark_value("kill") | (.killed | length) >= 1) and (mark("kill_rc") | all(.value.rc == 0))' \

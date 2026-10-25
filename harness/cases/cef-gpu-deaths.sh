@@ -80,9 +80,9 @@ require_restarted() {
 }
 
 case "$CASE_VARIANT" in
-  threshold) CASE_CHECKS=20 ;;
+  threshold) CASE_CHECKS=21 ;;
   one-fewer) CASE_CHECKS=11 ;;
-  fast) CASE_CHECKS=21 ;;
+  fast) CASE_CHECKS=22 ;;
 esac
 case_verdict() {
   # The loop's own end line, when the exec lived to print it (a restart kills the exec with its
