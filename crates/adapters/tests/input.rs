@@ -373,9 +373,9 @@ fn srt_connected(src: &gst::Element) -> bool {
 /// `m_GlobControlLock` in between: `CUDTSocket::getStatus` reports that gap as `SRTS_BROKEN`. On
 /// loopback the handshake completes about a millisecond into the start, which is when the source's
 /// first read runs; when the two met, `srtsrc` posted "Socket is broken or closed" and the
-/// generation was lost before its first frame (CI, 2026-10-24/25: 4 of 96 check runs). A live source
-/// reads only once PLAYING, so a start let go only after the handshake has completed never reads
-/// inside the gap.
+/// generation was lost before its first frame (CI, 2026-10-24/25: 4 of 96 check runs; the product's
+/// exposure is `docs/_INDEX.md` Owed 97). A live source reads only once PLAYING, so a start let go
+/// only after the handshake has completed never reads inside the gap.
 fn wait_held_past_the_handshake(
     input: &GstInput,
     hold: &StartHold,
@@ -397,14 +397,24 @@ fn wait_held_past_the_handshake(
                  {connected}"
             ));
         }
+        // About the loopback handshake's own time (the after-fix loop let starts go ~2 ms in).
         thread::sleep(Duration::from_millis(2));
     }
 }
 
+/// A window in which a loopback handshake would long since have completed, for the guard's "not let
+/// go" verdicts: the after-fix loop (run 40161932973) let every start go about 2 ms in.
+const LOOPBACK_HANDSHAKE_WINDOW: Duration = Duration::from_secs(1);
+
+/// What is left of `deadline`: zero once it has passed.
+fn left(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
 /// Lets the start in `hold` go once the caller's handshake has completed
-/// (`wait_held_past_the_handshake`), inside the domain's connect timeout.
-fn release_past_the_handshake(input: &GstInput, hold: &StartHold, gen: u64) {
-    if let Err(why) = wait_held_past_the_handshake(input, hold, connect_budget()) {
+/// (`wait_held_past_the_handshake`), waiting no longer than `within`.
+fn release_past_the_handshake(input: &GstInput, hold: &StartHold, gen: u64, within: Duration) {
+    if let Err(why) = wait_held_past_the_handshake(input, hold, within) {
         panic!("gen {gen}: {why}");
     }
     hold.release();
@@ -412,17 +422,23 @@ fn release_past_the_handshake(input: &GstInput, hold: &StartHold, gen: u64) {
 
 /// `rebuild(gen)`, its start held until the caller's handshake has completed
 /// (`release_past_the_handshake`). Every rebuild here that expects a connection goes through it.
-fn rebuild_past_the_handshake(input: &mut GstInput, gen: u64, s: &InputSpec) {
+/// Returns the connect's one deadline, the domain's connect timeout from the rebuild: the handshake
+/// and whatever the caller waits for next (`InputConnected`, a frame) share it, as they share the
+/// domain's one timeout.
+fn rebuild_past_the_handshake(input: &mut GstInput, gen: u64, s: &InputSpec) -> Instant {
+    let deadline = Instant::now() + connect_budget();
     let hold = input.hold_starts();
     input.rebuild(gen, s);
-    release_past_the_handshake(input, &hold, gen);
+    release_past_the_handshake(input, &hold, gen, left(deadline));
+    deadline
 }
 
-/// `rebuild(gen)` and wait for its `InputConnected`; returns the time it took.
+/// `rebuild(gen)` and wait for its `InputConnected`, all inside the domain's connect timeout; returns
+/// the time it took.
 fn connect(input: &mut GstInput, rx: &Receiver<Inbound>, gen: u64, s: &InputSpec) -> Duration {
     let t0 = Instant::now();
-    rebuild_past_the_handshake(input, gen, s);
-    let seen = events_until(rx, connect_budget(), |e| *e == Event::InputConnected { gen });
+    let deadline = rebuild_past_the_handshake(input, gen, s);
+    let seen = events_until(rx, left(deadline), |e| *e == Event::InputConnected { gen });
     assert!(
         losses(&seen).is_empty(),
         "no loss before gen {gen} connected: {seen:?}"
@@ -498,7 +514,7 @@ fn the_harness_lets_a_start_go_only_past_its_handshake() {
         assert!(Instant::now() < end, "the start never reached the hold");
         thread::sleep(Duration::from_millis(5));
     }
-    let unanswered = wait_held_past_the_handshake(&unanswered_input, &hold, Duration::from_secs(1));
+    let unanswered = wait_held_past_the_handshake(&unanswered_input, &hold, LOOPBACK_HANDSHAKE_WINDOW);
     eprintln!("nothing listening: {unanswered:?}");
     let why = unanswered.expect_err("a start whose handshake never completed was let go");
     assert!(
@@ -544,7 +560,7 @@ fn the_harness_lets_a_start_go_only_past_its_handshake() {
 
     // Connected, nothing held: not let go.
     let empty = input.hold_starts();
-    let unheld = wait_held_past_the_handshake(&input, &empty, Duration::from_millis(300));
+    let unheld = wait_held_past_the_handshake(&input, &empty, LOOPBACK_HANDSHAKE_WINDOW);
     eprintln!("connected, nothing held: {unheld:?}");
     let why = unheld.expect_err("a start that was not held was let go");
     assert!(
@@ -555,6 +571,60 @@ fn the_harness_lets_a_start_go_only_past_its_handshake() {
     finish(input);
     eprintln!("guard verdicts checked: {verdicts}");
     assert_eq!(verdicts, 3);
+}
+
+/// Production's order, which the harness's hold takes out of every other connecting test here: the
+/// source is PLAYING, its reader already in its read loop, when the caller's handshake completes.
+/// Nothing listens until the source is PLAYING with no handshake (the caller repeats its handshake
+/// request until one is answered, inside SRT's own connect timeout, F-012), and the listener starts
+/// only then, so the handshake completes under a waiting reader. The reader wakes on the first data,
+/// which libsrt delivers only once the socket is connected, and the generation connects with no loss.
+#[test]
+fn a_reader_already_waiting_when_the_handshake_completes_connects() {
+    let _s = serial();
+    let port = free_port();
+    let (mut input, rx, _frames, _lines) = input(&P720);
+    let t0 = Instant::now();
+    let deadline = t0 + connect_budget();
+    input.rebuild(1, &spec(port));
+    let src = loop {
+        let playing = input
+            .pipeline()
+            .and_then(|p| p.by_name("src"))
+            .filter(|src| src.current_state() == gst::State::Playing);
+        if let Some(src) = playing {
+            break src;
+        }
+        assert!(Instant::now() < deadline, "the source never went PLAYING");
+        thread::sleep(Duration::from_millis(2));
+    };
+    let playing_after = t0.elapsed();
+    let handshake_before_the_listener = srt_connected(&src);
+    let l = Listener::start(port, &cfg(640, 360));
+    let seen = events_until(&rx, left(deadline), |e| *e == Event::InputConnected { gen: 1 });
+    let connected_after = t0.elapsed();
+    let second = events_for(&rx, Duration::from_secs(1));
+    eprintln!(
+        "source PLAYING after {playing_after:?}, handshake completed before the listener started: \
+         {handshake_before_the_listener}; connected after {connected_after:?}; {} frames in the next \
+         second; callers {}",
+        frames_in(&second),
+        l.callers.load(Ordering::SeqCst)
+    );
+    assert!(
+        !handshake_before_the_listener,
+        "nothing listened, so no handshake had completed: the reader was waiting first"
+    );
+    assert!(losses(&seen).is_empty(), "{seen:?}");
+    assert!(losses(&second).is_empty(), "{second:?}");
+    assert!(
+        frames_in(&second) >= FRAMES_IN_THE_FIRST_SECOND,
+        "{} frames",
+        frames_in(&second)
+    );
+    assert_eq!(l.callers.load(Ordering::SeqCst), 1, "one handshake completed");
+    drop(src);
+    finish(input);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -676,7 +746,7 @@ fn rebuild_tears_down_the_old_pipeline() {
         thread::sleep(Duration::from_millis(5));
     }
     let gate = input.gate_dropped() - dropped_before;
-    release_past_the_handshake(&input, &hold, 2);
+    release_past_the_handshake(&input, &hold, 2, connect_budget());
     events_until(&rx, connect_budget(), |e| *e == Event::InputConnected { gen: 2 });
     eprintln!(
         "slot and ring reads: {reads}; generation-1 samples dropped at the gate: {gate}; ring \
@@ -926,8 +996,8 @@ fn reconnecting_twice_builds_three_generations_and_leaks_none() {
     let mut all = Vec::new();
     for gen in 1..=3u64 {
         let l = Listener::start(port, &cfg(640, 360));
-        rebuild_past_the_handshake(&mut input, gen, &spec(port));
-        all.extend(events_until(&rx, connect_budget(), |e| {
+        let deadline = rebuild_past_the_handshake(&mut input, gen, &spec(port));
+        all.extend(events_until(&rx, left(deadline), |e| {
             *e == Event::InputConnected { gen }
         }));
         all.extend(events_for(&rx, Duration::from_millis(500)));
@@ -1231,8 +1301,7 @@ fn a_full_inbound_channel_never_holds_the_camera_slot() {
     tx.try_send(Inbound::Event(Event::Tick))
         .expect("fills the channel");
     let (mut input, frames, lines) = input_with(tx, &P720);
-    rebuild_past_the_handshake(&mut input, 1, &spec(l.port));
-    let end = Instant::now() + connect_budget();
+    let end = rebuild_past_the_handshake(&mut input, 1, &spec(l.port));
     while frames.camera().is_none() {
         assert!(Instant::now() < end, "no frame reached the slot");
         thread::sleep(Duration::from_millis(20));
@@ -1455,7 +1524,7 @@ fn late_start(
     }
     thread::sleep(Duration::from_millis(ms));
     during(input);
-    release_past_the_handshake(input, &hold, gen);
+    release_past_the_handshake(input, &hold, gen, connect_budget());
     events_for(rx, Duration::from_secs(3))
 }
 
@@ -1916,9 +1985,10 @@ fn damaged_frames_are_held_back_not_shown() {
 
 /// M1: `stop` while a start is held inside its state change (where a hanging resolver holds it) leaves
 /// no pipeline PLAYING: it goes no further than PAUSED, decodes nothing, and goes to NULL, even with
-/// the teardown held 1.5 s behind it. (The listener may count one caller: `srtsrc` completes the SRT
-/// handshake inside its start, READY→PAUSED, before the hold's message, as it would after a real
-/// resolver came back. What the stop owes is no PLAYING and nothing decoded.)
+/// the teardown held 1.5 s behind it. (The listener may count one caller: `srtsrc` issues its SRT
+/// connect inside its start, READY→PAUSED, and the handshake completes asynchronously, usually just
+/// after the hold's message, as it would after a real resolver came back. What the stop owes is no
+/// PLAYING and nothing decoded.)
 #[test]
 fn stop_during_a_held_start_leaves_nothing_playing() {
     let _s = serial();
@@ -2020,8 +2090,7 @@ fn a_loss_waits_for_room_in_a_full_channel() {
     let l = Listener::start(port, &cfg(640, 360));
     let (tx, rx) = crossbeam_channel::bounded(1);
     let (mut input, frames, _lines) = input_with(tx.clone(), &P720);
-    rebuild_past_the_handshake(&mut input, 1, &spec(port));
-    let end = Instant::now() + connect_budget();
+    let end = rebuild_past_the_handshake(&mut input, 1, &spec(port));
     while frames.camera().is_none() {
         assert!(Instant::now() < end, "no frame reached the slot");
         thread::sleep(Duration::from_millis(20));
@@ -2077,7 +2146,7 @@ fn rebuild_never_waits_on_the_start() {
         "rebuild returned; the start was then held ({} waiting)",
         hold.waiting()
     );
-    release_past_the_handshake(&input, &hold, 1);
+    release_past_the_handshake(&input, &hold, 1, connect_budget());
     events_until(&rx, connect_budget(), |e| *e == Event::InputConnected { gen: 1 });
     finish(input);
 }
@@ -2098,7 +2167,7 @@ fn drop_returns_within_500_ms_while_the_pipeline_hangs() {
     input.rebuild(2, &spec(l.port));
     let rebuilt = t0.elapsed();
     assert!(rebuilt < Duration::from_millis(500), "rebuild {rebuilt:?}");
-    release_past_the_handshake(&input, &start, 2);
+    release_past_the_handshake(&input, &start, 2, connect_budget());
     events_until(&rx, connect_budget(), |e| *e == Event::InputConnected { gen: 2 });
     assert!(input.hang_decoder(hold), "the hook");
     thread::sleep(Duration::from_millis(300));
