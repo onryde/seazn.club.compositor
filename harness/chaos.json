@@ -30,6 +30,8 @@
     {"n": 15, "case": "cef-gpu-deaths", "variant": "fast", "runs": 3},
     {"n": 16, "case": "cef-leaks", "variant": "three", "runs": 1},
     {"n": 16, "case": "cef-leaks", "variant": "two", "runs": 1},
-    {"n": 17, "case": "dest-stall-rule", "runs": 1}
+    {"n": 17, "case": "dest-stall-rule", "runs": 1},
+    {"n": 18, "case": "output-hung", "variant": "hold", "runs": 1},
+    {"n": 18, "case": "output-hung", "variant": "hang", "runs": 1}
   ]
 }

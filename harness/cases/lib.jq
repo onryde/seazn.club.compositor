@@ -54,7 +54,10 @@ def index_regressions: [.overlay.runs[] | select(.index != null) | .index] as $i
 # which C09 sets on every sink). The error path always logs `output gen=<g> error:` first:
 # `error_ms` is that line for the swap's outgoing generation, `error_to_swap_ms` the back-off from it
 # to the swap, and `error_from_cut_ms` the wait from the cut to it. A report with no `output_errors`
-# field reads no error, never one: the error is read, not assumed.
+# field reads no error, never one: the error is read, not assumed. `error_to_swap_ms` is an interval
+# the product counts on its own clock, so it is read from the two lines' own `ts=` (logfacts'
+# `ts_ms`; the PR #73 confirm pass's b-1); every interval that crosses into the harness (the cut,
+# the beats) stays on docker's stamps.
 #
 # `reason` (Owed 87): the driver's `sink swap reason=<r> gen=<g>` line for the swap's generation,
 # logged just before the swap line (PR #57). `reasons_paired` checks the reason lines number the
@@ -74,7 +77,8 @@ def stall_swap($cut):
   | (.log.sink_swap_reasons) as $reasons
   | (.log.sink_swaps) as $swaps
   | (if $sw == null or $errors == null then [] else [$errors[] | select(.gen == $sw.gen - 1 and .at_ms < $swap)] end) as $err
-  | ($err | first | .at_ms) as $seen
+  | ($err | first) as $e
+  | ($e.at_ms) as $seen
   | (if $swap == null then [] else [beats[] | select(.received_ms < $swap)] end) as $b
   | ([range(1; $b | length) | select(($b[.].body.egressBytes // 0) > ($b[. - 1].body.egressBytes // 0))
       | $b[.].received_ms] | last) as $grow
@@ -85,7 +89,7 @@ def stall_swap($cut):
      reasons_paired: ($reasons != null and ($reasons | length) == ($swaps | length)
        and all(range(0; $swaps | length); $reasons[.].gen == $swaps[.].gen)),
      error_ms: $seen,
-     error_to_swap_ms: less($swap; $seen),
+     error_to_swap_ms: less($sw.ts_ms; $e.ts_ms),
      error_from_cut_ms: less($seen; $cut),
      from_cut_ms: less($swap; $cut),
      from_growth_ms: less($swap; $grow),
@@ -97,12 +101,14 @@ def stall_swap($cut):
 #   number the swap lines;
 # - the reason line reads error, and the outgoing sink's error line came before the swap (else
 #   `error_to_swap_ms` is null, and jq sorts null below every number: that reds);
-# - the sink was replaced after the domain's back-off from Connected (output_backoff_base_ms, a floor
-#   the product cannot beat, less one frame period: the domain acts on its frame ticks, and the two
-#   lines' docker stamps, read one by one and cut to the ms, cannot resolve finer. PR #71's CI run
-#   40137725801 read 499 ms for a swap whose own `ts=` stamps were 500 ms apart; a swap that skipped
-#   the back-off lands within a tick of the error, far below it) and inside the spec's output budget
-#   (§6 "≤5 s", budget_output_reconnect_ms);
+# - the sink was replaced after the domain's back-off from Connected (output_backoff_base_ms, on the
+#   lines' own `ts=`: the error line is written before the domain's `now` for it is read, and the
+#   swap line after the tick that builds, both on the process's ms clock, so a correct swap is never
+#   under the base; a swap that skipped the back-off lands within a tick of the error, far below it)
+#   and inside the spec's output budget (§6 "≤5 s", budget_output_reconnect_ms). Docker's stamps
+#   cannot judge this: `docker logs --timestamps` stamps each line when its daemon reads it, so the
+#   pair can sit closer than the process wrote them (PR #71's CI run 40137725801: 499.38 ms at ns
+#   precision for a swap whose `ts=` were 500 apart, the error line read about 1.4 ms late);
 # - the swap came within `bound_ms` of the last growth: a detector slower than the sink's timeout reds
 #   (C14's mutant m9 sets it to 20 s);
 # - the error came no sooner after the cut than the sink's timeout less one frame (the PR #65 review's
@@ -118,11 +124,53 @@ def stall_swap_judged($cut):
   stall_swap($cut) as $s
   | $s.swap_ms != null and $s.swap_beat_ms != null and $s.last_growth_ms != null and $s.reasons_paired
     and $s.reason == "error"
-    and $s.error_to_swap_ms >= $t.output_backoff_base_ms - $t.frame_period_ms
+    and $s.error_to_swap_ms >= $t.output_backoff_base_ms
     and $s.error_to_swap_ms <= $t.budget_output_reconnect_ms
     and $s.from_growth_ms <= $s.bound_ms
     and $s.error_from_cut_ms >= $t.output_sink_timeout_ms - $t.frame_period_ms
     and $s.error_from_cut_ms <= $t.output_sink_timeout_ms + $t.budget_output_lost_max_ms;
+
+# Owed 94's egress backstop (case 18, output-hung; the owner, 2026-10-24, "B"): a sink whose egress
+# stays flat while both encoders deliver is swapped, its reason line `egress_stalled`. The fault is
+# the hook's plant (`.log.sink_stall_planted`, Owed 94's `test hook` line: sink 1's writes held, or
+# its streaming thread hung), and `swap` is the first sink swap after it. Both are the process's own
+# lines, so `planted_to_swap_ms` is read on their `ts=` (as `error_to_swap_ms` is, b-1).
+# The window is the domain's, every term from $t (domain::output_link's backstop):
+# - the last reading that saw growth is no more than one poll before the plant (the poll before it
+#   saw the bytes of the frames before it), and the plant line is written within a tick of the hold,
+#   so the swap is no sooner than output_egress_flat_ms + output_backoff_base_ms - one poll - one
+#   tick after the plant line;
+# - and no later than output_egress_flat_ms + output_backoff_base_ms + two polls (the reading after
+#   the plant can still see what the sink wrote before it, and one more for that reading's way to
+#   the driver) + two ticks (the tick the backstop fires on, and the one that builds after the
+#   back-off).
+# `errors_before` lists the outgoing sink's own error lines before the swap: none, or the swap was
+# the error path's (a destination that dropped the idle publisher first, MediaMTX's readTimeout).
+def hung_swap:
+  ((.log.sink_stall_planted // []) | first) as $p
+  | [.log.sink_swaps[] | select($p != null and .at_ms >= $p.at_ms)] as $after
+  | ($after | first) as $sw
+  | (.log.sink_swap_reasons) as $reasons
+  | (.log.sink_swaps) as $swaps
+  | {planted_ms: ($p.at_ms // null), swap_ms: ($sw.at_ms // null), swap_gen: ($sw.gen // null),
+     swaps_after: ($after | length),
+     reason: (if $sw == null then null elif $reasons == null then "unknown"
+       else ([$reasons[] | select(.gen == $sw.gen and .at_ms <= $sw.at_ms)] | last | .reason) end),
+     reasons_paired: ($reasons != null and ($reasons | length) == ($swaps | length)
+       and all(range(0; $swaps | length); $reasons[.].gen == $swaps[.].gen)),
+     errors_before: [(.log.output_errors // [])[] | select($sw != null and .gen == $sw.gen - 1 and .at_ms < $sw.at_ms) | .at_ms],
+     planted_to_swap_ms: less($sw.ts_ms; $p.ts_ms),
+     floor_ms: ($t.output_egress_flat_ms + $t.output_backoff_base_ms - $t.output_progress_poll_ms - $t.tick_widest_ms),
+     ceiling_ms: ($t.output_egress_flat_ms + $t.output_backoff_base_ms + 2 * $t.output_progress_poll_ms + 2 * $t.tick_widest_ms)};
+
+# The backstop's swap, judged: the reason `egress_stalled` with the reason lines pairing the swap
+# lines, no error line of the outgoing sink before it, and inside the window. (No swap reads reason
+# null, a red; and the swap is sink 2: the plant went in on sink 1, `planted` checks that.)
+def hung_swap_judged:
+  hung_swap as $s
+  | $s.reasons_paired and $s.reason == "egress_stalled"
+    and $s.errors_before == []
+    and $s.planted_to_swap_ms >= $s.floor_ms and $s.planted_to_swap_ms <= $s.ceiling_ms;
 
 # The clear's phase in the output's reconnect cycle (cases 4, 5 and 12; the re-review's I-5, Owed
 # 84). Under the fault a sink is built every 6-7 s (a connect that times out, then the back-off), and

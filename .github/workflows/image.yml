@@ -304,7 +304,8 @@ jobs:
             fi
           done
           checked=0
-          for marker in COMPOSITOR_TEST_HOLD_TEARDOWNS 'test hook (Owed 82)'; do
+          for marker in COMPOSITOR_TEST_HOLD_TEARDOWNS 'test hook (Owed 82)' \
+            COMPOSITOR_TEST_HOLD_SINK_AFTER_MS COMPOSITOR_TEST_HANG_SINK_AFTER_MS 'test hook (Owed 94)'; do
             relay=$(grep -a -F -c -- "$marker" relay.bin || true)
             hooks=$(grep -a -F -c -- "$marker" hooks.bin || true)
             echo "marker '$marker': relay ${relay:-?}, relay-test-hooks ${hooks:-?}"
@@ -319,7 +320,7 @@ jobs:
             checked=$((checked + 1))
           done
           echo "test-hook markers checked: $checked"
-          [ "$checked" -eq 2 ]
+          [ "$checked" -eq 5 ]
       # Owed 85 (F-025): Docker's restart in place (`--restart on-failure`, ADR 0007 item 5) keeps the
       # container's writable layer, /tmp included, as compose's does in C14. Each exit C14 saw restarted
       # (75, 133, 137) must come back with CEF ready, one Xvfb with -displayfd, no X lock and its socket
