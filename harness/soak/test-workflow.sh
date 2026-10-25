@@ -269,7 +269,7 @@ got="$(LG_FLY="$fly" leakgate real '{"scanned":24,"leaks":0,"skipped":[],"leaked
 [ "${got%% *}" = 1 ] && ! grep -qx 'ok=true' "$W/lg/gh-out" && grep -qF 'the job token or the Fly token is in a fetched file' "$W/lg/log" \
   && ! grep -qF -- "$fly" "$W/lg/log" && pass "leak gate: the Fly token in a fetched file uploads nothing (and is not printed)" || fail "leak gate, the Fly token" "$got"
 got="$(LG_FLY="$fly" leakgate real '{"scanned":24,"leaks":0,"skipped":[],"leaked":[]}')"
-[ "${got%% *}" = 0 ] && grep -qx 'ok=true' "$W/lg/gh-out" && [ "$(stat -f %Lp "$W/lg/scan-patterns" 2>/dev/null || stat -c %a "$W/lg/scan-patterns")" = 600 ] \
+[ "${got%% *}" = 0 ] && grep -qx 'ok=true' "$W/lg/gh-out" && [ "$(stat -c %a "$W/lg/scan-patterns" 2>/dev/null || stat -f %Lp "$W/lg/scan-patterns")" = 600 ] \
   && pass "leak gate: with the Fly token set, a clean run uploads; the pattern file is mode 600" || fail "leak gate, the Fly token clean" "$got"
 # The runner's own compositor log (page=real): up only when the harness scanned those bytes.
 clog='ts=2026-10-24T12:00:00.000Z level=info msg=cef alive gen=1'
