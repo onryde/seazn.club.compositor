@@ -25,9 +25,21 @@ pub struct CefHealth {
 /// Why the process restarts in place: the most urgent cause, in `restart_cause`'s order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartCause {
-    ZygoteGone { gen: u64 },
-    GpuProcessDeaths { count: usize },
-    LeakedTeardowns { live: usize },
+    ZygoteGone {
+        gen: u64,
+    },
+    GpuProcessDeaths {
+        count: usize,
+    },
+    LeakedTeardowns {
+        live: usize,
+    },
+    /// Owed 99: blank pages (`graphics.rs`, the domain's own count) and GPU-process deaths, counted
+    /// together, reached `cef_gpu_deaths_to_restart` (`page_faults_restart`).
+    PageFaults {
+        blank_pages: usize,
+        gpu_process_deaths: usize,
+    },
 }
 
 impl RestartCause {
@@ -44,8 +56,34 @@ impl RestartCause {
             RestartCause::LeakedTeardowns { live } => {
                 format!("restart in place: {live} CEF teardowns leaked")
             }
+            RestartCause::PageFaults {
+                blank_pages,
+                gpu_process_deaths,
+            } => {
+                format!("restart in place: {blank_pages} blank CEF pages, {gpu_process_deaths} GPU-process deaths")
+            }
         }
     }
+}
+
+/// The in-place restart the page faults ask for (Owed 96, Owed 99; the coordinator's brief for Owed
+/// 99 B, 2026-10-25: "it counts toward the same restart threshold path"). The process counts two
+/// faults that each reload the page: a GPU-process death (the adapter's count, `CefHealth`) and a
+/// blank page (the domain's: a Ready page that showed no frame of its own by its bound). Below
+/// `cef_gpu_deaths_to_restart` of them together each reloads; at it the process restarts in place,
+/// so a page that never paints cannot reload forever: it costs one in-place restart, which owner
+/// ruling 2A caps at 6 a session. GPU-process deaths alone at the count are `restart_cause`'s, so
+/// this answers only once a blank page is among them (`blank_pages > 0`).
+pub fn page_faults_restart(
+    blank_pages: usize,
+    gpu_process_deaths: usize,
+    t: &Thresholds,
+) -> Option<RestartCause> {
+    let faults = blank_pages.saturating_add(gpu_process_deaths);
+    (blank_pages > 0 && faults >= t.cef_gpu_deaths_to_restart).then_some(RestartCause::PageFaults {
+        blank_pages,
+        gpu_process_deaths,
+    })
 }
 
 impl CefHealth {
@@ -86,6 +124,10 @@ mod tests {
             RestartCause::ZygoteGone { gen: u64::MAX },
             RestartCause::GpuProcessDeaths { count: usize::MAX },
             RestartCause::LeakedTeardowns { live: usize::MAX },
+            RestartCause::PageFaults {
+                blank_pages: usize::MAX,
+                gpu_process_deaths: usize::MAX,
+            },
         ] {
             let d = c.detail();
             assert!(d.chars().count() <= 100, "{d}");

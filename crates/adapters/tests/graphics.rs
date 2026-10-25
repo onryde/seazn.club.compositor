@@ -402,6 +402,41 @@ fn frames_before_ready_never_reach_the_slot() {
     r.g.stop();
 }
 
+// Owed 99: a page that paints before its ready and never after (`static=1`) still puts its frame on
+// air at its ready (the adapter's latch), and a build reports its first frame in the slot once, after
+// its ready (`CefPainted`, which ends the domain's blank-page watch). Whether cefsrc delivered any
+// sample after the ready is printed: when it delivered none (F-001: a sample only on paint), the frame
+// on air is the latched one, and the test asserts it.
+#[test]
+fn a_static_page_puts_its_first_frame_on_air_at_its_ready_and_reports_it_once() {
+    let _s = serial();
+    let mut r = rig();
+    r.g.restart(1, &page("?static=1"));
+    let before = events_until(&r.rx, load_timeout(), ready(1));
+    assert!(
+        !before.iter().any(|e| matches!(e, Event::CefPainted { .. })),
+        "a first frame reported before its ready: {before:?}"
+    );
+    let after = events_for(&r.rx, beat() * 2);
+    let painted = after
+        .iter()
+        .filter(|(_, e)| *e == Event::CefPainted { gen: 1 })
+        .count();
+    let s = r.g.samples(1);
+    let latched_only = s.delivered == s.dropped;
+    eprintln!("static page: {s:?}; painted reports after the ready: {painted}; no sample after the ready: {latched_only}");
+    assert_eq!(painted, 1, "events after the ready: {after:?}");
+    assert!(
+        r.frames.overlay().is_some(),
+        "the static page's frame never reached the slot"
+    );
+    assert!(s.delivered >= 1 && s.written >= 1, "{s:?}");
+    if latched_only {
+        assert_eq!(s.written, 1, "the frame on air is the latched one: {s:?}");
+    }
+    r.g.stop();
+}
+
 #[test]
 fn restart_holds_the_last_overlay_frame() {
     let _s = serial();

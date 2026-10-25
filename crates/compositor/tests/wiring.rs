@@ -156,9 +156,13 @@ impl Run {
     }
 }
 
-/// Generation `gen` readies at `ready` and beats every `cef_alive_every_ms` while before `until`.
+/// Generation `gen` readies at `ready` (its latest frame written at the ready and reported, C11 and
+/// Owed 99) and beats every `cef_alive_every_ms` while before `until`.
 fn page(t: &Thresholds, gen: u64, ready: u64, until: u64) -> Vec<(u64, Event)> {
-    let mut v = vec![(ready, Event::CefReady { gen })];
+    let mut v = vec![
+        (ready, Event::CefReady { gen }),
+        (ready, Event::CefPainted { gen }),
+    ];
     let mut at = ready + t.cef_alive_every_ms;
     while at < until {
         v.push((at, Event::CefAlive { gen }));

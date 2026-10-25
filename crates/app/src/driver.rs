@@ -377,6 +377,17 @@ impl Driver {
                 ));
                 p.graphics.restart(gen, &cfg.overlay_url);
             }
+            // The reload of a blank page (Owed 99): the same page, the next generation, in the same
+            // process, its cause logged first.
+            Effect::ReloadGraphicsNoFrames { gen, blank_pages } => {
+                let Some(cfg) = &self.session else {
+                    return self.no_session(now);
+                };
+                p.log.info(&format!(
+                    "cef reload gen={gen} reason=no_frames blank_pages={blank_pages}"
+                ));
+                p.graphics.restart(gen, &cfg.overlay_url);
+            }
             Effect::HideOverlay { reason, gen } => {
                 p.log
                     .info(&format!("overlay hidden reason={} gen={gen}", hide_name(reason)));
@@ -527,6 +538,7 @@ fn graphics_line(e: &Event) -> Option<String> {
         Event::CefReady { gen } => Some(format!("cef ready gen={gen}")),
         Event::CefCrashed { gen } => Some(format!("cef crashed gen={gen}")),
         Event::CefAlive { gen } => Some(format!("cef alive gen={gen}")),
+        Event::CefPainted { gen } => Some(format!("cef painted gen={gen}")),
         _ => None,
     }
 }

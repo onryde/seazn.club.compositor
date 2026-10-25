@@ -465,12 +465,15 @@ fn live_media(t: &Thresholds, tx: &Sender<Inbound>, log: &Logger, hooks: &TestHo
     }
 }
 
-/// Owed 82: a `test-hooks` build arms the held teardowns its environment asked for; the adapter's
-/// line saying so is C14's witness that the run carries the hook.
+/// Owed 82 and Owed 99: a `test-hooks` build arms the held teardowns and the withheld pages its
+/// environment asked for; the adapter's line saying so is C14's witness that the run carries the hook.
 #[cfg(feature = "test-hooks")]
 fn arm_test_hooks(graphics: &CefGraphics, hooks: &TestHooks) {
     if hooks.hold_teardowns > 0 {
         graphics.hold_next_teardowns(hooks.hold_teardowns);
+    }
+    if hooks.withhold_pages > 0 {
+        graphics.withhold_next_pages(hooks.withhold_pages);
     }
 }
 

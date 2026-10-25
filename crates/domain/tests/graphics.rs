@@ -321,6 +321,7 @@ fn setup_failure(
     let gen = g.generation();
     if ready_first {
         g.on_ready(now + 5, gen);
+        g.on_painted(gen); // C11 writes its latest frame at the ready (Owed 99)
         *air = Air::Live;
     }
     let from = g.state();
@@ -349,6 +350,7 @@ fn graphics_in(
     assert_eq!(g.on_tick(now, t), Some(Restart));
     if shown == Shown::Recycled {
         g.on_ready(now + 50, 1);
+        g.on_painted(1); // C11 writes its latest frame at the ready (Owed 99)
         let recycle = now + 50 + t.cef_recycle_every_ms;
         g.on_alive(recycle - 1, 1);
         assert_eq!(g.on_tick(recycle, t), Some(Restart), "setup: the recycle");
@@ -361,6 +363,7 @@ fn graphics_in(
     }
     if shown == Shown::Reloaded {
         g.on_ready(now + 50, 1);
+        g.on_painted(1); // C11 writes its latest frame at the ready (Owed 99)
         let death = now + 50 + t.cef_alive_every_ms - 1;
         assert_eq!(g.on_gpu_death(death, t), Some(Restart), "setup: the reload");
         air = Air::Held {
@@ -387,6 +390,7 @@ fn graphics_in(
         Kind::Ready => {
             let entered = now + 50;
             g.on_ready(entered, gen);
+            g.on_painted(gen); // C11 writes its latest frame at the ready (Owed 99)
             air = Air::Live;
             let (recycle, hang) = (t.cef_recycle_every_ms, t.cef_hang_after_ms);
             let last = match beat {
@@ -474,7 +478,11 @@ fn apply(g: &mut Graphics, e: GEvent, now: Ms, gen: u64, t: &Thresholds) -> Opti
     match e {
         GEvent::Tick => g.on_tick(now, t),
         GEvent::Ready => {
+            // A page that painted before or at its ready: C11 writes its latest frame at the ready
+            // and reports it (Owed 99), so this matrix's Ready page is a painted one. A page that
+            // never paints is `blank_*` below.
             g.on_ready(now, gen);
+            g.on_painted(gen);
             None
         }
         GEvent::Crashed => g.on_crashed(now, gen, t),
@@ -1057,6 +1065,9 @@ fn graphics_keeps_its_rules_over_generated_schedules() {
                         hid_since = None;
                         left_by_hang = false;
                     }
+                    Some(GraphicsAction::Blank { gen: b }) => {
+                        panic!("{ctx}: generation {b} reported blank, though every Ready here painted")
+                    }
                     None => {}
                 }
                 left_by_hang |= hang;
@@ -1318,6 +1329,7 @@ fn a_page_that_stops_beating_hides_on_the_frame_tick_grid() {
                 assert!(now <= horizon, "{mode:?} φ{phase}: no restart by {horizon} ms");
                 if !is_ready && now >= ready {
                     g.on_ready(ready, 1);
+                    g.on_painted(1); // C11 writes its latest frame at the ready (Owed 99)
                     is_ready = true;
                 }
                 while next < beats.len() && beats[next] <= now {
@@ -1417,6 +1429,7 @@ fn a_crashed_or_recycled_page_whose_reloads_never_ready_hides_on_the_frame_tick_
                     );
                     if !is_ready && now >= ready {
                         g.on_ready(ready, 1);
+                        g.on_painted(1); // C11 writes its latest frame at the ready (Owed 99)
                         is_ready = true;
                     }
                     while next < beats.len() && beats[next] <= now {
@@ -1657,4 +1670,302 @@ fn an_encoder_dropping_every_frame_steps_once_on_the_frame_tick_grid() {
     }
     eprintln!("saturated-encoder runs checked: {cases} (mode × phase), {frames} dropped frames");
     assert!(cases > 0 && frames > 0, "checked 0 runs");
+}
+
+// ---- Owed 99: a Ready page that never shows a frame of its own (option B, the PR #87 review's I-2) ----
+
+/// A machine whose generation 1 is Ready at `ready`, beating every `cef_alive_every_ms` up to `until`
+/// (the beats are delivered here, so a later tick never reads it silent), with no frame of its own.
+fn unpainted_ready(ready: Ms, t: &Thresholds) -> Graphics {
+    let mut g = Graphics::new();
+    assert_eq!(g.on_tick(0, t), Some(Restart), "setup: the first build");
+    g.on_ready(ready, 1);
+    assert_eq!(
+        g.state(),
+        GraphicsState::Ready {
+            since: ready,
+            last_alive: ready
+        },
+        "setup"
+    );
+    g
+}
+
+/// Ticks every ms from `from` to `to` inclusive, beating every `cef_alive_every_ms` from `beat_from`,
+/// and returns the actions with their instants.
+fn tick_span(g: &mut Graphics, from: Ms, to: Ms, beat_from: Ms, t: &Thresholds) -> Vec<(Ms, GraphicsAction)> {
+    let mut out = Vec::new();
+    let gen = g.generation();
+    for now in from..=to {
+        if now > beat_from && (now - beat_from).is_multiple_of(t.cef_alive_every_ms) {
+            g.on_alive(now, gen);
+        }
+        if let Some(a) = g.on_tick(now, t) {
+            out.push((now, a));
+        }
+    }
+    out
+}
+
+// The bound, exactly: a beating Ready page with no frame of its own is reported blank on the first
+// tick at its ready + `cef_hang_after_ms` (the declaration), not 1 ms before, and once: the ticks after
+// it report nothing more for that page, up to its recycle. Nothing moves: the machine stays Ready.
+#[test]
+fn a_ready_page_with_no_frame_is_blank_once_at_exactly_its_bound() {
+    let mut checked = 0;
+    for (set, t) in sweep_thresholds() {
+        let ready = 1_000;
+        let bound = ready + t.cef_hang_after_ms;
+        let mut g = unpainted_ready(ready, &t);
+        let before = tick_span(&mut g, ready, bound - 1, ready, &t);
+        assert_eq!(before, vec![], "{set}: before the bound");
+        let last = g.state();
+        assert_eq!(
+            g.on_tick(bound, &t),
+            Some(GraphicsAction::Blank { gen: 1 }),
+            "{set}"
+        );
+        assert_eq!(g.state(), last, "{set}: the report moves nothing");
+        assert_eq!(g.generation(), 1, "{set}");
+        let recycle = ready + t.cef_recycle_every_ms;
+        let after = tick_span(&mut g, bound + 1, recycle - 1, bound, &t);
+        assert_eq!(after, vec![], "{set}: reported once");
+        checked += 1;
+    }
+    eprintln!("blank bounds checked: {checked}");
+    assert_eq!(checked, sweep_thresholds().len());
+}
+
+// The watch ends at the page's first frame: a painted report of the Ready page's own generation at
+// any instant up to the bound's tick (here at the ready, 1 ms before the bound, and at the bound itself,
+// delivered before that tick) means no report ever; one from another generation, or one delivered
+// while the page was still loading (C11 never sends one there; the guard holds if it did), does not.
+#[test]
+fn only_the_ready_pages_own_first_frame_ends_the_watch() {
+    let t = Thresholds::default();
+    let ready = 1_000;
+    let bound = ready + t.cef_hang_after_ms;
+    let recycle = ready + t.cef_recycle_every_ms;
+    let mut checked = 0;
+    for at in [ready, bound - 1, bound] {
+        let mut g = unpainted_ready(ready, &t);
+        let mut acts = tick_span(&mut g, ready, at - 1, ready, &t);
+        g.on_painted(1);
+        acts.extend(tick_span(&mut g, at, recycle - 1, ready, &t));
+        assert_eq!(acts, vec![], "painted at {at}");
+        checked += 1;
+    }
+    for other in [0, 2] {
+        let mut g = unpainted_ready(ready, &t);
+        g.on_painted(other);
+        let acts = tick_span(&mut g, ready, bound, ready, &t);
+        assert_eq!(
+            acts,
+            vec![(bound, GraphicsAction::Blank { gen: 1 })],
+            "painted gen {other}"
+        );
+        checked += 1;
+    }
+    let mut g = Graphics::new();
+    assert_eq!(g.on_tick(0, &t), Some(Restart));
+    g.on_painted(1); // while loading
+    g.on_ready(ready, 1);
+    let acts = tick_span(&mut g, ready, bound, ready, &t);
+    assert_eq!(
+        acts,
+        vec![(bound, GraphicsAction::Blank { gen: 1 })],
+        "painted while loading"
+    );
+    checked += 1;
+    eprintln!("painted reports checked: {checked}");
+    assert_eq!(checked, 6);
+}
+
+// One page, one count: a Ready page that shows no frame AND stops beating is a hang at the same bound
+// (its ready is its last proof), hidden as a hang and counted as one failure there, and never also
+// reported blank, on that tick or later.
+#[test]
+fn a_silent_page_with_no_frame_is_a_hang_never_also_blank() {
+    let mut checked = 0;
+    for (set, t) in sweep_thresholds() {
+        let ready = 1_000;
+        let bound = ready + t.cef_hang_after_ms;
+        let mut g = unpainted_ready(ready, &t);
+        let mut acts = Vec::new();
+        for now in ready..=bound + t.cef_backoff_base_ms - 1 {
+            if let Some(a) = g.on_tick(now, &t) {
+                acts.push((now, a));
+            }
+        }
+        assert_eq!(acts, vec![(bound, hide(HideReason::Hang, 1))], "{set}");
+        assert!(
+            matches!(g.state(), GraphicsState::Backoff { attempt: 0, .. }),
+            "{set}: {:?}",
+            g.state()
+        );
+        checked += 1;
+    }
+    eprintln!("silent blank pages checked: {checked}");
+    assert_eq!(checked, sweep_thresholds().len());
+}
+
+// `on_blank_reload` reloads only a page reported blank: not a loading page, not a painted one, not an
+// unpainted one before its bound, and not twice. The reload is the next generation, loading from the
+// instant it is asked for, and records no failure: as many blank reloads as the failure count and one
+// more in one window, then a crash, still backs off from the first rung.
+#[test]
+fn only_a_page_reported_blank_is_reloaded_and_its_reload_is_no_failure() {
+    let t = Thresholds::default();
+    let ready = 1_000;
+    let bound = ready + t.cef_hang_after_ms;
+    // Loading.
+    let mut g = Graphics::new();
+    assert_eq!(g.on_tick(0, &t), Some(Restart));
+    assert_eq!(g.on_blank_reload(10), None, "loading");
+    assert_eq!(g.generation(), 1);
+    // Painted.
+    let mut g = unpainted_ready(ready, &t);
+    g.on_painted(1);
+    tick_span(&mut g, ready, bound, ready, &t);
+    assert_eq!(g.on_blank_reload(bound), None, "painted");
+    // Unpainted, before its bound.
+    let mut g = unpainted_ready(ready, &t);
+    tick_span(&mut g, ready, bound - 1, ready, &t);
+    assert_eq!(g.on_blank_reload(bound - 1), None, "before the bound");
+    assert_eq!(g.generation(), 1);
+    // Reported: the reload, once.
+    assert_eq!(g.on_tick(bound, &t), Some(GraphicsAction::Blank { gen: 1 }));
+    assert_eq!(g.on_blank_reload(bound), Some(Restart));
+    assert_eq!(g.generation(), 2);
+    assert_eq!(g.state(), GraphicsState::Starting { since: bound });
+    assert_eq!(g.on_blank_reload(bound), None, "twice");
+    assert_eq!(g.generation(), 2);
+    // No failure: count + 1 blank reloads inside one window, then a crash backs off from rung 0.
+    let mut now = bound;
+    let mut reloads = 1;
+    while reloads <= t.cef_fail_count {
+        let gen = g.generation();
+        g.on_ready(now + 10, gen);
+        now += 10;
+        let b = now + t.cef_hang_after_ms;
+        tick_span(&mut g, now, b - 1, now, &t);
+        assert_eq!(g.on_tick(b, &t), Some(GraphicsAction::Blank { gen }));
+        assert_eq!(g.on_blank_reload(b), Some(Restart));
+        now = b;
+        reloads += 1;
+    }
+    assert!(now - bound < t.cef_fail_window_ms, "setup: one window");
+    let gen = g.generation();
+    g.on_ready(now + 10, gen);
+    assert_eq!(g.on_crashed(now + 20, gen, &t), None);
+    assert_eq!(
+        g.state(),
+        GraphicsState::Backoff {
+            attempt: 0,
+            until: now + 20 + t.cef_backoff_base_ms
+        },
+        "the crash is the window's first failure"
+    );
+    eprintln!("blank reloads checked: {reloads}");
+    assert_eq!(reloads, t.cef_fail_count + 1);
+}
+
+// Owed 99 (b): a ready replaces nothing by itself. A crashed, recycled or reloaded page's last frame,
+// held through its reload, stays on air past the next page's ready while that page has shown no frame,
+// and comes off at its own bound (its proof + `cef_hang_after_ms`), naming its page and its cause; the
+// next page's first frame before that bound replaces it, and then nothing hides.
+#[test]
+fn a_held_frame_keeps_its_bound_past_a_ready_until_that_pages_first_frame() {
+    let mut checked = 0;
+    for (set, t) in sweep_thresholds() {
+        for ending in [HideReason::Crash, HideReason::Recycle, HideReason::Reload] {
+            for paints in [false, true] {
+                let mut g = Graphics::new();
+                assert_eq!(g.on_tick(0, &t), Some(Restart));
+                let r1 = 100;
+                g.on_ready(r1, 1);
+                g.on_painted(1);
+                let (proof, ended_at) = match ending {
+                    HideReason::Crash => {
+                        let p = r1 + t.cef_alive_every_ms;
+                        g.on_alive(p, 1);
+                        assert_eq!(g.on_crashed(p + 1, 1, &t), None);
+                        // Its back-off's restart.
+                        let until = p + 1 + t.cef_backoff_base_ms;
+                        assert_eq!(g.on_tick(until, &t), Some(Restart));
+                        (p, until)
+                    }
+                    HideReason::Recycle => {
+                        let recycle = r1 + t.cef_recycle_every_ms;
+                        let p = recycle - 1;
+                        g.on_alive(p, 1);
+                        assert_eq!(g.on_tick(recycle, &t), Some(Restart));
+                        (p, recycle)
+                    }
+                    _ => {
+                        let p = r1 + t.cef_alive_every_ms;
+                        g.on_alive(p, 1);
+                        assert_eq!(g.on_gpu_death(p + 1, &t), Some(Restart));
+                        (p, p + 1)
+                    }
+                };
+                let bound = proof + t.cef_hang_after_ms;
+                let r2 = ended_at + 1;
+                assert!(r2 < bound, "setup: the reload readies inside the bound");
+                g.on_ready(r2, 2);
+                if paints {
+                    g.on_painted(2);
+                }
+                let acts = tick_span(&mut g, r2, bound, r2, &t);
+                let want = if paints {
+                    vec![]
+                } else {
+                    vec![(bound, hide(ending, 1))]
+                };
+                assert_eq!(acts, want, "{set} {ending:?}, painted {paints}");
+                checked += 1;
+            }
+        }
+    }
+    eprintln!("held frames past a ready checked: {checked}");
+    assert_eq!(checked, sweep_thresholds().len() * 3 * 2);
+}
+
+// A page that never showed a frame of its own leaves nothing of its own on air: its crash holds no
+// frame (no `Crash` hide at its bound), and a frame held from an older page keeps that page, its bound
+// and its cause through it.
+#[test]
+fn a_page_that_never_showed_a_frame_holds_none_of_its_own() {
+    let t = Thresholds::default();
+    // Nothing older: the crash of an unpainted page leaves nothing to hide at its bound.
+    let mut g = unpainted_ready(100, &t);
+    assert_eq!(g.on_crashed(200, 1, &t), None);
+    let mut acts = Vec::new();
+    for now in 200..=200 + t.cef_backoff_base_ms - 1 {
+        if let Some(a) = g.on_tick(now, &t) {
+            acts.push((now, a));
+        }
+    }
+    assert_eq!(acts, vec![], "nothing on air to hide");
+    // An older page's frame held through an unpainted page's crash: still the older page's, at its bound.
+    let mut g = Graphics::new();
+    assert_eq!(g.on_tick(0, &t), Some(Restart));
+    g.on_ready(100, 1);
+    g.on_painted(1);
+    assert_eq!(g.on_gpu_death(150, &t), Some(Restart)); // held: gen 1, proof 100, Reload
+    g.on_ready(200, 2); // unpainted
+    assert_eq!(g.on_crashed(300, 2, &t), None);
+    let bound = 100 + t.cef_hang_after_ms;
+    let mut acts = Vec::new();
+    for now in 300..=bound {
+        if let Some(a) = g.on_tick(now, &t) {
+            acts.push((now, a));
+        }
+    }
+    let restart_at = 300 + t.cef_backoff_base_ms;
+    assert_eq!(
+        acts,
+        vec![(restart_at, Restart), (bound, hide(HideReason::Reload, 1))],
+        "the older page's frame, its bound and its cause"
+    );
 }
