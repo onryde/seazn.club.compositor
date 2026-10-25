@@ -3,9 +3,11 @@
 # soak's own numbers (soak.json) and the schedule (schedule.jq) bound. soak.yml and test-verdict.sh
 # both call it, so the run and the fixtures are judged by one command.
 #
-#   harness/soak/verdict.sh --dir <run dir> --page real|test --drive-min <N> [--schedule soak|dropouts|none]
-#                           [--thresholds <file>] [--jq <jq>]
+#   harness/soak/verdict.sh --dir <run dir> --page real|test --drive-min <N> --memory-mb <MB>
+#                           [--schedule soak|dropouts|none] [--thresholds <file>] [--jq <jq>]
 #
+# --memory-mb is the compositor Machine's memory (soak.yml passes its C_MEM, soak.json's
+# compositor_guest): check 1.projection's budget is soak.json's fraction of it.
 # <run dir> holds report.json, actions.jsonl, control-state.json, deliveries.jsonl,
 # overlay-samples.jsonl, logscan.json and compositor.log; a missing file reads as empty, so the
 # check that needs it fails (never passes on nothing). --schedule is what the driver was to do
@@ -19,6 +21,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DIR=""
 PAGE=""
 DRIVE_MIN=""
+MEMORY_MB=""
 SCHEDULE=soak
 THRESHOLDS="$HERE/../thresholds.json"
 JQ="jq"
@@ -27,6 +30,7 @@ while [ "$#" -gt 0 ]; do
     --dir) DIR="${2:?}"; shift 2 ;;
     --page) PAGE="${2:?}"; shift 2 ;;
     --drive-min) DRIVE_MIN="${2:?}"; shift 2 ;;
+    --memory-mb) MEMORY_MB="${2-}"; shift; [ "$#" -eq 0 ] || shift ;;
     --schedule) SCHEDULE="${2:?}"; shift 2 ;;
     --thresholds) THRESHOLDS="${2:?}"; shift 2 ;;
     --jq) JQ="${2:?}"; shift 2 ;;
@@ -36,6 +40,7 @@ done
 [ -d "$DIR" ] || { echo "verdict.sh: --dir names no directory" >&2; exit 64; }
 case "$PAGE" in real | test) ;; *) echo "verdict.sh: --page must be real or test" >&2; exit 64 ;; esac
 case "$DRIVE_MIN" in '' | *[!0-9]*) echo "verdict.sh: --drive-min must be whole minutes" >&2; exit 64 ;; esac
+case "$MEMORY_MB" in '' | *[!0-9]* | 0*) echo "verdict.sh: --memory-mb must be whole MB above 0 (the compositor Machine's memory: soak.yml's C_MEM)" >&2; exit 64 ;; esac
 case "$SCHEDULE" in soak | dropouts | none) ;; *) echo "verdict.sh: --schedule must be soak, dropouts or none" >&2; exit 64 ;; esac
 [ -f "$THRESHOLDS" ] || { echo "verdict.sh: no thresholds file $THRESHOLDS" >&2; exit 64; }
 
@@ -49,7 +54,8 @@ out="$("$JQ" -n -L "$HERE" \
   --slurpfile samples "$(file overlay-samples.jsonl)" --slurpfile logscan "$(file logscan.json)" \
   --rawfile complog "$(file compositor.log)" \
   --slurpfile t "$THRESHOLDS" --slurpfile soak "$HERE/soak.json" \
-  --argjson drive_min "$DRIVE_MIN" --arg page "$PAGE" --arg schedule "$SCHEDULE" -f "$HERE/verdict.jq")" || {
+  --argjson drive_min "$DRIVE_MIN" --argjson memory_mb "$MEMORY_MB" --arg page "$PAGE" --arg schedule "$SCHEDULE" \
+  -f "$HERE/verdict.jq")" || {
   echo "verdict.sh: jq failed" >&2
   exit 2
 }

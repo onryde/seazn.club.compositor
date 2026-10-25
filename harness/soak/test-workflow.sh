@@ -31,7 +31,8 @@
 #   step's own jq (the knob added, its own keys winning a clash, nothing added when empty); the knob
 #   in the run's name for the soak and the legs; the schedule through the runs step (a leg refused
 #   on dropouts and on none) to the harness's SOAK_SCHEDULE and the verdict's --schedule; and the
-#   verdict step run for real on the three greens, the memory split's MEASURE lines in the summary;
+#   verdict step run for real on the three greens, the memory split's MEASURE lines in the summary,
+#   and the compositor's memory (C_MEM) reaching check 1.projection as --memory-mb;
 # - flylog.py on a recorded-shape stream: pretty-printed entries, a replayed buffer, another
 #   Machine's entry, a cut-off tail, stamps with 9 and 3 fraction digits and an offset, a bare and a
 #   reasoned `overlay hidden`; and an empty stream refused.
@@ -135,6 +136,13 @@ check "the compositor's guest: the input, production's performance-4x by default
    and .jobs.plan.outputs.c_cpus == "${{ steps.runs.outputs.c_cpus }}" and .jobs.soak.env.GUEST == "${{ inputs.guest }}"'
 jq -e '.compositor_guest == {"performance-4x": {cpus: 4, memory_mb: 8192}, "performance-8x": {cpus: 8, memory_mb: 16384}}' "$HERE/soak.json" >/dev/null \
   && pass "soak.json: performance-4x is 4 CPUs, 8192 MB (R1's RUNNER_DEFAULT_GUEST), performance-8x 8 and 16384" || fail "soak.json's compositor_guest"
+# Check 1.projection budgets the production guest's memory at most: soak.json names it, and it is
+# the workflow's default guest and one of compositor_guest's.
+pg="$(jq -r '.memory_projection.production_guest' "$HERE/soak.json")"
+[ "$pg" = "$(jq -r '(.on // .["true"]).workflow_dispatch.inputs.guest.default' "$W/wf.json")" ] \
+  && jq -e --arg g "$pg" '.compositor_guest | has($g)' "$HERE/soak.json" >/dev/null \
+  && pass "soak.json's production_guest ($pg) is the workflow's default guest, in compositor_guest" \
+  || fail "soak.json's production_guest" "$pg"
 
 # --- the job token ---------------------------------------------------------------------------------
 grep -qE 'job_token="\$\(od -An -N32 -tx1 /dev/urandom' <<<"$launch" && pass "the job token: 32 random bytes" || fail "the job token's source"
@@ -168,7 +176,8 @@ bad="$(jq -r '[.jobs[].steps[]? | .run // empty] | join("\n")' "$W/wf.json" | gr
 [ -z "$bad" ] && pass "no input expanded inside a run" || fail "an input inside a run" "$bad"
 verdict="$(step soak "Verdict")"
 grep -qF 'harness/soak/verdict.sh --dir "$OUT" --page "$PAGE" --drive-min "$DRIVE_MIN" --schedule "$SCHEDULE"' <<<"$verdict" \
-  && grep -qF '::warning::PLUMBING ONLY' <<<"$verdict" && pass "the verdict: verdict.sh, PLUMBING ONLY on the test page" || fail "the verdict step"
+  && grep -qF -- '--memory-mb "$C_MEM" > "$OUT/verdict.json"' <<<"$verdict" \
+  && grep -qF '::warning::PLUMBING ONLY' <<<"$verdict" && pass "the verdict: verdict.sh with the compositor's memory (C_MEM), PLUMBING ONLY on the test page" || fail "the verdict step"
 
 # --- page=real's page source ---------------------------------------------------------------------
 check "the web job holds no secret" '.jobs.web | tojson | contains("secrets.") | not'
@@ -515,15 +524,18 @@ runs "" ball test performance-4x weekly || { grep -qF "schedule must be soak, dr
 [ "$refused" -eq 3 ] && pass "runs: dropouts and none on a leg and an unknown schedule are refused, each by its reason" || fail "runs: the schedule refusals" "$refused of 3"
 # The verdict step's soak path, run for real on the three greens: the schedule reaches verdict.sh,
 # and the memory split's MEASURE lines reach the summary.
+# C_MEM as the plan sets it for the workflow's default guest (soak.json's compositor_guest).
+VMEM="$(jq -r --arg g "$(jq -r '(.on // .["true"]).workflow_dispatch.inputs.guest.default' "$W/wf.json")" '.compositor_guest[$g].memory_mb' "$HERE/soak.json")"
 vsoak() { # <green dir> <schedule>: rc; the summary in $W/summary.md, outputs in $W/v.out
   rm -rf "$W/vout" && mkdir -p "$W/vout/out"
   cp "$1"/* "$W/vout/out/"
   echo '{"ok":true,"checker_exit":0,"ended_early":null}' >"$W/vout/out/done"
   : >"$W/v.out"; : >"$W/summary.md"
-  (cd "$ROOT" && RUNNER_TEMP="$W/vout" LEG="" PAGE=real DRIVE_MIN=30 SCHEDULE="$2" \
+  (cd "$ROOT" && RUNNER_TEMP="$W/vout" LEG="" PAGE=real DRIVE_MIN=30 SCHEDULE="$2" C_MEM="$VMEM" \
     GITHUB_OUTPUT="$W/v.out" GITHUB_STEP_SUMMARY="$W/summary.md" bash -eo pipefail -c "$verdict" >/dev/null 2>&1)
 }
 vsoak "$HERE/fixtures/green" soak && grep -qx 'status=pass' "$W/v.out" \
+  && grep -qF "PASS 1.projection memory projection" "$W/summary.md" && grep -qF "\"machine_memory_mb\":$VMEM," "$W/summary.md" \
   && grep -qF 'MEASURE per-dropout step (the lines): 6 of 6 dropouts measured, mean span 60 s; rss mean +9 MB' "$W/summary.md" \
   && grep -qF 'MEASURE compositor only: rss +36 MB, anon +32 MB' "$W/summary.md" && grep -qF 'MEASURE cef only: pss +4 MB' "$W/summary.md" \
   && pass "verdict, the soak: the green passes, the memory split's measures in the summary" || fail "verdict, the soak" "$(cat "$W/v.out") $(head -c 600 "$W/summary.md")"

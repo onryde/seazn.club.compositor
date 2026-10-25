@@ -9,7 +9,8 @@
 #   $complog     compositor.log, raw (flylog.py's; "" when missing): its `memory split` lines
 #   $t           harness/thresholds.json        $soak  harness/soak/soak.json
 #   $drive_min   the run's drive, in minutes (the duration env: SOAK_DRIVE_MIN)
-#   $page        "real" (the production overlay page) or "test" (C14's overlay-test.html: plumbing)
+#   $memory_mb   the compositor Machine's memory, in MB (soak.yml's C_MEM): check 1.projection's budget
+#   $page       "real" (the production overlay page) or "test" (C14's overlay-test.html: plumbing)
 #   $schedule    "soak", "dropouts" or "none" (schedule.jq's schedule_plan: what the driver was to do)
 # Every number comes from $t, $soak or $drive_min: none is typed here. Each check answers
 # {id, name, status: pass|fail|pending, reason, measured}; a check whose data is missing fails,
@@ -103,6 +104,8 @@ if ($page != "real" and $page != "test") then error("verdict: page must be real 
 | (if $s == null then ["no start action: the drive's windows are unknown"] else [] end) as $no_start
 | ($r.heartbeats.series // []) as $beats
 | (if $s == null then [] else [$beats[] | select(.received_ms >= $s and .received_ms < $s + $drive_ms)] end) as $drive_beats
+# The beats the drive must carry (check 5.beats), and the memMb beats check 1.projection must fit.
+| ($drive_ms / $t.heartbeat_interval_ms * $soak.heartbeat_min_ratio) as $want_beats
 | [$actions[] | select(.kind == "disconnect")] as $disc
 | ($r.output_outages // []) as $outages
 | ($r.log // {}) as $log
@@ -163,7 +166,9 @@ if ($page != "real" and $page != "test") then error("verdict: page must be real 
        schedule: $schedule, exit_reason: ($stopped.body.exitReason // null)}),
 
   # 1. Memory: hour 3's median memMb within memory_drift_max of hour 1's (the drive's last part
-  #    against its first: the hours of a 3-hour soak).
+  #    against its first: the hours of a 3-hour soak). The bound is 40 % (owner, 2026-10-25: "Up to
+  #    20% grew is fine", then "Machine is solely for relay so 40% is fine"; it was 10 %), and a
+  #    drift exactly at it passes (`>`).
   ([$drive_beats[] | select(.received_ms < $s + $part_ms) | .body.memMb | numbers] | median) as $m1
   | ([$drive_beats[] | select(.received_ms >= $s + 2 * $part_ms) | .body.memMb | numbers] | median) as $m3
   | check("1"; "memory";
@@ -175,6 +180,36 @@ if ($page != "real" and $page != "test") then error("verdict: page must be real 
       {hour1_median_mb: $m1, hour3_median_mb: $m3,
        drift_pct: (if $m1 == null or $m3 == null then null else (($m3 - $m1) / $m1 * 1000 | round) / 10 end),
        part_s: $plan.part_s}),
+
+  # 1.projection. Memory at the session cap (owner ruling A, 2026-10-25): the drive's memMb fitted
+  #    against time by least squares (x: hours since the start action), and the line projected to
+  #    memory_projection.session_cap_min (a livestream's 5 h), within memory_budget_fraction of the
+  #    smaller of the Machine's $memory_mb and the production guest's (memory_projection's
+  #    production_guest in compositor_guest), so a bigger soak guest never loosens the budget. The
+  #    projection is judged as it is reported, to 0.1 MB: exactly at the budget passes. The fit needs
+  #    check 5.beats's floor of memMb beats, and a spread in time to fit; fewer, none, or all at one
+  #    instant fail (never a projection of nothing), and so does a production_guest soak.json lacks.
+  ($soak.memory_projection) as $p
+  | [$drive_beats[] | select((.body.memMb | type) == "number") | {x: ((.received_ms - $s) / 3600000), y: .body.memMb}] as $pts
+  | ($pts | length) as $n
+  | (if ($p.production_guest | type) == "string" then $soak.compositor_guest[$p.production_guest].memory_mb else null end) as $prod_mb
+  | (if ($prod_mb | type) == "number" then ([$memory_mb, $prod_mb] | min) * $p.memory_budget_fraction else null end) as $budget
+  | (if $n == 0 then null else ([$pts[] | .x] | add) / $n end) as $xm
+  | (if $n == 0 then null else ([$pts[] | .y] | add) / $n end) as $ym
+  | (if $n == 0 then 0 else [$pts[] | (.x - $xm) * (.x - $xm)] | add end) as $sxx
+  | (if $sxx == 0 then null else ([$pts[] | (.x - $xm) * (.y - $ym)] | add) / $sxx end) as $slope
+  | (if $slope == null then null else $ym - $slope * $xm end) as $intercept
+  | (if $slope == null then null else $intercept + $slope * $p.session_cap_min / 60 | round1 end) as $projected
+  | check("1.projection"; "memory projection";
+      $no_report + $no_start
+      + (if $n < $want_beats then ["memory projection: \($n) drive beats carry memMb, want at least \($want_beats) (check 5.beats's floor)"] else [] end)
+      + (if $n > 0 and $slope == null then ["memory projection: \($n) memMb beat(s) with no spread in time to fit"] else [] end)
+      + (if $budget == null then ["memory projection: no budget: soak.json's memory_projection.production_guest (\($p.production_guest | tojson)) names no compositor_guest with a memory_mb"] else [] end)
+      + (if $projected != null and $budget != null and $projected > $budget
+         then ["memory projection: the drive's fit (\($slope | round1) MB/h from \($intercept | round1) MB, \($n) beats) reaches \($projected) MB at the session cap of \($p.session_cap_min) min, over the budget of \($budget) MB (\($p.memory_budget_fraction * 100) % of \([$memory_mb, $prod_mb] | min) MB: the Machine's \($memory_mb), production's \($prod_mb))"] else [] end);
+      {beats_fitted: $n, want_beats: $want_beats, slope_mb_per_h: ($slope | round1), intercept_mb: ($intercept | round1),
+       session_cap_min: $p.session_cap_min, projected_mb: $projected, budget_mb: $budget, machine_memory_mb: $memory_mb,
+       production_guest: $p.production_guest, production_memory_mb: $prod_mb}),
 
   # 1.split. The memory experiment's evidence (schedule dropouts or none; never the soak's, whose
   #    page=real log the runner may withhold): in the drive, lines carrying the compositor's RSS and
@@ -235,8 +270,7 @@ if ($page != "real" and $page != "test") then error("verdict: page must be real 
 
   # 5. Anti-vacuity: the beats, every scheduled dropout and disconnect done, and each disconnect
   #    landed (packets dropped) and was felt (an output outage over it).
-  ($drive_ms / $t.heartbeat_interval_ms * $soak.heartbeat_min_ratio) as $want_beats
-  | check("5.beats"; "heartbeats";
+  check("5.beats"; "heartbeats";
       $no_report + $no_start
       + (if ($drive_beats | length) < $want_beats then ["heartbeats: \($drive_beats | length) in the drive, want at least \($want_beats)"] else [] end);
       {beats_in_drive: ($drive_beats | length), want: $want_beats, max_gap_ms: ($r.heartbeats.max_gap_ms // null)}),
