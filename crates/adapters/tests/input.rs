@@ -580,15 +580,24 @@ fn the_harness_lets_a_start_go_only_past_its_handshake() {
     assert_eq!(verdicts, 3);
 }
 
+/// Nothing listened at the caller's first handshake request, so its handshake rode libsrt's resend,
+/// which libsrt 1.5.3 sends every 250 ms with no answer (`queue.cpp`:1085-1089): its listener accepts
+/// no earlier than this after the rebuild. A listener already up answers the first request instead
+/// (measured on CI: 8.8-11.7 ms after the rebuild with the listener started first, against
+/// 258-262 ms in 100 runs of production's order, run 40168203114).
+const HANDSHAKE_RODE_A_RESEND: Duration = Duration::from_millis(100);
+
 /// Production's order, which the harness's hold takes out of every other connecting test here: the
-/// source is PLAYING, its reader free to read, before the caller's handshake completes. Nothing
-/// listens until the source is seen PLAYING (the caller repeats its handshake request until one is
-/// answered, inside SRT's own connect timeout, F-012), so the order is made by construction; it is
-/// witnessed on two clocks: the source had no handshake when it was seen PLAYING, and the listener's
-/// own `caller-added` came after that instant (a listener started before the rebuild accepts the
-/// caller about a millisecond in, before the source goes PLAYING). The reader wakes on the first
-/// data, which libsrt delivers only once the socket is connected, and the generation connects with no
-/// loss.
+/// source is PLAYING, its reader free to read and parked waiting for data, before the caller's
+/// handshake completes. Nothing listens until the source is seen PLAYING (the caller repeats its
+/// handshake request until one is answered, inside SRT's own connect timeout, F-012), so the order is
+/// made by construction. It is witnessed three ways: the source had no handshake when it was seen
+/// PLAYING; the listener's own `caller-added` came after that instant; and it came no earlier than
+/// `HANDSHAKE_RODE_A_RESEND` after the rebuild, so the handshake rode a resend while the reader
+/// waited. With the listener started before the rebuild, the first two are a race the listener
+/// usually wins (CI: 4 of 5 runs red on them, the fifth accepted 97 µs after PLAYING); the third reds
+/// every time. The reader wakes on the first data, which libsrt delivers only once the socket is
+/// connected, and the generation connects with no loss.
 #[test]
 fn a_reader_already_waiting_when_the_handshake_completes_connects() {
     let _s = serial();
@@ -613,20 +622,24 @@ fn a_reader_already_waiting_when_the_handshake_completes_connects() {
     let seen = events_until(&rx, left(deadline), |e| *e == Event::InputConnected { gen: 1 });
     let connected_after = t0.elapsed();
     let second = events_for(&rx, Duration::from_secs(1));
-    let accepted_at = l
-        .first_caller_at
-        .lock()
-        .unwrap()
-        .expect("the listener accepted the caller");
+    let accepted: Option<Instant> = *l.first_caller_at.lock().unwrap();
     eprintln!(
         "source PLAYING after {:?}, connected then: {connected_when_free}; the listener accepted the \
-         caller {:?} after that (negative: {:?} before); connected after {connected_after:?}; {} frames \
-         in the next second; callers {}",
+         caller {:?} after the rebuild, {:?} after PLAYING was seen (negative: {:?} before); connected \
+         after {connected_after:?}; {} frames in the next second; callers {}",
         reader_free_at - t0,
-        accepted_at.saturating_duration_since(reader_free_at),
-        reader_free_at.saturating_duration_since(accepted_at),
+        accepted.map(|a| a.saturating_duration_since(t0)),
+        accepted.map(|a| a.saturating_duration_since(reader_free_at)),
+        accepted.map(|a| reader_free_at.saturating_duration_since(a)),
         frames_in(&second),
         l.callers.load(Ordering::SeqCst)
+    );
+    let accepted_at = accepted.expect("the listener accepted the caller");
+    assert!(
+        accepted_at.saturating_duration_since(t0) >= HANDSHAKE_RODE_A_RESEND,
+        "the listener accepted the caller {:?} after the rebuild, under {HANDSHAKE_RODE_A_RESEND:?}: \
+         it answered the first handshake request, so it was up before the reader waited",
+        accepted_at.saturating_duration_since(t0)
     );
     assert!(
         accepted_at > reader_free_at,
