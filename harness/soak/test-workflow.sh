@@ -28,7 +28,9 @@
 #   Machine's entry, a cut-off tail, stamps with 9 and 3 fraction digits and an offset, a bare and a
 #   reasoned `overlay hidden`; and an empty stream refused.
 #
-#   harness/soak/test-workflow.sh                 (SOAK_YML=<file> checks another copy: mutants)
+#   harness/soak/test-workflow.sh                 (SOAK_YML=<file> checks another copy: mutants;
+#                                                  HARNESS_BASH=<bash 5> runs the cost table's step,
+#                                                  which needs bash 4+ as the runner's has)
 #
 # Needs ruby (YAML), jq and python3. Prints `checked: N` and fails on zero.
 set -euo pipefail
@@ -232,7 +234,8 @@ else
 fi
 gate="$(step soak "Leak gate")"
 leakgate() { # <page> <secrets.json content or ""> [compositor.log content]: runs the step on a fake
-  # /out; rc, then what is left. @LOGSUM@ in the secrets is the log's own sha256.
+  # /out; rc, then what is left. @LOGSUM@ in the secrets is the log's own sha256. LG_FLY: the Fly
+  # token in the step's environment.
   rm -rf "$W/lg"; mkdir -p "$W/lg/out"
   printf 'tok_%s\n' "$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')" >"$W/lg/job-token"
   for f in status.json done driver.log web.log report.json; do echo '{}' >"$W/lg/out/$f"; done
@@ -245,7 +248,7 @@ leakgate() { # <page> <secrets.json content or ""> [compositor.log content]: run
   [ -z "$sec" ] || printf '%s\n' "$sec" >"$W/lg/out/secrets.json"
   : >"$W/lg/gh-out"
   local rc=0
-  RUNNER_TEMP="$W/lg" PAGE="$1" GITHUB_OUTPUT="$W/lg/gh-out" bash -eo pipefail -c "$gate" >"$W/lg/log" 2>&1 || rc=$?
+  RUNNER_TEMP="$W/lg" PAGE="$1" GITHUB_OUTPUT="$W/lg/gh-out" FLY_API_TOKEN="${LG_FLY:-}" bash -eo pipefail -c "$gate" >"$W/lg/log" 2>&1 || rc=$?
   echo "$rc $(cd "$W/lg/out" && ls | sort | tr '\n' ' ')"
 }
 got="$(leakgate real "")"
@@ -260,6 +263,14 @@ got="$(leakgate real '{"scanned":24,"leaks":1,"skipped":[],"leaked":[{"kind":"WE
   && pass "leak gate: a leak uploads nothing and prints the harness's redacted report" || fail "leak gate, a leak" "$got: $(head -c 400 "$W/lg/log")"
 got="$(leakgate real '{"scanned":24,"leaks":0,"skipped":[],"leaked":[]}')"
 [ "${got%% *}" = 0 ] && grep -qx 'ok=true' "$W/lg/gh-out" && pass "leak gate: a clean scan uploads" || fail "leak gate, clean" "$got"
+# The Fly token: a cost leg's flyctl output in a kept file is a leak; set and absent, a clean run uploads.
+fly="FlyV1 fm2_$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
+got="$(LG_FLY="$fly" leakgate real '{"scanned":24,"leaks":0,"skipped":[],"leaked":[]}' "ts=2026-10-24T12:00:00.000Z level=info msg=cef alive gen=1 ${fly}")"
+[ "${got%% *}" = 1 ] && ! grep -qx 'ok=true' "$W/lg/gh-out" && grep -qF 'the job token or the Fly token is in a fetched file' "$W/lg/log" \
+  && ! grep -qF -- "$fly" "$W/lg/log" && pass "leak gate: the Fly token in a fetched file uploads nothing (and is not printed)" || fail "leak gate, the Fly token" "$got"
+got="$(LG_FLY="$fly" leakgate real '{"scanned":24,"leaks":0,"skipped":[],"leaked":[]}')"
+[ "${got%% *}" = 0 ] && grep -qx 'ok=true' "$W/lg/gh-out" && [ "$(stat -f %Lp "$W/lg/scan-patterns" 2>/dev/null || stat -c %a "$W/lg/scan-patterns")" = 600 ] \
+  && pass "leak gate: with the Fly token set, a clean run uploads; the pattern file is mode 600" || fail "leak gate, the Fly token clean" "$got"
 # The runner's own compositor log (page=real): up only when the harness scanned those bytes.
 clog='ts=2026-10-24T12:00:00.000Z level=info msg=cef alive gen=1'
 got="$(leakgate real '{"scanned":24,"leaks":0,"skipped":[],"leaked":[],"compositor_log_sha256":"@LOGSUM@"}' "$clog")"
@@ -341,8 +352,9 @@ grep -qE '(^| )stills\.tar( |;|$)' <<<"$fetch" && pass "the fetch takes a leg's 
 check "the outputs' artifact: a name per leg and camera on the legs, the soak's unchanged" \
   '[.jobs.soak.steps[] | select((.uses // "") | startswith("actions/upload-artifact")) | .with.name]
    == ["soak-${{ github.run_id }}-${{ github.run_attempt }}${{ matrix.run.leg != '"'"''"'"' && format('"'"'-{0}-{1}'"'"', matrix.run.leg, matrix.run.camera) || '"'"''"'"' }}"]'
-check "the cost-table job: after every leg (not after a cancel), on the legs only, over the run's artifacts" \
-  '.jobs["cost-table"] | .needs == ["plan", "soak"] and .if == "${{ !cancelled() && needs.plan.outputs.mode == '"'"'legs'"'"' }}"
+check "the cost-table job: after every leg (not after a cancel), on the legs only and only with the token, over the run's artifacts" \
+  '.jobs["cost-table"] | .needs == ["plan", "soak"]
+   and .if == "${{ !cancelled() && needs.plan.outputs.enabled == '"'"'true'"'"' && needs.plan.outputs.mode == '"'"'legs'"'"' }}"
    and ([.steps[] | select((.uses // "") | startswith("actions/download-artifact")) | .with.pattern] == ["soak-${{ github.run_id }}-*"])
    and ([.steps[] | .run // empty] | join("\n") | contains("harness/soak/cost/table.sh \"${f[@]}\""))'
 # Every leg's session reaches the harness image (driver.sh reads /soak/session-composed-<output>.json).
@@ -355,6 +367,33 @@ for o in $outputs; do
 done
 [ "$n_out" -ge 2 ] && [ -z "$missing" ] && pass "the image: every leg's session fixture copied ($n_out outputs: $(echo $outputs))" \
   || fail "the image: the legs' session fixtures" "checked $n_out, missing:$missing"
+# The cost table's step, run for real: each leg:camera's latest attempt, and a red naming a run with
+# no verdict.
+table_step="$(step cost-table "The cost table")"
+ctab() { # <runs json> <artifact dir:verdict>...: rc; the summary in $W/ct/summary.md
+  local runs="$1" a; shift
+  rm -rf "$W/ct" && mkdir -p "$W/ct/legs"
+  for a in "$@"; do mkdir -p "$W/ct/legs/${a%%:*}"; [ -z "${a#*:}" ] || cp "${a#*:}" "$W/ct/legs/${a%%:*}/cost.json"; done
+  : >"$W/ct/summary.md"
+  (cd "$ROOT" && RUNNER_TEMP="$W/ct" GITHUB_RUN_ID=77 GUEST=performance-4x RUNS="$runs" GITHUB_STEP_SUMMARY="$W/ct/summary.md" \
+    "${HARNESS_BASH:-bash}" -eo pipefail -c "$table_step" >"$W/ct/log" 2>&1)
+}
+mkdir -p "$W/ctv"
+python3 -I "$HERE/cost/fixture.py" "$W/ctv/g" && python3 -I "$HERE/cost/fixture.py" "$W/ctv/r" cpu-over
+"$HERE/cost/verdict.sh" --dir "$W/ctv/g" --leg A --camera snow --guest performance-4x >"$W/ctv/green.json" 2>/dev/null || true
+"$HERE/cost/verdict.sh" --dir "$W/ctv/r" --leg A --camera snow --guest performance-4x >"$W/ctv/red.json" 2>/dev/null || true
+jq -c '.camera = "noise"' "$W/ctv/green.json" >"$W/ctv/green-noise.json"
+two='[{"leg":"A","camera":"snow"},{"leg":"A","camera":"noise"}]'
+if ctab "$two" "soak-77-1-A-snow:$W/ctv/red.json" "soak-77-2-A-snow:$W/ctv/green.json" "soak-77-1-A-noise:$W/ctv/green-noise.json" \
+  && grep -qF '# cost legs on performance-4x: 2 of 2 run(s), each its latest attempt' "$W/ct/summary.md" \
+  && grep -qF '| **Size rule verdict** | **PASS** | **PASS** |' "$W/ct/summary.md"; then
+  pass "cost table: a re-run leg's latest attempt only (attempt 1's red left out), 2 of 2 runs"
+else fail "cost table: the latest attempt" "$(head -c 500 "$W/ct/summary.md") $(tail -n 3 "$W/ct/log")"; fi
+if ctab "$two" "soak-77-1-A-snow:$W/ctv/green.json" "soak-77-1-A-noise:"; then fail "cost table: a missing verdict" "exit 0"
+else
+  grep -qF '::error::no verdict for A-noise' "$W/ct/log" && grep -qF '1 of 2 run(s)' "$W/ct/summary.md" \
+    && pass "cost table: a run with no verdict is named and fails the job, the rest still tabled" || fail "cost table: a missing verdict" "$(cat "$W/ct/log")"
+fi
 # The verdict step's leg path, run for real on fixture.py's green leg and on one red.
 vleg() { # <fixture mutation or ''>: rc; the summary in $W/summary.md, outputs in $W/v.out
   rm -rf "$W/vout" && mkdir -p "$W/vout/out"

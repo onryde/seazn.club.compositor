@@ -648,13 +648,20 @@ jobs:
       - name: Leak gate
         id: leaks
         if: always() && steps.launch.outputs.harness != ''
+        env:
+          # Scanned for too: a cost leg's leg.sh runs flyctl with it beside files that are kept
+          # (cost-leg.log, cost-samples.err). Never in argv: a mode-600 pattern file (printf is a builtin).
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
         run: |
           OUT="$RUNNER_TEMP/out"
           n="$(find "$OUT" -type f | wc -l)"
           [ -s "$RUNNER_TEMP/job-token" ] || { echo "::error::no job token file to scan with"; exit 1; }
           [ "$n" -gt 0 ] || { echo "::error::nothing to scan"; exit 1; }
-          if grep -rqF -f "$RUNNER_TEMP/job-token" "$OUT" "$RUNNER_TEMP/compositor.stream.json" 2> /dev/null; then
-            echo "::error::the job token is in a fetched file: nothing is uploaded"
+          # An empty line in a -f list matches every line, so an unset token adds none.
+          ( umask 077; cat "$RUNNER_TEMP/job-token" > "$RUNNER_TEMP/scan-patterns"
+            [ -z "${FLY_API_TOKEN:-}" ] || printf '%s\n' "$FLY_API_TOKEN" >> "$RUNNER_TEMP/scan-patterns" )
+          if grep -rqF -f "$RUNNER_TEMP/scan-patterns" "$OUT" "$RUNNER_TEMP/compositor.stream.json" 2> /dev/null; then
+            echo "::error::the job token or the Fly token is in a fetched file: nothing is uploaded"
             exit 1
           fi
           if [ -f "$OUT/secrets.json" ]; then
@@ -784,7 +791,7 @@ jobs:
   # for F-0xx "real overlay cost". A leg whose outputs were not uploaded (a leak) is missing from it.
   cost-table:
     needs: [plan, soak]
-    if: ${{ !cancelled() && needs.plan.outputs.mode == 'legs' }}
+    if: ${{ !cancelled() && needs.plan.outputs.enabled == 'true' && needs.plan.outputs.mode == 'legs' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -798,7 +805,26 @@ jobs:
       - name: The cost table
         env:
           GUEST: ${{ inputs.guest }}
+          RUNS: ${{ needs.plan.outputs.runs }}
         run: |
-          mapfile -t f < <(find "$RUNNER_TEMP/legs" -name cost.json | sort)
+          # Each leg:camera's latest attempt (a re-run of a failed leg leaves both attempts' artifacts,
+          # soak-<run>-<attempt>-<leg>-<camera>), then every run asked for, or a red naming the missing.
+          declare -A best
+          for d in "$RUNNER_TEMP/legs"/soak-"$GITHUB_RUN_ID"-*; do
+            c="$(find "$d" -name cost.json 2> /dev/null | head -n 1)"
+            [ -n "$c" ] || continue
+            n="${d##*/soak-"$GITHUB_RUN_ID"-}"
+            a="${n%%-*}" key="${n#*-}"
+            [[ $a =~ ^[0-9]+$ ]] || continue
+            if [ -z "${best[$key]:-}" ] || [ "$a" -gt "${best[$key]%%:*}" ]; then best[$key]="$a:$c"; fi
+          done
+          f=()
+          for key in "${!best[@]}"; do f+=("${best[$key]#*:}"); done
+          want="$(jq 'length' <<< "$RUNS")"
           [ "${#f[@]}" -gt 0 ] || { echo "::error::no leg's verdict (cost.json) among the artifacts"; exit 1; }
-          { echo "# cost legs on $GUEST: ${#f[@]} leg(s)"; harness/soak/cost/table.sh "${f[@]}"; } | tee -a "$GITHUB_STEP_SUMMARY"
+          { echo "# cost legs on $GUEST: ${#f[@]} of $want run(s), each its latest attempt"; harness/soak/cost/table.sh "${f[@]}"; } | tee -a "$GITHUB_STEP_SUMMARY"
+          missing="$(jq -r '.[] | "\(.leg)-\(.camera)"' <<< "$RUNS" | while read -r k; do [ -n "${best[$k]:-}" ] || printf '%s ' "$k"; done)"
+          if [ -n "$missing" ]; then
+            echo "::error::no verdict for ${missing% }: that leg's job stopped before its verdict"
+            exit 1
+          fi
