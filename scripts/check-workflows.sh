@@ -26,9 +26,13 @@
 #     with no tee and no GitHub command file on the line (soak.yml's leak gate writes the token to a
 #     umask-077 pattern file to grep the outputs for it). Into the log, $GITHUB_OUTPUT, $GITHUB_ENV
 #     or the step summary is.
-#  4. promote.yml: every job that holds a Fly token declares exactly `relay-${{ inputs.env }}`, and
-#     inputs.env is the choice [stg, prod], so the environment is relay-stg or relay-prod, whose
-#     required reviewers are the human approval (the owner ruling: the RELAY_IMAGE bump is explicit).
+#  4. Every Fly token behind its workflow's environment (the PR #85 review's I-1 and I-4): every job
+#     that holds one declares exactly relay-stg-push (deploy-stg.yml), relay-prod-push
+#     (deploy-prod.yml) or `relay-${{ inputs.env }}` (promote.yml, whose inputs.env is the choice
+#     [stg, prod], so relay-stg or relay-prod, whose required reviewers are the human approval: the
+#     owner ruling, the RELAY_IMAGE bump is explicit). A job outside an environment could read only a
+#     repository secret, which every branch's workflow reads; any other deploy workflow that holds a
+#     Fly token has no known environment and is a red.
 #  5. The CEF bump gate (Owed 22): in every deploy workflow, every job that holds a Fly token checks
 #     out before it uses the token, and each checkout's very next step is exactly
 #     `run: scripts/check-cef-bump.sh` with nothing but a name or id (no if, continue-on-error, shell
@@ -40,7 +44,8 @@
 #  8. The registry is the RELAY_REGISTRY variable (ADR 0007): a deploy workflow writes
 #     registry.fly.io only on a line that reads vars.RELAY_REGISTRY (its default).
 #  9. The tokens by blast radius (the PR #85 review's I-1): a deploy workflow names only the four
-#     Fly tokens below, whose reach the C16 handoff's minting steps fix; a web token
+#     Fly tokens below, whose reach the C16 handoff's minting steps fix (each an environment secret,
+#     rule 4); a web token
 #     (FLY_API_TOKEN_WEB_*, which sets seazn-club-<env>'s secrets) appears in promote.yml alone, in a
 #     job behind relay-${{ inputs.env }}; and no workflow names a secret by expression (secrets[...],
 #     toJSON(secrets)), which no rule here could read.
@@ -52,6 +57,18 @@
 #     step with id `provenance` before the guard (stg: the ref is refs/heads/main; prod: the tag's
 #     commit is on main, by merge-base --is-ancestor), which exits 1 on a refusal and carries no if,
 #     continue-on-error or shell.
+# 12. The push environment holds (I-4): deploy-stg.yml's and deploy-prod.yml's push job runs a step
+#     with id `environment` before its first Fly token step, which reads the environment and its
+#     deployment policies through the REST API, requires custom policies of exactly branch:main
+#     (relay-stg-push) or tag:v* (relay-prod-push), and exits 1 otherwise; nothing but a name, id,
+#     env and run.
+# 13. Main's build record (I-4): the push job attests the pushed digest (a step with id `attest`
+#     using actions/attest pinned by commit, after the Push step, on steps.push.outputs.digest), then
+#     verifies on BOTH paths (a step with id `record`, no if, before the summary) with
+#     `gh attestation verify --cert-identity` naming deploy-stg.yml@refs/heads/main or
+#     deploy-prod.yml@refs/tags/$TAG, --source-digest "$GITHUB_SHA" and --deny-self-hosted-runners,
+#     exiting 1 when it does not verify; and promote.yml's step runs `gh attestation verify` with
+#     --cert-identity, --source-digest and --deny-self-hosted-runners before its first call to web.
 #
 # The deploy workflows are deploy-stg.yml, deploy-prod.yml and promote.yml, each required, plus any
 # other workflow that names the stg or prod relay or web app, or their tokens: a new one is held to
@@ -318,27 +335,40 @@ done
 echo "no secret echoed: $runs run blocks read"
 [ "$runs" -gt 0 ] || failed "0 run blocks read: the secret rule read nothing"
 
-# 4. promote.yml asks a human.
-if [ -f "$dir/promote.yml" ]; then
-  envs=0
-  out=$(jq -r "$JQ_LIB"'
-    ( (.["true"].workflow_dispatch.inputs.env // {}) as $in
-      | if ($in.type == "choice" and $in.options == ["stg", "prod"]) then empty
-        else "FAIL inputs.env is not the choice [stg, prod]: relay-${{ inputs.env }} could name an environment nobody protects" end ),
+# 4. Every Fly token behind its workflow's environment.
+envs=0
+for f in ${deploy[@]+"${deploy[@]}"}; do
+  b=$(basename "$f")
+  # shellcheck disable=SC2016  # a literal ${{ }}: the expression text the rule matches
+  case "$b" in
+    deploy-stg.yml) want='^relay-stg-push$' shown=relay-stg-push ;;
+    deploy-prod.yml) want='^relay-prod-push$' shown=relay-prod-push ;;
+    promote.yml) want='^relay-\$\{\{ *inputs\.env *\}\}$' shown='relay-${{ inputs.env }}' ;;
+    *) want='' shown='' ;;
+  esac
+  out=$(jq -r --arg b "$b" --arg want "$want" --arg shown "$shown" "$JQ_LIB"'
+    ( if $b != "promote.yml" then empty
+      else (.["true"].workflow_dispatch.inputs.env // {}) as $in
+        | if ($in.type == "choice" and $in.options == ["stg", "prod"]) then empty
+          else "FAIL inputs.env is not the choice [stg, prod]: relay-${{ inputs.env }} could name an environment nobody protects" end
+      end ),
     ( [ .jobs | to_entries[] | select(.value | holds_fly)
         | {job: .key, env: ((.value.environment // "") | if type == "object" then (.name // "") else . end | tostring)} ]
       | if length == 0 then "FAIL no job holds a Fly token"
-        else .[] | if (.env | test("^relay-\\$\\{\\{ *inputs\\.env *\\}\\}$")) then "ENV \(.job) \(.env)"
-          else "FAIL job \(.job) holds a Fly token and declares environment \u0027\(.env)\u0027, not exactly relay-${{ inputs.env }}: no reviewer of relay-stg or relay-prod approves the promote" end
-        end )' "$(json "$dir/promote.yml")")
+        else .[] | if $want != "" and (.env | test($want)) then "ENV \(.job) \(.env)"
+          elif $want == "" then "FAIL job \(.job) holds a Fly token, and no environment is known for this workflow: the token could only be a repository secret, which every branch\u0027s workflow reads"
+          elif $b == "promote.yml" then "FAIL job \(.job) holds a Fly token and declares environment \u0027\(.env)\u0027, not exactly relay-${{ inputs.env }}: no reviewer of relay-stg or relay-prod approves the promote"
+          else "FAIL job \(.job) holds a Fly token and declares environment \u0027\(.env)\u0027, not exactly \($shown): outside it the token can only be a repository secret, which every branch\u0027s workflow reads (the PR #85 review\u0027s I-4)" end
+        end )' "$(json "$f")")
   while IFS= read -r line; do
     case "$line" in
-      FAIL*) failed "promote.yml: ${line#FAIL }" ;;
-      ENV*) envs=$((envs + 1)); echo "promote environment: ${line#ENV }" ;;
+      FAIL*) failed "$b: ${line#FAIL }" ;;
+      ENV*) envs=$((envs + 1)); echo "token environment: $b ${line#ENV }" ;;
     esac
   done <<< "$out"
-  echo "promote jobs behind an environment: $envs"
-fi
+done
+echo "fly token jobs behind their workflow's environment: $envs"
+[ "$envs" -gt 0 ] || failed "no Fly token job behind an environment: the environment rule read nothing"
 
 # 5. The CEF bump gate after every checkout of a token-holding deploy job.
 gates=0
@@ -487,6 +517,104 @@ for pair in "deploy-stg.yml:refs/heads/main" "deploy-prod.yml:merge-base --is-an
   done <<< "$out"
 done
 echo "provenance steps before a push guard: $provenance"
+
+# The push job: the one job holding a Fly token in a step other than the guard (id token).
+read -r -d '' JQ_PUSH << 'JQ' || true
+def push_jobs: [ .jobs | to_entries[] | select((.value | holds_fly) and (any((.value.steps // [])[]; .id == "token") | not)) ];
+def code_lines: split("\n") | map(select(test("^\\s*#") | not)) | join("\n");
+JQ
+
+# 12. The push environment holds.
+env_checks=0
+for pair in "deploy-stg.yml:branch:main" "deploy-prod.yml:tag:v*"; do
+  b=${pair%%:*} want=${pair#*:}
+  [ -f "$dir/$b" ] || continue
+  out=$(jq -r --arg want "$want" "$JQ_LIB$JQ_PUSH"'
+    push_jobs as $jobs
+    | if ($jobs | length) != 1 then "FAIL \($jobs | length) jobs hold a Fly token beyond the guard, not 1 (the push job)"
+      else $jobs[0] | .key as $j | (.value.steps // []) as $steps
+        | ([ $steps | to_entries[] | select(.value | holds_fly) | .key ] | min) as $first
+        | ([ $steps | to_entries[] | select(.value.id == "environment") | .key ][0]) as $e
+        | if $e == null then "FAIL job \($j) has no step with id environment: nothing proves the push token is still \($want)\u0027s alone"
+          elif $e > $first then "FAIL job \($j): the environment check comes after its first Fly token step"
+          elif (($steps[$e] | keys) - ["name", "id", "env", "run"] | length) > 0
+          then "FAIL job \($j): the environment check carries \((($steps[$e] | keys) - ["name", "id", "env", "run"]) | join(", ")): it runs bare, or a refusal could pass"
+          else (($steps[$e].run // "") | code_lines) as $r
+            | ([ "environments/", "deployment-branch-policies", "custom_branch_policies", $want ] | map(select(. as $x | $r | contains($x) | not))) as $missing
+            | if ($missing | length) > 0 then "FAIL job \($j): the environment check does not read \($missing | map("\u0027" + . + "\u0027") | join(", "))"
+              elif ($r | test("(^|[;\\s])exit 1([;\\s]|$)") | not) then "FAIL job \($j): the environment check never exits 1"
+              else "ENVCHECK \($j)" end
+          end
+      end' "$(json "$dir/$b")")
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL*) failed "$b (push environment): ${line#FAIL }" ;;
+      ENVCHECK*) env_checks=$((env_checks + 1)) ;;
+    esac
+  done <<< "$out"
+done
+echo "push environment checks before the first push-token step: $env_checks of 2"
+
+# 13. Main's build record.
+records=0 promote_verifies=0
+# shellcheck disable=SC2016  # a literal $TAG: the text the record check must hold
+for pair in 'deploy-stg.yml:deploy-stg.yml@refs/heads/main' 'deploy-prod.yml:deploy-prod.yml@refs/tags/$TAG'; do
+  b=${pair%%:*} want=${pair#*:}
+  [ -f "$dir/$b" ] || continue
+  out=$(jq -r --arg want "$want" "$JQ_LIB$JQ_PUSH"'
+    push_jobs as $jobs
+    | if ($jobs | length) != 1 then "FAIL \($jobs | length) jobs hold a Fly token beyond the guard, not 1 (the push job)"
+      else $jobs[0] | .key as $j | (.value.steps // []) as $steps
+        | ([ $steps | to_entries[] | select(.value.id == "push") | .key ][0]) as $push
+        | ([ $steps | to_entries[] | select(.value.id == "attest") | .key ][0]) as $a
+        | ([ $steps | to_entries[] | select(.value.id == "record") | .key ][0]) as $rec
+        | ([ $steps | to_entries[] | select(.value.id == "summary") | .key ][0]) as $sum
+        | if $push == null then "FAIL job \($j) has no step with id push"
+          elif $a == null then "FAIL job \($j) has no step with id attest: nothing records the push as main\u0027s build"
+          elif $a < $push then "FAIL job \($j): the attest step comes before the push"
+          elif (($steps[$a].uses // "") | test("^actions/attest@[0-9a-f]{40}$") | not)
+          then "FAIL job \($j): the attest step is not actions/attest pinned by commit: \($steps[$a].uses // "no uses")"
+          elif ((($steps[$a].with // {})["subject-digest"] // "") | tostring | contains("steps.push.outputs.digest") | not)
+          then "FAIL job \($j): the attest step does not attest steps.push.outputs.digest"
+          elif $rec == null then "FAIL job \($j) has no step with id record: a found tag is never checked against main\u0027s build"
+          elif $rec < $a then "FAIL job \($j): the record check comes before the attest step"
+          elif $sum == null or $sum < $rec then "FAIL job \($j): the summary (step id summary) does not come after the record check"
+          elif (($steps[$rec] | keys) - ["name", "id", "env", "run"] | length) > 0
+          then "FAIL job \($j): the record check carries \((($steps[$rec] | keys) - ["name", "id", "env", "run"]) | join(", ")): it must run on both paths, bare"
+          else (($steps[$rec].run // "") | code_lines) as $r
+            | ([ "gh attestation verify", "--cert-identity", $want, "--source-digest \"$GITHUB_SHA\"", "--deny-self-hosted-runners" ]
+                | map(select(. as $x | $r | contains($x) | not))) as $missing
+            | if ($missing | length) > 0 then "FAIL job \($j): the record check does not read \($missing | map("\u0027" + . + "\u0027") | join(", "))"
+              elif ($r | test("(^|[;\\s])exit 1([;\\s]|$)") | not) then "FAIL job \($j): the record check never exits 1"
+              else "RECORD \($j)" end
+          end
+      end' "$(json "$dir/$b")")
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL*) failed "$b (build record): ${line#FAIL }" ;;
+      RECORD*) records=$((records + 1)) ;;
+    esac
+  done <<< "$out"
+done
+if [ -f "$dir/promote.yml" ]; then
+  out=$(jq -r "$JQ_LIB"'
+    [ .jobs[] | (.steps // [])[] | select((.run // "") | test("(^|[^A-Za-z0-9_])web_fly\\s")) ] as $s
+    | if ($s | length) != 1 then "FAIL \($s | length) steps call web_fly, not exactly 1 (the promote step)"
+      else ($s[0].run | split("\n") | to_entries | map(select(.value | test("^\\s*#") | not))) as $lines
+        | ([ $lines[] | select(.value | test("(^|[^A-Za-z0-9_])web_fly\\s")) | .key ] | min) as $web
+        | ( "gh attestation verify", "--cert-identity", "--source-digest", "--deny-self-hosted-runners" ) as $want
+        | ([ $lines[] | select(.value | contains($want)) | .key ] | min) as $at
+        | if $at != null and $at < $web then "VERIFY \($want)"
+          else "FAIL the promote step does not read \u0027\($want)\u0027 before its first call to web (line \($web + 1)): an unattested digest would reach web" end
+      end' "$(json "$dir/promote.yml")")
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL*) failed "promote.yml (build record): ${line#FAIL }" ;;
+      VERIFY*) promote_verifies=$((promote_verifies + 1)) ;;
+    esac
+  done <<< "$out"
+fi
+echo "build records: $records of 2 push jobs attest and verify both paths; promote reads $promote_verifies of 4 before its first call to web"
 
 finished=1
 if [ "$fails" -gt 0 ]; then

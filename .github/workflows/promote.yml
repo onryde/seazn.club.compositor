@@ -12,22 +12,28 @@ run-name: promote ${{ inputs.env }} ${{ inputs.ref }}
 #   gh workflow run promote.yml --ref main -f env=stg -f ref=<40-hex main sha>@<digest from deploy-stg>
 #   gh workflow run promote.yml --ref main -f env=prod -f ref=<vX.Y.Z>@<digest from deploy-prod>  (after C17)
 #
-# The `@sha256:<digest>` suffix is optional; with it, promote refuses unless the tag still resolves
-# to that digest, so what the reviewer approves is what ships.
+# The `@sha256:<digest>` pin is required (the PR #85 review's I-4): promote refuses unless the tag
+# still resolves to that digest AND the digest carries the attestation deploy-<env>.yml signs for
+# every push (stg: deploy-stg.yml at refs/heads/main; prod: deploy-prod.yml at refs/tags/<tag>; in
+# both, the ref's own commit). A branch's workflow cannot sign as either, so an image it planted
+# under a main sha's or a future release's tag is refused here, however its commit checks out.
 #
-# Two tokens per env, split by what they can reach (the PR #85 review's I-1):
-#   - FLY_API_TOKEN_RELAY_<ENV>_PUSH, a repository secret (deploy-<env>.yml pushes with it), minted
-#     `fly tokens create deploy -a seazn-relay-<env>`: here it only reads the relay registry.
+# Two tokens per env, split by what they can reach (the PR #85 review's I-1), both ENVIRONMENT
+# secrets of relay-<env>, never repository ones (any branch's workflow reads a repository secret):
+#   - FLY_API_TOKEN_RELAY_<ENV>_PUSH, minted `fly tokens create deploy -a seazn-relay-<env>`: here it
+#     only reads the relay registry, which answers no one without credentials (HTTP 401, re-pinned
+#     2026-10-25), and `gh attestation verify oci://...` reads the manifest through that login. The
+#     deploy workflow's own copy is relay-<env>-push's.
 #   - FLY_API_TOKEN_WEB_<ENV>, minted `fly tokens create deploy -a seazn-club-<env>`: it sets web's
-#     secrets, so it is an ENVIRONMENT secret of relay-<env> and never a repository one (any branch's
-#     workflow reads a repository secret). Each expression names one secret, never a fallback.
+#     secrets. Each expression names one secret, never a fallback.
 # GitHub creates an environment a job names, with no rules, on its first run, so the step refuses
 # unless relay-<env> has a required reviewer and deploys from main alone; it reads both through the
 # REST API, and any API error is a refusal.
 #
 # Before any Fly call the step also proves where the image came from (I-2): the ref is a commit on
 # main (stg: a 40-hex sha; prod: a vX.Y.Z tag, nothing else), and that commit's own tree passes the
-# CEF bump gate (main's copy of the gate reads the promoted commit's record, not main's).
+# CEF bump gate (main's copy of the gate reads the promoted commit's record, not main's). Before any
+# call to web, the pinned digest's attestation verifies as that commit's build by deploy-<env>.yml.
 #
 # RELAY_IMAGE is set as a Fly secret on seazn-club-<env>: re-pinned 2026-10-25, it is no [env] entry
 # in seazn.club's fly.stg.toml or fly.toml (nor in either app's deployed config), and stg's relay
@@ -48,13 +54,13 @@ on:
         options: [stg, prod]
         required: true
       ref:
-        description: "stg: a 40-hex main sha; prod: a vX.Y.Z tag; either optionally @sha256:<digest>"
+        description: "stg: <40-hex main sha>@sha256:<digest>; prod: <vX.Y.Z>@sha256:<digest> (the digest is required: the deploy's summary prints the ref)"
         type: string
         required: true
-# actions: read covers every GitHub read the step makes: this workflow's earlier runs (the previous
-# ref), and relay-<env>'s environment and deployment branch policies (GitHub's fine-grained
-# permission table lists both GETs under Actions: read, re-pinned 2026-10-25).
-permissions: { contents: read, actions: read }
+# actions: read covers this workflow's earlier runs (the previous ref) and relay-<env>'s environment
+# and deployment branch policies (GitHub's fine-grained permission table lists both GETs under
+# Actions: read, re-pinned 2026-10-25); attestations: read, the deploy's build record.
+permissions: { contents: read, actions: read, attestations: read }
 concurrency:
   group: promote-${{ inputs.env }}
   cancel-in-progress: false
@@ -97,7 +103,7 @@ jobs:
           }
           if [ "$RELAY_ENV" = prod ]; then
             if [ -z "$FLY_API_TOKEN_RELAY_PROD_PUSH" ]; then
-              echo "::warning::FLY_API_TOKEN_RELAY_PROD_PUSH unset — promote skipped"
+              echo "::warning::FLY_API_TOKEN_RELAY_PROD_PUSH unset (an environment secret of relay-prod) — promote skipped"
               skipped
             fi
             if [ -z "$FLY_API_TOKEN_WEB_PROD" ]; then
@@ -106,7 +112,7 @@ jobs:
             fi
           else
             if [ -z "$FLY_API_TOKEN_RELAY_STG_PUSH" ]; then
-              echo "::warning::FLY_API_TOKEN_RELAY_STG_PUSH unset — promote skipped"
+              echo "::warning::FLY_API_TOKEN_RELAY_STG_PUSH unset (an environment secret of relay-stg) — promote skipped"
               skipped
             fi
             if [ -z "$FLY_API_TOKEN_WEB_STG" ]; then
@@ -140,16 +146,16 @@ jobs:
         run: |
           fail() { echo "::error::$*"; exit 1; }
 
-          # 1. The inputs: each env takes its own ref shape, optionally pinned to a digest.
+          # 1. The inputs: each env takes its own ref shape, pinned to a digest (required, I-4).
           case "$RELAY_ENV" in
             stg) shape='^[0-9a-f]{40}$' what="a 40-hex main sha (deploy-stg's tag)" ;;
             prod) shape='^v[0-9]+\.[0-9]+\.[0-9]+$' what="a vX.Y.Z release tag (deploy-prod's tag)" ;;
             *) fail "env must be stg or prod: '$RELAY_ENV'" ;;
           esac
-          tag=${REF%@*} pin=''
-          [ "$tag" = "$REF" ] || pin=${REF#*@}
-          [[ "$tag" =~ $shape ]] || fail "a $RELAY_ENV ref is $what, optionally @sha256:<digest>: '$REF'"
-          [ -z "$pin" ] || [[ "$pin" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "the part after @ must be sha256:<64 hex>: '$REF'"
+          tag=${REF%%@*} pin=${REF#*@}
+          [ "$tag" != "$REF" ] || fail "a $RELAY_ENV ref names its digest, <ref>@sha256:<digest> as deploy-$RELAY_ENV.yml's summary prints it: the pin is required: '$REF'"
+          [[ "$tag" =~ $shape ]] || fail "a $RELAY_ENV ref is $what@sha256:<digest>: '$REF'"
+          [[ "$pin" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "the part after @ must be sha256:<64 hex>: '$REF'"
           [ "$GITHUB_REF" = refs/heads/main ] || fail "promote runs from main only, not $GITHUB_REF"
 
           # 2. The approval is real (I-1): relay-<env> has a required reviewer and deploys from main
@@ -216,8 +222,18 @@ jobs:
             2) fail "not pushed: $repo:$tag (deploy-$RELAY_ENV.yml pushes it)" ;;
             *) fail "the registry could not be read for $repo:$tag (only 'not found' means not pushed): $(head -c 300 "$RUNNER_TEMP/inspect.err")" ;;
           esac
-          [ -z "$pin" ] || [ "$digest" = "$pin" ] || fail "$repo:$tag resolves to $digest, not the $pin this promote names: the tag moved, nothing promoted"
+          [ "$digest" = "$pin" ] || fail "$repo:$tag resolves to $digest, not the $pin this promote names: the tag moved, nothing promoted"
           new="$repo:$tag@$digest"
+
+          # 4b. Main built it (I-4): the pinned digest carries the attestation deploy-<env>.yml signs
+          #     for each push, at this commit (stg: from refs/heads/main; prod: from refs/tags/<tag>).
+          #     A tag planted by anything else (a branch's workflow, a hand push) has none.
+          if [ "$RELAY_ENV" = prod ]; then source_ref="refs/tags/$tag"; else source_ref=refs/heads/main; fi
+          identity="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/deploy-$RELAY_ENV.yml@$source_ref"
+          gh attestation verify "oci://$repo@$pin" --repo "$GITHUB_REPOSITORY" --cert-identity "$identity" \
+              --source-ref "$source_ref" --source-digest "$commit" --signer-digest "$commit" --deny-self-hosted-runners \
+              > "$RUNNER_TEMP/attest.out" 2>&1 \
+            || fail "$repo:$tag@$pin is not main's own build: no attestation from $identity for $commit (a squat, or an image deploy-$RELAY_ENV.yml never pushed), nothing promoted: $(tail -c 300 "$RUNNER_TEMP/attest.out")"
 
           # 5. An [env] entry would make this a seazn.club PR, not a secret (C16 brief, step 3).
           config=$(web_fly config show -a "$web")
@@ -265,19 +281,23 @@ jobs:
           else
             prev_note="unknown: this workflow's runs could not be read ($(head -c 200 "$RUNNER_TEMP/gh.err"))"
           fi
+          # A rollback is offered only as the pinned ref that run promoted, and only while its tag
+          # still resolves to that pin (a run before the pin was required named none: no rollback).
           rollback=''
           if [ -n "$prev" ]; then
-            prev_tag=${prev%@*}
+            prev_tag=${prev%%@*}
             if prev_digest=$(resolve "$prev_tag"); then rc=0; else rc=$?; fi
-            if [ "$rc" -eq 2 ]; then
-              previous="\`$repo:$prev_tag\` (promote run $prev_run; no longer in the registry)"
+            if [ "$prev" = "$prev_tag" ]; then
+              previous="\`$repo:$prev_tag\` (promote run $prev_run; it named no digest, so nothing can be verified now)"
+            elif [ "$rc" -eq 2 ]; then
+              previous="\`$repo:$prev\` (promote run $prev_run; no longer in the registry)"
             elif [ "$rc" -ne 0 ]; then
-              previous="\`$repo:$prev_tag\` (promote run $prev_run; the registry could not be read for it)"
-            elif [ "$prev" != "$prev_tag" ] && [ "${prev#*@}" != "$prev_digest" ]; then
+              previous="\`$repo:$prev\` (promote run $prev_run; the registry could not be read for it)"
+            elif [ "${prev#*@}" != "$prev_digest" ]; then
               previous="\`$repo:$prev\` (promote run $prev_run; the tag has moved since, to $prev_digest)"
             else
-              previous="\`$repo:$prev_tag@$prev_digest\` (promote run $prev_run; the digest as read now)"
-              rollback="$prev_tag@$prev_digest"
+              previous="\`$repo:$prev\` (promote run $prev_run)"
+              rollback=$prev
             fi
           elif [ -n "$prev_note" ]; then
             previous=$prev_note
@@ -308,12 +328,13 @@ jobs:
             echo "|---|---|"
             echo "| web app | $web |"
             echo "| commit | $commit (on main; CEF bump gate passed in its tree) |"
+            echo "| build record | attested by \`$identity\` |"
             echo "| new RELAY_IMAGE | \`$new\` |"
             echo "| previous RELAY_IMAGE | $previous |"
             echo "| RELAY_IMAGE's Fly digest | $before → $after_digest (Deployed) |"
             echo
             if [ -n "$rollback" ]; then
-              echo "Rollback: \`gh workflow run promote.yml --ref main -f env=$RELAY_ENV -f ref=$rollback\` (a relay-$RELAY_ENV reviewer approves it; it refuses if that tag has moved)."
+              echo "Rollback: \`gh workflow run promote.yml --ref main -f env=$RELAY_ENV -f ref=$rollback\` (a relay-$RELAY_ENV reviewer approves it; it refuses if that tag has moved or its attestation does not verify)."
             elif [ -n "$prev" ]; then
               echo "Rollback: the previous ref cannot be verified now ($previous)."
             else
