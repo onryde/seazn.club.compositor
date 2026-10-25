@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use adapters::frame_store::{FrameStore, AUDIO_CHANNELS, AUDIO_FRAME_BYTES, AUDIO_RATE, AUDIO_RING_BYTES};
-use adapters::gst_input::{GstInput, StartHold};
+use adapters::gst_input::{GstInput, InputThreads, StartHold};
 use adapters::gst_programme::GstProgramme;
 use app::ports::{Inbound, InputSource, InputSpec, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::{Receiver, Sender};
@@ -2067,54 +2067,147 @@ fn stop_during_a_held_start_leaves_nothing_playing() {
     finish(input);
 }
 
-/// This process's threads named `input-build` (each build's own), from `/proc` (Linux). The name is
-/// matched whole: the test binary's own main thread is `input-<hash>`.
-fn input_threads() -> usize {
-    std::fs::read_dir("/proc/self/task")
+/// This process's threads named `input-build` (the adapter's build threads), by id, from `/proc`
+/// (Linux). The name is matched whole: the test binary's own main thread is `input-<hash>`.
+fn input_thread_ids() -> Vec<u64> {
+    let mut ids: Vec<u64> = std::fs::read_dir("/proc/self/task")
         .map(|d| {
             d.filter_map(Result::ok)
                 .filter(|e| {
                     std::fs::read_to_string(e.path().join("comm"))
                         .is_ok_and(|c| c.trim_end() == "input-build")
                 })
-                .count()
+                .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse().ok()))
+                .collect()
         })
-        .unwrap_or(0)
+        .unwrap_or_default();
+    ids.sort_unstable();
+    ids
 }
 
-/// M2: each generation's threads end with it. Across three generations (each connected, then lost)
-/// and a stop, the count of the adapter's threads goes back to where it started; while a generation
-/// is live it is above it, so the count can see them.
-#[test]
-fn every_generations_threads_end_with_it() {
-    let _s = serial();
-    thread::sleep(Duration::from_millis(300));
-    let baseline = input_threads();
-    let port = free_port();
+/// Every one of the adapter's threads is waiting for a job (none is running one, and none is between
+/// two), or the panic names the one that stayed busy: the pools are the whole process's, and an
+/// earlier test's hook may hold one for seconds.
+fn threads_settled() -> InputThreads {
+    let end = Instant::now() + Duration::from_secs(15);
+    loop {
+        let now = GstInput::threads();
+        if now.builds.idle == now.builds.spawned && now.tasks.idle == now.tasks.spawned {
+            return now;
+        }
+        assert!(Instant::now() < end, "an input thread stayed busy: {now:?}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// One generation on an adapter of its own, connected and then lost, and the adapter dropped with
+/// every teardown returned; the build threads `/proc` lists while it is live.
+fn one_generation_on_a_new_adapter(port: u16) -> usize {
+    let l = Listener::start(port, &cfg(640, 360));
     let (mut input, rx, _frames, _lines) = input(&P720);
+    connect(&mut input, &rx, 1, &spec(port));
+    let live = input_thread_ids().len();
+    l.stop();
+    events_until(&rx, LOSS_BUDGET, |e| matches!(e, Event::InputLost { .. }));
+    finish(input);
+    live
+}
+
+/// The task-owning elements of every build (the module's diagram): `srtsrc` and the two leaky
+/// queues each run one streaming task.
+const TASKS_PER_BUILD: u64 = 3;
+
+/// M2, as amended by Owed 100 (F-031): the adapter's threads outlive their generations and are
+/// reused, so generations add none. On new threads each build parked its frames in another glibc
+/// arena, about +1.2 MB of the process's memory per rebuild. A generation runs on its own adapter
+/// here, so one build is in flight at a time: after one to warm the pools, three more run three
+/// builds and at least nine streaming tasks on the adapter's threads, each task on its role's
+/// threads (the pipeline has one source task, one video queue and one audio queue, and nothing
+/// else starts a task), spawn no thread, and the build threads `/proc` lists are the same ones, by
+/// id, before and after. Then the production sequence,
+/// four generations on one adapter, each `rebuild` tearing the last one down while it starts the
+/// next: two builds overlap, so the pools may grow to two builds' worth of threads, and no further.
+#[test]
+fn the_generations_reuse_the_adapters_threads() {
+    let _s = serial();
+    let port = free_port();
+    one_generation_on_a_new_adapter(port);
+    let before = threads_settled();
+    let ids_before = input_thread_ids();
     let mut live = Vec::new();
-    for gen in 1..=3u64 {
+    for _ in 0..3 {
+        live.push(one_generation_on_a_new_adapter(port));
+    }
+    let after = threads_settled();
+    let ids_after = input_thread_ids();
+    eprintln!(
+        "one build at a time: threads before {before:?} (build threads {ids_before:?}), after {after:?} \
+         ({ids_after:?}); build threads listed while live {live:?}"
+    );
+    assert_eq!(
+        after.builds.ran - before.builds.ran,
+        3,
+        "the three builds ran on the adapter's threads"
+    );
+    assert!(
+        after.tasks.ran - before.tasks.ran >= 3 * TASKS_PER_BUILD,
+        "every build's streaming tasks ran on the adapter's pool: {} tasks",
+        after.tasks.ran - before.tasks.ran
+    );
+    for (role, was, now) in [
+        ("source", before.source, after.source),
+        ("video", before.video, after.video),
+        ("audio", before.audio, after.audio),
+    ] {
+        assert_eq!(
+            now.ran - was.ran,
+            3,
+            "each build's {role} task ran on the {role} threads"
+        );
+    }
+    assert_eq!(
+        after.other.ran, before.other.ran,
+        "a build has no task of another role"
+    );
+    assert_eq!(
+        after.builds.spawned, before.builds.spawned,
+        "no build thread was started"
+    );
+    assert_eq!(
+        after.tasks.spawned, before.tasks.spawned,
+        "no task thread was started"
+    );
+    assert!(
+        !ids_before.is_empty(),
+        "an idle build thread is listed between generations"
+    );
+    assert_eq!(ids_after, ids_before, "the same build threads, by id");
+    assert!(
+        live.iter().all(|&n| n >= 1),
+        "a live generation's build thread is listed: {live:?}"
+    );
+
+    let (mut input, rx, _frames, _lines) = input(&P720);
+    for gen in 1..=4u64 {
         let l = Listener::start(port, &cfg(640, 360));
         connect(&mut input, &rx, gen, &spec(port));
-        live.push(input_threads());
         l.stop();
         events_until(&rx, LOSS_BUDGET, |e| matches!(e, Event::InputLost { .. }));
     }
     input.stop();
-    // Judged on the thread count itself, before `finish` looks at the teardown counter.
-    let end = Instant::now() + Duration::from_secs(5);
-    while input_threads() > baseline && Instant::now() < end {
-        thread::sleep(Duration::from_millis(20));
-    }
-    let after = input_threads();
-    eprintln!("input threads: baseline {baseline}, while live {live:?}, after the stop {after}");
-    assert_eq!(live.len(), 3);
-    assert!(
-        live.iter().all(|&n| n > baseline),
-        "the count sees a live generation's threads"
-    );
-    assert_eq!(after, baseline, "every generation's threads ended");
     finish(input);
+    let overlapped = threads_settled();
+    eprintln!("two builds overlapping: threads {overlapped:?}");
+    assert_eq!(overlapped.builds.ran - after.builds.ran, 4);
+    assert!(overlapped.tasks.ran - after.tasks.ran >= 4 * TASKS_PER_BUILD);
+    assert!(
+        overlapped.builds.spawned <= after.builds.spawned.max(2),
+        "two overlapping builds need two build threads: {overlapped:?}"
+    );
+    assert!(
+        overlapped.tasks.spawned <= after.tasks.spawned.max(2 * TASKS_PER_BUILD as usize),
+        "two overlapping builds need two builds' tasks: {overlapped:?}"
+    );
 }
 
 /// M3: the loss of a generation waits for room in a full inbound channel and is then delivered,

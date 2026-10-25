@@ -5,6 +5,7 @@ pub mod frame_store;
 pub mod gst_input;
 pub mod gst_output;
 pub mod gst_programme;
+mod input_threads;
 pub mod metrics_proc;
 pub mod phase_http;
 pub mod redact;
