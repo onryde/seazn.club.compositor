@@ -1,10 +1,10 @@
 {
   "about": "The chaos suite's legs (C14 brief, amended 2026-10-20): each harness/cases/<case>.sh, variant and repeat is one leg of chaos.yml. The restart cases run 3 times and run-chaos.sh prints the worst outage. n is the brief's case number. `owed` (C14 fix round 3, item 4) names the docs/_INDEX.md Owed row behind each check a leg is known to fail (a row, or a list tried in order), so run-chaos.sh's table says which reds are explained; it never changes a verdict, and an owed red is as red as any other. A row is named for a failed check only when its `owed_signatures` filter (jq over that leg's verdict.json, its measures the evidence of the row's own cause) holds in that run (fix round 4, the re-review's I-3); else the check reads NOT OWED with the signature absent. A row leaves the map when its fix merges, and a red on its checks then reads NOT OWED: Owed 85 (a restarted container's CEF never starting; PR #54, main 263b08a), Owed 84 (a late sink's backlog; PR #57) and Owed 70 (a) (a fast GPU-death loop counted late; PR #55), all 2026-10-24, main 567cfcc. Owed 87 (the stall rule never beating rtmp2sink's own 5 s socket timeout) left it by a ruling, not a fix: the owner, 2026-10-24, \"A\", retired the rule, so the sink's error is the only stall detector and cases 5, 12 and 17 witness that path; a red on their checks reads NOT OWED. Cases 4, 5 and 12 each run twice, once per phase of the clear (no variant: a connect pending; `backoff`: after one failed; the re-review's I-5).",
   "owed_signatures": {
-    "86": ".measures.starvation_applied.applied == true and .measures.ladder_moved.dropped_rise == 0 and .measures.ladder_moved.half_rate_beats == 0"
+    "86": ".measures.starvation_applied.applied == true and .measures.ladder_unmoved.stepped == 0 and .measures.alarm_raised.raise_from_stress_ms >= 0 and .measures.beats_below_floor.checked >= 1 and .measures.beats_below_floor.above == 0"
   },
   "owed_titles": {
-    "86": "the ladder never moves under CPU starvation, and the beats read healthy"
+    "86": "the clock does not hold under CPU starvation with the ladder ruled out; the honest beat and its alarm say so"
   },
   "legs": [
     {"n": 1, "case": "camera-stop", "runs": 1},
@@ -15,7 +15,7 @@
     {"n": 5, "case": "dest-stall", "runs": 1},
     {"n": 5, "case": "dest-stall", "variant": "backoff", "runs": 1},
     {"n": 6, "case": "cpu-starved", "runs": 1,
-      "owed": {"window_fps": "86", "pts_gaps": "86", "ladder_moved": "86", "scheduled_changes_shown": "86"}},
+      "owed": {"window_fps": "86", "pts_gaps": "86", "scheduled_changes_shown": "86"}},
     {"n": 7, "case": "score-down", "runs": 1},
     {"n": 8, "case": "cef-killed", "runs": 3},
     {"n": 9, "case": "process-killed", "runs": 3},

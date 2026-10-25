@@ -295,15 +295,14 @@ fn the_table_reds_on_a_fail_an_error_a_missing_verdict_or_a_missed_sweep() {
     let mut reds = 0;
     edit(&dir, "cpu-starved", |v| {
         v["status"] = json!("fail");
-        v["failed"] = json!(["ladder_moved"]);
-        v["measures"]["starvation_applied"] = json!({"applied": true});
-        v["measures"]["ladder_moved"] = json!({"dropped_rise": 0, "half_rate_beats": 0});
+        v["failed"] = json!(["window_fps"]);
+        for (k, x) in ci_honest_beat().as_object().unwrap() {
+            v["measures"][k] = x.clone();
+        }
     });
     let out = run(&["--table", d]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(
-        stdout(&out).contains("| cpu-starved | FAIL | 4/4 | outage_ms | failed: ladder_moved (Owed 86) |")
-    );
+    assert!(stdout(&out).contains("| cpu-starved | FAIL | 4/4 | outage_ms | failed: window_fps (Owed 86) |"));
     assert!(stdout(&out).contains("this run does not count"));
     reds += 1;
 
@@ -570,7 +569,10 @@ fn every_owed_entry_names_a_real_check_and_a_real_open_owed_row_with_a_signature
         "owed entries checked: {checked}; signature reads checked: {sig_reads}; signatures: {}",
         sigs.len()
     );
-    assert!(checked >= 4, "Owed 86's known reds are listed ({checked})");
+    assert!(
+        checked >= 3,
+        "Owed 86's known reds, case 6's clock checks, are listed ({checked})"
+    );
     assert!(
         sig_reads >= checked,
         "every entry's signature reads a measure ({sig_reads})"
@@ -586,31 +588,34 @@ fn each_owed_signature_holds_on_its_causes_evidence_and_not_without_it() {
     let m = manifest();
     let sig = |r: &str| m["owed_signatures"][r].as_str().unwrap().to_owned();
     let mut checked = 0;
+    // Owed 86 (case 6 under the honest beat): CI's evidence, then each part of it absent in turn: the
+    // drive unfelt, the ladder moved, the alarm never raised or raised before the quota, no beat
+    // judged, a judged beat at or over the floor.
+    let without = |path: [&str; 2], x: Value| {
+        let mut m = ci_honest_beat();
+        m[path[0]][path[1]] = x;
+        m
+    };
     for (row, holds, measures) in [
+        ("86", true, ci_honest_beat()),
         (
             "86",
-            true,
-            json!({"starvation_applied": {"applied": true},
-            "ladder_moved": {"dropped_rise": 0, "half_rate_beats": 0}}),
+            false,
+            without(["starvation_applied", "applied"], json!(false)),
+        ),
+        ("86", false, without(["ladder_unmoved", "stepped"], json!(2))),
+        (
+            "86",
+            false,
+            without(["alarm_raised", "raise_from_stress_ms"], Value::Null),
         ),
         (
             "86",
             false,
-            json!({"starvation_applied": {"applied": false},
-            "ladder_moved": {"dropped_rise": 0, "half_rate_beats": 0}}),
+            without(["alarm_raised", "raise_from_stress_ms"], json!(-11_000)),
         ),
-        (
-            "86",
-            false,
-            json!({"starvation_applied": {"applied": true},
-            "ladder_moved": {"dropped_rise": 40, "half_rate_beats": 0}}),
-        ),
-        (
-            "86",
-            false,
-            json!({"starvation_applied": {"applied": true},
-            "ladder_moved": {"dropped_rise": 0, "half_rate_beats": 2}}),
-        ),
+        ("86", false, without(["beats_below_floor", "checked"], json!(0))),
+        ("86", false, without(["beats_below_floor", "above"], json!(1))),
     ] {
         assert_eq!(
             signature_holds(&sig(row), &json!({"measures": measures})),
@@ -620,7 +625,7 @@ fn each_owed_signature_holds_on_its_causes_evidence_and_not_without_it() {
         checked += 1;
     }
     eprintln!("signature cases checked: {checked}");
-    assert_eq!(checked, 4);
+    assert_eq!(checked, 7);
     // Owed 87 is DECIDED (the owner, 2026-10-24, "A": the stall rule is retired): its signature and
     // title left the map with its tags, so a red on its old checks reads NOT OWED.
     for map in ["owed_signatures", "owed_titles"] {
@@ -629,6 +634,21 @@ fn each_owed_signature_holds_on_its_causes_evidence_and_not_without_it() {
             "Owed 87 is still in chaos.json's {map}"
         );
     }
+}
+
+/// Case 6's honest-beat measures as CI's run 40143263604 carried them, re-judged by this branch's
+/// verdict over that run's own compositor.log: the quota felt, the ladder still, the alarm raised
+/// 4 629 ms into the quota, and 7 judged beats, none at or over the floor. The run's three reds were
+/// the clock's (window_fps, pts_gaps, scheduled_changes_shown): Owed 86's evidence.
+fn ci_honest_beat() -> Value {
+    json!({"starvation_applied": {"applied": true, "window_fps": 17.808082321794295, "fps_floor": 28.5,
+            "min_encoder_speed": 0.6000000000000014, "speed_min": 0.95, "dropped_rise": 0},
+        "ladder_unmoved": {"beats": 22, "stepped": 0, "rungs": ["full"], "dropped_before": 0,
+            "dropped_rise": 0},
+        "alarm_raised": {"raises": 1, "raise_fps": 20.46, "raise_from_stress_ms": 4629,
+            "window_ms": 40038},
+        "beats_below_floor": {"checked": 7, "above": 0, "floor": 28.5,
+            "fps": [20.27, 20.0, 19.54, 20.2, 20.0, 19.4, 17.6]}})
 }
 
 /// Case 17's `stall_swap` measure as CI's run 40121220366 left it (PR #65), in this branch's shape:
@@ -660,14 +680,11 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     };
 
     verdicts(&dir, true);
-    // CI's cpu-starved: its one failed check owed, the row's evidence present (Owed 86).
-    let starved = json!({"starvation_applied": {"applied": true},
-        "ladder_moved": {"dropped_rise": 0, "half_rate_beats": 0}});
-    edit(
-        &dir,
-        "cpu-starved",
-        fail(json!(["ladder_moved"]), starved.clone()),
-    );
+    // CI's cpu-starved (run 40143263604) re-judged: the clock's three checks failed, each owed, the
+    // row's evidence present (Owed 86: the honest beat and its alarm read the starvation, the ladder
+    // still).
+    let clock = json!(["window_fps", "pts_gaps", "scheduled_changes_shown"]);
+    edit(&dir, "cpu-starved", fail(clock.clone(), ci_honest_beat()));
     // CI's case 17 (PR #65), its reds once Owed 87's: since the owner's ruling (2026-10-24, "A")
     // the row is DECIDED and its tags are gone, so both are news, its old evidence notwithstanding.
     edit(
@@ -706,7 +723,7 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     assert_eq!(out.status.code(), Some(1), "an owed red is still red");
     let mut owed_rows = 0;
     for row in [
-        "| cpu-starved | FAIL | 4/4 | outage_ms | failed: ladder_moved (Owed 86) |",
+        "| cpu-starved | FAIL | 4/4 | outage_ms | failed: window_fps (Owed 86), pts_gaps (Owed 86), scheduled_changes_shown (Owed 86) |",
         "| dest-stall | FAIL | 4/4 | outage_ms | failed: stall_swap (NOT OWED), output_lost (NOT OWED) |",
         "| dest-stall-rule | FAIL | 4/4 | outage_ms | failed: buffer_capped (NOT OWED), stall_swap (NOT OWED) |",
         "| camera-stop | FAIL | 4/4 | outage_ms | failed: slate_ms (NOT OWED) |",
@@ -734,8 +751,9 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     assert!(!s.contains("this run counts"));
 
     // The re-review's I-3: an owed check that fails WITHOUT its row's evidence is not that row's:
-    // cpu-starved's ladder_moved on a window that dropped frames (the ladder's input moved, so not
-    // Owed 86's still ladder). And the rows fixed read NOT OWED whatever their old evidence:
+    // cpu-starved's window_fps beside a beat that lied (every judged beat at the full rate, the alarm
+    // never raised: the honest beat's own reds, which no Owed row names, so not Owed 86's lost clock
+    // under an honest beat). And the rows fixed read NOT OWED whatever their old evidence:
     // dest-disconnect's output_lost in a pending connect (Owed 84, PR #57), the fast leg's
     // overlay_back on a loop counted late (Owed 70 (a), PR #55), and Owed 87's checks with the
     // evidence its signature read before the owner's ruling (2026-10-24, "A"): dest-stall's and
@@ -757,11 +775,15 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     edit(
         &dir,
         "cpu-starved",
-        fail(
-            json!(["ladder_moved"]),
-            json!({"starvation_applied": {"applied": true},
-                "ladder_moved": {"dropped_rise": 40, "half_rate_beats": 0}}),
-        ),
+        fail(json!(["beats_below_floor", "alarm_raised", "window_fps"]), {
+            let mut m = ci_honest_beat();
+            m["alarm_raised"]["raises"] = json!(0);
+            m["alarm_raised"]["raise_fps"] = Value::Null;
+            m["alarm_raised"]["raise_from_stress_ms"] = Value::Null;
+            m["beats_below_floor"]["above"] = json!(7);
+            m["beats_below_floor"]["fps"] = json!(vec![30.0; 7]);
+            m
+        }),
     );
     edit(
         &dir,
@@ -793,7 +815,7 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     for row in [
         "| dest-disconnect | FAIL | 4/4 | outage_ms | failed: output_lost (NOT OWED) |",
         "| dest-stall | FAIL | 4/4 | outage_ms | failed: stall_swap (NOT OWED) |",
-        "| cpu-starved | FAIL | 4/4 | outage_ms | failed: ladder_moved (NOT OWED: Owed 86's signature absent) |",
+        "| cpu-starved | FAIL | 4/4 | outage_ms | failed: beats_below_floor (NOT OWED), alarm_raised (NOT OWED), window_fps (NOT OWED: Owed 86's signature absent) |",
         "| dest-trickle | FAIL | 4/4 | outage_ms | failed: stall_swap (NOT OWED) |",
         "| dest-stall-rule | FAIL | 4/4 | outage_ms | failed: buffer_capped (NOT OWED), stall_swap (NOT OWED) |",
         "| cef-gpu-deaths-fast-r1 | FAIL | 4/4 | outage_ms | failed: overlay_back (NOT OWED) |",
@@ -805,7 +827,7 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     }
     assert!(s.contains("red, every failed check owed: none\n"), "{s}");
     assert!(s.contains(
-        "red on a check no Owed row names: dest-disconnect (output_lost); dest-stall (stall_swap); cpu-starved (ladder_moved); dest-trickle (stall_swap); cef-gpu-deaths-fast-r1 (overlay_back); cef-gpu-deaths-fast-r2 (overlay_back); cef-gpu-deaths-fast-r3 (overlay_back); dest-stall-rule (buffer_capped, stall_swap)\n"
+        "red on a check no Owed row names: dest-disconnect (output_lost); dest-stall (stall_swap); cpu-starved (beats_below_floor, alarm_raised, window_fps); dest-trickle (stall_swap); cef-gpu-deaths-fast-r1 (overlay_back); cef-gpu-deaths-fast-r2 (overlay_back); cef-gpu-deaths-fast-r3 (overlay_back); dest-stall-rule (buffer_capped, stall_swap)\n"
     ), "{s}");
     for gone in ["Owed 70", "Owed 84", "Owed 85", "Owed 86:", "Owed 87:"] {
         assert!(
@@ -817,7 +839,7 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
 
     // Only owed reds: still red, and the run still does not count.
     verdicts(&dir, true);
-    edit(&dir, "cpu-starved", fail(json!(["ladder_moved"]), starved));
+    edit(&dir, "cpu-starved", fail(clock, ci_honest_beat()));
     let out = run(&["--table", d]);
     let s = stdout(&out);
     assert_eq!(out.status.code(), Some(1));
