@@ -230,6 +230,22 @@ def hung_swap_judged:
     and $s.errors_before == []
     and $s.planted_to_swap_ms >= $s.floor_ms and $s.planted_to_swap_ms <= $s.ceiling_ms;
 
+# A duration as MediaMTX's API prints it (`GET /v3/config/global/get`, F-021): its `conf.Duration`
+# (internal/conf/duration.go at v1.21.2) is a day count `<n>d` when there is one, then Go's
+# `time.Duration` String(), e.g. "1m0s", "10s", "59.999s", "500ms". In ms; null for anything else
+# (not a string, empty, a number with no unit, or text before, between or after the parts), so a
+# reading that is not a duration never passes a `>=`. The unit table is the format's, not a bound.
+def mtx_duration_ms:
+  if type != "string" then null
+  else (if startswith("-") then [-1, .[1:]] else [1, .] end) as [$sign, $s]
+    | [$s | scan("([0-9]+(?:\\.[0-9]+)?)(d|h|ms|us|µs|ns|m|s)")] as $parts
+    | if $parts == [] or ($parts | map(add) | add) != $s then null
+      else $sign * ($parts | map((.[0] | tonumber)
+          * {d: 86400000, h: 3600000, m: 60000, s: 1000, ms: 1, us: 0.001, "µs": 0.001, ns: 0.000001}[.[1]])
+        | add)
+      end
+  end;
+
 # The clear's phase in the output's reconnect cycle (cases 4, 5 and 12; the re-review's I-5, Owed
 # 84). Under the fault a sink is built every 6-7 s (a connect that times out, then the back-off), and
 # the drive clears the leg in one of two phases (`clear_out_in_phase`, run-case.sh), named in the

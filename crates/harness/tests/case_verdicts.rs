@@ -1756,14 +1756,75 @@ fn output_hung_after_ms() -> i64 {
 /// MediaMTX's first frame from sink 2 after its build (a connect to the local server).
 const HUNG_FIRST_FRAME_MS: i64 = 300;
 
+/// A threshold or budget from harness/thresholds.json, the file the verdicts read.
+fn threshold_ms(key: &str) -> i64 {
+    let t: Value =
+        serde_json::from_str(&std::fs::read_to_string(repo().join("harness/thresholds.json")).unwrap())
+            .unwrap();
+    t[key]
+        .as_f64()
+        .unwrap_or_else(|| panic!("thresholds.json has no {key}")) as i64
+}
+
+/// A duration as MediaMTX's API prints it (`conf.Duration`, internal/conf/duration.go at v1.21.2: a
+/// day count `<n>d` when there is one, then Go's `time.Duration` String()): `1h1m0s`, `1m0s`, `10s`,
+/// and a fraction after the seconds, trailing zeros dropped (`59.999s`). Written from Go's format,
+/// independent of lib.jq's reader; at least a second and under a day (no `ms` or `d` form here).
+fn go_duration(ms: i64) -> String {
+    assert!(
+        (1_000..86_400_000).contains(&ms),
+        "a duration this writes: {ms} ms"
+    );
+    let (h, m, s, frac) = (ms / 3_600_000, ms / 60_000 % 60, ms / 1_000 % 60, ms % 1_000);
+    let secs = if frac == 0 {
+        s.to_string()
+    } else {
+        format!("{s}.{}", format!("{frac:03}").trim_end_matches('0'))
+    };
+    if h > 0 {
+        format!("{h}h{m}m{secs}s")
+    } else if m > 0 {
+        format!("{m}m{secs}s")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// The readTimeout case 18 asks MediaMTX for, in ms (output-hung.sh's MTX_READ_TIMEOUT_MS), as its
+/// verdict prints it: judged once, over a world with no MediaMTX reading (which reds on that alone).
+fn mtx_asked_ms() -> i64 {
+    static ASKED: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(|| {
+        let w = output_hung_bare("hold", output_hung_after_ms(), hung_to_swap());
+        let v = judge(&w, "output-hung", "hold", "hung-asked");
+        assert_eq!(
+            v.json["failed"],
+            json!(["destination_outwaits"]),
+            "hung-asked: no reading reds on it alone"
+        );
+        v.json["measures"]["destination_outwaits"]["asked_ms"]
+            .as_i64()
+            .expect("the verdict prints asked_ms")
+    })
+}
+
 /// Case 18's world (Owed 94): the compositor armed to stall sink 1 (`stall`) the case's
 /// OUTPUT_HUNG_AFTER_MS after its build (boot()'s first swap), the plant `after` ms after that build
 /// (the drive's schedule, unless a sim moves it), and the backstop's swap `to_swap` ms after
 /// the plant line, both on the process's own clock: its reason `egress_stalled`, sink 2 connecting
 /// and earning Connected output_connected_after_ms after its first bytes. The beats from the
 /// backstop's firing (one back-off before the swap) until then read `stalled`; MediaMTX has no frame
-/// from just after the plant until sink 2's first.
+/// from just after the plant until sink 2's first. MediaMTX reports the readTimeout the case asks
+/// for (the `mtx_read_timeout` mark, in its API's format).
 fn output_hung_at(stall: &str, after: i64, to_swap: i64) -> World {
+    let mut w = output_hung_bare(stall, after, to_swap);
+    let at = w.drive + 200;
+    w.mark("mtx_read_timeout", at, json!(go_duration(mtx_asked_ms())));
+    w
+}
+
+/// `output_hung_at`'s world with no MediaMTX reading.
+fn output_hung_bare(stall: &str, after: i64, to_swap: i64) -> World {
     let mut w = World::new(70);
     let start = w.live - 9_000;
     let build = start + 2_400;
@@ -1798,12 +1859,15 @@ fn output_hung_at(stall: &str, after: i64, to_swap: i64) -> World {
 /// The backstop's swap inside its window: the readings' half poll after the plant, then the
 /// threshold, a tick and the back-off.
 fn output_hung(stall: &str) -> World {
-    let w = World::new(1);
-    let to_swap = w.ms("output_egress_flat_ms")
-        + w.ms("output_progress_poll_ms") / 2
+    output_hung_at(stall, output_hung_after_ms(), hung_to_swap())
+}
+
+/// The good world's plant to swap: `output_hung`'s.
+fn hung_to_swap() -> i64 {
+    threshold_ms("output_egress_flat_ms")
+        + threshold_ms("output_progress_poll_ms") / 2
         + TICK_AFTER_BACKOFF_MS
-        + w.ms("output_backoff_base_ms");
-    output_hung_at(stall, output_hung_after_ms(), to_swap)
+        + threshold_ms("output_backoff_base_ms")
 }
 
 #[test]
@@ -1848,19 +1912,35 @@ fn output_hung_swaps_on_the_egress_backstop_and_reds_on_any_other_path() {
         );
         let gap = m["gap_ms"].as_i64().unwrap();
         assert!(gap > flat && gap <= budget, "{tag}: gap {gap}");
-        // The PR #76 review's I-1: MediaMTX's idle deadline for this case is four outage targets
-        // (output-hung.sh), past the window's ceiling here and at the owner's question's "about 15 s"
-        // (a threshold of a whole budget), so no destination deadline races the backstop.
+        // The PR #76 review's I-1: the idle deadline the case asks MediaMTX for is past the window's
+        // ceiling here and at the owner's question's "about 15 s" (a threshold of a whole budget), so
+        // no destination deadline races the backstop. The confirm pass's n-1: the check reads what
+        // MediaMTX's running config reports (the mark), in ms, never the number the case derived.
         let d = &m["destination_outwaits"];
+        let asked = mtx_asked_ms();
         assert_eq!(
-            (d["ceiling_ms"].as_i64(), d["mtx_read_timeout_ms"].as_i64()),
-            (Some(ceiling), Some(4 * budget)),
+            (
+                d["read"].as_str(),
+                d["read_ms"].as_i64(),
+                d["asked_ms"].as_i64(),
+                d["ceiling_ms"].as_i64()
+            ),
+            (
+                Some(go_duration(asked).as_str()),
+                Some(asked),
+                Some(asked),
+                Some(ceiling)
+            ),
             "{tag}: the destination's deadline"
         );
         assert!(
-            budget + ceiling - flat < 4 * budget,
-            "{tag}: a 15 s threshold's ceiling"
+            ceiling < asked && budget + ceiling - flat < asked,
+            "{tag}: the asked {asked} ms outwaits this window and a 15 s threshold's"
         );
+        // The confirm pass's n-2: the good world loses no programme beyond the outage (within a
+        // frame of the camera's emits).
+        let lost = m["lost_ms"].as_i64().unwrap();
+        assert!(lost.abs() <= PERIOD_MS.ceil() as i64, "{tag}: lost {lost}");
         checked += 1;
     }
     // Judged as the other variant: the arming line and the plant name another stall.
@@ -2132,8 +2212,88 @@ fn output_hung_swaps_on_the_egress_backstop_and_reds_on_any_other_path() {
     let v = judge(&w, "output-hung", "hold", "hung-again-no-beat");
     assert_fails(&v, "beat_playing_again", "hung-again-no-beat");
     checked += 3;
+    // The confirm pass's n-1: the destination's deadline is what MediaMTX's running config reports,
+    // so a setting it ignored reds (`MTX_READTIMEOUT` under a renamed key or an image bump leaves
+    // MediaMTX's default, 10 s: conf.go's setDefaults at v1.21.2), as do a reading 1 ms short of what
+    // the case asks, one in no unit, one with text after its parts, and none at all; one past it
+    // passes.
+    let asked = mtx_asked_ms();
+    for (tag, read, red) in [
+        ("hung-mtx-default", Some("10s".to_owned()), true),
+        ("hung-mtx-short", Some(go_duration(asked - 1)), true),
+        ("hung-mtx-unitless", Some(asked.to_string()), true),
+        (
+            "hung-mtx-junk",
+            Some(format!("{} junk", go_duration(asked + 3_600_000))),
+            true,
+        ),
+        ("hung-mtx-unread", None, true),
+        ("hung-mtx-longer", Some(go_duration(asked + 3_600_000)), false),
+    ] {
+        let mut w = output_hung("hold");
+        w.marks.retain(|m| m.0 != "mtx_read_timeout");
+        if let Some(read) = read {
+            let at = w.drive + 200;
+            w.mark("mtx_read_timeout", at, json!(read));
+        }
+        let v = judge(&w, "output-hung", "hold", tag);
+        if red {
+            assert_eq!(v.json["failed"], json!(["destination_outwaits"]), "{tag}");
+        } else {
+            assert_pass(&v, tag);
+        }
+        checked += 1;
+    }
+    // The confirm pass's n-2: the programme lost beyond the hang's outage is inside spec §6's output
+    // stall row ("≤2 s of programme lost", budget_output_lost_max_ms), as cases 4, 5 and 12 judge
+    // theirs. At the budget passes, 1 ms past it reds, and an unread loss reds (jq sorts null below
+    // every number, so `<=` alone would pass it).
+    let lost_budget = threshold_ms("budget_output_lost_max_ms");
+    fn lost_to(r: &mut Value, over: Option<i64>) {
+        let b = threshold_ms("budget_output_lost_max_ms");
+        for o in r["output_outages"].as_array_mut().unwrap() {
+            o["lost_ms"] = over.map_or(Value::Null, |x| json!(b + x));
+        }
+    }
+    type Patch = fn(&mut Value);
+    let patches: [(&str, Patch, bool); 3] = [
+        ("hung-lost-at-budget", |r| lost_to(r, Some(0)), false),
+        ("hung-lost-over", |r| lost_to(r, Some(1)), true),
+        ("hung-lost-unread", |r| lost_to(r, None), true),
+    ];
+    for (tag, patch, red) in patches {
+        let mut w = output_hung("hold");
+        w.report_patch = Some(patch);
+        let v = judge(&w, "output-hung", "hold", tag);
+        if red {
+            assert_eq!(v.json["failed"], json!(["output_lost"]), "{tag}");
+        } else {
+            assert_pass(&v, tag);
+        }
+        checked += 1;
+    }
+    // And through the checker: the camera stopped emitting before the plant, short of the slate (the
+    // programme repeats its last frame), so the counter gap across the outage outruns its wall span by
+    // the camera's silence less its latency, here 500 ms past the budget.
+    let mut w = output_hung("hold");
+    let planted = w.log.iter().find(|l| l.1.ends_with("planted=true")).unwrap().0;
+    let silent = lost_budget + LATENCY_MS as i64 + 500;
+    assert!(
+        ((silent - LATENCY_MS as i64) as f64) < w.slate_after_ms,
+        "the silence {silent} ms stays short of the slate"
+    );
+    w.camera_gaps.push((planted + 30 - silent, planted + 30));
+    let v = judge(&w, "output-hung", "hold", "hung-lost-camera-silent");
+    assert_eq!(
+        v.json["failed"],
+        json!(["output_lost"]),
+        "hung-lost-camera-silent"
+    );
+    let lost = v.json["measures"]["lost_ms"].as_i64().unwrap();
+    assert!(lost > lost_budget, "hung-lost-camera-silent: lost {lost}");
+    checked += 1;
     eprintln!("output-hung sims checked: {checked}");
-    assert_eq!(checked, 31);
+    assert_eq!(checked, 41);
 }
 
 /// What the starvation did to the compositor (case 6). The honest beat (Owed 86; the owner,
