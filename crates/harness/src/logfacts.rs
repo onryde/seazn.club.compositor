@@ -1195,7 +1195,10 @@ mod tests {
             (5_033, "output fps beat=20.46 floor=28.50"),
             (5_033, "output starvation alarm raised fps=20.46 floor=28.50"),
             (45_167, "output fps beat=83.67 floor=28.50"),
-            (45_167, "output starvation alarm cleared fps=83.67 recovered=29.50"),
+            (
+                45_167,
+                "output starvation alarm cleared fps=83.67 recovered=29.50",
+            ),
             // Near misses: none is one of these facts.
             (46_000, "output fps beat=NaN floor=28.50"),
             (46_100, "output fps beat=inf floor=28.50"),
