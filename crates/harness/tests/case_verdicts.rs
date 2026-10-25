@@ -2363,6 +2363,19 @@ fn output_hung_swaps_on_the_egress_backstop_and_reds_on_any_other_path() {
         "hung-lost-two-under: both outages judged: {lost}"
     );
     checked += 1;
+    // The PR #86 review's n-1: a negative reading counts as none, never as a loss. Owed 92's dating
+    // (−budget) beside a loss at the budget passes: the programme lost is the budget, where counting
+    // the negative's size as lost would read twice it.
+    let mut w = with_second();
+    w.report_patch = Some(|r| two_lost(r, |b| (-b, b)));
+    let v = judge(&w, "output-hung", "hold", "hung-lost-dating");
+    assert_pass(&v, "hung-lost-dating");
+    assert_eq!(
+        v.json["measures"]["output_lost"]["programme_lost_ms"].as_i64(),
+        Some(lost_budget),
+        "hung-lost-dating: the programme lost"
+    );
+    checked += 1;
     let pairs: [(&str, Patch); 3] = [
         ("hung-lost-second-over", |r| two_lost(r, |b| (0, b + 1))),
         ("hung-lost-masked", |r| two_lost(r, |b| (-b, b + 1))),
@@ -2381,7 +2394,7 @@ fn output_hung_swaps_on_the_egress_backstop_and_reds_on_any_other_path() {
     assert_fails(&v, "output_lost", "hung-lost-no-outage");
     checked += 1;
     eprintln!("output-hung sims checked: {checked}");
-    assert_eq!(checked, 54);
+    assert_eq!(checked, 55);
 }
 
 /// What the starvation did to the compositor (case 6). The honest beat (Owed 86; the owner,
