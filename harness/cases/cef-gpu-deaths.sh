@@ -6,7 +6,9 @@
 #              least KILL_SPACING_MS after the one before: the restart as in case 13
 #              (`restart in place: <n> CEF GPU-process deaths`), never Chromium's abort;
 #   one-fewer  one kill fewer: no restart and no exit in the run, `gpu_process_deaths=<n-1>` logged,
-#              and every score change scheduled after the last kill shown (the re-review's m-1);
+#              the page reloaded after each death and the overlay back after each kill within the
+#              reload's budget (Owed 96), and every score change scheduled after the last kill's
+#              reload window shown (the re-review's m-1);
 #   fast       the fast loop (the PR #34 review's gap): each kill the moment a new pid appears, until
 #              the process exits or chromium_gpu_deaths_abort - 1 are done (one short of the abort).
 #
@@ -22,6 +24,13 @@
 # the drive's end, so a restart it causes still shows its outage and its beats before the end
 # request. A loop that reaches it fails (`kill_loop_in_time`). Mutant 7 (cef_gpu_deaths_to_restart
 # 6 in a scratch build) must red the threshold run's `died_in_place`.
+#
+# Owed 96 (owner ruling 2026-10-25 "A": reload the page after each counted GPU-process death; CI's
+# run 40148980537 had the overlay off air 82.6 s after a counted death while every beat read
+# `graphics: ready`): in every variant each count the `cef health` lines rise to below
+# cef_gpu_deaths_to_restart is reloaded once (`gpu_death_reloads`), and the count at it reloads
+# nothing (the in-place restart does). In one-fewer the overlay is back after each kill
+# (`overlay_back_after_each_kill`) and stays on air after the last (`stays_on_air`).
 
 CASE_LIVE_S=90
 KILL_SPACING_MS=2000
@@ -55,13 +64,52 @@ SPLIT="$DECIDING"' as $line | (dies_after(mark_at("kill")) | first | .at_ms) as 
      unread: (if $line == null then null else (mark("kill") | map(select(.at_ms <= $line.at_ms)) | length) - $line.gpu_process_deaths end),
      at_exit: (if $line == null then null else mark("kill") | map(select(.at_ms > $line.at_ms and ($die == null or .at_ms < $die))) | length end)}'
 
-# The score changes due after the last kill (case 15 one-fewer), as `$due`, with `$k` the last kill:
-# up to the last programme frame or the end request, whichever is first, less the frame-to-encoder
-# budget. With no end request (or no frame) the bound is null and nothing is due: a red that prints
-# `end_request_ms: null`, never a jq error with a null measure (the PR #79 confirm pass's C-3).
-DUE_AFTER_KILL='(mark("kill") | last | .at_ms) as $k
+# Owed 96: the reloads. The counts the `cef health` lines rose to below cef_gpu_deaths_to_restart
+# (`want`; a count read twice, or by the periodic line, is one), against the `cef reload ... deaths=<n>`
+# lines (`got`), in log order: one reload a count, none at the restart's. Each reload follows its
+# count's first health line (the driver writes both in the tick that read it; docker stamps lines in
+# the order it reads them) and within one child poll of it.
+RELOADS='. as $r
+  | ([.log.cef_health[] | .gpu_process_deaths | select(. > 0 and . < $t.cef_gpu_deaths_to_restart)] | unique) as $want
+  | {want: $want, got: [.log.cef_reloads[] | .deaths],
+     rows: [.log.cef_reloads[] | . as $x
+       | ([$r.log.cef_health[] | select(.gpu_process_deaths == $x.deaths)] | first | .at_ms) as $h
+       | {gen: $x.gen, deaths: $x.deaths, reason: $x.reason, after_health_ms: less($x.at_ms; $h)}]}'
+require_reloads() {
+  require gpu_death_reloads "$RELOADS"' | (.want | length) >= 1 and .got == .want
+    and all(.rows[]; .reason == "gpu_process_death" and .after_health_ms != null
+      and .after_health_ms >= 0 and .after_health_ms <= $t.cef_child_poll_ms)' "$RELOADS"
+}
+
+# Owed 96, one-fewer: the overlay back after each kill. Per kill: the reload it caused (the first
+# `cef reload` after it), the first `cef ready` of that generation or a later one at or after that
+# reload, and the back frame, the first strip frame at or after that ready (fresh frames, never the
+# held one). Each back frame lies within `budget_gpu_death_reload_ms` (harness::thresholds, derived:
+# the child poll, a tick, the domain's load timeout, the frame to the encoder) of the LAST kill at or
+# before it: a kill while a reload loads reloads again (the domain's rule), so the window restarts
+# at that kill. No reload, no ready or no frame is no back.
+BACKS='[mark("kill")[] | .at_ms] as $ks
+  | [$ks[] as $k
+     | ([.log.cef_reloads[] | select(.at_ms > $k)] | first) as $rl
+     | (if $rl == null then null else [.log.cef_ready[] | select(.gen >= $rl.gen and .at_ms >= $rl.at_ms)] | first end) as $rd
+     | (if $rd == null then null else [.frames_table[] | select(.[0] >= $rd.at_ms and .[2] != null)] | first | .[0] end) as $back
+     | ([$ks[] | select(. <= ($back // $k))] | max) as $from
+     | {kill_ms: $k, reload_gen: $rl.gen, ready_gen: $rd.gen, back_ms: $back, back_after_ms: less($back; $from)}]'
+
+# The score changes due after the last kill's reload window (case 15 one-fewer), as `$due`, with `$k`
+# the last kill and `$from` the window's end: the overlay's back frame after that kill, or the
+# reload budget after the kill when that comes first or there is no back frame, so the due set allows
+# the reload and nothing more (Owed 96). Up to the last programme frame or the end request, whichever
+# is first, less the frame-to-encoder budget. With no kill, no end request (or no frame) a bound is
+# null and nothing is due: a red that prints `end_request_ms: null`, never a jq error with a null
+# measure (the PR #79 confirm pass's C-3). A null back is handled before `min`, which would take it
+# for the smallest.
+DUE_AFTER_RELOAD='(mark("kill") | last | .at_ms) as $k
+  | ('"$BACKS"' | last | .back_ms) as $back
+  | (if $k == null then null elif $back == null then $k + $t.budget_gpu_death_reload_ms
+     else [$back, $k + $t.budget_gpu_death_reload_ms] | min end) as $from
   | ([($r.frames_table | last | .[0]), $run.end_request_ms] | min) as $last
-  | [scheduled[] | select($k != null and $last != null and .due_ms > $k and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due'
+  | [scheduled[] | select($from != null and $last != null and .due_ms > $from and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due'
 
 require_split() {
   require gpu_death_split "$SPLIT"' | .unread != null and .unread >= 0 and .unread <= $t.budget_gpu_deaths_unread
@@ -77,12 +125,13 @@ require_restarted() {
       needs: \$t.cef_gpu_deaths_to_restart}"
   require_in_place_restart 'mark_at("kill")' "\"restart in place: \\($DECIDING.gpu_process_deaths) CEF GPU-process deaths\""
   require_split
+  require_reloads
 }
 
 case "$CASE_VARIANT" in
-  threshold) CASE_CHECKS=21 ;;
-  one-fewer) CASE_CHECKS=11 ;;
-  fast) CASE_CHECKS=22 ;;
+  threshold) CASE_CHECKS=22 ;;
+  one-fewer) CASE_CHECKS=14 ;;
+  fast) CASE_CHECKS=23 ;;
 esac
 case_verdict() {
   # The loop's own end line, when the exec lived to print it (a restart kills the exec with its
@@ -108,38 +157,38 @@ case_verdict() {
       require counter_regressions '.camera.counter_regressions == 0'
       require_run no_core '.cores.diff_ok and .cores.container_files == 0 and .cores.host_after == .cores.host_before' '.cores'
       require no_output_outages '.output_outages == []' '.output_outages | length'
-      # No restart, and the page still paints after the last kill: every score change the timeline
-      # schedules after it shows (the re-review's m-1: round 3's `overlay_back` here passed on the
-      # held frame, CI's `back_ms` 20 and 22, a frame that never left; a page that stops painting
-      # while it beats keeps a stale score on air, and the hang rule never hides a page that beats).
-      # Due up to the last PROGRAMME frame, never the last frame whose overlay read (Owed 96): that
-      # bound fell back to the kill when the page went off air (run 40148980537 read "0 due"; 22
-      # fell due before its end request, every one missing), and passed a page that went off air
-      # later. And no later than the end request:
-      # what the page shows in the final hold is not this check's (the PR #79 review's m-1).
-      # `off_air` is Owed 96's evidence: the longest strip-less run after the first kill (healthy
-      # runs show a 1 or 2 frame blip at a kill), timed from the kill before it; `at_kill` when that
-      # is within one child poll (`cef_child_poll_ms`, the cadence the product counts a death at),
-      # the hides logged after the first kill, and `covers_missing`: changes are missing and every
-      # one fell due inside the run (false with none missing).
-      require scheduled_changes_shown '. as $r | '"$DUE_AFTER_KILL"'
+      require_reloads
+      # Owed 96: back after each kill, held for `resume_after_ms` from the last one's back frame
+      # (lib.jq's on_air_for: a page that paints one frame and goes off air is not back), and on air
+      # from there to the end request (lib.jq's stays_on_air_from, its allowance unchanged: the
+      # reload window ends at the back frame, so none of it is excused there).
+      require overlay_back_after_each_kill "$BACKS"' as $b | ($b | length) >= 1
+        and all($b[]; .back_ms != null and .back_after_ms <= $t.budget_gpu_death_reload_ms)
+        and on_air_for($b | last | .back_ms; $t.resume_after_ms)' \
+        "$BACKS"' as $b | {kills: $b, budget: $t.budget_gpu_death_reload_ms}
+          + hold_evidence($b | last | .back_ms; $t.resume_after_ms)'
+      require stays_on_air '('"$BACKS"' | last | .back_ms) as $back | stays_on_air_from($back) | stays_on_air_ok' \
+        '('"$BACKS"' | last | .back_ms) as $back | {back_ms: $back} + stays_on_air_from($back)'
+      # No restart, and the page paints after the last kill's reload: every score change the
+      # timeline schedules after the reload window shows (the re-review's m-1: round 3's
+      # `overlay_back` here passed on the held frame, CI's `back_ms` 20 and 22, a frame that never
+      # left; a page that stops painting while it beats keeps a stale score on air, and the hang rule
+      # never hides a page that beats). Due up to the last PROGRAMME frame, never the last frame whose
+      # overlay read: that bound fell back to the kill when the page went off air (run 40148980537
+      # read "0 due"; 22 fell due before its end request, every one missing), and passed a page that
+      # went off air later. And no later than the end request: what the page shows in the final hold
+      # is not this check's (the PR #79 review's m-1). `due_from_ms` is the reload window's end the
+      # due set starts after. The measure's `off_air` (Owed 96's signature evidence) left with the
+      # fix: the back and stays-on-air checks above measure the page that stops painting, and Owed 96
+      # left chaos.json, so a red here reads NOT OWED.
+      require scheduled_changes_shown '. as $r | '"$DUE_AFTER_RELOAD"'
         | ($r.overlay.score_index_changes | map(.index)) as $shown
         | ($due | length) >= 1 and ($due - $shown) == []' \
-        '. as $r | '"$DUE_AFTER_KILL"'
+        '. as $r | '"$DUE_AFTER_RELOAD"'
         | ($due - ($r.overlay.score_index_changes | map(.index))) as $missing
-        | (mark("kill") | first | .at_ms) as $k0
-        | ([$r.overlay.runs[] | select(.index == null and $k0 != null and .from_ms > $k0)] | max_by(.frames)) as $off
-        | {due_after_last_kill: ($due | length), missing: $missing, end_request_ms: $run.end_request_ms,
-           lag_ms: [$r.overlay.score_index_changes[] | select(.due_wall_ms != null and $k != null and .due_wall_ms > $k)
-             | .frame_wall_ms - .due_wall_ms] | {min: min, max: max},
-           off_air: (if $off == null then null
-             else less($off.from_ms; [mark("kill")[] | select(.at_ms < $off.from_ms) | .at_ms] | max) as $after
-             | {from_ms: $off.from_ms, after_kill_ms: $after, at_kill: ($after <= $t.cef_child_poll_ms),
-                ms: ($off.to_ms - $off.from_ms), frames: $off.frames, to_end: ($off == ($r.overlay.runs | last)),
-                hidden_after_kill: ([$r.log.overlay_hidden[] | select(.at_ms > $k0)] | length),
-                covers_missing: (($missing | length) >= 1
-                  and all(scheduled[] | select(.index as $i | any($missing[]; . == $i)) | .due_ms;
-                    . + $t.budget_frame_to_encoder_ms >= $off.from_ms and . < $off.to_ms))} end)}'
+        | {due_after_reload: ($due | length), due_from_ms: $from, missing: $missing, end_request_ms: $run.end_request_ms,
+           lag_ms: [$r.overlay.score_index_changes[] | select(.due_wall_ms != null and $from != null and .due_wall_ms > $from)
+             | .frame_wall_ms - .due_wall_ms] | {min: min, max: max}}'
       ;;
     fast)
       require kills_distinct '(mark("kill") | length) >= 1 and (mark("kill") | map(.value.pid) | repeats) == []' \

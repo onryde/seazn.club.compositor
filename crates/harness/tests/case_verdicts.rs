@@ -4200,10 +4200,38 @@ fn cef_renderer_zygote_killed_restarts_in_place_and_reds_when_an_old_process_sur
     );
 }
 
+/// A reloaded page's ready, after its reload: the C15 cost legs measured a new build ready 4.2 to
+/// 5.2 s after its restart.
+const RELOAD_READY_MS: i64 = 4_500;
+
 /// GPU-process kills from 20 s, `spacing_ms` apart, `kills` of them; the child poll counts each
 /// `count_lag_ms` after it. With `restarts`, the compositor restarts in place after the poll that
-/// counted `cef_gpu_deaths_to_restart`, `exit_after_ms` after that poll.
+/// counted `cef_gpu_deaths_to_restart`, `exit_after_ms` after that poll. Each count below that
+/// reloads the page (Owed 96; owner ruling 2026-10-25 "A"): `gpu_deaths_reloading`.
 fn gpu_deaths(kills: u32, spacing_ms: i64, count_lag_ms: i64, restarts: bool, exit_after_ms: i64) -> World {
+    gpu_deaths_reloading(
+        kills,
+        spacing_ms,
+        count_lag_ms,
+        restarts,
+        exit_after_ms,
+        RELOAD_READY_MS,
+    )
+}
+
+/// `gpu_deaths`, the reloads' ready `ready_ms` after each. The driver logs `cef reload gen=<g>
+/// reason=gpu_process_death deaths=<n>` in the tick that read a count below the restart's, right
+/// after its `cef health` line; generation `g` signals ready `ready_ms` later unless another reload
+/// (or the die) comes first, and from the first reload of a run of them to that ready the overlay
+/// holds the frame it had (the programme keeps the last overlay frame while a reload loads).
+fn gpu_deaths_reloading(
+    kills: u32,
+    spacing_ms: i64,
+    count_lag_ms: i64,
+    restarts: bool,
+    exit_after_ms: i64,
+    ready_ms: i64,
+) -> World {
     let mut w = World::new(90);
     let k0 = w.at(20.0);
     let n = w.ms("cef_gpu_deaths_to_restart") as usize;
@@ -4224,6 +4252,36 @@ fn gpu_deaths(kills: u32, spacing_ms: i64, count_lag_ms: i64, restarts: bool, ex
                 format!("cef health zygote_gone=- leaked_teardowns=0 gpu_process_deaths={deaths}"),
             );
         }
+    }
+    // The reloads: each count below the restart's, read before the die.
+    let reloads: Vec<i64> = counted
+        .iter()
+        .take(w.gpu_deaths.len())
+        .take(n - 1)
+        .copied()
+        .filter(|&c| die.is_none_or(|d| c < d))
+        .collect();
+    let mut held_from: Option<i64> = None;
+    for (j, &at) in reloads.iter().enumerate() {
+        let gen = 2 + j as u64;
+        w.line(
+            at,
+            format!("cef reload gen={gen} reason=gpu_process_death deaths={}", j + 1),
+        );
+        let from = *held_from.get_or_insert(at);
+        let ready = at + ready_ms;
+        let superseded = reloads.get(j + 1).is_some_and(|&next| next < ready);
+        if superseded {
+            continue;
+        }
+        match die {
+            Some(d) if ready >= d => w.overlay_hold.push((from, d)),
+            _ => {
+                w.line(ready, format!("cef ready gen={gen}"));
+                w.overlay_hold.push((from, ready));
+            }
+        }
+        held_from = None;
     }
     if let (Some(d), Some(line)) = (die, deciding) {
         let detail = format!("restart in place: {n} CEF GPU-process deaths");
@@ -4263,6 +4321,65 @@ fn cef_gpu_deaths_threshold_restarts_in_place_and_reds_when_the_threshold_is_six
         "overlay_back",
         "gpu-nooverlay",
     );
+    // Owed 96 (owner ruling 2026-10-25 "A"): each count below the restart's reloads once, and the
+    // count at it reloads nothing. The healthy run's reloads are the counts 1 to n - 1, from the
+    // declared threshold.
+    let w = gpu_deaths(n, 2_000, 800, true, 600);
+    let v = judge(&w, "cef-gpu-deaths", "threshold", "gpu-reloads");
+    let want: Vec<u32> = (1..n).collect();
+    assert_eq!(
+        v.json["measures"]["gpu_death_reloads"]["got"],
+        json!(want),
+        "gpu-reloads: {}",
+        v.json["measures"]["gpu_death_reloads"]
+    );
+    // The harness's mutant "reload on the threshold death too": a reload line at the deciding count.
+    let mut w = gpu_deaths(n, 2_000, 800, true, 600);
+    let deciding = w.gpu_deaths[n as usize - 1];
+    w.line(
+        deciding,
+        format!("cef reload gen={} reason=gpu_process_death deaths={n}", n + 1),
+    );
+    assert_fails(
+        &judge(&w, "cef-gpu-deaths", "threshold", "gpu-reload-at-restart"),
+        "gpu_death_reloads",
+        "gpu-reload-at-restart",
+    );
+    // The build before the fix: no reload at all.
+    let mut w = gpu_deaths(n, 2_000, 800, true, 600);
+    without_reloads(&mut w);
+    assert_fails(
+        &judge(&w, "cef-gpu-deaths", "threshold", "gpu-noreload"),
+        "gpu_death_reloads",
+        "gpu-noreload",
+    );
+    // A reload named for another cause, and one a poll late after its count: each reds.
+    for (tag, from, to) in [
+        (
+            "gpu-reload-cause",
+            "reason=gpu_process_death deaths=1",
+            "reason=recycle deaths=1",
+        ),
+        ("gpu-reload-late", "", ""),
+    ] {
+        let mut w = gpu_deaths(n, 2_000, 800, true, 600);
+        let poll = w.ms("cef_child_poll_ms");
+        let first = w
+            .log
+            .iter_mut()
+            .find(|(_, m)| m.starts_with("cef reload gen=2 "))
+            .expect("the first reload");
+        if from.is_empty() {
+            first.0 += poll + 1;
+        } else {
+            first.1 = first.1.replace(from, to);
+        }
+        assert_fails(
+            &judge(&w, "cef-gpu-deaths", "threshold", tag),
+            "gpu_death_reloads",
+            tag,
+        );
+    }
 }
 
 /// The report.json `judge` wrote under `tag` for the leg `name` (`<case>-<variant>`).
@@ -4296,46 +4413,74 @@ fn due_after(w: &World, report: &Value, from: i64) -> Vec<(u16, i64)> {
         .collect()
 }
 
-/// Whether chaos.json's signature for Owed `row` holds on a verdict.json, as run-chaos.sh reads it
-/// (`jq -e`): the producer's own measure through the table's own filter.
-fn owed_signature_holds(row: &str, verdict: &Value) -> bool {
-    let m: Value = serde_json::from_str(
-        &std::fs::read_to_string(repo().join("harness/chaos.json")).expect("chaos.json"),
-    )
-    .unwrap();
-    let sig = m["owed_signatures"][row]
-        .as_str()
-        .unwrap_or_else(|| panic!("chaos.json has no signature for Owed {row}"));
-    let mut child = Command::new("jq")
-        .args(["-e", sig])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("jq runs");
-    {
-        use std::io::Write;
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(verdict.to_string().as_bytes())
-            .unwrap();
-    }
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        !String::from_utf8_lossy(&out.stderr).contains("error"),
-        "Owed {row}'s signature errs: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    out.status.success()
+/// Whether log line `m` is a reloaded generation's ready (a generation after the first).
+fn is_reload_ready(m: &str) -> bool {
+    m.strip_prefix("cef ready gen=")
+        .and_then(|g| g.parse::<u64>().ok())
+        .is_some_and(|g| g >= 2)
+}
+
+/// The ready of the last reload `w` logged (a generation after the first), from the world's own log.
+fn last_reload_ready(w: &World) -> Option<i64> {
+    w.log
+        .iter()
+        .filter(|(_, m)| is_reload_ready(m))
+        .map(|l| l.0)
+        .max()
+}
+
+/// The first programme frame at or after `at` whose overlay read, from the run's recorded frames.
+fn first_strip_frame(report: &Value, at: i64) -> Option<i64> {
+    report["frames_table"]
+        .as_array()?
+        .iter()
+        .find(|f| f[0].as_i64().is_some_and(|x| x >= at) && !f[2].is_null())
+        .and_then(|f| f[0].as_i64())
+}
+
+/// Where the due set starts (Owed 96): the overlay's first strip frame after the last reload's
+/// ready, or the reload budget after the last kill when that comes first or nothing came back. From
+/// the world's log and the frames its run recorded, never from a verdict.
+fn reload_window_end(w: &World, report: &Value, last_kill: i64) -> i64 {
+    let cap = last_kill + w.ms("budget_gpu_death_reload_ms");
+    last_reload_ready(w)
+        .and_then(|r| first_strip_frame(report, r))
+        .map_or(cap, |b| b.min(cap))
+}
+
+/// The checks a verdict failed, sorted.
+fn failed_sorted(v: &Verdict) -> Vec<String> {
+    let mut f: Vec<String> = v.json["failed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|x| x.as_str().map(str::to_owned))
+        .collect();
+    f.sort();
+    f
+}
+
+/// `checks`, sorted, as owned strings.
+fn sorted(checks: &[&str]) -> Vec<String> {
+    let mut c: Vec<String> = checks.iter().map(|&x| x.to_owned()).collect();
+    c.sort();
+    c
+}
+
+/// `w` with the product's reloads removed (the build before Owed 96's fix): no reload line, no
+/// reloaded generation's ready, and nothing held for one; the page paints on through every kill.
+fn without_reloads(w: &mut World) {
+    w.log
+        .retain(|(_, m)| !(m.starts_with("cef reload ") || is_reload_ready(m)));
+    w.overlay_hold.clear();
 }
 
 const ONE_FEWER: &str = "cef-gpu-deaths-one-fewer";
 
 #[test]
-fn cef_gpu_deaths_one_fewer_restarts_nothing_and_reds_on_a_restart() {
+fn cef_gpu_deaths_one_fewer_reloads_after_each_kill_and_reds_on_a_restart() {
     let n = World::new(1).ms("cef_gpu_deaths_to_restart") as u32;
+    let budget = World::new(1).ms("budget_gpu_death_reload_ms");
     let kills = |w: &World| {
         let mut k: Vec<i64> = w.marks.iter().filter(|m| m.0 == "kill").map(|m| m.1).collect();
         k.sort_unstable();
@@ -4343,56 +4488,68 @@ fn cef_gpu_deaths_one_fewer_restarts_nothing_and_reds_on_a_restart() {
     };
     let indices = |d: &[(u16, i64)]| d.iter().map(|x| x.0).collect::<Vec<_>>();
     let mut checked = 0;
-    // The healthy run: every change due after the last kill, up to the last programme frame, shown;
-    // nothing missing, nothing off air, and no Owed 96 evidence.
+    // The healthy run: each kill counted and reloaded (the second while the first reload loads, so
+    // the first never gets ready), the overlay held through the reloads and back with the last
+    // one's ready, within the budget of the last kill; every change due after the reload window
+    // shown, and nothing off air.
     let w = gpu_deaths(n - 1, 2_000, 800, false, 0);
     let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-good");
     assert_pass(&v, "fewer-good");
-    let due = due_after(
-        &w,
-        &judged_report("fewer-good", ONE_FEWER),
-        *kills(&w).last().unwrap(),
+    let report = judged_report("fewer-good", ONE_FEWER);
+    let ks = kills(&w);
+    let last = *ks.last().unwrap();
+    let reloads = &v.json["measures"]["gpu_death_reloads"];
+    let counts: Vec<u32> = (1..n).collect();
+    assert_eq!(
+        (&reloads["want"], &reloads["got"]),
+        (&json!(counts), &json!(counts)),
+        "fewer-good: one reload a count below the restart's: {reloads}"
     );
+    let ready = last_reload_ready(&w).expect("fewer-good: a reload got ready");
+    let back = first_strip_frame(&report, ready).expect("fewer-good: a frame after the ready");
+    let backs = &v.json["measures"]["overlay_back_after_each_kill"]["kills"];
+    let want: Vec<Value> = (0..ks.len())
+        .map(|i| {
+            json!({"kill_ms": ks[i], "reload_gen": 2 + i, "ready_gen": 1 + ks.len(),
+                "back_ms": back, "back_after_ms": back - last})
+        })
+        .collect();
+    assert_eq!(backs, &json!(want), "fewer-good: {backs}");
+    assert!(back - last <= budget, "fewer-good: back within the budget");
+    let from = reload_window_end(&w, &report, last);
+    assert_eq!(from, back, "fewer-good: the window ends at the back frame");
+    let due = due_after(&w, &report, from);
+    let excused = w
+        .timeline_events()
+        .into_iter()
+        .filter(|&(_, at)| at + w.delay_ms > last && at + w.delay_ms <= from)
+        .count();
     let shown = &v.json["measures"]["scheduled_changes_shown"];
-    eprintln!("fewer-good: {} due after the last kill: {shown}", due.len());
+    eprintln!(
+        "fewer-good: {} due after the reload window, {excused} due inside it: {shown}",
+        due.len()
+    );
     assert!(
-        due.len() >= 2,
-        "fewer-good: changes fall due after the last kill: {due:?}"
+        due.len() >= 2 && excused >= 1,
+        "fewer-good: changes fall due inside the reload window and after it: {due:?}"
     );
     assert_eq!(
-        shown["due_after_last_kill"],
-        json!(due.len()),
+        (
+            &shown["due_after_reload"],
+            &shown["due_from_ms"],
+            &shown["missing"]
+        ),
+        (&json!(due.len()), &json!(from), &json!([])),
         "fewer-good: {shown}"
     );
-    assert_eq!(shown["missing"], json!([]), "fewer-good: {shown}");
-    assert_eq!(shown["off_air"], Value::Null, "fewer-good: {shown}");
-    assert!(
-        !owed_signature_holds("96", &v.json),
-        "fewer-good: Owed 96 on a green run"
-    );
     checked += 1;
-    // CI's green 40148976014: a 2-frame blip off air 51 ms after the first kill, then on air to the
-    // end. Green, and still no Owed 96 evidence: nothing is missing.
+    // CI's green 40148976014: a 2-frame blip off air 51 ms after the first kill. Still green.
     let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
     let k0 = kills(&w)[0];
     w.overlay_none.push((k0 + 51, k0 + 51 + 66));
-    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-blip");
-    assert_pass(&v, "fewer-blip");
-    let shown = &v.json["measures"]["scheduled_changes_shown"];
-    assert_eq!(shown["missing"], json!([]), "fewer-blip: {shown}");
-    assert!(
-        shown["off_air"]["frames"].as_u64().is_some_and(|f| f >= 1),
-        "fewer-blip: {shown}"
-    );
-    // Fix round 1's m-2: nothing missing is never "covers the missing".
-    assert_eq!(
-        shown["off_air"]["covers_missing"],
-        json!(false),
-        "fewer-blip: {shown}"
-    );
-    assert!(
-        !owed_signature_holds("96", &v.json),
-        "fewer-blip: Owed 96 with nothing missing"
+    assert_pass(
+        &judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-blip"),
+        "fewer-blip",
     );
     checked += 1;
     let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
@@ -4404,64 +4561,130 @@ fn cef_gpu_deaths_one_fewer_restarts_nothing_and_reds_on_a_restart() {
         "fewer-restart",
     );
     checked += 1;
-    // Owed 96, CI's red 40148980537 (fix round 3's item 3 and the re-review's m-1 before it): no
-    // restart, and the overlay off air 77 ms after the last kill, to the end. Every change due after
-    // that kill up to the last programme frame is missing, and the measure says so: the old bound,
-    // the last frame whose overlay read, fell back to the kill and printed "0 due" (27 missing).
+    // The build before the fix (the harness's own mutant, "remove the reload"): no reload, the page
+    // painting on. The reload check reds, and with no reload nothing is back after a kill; the
+    // changes due after the budget all show, so that check holds.
+    let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
+    without_reloads(&mut w);
+    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-noreload");
+    assert_eq!(
+        failed_sorted(&v),
+        sorted(&[
+            "gpu_death_reloads",
+            "overlay_back_after_each_kill",
+            "stays_on_air"
+        ]),
+        "fewer-noreload"
+    );
+    assert_eq!(
+        v.json["measures"]["gpu_death_reloads"]["got"],
+        json!([]),
+        "fewer-noreload"
+    );
+    checked += 1;
+    // Owed 96's red, CI's 40148980537, after the fix: the reloads logged, and the overlay off air
+    // 77 ms after the last kill to the end. Nothing comes back, so the due set starts at the budget,
+    // and every change due after it is missing. Owed 96 left chaos.json with this fix, so the red
+    // reads NOT OWED (chaos_table.rs).
     let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
     let last = *kills(&w).last().unwrap();
     w.overlay_none.push((last + 77, w.end + 60_000));
     let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-nooverlay");
-    assert_fails(&v, "scheduled_changes_shown", "fewer-nooverlay");
-    let due = due_after(&w, &judged_report("fewer-nooverlay", ONE_FEWER), last);
+    assert_eq!(
+        failed_sorted(&v),
+        sorted(&[
+            "overlay_back_after_each_kill",
+            "scheduled_changes_shown",
+            "stays_on_air"
+        ]),
+        "fewer-nooverlay"
+    );
+    let report = judged_report("fewer-nooverlay", ONE_FEWER);
+    let from = reload_window_end(&w, &report, last);
+    assert_eq!(from, last + budget, "fewer-nooverlay: no back frame");
+    let due = due_after(&w, &report, from);
     let shown = &v.json["measures"]["scheduled_changes_shown"];
     eprintln!("fewer-nooverlay: {} due, all missing: {shown}", due.len());
     assert!(due.len() >= 2, "fewer-nooverlay: {due:?}");
     assert_eq!(
-        shown["due_after_last_kill"],
-        json!(due.len()),
+        (
+            &shown["due_after_reload"],
+            &shown["due_from_ms"],
+            &shown["missing"]
+        ),
+        (&json!(due.len()), &json!(from), &json!(indices(&due))),
         "fewer-nooverlay: {shown}"
     );
-    assert_eq!(shown["missing"], json!(indices(&due)), "fewer-nooverlay: {shown}");
-    let off = &shown["off_air"];
-    let after = off["after_kill_ms"].as_f64().unwrap_or(-1.0);
-    assert!(
-        (77.0..77.0 + PERIOD_MS + 1.0).contains(&after),
-        "fewer-nooverlay: off air at the first frame from 77 ms after the last kill: {off}"
-    );
-    assert_eq!(
-        (&off["to_end"], &off["covers_missing"]),
-        (&json!(true), &json!(true)),
-        "fewer-nooverlay: {off}"
-    );
-    assert_eq!(
-        (&off["at_kill"], &off["hidden_after_kill"]),
-        (&json!(true), &json!(0)),
-        "fewer-nooverlay: within a child poll of the kill, and nothing hid it: {off}"
-    );
-    assert!(
-        owed_signature_holds("96", &v.json),
-        "fewer-nooverlay: Owed 96's evidence"
-    );
     checked += 1;
-    // The hole the old bound left: the page paints on after the last kill, then goes off air for
-    // good 30 s later. The changes due before that show, every one due after it is missing, and the
-    // check reds (the old bound cut the due set at the last painted frame, and passed). Fix round
-    // 1's I-1: 30 s is no child poll after any kill, so nothing ties the run to a GPU death and it
-    // is not Owed 96's, though it holds every missing change.
+    // The reload budget, at its edge (a slow ready): back 100 ms inside it is green, 100 ms past it
+    // reds on the back alone (no change falls due in the 134 ms between, and the overlay stays on
+    // air from the late back).
+    let lag = 800;
+    for (tag, ready_ms, green) in [
+        ("fewer-edge-back", budget - lag - 100, true),
+        ("fewer-late-back", budget - lag + 100, false),
+    ] {
+        let w = gpu_deaths_reloading(n - 1, 2_000, lag, false, 0, ready_ms);
+        let v = judge(&w, "cef-gpu-deaths", "one-fewer", tag);
+        let report = judged_report(tag, ONE_FEWER);
+        let last = *kills(&w).last().unwrap();
+        let back = first_strip_frame(&report, last_reload_ready(&w).unwrap()).unwrap();
+        eprintln!(
+            "{tag}: back {} ms after the last kill, budget {budget}",
+            back - last
+        );
+        if green {
+            assert!(back - last <= budget, "{tag}");
+            assert_pass(&v, tag);
+        } else {
+            assert!(back - last > budget, "{tag}");
+            assert_eq!(
+                failed_sorted(&v),
+                sorted(&["overlay_back_after_each_kill"]),
+                "{tag}"
+            );
+        }
+        checked += 1;
+    }
+    // Back at the reload's ready, then off air 500 ms later for good: one frame's worth of back is no
+    // back (on_air_for), and the overlay never stays on air.
+    let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
+    let ready = last_reload_ready(&w).unwrap();
+    w.overlay_none.push((ready + 500, w.end + 60_000));
+    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-back-blinks");
+    for check in [
+        "overlay_back_after_each_kill",
+        "stays_on_air",
+        "scheduled_changes_shown",
+    ] {
+        assert!(
+            failed_sorted(&v).contains(&check.to_owned()),
+            "fewer-back-blinks: {check} held: {:?}",
+            v.json["failed"]
+        );
+    }
+    checked += 1;
+    // The hole the old bound left: the page paints on after the reload, then goes off air for good
+    // 30 s after the last kill. Back after every kill, so only staying on air and the changes due
+    // after the off-air start red.
     let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
     let last = *kills(&w).last().unwrap();
     let off_from = last + 30_000;
     w.overlay_none.push((off_from, w.end + 60_000));
     let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-offair-later");
-    assert_fails(&v, "scheduled_changes_shown", "fewer-offair-later");
-    let due = due_after(&w, &judged_report("fewer-offair-later", ONE_FEWER), last);
+    assert_eq!(
+        failed_sorted(&v),
+        sorted(&["scheduled_changes_shown", "stays_on_air"]),
+        "fewer-offair-later"
+    );
+    let report = judged_report("fewer-offair-later", ONE_FEWER);
+    let due = due_after(&w, &report, reload_window_end(&w, &report, last));
     // A change due within the overlay's lag (and two frames) of the off-air start would make the
     // split a coin: the world keeps clear of one.
-    let lag = OVERLAY_LAG_MS + 2.0 * PERIOD_MS;
+    let slack = OVERLAY_LAG_MS + 2.0 * PERIOD_MS;
     assert!(
         due.iter()
-            .all(|&(_, d)| (d as f64) < off_from as f64 - lag || d >= off_from),
+            .all(|&(_, d)| (d as f64) < off_from as f64 - slack || d >= off_from),
         "fewer-offair-later: a change due at the off-air start: {due:?}"
     );
     let gone: Vec<(u16, i64)> = due.iter().copied().filter(|&(_, d)| d >= off_from).collect();
@@ -4470,100 +4693,77 @@ fn cef_gpu_deaths_one_fewer_restarts_nothing_and_reds_on_a_restart() {
         "fewer-offair-later: changes due on both sides of the off-air start: {due:?}"
     );
     let shown = &v.json["measures"]["scheduled_changes_shown"];
-    eprintln!(
-        "fewer-offair-later: {} due, {} missing: {shown}",
-        due.len(),
-        gone.len()
-    );
     assert_eq!(
-        shown["due_after_last_kill"],
-        json!(due.len()),
+        (&shown["due_after_reload"], &shown["missing"]),
+        (&json!(due.len()), &json!(indices(&gone))),
         "fewer-offair-later: {shown}"
-    );
-    assert_eq!(
-        shown["missing"],
-        json!(indices(&gone)),
-        "fewer-offair-later: {shown}"
-    );
-    let off = &shown["off_air"];
-    assert_eq!(
-        (&off["at_kill"], &off["hidden_after_kill"], &off["covers_missing"]),
-        (&json!(false), &json!(0), &json!(true)),
-        "fewer-offair-later: only the kill tie is absent: {off}"
-    );
-    assert!(
-        !owed_signature_holds("96", &v.json),
-        "fewer-offair-later: an off-air run 30 s after the last kill is not Owed 96's"
     );
     checked += 1;
-    // A page that stops painting and keeps beating holds its last frame on air (a stale score; the
-    // re-review's m-1: round 3's `overlay_back` passed it, CI's `back_ms` 20 and 22): red, changes
-    // missing, and nothing off air, so not Owed 96's.
+    // A page that stops painting and keeps its last frame on air from the last kill (a stale score;
+    // the re-review's m-1: round 3's `overlay_back` passed it): the strip reads at the reload's
+    // ready, so it is "back" and stays on air, and only the changes shown red.
     let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
     let last = *kills(&w).last().unwrap();
-    w.overlay_hold.push((last, w.end + 60_000));
+    w.overlay_hold.insert(0, (last, w.end + 60_000));
     let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-held");
-    assert_fails(&v, "scheduled_changes_shown", "fewer-held");
+    assert_eq!(
+        failed_sorted(&v),
+        sorted(&["scheduled_changes_shown"]),
+        "fewer-held"
+    );
     let shown = &v.json["measures"]["scheduled_changes_shown"];
     assert!(
-        shown["due_after_last_kill"].as_u64().is_some_and(|n| n >= 1)
+        shown["due_after_reload"].as_u64().is_some_and(|n| n >= 1)
             && shown["missing"].as_array().is_some_and(|m| !m.is_empty()),
-        "fewer-held: the changes due after the last kill are missing: {shown}"
-    );
-    assert_eq!(shown["off_air"], Value::Null, "fewer-held: {shown}");
-    assert!(
-        !owed_signature_holds("96", &v.json),
-        "fewer-held: Owed 96 with nothing off air"
+        "fewer-held: the changes due after the reload window are missing: {shown}"
     );
     checked += 1;
-    // The same held page after CI's 2-frame blip at the first kill: the longest off-air run does not
-    // hold the missing changes, so the signature stays absent.
+    // The same stale page after CI's 2-frame blip at the first kill.
     let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
     let (k0, last) = (kills(&w)[0], *kills(&w).last().unwrap());
     w.overlay_none.push((k0 + 51, k0 + 51 + 66));
-    w.overlay_hold.push((last, w.end + 60_000));
-    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-blip-held");
-    assert_fails(&v, "scheduled_changes_shown", "fewer-blip-held");
-    let shown = &v.json["measures"]["scheduled_changes_shown"];
-    assert_eq!(
-        shown["off_air"]["covers_missing"],
-        json!(false),
-        "fewer-blip-held: {shown}"
-    );
-    assert!(
-        !owed_signature_holds("96", &v.json),
-        "fewer-blip-held: a blip is not Owed 96's cause"
+    w.overlay_hold.insert(0, (last, w.end + 60_000));
+    assert_fails(
+        &judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-blip-held"),
+        "scheduled_changes_shown",
+        "fewer-blip-held",
     );
     checked += 1;
-    // Off air from BEFORE the first kill, to the end: red with every change missing, but no off-air
-    // run starts after a GPU kill, so not Owed 96's.
+    // Off air from BEFORE the first kill, to the end: never back, every change after the budget
+    // missing.
     let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
     let (k0, last) = (kills(&w)[0], *kills(&w).last().unwrap());
     w.overlay_none.push((k0 - 5_000, w.end + 60_000));
     let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-offair-before");
-    assert_fails(&v, "scheduled_changes_shown", "fewer-offair-before");
-    let due = due_after(&w, &judged_report("fewer-offair-before", ONE_FEWER), last);
-    let shown = &v.json["measures"]["scheduled_changes_shown"];
     assert_eq!(
-        shown["missing"],
-        json!(indices(&due)),
-        "fewer-offair-before: {shown}"
+        failed_sorted(&v),
+        sorted(&[
+            "overlay_back_after_each_kill",
+            "scheduled_changes_shown",
+            "stays_on_air"
+        ]),
+        "fewer-offair-before"
     );
-    assert_eq!(shown["off_air"], Value::Null, "fewer-offair-before: {shown}");
-    assert!(
-        !owed_signature_holds("96", &v.json),
-        "fewer-offair-before: off air before any kill"
+    let due = due_after(
+        &w,
+        &judged_report("fewer-offair-before", ONE_FEWER),
+        last + budget,
+    );
+    assert_eq!(
+        v.json["measures"]["scheduled_changes_shown"]["missing"],
+        json!(indices(&due)),
+        "fewer-offair-before"
     );
     checked += 1;
     // Fix round 1's I-1 and m-1: the run records the final hold's end slate, off air from 500 ms
     // after the end request. A change due in the hold is no change the run owed (the due set ends at
-    // the end request), so the run is green and not Owed 96's.
+    // the end request), so the run is green.
     let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
     w.tail_ms = w.ms("final_hold_ms");
     let end = w.end;
     w.overlay_none.push((end + 500, end + 60_000));
     let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-final-hold");
-    let budget = w.ms("budget_frame_to_encoder_ms");
+    let fte = w.ms("budget_frame_to_encoder_ms");
     let report = judged_report("fewer-final-hold", ONE_FEWER);
     let last_frame = report["frames_table"]
         .as_array()
@@ -4573,7 +4773,7 @@ fn cef_gpu_deaths_one_fewer_restarts_nothing_and_reds_on_a_restart() {
     let in_hold = w
         .timeline_events()
         .into_iter()
-        .filter(|&(_, at)| at + w.delay_ms > end + 500 && at + w.delay_ms <= last_frame - budget)
+        .filter(|&(_, at)| at + w.delay_ms > end + 500 && at + w.delay_ms <= last_frame - fte)
         .count();
     eprintln!("fewer-final-hold: {in_hold} changes fall due in the recorded hold, off air");
     assert!(
@@ -4581,140 +4781,80 @@ fn cef_gpu_deaths_one_fewer_restarts_nothing_and_reds_on_a_restart() {
         "fewer-final-hold: the hold is recorded and a change falls due off air in it"
     );
     assert_pass(&v, "fewer-final-hold");
-    let shown = &v.json["measures"]["scheduled_changes_shown"];
-    assert_eq!(shown["missing"], json!([]), "fewer-final-hold: {shown}");
-    assert_eq!(
-        shown["off_air"]["at_kill"],
-        json!(false),
-        "fewer-final-hold: {shown}"
-    );
-    assert!(
-        !owed_signature_holds("96", &v.json),
-        "fewer-final-hold: the end slate is not Owed 96's"
-    );
     checked += 1;
-    // Fix round 1's I-1: the graphics hid the overlay on purpose (a hide line after the first kill)
-    // and it stayed off: red, every change missing and within a child poll of the kill, but a hide
-    // is the graphics working as designed, not the page dying unseen.
+    // The graphics hid the overlay on purpose after the last kill and it stayed off: red.
     let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
     let last = *kills(&w).last().unwrap();
     w.line(last + 60, "overlay hidden reason=hang gen=1");
     w.overlay_none.push((last + 77, w.end + 60_000));
     let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-hidden");
+    assert_fails(&v, "overlay_back_after_each_kill", "fewer-hidden");
     assert_fails(&v, "scheduled_changes_shown", "fewer-hidden");
-    let off = &v.json["measures"]["scheduled_changes_shown"]["off_air"];
+    checked += 1;
+    // A stale page then off air (spaced kills, so the first reload is superseded too): never back.
+    let mut w = gpu_deaths(n - 1, 3_800, 800, false, 0);
+    let last = *kills(&w).last().unwrap();
+    let off_from = last + 850;
+    w.overlay_hold.insert(0, (last, off_from));
+    w.overlay_none.push((off_from, w.end + 60_000));
+    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-held-offair");
+    assert_fails(&v, "overlay_back_after_each_kill", "fewer-held-offair");
+    assert_fails(&v, "scheduled_changes_shown", "fewer-held-offair");
+    checked += 1;
+    // Off air at the last kill for 5 s, then a stale page to the end: back (the strip reads at the
+    // reload's ready) and on air, but the changes due after the window are missing.
+    let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
+    let last = *kills(&w).last().unwrap();
+    let stale = last + 5_000;
+    w.overlay_none.push((last + 77, stale));
+    w.overlay_hold.insert(0, (stale, w.end + 60_000));
+    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-offair-held");
     assert_eq!(
-        (&off["at_kill"], &off["hidden_after_kill"], &off["covers_missing"]),
-        (&json!(true), &json!(1), &json!(true)),
-        "fewer-hidden: only the hide differs from Owed 96's evidence: {off}"
-    );
-    assert!(
-        !owed_signature_holds("96", &v.json),
-        "fewer-hidden: a deliberate hide is not Owed 96's"
+        failed_sorted(&v),
+        sorted(&["scheduled_changes_shown"]),
+        "fewer-offair-held"
     );
     checked += 1;
-    // Fix round 1's I-2 (survivor `max_by` -> `first`): CI's 2-frame blip at the first kill, then
-    // CI's red at the last. The off-air run measured is the long one, so Owed 96 holds; the first
-    // run after the first kill is the blip, which holds none of the missing changes.
+    // CI's blip at the first kill, then CI's red at the last (the shape fix round 1's I-2 named): the
+    // blip masks nothing, and every check over the last kill reds.
     let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
     let (k0, last) = (kills(&w)[0], *kills(&w).last().unwrap());
     w.overlay_none.push((k0 + 51, k0 + 51 + 66));
     w.overlay_none.push((last + 77, w.end + 60_000));
     let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-blip-offair");
-    assert_fails(&v, "scheduled_changes_shown", "fewer-blip-offair");
-    let off = &v.json["measures"]["scheduled_changes_shown"]["off_air"];
-    let after = off["after_kill_ms"].as_f64().unwrap_or(-1.0);
-    assert!(
-        (77.0..77.0 + PERIOD_MS + 1.0).contains(&after) && off["to_end"] == json!(true),
-        "fewer-blip-offair: the long run at the last kill, not the blip: {off}"
-    );
-    assert!(
-        owed_signature_holds("96", &v.json),
-        "fewer-blip-offair: Owed 96's evidence past the blip"
-    );
-    checked += 1;
-    // Fix round 1's I-2 (survivor: covers_missing's lower bound deleted): the page holds its frame
-    // from the last kill (a change due 250 ms later never shows), then goes off air 850 ms after the
-    // kill. That run cannot hold the change the held page lost, so it is not Owed 96's evidence.
-    let mut w = gpu_deaths(n - 1, 3_800, 800, false, 0);
-    let last = *kills(&w).last().unwrap();
-    let off_from = last + 850;
-    w.overlay_hold.push((last, off_from));
-    w.overlay_none.push((off_from, w.end + 60_000));
-    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-held-offair");
-    assert_fails(&v, "scheduled_changes_shown", "fewer-held-offair");
-    let due = due_after(&w, &judged_report("fewer-held-offair", ONE_FEWER), last);
-    let held: Vec<u16> = due
-        .iter()
-        .filter(|&&(_, d)| d + budget < off_from)
-        .map(|x| x.0)
-        .collect();
-    let shown = &v.json["measures"]["scheduled_changes_shown"];
-    eprintln!("fewer-held-offair: {} lost to the held page: {shown}", held.len());
-    assert!(
-        !held.is_empty()
-            && shown["missing"]
-                .as_array()
-                .is_some_and(|m| held.iter().all(|i| m.contains(&json!(i)))),
-        "fewer-held-offair: a change due before the off-air run is missing: {held:?} {shown}"
-    );
-    let off = &shown["off_air"];
     assert_eq!(
-        (&off["at_kill"], &off["hidden_after_kill"], &off["covers_missing"]),
-        (&json!(true), &json!(0), &json!(false)),
-        "fewer-held-offair: {off}"
-    );
-    assert!(
-        !owed_signature_holds("96", &v.json),
-        "fewer-held-offair: the off-air run did not lose the held change"
-    );
-    checked += 1;
-    // And the other bound: off air at the last kill for 5 s, then a held page to the end. The
-    // changes due in the held tail are missing past the off-air run's end.
-    let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
-    let last = *kills(&w).last().unwrap();
-    let back = last + 5_000;
-    w.overlay_none.push((last + 77, back));
-    w.overlay_hold.push((back, w.end + 60_000));
-    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-offair-held");
-    assert_fails(&v, "scheduled_changes_shown", "fewer-offair-held");
-    let due = due_after(&w, &judged_report("fewer-offair-held", ONE_FEWER), last);
-    assert!(
-        due.iter().any(|&(_, d)| d > back),
-        "fewer-offair-held: a change falls due on the held page: {due:?}"
-    );
-    let off = &v.json["measures"]["scheduled_changes_shown"]["off_air"];
-    assert_eq!(
-        (&off["at_kill"], &off["hidden_after_kill"], &off["covers_missing"]),
-        (&json!(true), &json!(0), &json!(false)),
-        "fewer-offair-held: {off}"
-    );
-    assert!(
-        !owed_signature_holds("96", &v.json),
-        "fewer-offair-held: the held page lost the late changes, not the off-air run"
+        failed_sorted(&v),
+        sorted(&[
+            "overlay_back_after_each_kill",
+            "scheduled_changes_shown",
+            "stays_on_air"
+        ]),
+        "fewer-blip-offair"
     );
     checked += 1;
-    // Fix round 1's m-3: no kill landed. The check reds on nothing due (anti-vacuity), and the
-    // measure still prints: nothing due, nothing missing, no off-air run "after a kill" although
-    // the overlay goes off air.
+    // Fix round 1's m-3: no kill landed. Every check over the kills reds on nothing (anti-vacuity),
+    // and the measures still print: nothing due, nothing reloaded, no kill to come back after.
     let mut w = gpu_deaths(0, 2_000, 800, false, 0);
     let off_from = w.at(30.0);
     w.overlay_none.push((off_from, w.end + 60_000));
     let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-nokills");
-    assert_fails(&v, "scheduled_changes_shown", "fewer-nokills");
-    let shown = &v.json["measures"]["scheduled_changes_shown"];
+    for check in [
+        "gpu_death_reloads",
+        "overlay_back_after_each_kill",
+        "scheduled_changes_shown",
+    ] {
+        assert_fails(&v, check, "fewer-nokills");
+    }
+    let m = &v.json["measures"];
     assert_eq!(
         (
-            &shown["due_after_last_kill"],
-            &shown["missing"],
-            &shown["off_air"]
+            &m["scheduled_changes_shown"]["due_after_reload"],
+            &m["scheduled_changes_shown"]["missing"],
+            &m["overlay_back_after_each_kill"]["kills"],
+            &m["gpu_death_reloads"]["want"],
         ),
-        (&json!(0), &json!([]), &Value::Null),
-        "fewer-nokills: {shown}"
-    );
-    assert!(
-        !owed_signature_holds("96", &v.json),
-        "fewer-nokills: no kill, no Owed 96"
+        (&json!(0), &json!([]), &json!([]), &json!([])),
+        "fewer-nokills: {m}"
     );
     checked += 1;
     // The PR #79 confirm pass's C-3: the run never recorded its end request. The bound is null, so
@@ -4728,7 +4868,7 @@ fn cef_gpu_deaths_one_fewer_restarts_nothing_and_reds_on_a_restart() {
     assert_eq!(
         (
             &shown["end_request_ms"],
-            &shown["due_after_last_kill"],
+            &shown["due_after_reload"],
             &shown["missing"]
         ),
         (&Value::Null, &json!(0), &json!([])),
@@ -4737,7 +4877,7 @@ fn cef_gpu_deaths_one_fewer_restarts_nothing_and_reds_on_a_restart() {
     assert!(shown.is_object(), "fewer-noend: the measure printed: {shown}");
     checked += 1;
     eprintln!("one-fewer worlds checked: {checked}");
-    assert_eq!(checked, 15);
+    assert_eq!(checked, 19);
 }
 
 #[test]

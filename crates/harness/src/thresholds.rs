@@ -48,6 +48,20 @@ pub const BUDGET_ZYGOTE_VERDICT_MS: u64 = 2_000;
 pub const BUDGET_GPU_DEATHS_UNREAD: u64 = 1;
 /// ...and one to deaths during the exit (the final beat's flush, while CEF still runs).
 pub const BUDGET_GPU_DEATHS_AT_EXIT: u64 = 1;
+/// Owed 96 (owner ruling 2026-10-25 "A": reload the page after each counted GPU-process death), case
+/// 15 one-fewer: the overlay is back on air after a GPU-process kill within the reload's own terms,
+/// summed. No spec number exists for it, so it is derived, never typed: the child poll counts the
+/// death (`cef_child_poll_ms`), the next tick reads the count and reloads (`TICK_WIDEST_MS`), the
+/// reloaded page signals ready before the domain's own load timeout gives up on it
+/// (`cef_load_timeout_ms`), and its first frame reaches the encoder (`BUDGET_FRAME_TO_ENCODER_MS`).
+/// The adapters' poll is passed in, so it is computed in `dump`.
+pub fn budget_gpu_death_reload_ms(cef_child_poll_ms: u64) -> u64 {
+    cef_child_poll_ms
+        + TICK_WIDEST_MS
+        + Thresholds::default().cef_load_timeout_ms
+        + BUDGET_FRAME_TO_ENCODER_MS
+}
+
 /// The harness page's poll period for `/score.json` and `/page-control.json`
 /// (`harness/pages/overlay-test.html`, which reads it from fake-control). Case 7's recovery bound:
 /// the first poll after the feed returns.
@@ -196,6 +210,10 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     put("budget_zygote_verdict_ms", json!(BUDGET_ZYGOTE_VERDICT_MS));
     put("budget_gpu_deaths_unread", json!(BUDGET_GPU_DEATHS_UNREAD));
     put("budget_gpu_deaths_at_exit", json!(BUDGET_GPU_DEATHS_AT_EXIT));
+    put(
+        "budget_gpu_death_reload_ms",
+        json!(budget_gpu_death_reload_ms(cef_child_poll_ms)),
+    );
     put("harness_page_poll_ms", json!(HARNESS_PAGE_POLL_MS));
     Value::Object(m)
 }
@@ -371,6 +389,34 @@ mod tests {
         assert_eq!(
             (BUDGET_GPU_DEATHS_UNREAD + BUDGET_GPU_DEATHS_AT_EXIT) as usize,
             survivable
+        );
+    }
+
+    // Owed 96: the reload budget is its four terms, each read from its own declaration (the adapters'
+    // poll carried in, here 2, so a term read from the wrong place shows), and a reload comes back
+    // inside a process restart's own budget (else restarting would be the better recovery).
+    #[test]
+    fn the_gpu_death_reload_budget_is_its_terms() {
+        let t = Thresholds::default();
+        let v = dump(AdapterConsts {
+            cef_child_poll_ms: 2,
+            encoded_ring_span_ms: 3,
+            reaper_kill_after_ms: 4,
+            teardown_leak_after_ms: 5,
+        });
+        let want = 2 + TICK_WIDEST_MS + t.cef_load_timeout_ms + BUDGET_FRAME_TO_ENCODER_MS;
+        assert_eq!(v["budget_gpu_death_reload_ms"].as_u64(), Some(want));
+        let (_, committed) = committed();
+        let poll = committed["cef_child_poll_ms"]
+            .as_u64()
+            .expect("the committed poll");
+        let budget = committed["budget_gpu_death_reload_ms"]
+            .as_u64()
+            .expect("the committed reload budget");
+        assert_eq!(budget, budget_gpu_death_reload_ms(poll));
+        assert!(
+            budget < BUDGET_PROCESS_RESTART_OUTPUT_MS,
+            "a reload ({budget} ms) slower than a process restart"
         );
     }
 
