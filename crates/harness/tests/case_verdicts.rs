@@ -1840,6 +1840,19 @@ fn output_hung_swaps_on_the_egress_backstop_and_reds_on_any_other_path() {
         );
         let gap = m["gap_ms"].as_i64().unwrap();
         assert!(gap > flat && gap <= budget, "{tag}: gap {gap}");
+        // The PR #76 review's I-1: MediaMTX's idle deadline for this case is four outage targets
+        // (output-hung.sh), past the window's ceiling here and at the owner's question's "about 15 s"
+        // (a threshold of a whole budget), so no destination deadline races the backstop.
+        let d = &m["destination_outwaits"];
+        assert_eq!(
+            (d["ceiling_ms"].as_i64(), d["mtx_read_timeout_ms"].as_i64()),
+            (Some(ceiling), Some(4 * budget)),
+            "{tag}: the destination's deadline"
+        );
+        assert!(
+            budget + ceiling - flat < 4 * budget,
+            "{tag}: a 15 s threshold's ceiling"
+        );
         checked += 1;
     }
     // Judged as the other variant: the arming line and the plant name another stall.
@@ -1885,12 +1898,19 @@ fn output_hung_swaps_on_the_egress_backstop_and_reds_on_any_other_path() {
     let v = judge(&w, "output-hung", "hold", "hung-planted-twice");
     assert_eq!(v.json["failed"], json!(["planted"]), "hung-planted-twice");
     checked += 3;
-    // The plant inside the drive, with the gap budget's room before the end: each boundary reds on
-    // that alone, 1 ms inside it passes (World: boot 9 s before live, sink 1 at +2.4 s, the drive
-    // 1 s after live, the end 70 s after the drive).
+    // The plant inside the drive, with room before the end: each boundary reds on that alone, 1 ms
+    // inside it passes (World: boot 9 s before live, sink 1 at +2.4 s, the drive 1 s after live, the
+    // end 70 s after the drive). The room is the latest swap the window accepts, then
+    // `beat_playing_again`'s wait and a heartbeat for its beat (longer than the outage's budget).
     let to_swap = flat + poll / 2 + TICK_AFTER_BACKOFF_MS + base;
+    let room = ceiling
+        + w.ms("output_connect_timeout_ms")
+        + w.ms("output_connected_after_ms")
+        + 2 * tick
+        + w.ms("heartbeat_interval_ms");
+    assert!(room > budget, "room {room} ms");
     let at_drive = 9_000 - 2_400 + 1_000;
-    let at_end = at_drive + 70_000 - budget;
+    let at_end = at_drive + 70_000 - room;
     for (tag, after, red) in [
         ("hung-at-drive", at_drive, true),
         ("hung-after-drive", at_drive + 1, false),
@@ -2054,8 +2074,58 @@ fn output_hung_swaps_on_the_egress_backstop_and_reds_on_any_other_path() {
         "hung-outage-after"
     );
     checked += 2;
+    // The PR #76 review's m-3: once sink 2 could have earned Connected at the latest (a whole connect,
+    // the Connected bound and a tick for each after the swap), the beats read `playing` again until
+    // the end request. A beat just before that may still read stalled, one at it may not, and a window
+    // with no beat witnesses nothing.
+    let again = swap + w.ms("output_connect_timeout_ms") + w.ms("output_connected_after_ms") + 2 * tick;
+    let with_stalled_beat = |at: i64| {
+        let mut w = output_hung("hold");
+        let mut body = w
+            .beats
+            .iter()
+            .find(|b| b.1["state"] == "playing")
+            .unwrap()
+            .1
+            .clone();
+        body["state"] = json!("stalled");
+        body["output"] = json!("connecting");
+        w.beats.push((at, body));
+        w.beats.sort_by_key(|b| b.0);
+        w
+    };
+    let v = judge(
+        &with_stalled_beat(again - 1),
+        "output-hung",
+        "hold",
+        "hung-again-before",
+    );
+    assert_pass(&v, "hung-again-before");
+    let v = judge(
+        &with_stalled_beat(again),
+        "output-hung",
+        "hold",
+        "hung-again-stalled",
+    );
+    assert_eq!(
+        v.json["failed"],
+        json!(["beat_playing_again"]),
+        "hung-again-stalled"
+    );
+    let mut w = output_hung("hold");
+    let end_request = w.end;
+    let inside = w
+        .beats
+        .iter()
+        .filter(|b| b.0 >= again && b.0 < end_request)
+        .count();
+    assert!(inside >= 1, "the good world has {inside} beats in the window");
+    w.beats.retain(|b| !(b.0 >= again && b.0 < end_request));
+    let v = judge(&w, "output-hung", "hold", "hung-again-no-beat");
+    assert_fails(&v, "beat_playing_again", "hung-again-no-beat");
+    checked += 3;
     eprintln!("output-hung sims checked: {checked}");
-    assert_eq!(checked, 28);
+    assert_eq!(checked, 31);
 }
 
 /// What the starvation did to the compositor (case 6).

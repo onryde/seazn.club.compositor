@@ -14,3 +14,8 @@ services:
     environment:
       COMPOSITOR_TEST_HOLD_SINK_AFTER_MS: ${COMPOSITOR_TEST_HOLD_SINK_AFTER_MS?case 18 sets the hold (or leaves it empty)}
       COMPOSITOR_TEST_HANG_SINK_AFTER_MS: ${COMPOSITOR_TEST_HANG_SINK_AFTER_MS?case 18 sets the hang (or leaves it empty)}
+  # MediaMTX closes a publisher idle for its readTimeout (10 s by default in 1.21.2), inside the
+  # backstop's window (the PR #76 review's I-1): case 18 raises it, derived in output-hung.sh.
+  mediamtx:
+    environment:
+      MTX_READTIMEOUT: ${OUTPUT_HUNG_MTX_READTIMEOUT:?case 18 derives MediaMTX's readTimeout}
