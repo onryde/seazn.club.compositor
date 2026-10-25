@@ -75,9 +75,9 @@ const BOUND_KIB: f64 = 512.0;
 /// window. A rebuild that passes connects within one connect timeout (the handshake and
 /// `InputConnected` come from the one connect), decodes for one window, and has the build before it
 /// torn down meanwhile: about 3 s a rebuild on CI, against 6 s here, so 280 s in all. A child past
-/// it is killed and the gate reds by name, inside check.yml's 25 minutes: the job's slowest green run
+/// it is killed and the gate reds by name, inside check.yml's 30 minutes: the job's slowest green run
 /// in the 40 before this gate (the PR #91 review) took 1 145 s, and with the listener's 30 s and
-/// this budget its worst case is about 1 455 s of 1 500.
+/// this budget its worst case is about 1 455 s of 1 800.
 fn child_budget(t: &Thresholds) -> Duration {
     let rebuild = Duration::from_millis(t.input_connect_timeout_ms + DECODE_MS);
     CHILD_FLOOR + rebuild * (WARMUP + MEASURED) as u32

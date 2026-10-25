@@ -14,7 +14,10 @@ permissions: { contents: read }
 jobs:
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    # 30 min (PR #91 confirm pass N1). The slowest green run before Owed 100's heap gate took
+    # 1 145 s; with the gate's listener (30 s) and its measuring child killed at its budget (280 s,
+    # tests/input_heap.rs `child_budget`) the worst case is about 1 455 s, too close to 25 min.
+    timeout-minutes: 30
     defaults:
       # An explicit `shell: bash` runs `bash -eo pipefail`. The implicit default is `bash -e` with no
       # pipefail, under which `cargo test … | tee` exits with tee's 0 and a failing suite passes.
