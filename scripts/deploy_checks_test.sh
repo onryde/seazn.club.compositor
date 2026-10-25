@@ -686,7 +686,7 @@ expect_red "n24 deploy-stg's Push behind a widened guard" 'push.Push holds FLY_A
 fresh; edit "$W/wf/$STG" "      - name: Free disk space
         if: steps.token.outputs.enabled == 'true'
 " "      - name: Free disk space
-        if: steps.token.outputs.enabled == 'true' || always()
+        if: steps.token.outputs.enabled == 'true' && github.event_name == 'push' || always()
 "
 expect_red "n24b deploy-stg's Free disk space behind a widened guard" 'push.Free disk space comes after the FLY_API_TOKEN_RELAY_STG guard but does not read it'
 
@@ -835,6 +835,9 @@ case "$1 ${2:-}" in
     if [ -f "$STATE/list-fails-at" ] && [ "$(cat "$STATE/list-fails-at")" = "$n" ]; then echo "Error: timeout (fake)" >&2; exit 1; fi
     cat "$s" ;;
   "secrets set")
+    # The read credential is gone before the web app is touched (m-12): its path is the one curl logged.
+    cfg=$(sed -n 's/^curl-config ok //p' "$STATE/log" | tail -n 1)
+    if [ -n "$cfg" ] && [ -e "$cfg" ]; then echo "creds-present-at-set $cfg" >> "$STATE/log"; fi
     [ ! -f "$STATE/set-fails" ] || { echo "Error: unauthorized (fake)" >&2; exit 1; }
     [ ! -f "$STATE/set-noop" ] || exit 0
     name=${3%%=*} value=${3#*=}
@@ -894,7 +897,7 @@ while [ $# -gt 0 ]; do
     -o) out=$2; shift ;;
     -w) fmt=$2; shift ;;
     -H | --proto | --max-time) shift ;;
-    -sS) ;;
+    -q | -sS) ;;
     https://*) url=$1 ;;
     *) echo "fake curl: unexpected $1" >&2; exit 2 ;;
   esac
@@ -1278,7 +1281,8 @@ line_of() { grep -nF -- "$1" "$STATE/log" | head -n 1 | cut -d: -f1; }
 if [ "$rc" -eq 0 ] && has "$STATE/log" "$set_line" \
   && has "$STATE/log" 'flyctl tokens create deploy -a seazn-relay-stg -n promote-read-stg-' && has "$STATE/log" ' -x 10m (token none)' \
   && has "$STATE/log" 'flyctl config show -a seazn-club-stg (token none)' \
-  && [ -n "$cfg_path" ] && [ ! -e "$cfg_path" ] && has "$STATE/log" "curl -sS --proto =https --max-time 60 -K $cfg_path" \
+  && [ -n "$cfg_path" ] && [ ! -e "$cfg_path" ] && has "$STATE/log" "curl -q -sS --proto =https --max-time 60 -K $cfg_path" \
+  && ! has "$STATE/log" 'creds-present-at-set' \
   && has "$STATE/log" "https://$REG/v2/seazn-relay-stg/manifests/$D_NEW" && ! grep -q '^docker ' "$STATE/log" && no_token_seen \
   && [ "$(line_of 'flyctl secrets set')" -lt "$(line_of 'flyctl secrets deploy -a seazn-club-stg (token none)')" ] \
   && ! grep -qE 'token (WRONG|push)' "$STATE/log" && [ "$n_fly" -gt 0 ] && [ "$n_cwd" -eq "$n_fly" ] && ! has "$STATE/log" "[cwd $W/op" \
@@ -1291,7 +1295,7 @@ if [ "$rc" -eq 0 ] && has "$STATE/log" "$set_line" \
   && has "$W/step.out" "  RELAY_IMAGE's digest:  d0 -> $(digest_of "$new_value") (Deployed)" \
   && has "$W/step.out" "Rollback: scripts/promote.sh stg $OLD@$D_OLD (it refuses" \
   && [ "$(tail -n 1 "$PLOG/stg.log" | cut -d' ' -f2-)" = "stg $SHA@$D_NEW $new_value $(digest_of "$new_value")" ]; then
-  ok "promote P1: stg on the stored login, no docker; the manifest read by digest on a 10-minute relay-only read token kept in a 0600 curl config (gone after, never in argv or output); main's record verified on that file before any web call; all $n_fly flyctl calls from the empty cwd; RELAY_IMAGE set by digest then deployed; previous = the log entry whose Fly digest is live, with its rollback; logged"
+  ok "promote P1: stg on the stored login, no docker; the manifest read by digest (curl -q first: no ~/.curlrc) on a 10-minute relay-only read token kept in a 0600 curl config (gone before the web app is touched, never in argv or output); main's record verified on that file before any web call; all $n_fly flyctl calls from the empty cwd; RELAY_IMAGE set by digest then deployed; previous = the log entry whose Fly digest is live, with its rollback; logged"
 else
   bad "promote P1: rc $rc (flyctl $n_fly, from the empty cwd $n_cwd, config '$cfg_path')"; show
 fi

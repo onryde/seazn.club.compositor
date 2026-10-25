@@ -188,10 +188,11 @@ fi
 rm -f "$tmp/token"
 accept='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json'
 # fetch DIGEST OUT: the HTTP status of GET manifests/DIGEST, 000 when curl itself failed. curl's error
-# text is never printed: with -K it could carry the credential.
+# text is never printed: with -K it could carry the credential. -q comes first, so no ~/.curlrc is read
+# (the PR #93 confirm pass's m-13): this config and these flags are the whole request.
 fetch() {
   local code
-  code=$(curl -sS --proto '=https' --max-time 60 -K "$creds" -H "Accept: $accept" -o "$2" -w '%{http_code}' \
+  code=$(curl -q -sS --proto '=https' --max-time 60 -K "$creds" -H "Accept: $accept" -o "$2" -w '%{http_code}' \
     "https://$registry/v2/$app/manifests/$1" 2> /dev/null) || code=000
   echo "$code"
 }
@@ -262,6 +263,9 @@ elif [ "$before" = unset ]; then
 else
   previous="set elsewhere (Fly digest $before; the value is write-only, and no promote logged on this machine set it)"
 fi
+# The registry's last read is above: the credential goes now, not at exit (m-12). The token itself
+# expires 10 minutes after it was minted; it is not revoked here.
+rm -f "$creds"
 
 # 9. Stage, deploy, and prove it took (m-7).
 on_fly secrets set "RELAY_IMAGE=$new" -a "$web" --stage || fail "flyctl secrets set failed on $web: nothing deployed"
