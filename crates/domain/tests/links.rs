@@ -5,6 +5,7 @@
 //! (AGENTS.md §5).
 use domain::config::{
     OutputProfile, Thresholds, OUTPUT_GAP_BUDGET_MS, OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS,
+    TICK_WIDEST_MS,
 };
 use domain::input_link::{InputAction, InputLink, InputState, LossReason, KICK_HISTORY_CAP};
 use domain::output_link::{Encoded, OutputLink, OutputState, SwapReason};
@@ -498,6 +499,102 @@ fn the_egress_backstop_ends_only_a_flowing_sink_and_only_while_the_encoders_deli
     eprintln!("backstop pairs checked: {checked} ({fired} fire)");
     assert_eq!(checked, OUTPUT_KINDS.len() * DELIVERIES.len());
     assert_eq!(fired, 2, "Proving and Connected, delivering");
+}
+
+// The PR #73 review's P-3, measured: the multi-wake trickle. A destination that drains one RTMP
+// message across several socket waits, each `wait` ms apart, completes a message every `message` ms
+// (rtmp2sink counts its bytes only once a message is all written, so the total grows only then).
+// rtmp2sink's own error comes only when one wait outlasts its socket timeout (OUTPUT_SINK_TIMEOUT_MS
+// after the cut, the bytes flowing at full rate until it); a wait under it never errors. So:
+// - a wait at or past the timeout: the sink's error, the base back-off, a build (reason `error`),
+//   whatever the messages do (Owed 87's path, unchanged);
+// - every wait under the timeout and a message slower than the backstop's threshold: no error ever,
+//   and only the backstop swaps, output_egress_flat_ms after the cut and the base back-off later
+//   (reason `egress_stalled`). Before Owed 94 nothing swapped such a sink: the viewer saw one frame
+//   per message for as long as the destination trickled;
+// - every wait under the timeout and a message no slower than the threshold less a poll: nothing
+//   swaps (the total keeps growing), as before Owed 94.
+// The readings come every OUTPUT_PROGRESS_POLL_MS with both encoders delivering, and the ticks every
+// widest frame (TICK_WIDEST_MS), from the cut; each row's expected detector and window comes from
+// the rule above, never from the link.
+#[test]
+fn a_multi_wake_trickle_is_swapped_by_the_backstop_only_where_no_socket_wait_reaches_the_timeout() {
+    let t = Thresholds::default();
+    let (flat, base, poll, tick) = (
+        t.output_egress_flat_ms,
+        t.output_backoff_base_ms,
+        OUTPUT_PROGRESS_POLL_MS,
+        TICK_WIDEST_MS,
+    );
+    let timeout = OUTPUT_SINK_TIMEOUT_MS;
+    const HORIZON_MS: Ms = 30_000;
+    let waits = [1_000, 2_500, timeout - 1, timeout, timeout + 2_000];
+    // u64::MAX: no message completes in the horizon (a keyframe larger than the trickle moves).
+    let messages = [2_000, flat - poll, flat + poll, 12_000, 20_000, u64::MAX];
+    let (mut rows, mut by_error, mut by_backstop, mut none) = (0, 0, 0, 0);
+    for wait in waits {
+        for message in messages.into_iter().filter(|m| *m >= wait) {
+            let (mut o, _) = output_in(Kind::Up, &t);
+            let built = 100 + base;
+            let cut = built + 50 + t.output_connected_after_ms;
+            o.on_delivery(cut - 10, 2, Encoded { video: 1, audio: 1 });
+            o.on_delivery(cut - 5, 2, Encoded { video: 2, audio: 2 });
+            let mut k = 2;
+            let mut swap = None;
+            let mut errored = false;
+            for now in cut + 1..=cut + HORIZON_MS {
+                let since = now - cut;
+                if wait >= timeout && since == timeout && !errored {
+                    o.on_error(now, 2, &t);
+                    errored = true;
+                }
+                if since % poll == 0 {
+                    let done = if message == u64::MAX { 0 } else { since / message };
+                    o.on_progress(now, 2, 1_000 + done, &t);
+                    k += 1;
+                    o.on_delivery(now, 2, Encoded { video: k, audio: k });
+                }
+                if since % tick == 0 && o.on_tick(now, &t) {
+                    swap = Some((since, o.swap_reason(), o.generation()));
+                    break;
+                }
+            }
+            let (want, window) = if wait >= timeout {
+                (Some(SwapReason::Error), (timeout + base, timeout + base + tick))
+            } else if message > flat {
+                (
+                    Some(SwapReason::EgressStalled),
+                    (flat + base, flat + base + 2 * tick),
+                )
+            } else {
+                (None, (0, 0))
+            };
+            match (want, swap) {
+                (Some(reason), Some((at, got, gen))) => {
+                    assert_eq!((got, gen), (reason, 3), "wait {wait}, message {message}");
+                    assert!(
+                        at >= window.0 && at <= window.1,
+                        "wait {wait}, message {message}: swap at +{at}, want {window:?}"
+                    );
+                    if reason == SwapReason::Error {
+                        by_error += 1;
+                    } else {
+                        by_backstop += 1;
+                    }
+                    eprintln!("wait {wait:>5} ms, message {message:>20} ms: {got:?} at +{at} ms");
+                }
+                (None, None) => {
+                    none += 1;
+                    eprintln!("wait {wait:>5} ms, message {message:>20} ms: no swap in {HORIZON_MS} ms");
+                }
+                (want, got) => panic!("wait {wait}, message {message}: want {want:?}, got {got:?}"),
+            }
+            rows += 1;
+        }
+    }
+    eprintln!("multi-wake rows checked: {rows} ({by_error} error, {by_backstop} backstop, {none} none)");
+    assert_eq!(rows, 26);
+    assert_eq!((by_error, by_backstop, none), (10, 12, 4));
 }
 
 // ---- generated schedules, against facts the harness tracks itself ----
