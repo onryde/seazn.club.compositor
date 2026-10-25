@@ -943,10 +943,13 @@ derived constant.
   - `beat_playing_again` (the review's m-3, the plan's "and `playing` again"): from the swap plus
     output_connect_timeout_ms, output_connected_after_ms and two ticks until the end request, at least
     one beat, all `playing`;
-  - `output_lost` (the confirm pass's n-2): the hang's outage's `lost_ms` is read and at most
-    budget_output_lost_max_ms, spec §6's output stall row, as cases 4, 5 and 12 judge theirs. No
-    floor: CI's −2 s readings are Owed 92's dating (`docs/_INDEX.md` Owed 94, Owed 92), and Owed 92's
-    risk holds here too;
+  - `output_lost` (the confirm pass's n-2; the PR #84 review's m-1): spec §6's output stall row,
+    "≤2 s of programme lost" (budget_output_lost_max_ms), read as one stall's recovery target. So
+    the programme lost is summed over every outage from the plant to a reconnect's budget past the
+    swap (the window `no_outage_outside_hang` excuses), a negative reading counting as none; at
+    least one outage is in the window, and every one's `lost_ms` is read. Cases 4, 5 and 12 bound
+    each outage instead (unchanged). No floor: CI's −2 s readings are Owed 92's dating
+    (`docs/_INDEX.md` Owed 94, Owed 92), and Owed 92's risk holds here too;
   - the false-positive sweep, `no_restarts` and `ended_beat`; measures `gap_ms` (the key) and
     `lost_ms`.
 - **b-1 (the PR #73 confirm pass):** `stall_swap`'s `error_to_swap_ms` is read from the two lines'
@@ -963,7 +966,8 @@ derived constant.
   reached (false premises, 2026-10-25); a backstop swap there is a red to read.
 - thresholds.json gains `output_egress_flat_ms`, `output_progress_poll_ms` (back, for the window)
   and `tick_widest_ms`.
-- **Host mutants**, 29, all KILLED, each with a named FAIL in a `case_verdicts.rs` sim: lib.jq's
+- **Host mutants**, all KILLED, each with a named FAIL (a `case_verdicts.rs` sim's, or one of its
+  named assertions where said). The first 29: lib.jq's
   `hung_swap` (the reason, the pairing, the error-first, the floor, the ceiling, `ts=` against
   docker, the floor's tick term), case 18's checks (the beat's state and its count, the gap's budget
   and its one outage, the drive's two bounds, one swap, the arming's stall and ms, the plant's count,
@@ -975,8 +979,16 @@ derived constant.
   reading, passes), its `>=` as `>` (`hung-hold-good`), `output_lost`'s null conjunct dropped
   (`hung-lost-unread`) and its `<=` as `<` (`hung-lost-at-budget`), `mtx_duration_ms` without its
   whole-string test (`hung-mtx-junk`), and the asked value at one budget, not four (the good world's
-  "outwaits this window and a 15 s threshold's"). H28's mutant (the asked value at 0) now dies in
-  `go_duration`'s range assertion, not in `destination_outwaits`.
+  "outwaits this window and a 15 s threshold's" assertion). H28's mutant (the asked value at 0)
+  now dies in `go_duration`'s range assertion ("a duration this writes: 0 ms"), not in a sim; the
+  property it targets, an asked value that outwaits the window, is N6's. The PR #84 review's m-1
+  and m-2 follow-up's O1-O4 and the unit rows: `output_lost` over GAP's outages only, not the
+  hang's window (`hung-lost-second-over`), without the clamp of negative readings
+  (`hung-lost-masked`), with `max` for the sum (`hung-lost-sum-over`), and without its
+  one-outage clause (`hung-lost-no-outage`); and each row of `mtx_duration_ms`'s unit table
+  scaled tenfold (`ms` as 1 000, the review's ME, by `hung-mtx-ms`, which then passes "500ms";
+  `d`, `h`, `s`, `us`, `µs` and `ns` by `hung-mtx-d`, `-h`, `-s`, `-us`, `-micro` and `-ns`, each
+  reading's ms worked out by hand).
 - **CI mutants** (a throwaway `mut/owed94` PR, the `mut/c14-case16` workflow's shape: the target check
   PASSes unmutated, then FAILs mutated with its controls still PASS): (a) the case on the plain relay
   image reds `armed`; (b) the backstop's Connected arm removed reds `backstop_swap` on `hold`; (c)
