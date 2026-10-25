@@ -5664,9 +5664,9 @@ type BackLeg = (
 
 /// The PR #79 confirm pass's C-4 (a coordinator decision): a restart that comes back, holds for the
 /// hold and then leaves the air passed every restart leg. `stays_on_air` judges each leg with a back
-/// check from its back frame to the end request: no strip-less run longer than the frames the
-/// frame-to-encoder budget holds, a run at one of the case's own later kills set aside, and an empty
-/// span red.
+/// check from its back frame to the end request: no more strip-less frames in all than the
+/// frame-to-encoder budget holds (a total, so a strobe reds too; no run set aside at a kill, the
+/// approval's F-1), and an empty span red.
 #[test]
 fn stays_on_air_reds_a_page_that_leaves_after_coming_back_in_every_leg_with_a_back_check() {
     let t = World::new(1);
@@ -5756,6 +5756,7 @@ fn stays_on_air_reds_a_page_that_leaves_after_coming_back_in_every_leg_with_a_ba
         assert!(
             m["span_frames"].as_u64().is_some_and(|n| n > 0)
                 && m["longest_frames"] == json!(0)
+                && m["off_air_frames"] == json!(0)
                 && m["allowance_frames"] == json!(allowance),
             "{tag}-good: {m}"
         );
@@ -5802,22 +5803,59 @@ fn stays_on_air_reds_a_page_that_leaves_after_coming_back_in_every_leg_with_a_ba
             assert_check_passes(&v, "stays_on_air", &tag);
         }
     }
-    // A run at one of the case's own kills after the back frame is set aside (a blip at a later kill
-    // is expected; an off-air run there is Owed 96's shape), however long.
-    let mut w = cef_killed(good(), 133);
+    // The approval's F-1: no run is set aside at a kill. CI's 2-frame blip at a kill after the back
+    // frame fits the allowance and passes; a run at that kill longer than the allowance reds, and so
+    // does one from that kill to the end.
     let later = back + 3_000;
-    w.mark("kill", later, json!({"at_ms": later, "killed": [], "types": []}));
-    w.overlay_none.push((
-        later + 51,
-        later + 51 + ((allowance + 3) as f64 * PERIOD_MS) as i64,
-    ));
-    let v = judge(&w, "cef-killed", "", "sty-later-kill");
-    assert_check_passes(&v, "stays_on_air", "sty-later-kill");
+    let later_kill = |w: &mut World| {
+        w.mark("kill", later, json!({"at_ms": later, "killed": [], "types": []}));
+    };
+    let mut w = cef_killed(good(), 133);
+    later_kill(&mut w);
+    w.overlay_none.push((later + 51, later + 51 + 66));
+    let v = judge(&w, "cef-killed", "", "sty-later-blip");
+    assert_check_passes(&v, "stays_on_air", "sty-later-blip");
+    let m = &v.json["measures"]["stays_on_air"];
+    assert!(
+        m["off_air_frames"]
+            .as_u64()
+            .is_some_and(|n| (1..=allowance).contains(&n)),
+        "sty-later-blip: {m}"
+    );
+    for (tag, to) in [
+        (
+            "sty-later-long",
+            later + 51 + ((allowance + 3) as f64 * PERIOD_MS) as i64,
+        ),
+        ("sty-later-to-end", w.end + 60_000),
+    ] {
+        let mut w = cef_killed(good(), 133);
+        later_kill(&mut w);
+        w.overlay_none.push((later + 51, to));
+        let v = judge(&w, "cef-killed", "", tag);
+        assert_fails(&v, "stays_on_air", tag);
+        let m = &v.json["measures"]["stays_on_air"];
+        assert!(
+            m["longest_frames"].as_u64().is_some_and(|n| n > allowance),
+            "{tag}: {m}"
+        );
+    }
+    // The strobe: off for the allowance, on for one frame, three times. No run is longer than the
+    // allowance, but the span's total off air is: red.
+    let mut w = cef_killed(good(), 133);
+    let cycle = (allowance + 1) as f64 * PERIOD_MS;
+    for i in 0..3 {
+        let from = w0 - 10 + (f64::from(i) * cycle) as i64;
+        w.overlay_none
+            .push((from, from + (allowance as f64 * PERIOD_MS) as i64));
+    }
+    let v = judge(&w, "cef-killed", "", "sty-strobe");
+    assert_fails(&v, "stays_on_air", "sty-strobe");
     let m = &v.json["measures"]["stays_on_air"];
     assert_eq!(
-        (&m["at_later_kill"], &m["longest_frames"]),
-        (&json!(1), &json!(0)),
-        "sty-later-kill: {m}"
+        (&m["runs"], &m["longest_frames"], &m["off_air_frames"]),
+        (&json!(3), &json!(allowance), &json!(3 * allowance)),
+        "sty-strobe: {m}"
     );
     // The span ends at the end request: the final hold's end slate, off air, is not this check's.
     let mut w = cef_killed(good(), 133);

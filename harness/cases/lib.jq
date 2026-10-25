@@ -57,13 +57,14 @@ def hold_evidence($b; $w): {stayed_ms: stayed_ms($b), hold_ms: $w,
 # Stays on air after back (the PR #79 confirm pass's C-4, a coordinator decision: a restart that came
 # back for 1.5 s and then died passed every restart leg). From the back frame of $b up to the last
 # programme frame or the end request, whichever is first, in frame order: the strip-less runs, each
-# {from_ms, frames}. A run that starts within one child poll (`cef_child_poll_ms`, Owed 96's
-# `at_kill`) after one of the case's own kills AFTER the back frame is set aside: a blip at a later
-# kill is expected, and an off-air run there is Owed 96's shape, judged by its own signature. Every
-# other run must be no longer than the allowance: the frames the frame-to-encoder budget holds
-# (`budget_frame_to_encoder_ms` / `frame_period_ms`, 4; healthy runs show 1 or 2 strip-less frames at
-# a GPU kill, and none after back). No back, no end request or no frame in the span is null: the
-# caller reds it (zero frames proves nothing).
+# {from_ms, frames}. Their TOTAL must be no more than the allowance: the frames the frame-to-encoder
+# budget holds (`budget_frame_to_encoder_ms` / `frame_period_ms`, 4; healthy runs show 1 or 2
+# strip-less frames at a GPU kill and none after back). A total, not a per-run cap, so a strobe (4
+# off, 1 on, again and again) reds, and it bounds the longest run too. No run is set aside at a kill:
+# no leg with a back check kills after its back, and a blip at a later kill fits the allowance
+# (the approval's F-1 dropped the exclusion that set aside a run of any length there). No back, no
+# end request or no frame in the span is null or empty: the caller reds it (zero frames proves
+# nothing).
 def off_air_allowance_frames: $t.budget_frame_to_encoder_ms / $t.frame_period_ms | floor;
 def stays_on_air_from($b):
   ([(.frames_table | last | .[0]), $run.end_request_ms] | min) as $end
@@ -75,15 +76,13 @@ def stays_on_air_from($b):
        elif .cur != null then .runs += [.cur] | .cur = null
        else . end)
      | .runs + (if .cur == null then [] else [.cur] end) end) as $runs
-  | [mark("kill")[] | .at_ms | select($b != null and . > $b)] as $later
-  | (if $runs == null then null
-     else [$runs[] | select(.from_ms as $s | any($later[]; $s >= . and $s - . <= $t.cef_child_poll_ms) | not)] end) as $judged
   | {until_ms: $end, span_frames: ($span | if . == null then null else length end),
      allowance_frames: off_air_allowance_frames,
-     longest_frames: (if $judged == null then null else [$judged[].frames] | max // 0 end),
-     longest_from_ms: (if $judged == null then null else $judged | max_by(.frames) | .from_ms end),
-     at_later_kill: (if $runs == null then null else ($runs | length) - ($judged | length) end)};
-def stays_on_air_ok: .span_frames >= 1 and .longest_frames <= .allowance_frames;
+     off_air_frames: (if $runs == null then null else [$runs[].frames] | add // 0 end),
+     runs: ($runs | if . == null then null else length end),
+     longest_frames: (if $runs == null then null else [$runs[].frames] | max // 0 end),
+     longest_from_ms: (if $runs == null then null else $runs | max_by(.frames) | .from_ms end)};
+def stays_on_air_ok: .span_frames >= 1 and .off_air_frames <= .allowance_frames;
 
 # The output outage that spans a process restart: its last packet before the start, its first
 # after the die.
