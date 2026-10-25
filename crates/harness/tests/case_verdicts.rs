@@ -2128,28 +2128,122 @@ fn output_hung_swaps_on_the_egress_backstop_and_reds_on_any_other_path() {
     assert_eq!(checked, 31);
 }
 
-/// What the starvation did to the compositor (case 6).
+/// What the starvation did to the compositor (case 6). The honest beat (Owed 86; the owner,
+/// 2026-10-24, "Ok", relayed by the coordinator): the beat's fps is the encoder's real output rate
+/// over the beat window, with a starvation alarm, and the ladder is not changed.
 #[derive(Clone, Copy, PartialEq)]
 enum Felt {
-    /// Nothing: droppedFrames 0, rung full and encoderSpeed 1.0 throughout (CI's first build, a
-    /// sibling container's burn).
+    /// Nothing: encoderSpeed 1.0, droppedFrames 0, rung full and every beat at the profile's rate, so
+    /// no alarm (CI's first build, a sibling container's burn).
     No,
-    /// The encoder fell behind realtime, and the ladder never moved: droppedFrames 0, rung full
-    /// (Owed 86, as CI read it: encoderSpeed 0.90 to 1.07, every beat healthy).
-    Unread,
-    /// The overruns the ladder's step needs, and no step (the ladder never moves).
-    Drops,
-    /// A step to overlay_half_rate with no overrun counted (droppedFrames never rose).
-    Uncounted,
-    /// Overruns and the step to overlay_half_rate.
+    /// The honest beat: the encoder behind realtime (encoderSpeed 0.8 in the window), each beat's
+    /// rate the frames out of it over its window, so under the floor while the quota holds, and the
+    /// alarm raised, then cleared once the rate is back; droppedFrames 0 and rung full (CI's run
+    /// 40143263604).
+    Honest,
+    /// F-024's beat: the encoder behind realtime and every beat at the profile's rate (the tick
+    /// grid's push count, before #69), so the alarm never fires.
+    Lying,
+    /// Honest, and the ladder stepped: overruns past its step, then overlay_half_rate.
     Step,
-    /// As `Step`, and the step absorbed it at once: every beat at encoderSpeed 1.0, the clock whole.
-    Absorbed,
+    /// Honest, and a step to overlay_half_rate with no overrun counted.
+    Uncounted,
+}
+
+/// The starvation alarm's lines: as declared (`domain::starvation`, at thresholds.json's levels), or
+/// one of its regressions, each a product mutant.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum AlarmIs {
+    Declared,
+    /// Never raised: its floor 0, which no rate is below.
+    NeverRaised,
+    /// Raised, never cleared: its recovered level above the profile's rate.
+    NeverCleared,
+    /// Raised on the healthy clock before the quota: its floor above the profile's rate, so a healthy
+    /// beat raises it and the next one clears it.
+    FalseRaise,
+    /// Silent through the window (its lines there lost), then raised by the drain's short last window
+    /// (Owed 91's mid-drain gap).
+    RaisedLate,
+    /// Cleared at the floor (the PR #69 review's clear-at-floor mutant), with the rate back only to
+    /// between the floor and the recovered level.
+    ClearsAtFloor,
+    /// Cleared on the first beat past realtime_after's window, though the rate was back sooner.
+    ClearsLate,
+    /// Cleared inside the window, on the beat after the raise: its recovered level under the
+    /// starved rate, so it flaps raise, clear, raise through the quota (the PR #77 review's I2).
+    ClearsEarly,
+}
+
+/// The beat's rate beyond the quota's own shape: each a regression, or a phase the verdict must
+/// tell from the starvation's (the PR #77 review's I2 and m1).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Shape {
+    /// The quota's shape only.
+    Quota,
+    /// One beat inside the window at the profile's rate among starved ones.
+    OneFull,
+    /// One beat before the quota under the floor (the PR #69 review's m4: a short off-grid window
+    /// at startup), then the rate back: the alarm raises and clears before the quota.
+    StartupDip,
+    /// The rate back after the quota, then a dip 0.1 under the floor inside realtime_after's window:
+    /// the product re-raises, a catch-up that does not hold.
+    SagsAfter,
+    /// The rate back after the quota, then one healthy beat a few frames short (0.1 under the
+    /// recovered level, over the floor) inside realtime_after's window: no re-raise, a pass.
+    HealthyDip,
+}
+
+/// The rate CI's case 6 read while the 0.75 quota held (run 40143263604: 17.6 to 20.27 fps over its 7
+/// judged beats). Sim physics only: no verdict reads it.
+const STARVED_FPS: f64 = 20.0;
+
+/// The honest beat's three lines (app/src/driver.rs; logfacts pins their formats).
+const BEAT_LINE: &str = "output fps beat=";
+const RAISED_LINE: &str = "output starvation alarm raised ";
+const CLEARED_LINE: &str = "output starvation alarm cleared ";
+
+/// The honest beat's log lines for `readings`, under an alarm raised below `floor` and cleared at or
+/// above `recovered` (`domain::starvation`'s rule as its doc declares it), in the driver's formats.
+fn honest_lines(readings: &[(i64, f64)], floor: f64, recovered: f64) -> Vec<(i64, String)> {
+    let mut raised = false;
+    let mut out = Vec::new();
+    for &(at, fps) in readings {
+        out.push((at, format!("{BEAT_LINE}{fps:.2} floor={floor:.2}")));
+        if !raised && fps < floor {
+            raised = true;
+            out.push((at, format!("{RAISED_LINE}fps={fps:.2} floor={floor:.2}")));
+        } else if raised && fps >= recovered {
+            raised = false;
+            out.push((at, format!("{CLEARED_LINE}fps={fps:.2} recovered={recovered:.2}")));
+        }
+    }
+    out
+}
+
+fn level(w: &World, key: &str) -> f64 {
+    w.t[key]
+        .as_f64()
+        .unwrap_or_else(|| panic!("thresholds.json has no {key}"))
 }
 
 /// The quota at three quarters of the compositor's 1.4-CPU demand from 20 s for 40 s, put back with
-/// `done` (the drive's `stress_done`).
+/// `done` (the drive's `stress_done`), the alarm as declared.
 fn cpu_starved(done: bool, rung_back: bool, felt: Felt) -> World {
+    cpu_starved_alarm(done, rung_back, felt, AlarmIs::Declared)
+}
+
+fn cpu_starved_alarm(done: bool, rung_back: bool, felt: Felt, alarm: AlarmIs) -> World {
+    cpu_starved_shaped(done, rung_back, felt, alarm, Shape::Quota)
+}
+
+/// The wire's `fps` for a reading: control_http.rs's `fps_wire`, one decimal (pinned there by
+/// `the_wire_fps_is_the_reading_to_one_decimal`).
+fn fps_wire(fps: f64) -> f64 {
+    (fps * 10.0).round() / 10.0
+}
+
+fn cpu_starved_shaped(done: bool, rung_back: bool, felt: Felt, alarm: AlarmIs, shape: Shape) -> World {
     let mut w = World::new(80);
     let (a, b) = (w.at(20.0), w.at(60.0));
     w.mark(
@@ -2160,58 +2254,643 @@ fn cpu_starved(done: bool, rung_back: bool, felt: Felt) -> World {
     if done {
         w.mark("stress_done", b, json!({"cpus": 4.0}));
     }
-    let step = w.ms("ladder_overruns_to_step");
     let end = w.end;
-    // droppedFrames is the session's overrun count (cumulative, the ladder's `overruns`).
-    let dropped = match felt {
-        Felt::No | Felt::Unread | Felt::Uncounted => 0,
-        Felt::Drops => step,
-        Felt::Step | Felt::Absorbed => 40,
-    };
+    // droppedFrames is the session's overrun count (cumulative, the ladder's `overruns`); 40 is past
+    // any step (ladder_overruns_to_step).
+    let dropped = if felt == Felt::Step { 40 } else { 0 };
     w.beats_in(a + 1_000, end + 1, |x| x["droppedFrames"] = json!(dropped));
-    match felt {
-        Felt::No | Felt::Absorbed => {}
-        Felt::Unread => w.beats_in(a + 6_000, a + 6_001 + w.ms("heartbeat_interval_ms"), |x| {
-            x["encoderSpeed"] = json!(0.9)
-        }),
-        _ => w.beats_in(a, b, |x| x["encoderSpeed"] = json!(0.8)),
+    if felt != Felt::No {
+        w.beats_in(a, b, |x| x["encoderSpeed"] = json!(0.8));
     }
-    if matches!(felt, Felt::Step | Felt::Uncounted | Felt::Absorbed) {
+    if matches!(felt, Felt::Step | Felt::Uncounted) {
         w.beats_in(a + 6_000, end + 1, |x| x["rung"] = json!("overlay_half_rate"));
         if rung_back {
             w.beats_in(b + 5_000, end + 1, |x| x["rung"] = json!("full"));
         }
     }
+    // The beat's rate: the frames out of the encoder since the beat before (adapters::stats's
+    // BeatRate), so the share of that span under the quota reads STARVED_FPS. The first two beats
+    // after a start read nothing (compositor/tests/wiring.rs).
+    let hb = w.ms("heartbeat_interval_ms");
+    let (floor, recovered) = (level(&w, "output_fps_floor"), level(&w, "output_fps_recovered"));
+    let rate = 1_000.0 / level(&w, "frame_period_ms");
+    let back = if alarm == AlarmIs::ClearsAtFloor {
+        (floor + recovered) / 2.0
+    } else {
+        rate
+    };
+    let honest = matches!(felt, Felt::Honest | Felt::Step | Felt::Uncounted);
+    let first = w.live + 2 * hb;
+    let mut readings: Vec<(i64, f64)> = w
+        .beats
+        .iter()
+        .filter(|(at, body)| *at >= first && body["state"] == "playing")
+        .map(|(at, _)| {
+            let at = *at;
+            let starved = (at.min(b) - (at - hb).max(a)).max(0) as f64 / hb as f64;
+            let base = if at > b { back } else { rate };
+            let fps = if honest {
+                STARVED_FPS * starved + base * (1.0 - starved)
+            } else {
+                rate
+            };
+            (at, fps)
+        })
+        .collect();
+    // The shape's beat: the third judged one, the second reading, or the second beat whose window
+    // lies after the quota.
+    let at = match shape {
+        Shape::Quota => None,
+        Shape::OneFull => readings.iter().filter(|r| r.0 >= a + hb && r.0 <= b).nth(2),
+        Shape::StartupDip => readings.get(1),
+        Shape::SagsAfter | Shape::HealthyDip => readings.iter().filter(|r| r.0 >= b + hb).nth(1),
+    }
+    .map(|r| r.0);
+    if let Some(at) = at {
+        let fps = match shape {
+            Shape::OneFull => rate,
+            Shape::StartupDip => floor - 1.0,
+            Shape::SagsAfter => floor - 0.1,
+            Shape::HealthyDip => recovered - 0.1,
+            Shape::Quota => unreachable!("the quota's shape moves no beat"),
+        };
+        readings.iter_mut().find(|r| r.0 == at).unwrap().1 = fps;
+    }
+    // The wire carries the same reading, to one decimal (C06's heartbeat, control_http.rs); a beat
+    // with no reading sends no `fps`.
+    for &(at, fps) in &readings {
+        w.beats_in(at, at + 1, |x| x["fps"] = json!(fps_wire(fps)));
+    }
+    let (alarm_floor, alarm_recovered) = match alarm {
+        AlarmIs::NeverRaised => (0.0, recovered),
+        AlarmIs::NeverCleared => (floor, rate + 1.0),
+        AlarmIs::FalseRaise => (rate + 0.5, recovered),
+        AlarmIs::ClearsAtFloor => (floor, floor),
+        AlarmIs::ClearsEarly => (floor, STARVED_FPS / 2.0),
+        AlarmIs::Declared | AlarmIs::RaisedLate | AlarmIs::ClearsLate => (floor, recovered),
+    };
+    let mut lines = honest_lines(&readings, alarm_floor, alarm_recovered);
+    match alarm {
+        AlarmIs::RaisedLate => {
+            lines.retain(|(_, m)| m.starts_with(BEAT_LINE));
+            let at = end + w.ms("final_hold_ms") + 150;
+            lines.push((at, format!("{RAISED_LINE}fps=0.40 floor={floor:.2}")));
+        }
+        AlarmIs::ClearsLate => {
+            lines.retain(|(_, m)| !m.starts_with(CLEARED_LINE));
+            let late = b + w.ms("budget_ladder_realtime_ms") + hb;
+            let &(at, fps) = readings
+                .iter()
+                .find(|r| r.0 > late)
+                .expect("a beat past realtime_after's window");
+            lines.push((at, format!("{CLEARED_LINE}fps={fps:.2} recovered={recovered:.2}")));
+        }
+        _ => {}
+    }
+    for (at, m) in lines {
+        w.line(at, m);
+    }
     w
 }
 
+/// The beats case 6 judges: those whose window lies inside the quota's, [stress + one beat,
+/// stress_done], counted from the world, not the verdict.
+fn judged_beats(w: &World) -> usize {
+    let at = |n: &str| w.marks.iter().find(|m| m.0 == n).map(|m| m.1).unwrap();
+    let (a, b) = (at("stress") + w.ms("heartbeat_interval_ms"), at("stress_done"));
+    w.log
+        .iter()
+        .filter(|(t, m)| m.starts_with(BEAT_LINE) && *t >= a && *t <= b)
+        .count()
+}
+
+/// The sim's alarm is the product's: `domain::starvation::StarvationAlarm` over the world's logged
+/// rates, at the profile the harness session runs (720p30, the fixture's), changes on the same beats.
+fn assert_sim_alarm_is_the_products(w: &World) {
+    use domain::starvation::{Alarm, StarvationAlarm};
+    let rate = |m: &str| -> f64 {
+        m.strip_prefix(BEAT_LINE)
+            .and_then(|r| r.split(' ').next())
+            .and_then(|r| r.parse().ok())
+            .unwrap()
+    };
+    let mut product = StarvationAlarm::default();
+    let mut want = Vec::new();
+    for (at, m) in w.log.iter().filter(|l| l.1.starts_with(BEAT_LINE)) {
+        match product.on_reading(rate(m), &domain::config::OutputProfile::P720) {
+            Some(Alarm::Raised) => want.push((*at, "raised")),
+            Some(Alarm::Cleared) => want.push((*at, "cleared")),
+            None => {}
+        }
+    }
+    let got: Vec<(i64, &str)> = w
+        .log
+        .iter()
+        .filter_map(|(at, m)| {
+            if m.starts_with(RAISED_LINE) {
+                Some((*at, "raised"))
+            } else if m.starts_with(CLEARED_LINE) {
+                Some((*at, "cleared"))
+            } else {
+                None
+            }
+        })
+        .collect();
+    eprintln!("alarm changes compared with domain::starvation: {}", want.len());
+    assert!(want.len() >= 2, "the good world raises and clears ({want:?})");
+    assert_eq!(got, want, "the sim's alarm is not domain::starvation's");
+}
+
+/// Case 6 as CI's run 40143263604 read it under the honest beat: the beat and its alarm told the
+/// truth and the ladder stayed still (by its rule), and the recording lost frames in the window:
+/// its rate under the floors, score changes never shown, PTS gaps. Each outage covers one scheduled
+/// change's whole time on screen (from its due time to the next one's, plus the page's lag).
+fn cpu_clock_lost() -> World {
+    let mut w = cpu_starved(true, false, Felt::Honest);
+    let (a, b) = (w.at(20.0), w.at(60.0));
+    let lag = OVERLAY_LAG_MS as i64;
+    let due: Vec<i64> = w
+        .timeline_events()
+        .iter()
+        .map(|&(_, at)| at + w.delay_ms)
+        .collect();
+    let spans: Vec<(i64, i64)> = due
+        .windows(2)
+        .filter(|d| d[0] >= a && d[1] + 2 * lag < b)
+        .step_by(2)
+        .map(|d| (d[0], d[1] + 2 * lag))
+        .collect();
+    assert!(spans.len() >= 3, "{spans:?}");
+    w.outages.extend(spans);
+    // The checker's PTS gaps, as CI's report carried five of them in the window.
+    w.report_patch = Some(|r| r["pts_gaps"] = json!([{"at_ms": 0, "gap_ms": 1_834}]));
+    w
+}
+
+fn failed_checks(v: &Verdict) -> Vec<Value> {
+    v.json["failed"].as_array().unwrap().clone()
+}
+
+/// The judged wire beats: those at `[stress + one beat, stress_done]` that carry `fps`, counted from
+/// the world.
+fn judged_wire(w: &World) -> usize {
+    let at = |n: &str| w.marks.iter().find(|m| m.0 == n).map(|m| m.1).unwrap();
+    let (a, b) = (at("stress") + w.ms("heartbeat_interval_ms"), at("stress_done"));
+    w.beats
+        .iter()
+        .filter(|(t, x)| *t >= a && *t <= b && x["fps"].is_number())
+        .count()
+}
+
+// The wire's `fps` is the reading to one decimal: the producer's rounding, pinned in its source, and
+// CI's run 40143263604, whose log and wire carried 20.27 and 20.3, 19.54 and 19.5 for the same beats.
+// The verdict's tolerance between the two writers (half the wire's 0.1 plus half the log's 0.01)
+// rests on this.
 #[test]
-fn cpu_starved_steps_the_ladder_and_holds_its_frame_rate_and_reds_when_nothing_moved() {
+fn the_wire_fps_is_the_reading_to_one_decimal() {
+    let src = std::fs::read_to_string(repo().join("crates/adapters/src/control_http.rs")).unwrap();
+    let mut pinned = 0;
+    for needle in [
+        ".map(|v| (v * 10.0).round() / 10.0)",
+        "if let Some(v) = fps_wire(measured.fps) {",
+        "put(\"fps\", v);",
+    ] {
+        assert_eq!(
+            src.matches(needle).count(),
+            1,
+            "control_http.rs no longer has `{needle}` once"
+        );
+        pinned += 1;
+    }
+    let mut checked = 0;
+    for (log, wire) in [(20.27, 20.3), (19.54, 19.5), (17.6, 17.6), (20.0, 20.0)] {
+        assert_eq!(fps_wire(log), wire, "{log}");
+        checked += 1;
+    }
+    eprintln!("producer lines pinned: {pinned}, CI pairs checked: {checked}");
+    assert_eq!((pinned, checked), (3, 4));
+}
+
+// The good run, and the alarm's own reds: each regression of the alarm, a product mutant, reds its
+// check by name, and the beats still read the truth.
+#[test]
+fn cpu_starved_passes_on_an_honest_beat_and_reds_on_each_alarm_regression() {
+    let w = cpu_starved(true, false, Felt::Honest);
+    assert_sim_alarm_is_the_products(&w);
+    let v = judge(&w, "cpu-starved", "", "cpu-good");
+    assert_pass(&v, "cpu-good");
+    let m = &v.json["measures"];
+    let (judged, wire) = (judged_beats(&w), judged_wire(&w));
+    eprintln!("cpu-good: beats judged in the window: {judged} logged, {wire} on the wire");
+    assert!(judged >= 1 && wire >= 1, "cpu-good judges no beat");
+    assert_eq!(m["fps_beats_read"]["checked"], judged, "cpu-good: {m}");
+    assert_eq!(m["fps_beats_read"]["reason"], Value::Null, "cpu-good: {m}");
+    assert_eq!(m["beats_below_floor"]["above"], 0, "cpu-good: {m}");
+    assert_eq!(m["wire_below_floor"]["checked"], wire, "cpu-good: {m}");
+    assert_eq!(m["wire_below_floor"]["above"], 0, "cpu-good: {m}");
+    assert_eq!(m["wire_agrees_with_log"]["checked"], judged, "cpu-good: {m}");
+    assert_eq!(m["starvation_applied"]["applied"], true, "cpu-good: {m}");
+    assert_eq!(m["ladder_justified"]["stepped"], 0, "cpu-good: {m}");
+    // The recovery is judged past the catch-up: on the beats whose window lies after the quota.
+    let after = m["alarm_cleared"]["after"].as_array().unwrap();
+    assert!(!after.is_empty(), "cpu-good: {m}");
+    // The clock is measured with its samples (the owner, 2026-10-25, "A"): the window's frames, the
+    // recording's, and the score changes due.
+    assert!(m["window_fps"]["frames"].as_u64() >= Some(1), "cpu-good: {m}");
+    assert!(m["pts_gaps"]["frames"].as_u64() >= Some(2), "cpu-good: {m}");
+    assert!(
+        m["scheduled_changes_shown"]["due"].as_u64() >= Some(1),
+        "cpu-good: {m}"
+    );
+    // A healthy beat a few frames short after the clear (0.1 under the recovered level, over the
+    // floor: a 5 s window three frames short) is no re-raise, so no red: the product raises only
+    // under the floor (the coordinator, medium, 2026-10-25, on #77's confirm pass).
+    let (floor, recovered) = (level(&w, "output_fps_floor"), level(&w, "output_fps_recovered"));
+    assert!(
+        floor < recovered - 0.1,
+        "the dip lies between the floor and the recovered level"
+    );
+    let dip = cpu_starved_shaped(true, false, Felt::Honest, AlarmIs::Declared, Shape::HealthyDip);
+    let v = judge(&dip, "cpu-starved", "", "cpu-healthy-dip");
+    assert_pass(&v, "cpu-healthy-dip");
+    let c = &v.json["measures"]["alarm_cleared"];
+    let after: Vec<f64> = c["after"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_f64)
+        .collect();
+    eprintln!("cpu-healthy-dip: the recovery's beats {after:?} against {floor} and {recovered}");
+    assert!(
+        after.iter().any(|&f| f >= floor && f < recovered),
+        "cpu-healthy-dip: the dip is not among the judged beats: {c}"
+    );
+    assert!(after.iter().any(|&f| f >= recovered), "cpu-healthy-dip: {c}");
+    assert_eq!(
+        v.json["measures"]["alarm_raised"]["raises"], 1,
+        "cpu-healthy-dip: the product does not re-raise over the floor"
+    );
+    let mut checked = 0;
+    for (tag, alarm, shape, check) in [
+        (
+            "cpu-never-raised",
+            AlarmIs::NeverRaised,
+            Shape::Quota,
+            "alarm_raised",
+        ),
+        (
+            "cpu-false-raise",
+            AlarmIs::FalseRaise,
+            Shape::Quota,
+            "alarm_raised",
+        ),
+        (
+            "cpu-startup-dip",
+            AlarmIs::Declared,
+            Shape::StartupDip,
+            "alarm_raised",
+        ),
+        (
+            "cpu-raised-late",
+            AlarmIs::RaisedLate,
+            Shape::Quota,
+            "alarm_raised",
+        ),
+        (
+            "cpu-never-cleared",
+            AlarmIs::NeverCleared,
+            Shape::Quota,
+            "alarm_cleared",
+        ),
+        (
+            "cpu-clears-early",
+            AlarmIs::ClearsEarly,
+            Shape::Quota,
+            "alarm_cleared",
+        ),
+        (
+            "cpu-clears-at-floor",
+            AlarmIs::ClearsAtFloor,
+            Shape::Quota,
+            "alarm_cleared",
+        ),
+        (
+            "cpu-clears-late",
+            AlarmIs::ClearsLate,
+            Shape::Quota,
+            "alarm_cleared",
+        ),
+        (
+            "cpu-sags-after",
+            AlarmIs::Declared,
+            Shape::SagsAfter,
+            "alarm_cleared",
+        ),
+    ] {
+        let w = cpu_starved_shaped(true, false, Felt::Honest, alarm, shape);
+        let v = judge(&w, "cpu-starved", "", tag);
+        assert_fails(&v, check, tag);
+        // Each is the alarm's own red, or the recovery's: the judged beats still read the truth on
+        // both writers.
+        let failed = failed_checks(&v);
+        for honest in ["beats_below_floor", "wire_below_floor", "wire_agrees_with_log"] {
+            assert!(!failed.contains(&json!(honest)), "{tag}: {failed:?}");
+        }
+        checked += 1;
+    }
+    eprintln!("cpu-starved alarm regressions checked: {checked}");
+    assert_eq!(checked, 9);
+    // The sag is a re-raise: 0.1 under the floor, inside the judged beats.
+    let sag = cpu_starved_shaped(true, false, Felt::Honest, AlarmIs::Declared, Shape::SagsAfter);
+    let v = judge(&sag, "cpu-starved", "", "cpu-sags-after");
+    let c = &v.json["measures"]["alarm_cleared"];
+    assert!(
+        c["after"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_f64)
+            .any(|f| f < floor),
+        "cpu-sags-after: the sag is not among the judged beats: {c}"
+    );
+    assert!(
+        v.json["measures"]["alarm_raised"]["raises"].as_u64() >= Some(2),
+        "cpu-sags-after: the product re-raises under the floor"
+    );
+    // The startup dip is the product's own alarm on a reading under the floor before the quota (its
+    // raise is the run's first), and the run's last raise is the starvation's: the verdict reads
+    // the first.
+    let w = cpu_starved_shaped(true, false, Felt::Honest, AlarmIs::Declared, Shape::StartupDip);
+    let v = judge(&w, "cpu-starved", "", "cpu-startup-dip");
+    let r = &v.json["measures"]["alarm_raised"];
+    assert!(r["raises"].as_u64() >= Some(2), "cpu-startup-dip: {r}");
+    assert!(
+        matches!(r["raise_from_stress_ms"].as_i64(), Some(x) if x < 0),
+        "cpu-startup-dip: {r}"
+    );
+    // No beat whose window lies after the quota inside realtime_after's window (the log's beats
+    // there lost): a recovery read on no beat is none.
+    let mut w = cpu_starved(true, false, Felt::Honest);
+    let (hb, b) = (w.ms("heartbeat_interval_ms"), w.at(60.0));
+    w.log.retain(|(t, m)| !(m.starts_with(BEAT_LINE) && *t >= b + hb));
+    let v = judge(&w, "cpu-starved", "", "cpu-no-after");
+    assert_fails(&v, "alarm_cleared", "cpu-no-after");
+    assert_eq!(
+        v.json["measures"]["alarm_cleared"]["after"],
+        json!([]),
+        "cpu-no-after"
+    );
+}
+
+// The beat's own reds, on either of its writers: a beat that never reads the starvation (F-024's),
+// on both or on the wire alone; a wire that disagrees with the log or is missing; one judged beat at
+// the full rate; a beat read nowhere (anti-vacuity, each reason named); and levels not the profile's.
+#[test]
+fn cpu_starved_reds_when_the_beat_lies_on_either_writer_or_is_missing() {
+    // F-024's beat: the quota felt, every beat at the profile's rate on both writers, so no alarm.
+    let v = judge(
+        &cpu_starved(true, false, Felt::Lying),
+        "cpu-starved",
+        "",
+        "cpu-lying",
+    );
+    for check in ["beats_below_floor", "wire_below_floor", "alarm_raised"] {
+        assert_fails(&v, check, "cpu-lying");
+    }
+    assert_eq!(
+        v.json["measures"]["starvation_applied"]["applied"], true,
+        "cpu-lying: the drive was felt"
+    );
+    let mut checked = 1;
+    // The wire's own regressions, the log honest: F-024 on the wire alone (the web and the organiser
+    // see the profile's rate), a wire a frame per second under the log, one judged beat with no
+    // `fps`, and no `fps` at all.
+    let base = cpu_starved(true, false, Felt::Honest);
+    let rate = 1_000.0 / level(&base, "frame_period_ms");
+    let (a, b) = (base.at(20.0) + base.ms("heartbeat_interval_ms"), base.at(60.0));
+    let (live, end) = (base.live, base.end);
+    let first = base
+        .beats
+        .iter()
+        .find(|(t, x)| *t >= a && *t <= b && x["fps"].is_number())
+        .map(|x| x.0)
+        .unwrap();
+    for (tag, fails, passes) in [
+        (
+            "cpu-wire-lies",
+            &["wire_below_floor", "wire_agrees_with_log"][..],
+            &["beats_below_floor", "alarm_raised"][..],
+        ),
+        (
+            "cpu-wire-offset",
+            &["wire_agrees_with_log"][..],
+            &["wire_below_floor", "beats_below_floor"][..],
+        ),
+        (
+            "cpu-wire-missing-one",
+            &["wire_agrees_with_log"][..],
+            &["wire_below_floor", "beats_below_floor"][..],
+        ),
+        (
+            "cpu-no-wire",
+            &["wire_below_floor", "wire_agrees_with_log"][..],
+            &["beats_below_floor", "fps_beats_read"][..],
+        ),
+    ] {
+        let mut w = cpu_starved(true, false, Felt::Honest);
+        match tag {
+            "cpu-wire-lies" => w.beats_in(live, end + 1, |x| {
+                if x["fps"].is_number() {
+                    x["fps"] = json!(rate);
+                }
+            }),
+            "cpu-wire-offset" => w.beats_in(live, end + 1, |x| {
+                if let Some(f) = x["fps"].as_f64() {
+                    x["fps"] = json!(fps_wire(f - 1.0));
+                }
+            }),
+            "cpu-wire-missing-one" => w.beats_in(first, first + 1, |x| {
+                x.as_object_mut().unwrap().remove("fps");
+            }),
+            _ => w.beats_in(live, end + 1, |x| {
+                x.as_object_mut().unwrap().remove("fps");
+            }),
+        }
+        let v = judge(&w, "cpu-starved", "", tag);
+        for check in fails {
+            assert_fails(&v, check, tag);
+        }
+        let failed = failed_checks(&v);
+        for check in passes {
+            assert!(!failed.contains(&json!(check)), "{tag}: {failed:?}");
+        }
+        checked += 1;
+    }
+    // One judged beat at the full rate among starved ones, on both writers: "every judged beat"
+    // means every one.
+    let w = cpu_starved_shaped(true, false, Felt::Honest, AlarmIs::Declared, Shape::OneFull);
+    let v = judge(&w, "cpu-starved", "", "cpu-one-full");
+    for check in ["beats_below_floor", "wire_below_floor"] {
+        assert_fails(&v, check, "cpu-one-full");
+    }
+    let m = &v.json["measures"];
+    assert_eq!(m["beats_below_floor"]["above"], 1, "cpu-one-full: {m}");
+    assert_eq!(m["wire_below_floor"]["above"], 1, "cpu-one-full: {m}");
+    assert!(
+        m["beats_below_floor"]["checked"].as_u64() >= Some(2),
+        "cpu-one-full: {m}"
+    );
+    checked += 1;
+    // No beat read: none logged, none in the window, the window's marks lost, or a report from a
+    // checker older than the honest beat. Each is a FAIL with its reason, and 0 checked.
+    for (tag, reason) in [
+        ("cpu-no-beats", "no `output fps beat=` line in the log"),
+        ("cpu-no-window-beats", "no beat inside the starvation window"),
+        (
+            "cpu-old-report",
+            "the report has no output_fps (a checker older than the honest beat)",
+        ),
+    ] {
+        let mut w = cpu_starved(true, false, Felt::Honest);
+        match tag {
+            "cpu-no-beats" => w.log.retain(|(_, m)| !m.starts_with(BEAT_LINE)),
+            "cpu-no-window-beats" => w
+                .log
+                .retain(|(t, m)| !(m.starts_with(BEAT_LINE) && *t >= a && *t <= b)),
+            _ => {
+                w.report_patch = Some(|r| {
+                    r["log"].as_object_mut().unwrap().remove("output_fps");
+                });
+            }
+        }
+        let v = judge(&w, "cpu-starved", "", tag);
+        for check in ["fps_beats_read", "beats_below_floor", "wire_agrees_with_log"] {
+            assert_fails(&v, check, tag);
+        }
+        if tag != "cpu-no-window-beats" {
+            assert_fails(&v, "beat_levels_known", tag);
+        }
+        let shown = &v.json["measures"]["fps_beats_read"];
+        assert_eq!(shown["reason"], reason, "{tag}: {shown}");
+        assert_eq!(shown["checked"], 0, "{tag}: {shown}");
+        checked += 1;
+    }
+    // The log's levels are the profile's (P720, the fixture's session): a floor or a recovered
+    // level from another profile (25 fps) is a red by name, never judged against 720p30's.
+    let floor = level(&base, "output_fps_floor");
+    let recovered = level(&base, "output_fps_recovered");
+    for (tag, from, to) in [
+        (
+            "cpu-other-floor",
+            format!(" floor={floor:.2}"),
+            format!(" floor={:.2}", floor * 25.0 / rate),
+        ),
+        (
+            "cpu-other-recovered",
+            format!(" recovered={recovered:.2}"),
+            format!(" recovered={:.2}", recovered * 25.0 / rate),
+        ),
+    ] {
+        let mut w = cpu_starved(true, false, Felt::Honest);
+        let mut n = 0;
+        for (_, m) in &mut w.log {
+            if m.contains(&from) {
+                *m = m.replace(&from, &to);
+                n += 1;
+            }
+        }
+        assert!(n >= 1, "{tag}: no line carried `{from}`");
+        let v = judge(&w, "cpu-starved", "", tag);
+        assert_fails(&v, "beat_levels_known", tag);
+        checked += 1;
+    }
+    eprintln!("cpu-starved beat reds checked: {checked}");
+    assert_eq!(checked, 11);
+}
+
+// The ladder's logic is unchanged (the owner's ruling, no ladder change; the coordinator, medium,
+// 2026-10-25, on the PR #77 review's I3): a step its own trigger justifies passes, a step without
+// the overruns its rule needs is a red, and C05's rungs and bottom still hold.
+#[test]
+fn cpu_starved_judges_the_ladder_by_its_own_rule() {
+    // A step with its overruns counted: the unchanged C09 rule at work. The whole verdict passes.
     let v = judge(
         &cpu_starved(true, false, Felt::Step),
         "cpu-starved",
         "",
-        "cpu-good",
+        "cpu-step",
     );
-    assert_pass(&v, "cpu-good");
-    assert_eq!(
-        v.json["measures"]["starvation_applied"]["applied"], true,
-        "cpu-good"
-    );
-    // A ladder that steps inside its 1 s window keeps every beat at realtime and the clock whole:
-    // the overruns it counted are the starvation's witness, and the case passes.
+    assert_pass(&v, "cpu-step");
+    let l = &v.json["measures"]["ladder_justified"];
+    let needs = cpu_starved(true, false, Felt::Step).ms("ladder_overruns_to_step");
+    assert!(l["stepped"].as_u64() > Some(0), "cpu-step: {l}");
+    assert!(l["step_rise"].as_i64() >= Some(needs), "cpu-step: {l}");
+    let mut checked = 1;
+    // A step with no overrun counted, and one with one fewer than the rule needs.
+    let mut unjustified = cpu_starved(true, false, Felt::Step);
+    let (a, end) = (unjustified.at(20.0), unjustified.end);
+    unjustified.beats_in(a + 1_000, end + 1, move |x| x["droppedFrames"] = json!(needs - 1));
+    for (tag, w) in [
+        ("cpu-uncounted", cpu_starved(true, false, Felt::Uncounted)),
+        ("cpu-unjustified", unjustified),
+    ] {
+        let v = judge(&w, "cpu-starved", "", tag);
+        assert_fails(&v, "ladder_justified", tag);
+        let l = &v.json["measures"]["ladder_justified"];
+        assert!(
+            matches!(l["step_rise"].as_i64(), Some(r) if r < needs),
+            "{tag}: {l}"
+        );
+        checked += 1;
+    }
+    // A step, then back to full: C05's bottom does not hold, though the step was justified.
     let v = judge(
-        &cpu_starved(true, false, Felt::Absorbed),
+        &cpu_starved(true, true, Felt::Step),
         "cpu-starved",
         "",
-        "cpu-absorbed",
+        "cpu-climbs",
     );
-    assert_pass(&v, "cpu-absorbed");
-    assert_eq!(
-        v.json["measures"]["starvation_applied"]["min_encoder_speed"], 1.0,
-        "cpu-absorbed"
+    assert_fails(&v, "rung_holds", "cpu-climbs");
+    assert!(
+        !failed_checks(&v).contains(&json!("ladder_justified")),
+        "cpu-climbs: {:?}",
+        failed_checks(&v)
     );
-    let w = cpu_starved(false, false, Felt::Step);
+    checked += 1;
+    // A rung C05 retired (FastPreset), its step justified: not a rung the ladder knows.
+    let mut w = cpu_starved(true, false, Felt::Step);
+    let (live, end) = (w.live, w.end);
+    w.beats_in(live, end + 1, |x| {
+        if x["rung"] == "overlay_half_rate" {
+            x["rung"] = json!("fast_preset");
+        }
+    });
+    let v = judge(&w, "cpu-starved", "", "cpu-unknown-rung");
+    assert_fails(&v, "rungs_known", "cpu-unknown-rung");
+    assert!(
+        !failed_checks(&v).contains(&json!("ladder_justified")),
+        "cpu-unknown-rung: {:?}",
+        failed_checks(&v)
+    );
+    checked += 1;
+    // No beat carried a rung: the ladder read nowhere is no proof it followed its rule.
+    let mut w = cpu_starved(true, false, Felt::Honest);
+    w.beats_in(live, end + 1, |x| {
+        x.as_object_mut().unwrap().remove("rung");
+    });
+    let v = judge(&w, "cpu-starved", "", "cpu-no-rung");
+    assert_fails(&v, "ladder_justified", "cpu-no-rung");
+    assert_fails(&v, "rungs_known", "cpu-no-rung");
+    checked += 1;
+    eprintln!("cpu-starved ladder cases checked: {checked}");
+    assert_eq!(checked, 6);
+}
+
+// The drive's own reds (the quota not held, not restored, never set), the drive's witness, and the
+// clock: CI's world under the honest beat, its clock measured (the owner, 2026-10-25, "A").
+#[test]
+fn cpu_starved_reds_on_its_drive_and_measures_a_lost_clock() {
+    let w = cpu_starved(false, false, Felt::Honest);
     assert_fails(
         &judge(&w, "cpu-starved", "", "cpu-notdone"),
         "stress_ran",
@@ -2234,14 +2913,14 @@ fn cpu_starved_steps_the_ladder_and_holds_its_frame_rate_and_reds_when_nothing_m
             w.marks.iter_mut().find(|m| m.0 == "stress_done").unwrap().2["cpus"] = json!(1.05);
         }),
     ] {
-        let mut w = cpu_starved(true, false, Felt::Step);
+        let mut w = cpu_starved(true, false, Felt::Honest);
         edit(&mut w);
         assert_fails(&judge(&w, "cpu-starved", "", tag), "stress_ran", tag);
         checked += 1;
     }
     assert_eq!(checked, 3);
     // The drive could not read the demand: no quota, the refusal shown.
-    let mut w = cpu_starved(false, false, Felt::Step);
+    let mut w = cpu_starved(false, false, Felt::Honest);
     w.marks.retain(|m| m.0 != "stress");
     let at = w.at(20.0);
     w.mark(
@@ -2257,24 +2936,25 @@ fn cpu_starved_steps_the_ladder_and_holds_its_frame_rate_and_reds_when_nothing_m
         "cpu-refused"
     );
     // A window with no start (an out/ that lost the `stress` mark): no window, so nothing in it was
-    // starved, whatever the beats before its end read.
-    let mut w = cpu_starved(true, false, Felt::Step);
+    // starved, whatever the beats before its end read, and no beat is judged in it.
+    let mut w = cpu_starved(true, false, Felt::Honest);
     w.marks.retain(|m| m.0 != "stress");
     let v = judge(&w, "cpu-starved", "", "cpu-nostart");
     assert_fails(&v, "starvation_applied", "cpu-nostart");
+    assert_fails(&v, "fps_beats_read", "cpu-nostart");
     assert_eq!(
         v.json["measures"]["starvation_applied"]["applied"], false,
         "cpu-nostart"
     );
-    let w = cpu_starved(true, true, Felt::Step);
-    assert_fails(
-        &judge(&w, "cpu-starved", "", "cpu-climbs"),
-        "rung_holds",
-        "cpu-climbs",
+    // The reason names the lost mark, not an empty window (the PR #77 review's m6).
+    assert_eq!(
+        v.json["measures"]["fps_beats_read"]["reason"],
+        "no quota window: a `stress` or `stress_done` mark is missing",
+        "cpu-nostart"
     );
     // CI's first build: the stress never reached the compositor (the PR #52 review's I3). The
-    // re-review's I-4: that is the drive's own red (`starvation_applied`), and `ladder_moved` is
-    // never judged a pass on a window nothing starved.
+    // re-review's I-4: that is the drive's own red (`starvation_applied`), and no Owed row explains
+    // it.
     let v = judge(
         &cpu_starved(true, false, Felt::No),
         "cpu-starved",
@@ -2282,12 +2962,11 @@ fn cpu_starved_steps_the_ladder_and_holds_its_frame_rate_and_reds_when_nothing_m
         "cpu-unfelt",
     );
     assert_fails(&v, "starvation_applied", "cpu-unfelt");
-    assert_fails(&v, "ladder_moved", "cpu-unfelt");
-    assert_eq!(v.json["measures"]["ladder_moved"]["starved"], false, "cpu-unfelt");
-    // The window's frame rate alone says starved (2 s of the 40 lost, encoderSpeed 1.0 throughout).
+    // The window's frame rate alone says starved: 4 s of the 40 lost (27 fps, under the floor),
+    // encoderSpeed 1.0 throughout. The recording's clock did not hold either: measured, under the bar.
     let mut w = cpu_starved(true, false, Felt::No);
     let a = w.at(30.0);
-    w.outages.push((a, a + 2_000));
+    w.outages.push((a, a + 4_000));
     let v = judge(&w, "cpu-starved", "", "cpu-fps-only");
     assert!(
         !v.json["failed"]
@@ -2297,26 +2976,175 @@ fn cpu_starved_steps_the_ladder_and_holds_its_frame_rate_and_reds_when_nothing_m
         "cpu-fps-only: {:?}",
         v.json["measures"]["starvation_applied"]
     );
-    assert_fails(&v, "window_fps", "cpu-fps-only");
-    // Owed 86 as CI read it: starved (one beat's encoderSpeed 0.90), the ladder never moved. The
-    // measures carry what Owed 86's signature reads (chaos.json): starved, no rise, no step.
-    let v = judge(
-        &cpu_starved(true, false, Felt::Unread),
+    let fps = v.json["measures"]["window_fps"]["fps"].as_f64();
+    let bar = level(&w, "budget_fps_mean_min");
+    assert!(
+        fps.is_some_and(|f| f < bar),
+        "cpu-fps-only: {fps:?} against {bar}"
+    );
+    // 1 s of the 40 lost (29.25 fps): over the beat's floor, under the recording's mean bar. The
+    // witness reads the beat's floor (OutputProfile::P720.fps_floor(), the PR #69 review's m1), so
+    // the product's own reading says this window was not starved: the drive's red, no Owed row's.
+    let mut w = cpu_starved(true, false, Felt::No);
+    let a = w.at(30.0);
+    w.outages.push((a, a + 1_000));
+    let v = judge(&w, "cpu-starved", "", "cpu-fps-near");
+    let s = &v.json["measures"]["starvation_applied"];
+    let (floor, bar) = (level(&w, "output_fps_floor"), level(&w, "budget_fps_mean_min"));
+    let fps = s["window_fps"].as_f64().expect("cpu-fps-near: a window rate");
+    assert!(
+        floor < fps && fps < bar,
+        "cpu-fps-near: {fps} between the floor {floor} and the bar {bar}"
+    );
+    assert_eq!(s["fps_floor"].as_f64(), Some(floor), "cpu-fps-near: {s}");
+    assert_fails(&v, "starvation_applied", "cpu-fps-near");
+    // CI's world under the honest beat (run 40143263604): the beat, the wire, the alarm and the
+    // ladder told the truth, and the recording lost frames in the window (its rate under the bar,
+    // score changes never shown, PTS gaps). Since the owner's ruling (2026-10-25, "A") case 6
+    // measures the clock: the case passes, and the three values are shown, in its log and in
+    // run-chaos.sh's table (the case's key measure).
+    let lost = cpu_clock_lost();
+    let v = judge(&lost, "cpu-starved", "", "cpu-clock-lost");
+    assert_pass(&v, "cpu-clock-lost");
+    let m = &v.json["measures"];
+    let bar = level(&lost, "budget_fps_mean_min");
+    let fps = m["window_fps"]["fps"].as_f64();
+    assert!(fps.is_some_and(|f| f < bar), "cpu-clock-lost: {m}");
+    assert!(m["pts_gaps"]["gaps"].as_u64() >= Some(1), "cpu-clock-lost: {m}");
+    let unshown = m["scheduled_changes_shown"]["missing"].as_array().unwrap().len();
+    let due = m["scheduled_changes_shown"]["due"].as_u64().unwrap();
+    eprintln!("cpu-clock-lost: {fps:?} fps against {bar}, {unshown} of {due} changes unshown");
+    assert!(unshown >= 3, "cpu-clock-lost: {m}");
+    assert_eq!(v.json["key"], "clock_measured", "cpu-clock-lost");
+    let key = &m["clock_measured"];
+    assert_eq!(key["unshown"], unshown, "cpu-clock-lost: {key}");
+    assert_eq!(key["due"], due, "cpu-clock-lost: {key}");
+    assert_eq!(key["pts_gaps"], m["pts_gaps"]["gaps"], "cpu-clock-lost: {key}");
+    assert!(
+        key["fps"].as_f64().is_some_and(|f| f < bar),
+        "cpu-clock-lost: {key}"
+    );
+    // The same recording judged by a case that keeps its clock check: input-impaired's pts_gaps, the
+    // predicate case 6 judged before the ruling, still reds on it. No other case judges window_fps,
+    // and cef-gpu-deaths and cef-leaks judge their own scheduled windows (after the last kill, the
+    // leak), so pts_gaps is the shared witness.
+    let v = judge(&lost, "input-impaired", "", "impaired-clock-lost");
+    assert_fails(&v, "pts_gaps", "impaired-clock-lost");
+    // A clock read on nothing is a red: no window (the quota never put back), no recording, no score
+    // change scheduled after the quota, and a recording of one frame (a gap is between two; the
+    // frame overlaid and late, so changes are due and only the frame count reds).
+    let mut checked = 0;
+    for (tag, edit) in [
+        (
+            "cpu-clock-nowindow",
+            (|w: &mut World| w.marks.retain(|m| m.0 != "stress_done")) as fn(&mut World),
+        ),
+        ("cpu-clock-norecording", |w: &mut World| {
+            w.report_patch = Some(|r| r["frames_table"] = json!([]));
+        }),
+        ("cpu-clock-nochanges", |w: &mut World| w.score_offsets.clear()),
+        ("cpu-clock-oneframe", |w: &mut World| {
+            w.report_patch = Some(|r| {
+                let last = r["frames_table"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|f| !f[2].is_null())
+                    .cloned()
+                    .unwrap();
+                r["frames_table"] = json!([last]);
+            });
+        }),
+    ] {
+        let mut w = cpu_starved(true, false, Felt::Honest);
+        edit(&mut w);
+        let v = judge(&w, "cpu-starved", "", tag);
+        assert_fails(&v, "clock_measured", tag);
+        if tag == "cpu-clock-oneframe" {
+            let m = &v.json["measures"];
+            assert_eq!(m["pts_gaps"]["frames"], 1, "{tag}: {m}");
+            assert!(
+                m["scheduled_changes_shown"]["due"].as_u64() >= Some(1),
+                "{tag}: {m}"
+            );
+        }
+        checked += 1;
+    }
+    eprintln!("cpu-starved unsampled clocks checked: {checked}");
+    assert_eq!(checked, 4);
+}
+
+// A page that goes off air after the quota (Owed 96, PR #79's finding): the changes due are bounded
+// by the last PROGRAMME frame, not by the last frame whose overlay read, so the changes the page
+// never showed are measured missing, not dropped from the due set. Each expected index comes from
+// the world's own schedule (the timeline's `at` plus its delay), never from the verdict.
+#[test]
+fn cpu_starved_counts_the_changes_due_after_the_page_goes_off_air() {
+    let on_air = judge(
+        &cpu_starved(true, false, Felt::Honest),
         "cpu-starved",
         "",
-        "cpu-owed86",
+        "cpu-on-air",
     );
-    assert_fails(&v, "ladder_moved", "cpu-owed86");
-    let m = &v.json["measures"];
-    assert_eq!(m["starvation_applied"]["applied"], true, "cpu-owed86: {m}");
-    assert_eq!(m["ladder_moved"]["dropped_rise"], 0, "cpu-owed86: {m}");
-    assert_eq!(m["ladder_moved"]["half_rate_beats"], 0, "cpu-owed86: {m}");
-    // Each half of `ladder_moved` alone: overruns enough for a step and no step, then a step with no
-    // overrun counted.
-    for (tag, felt) in [("cpu-nostep", Felt::Drops), ("cpu-uncounted", Felt::Uncounted)] {
-        let w = cpu_starved(true, false, felt);
-        assert_fails(&judge(&w, "cpu-starved", "", tag), "ladder_moved", tag);
-    }
+    assert_pass(&on_air, "cpu-on-air");
+    let shown = &on_air.json["measures"]["scheduled_changes_shown"];
+    assert_eq!(shown["missing"], json!([]), "cpu-on-air: {shown}");
+    let mut w = cpu_starved(true, false, Felt::Honest);
+    let done = w
+        .marks
+        .iter()
+        .find(|m| m.0 == "stress_done")
+        .map(|m| m.1)
+        .unwrap();
+    let delay = w.delay_ms;
+    let due: Vec<(u16, i64)> = w
+        .timeline_events()
+        .iter()
+        .map(|&(i, at)| (i, at + delay))
+        .collect();
+    // The first change due a second past the quota with half a second clear before it; the page
+    // goes off air 50 ms before it is due, so every change before it was shown and none from it on.
+    let k = (0..due.len())
+        .find(|&j| due[j].1 > done + 1_000 && (j == 0 || due[j].1 - due[j - 1].1 > 500))
+        .expect("a change due after the quota with a gap before it");
+    let off = due[k].1 - 50;
+    // The guard on the programme's last frame: no change is due in its last second, so "due by the
+    // last frame less the frame-to-encoder lag" cannot turn on a frame's phase.
+    let tail = w.end - 1_000;
+    assert!(
+        due.iter().all(|&(_, d)| d <= tail || d > w.end),
+        "a change is due in the programme's last second: {due:?}"
+    );
+    w.overlay_none.push((off, w.end + 1_000));
+    let v = judge(&w, "cpu-starved", "", "cpu-off-air-later");
+    let expected: Vec<u16> = due[k..]
+        .iter()
+        .filter(|&&(_, d)| d <= tail)
+        .map(|&(i, _)| i)
+        .collect();
+    let m = &v.json["measures"]["scheduled_changes_shown"];
+    eprintln!(
+        "cpu-off-air-later: off air {} ms after the quota, {} changes unshown of {} due",
+        off - done,
+        expected.len(),
+        m["due"]
+    );
+    assert!(!expected.is_empty(), "no change due after the page went off air");
+    assert!(m["due"].as_u64() >= Some(expected.len() as u64), "{m}");
+    assert_eq!(m["missing"], json!(expected), "cpu-off-air-later: {m}");
+    assert_eq!(
+        v.json["measures"]["clock_measured"]["unshown"],
+        expected.len(),
+        "cpu-off-air-later: the key measure"
+    );
+    // Off air is still case 6's red, by its own check; the clock is measured, not judged.
+    assert_fails(&v, "score_on_air", "cpu-off-air-later");
+    assert!(
+        !failed_checks(&v).contains(&json!("clock_measured")),
+        "cpu-off-air-later: {:?}",
+        failed_checks(&v)
+    );
 }
 
 fn score_down(page_says: bool, overlay_drops: bool) -> World {

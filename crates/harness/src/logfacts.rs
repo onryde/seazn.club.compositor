@@ -16,6 +16,9 @@
 //!   `programme started`; and `app::driver`'s `sink swap reason=<r> gen=<g>` just before the swap
 //!   line (Owed 87, PR #57);
 //! - `adapters::gst_output`: `output gen=<g> error: <text>` (a sink's bus error);
+//! - `app::driver` (Owed 86, the honest beat): `output fps beat=<fps> floor=<floor>` each beat, and
+//!   the starvation alarm's `output starvation alarm raised fps=<fps> floor=<floor>` and
+//!   `output starvation alarm cleared fps=<fps> recovered=<level>` (C14 case 6);
 //! - `compositor::wiring` and `main`: `compositor started drivers=…` (a boot), `exit code=<n>`;
 //! - C11's dispatcher: `gen=<g>: page console: hang starts` (the harness page's hang, its own line)
 //!   and `gen=<g>: score stale=<true|false>`;
@@ -188,6 +191,17 @@ pub struct TeardownLeak {
     pub leaked: u64,
 }
 
+/// One of Owed 86's honest-beat lines (`app::driver`, the beat's `SendHeartbeat`): `fps` the
+/// programme's real output rate over the beat window, `level` the line's floor (`output fps beat=`,
+/// `output starvation alarm raised`) or its recovered level (`output starvation alarm cleared`), each
+/// as the driver prints it (`{:.2}`).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+pub struct FpsLine {
+    pub at_ms: i64,
+    pub fps: f64,
+    pub level: f64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct Stale {
     pub at_ms: i64,
@@ -208,8 +222,8 @@ pub struct Killed {
     pub status: i64,
 }
 
-/// The log's facts, in log order.
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+/// The log's facts, in log order. (`PartialEq` only: the honest beat's rates are `f64`.)
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct LogFacts {
     pub lines: u64,
     /// Lines with a docker stamp (a log read without `--timestamps` has none).
@@ -238,6 +252,13 @@ pub struct LogFacts {
     /// the sink's publish was accepted, so it sends from here (case 17's measure, the PR #65
     /// review's m-4: a publish under a trickle is Owed 88's write-stall path).
     pub sink_publishes: Vec<GenAt>,
+    /// `output fps beat=<fps> floor=<floor>` (Owed 86, the honest beat): each beat's real output rate
+    /// and the floor it was judged against (case 6).
+    pub output_fps: Vec<FpsLine>,
+    /// `output starvation alarm raised fps=<fps> floor=<floor>`: the beat that raised the alarm.
+    pub starvation_raised: Vec<FpsLine>,
+    /// `output starvation alarm cleared fps=<fps> recovered=<level>`: the beat that cleared it.
+    pub starvation_cleared: Vec<FpsLine>,
     pub page_hangs: Vec<GenAt>,
     pub score_stale: Vec<Stale>,
     /// `gen=<g>: loading <origin>`: each build's load, so a case can tell the newest gen (case 16).
@@ -326,6 +347,25 @@ fn num(s: &str) -> Option<u64> {
         return None;
     }
     s.parse().ok()
+}
+
+/// A rate as `{:.2}` prints a finite, non-negative `f64`: digits, a point, digits (no sign, no
+/// exponent, no `NaN` or `inf`, which the driver never logs).
+fn decimal(s: &str) -> Option<f64> {
+    let (int, frac) = s.split_once('.')?;
+    num(int)?;
+    num(frac)?;
+    s.parse().ok()
+}
+
+/// `<prefix><fps><sep><level>`, the whole message: one of the honest beat's lines (Owed 86).
+fn fps_line(msg: &str, prefix: &str, sep: &str, at_ms: i64) -> Option<FpsLine> {
+    let (fps, level) = msg.strip_prefix(prefix)?.split_once(sep)?;
+    Some(FpsLine {
+        at_ms,
+        fps: decimal(fps)?,
+        level: decimal(level)?,
+    })
 }
 
 /// `[a, b]` as Rust's `{:?}` prints a `Vec<i32>` of pids; `[]` is empty.
@@ -496,6 +536,12 @@ pub fn log_facts(text: &str) -> LogFacts {
             f.output_errors.push(ga(g));
         } else if let Some(g) = sink_publish(m) {
             f.sink_publishes.push(ga(g));
+        } else if let Some(b) = fps_line(m, "output fps beat=", " floor=", at_ms) {
+            f.output_fps.push(b);
+        } else if let Some(r) = fps_line(m, "output starvation alarm raised fps=", " floor=", at_ms) {
+            f.starvation_raised.push(r);
+        } else if let Some(c) = fps_line(m, "output starvation alarm cleared fps=", " recovered=", at_ms) {
+            f.starvation_cleared.push(c);
         } else if let Some(code) = gen_after(m, "exit code=") {
             f.exits.push(Exit {
                 at_ms,
@@ -1136,6 +1182,77 @@ mod tests {
             "gst_output.rs's publish line changed: update `sink_publishes`"
         );
         eprintln!("log lines checked: {}, publishes read: {}", f.lines, read.len());
+    }
+
+    /// Owed 86's honest beat (`app::driver`'s `SendHeartbeat`): each beat's real output rate and the
+    /// starvation alarm's two changes, the lines case 6 judges. The lines are case 6's in CI (run
+    /// 40143263604: 30.00 before the quota, 20.46 on its first beat, 83.67 on the catch-up after it).
+    #[test]
+    fn the_honest_beat_lines_are_read_with_their_rates() {
+        let mut log = String::new();
+        let lines = [
+            (0, "output fps beat=30.00 floor=28.50"),
+            (5_033, "output fps beat=20.46 floor=28.50"),
+            (5_033, "output starvation alarm raised fps=20.46 floor=28.50"),
+            (45_167, "output fps beat=83.67 floor=28.50"),
+            (
+                45_167,
+                "output starvation alarm cleared fps=83.67 recovered=29.50",
+            ),
+            // Near misses: none is one of these facts.
+            (46_000, "output fps beat=NaN floor=28.50"),
+            (46_100, "output fps beat=inf floor=28.50"),
+            (46_200, "output fps beat=-1.00 floor=28.50"),
+            (46_300, "output fps beat=+2.00 floor=28.50"),
+            (46_400, "output fps beat=1e3 floor=28.50"),
+            (46_450, "output fps beat=2.5e1 floor=28.50"),
+            (46_500, "output fps beat=20 floor=28.50"),
+            (46_600, "output fps beat= floor=28.50"),
+            (46_700, "output fps beat=20.46 floor=28.50 extra=1"),
+            (46_750, "output fps beat=20.46 floor=NaN"),
+            (46_800, "output fps beat=20.46 recovered=29.50"),
+            (46_900, "output starvation alarm raised fps=20.46 recovered=29.50"),
+            (47_000, "output starvation alarm cleared fps=83.67 floor=28.50"),
+            (47_100, "output starvation alarm raised fps=20.46"),
+            (47_200, "gen=1: page console: output fps beat=20.46 floor=28.50"),
+            (47_300, "output fps beat=20.46. floor=28.50"),
+        ];
+        for (at, m) in lines {
+            log.push_str(&line(at, m));
+        }
+        let f = log_facts(&log);
+        let read = |v: &[FpsLine]| -> Vec<(i64, f64, f64)> {
+            v.iter().map(|l| (l.at_ms - NOON_MS, l.fps, l.level)).collect()
+        };
+        assert_eq!(
+            read(&f.output_fps),
+            vec![(0, 30.0, 28.5), (5_033, 20.46, 28.5), (45_167, 83.67, 28.5)]
+        );
+        assert_eq!(read(&f.starvation_raised), vec![(5_033, 20.46, 28.5)]);
+        assert_eq!(read(&f.starvation_cleared), vec![(45_167, 83.67, 29.5)]);
+        // The producer's own formats, each once, so the parser and the lines cannot drift apart
+        // unseen.
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../app/src/driver.rs"))
+            .expect("driver.rs");
+        let mut pinned = 0;
+        for producer in [
+            "\"output fps beat={fps:.2} floor={floor:.2}\"",
+            "\"output starvation alarm raised fps={fps:.2} floor={floor:.2}\"",
+            "\"output starvation alarm cleared fps={fps:.2} recovered={:.2}\"",
+        ] {
+            assert_eq!(
+                src.matches(producer).count(),
+                1,
+                "driver.rs's line changed: update logfacts ({producer})"
+            );
+            pinned += 1;
+        }
+        let facts = f.output_fps.len() + f.starvation_raised.len() + f.starvation_cleared.len();
+        eprintln!(
+            "log lines checked: {}, producers pinned: {pinned}, facts read: {facts}",
+            f.lines
+        );
+        assert_eq!(pinned, 3);
     }
 
     #[test]

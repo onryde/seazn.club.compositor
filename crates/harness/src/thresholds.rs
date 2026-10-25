@@ -168,6 +168,10 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     put("tick_widest_ms", json!(TICK_WIDEST_MS));
     put("chromium_gpu_deaths_abort", json!(CHROMIUM_GPU_DEATHS_ABORT));
     put("frame_period_ms", json!(OutputProfile::P720.frame_period_ms()));
+    // Owed 86's starvation alarm, for the same profile: raised by a beat below the floor, cleared by
+    // one at or above the recovered level (case 6, the honest beat).
+    put("output_fps_floor", json!(OutputProfile::P720.fps_floor()));
+    put("output_fps_recovered", json!(OutputProfile::P720.fps_recovered()));
     // C08's final-beat flush bound (an in-place restart's decision-to-exit part).
     put("final_beat_timeout_ms", json!(app::ports::FINAL_BEAT_TIMEOUT_MS));
     // The adapters'.
@@ -281,7 +285,19 @@ mod tests {
         for k in retired {
             assert!(v.get(k).is_none(), "{k} is still dumped");
         }
-        eprintln!("named fields checked: {}", pairs.len() + 4 + retired.len());
+        // Owed 86's honest beat: the starvation alarm's two levels for the harness session's profile
+        // (720p30, the fixture's), read from the profile's own declarations (case 6).
+        let levels = [
+            ("output_fps_floor", OutputProfile::P720.fps_floor()),
+            ("output_fps_recovered", OutputProfile::P720.fps_recovered()),
+        ];
+        for (k, want) in levels {
+            assert_eq!(v[k].as_f64(), Some(want), "{k}");
+        }
+        eprintln!(
+            "named fields checked: {}",
+            pairs.len() + 4 + retired.len() + levels.len()
+        );
     }
 
     // The brief: "Add a unit test that each budget is consistent with its threshold". A spike-driven

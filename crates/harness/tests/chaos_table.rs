@@ -293,16 +293,15 @@ fn the_table_reds_on_a_fail_an_error_a_missing_verdict_or_a_missed_sweep() {
     assert!(s.contains(&format!("worst outage_ms, cef-killed: {} over 3 runs", 7_000 + k)));
 
     let mut reds = 0;
+    // Case 6 owes nothing since the owner's ruling (2026-10-25, "A"): a red there is news.
     edit(&dir, "cpu-starved", |v| {
         v["status"] = json!("fail");
-        v["failed"] = json!(["ladder_moved"]);
-        v["measures"]["starvation_applied"] = json!({"applied": true});
-        v["measures"]["ladder_moved"] = json!({"dropped_rise": 0, "half_rate_beats": 0});
+        v["failed"] = json!(["alarm_raised"]);
     });
     let out = run(&["--table", d]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
-        stdout(&out).contains("| cpu-starved | FAIL | 4/4 | outage_ms | failed: ladder_moved (Owed 86) |")
+        stdout(&out).contains("| cpu-starved | FAIL | 4/4 | outage_ms | failed: alarm_raised (NOT OWED) |")
     );
     assert!(stdout(&out).contains("this run does not count"));
     reds += 1;
@@ -509,14 +508,13 @@ fn signature_holds(sig: &str, verdict: &Value) -> Option<bool> {
 /// would make an unexplained red look explained. And each row has a signature (the re-review's I-3) that compiles, is false
 /// on a verdict that measured nothing (absent evidence is no cause), and reads only measures the
 /// leg's case records (a signature over a measure no case writes could never hold).
-#[test]
-fn every_owed_entry_names_a_real_check_and_a_real_open_owed_row_with_a_signature() {
-    let m = manifest();
+/// These checks over manifest `m` and the Owed table `index`: (owed entries checked, signature
+/// reads checked). Panics on the first entry that fails one.
+fn owed_entries_checked(m: &Value, index: &str) -> (usize, usize) {
     let titles = m["owed_titles"].as_object().expect("chaos.json has owed_titles");
     let sigs = m["owed_signatures"]
         .as_object()
         .expect("chaos.json has owed_signatures");
-    let index = std::fs::read_to_string(repo().join("docs/_INDEX.md")).unwrap();
     let (mut checked, mut sig_reads) = (0, 0);
     for l in m["legs"].as_array().unwrap() {
         let case = l["case"].as_str().unwrap();
@@ -566,69 +564,76 @@ fn every_owed_entry_names_a_real_check_and_a_real_open_owed_row_with_a_signature
         }
         assert!(titles.contains_key(row), "Owed {row}'s signature has no title");
     }
-    eprintln!(
-        "owed entries checked: {checked}; signature reads checked: {sig_reads}; signatures: {}",
-        sigs.len()
-    );
-    assert!(checked >= 4, "Owed 86's known reds are listed ({checked})");
+    assert_eq!(sigs.len(), titles.len(), "a signature for every titled row");
     assert!(
         sig_reads >= checked,
         "every entry's signature reads a measure ({sig_reads})"
     );
-    assert_eq!(sigs.len(), titles.len(), "a signature for every titled row");
+    (checked, sig_reads)
 }
 
-/// What each signature reads true on, from the evidence CI's runs carried (the re-review's Q3 table)
-/// and false on that evidence's absence: the shapes the cases record (case_verdicts.rs pins those
-/// measures against the cases themselves).
 #[test]
-fn each_owed_signature_holds_on_its_causes_evidence_and_not_without_it() {
+fn every_owed_entry_names_a_real_check_and_a_real_open_owed_row_with_a_signature() {
+    // The committed manifest: no Owed row is open in chaos.json since Owed 86 left it by the owner's
+    // ruling (2026-10-25, "A": case 6's clock measured, not judged), as Owed 87 did (2026-10-24, "A").
+    // A new row's tags move this count.
     let m = manifest();
-    let sig = |r: &str| m["owed_signatures"][r].as_str().unwrap().to_owned();
+    let index = std::fs::read_to_string(repo().join("docs/_INDEX.md")).unwrap();
+    let (checked, sig_reads) = owed_entries_checked(&m, &index);
+    eprintln!("committed owed entries checked: {checked}; signature reads: {sig_reads}");
+    assert_eq!(
+        (checked, sig_reads),
+        (0, 0),
+        "an Owed row's tags are back in chaos.json: this test's committed count moves with them"
+    );
+    // The same checks over a probe entry, so the sweep is not read on nothing: case 6's alarm_raised
+    // owed to an open test row whose signature reads the case's own measure.
+    let mut probe = m.clone();
+    probe["owed_signatures"]["98"] = json!(".measures.alarm_raised.raises >= 1");
+    probe["owed_titles"]["98"] = json!("a probe row");
+    let mut legs = 0;
+    for l in probe["legs"].as_array_mut().unwrap() {
+        if l["case"] == "cpu-starved" {
+            l["owed"] = json!({"alarm_raised": "98"});
+            legs += 1;
+        }
+    }
+    assert_eq!(legs, 1, "case 6 is one leg of chaos.json");
+    let (checked, sig_reads) =
+        owed_entries_checked(&probe, "| 98 | a probe row, open | C14 | the coordinator |\n");
+    eprintln!("probe owed entries checked: {checked}; signature reads: {sig_reads}");
+    assert_eq!((checked, sig_reads), (1, 1));
+}
+
+/// The rows decided by a ruling left chaos.json with their tags, so a red on their old checks reads
+/// NOT OWED: Owed 87 (the owner, 2026-10-24, "A": the stall rule retired) and Owed 86 (the owner,
+/// 2026-10-25, "A": case 6's clock measured, not judged, under the induced starvation). No leg names
+/// either, and neither has a signature or a title.
+#[test]
+fn the_decided_owed_rows_left_chaos_json_with_their_tags() {
+    let m = manifest();
     let mut checked = 0;
-    for (row, holds, measures) in [
-        (
-            "86",
-            true,
-            json!({"starvation_applied": {"applied": true},
-            "ladder_moved": {"dropped_rise": 0, "half_rate_beats": 0}}),
-        ),
-        (
-            "86",
-            false,
-            json!({"starvation_applied": {"applied": false},
-            "ladder_moved": {"dropped_rise": 0, "half_rate_beats": 0}}),
-        ),
-        (
-            "86",
-            false,
-            json!({"starvation_applied": {"applied": true},
-            "ladder_moved": {"dropped_rise": 40, "half_rate_beats": 0}}),
-        ),
-        (
-            "86",
-            false,
-            json!({"starvation_applied": {"applied": true},
-            "ladder_moved": {"dropped_rise": 0, "half_rate_beats": 2}}),
-        ),
-    ] {
-        assert_eq!(
-            signature_holds(&sig(row), &json!({"measures": measures})),
-            Some(holds),
-            "Owed {row} on {measures}"
-        );
-        checked += 1;
+    for row in ["86", "87"] {
+        for map in ["owed_signatures", "owed_titles"] {
+            assert!(
+                m[map].get(row).is_none(),
+                "Owed {row} is still in chaos.json's {map}"
+            );
+            checked += 1;
+        }
+        for l in m["legs"].as_array().unwrap() {
+            let named = l
+                .get("owed")
+                .and_then(Value::as_object)
+                .is_some_and(|o| o.values().any(|r| rows_of(r).contains(&row.to_owned())));
+            assert!(!named, "{}: still owes Owed {row}", l["case"]);
+            checked += 1;
+        }
     }
-    eprintln!("signature cases checked: {checked}");
-    assert_eq!(checked, 4);
-    // Owed 87 is DECIDED (the owner, 2026-10-24, "A": the stall rule is retired): its signature and
-    // title left the map with its tags, so a red on its old checks reads NOT OWED.
-    for map in ["owed_signatures", "owed_titles"] {
-        assert!(
-            m[map].get("87").is_none(),
-            "Owed 87 is still in chaos.json's {map}"
-        );
-    }
+    let legs = m["legs"].as_array().unwrap().len();
+    eprintln!("decided-row absences checked: {checked} ({legs} legs)");
+    assert!(legs >= 1);
+    assert_eq!(checked, 2 * (2 + legs), "every map and leg read");
 }
 
 /// Case 17's `stall_swap` measure as CI's run 40121220366 left it (PR #65), in this branch's shape:
@@ -642,12 +647,26 @@ fn ci_rule() -> Value {
 
 /// A red table names each failed check's Owed row when that row's signature holds in the run, and
 /// says which reds no Owed row explains. No verdict is softened: an owed red is as red as any other,
-/// and the run never counts.
+/// and the run never counts. No row is open in chaos.json since Owed 86's ruling (the owner,
+/// 2026-10-25, "A"), so a copy of the manifest gives case 6's leg a probe row, 98, on three of its
+/// checks, its signature a measure of the run; the committed rows' reds read NOT OWED beside it.
 #[test]
 fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("chaos-table-owed");
     let d = dir.to_str().unwrap();
-    let m = manifest();
+    let mut m = manifest();
+    m["owed_signatures"]["98"] = json!(".measures.probe.evidence == true");
+    m["owed_titles"]["98"] = json!("a probe row");
+    let probed = json!(["beats_below_floor", "wire_below_floor", "alarm_raised"]);
+    let mut legs = 0;
+    for l in m["legs"].as_array_mut().unwrap() {
+        if l["case"] == "cpu-starved" {
+            l["owed"] = json!({"beats_below_floor": "98", "wire_below_floor": "98", "alarm_raised": "98"});
+            legs += 1;
+        }
+    }
+    assert_eq!(legs, 1, "case 6 is one leg of chaos.json");
+    let path = dir.with_extension("json");
     let title = |row: &str| m["owed_titles"][row].as_str().unwrap().to_owned();
     let fail = |failed: Value, measures: Value| {
         move |v: &mut Value| {
@@ -658,16 +677,12 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
             }
         }
     };
+    let evidence = |held: bool| json!({"probe": {"evidence": held}});
 
     verdicts(&dir, true);
-    // CI's cpu-starved: its one failed check owed, the row's evidence present (Owed 86).
-    let starved = json!({"starvation_applied": {"applied": true},
-        "ladder_moved": {"dropped_rise": 0, "half_rate_beats": 0}});
-    edit(
-        &dir,
-        "cpu-starved",
-        fail(json!(["ladder_moved"]), starved.clone()),
-    );
+    std::fs::write(&path, m.to_string()).unwrap();
+    // Case 6's probed checks failed, each owed, the row's evidence present.
+    edit(&dir, "cpu-starved", fail(probed.clone(), evidence(true)));
     // CI's case 17 (PR #65), its reds once Owed 87's: since the owner's ruling (2026-10-24, "A")
     // the row is DECIDED and its tags are gone, so both are news, its old evidence notwithstanding.
     edit(
@@ -701,12 +716,12 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
             json!({"graphics_failed_after_start": 1}),
         ),
     );
-    let out = run(&["--table", d]);
+    let out = run_manifest(&["--table", d], &path);
     let s = stdout(&out);
     assert_eq!(out.status.code(), Some(1), "an owed red is still red");
     let mut owed_rows = 0;
     for row in [
-        "| cpu-starved | FAIL | 4/4 | outage_ms | failed: ladder_moved (Owed 86) |",
+        "| cpu-starved | FAIL | 4/4 | outage_ms | failed: beats_below_floor (Owed 98), wire_below_floor (Owed 98), alarm_raised (Owed 98) |",
         "| dest-stall | FAIL | 4/4 | outage_ms | failed: stall_swap (NOT OWED), output_lost (NOT OWED) |",
         "| dest-stall-rule | FAIL | 4/4 | outage_ms | failed: buffer_capped (NOT OWED), stall_swap (NOT OWED) |",
         "| camera-stop | FAIL | 4/4 | outage_ms | failed: slate_ms (NOT OWED) |",
@@ -721,21 +736,21 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
         "red on a check no Owed row names: camera-stop (slate_ms); dest-stall (stall_swap, output_lost); cef-killed-r1 (overlay_back, same_session); dest-stall-rule (buffer_capped, stall_swap)\n"
     ), "{s}");
     assert!(
-        s.contains(&format!("Owed 86: {}\n", title("86"))),
-        "Owed 86's title"
+        s.contains(&format!("Owed 98: {}\n", title("98"))),
+        "Owed 98's title"
     );
-    for gone in ["Owed 70", "Owed 84", "Owed 85", "Owed 87"] {
+    for gone in ["Owed 70", "Owed 84", "Owed 85", "Owed 86", "Owed 87"] {
         assert!(
             !s.contains(gone),
-            "only the rows this run's reds name, never a fixed one: {gone}"
+            "only the rows this run's reds name, never a fixed or decided one: {gone}"
         );
     }
     assert!(s.contains("this run does not count"));
     assert!(!s.contains("this run counts"));
 
     // The re-review's I-3: an owed check that fails WITHOUT its row's evidence is not that row's:
-    // cpu-starved's ladder_moved on a window that dropped frames (the ladder's input moved, so not
-    // Owed 86's still ladder). And the rows fixed read NOT OWED whatever their old evidence:
+    // case 6's beats_below_floor with the probe's evidence absent, beside a check the row never
+    // named. And the rows fixed or decided read NOT OWED whatever their old evidence:
     // dest-disconnect's output_lost in a pending connect (Owed 84, PR #57), the fast leg's
     // overlay_back on a loop counted late (Owed 70 (a), PR #55), and Owed 87's checks with the
     // evidence its signature read before the owner's ruling (2026-10-24, "A"): dest-stall's and
@@ -757,11 +772,7 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     edit(
         &dir,
         "cpu-starved",
-        fail(
-            json!(["ladder_moved"]),
-            json!({"starvation_applied": {"applied": true},
-                "ladder_moved": {"dropped_rise": 40, "half_rate_beats": 0}}),
-        ),
+        fail(json!(["fps_beats_read", "beats_below_floor"]), evidence(false)),
     );
     edit(
         &dir,
@@ -786,14 +797,14 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
             ),
         );
     }
-    let out = run(&["--table", d]);
+    let out = run_manifest(&["--table", d], &path);
     let s = stdout(&out);
     assert_eq!(out.status.code(), Some(1));
     let mut rows = 0;
     for row in [
         "| dest-disconnect | FAIL | 4/4 | outage_ms | failed: output_lost (NOT OWED) |",
         "| dest-stall | FAIL | 4/4 | outage_ms | failed: stall_swap (NOT OWED) |",
-        "| cpu-starved | FAIL | 4/4 | outage_ms | failed: ladder_moved (NOT OWED: Owed 86's signature absent) |",
+        "| cpu-starved | FAIL | 4/4 | outage_ms | failed: fps_beats_read (NOT OWED), beats_below_floor (NOT OWED: Owed 98's signature absent) |",
         "| dest-trickle | FAIL | 4/4 | outage_ms | failed: stall_swap (NOT OWED) |",
         "| dest-stall-rule | FAIL | 4/4 | outage_ms | failed: buffer_capped (NOT OWED), stall_swap (NOT OWED) |",
         "| cef-gpu-deaths-fast-r1 | FAIL | 4/4 | outage_ms | failed: overlay_back (NOT OWED) |",
@@ -805,20 +816,22 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
     }
     assert!(s.contains("red, every failed check owed: none\n"), "{s}");
     assert!(s.contains(
-        "red on a check no Owed row names: dest-disconnect (output_lost); dest-stall (stall_swap); cpu-starved (ladder_moved); dest-trickle (stall_swap); cef-gpu-deaths-fast-r1 (overlay_back); cef-gpu-deaths-fast-r2 (overlay_back); cef-gpu-deaths-fast-r3 (overlay_back); dest-stall-rule (buffer_capped, stall_swap)\n"
+        "red on a check no Owed row names: dest-disconnect (output_lost); dest-stall (stall_swap); cpu-starved (fps_beats_read, beats_below_floor); dest-trickle (stall_swap); cef-gpu-deaths-fast-r1 (overlay_back); cef-gpu-deaths-fast-r2 (overlay_back); cef-gpu-deaths-fast-r3 (overlay_back); dest-stall-rule (buffer_capped, stall_swap)\n"
     ), "{s}");
-    for gone in ["Owed 70", "Owed 84", "Owed 85", "Owed 86:", "Owed 87:"] {
+    for gone in [
+        "Owed 70", "Owed 84", "Owed 85", "Owed 86:", "Owed 87:", "Owed 98:",
+    ] {
         assert!(
             !s.contains(gone),
-            "a row whose evidence is absent, or whose fix merged, is not named: {gone}"
+            "a row whose evidence is absent, or whose fix or ruling is in, is not named: {gone}"
         );
     }
     assert_eq!(rows, 8);
 
     // Only owed reds: still red, and the run still does not count.
     verdicts(&dir, true);
-    edit(&dir, "cpu-starved", fail(json!(["ladder_moved"]), starved));
-    let out = run(&["--table", d]);
+    edit(&dir, "cpu-starved", fail(probed, evidence(true)));
+    let out = run_manifest(&["--table", d], &path);
     let s = stdout(&out);
     assert_eq!(out.status.code(), Some(1));
     assert!(s.contains("red on a check no Owed row names: none\n"));
@@ -826,7 +839,7 @@ fn the_table_names_each_failed_checks_owed_row_and_stays_red() {
 
     // A green run prints neither line.
     verdicts(&dir, true);
-    let out = run(&["--table", d]);
+    let out = run_manifest(&["--table", d], &path);
     let s = stdout(&out);
     assert_eq!(out.status.code(), Some(0));
     assert!(!s.contains("every failed check owed") && !s.contains("no Owed row names"));

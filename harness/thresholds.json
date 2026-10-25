@@ -50,6 +50,8 @@
   "output_connect_timeout_ms": 5000,
   "output_connected_after_ms": 5000,
   "output_egress_flat_ms": 9000,
+  "output_fps_floor": 28.5,
+  "output_fps_recovered": 29.5,
   "output_gap_budget_ms": 15000,
   "output_progress_poll_ms": 250,
   "output_sink_timeout_ms": 5000,
