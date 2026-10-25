@@ -947,8 +947,10 @@ derived constant.
     "≤2 s of programme lost" (budget_output_lost_max_ms), read as one stall's recovery target. So
     the programme lost is summed over every outage from the plant to a reconnect's budget past the
     swap (the window `no_outage_outside_hang` excuses), a negative reading counting as none; at
-    least one outage is in the window, and every one's `lost_ms` is read. Cases 4, 5 and 12 bound
-    each outage instead (unchanged). No floor: CI's −2 s readings are Owed 92's dating
+    least one outage is in the window, and every one's `lost_ms` is read. Cases 4, 5 and 12 still
+    judge each outage on its own (`require_output_recovers`): not a second reading of the row (each
+    of them is one failure too), but a form that predates #86 and was outside its scope; Owed 98
+    tracks moving them to the summed form. No floor: CI's −2 s readings are Owed 92's dating
     (`docs/_INDEX.md` Owed 94, Owed 92), and Owed 92's risk holds here too;
   - the false-positive sweep, `no_restarts` and `ended_beat`; measures `gap_ms` (the key) and
     `lost_ms`.
@@ -988,7 +990,9 @@ derived constant.
   one-outage clause (`hung-lost-no-outage`); and each row of `mtx_duration_ms`'s unit table
   scaled tenfold (`ms` as 1 000, the review's ME, by `hung-mtx-ms`, which then passes "500ms";
   `d`, `h`, `s`, `us`, `µs` and `ns` by `hung-mtx-d`, `-h`, `-s`, `-us`, `-micro` and `-ns`, each
-  reading's ms worked out by hand).
+  reading's ms worked out by hand). The PR #86 review's n-1: P6, a negative reading counted as
+  its size in lost, not as none, by `hung-lost-dating` (−budget beside a loss at the budget, a
+  pass that P6 reads as twice the budget).
 - **CI mutants** (a throwaway `mut/owed94` PR, the `mut/c14-case16` workflow's shape: the target check
   PASSes unmutated, then FAILs mutated with its controls still PASS): (a) the case on the plain relay
   image reds `armed`; (b) the backstop's Connected arm removed reds `backstop_swap` on `hold`; (c)
