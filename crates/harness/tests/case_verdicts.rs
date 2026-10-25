@@ -118,6 +118,9 @@ struct World {
     cores: Value,
     /// Changes report.json after the checker wrote it (a report from an older checker).
     report_patch: Option<fn(&mut Value)>,
+    /// The programme records this long past the end request (the final hold's end slate); 0 stops
+    /// the recording at the end request.
+    tail_ms: i64,
 }
 
 impl World {
@@ -180,6 +183,7 @@ impl World {
             cores: json!({"diff_ok": true, "container_files": 0, "host_before": 0, "host_after": 0,
                 "core_pattern": "core"}),
             report_patch: None,
+            tail_ms: 0,
         };
         let hb = w.ms("heartbeat_interval_ms");
         let mut at = live;
@@ -378,7 +382,7 @@ impl World {
         loop {
             let w = prog0 + f64::from(k) * PERIOD_MS;
             k += 1;
-            if w > self.end as f64 - PERIOD_MS {
+            if w > (self.end + self.tail_ms) as f64 - PERIOD_MS {
                 break;
             }
             if within(&self.outages, w).is_some() {
@@ -3192,6 +3196,21 @@ fn score_down_reports_stale_and_holds_the_last_score_and_reds_when_the_page_is_s
         "last_good_held",
         "score-blank",
     );
+    // PR #79's fix round 1 (the one-frame hole): the first change after the recovery shows, and the
+    // overlay goes off air 300 ms after the page's first good poll could show it, to the end. A
+    // recovery is held for resume_after_ms: red.
+    let mut w = score_down(true, false);
+    let until = w.score_blind.unwrap().1;
+    let poll = w.ms("harness_page_poll_ms");
+    let hold = w.ms("resume_after_ms");
+    w.overlay_none.push((until + poll + 300, w.end + 60_000));
+    let v = judge(&w, "score-down", "", "score-back-leaves");
+    assert_fails(&v, "changes_after_recovery", "score-back-leaves");
+    let shown = &v.json["measures"]["changes_after_recovery"];
+    assert!(
+        shown["stayed_ms"].as_i64().is_some_and(|s| s > 0 && s < hold),
+        "score-back-leaves: on air less than the hold: {shown}"
+    );
 }
 
 /// `in-container.sh kill-cef` at 20 s: its targets (`kill`, printed before the kill) and, when the
@@ -3334,6 +3353,64 @@ fn cef_killed_restarts_the_process_and_reds_when_the_kill_missed_or_the_death_is
         &judge(&w, "cef-killed", "", "cef-overlay-inbudget"),
         "cef-overlay-inbudget",
     );
+    // PR #79's fix round 1 (the one-frame hole): the overlay is back with the first programme frame
+    // after the restart and off air again 400 ms later, to the end. Back means held for
+    // resume_after_ms: red, and the measure says how long it stayed.
+    let mut w = cef_killed(good(), 133);
+    let start = *w.starts().last().unwrap();
+    let hold = w.ms("resume_after_ms");
+    w.overlay_none
+        .push((start + FIRST_PACKET_MS + 400, w.end + 60_000));
+    let v = judge(&w, "cef-killed", "", "cef-back-leaves");
+    assert_fails(&v, "overlay_back", "cef-back-leaves");
+    let back = &v.json["measures"]["overlay_back"];
+    assert!(
+        back["stayed_ms"].as_i64().is_some_and(|s| s > 0 && s < hold),
+        "cef-back-leaves: on air less than the hold: {back}"
+    );
+    // CI's restart legs (PR run 40154210504, all 16): the restart's catch-up burst lands its
+    // strip-less frames and its first strip frames on ONE wall ms, the strip-less ones first. Back
+    // is judged in frame order from the first strip frame, so the burst's outage frames before it
+    // are not "off air after back" (a wall-ms window redded every real restart leg).
+    let mut w = cef_killed(good(), 133);
+    let start = *w.starts().last().unwrap();
+    w.overlay_none.push((k + 1_200, start + FIRST_PACKET_MS + 900));
+    w.report_patch = Some(|r| {
+        let f = r["frames_table"].as_array_mut().unwrap();
+        let back = (1..f.len())
+            .rev()
+            .find(|&i| !f[i][2].is_null() && f[i - 1][2].is_null())
+            .expect("a strip frame after strip-less ones");
+        let wall = f[back][0].clone();
+        let mut i = back;
+        while i > 0 && f[i - 1][2].is_null() {
+            i -= 1;
+            f[i][0] = wall.clone();
+        }
+        assert!(
+            back - i >= 2,
+            "a burst of strip-less frames on the back frame's wall ms"
+        );
+    });
+    let v = judge(&w, "cef-killed", "", "cef-back-burst");
+    assert_pass(&v, "cef-back-burst");
+    let report = judged_report("cef-back-burst", "cef-killed");
+    let back_ms = report["frames_table"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f[0].as_i64().is_some_and(|w| w > start) && !f[2].is_null())
+        .map(|f| f[0].as_i64().unwrap())
+        .next()
+        .unwrap();
+    let burst = report["frames_table"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f[0].as_i64() == Some(back_ms) && f[2].is_null())
+        .count();
+    eprintln!("cef-back-burst: {burst} strip-less frames on the back frame's wall ms");
+    assert!(burst >= 2, "cef-back-burst: {burst}");
 }
 
 /// The kill's status line reads a failed `kill`.
@@ -3495,6 +3572,19 @@ fn cef_hung_at(log_ms: i64, strip_ms: i64) -> World {
 #[test]
 fn cef_hung_hides_and_restarts_graphics_and_reds_when_the_hang_is_never_seen() {
     assert_pass(&judge(&cef_hung(true), "cef-hung", "", "hung-good"), "hung-good");
+    // PR #79's fix round 1 (the one-frame hole): back after the new generation's ready, and off
+    // air again 400 ms later, to the end. Back means held for resume_after_ms: red.
+    let mut w = cef_hung(true);
+    let back = w.overlay_none[0].1;
+    let hold = w.ms("resume_after_ms");
+    w.overlay_none.push((back + 400, w.end + 60_000));
+    let v = judge(&w, "cef-hung", "", "hung-back-leaves");
+    assert_fails(&v, "overlay_back", "hung-back-leaves");
+    let shown = &v.json["measures"]["overlay_back"];
+    assert!(
+        shown["stayed_ms"].as_i64().is_some_and(|s| s > 0 && s < hold),
+        "hung-back-leaves: on air less than the hold: {shown}"
+    );
     // Mutant 4: C05b's hang arm deleted at Ready: the hang is never seen.
     assert_fails(
         &judge(&cef_hung(false), "cef-hung", "", "hung-unseen"),
@@ -3866,15 +3956,17 @@ fn judged_report(tag: &str, name: &str) -> Value {
 }
 
 /// The score changes `w`'s timeline makes due after `from` and no later than the run's last
-/// PROGRAMME frame less the frame-to-encoder budget, as (index, due): what a check of the changes
-/// shown must find (Owed 96: never bounded by the last frame whose overlay read). From the world's
+/// PROGRAMME frame or its end request, whichever is first, less the frame-to-encoder budget, as
+/// (index, due): what a check of the changes shown must find (Owed 96: never bounded by the last
+/// frame whose overlay read; fix round 1's m-1: nor by the final hold's end slate). From the world's
 /// own timeline and the frames its run recorded, never from a verdict.
 fn due_after(w: &World, report: &Value, from: i64) -> Vec<(u16, i64)> {
     let last = report["frames_table"]
         .as_array()
         .and_then(|f| f.last())
         .and_then(|f| f[0].as_i64())
-        .expect("the run recorded a programme frame");
+        .expect("the run recorded a programme frame")
+        .min(w.end);
     let budget = w.ms("budget_frame_to_encoder_ms");
     w.timeline_events()
         .into_iter()
@@ -3971,6 +4063,12 @@ fn cef_gpu_deaths_one_fewer_restarts_nothing_and_reds_on_a_restart() {
         shown["off_air"]["frames"].as_u64().is_some_and(|f| f >= 1),
         "fewer-blip: {shown}"
     );
+    // Fix round 1's m-2: nothing missing is never "covers the missing".
+    assert_eq!(
+        shown["off_air"]["covers_missing"],
+        json!(false),
+        "fewer-blip: {shown}"
+    );
     assert!(
         !owed_signature_holds("96", &v.json),
         "fewer-blip: Owed 96 with nothing missing"
@@ -4015,6 +4113,11 @@ fn cef_gpu_deaths_one_fewer_restarts_nothing_and_reds_on_a_restart() {
         (&json!(true), &json!(true)),
         "fewer-nooverlay: {off}"
     );
+    assert_eq!(
+        (&off["at_kill"], &off["hidden_after_kill"]),
+        (&json!(true), &json!(0)),
+        "fewer-nooverlay: within a child poll of the kill, and nothing hid it: {off}"
+    );
     assert!(
         owed_signature_holds("96", &v.json),
         "fewer-nooverlay: Owed 96's evidence"
@@ -4022,7 +4125,9 @@ fn cef_gpu_deaths_one_fewer_restarts_nothing_and_reds_on_a_restart() {
     checked += 1;
     // The hole the old bound left: the page paints on after the last kill, then goes off air for
     // good 30 s later. The changes due before that show, every one due after it is missing, and the
-    // check reds (the old bound cut the due set at the last painted frame, and passed).
+    // check reds (the old bound cut the due set at the last painted frame, and passed). Fix round
+    // 1's I-1: 30 s is no child poll after any kill, so nothing ties the run to a GPU death and it
+    // is not Owed 96's, though it holds every missing change.
     let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
     let last = *kills(&w).last().unwrap();
     let off_from = last + 30_000;
@@ -4059,9 +4164,15 @@ fn cef_gpu_deaths_one_fewer_restarts_nothing_and_reds_on_a_restart() {
         json!(indices(&gone)),
         "fewer-offair-later: {shown}"
     );
+    let off = &shown["off_air"];
+    assert_eq!(
+        (&off["at_kill"], &off["hidden_after_kill"], &off["covers_missing"]),
+        (&json!(false), &json!(0), &json!(true)),
+        "fewer-offair-later: only the kill tie is absent: {off}"
+    );
     assert!(
-        owed_signature_holds("96", &v.json),
-        "fewer-offair-later: Owed 96's evidence"
+        !owed_signature_holds("96", &v.json),
+        "fewer-offair-later: an off-air run 30 s after the last kill is not Owed 96's"
     );
     checked += 1;
     // A page that stops painting and keeps beating holds its last frame on air (a stale score; the
@@ -4123,8 +4234,170 @@ fn cef_gpu_deaths_one_fewer_restarts_nothing_and_reds_on_a_restart() {
         "fewer-offair-before: off air before any kill"
     );
     checked += 1;
+    // Fix round 1's I-1 and m-1: the run records the final hold's end slate, off air from 500 ms
+    // after the end request. A change due in the hold is no change the run owed (the due set ends at
+    // the end request), so the run is green and not Owed 96's.
+    let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
+    w.tail_ms = w.ms("final_hold_ms");
+    let end = w.end;
+    w.overlay_none.push((end + 500, end + 60_000));
+    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-final-hold");
+    let budget = w.ms("budget_frame_to_encoder_ms");
+    let report = judged_report("fewer-final-hold", ONE_FEWER);
+    let last_frame = report["frames_table"]
+        .as_array()
+        .and_then(|f| f.last())
+        .and_then(|f| f[0].as_i64())
+        .unwrap();
+    let in_hold = w
+        .timeline_events()
+        .into_iter()
+        .filter(|&(_, at)| at + w.delay_ms > end + 500 && at + w.delay_ms <= last_frame - budget)
+        .count();
+    eprintln!("fewer-final-hold: {in_hold} changes fall due in the recorded hold, off air");
+    assert!(
+        last_frame > end + 500 && in_hold >= 1,
+        "fewer-final-hold: the hold is recorded and a change falls due off air in it"
+    );
+    assert_pass(&v, "fewer-final-hold");
+    let shown = &v.json["measures"]["scheduled_changes_shown"];
+    assert_eq!(shown["missing"], json!([]), "fewer-final-hold: {shown}");
+    assert_eq!(
+        shown["off_air"]["at_kill"],
+        json!(false),
+        "fewer-final-hold: {shown}"
+    );
+    assert!(
+        !owed_signature_holds("96", &v.json),
+        "fewer-final-hold: the end slate is not Owed 96's"
+    );
+    checked += 1;
+    // Fix round 1's I-1: the graphics hid the overlay on purpose (a hide line after the first kill)
+    // and it stayed off: red, every change missing and within a child poll of the kill, but a hide
+    // is the graphics working as designed, not the page dying unseen.
+    let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
+    let last = *kills(&w).last().unwrap();
+    w.line(last + 60, "overlay hidden reason=hang gen=1");
+    w.overlay_none.push((last + 77, w.end + 60_000));
+    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-hidden");
+    assert_fails(&v, "scheduled_changes_shown", "fewer-hidden");
+    let off = &v.json["measures"]["scheduled_changes_shown"]["off_air"];
+    assert_eq!(
+        (&off["at_kill"], &off["hidden_after_kill"], &off["covers_missing"]),
+        (&json!(true), &json!(1), &json!(true)),
+        "fewer-hidden: only the hide differs from Owed 96's evidence: {off}"
+    );
+    assert!(
+        !owed_signature_holds("96", &v.json),
+        "fewer-hidden: a deliberate hide is not Owed 96's"
+    );
+    checked += 1;
+    // Fix round 1's I-2 (survivor `max_by` -> `first`): CI's 2-frame blip at the first kill, then
+    // CI's red at the last. The off-air run measured is the long one, so Owed 96 holds; the first
+    // run after the first kill is the blip, which holds none of the missing changes.
+    let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
+    let (k0, last) = (kills(&w)[0], *kills(&w).last().unwrap());
+    w.overlay_none.push((k0 + 51, k0 + 51 + 66));
+    w.overlay_none.push((last + 77, w.end + 60_000));
+    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-blip-offair");
+    assert_fails(&v, "scheduled_changes_shown", "fewer-blip-offair");
+    let off = &v.json["measures"]["scheduled_changes_shown"]["off_air"];
+    let after = off["after_kill_ms"].as_f64().unwrap_or(-1.0);
+    assert!(
+        (77.0..77.0 + PERIOD_MS + 1.0).contains(&after) && off["to_end"] == json!(true),
+        "fewer-blip-offair: the long run at the last kill, not the blip: {off}"
+    );
+    assert!(
+        owed_signature_holds("96", &v.json),
+        "fewer-blip-offair: Owed 96's evidence past the blip"
+    );
+    checked += 1;
+    // Fix round 1's I-2 (survivor: covers_missing's lower bound deleted): the page holds its frame
+    // from the last kill (a change due 250 ms later never shows), then goes off air 850 ms after the
+    // kill. That run cannot hold the change the held page lost, so it is not Owed 96's evidence.
+    let mut w = gpu_deaths(n - 1, 3_800, 800, false, 0);
+    let last = *kills(&w).last().unwrap();
+    let off_from = last + 850;
+    w.overlay_hold.push((last, off_from));
+    w.overlay_none.push((off_from, w.end + 60_000));
+    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-held-offair");
+    assert_fails(&v, "scheduled_changes_shown", "fewer-held-offair");
+    let due = due_after(&w, &judged_report("fewer-held-offair", ONE_FEWER), last);
+    let held: Vec<u16> = due
+        .iter()
+        .filter(|&&(_, d)| d + budget < off_from)
+        .map(|x| x.0)
+        .collect();
+    let shown = &v.json["measures"]["scheduled_changes_shown"];
+    eprintln!("fewer-held-offair: {} lost to the held page: {shown}", held.len());
+    assert!(
+        !held.is_empty()
+            && shown["missing"]
+                .as_array()
+                .is_some_and(|m| held.iter().all(|i| m.contains(&json!(i)))),
+        "fewer-held-offair: a change due before the off-air run is missing: {held:?} {shown}"
+    );
+    let off = &shown["off_air"];
+    assert_eq!(
+        (&off["at_kill"], &off["hidden_after_kill"], &off["covers_missing"]),
+        (&json!(true), &json!(0), &json!(false)),
+        "fewer-held-offair: {off}"
+    );
+    assert!(
+        !owed_signature_holds("96", &v.json),
+        "fewer-held-offair: the off-air run did not lose the held change"
+    );
+    checked += 1;
+    // And the other bound: off air at the last kill for 5 s, then a held page to the end. The
+    // changes due in the held tail are missing past the off-air run's end.
+    let mut w = gpu_deaths(n - 1, 2_000, 800, false, 0);
+    let last = *kills(&w).last().unwrap();
+    let back = last + 5_000;
+    w.overlay_none.push((last + 77, back));
+    w.overlay_hold.push((back, w.end + 60_000));
+    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-offair-held");
+    assert_fails(&v, "scheduled_changes_shown", "fewer-offair-held");
+    let due = due_after(&w, &judged_report("fewer-offair-held", ONE_FEWER), last);
+    assert!(
+        due.iter().any(|&(_, d)| d > back),
+        "fewer-offair-held: a change falls due on the held page: {due:?}"
+    );
+    let off = &v.json["measures"]["scheduled_changes_shown"]["off_air"];
+    assert_eq!(
+        (&off["at_kill"], &off["hidden_after_kill"], &off["covers_missing"]),
+        (&json!(true), &json!(0), &json!(false)),
+        "fewer-offair-held: {off}"
+    );
+    assert!(
+        !owed_signature_holds("96", &v.json),
+        "fewer-offair-held: the held page lost the late changes, not the off-air run"
+    );
+    checked += 1;
+    // Fix round 1's m-3: no kill landed. The check reds on nothing due (anti-vacuity), and the
+    // measure still prints: nothing due, nothing missing, no off-air run "after a kill" although
+    // the overlay goes off air.
+    let mut w = gpu_deaths(0, 2_000, 800, false, 0);
+    let off_from = w.at(30.0);
+    w.overlay_none.push((off_from, w.end + 60_000));
+    let v = judge(&w, "cef-gpu-deaths", "one-fewer", "fewer-nokills");
+    assert_fails(&v, "scheduled_changes_shown", "fewer-nokills");
+    let shown = &v.json["measures"]["scheduled_changes_shown"];
+    assert_eq!(
+        (
+            &shown["due_after_last_kill"],
+            &shown["missing"],
+            &shown["off_air"]
+        ),
+        (&json!(0), &json!([]), &Value::Null),
+        "fewer-nokills: {shown}"
+    );
+    assert!(
+        !owed_signature_holds("96", &v.json),
+        "fewer-nokills: no kill, no Owed 96"
+    );
+    checked += 1;
     eprintln!("one-fewer worlds checked: {checked}");
-    assert_eq!(checked, 8);
+    assert_eq!(checked, 14);
 }
 
 #[test]
@@ -4918,6 +5191,32 @@ fn cef_leaks_two_carries_its_leaks_on_air_and_reds_without_the_hold_or_its_witne
         "leaks2-overlay-off-later: {on_air}"
     );
     red(w, &["overlay_on_air"], "leaks2-overlay-off-later");
+    // PR #79's fix round 1 (m-1): the run records the final hold's end slate, off air from 500 ms
+    // after the end request. The due set ends at the end request, so the changes due in the hold
+    // are owed by no one: green.
+    let mut w = leaks(hold);
+    w.tail_ms = w.ms("final_hold_ms");
+    let end = w.end;
+    w.overlay_none.push((end + 500, end + 60_000));
+    let v = judge(&w, "cef-leaks", "two", "leaks2-final-hold");
+    let report = judged_report("leaks2-final-hold", "cef-leaks-two");
+    let last_frame = report["frames_table"]
+        .as_array()
+        .and_then(|f| f.last())
+        .and_then(|f| f[0].as_i64())
+        .unwrap();
+    let budget = w.ms("budget_frame_to_encoder_ms");
+    let in_hold = w
+        .timeline_events()
+        .into_iter()
+        .filter(|&(_, at)| at + w.delay_ms > end + 500 && at + w.delay_ms <= last_frame - budget)
+        .count();
+    eprintln!("leaks2-final-hold: {in_hold} changes fall due in the recorded hold, off air");
+    assert!(
+        last_frame > end + 500 && in_hold >= 1,
+        "leaks2-final-hold: the hold is recorded and a change falls due off air in it"
+    );
+    assert_pass(&v, "leaks2-final-hold");
     // The newest build ready, then its page holding one frame (a stale score on air).
     let mut w = leaks(hold);
     let ready = w.log.iter().find(|(_, m)| *m == next_ready).map(|l| l.0).unwrap();

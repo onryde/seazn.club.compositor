@@ -362,17 +362,20 @@ require_clear_phase() {
 # whose CEF never started, red here; PR #54 fixed that cause (main 263b08a), so no owed tag excuses
 # such a red now. Its evidence is still measured beside it: `graphics_failed_after_start`, the
 # `overlay hidden reason=failed` lines after <start> (graphics gave up after CEF_FAIL_COUNT builds;
-# the re-review's I-3). 2 checks.
+# the re-review's I-3). And back means held: on air for `resume_after_ms` from that first frame
+# (lib.jq's on_air_for; a page that paints one frame and goes off air is not back). 2 checks.
 require_overlay_back() {
   local die="$1" start="$2"
   measure graphics_failed_after_start "($start) as \$s
     | if \$s == null then null else [.log.overlay_hidden[] | select(.reason == \"failed\" and .at_ms > \$s)] | length end"
   require overlay_back "restart_outage($die; $start) as \$o | ($start) as \$s
     | (if \$s == null then null else [.frames_table[] | select(.[0] > \$s and .[2] != null)] | first | .[0] end) as \$back
-    | \$o != null and \$back != null and (\$back - \$o.from_wall_ms) <= \$t.budget_process_restart_output_ms" \
+    | \$o != null and \$back != null and (\$back - \$o.from_wall_ms) <= \$t.budget_process_restart_output_ms
+    and on_air_for(\$back; \$t.resume_after_ms)" \
     "restart_outage($die; $start) as \$o | ($start) as \$s
-    | {back_ms: less(if \$s == null then null else [.frames_table[] | select(.[0] > \$s and .[2] != null)] | first | .[0] end;
-         \$o.from_wall_ms), budget: \$t.budget_process_restart_output_ms}"
+    | (if \$s == null then null else [.frames_table[] | select(.[0] > \$s and .[2] != null)] | first | .[0] end) as \$back
+    | {back_ms: less(\$back; \$o.from_wall_ms), budget: \$t.budget_process_restart_output_ms,
+       stayed_ms: stayed_ms(\$back), hold_ms: \$t.resume_after_ms}"
 }
 
 # C11b's in-place restart after <after> (a jq expression): the final beat says why, with

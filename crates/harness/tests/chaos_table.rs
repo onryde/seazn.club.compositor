@@ -637,38 +637,48 @@ fn the_decided_owed_rows_left_chaos_json_with_their_tags() {
 }
 
 /// Owed 96 (2026-10-25): case 15 one-fewer's `scheduled_changes_shown` red reads owed only on its
-/// cause's evidence: an off-air run after a GPU kill that holds every missing change (CI's run
-/// 40148980537, re-judged under the programme bound). A held page, a 2-frame blip at a kill beside
-/// one, and a red with nothing missing read NOT OWED. case_verdicts.rs drives the same signature
-/// through the case's own measure.
+/// cause's evidence: an off-air run that starts within a child poll of a GPU kill (`at_kill`), with
+/// no deliberate hide after the first kill, that holds every missing change (CI's run 40148980537,
+/// re-judged under the programme bound). A held page, a 2-frame blip at a kill beside one, a red
+/// with nothing missing, an off-air run long after the last kill and a hidden one read NOT OWED.
+/// case_verdicts.rs drives the same signature through the case's own measure.
 #[test]
 fn owed_96_names_the_one_fewer_off_air_red_and_nothing_else() {
     let m = manifest();
     let sig = m["owed_signatures"]["96"].as_str().unwrap().to_owned();
-    let off = |covers: bool| {
-        json!({"from_ms": 1_792_891_584_297_i64, "after_kill_ms": 77, "ms": 82_604, "frames": 2_478,
-            "to_end": true, "covers_missing": covers})
+    // The CI red's off-air run; each shape below breaks one of the signature's three conjuncts.
+    let off_with = |at_kill: bool, hidden: u32, covers: bool| {
+        json!({"from_ms": 1_792_891_584_297_i64, "after_kill_ms": if at_kill { 77 } else { 30_077 },
+            "at_kill": at_kill, "ms": 82_604, "frames": 2_478, "to_end": true,
+            "hidden_after_kill": hidden, "covers_missing": covers})
     };
-    let ci = json!({"due_after_last_kill": 27, "missing": (7..=33).collect::<Vec<u16>>(),
+    let off = |covers: bool| off_with(true, 0, covers);
+    let ci = json!({"due_after_last_kill": 22, "missing": (12..=33).collect::<Vec<u16>>(),
         "lag_ms": {"min": null, "max": null}, "off_air": off(true)});
+    let missing = |off_air: Value| json!({"due_after_last_kill": 22, "missing": (12..=33).collect::<Vec<u16>>(), "off_air": off_air});
     let mut checked = 0;
     for (tag, holds, shown) in [
         ("ci-red", true, ci.clone()),
         (
             "held",
             false,
-            json!({"due_after_last_kill": 27, "missing": [7, 8], "off_air": null}),
+            json!({"due_after_last_kill": 22, "missing": [12, 13], "off_air": null}),
         ),
         (
             "blip-held",
             false,
-            json!({"due_after_last_kill": 27, "missing": [7], "off_air": off(false)}),
+            json!({"due_after_last_kill": 22, "missing": [12], "off_air": off(false)}),
         ),
         (
             "nothing-missing",
             false,
-            json!({"due_after_last_kill": 0, "missing": [], "off_air": off(true)}),
+            json!({"due_after_last_kill": 0, "missing": [], "off_air": off(false)}),
         ),
+        // Fix round 1's I-1: an off-air run that starts long after the last kill (no child poll ties
+        // it to one), and one the graphics hid on purpose, hold the missing changes and are not
+        // Owed 96's.
+        ("later", false, missing(off_with(false, 0, true))),
+        ("hidden", false, missing(off_with(true, 1, true))),
     ] {
         assert_eq!(
             signature_holds(&sig, &json!({"measures": {"scheduled_changes_shown": shown}})),
@@ -678,7 +688,7 @@ fn owed_96_names_the_one_fewer_off_air_red_and_nothing_else() {
         checked += 1;
     }
     eprintln!("Owed 96 signature cases checked: {checked}");
-    assert_eq!(checked, 4);
+    assert_eq!(checked, 6);
 
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("chaos-table-owed-96");
     let d = dir.to_str().unwrap();
@@ -707,7 +717,7 @@ fn owed_96_names_the_one_fewer_off_air_red_and_nothing_else() {
     edit(
         &dir,
         "cef-gpu-deaths-one-fewer",
-        fail(json!({"due_after_last_kill": 27, "missing": [7, 8], "off_air": null})),
+        fail(json!({"due_after_last_kill": 22, "missing": [12, 13], "off_air": null})),
     );
     let out = run(&["--table", d]);
     let s = stdout(&out);

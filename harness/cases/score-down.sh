@@ -51,8 +51,13 @@ case_verdict() {
     and (frames_between(mark_at("down"); $u) | map(select(.[2] == null)) | length) == 0' \
     'mark_value("down").score_down_until_ms as $u | {held: (frames_between($u - $t.heartbeat_interval_ms; $u) | map(.[2] | select(. != null)) | max),
       no_overlay_frames: (frames_between(mark_at("down"); $u) | map(select(.[2] == null)) | length)}'
-  require changes_after_recovery '[.overlay.score_index_changes[] | select(.frame_wall_ms > mark_value("down").score_down_until_ms)] | length >= 1' \
-    '[.overlay.score_index_changes[] | select(.frame_wall_ms > mark_value("down").score_down_until_ms)] | length'
+  # The first change after the recovery, and the overlay held on air for resume_after_ms from it
+  # (lib.jq's on_air_for: one frame and off air is no recovery).
+  require changes_after_recovery '([.overlay.score_index_changes[] | select(.frame_wall_ms > mark_value("down").score_down_until_ms)] | first | .frame_wall_ms) as $c
+    | $c != null and on_air_for($c; $t.resume_after_ms)' \
+    '([.overlay.score_index_changes[] | select(.frame_wall_ms > mark_value("down").score_down_until_ms)]) as $c
+    | {changes: ($c | length), first_ms: ($c | first | .frame_wall_ms), stayed_ms: stayed_ms($c | first | .frame_wall_ms),
+       hold_ms: $t.resume_after_ms}'
   require never_regresses 'index_regressions == []' 'index_regressions | length'
   require_no_false_restart
 }

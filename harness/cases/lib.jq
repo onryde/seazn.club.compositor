@@ -26,6 +26,24 @@ def beats_between($a; $b): [beats[] | select(.received_ms >= $a and .received_ms
 # The recording's frames, each [wall_ms, counter, score] (null where a strip did not read).
 def frames_between($a; $b): [.frames_table[] | select(.[0] >= $a and .[0] < $b)];
 
+# "Back" is held, not one frame (the PR #79 review's gap hunt: a page that paints one frame and goes
+# off air passed every "back" check). On air from $b for $w: the recording reaches $b + $w (a window
+# with no frames proves nothing), and every frame from the first strip frame at or after $b through
+# $b + $w shows the strip. Frame ORDER, not wall time: a restart's catch-up burst lands many frames
+# on one wall ms, the strip-less ones first, so a wall-ms window starting at $b re-reads the outage
+# (every real restart leg of run 40154210504 did). The callers pass $t.resume_after_ms, the domain's
+# own hold-off before a returning source counts as back. A null $b is never back.
+def back_frame($b): .frames_table as $f
+  | if $b == null then null
+    else first(range(0; $f | length) | select($f[.][0] >= $b and $f[.][2] != null)) // null end;
+def on_air_for($b; $w): .frames_table as $f | back_frame($b) as $i
+  | $i != null and ($f | last | .[0]) >= $b + $w
+  and ($f[$i:] | map(select(.[0] <= $b + $w)) | all(.[2] != null));
+# How long the strip stayed on air from $b: to the first strip-less frame after its back frame, or
+# null when none follows (or $b is null).
+def stayed_ms($b): .frames_table as $f | back_frame($b) as $i
+  | if $i == null then null else less(first($f[$i:][] | select(.[2] == null) | .[0]) // null; $b) end;
+
 # The output outage that spans a process restart: its last packet before the start, its first
 # after the die.
 def restart_outage($die; $start):

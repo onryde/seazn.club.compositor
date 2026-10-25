@@ -55,6 +55,13 @@ SPLIT="$DECIDING"' as $line | (dies_after(mark_at("kill")) | first | .at_ms) as 
      unread: (if $line == null then null else (mark("kill") | map(select(.at_ms <= $line.at_ms)) | length) - $line.gpu_process_deaths end),
      at_exit: (if $line == null then null else mark("kill") | map(select(.at_ms > $line.at_ms and ($die == null or .at_ms < $die))) | length end)}'
 
+# The score changes due after the last kill (case 15 one-fewer), as `$due`, with `$k` the last kill:
+# up to the last programme frame or the end request, whichever is first, less the frame-to-encoder
+# budget.
+DUE_AFTER_KILL='(mark("kill") | last | .at_ms) as $k
+  | ([($r.frames_table | last | .[0]), $run.end_request_ms] | min) as $last
+  | [scheduled[] | select($k != null and .due_ms > $k and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due'
+
 require_split() {
   require gpu_death_split "$SPLIT"' | .unread != null and .unread >= 0 and .unread <= $t.budget_gpu_deaths_unread
     and .at_exit <= $t.budget_gpu_deaths_at_exit' \
@@ -105,30 +112,33 @@ case_verdict() {
       # held frame, CI's `back_ms` 20 and 22, a frame that never left; a page that stops painting
       # while it beats keeps a stale score on air, and the hang rule never hides a page that beats).
       # Due up to the last PROGRAMME frame, never the last frame whose overlay read (Owed 96): that
-      # bound fell back to the kill when the page went off air (run 40148980537 read "0 due" for
-      # 27 missing), and passed a page that went off air later. `off_air` is the longest strip-less
-      # run after the first kill (healthy runs show 2-frame blips at a kill), timed from the kill
-      # before it, and whether every missing change fell due inside it: Owed 96's evidence.
-      require scheduled_changes_shown '. as $r | (mark("kill") | last | .at_ms) as $k
+      # bound fell back to the kill when the page went off air (run 40148980537 read "0 due"; 22
+      # fell due before its end request, every one missing), and passed a page that went off air
+      # later. And no later than the end request:
+      # what the page shows in the final hold is not this check's (the PR #79 review's m-1).
+      # `off_air` is Owed 96's evidence: the longest strip-less run after the first kill (healthy
+      # runs show a 1 or 2 frame blip at a kill), timed from the kill before it; `at_kill` when that
+      # is within one child poll (`cef_child_poll_ms`, the cadence the product counts a death at),
+      # the hides logged after the first kill, and `covers_missing`: changes are missing and every
+      # one fell due inside the run (false with none missing).
+      require scheduled_changes_shown '. as $r | '"$DUE_AFTER_KILL"'
         | ($r.overlay.score_index_changes | map(.index)) as $shown
-        | ($r.frames_table | last | .[0]) as $last
-        | [scheduled[] | select($k != null and .due_ms > $k and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due
         | ($due | length) >= 1 and ($due - $shown) == []' \
-        '. as $r | (mark("kill") | last | .at_ms) as $k
-        | ($r.frames_table | last | .[0]) as $last
-        | [scheduled[] | select($k != null and .due_ms > $k and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due
+        '. as $r | '"$DUE_AFTER_KILL"'
         | ($due - ($r.overlay.score_index_changes | map(.index))) as $missing
         | (mark("kill") | first | .at_ms) as $k0
-        | ([$r.overlay.runs[] | select(.index == null and .from_ms > $k0)] | max_by(.frames)) as $off
+        | ([$r.overlay.runs[] | select(.index == null and $k0 != null and .from_ms > $k0)] | max_by(.frames)) as $off
         | {due_after_last_kill: ($due | length), missing: $missing,
            lag_ms: [$r.overlay.score_index_changes[] | select(.due_wall_ms != null and $k != null and .due_wall_ms > $k)
              | .frame_wall_ms - .due_wall_ms] | {min: min, max: max},
            off_air: (if $off == null then null
-             else ([mark("kill")[] | select(.at_ms < $off.from_ms) | .at_ms] | last) as $kb
-             | {from_ms: $off.from_ms, after_kill_ms: ($off.from_ms - $kb), ms: ($off.to_ms - $off.from_ms),
-                frames: $off.frames, to_end: ($off == ($r.overlay.runs | last)),
-                covers_missing: all(scheduled[] | select(.index as $i | any($missing[]; . == $i)) | .due_ms;
-                  . + $t.budget_frame_to_encoder_ms >= $off.from_ms and . < $off.to_ms)} end)}'
+             else less($off.from_ms; [mark("kill")[] | select(.at_ms < $off.from_ms) | .at_ms] | max) as $after
+             | {from_ms: $off.from_ms, after_kill_ms: $after, at_kill: ($after <= $t.cef_child_poll_ms),
+                ms: ($off.to_ms - $off.from_ms), frames: $off.frames, to_end: ($off == ($r.overlay.runs | last)),
+                hidden_after_kill: ([$r.log.overlay_hidden[] | select(.at_ms > $k0)] | length),
+                covers_missing: (($missing | length) >= 1
+                  and all(scheduled[] | select(.index as $i | any($missing[]; . == $i)) | .due_ms;
+                    . + $t.budget_frame_to_encoder_ms >= $off.from_ms and . < $off.to_ms))} end)}'
       ;;
     fast)
       require kills_distinct '(mark("kill") | length) >= 1 and (mark("kill") | map(.value.pid) | repeats) == []' \

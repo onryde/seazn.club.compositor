@@ -189,17 +189,18 @@ case_verdict() {
     # the timeline schedules after it shown (case 15's one-fewer: a page that stops painting and
     # keeps beating holds a stale score on air), and graphics never gave up. Due up to the last
     # PROGRAMME frame, never the last frame whose overlay read: that bound passed a page that went
-    # off air partway, and read "0 due" for one that went off at once (case 15's Owed 96).
+    # off air partway, and read "0 due" for one that went off at once (case 15's Owed 96). And no
+    # later than the end request (the final hold is not this check's; the PR #79 review's m-1).
     local newest='(mark("kill") | last | .at_ms) as $k
       | ([.log.cef_loading[] | select($k != null and .at_ms > $k)] | last) as $n
       | (if $n == null then null else [.log.cef_ready[] | select(.gen == $n.gen and .at_ms > $n.at_ms)] | first | .at_ms end) as $ready'
     require overlay_on_air "$newest"' | . as $r
       | ($r.overlay.score_index_changes | map(.index)) as $shown
-      | ($r.frames_table | last | .[0]) as $last
+      | ([($r.frames_table | last | .[0]), $run.end_request_ms] | min) as $last
       | [scheduled[] | select($ready != null and .due_ms > $ready and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due
       | ($due | length) >= 1 and ($due - $shown) == []
       and ([.log.overlay_hidden[] | select(.reason == "failed")] == [])' \
-      "$newest"' | . as $r | ($r.frames_table | last | .[0]) as $last
+      "$newest"' | . as $r | ([($r.frames_table | last | .[0]), $run.end_request_ms] | min) as $last
       | [scheduled[] | select($ready != null and .due_ms > $ready and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due
       | {newest_gen: $n.gen, ready_ms: $ready, due_after_ready: ($due | length),
          missing: ($due - ($r.overlay.score_index_changes | map(.index))),
