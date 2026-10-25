@@ -128,6 +128,8 @@ struct Listener {
     stream_ids: Arc<Mutex<Vec<String>>>,
     /// Callers whose handshake completed (`caller-added`).
     callers: Arc<AtomicUsize>,
+    /// When the first caller's handshake completed (`caller-added`; `Listener::start` only).
+    first_caller_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Listener {
@@ -179,7 +181,10 @@ impl Listener {
         });
         let callers = Arc::new(AtomicUsize::new(0));
         let added = Arc::clone(&callers);
+        let first_caller_at: Arc<Mutex<Option<Instant>>> = Arc::default();
+        let first = Arc::clone(&first_caller_at);
         out.connect("caller-added", false, move |_| {
+            first.lock().unwrap().get_or_insert_with(Instant::now);
             added.fetch_add(1, Ordering::SeqCst);
             None
         });
@@ -189,6 +194,7 @@ impl Listener {
             port,
             stream_ids,
             callers,
+            first_caller_at,
         }
     }
 
@@ -222,6 +228,7 @@ impl Listener {
             port,
             stream_ids: Arc::default(),
             callers,
+            first_caller_at: Arc::default(),
         }
     }
 
@@ -574,11 +581,14 @@ fn the_harness_lets_a_start_go_only_past_its_handshake() {
 }
 
 /// Production's order, which the harness's hold takes out of every other connecting test here: the
-/// source is PLAYING, its reader already in its read loop, when the caller's handshake completes.
-/// Nothing listens until the source is PLAYING with no handshake (the caller repeats its handshake
-/// request until one is answered, inside SRT's own connect timeout, F-012), and the listener starts
-/// only then, so the handshake completes under a waiting reader. The reader wakes on the first data,
-/// which libsrt delivers only once the socket is connected, and the generation connects with no loss.
+/// source is PLAYING, its reader free to read, before the caller's handshake completes. Nothing
+/// listens until the source is seen PLAYING (the caller repeats its handshake request until one is
+/// answered, inside SRT's own connect timeout, F-012), so the order is made by construction; it is
+/// witnessed on two clocks: the source had no handshake when it was seen PLAYING, and the listener's
+/// own `caller-added` came after that instant (a listener started before the rebuild accepts the
+/// caller about a millisecond in, before the source goes PLAYING). The reader wakes on the first
+/// data, which libsrt delivers only once the socket is connected, and the generation connects with no
+/// loss.
 #[test]
 fn a_reader_already_waiting_when_the_handshake_completes_connects() {
     let _s = serial();
@@ -587,33 +597,46 @@ fn a_reader_already_waiting_when_the_handshake_completes_connects() {
     let t0 = Instant::now();
     let deadline = t0 + connect_budget();
     input.rebuild(1, &spec(port));
-    let src = loop {
+    let (src, reader_free_at) = loop {
         let playing = input
             .pipeline()
             .and_then(|p| p.by_name("src"))
             .filter(|src| src.current_state() == gst::State::Playing);
         if let Some(src) = playing {
-            break src;
+            break (src, Instant::now());
         }
         assert!(Instant::now() < deadline, "the source never went PLAYING");
         thread::sleep(Duration::from_millis(2));
     };
-    let playing_after = t0.elapsed();
-    let handshake_before_the_listener = srt_connected(&src);
+    let connected_when_free = srt_connected(&src);
     let l = Listener::start(port, &cfg(640, 360));
     let seen = events_until(&rx, left(deadline), |e| *e == Event::InputConnected { gen: 1 });
     let connected_after = t0.elapsed();
     let second = events_for(&rx, Duration::from_secs(1));
+    let accepted_at = l
+        .first_caller_at
+        .lock()
+        .unwrap()
+        .expect("the listener accepted the caller");
     eprintln!(
-        "source PLAYING after {playing_after:?}, handshake completed before the listener started: \
-         {handshake_before_the_listener}; connected after {connected_after:?}; {} frames in the next \
-         second; callers {}",
+        "source PLAYING after {:?}, connected then: {connected_when_free}; the listener accepted the \
+         caller {:?} after that (negative: {:?} before); connected after {connected_after:?}; {} frames \
+         in the next second; callers {}",
+        reader_free_at - t0,
+        accepted_at.saturating_duration_since(reader_free_at),
+        reader_free_at.saturating_duration_since(accepted_at),
         frames_in(&second),
         l.callers.load(Ordering::SeqCst)
     );
     assert!(
-        !handshake_before_the_listener,
-        "nothing listened, so no handshake had completed: the reader was waiting first"
+        accepted_at > reader_free_at,
+        "the handshake completed {:?} before the source was seen PLAYING: the harness's order, not \
+         production's",
+        reader_free_at.saturating_duration_since(accepted_at)
+    );
+    assert!(
+        !connected_when_free,
+        "the source was connected when it went PLAYING: its reader was not waiting first"
     );
     assert!(losses(&seen).is_empty(), "{seen:?}");
     assert!(losses(&second).is_empty(), "{second:?}");
