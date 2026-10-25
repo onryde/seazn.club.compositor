@@ -2244,6 +2244,38 @@ fn output_hung_swaps_on_the_egress_backstop_and_reds_on_any_other_path() {
         }
         checked += 1;
     }
+    // The PR #84 review's m-2: every row of `mtx_duration_ms`'s unit table. Each reading's ms is worked
+    // out by hand from its unit (1 d = 86 400 000 ms, 1 h = 3 600 000, 1 s = 1 000, 1 ms = 1,
+    // 1 µs = 1/1 000, 1 ns = 1/1 000 000; Go's String() writes `µs`, its parser also takes `us`), and
+    // judged against what the case asks: under it reds `destination_outwaits` alone, at or past it
+    // passes. "500ms" is the fail-open one: read in any longer unit it would pass.
+    for (tag, read, by_hand) in [
+        ("hung-mtx-ms", "500ms", 500.0),
+        ("hung-mtx-h", "1h", 3_600_000.0),
+        ("hung-mtx-s", "90s", 90_000.0),
+        ("hung-mtx-d", "1d", 86_400_000.0),
+        ("hung-mtx-us", "60000000us", 60_000.0),
+        ("hung-mtx-micro", "59999999µs", 59_999.999),
+        ("hung-mtx-ns", "60000000000ns", 60_000.0),
+        ("hung-mtx-ns-short", "59999999999ns", 59_999.999_999),
+    ] {
+        let mut w = output_hung("hold");
+        w.marks.retain(|m| m.0 != "mtx_read_timeout");
+        let at = w.drive + 200;
+        w.mark("mtx_read_timeout", at, json!(read));
+        let v = judge(&w, "output-hung", "hold", tag);
+        let got = v.json["measures"]["destination_outwaits"]["read_ms"].as_f64();
+        assert!(
+            got.is_some_and(|g| (g - by_hand).abs() < 1e-6),
+            "{tag}: {read} read as {got:?} ms, by hand {by_hand}"
+        );
+        if by_hand < asked as f64 {
+            assert_eq!(v.json["failed"], json!(["destination_outwaits"]), "{tag}");
+        } else {
+            assert_pass(&v, tag);
+        }
+        checked += 1;
+    }
     // The confirm pass's n-2: the programme lost beyond the hang's outage is inside spec §6's output
     // stall row ("≤2 s of programme lost", budget_output_lost_max_ms), as cases 4, 5 and 12 judge
     // theirs. At the budget passes, 1 ms past it reds, and an unread loss reds (jq sorts null below
@@ -2292,8 +2324,64 @@ fn output_hung_swaps_on_the_egress_backstop_and_reds_on_any_other_path() {
     let lost = v.json["measures"]["lost_ms"].as_i64().unwrap();
     assert!(lost > lost_budget, "hung-lost-camera-silent: lost {lost}");
     checked += 1;
+    // The PR #84 review's m-1: spec §6's "≤2 s of programme lost" is the recovery target of one output
+    // stall, so it bounds the programme lost over every outage the hang causes (the window
+    // `no_outage_outside_hang` excuses, from the plant to a reconnect's budget past the swap), summed,
+    // a negative reading counting as none (Owed 92: the dating's, never programme regained). With a
+    // second outage in sink 2's first seconds: both small passes; the second alone over the budget
+    // reds; a −budget first reading does not hide it; two under the budget whose sum is over it red.
+    // And no outage in the window at all reds.
+    let second = (1_000, 1_500);
+    assert!(
+        second.1 < w.ms("budget_output_reconnect_ms"),
+        "the second outage is inside the window"
+    );
+    let with_second = || {
+        let mut w = output_hung("hold");
+        let swap = w
+            .log
+            .iter()
+            .find(|l| l.1 == "sink swap gen=2 target=rtmp")
+            .unwrap()
+            .0;
+        w.outages.push((swap + second.0, swap + second.1));
+        w
+    };
+    fn two_lost(r: &mut Value, f: fn(i64) -> (i64, i64)) {
+        let (a, b) = f(threshold_ms("budget_output_lost_max_ms"));
+        let o = r["output_outages"].as_array_mut().unwrap();
+        assert_eq!(o.len(), 2, "two outages: {o:?}");
+        o[0]["lost_ms"] = json!(a);
+        o[1]["lost_ms"] = json!(b);
+    }
+    let v = judge(&with_second(), "output-hung", "hold", "hung-lost-two-under");
+    assert_pass(&v, "hung-lost-two-under");
+    let lost = &v.json["measures"]["output_lost"]["lost_ms"];
+    assert_eq!(
+        lost.as_array().map(Vec::len),
+        Some(2),
+        "hung-lost-two-under: both outages judged: {lost}"
+    );
+    checked += 1;
+    let pairs: [(&str, Patch); 3] = [
+        ("hung-lost-second-over", |r| two_lost(r, |b| (0, b + 1))),
+        ("hung-lost-masked", |r| two_lost(r, |b| (-b, b + 1))),
+        ("hung-lost-sum-over", |r| two_lost(r, |b| (b / 2 + 1, b - b / 2))),
+    ];
+    for (tag, patch) in pairs {
+        let mut w = with_second();
+        w.report_patch = Some(patch);
+        let v = judge(&w, "output-hung", "hold", tag);
+        assert_eq!(v.json["failed"], json!(["output_lost"]), "{tag}");
+        checked += 1;
+    }
+    let mut w = output_hung("hold");
+    w.outages.clear();
+    let v = judge(&w, "output-hung", "hold", "hung-lost-no-outage");
+    assert_fails(&v, "output_lost", "hung-lost-no-outage");
+    checked += 1;
     eprintln!("output-hung sims checked: {checked}");
-    assert_eq!(checked, 41);
+    assert_eq!(checked, 54);
 }
 
 /// What the starvation did to the compositor (case 6). The honest beat (Owed 86; the owner,

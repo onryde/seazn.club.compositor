@@ -233,13 +233,14 @@ def hung_swap_judged:
 # A duration as MediaMTX's API prints it (`GET /v3/config/global/get`, F-021): its `conf.Duration`
 # (internal/conf/duration.go at v1.21.2) is a day count `<n>d` when there is one, then Go's
 # `time.Duration` String(), e.g. "1m0s", "10s", "59.999s", "500ms". In ms; null for anything else
-# (not a string, empty, a number with no unit, or text before, between or after the parts), so a
-# reading that is not a duration never passes a `>=`. The unit table is the format's, not a bound.
+# (not a string, empty, a number with no unit, or text before, between or after the parts: the
+# parts must spell the whole string, and no parts spell null), so a reading that is not a duration
+# never passes a `>=`. The unit table is the format's, not a bound.
 def mtx_duration_ms:
   if type != "string" then null
   else (if startswith("-") then [-1, .[1:]] else [1, .] end) as [$sign, $s]
     | [$s | scan("([0-9]+(?:\\.[0-9]+)?)(d|h|ms|us|µs|ns|m|s)")] as $parts
-    | if $parts == [] or ($parts | map(add) | add) != $s then null
+    | if ($parts | map(add) | add) != $s then null
       else $sign * ($parts | map((.[0] | tonumber)
           * {d: 86400000, h: 3600000, m: 60000, s: 1000, ms: 1, us: 0.001, "µs": 0.001, ns: 0.000001}[.[1]])
         | add)

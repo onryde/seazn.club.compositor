@@ -35,9 +35,10 @@
 # That what the case asks outwaits the window, at this threshold and at a whole budget's, is
 # case_verdicts.rs's to pin: both numbers come from harness/thresholds.json.
 #
-# The programme lost beyond the hang's outage is inside spec §6's output stall row (`output_lost`,
-# budget_output_lost_max_ms; the confirm pass's n-2), as cases 4, 5 and 12 judge theirs, with no
-# floor. CI read -2 002, -1 992, +56 and +84 ms (runs 40154724972, 40154728288): Owed 92's dating of
+# The programme lost beyond the hang's outages is inside spec §6's output stall row (`output_lost`,
+# budget_output_lost_max_ms; the confirm pass's n-2): summed over every outage from the plant to a
+# reconnect's budget past the swap (the PR #84 review's m-1; cases 4, 5 and 12 bound each outage),
+# with no floor. CI read -2 002, -1 992, +56 and +84 ms (runs 40154724972, 40154728288): Owed 92's dating of
 # a connection's first segment (F-028), about -2 s when that segment's head shows the camera, about 0
 # when MediaMTX's recorder discarded a sample and its head is the frames before the first keyframe.
 
@@ -85,6 +86,10 @@ ROOM='([$t.output_gap_budget_ms, hung_swap.ceiling_ms + $t.output_connect_timeou
 # The outage the hang caused: the one spanning the plant and the swap (none without both: jq reads
 # `x < null` false).
 GAP="hung_swap as \$s | [.output_outages[] | select(.to_wall_ms > \$s.planted_ms and .from_wall_ms < \$s.swap_ms)]"
+# Every outage the hang causes: from the plant to a reconnect's budget past the swap, the window
+# `no_outage_outside_hang` excuses (none without both, as above).
+HANG_OUTAGES="hung_swap as \$s | [.output_outages[] | select(.to_wall_ms > \$s.planted_ms
+  and .from_wall_ms < \$s.swap_ms + \$t.budget_output_reconnect_ms)]"
 
 # MediaMTX's reading, in ms (null when unread or not a duration: jq sorts it below every number).
 MTX_READ='(mark_value("mtx_read_timeout") | mtx_duration_ms)'
@@ -135,10 +140,16 @@ case_verdict() {
     | ($b | length) >= 1 and all($b[]; .body.state == "playing")' \
     'hung_swap as $s | [beats[] | select($s.swap_ms != null and .received_ms >= $s.swap_ms
       and .received_ms < $run.end_request_ms) | {received_ms, state: .body.state, output: .body.output}]'
-  # Spec §6's output stall row, "≤2 s of programme lost" (the header's n-2). No outage, or one with
-  # no camera counter on a side, reads null, and null passes `<=` in jq: the first conjunct reds it.
-  require output_lost "(($GAP) | first | .lost_ms) as \$l | \$l != null and \$l <= \$t.budget_output_lost_max_ms" \
-    "{lost_ms: (($GAP) | first | .lost_ms), budget: \$t.budget_output_lost_max_ms}"
+  # Spec §6's output stall row, "≤2 s of programme lost" (the header's n-2), is one stall's recovery
+  # target, so it bounds the programme lost over every outage the hang causes, summed (the PR #84
+  # review's m-1), a negative reading counting as none (Owed 92: the dating's, never programme
+  # regained). No outage in the window reds, and so does one with no camera counter on a side (its
+  # null would read as 0 below, and passes `<=` in jq).
+  require output_lost "[($HANG_OUTAGES)[] | .lost_ms] as \$l | (\$l | length) >= 1 and all(\$l[]; . != null)
+    and ([\$l[] | if . < 0 then 0 else . end] | add) <= \$t.budget_output_lost_max_ms" \
+    "[($HANG_OUTAGES)[] | .lost_ms] as \$l | {lost_ms: \$l,
+      programme_lost_ms: ([\$l[] | select(. != null) | if . < 0 then 0 else . end] | add),
+      budget: \$t.budget_output_lost_max_ms}"
   measure gap_ms "($GAP) | first | .to_wall_ms - .from_wall_ms"
   measure lost_ms "($GAP) | first | .lost_ms"
   require_no_false_restart
