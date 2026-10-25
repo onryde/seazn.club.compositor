@@ -497,7 +497,9 @@ happen" turned into a tested guard.
   before the bound is not Connected while it is silent: the sink's error ends it as a failure, and a
   growth that resumes at or past the bound, counted from the first growth, connects. A silence inside
   the proof is no failure and does not restart it
-  (`a_proving_sink_that_grows_again_after_a_silence_connects_at_the_bound`).
+  (`a_proving_sink_that_grows_again_after_a_silence_connects_at_the_bound`). (Amended 2026-10-25,
+  Owed 94: while the encoders starve or are unread; with both delivering, a silence of
+  `output_egress_flat_ms` is the backstop's, below.)
 - (Amended 2026-10-19.) Every sweep prints its count and fails on 0. Each guard's mutant goes red: the
   bound's `>=`, the reset placement, and the generation checks.
 - (Amended 2026-10-24, Owed 87.) No stall rule: `output_stall_after_ms` and `SwapReason::Stall` are
@@ -506,6 +508,14 @@ happen" turned into a tested guard.
   `a_proving_sink_that_goes_silent_waits_for_its_error`). A destination stall swaps one base back-off
   after the sink's own error at `OUTPUT_SINK_TIMEOUT_MS` (`a_destination_stall_swaps_on_the_sinks_timeout_error`).
   Each mutant went red: a stall path re-added in Proving, one in Connected, and the constant at 20 s.
+  (Amended 2026-10-25, Owed 94; the PR #76 review's I-2.) True only while the encoders starve or are
+  unread: those two tests sent no encoder reading, which production always sends. They now send
+  starving readings (the totals repeat) and are renamed
+  `a_connected_sink_that_sends_nothing_while_the_encoders_starve_is_swapped_only_by_its_error` and
+  `a_proving_sink_that_goes_silent_while_the_encoders_starve_waits_for_its_error`. With both encoders
+  delivering, the backstop ends a flat sink (next bullet). And "a destination stall swaps on the
+  sink's error" holds when one socket wait outlasts the timeout; a multi-wake trickle never errors
+  (the PR #73 review's P-3).
 - (Amended 2026-10-25, Owed 94.) The egress backstop, not a stall rule. Owner, 2026-10-24, in chat,
   relayed by the coordinator: "B". A Proving or Connected sink whose total has not grown for
   `output_egress_flat_ms` while both encoded tracks grew at every reading backs off with
@@ -529,15 +539,20 @@ target. Owner, 2026-10-24, in chat, relayed by the coordinator: "B".
 
 **As built.**
 - `config.rs`: `output_egress_flat_ms(backoff_base_ms, connect_timeout_ms)`, one derived constant: the
-  15 s gap budget less a failed reconnect (the connect timeout), the base back-off, one progress poll and
-  two widest ticks, floored to the poll. With today's constants that is 9 000 ms; the value is pending
-  with the owner, so the answer changes one place. `OUTPUT_PROGRESS_POLL_MS` and `TICK_WIDEST_MS` move
+  15 s gap budget less one connect's worst case (the connect timeout; not a failed reconnect: the hung
+  path fits with no failed connect, as the stall path does), the base back-off, one progress poll and
+  two widest ticks, floored to the poll. With today's constants that is 9 000 ms. The owner,
+  2026-10-25, in chat, relayed by the coordinator ("Apply rec", the coordinator's recommendation of
+  the derived value): 9 s, keeps the worst outage under 15 s. `OUTPUT_PROGRESS_POLL_MS` and `TICK_WIDEST_MS` move
   into `domain::config` so the derivation reads them (adapters re-exports the poll). `Thresholds` gains
   `output_egress_flat_ms`.
 - Two assertions from independent sums: `the_egress_backstop_is_the_longest_threshold_that_keeps_the_15_s_budget`
   (the worst hung gap stays inside the budget, and one poll more would not) and
-  `a_destination_stall_reaches_the_sinks_error_before_the_backstop` (the threshold sits above the sink
-  timeout plus a poll and a tick). The poll's pin moved with it: `the_progress_poll_is_owed_15s_250_ms`.
+  `a_socket_wait_past_the_timeout_errors_before_the_backstop` (the threshold sits above the sink
+  timeout plus a poll and a tick; renamed from `a_destination_stall_reaches_the_sinks_error_before_the_backstop`,
+  since a multi-wake trickle never errors). The poll's pin moved with it: `the_progress_poll_is_owed_15s_250_ms`.
+  `output_recovery_paths_against_the_f004_budget_on_a_1_ms_grid` pins 0 failed connects after a hang
+  (the PR #76 review's m-1).
 - `OutputLink::on_delivery(now, gen, Encoded)`: a reading whose two encoded totals both grew keeps
   `delivering_since`; any other reading clears it. `egress_flat` reads elapsed(now, max(grew_at,
   delivering_since)), and a build clears the egress, so the new sink's clock starts at its first growth.
@@ -546,15 +561,26 @@ target. Owner, 2026-10-24, in chat, relayed by the coordinator: "B".
 - `links.rs` sweeps: `the_egress_backstop_ends_only_a_flowing_sink_and_only_while_the_encoders_deliver`
   (the delivery/egress pairs) and, for the PR #73 review's P-3,
   `a_multi_wake_trickle_is_swapped_by_the_backstop_only_where_no_socket_wait_reaches_the_timeout`
-  (26 rows: 10 errored at +5 508 ms, 12 swapped by the backstop at +9 520 ms, 4 never). A trickle
+  (26 rows at 9 000 ms: 10 errored at +5 508 ms, 12 swapped by the backstop at +9 520 ms, 4 never;
+  the tally is no longer pinned, so it moves with the threshold, the PR #76 review's m-4). A trickle
   whose every socket wait is under the sink timeout was never swapped before; the backstop now swaps it,
-  with the reason `egress_stalled`, not `error`.
+  with the reason `egress_stalled`, not `error`. When the trickle persists (the review's m-2,
+  `a_persistent_multi_wake_trickle_swaps_every_later_sink_from_proving_and_none_connects`), every later
+  sink is swapped from Proving too, never Connected, its back-off climbing to the cap: builds every
+  10.3, 11.2, 11.3, 11.3 s, the beat never `playing`, where before one Connected sink read `playing`
+  over one frame per message.
+- `app::run` (the review's m-5) steps the messages already queued before it ticks, so a driver
+  thread that stalled past the threshold reads the queued growth before the backstop judges it
+  (`a_driver_stalled_past_the_backstop_reads_its_queued_readings_before_it_ticks`; red before:
+  `[Backoff, Backoff]`).
 - Mutants D1 to D7, each red with named tests: the threshold below the sink timeout (4 reds, the two
   ordering/budget assertions among them), counting during starvation (5), no swap from Connected (6),
   the supervisor dropping the encoded counts (1), the egress not cleared at a build
   (`the_backstop_restarts_with_each_sink_and_ignores_other_generations`), no swap from Proving
   (`a_proving_sink_that_stops_growing_is_swapped_too_and_carries_its_failures`), and a starved reading
-  not restarting the clock (2).
+  not restarting the clock (2). Fix round 1 (the PR #76 review): D8, a repeated encoded total counted as
+  delivery, reds both renamed starvation tests and two more (4); A1, `run()` stepping nothing before
+  it ticks, reds the stalled-driver scenario.
 
 ## Amendment 2026-10-19 (Owed 38: Connected is earned by sustained growth)
 
@@ -651,11 +677,14 @@ won once, by about 1 ms. rtmp2 counts bytes only when a whole message is written
   `Connected` and `Backoff { attempt, until }`. No state keeps a last progress. Proving still earns
   Connected only by growth (Owed 38), and a repeated or backwards total is no progress. A silence
   inside the proof no longer fails it: the first growth at or past the bound connects, however long
-  the sink was silent before it (the PR #73 review's m-2).
+  the sink was silent before it (the PR #73 review's m-2). (Amended 2026-10-25, Owed 94: however long
+  while the encoders starve or are unread; with both delivering, a silence of `output_egress_flat_ms`
+  is the backstop's.)
 - `on_tick` keeps two timers: a due back-off builds, and a Connecting sink past
   `output_connect_timeout_ms` backs off (`SwapReason::ConnectTimeout`). Proving and Connected have
   no timer: only `on_error` ends them (`SwapReason::Error`; from Connected it is failure 1, so the
-  base back-off comes first).
+  base back-off comes first). (Amended 2026-10-25, Owed 94: since the backstop, Proving and Connected
+  have one more timer, `output_egress_flat_ms` of flat egress while both encoders deliver.)
 - `Thresholds::output_stall_after_ms` and `SwapReason::Stall` are removed. `config::OUTPUT_SINK_TIMEOUT_MS`
   (5 000, GStreamer 1.24.2's rtmp2 default) is the adapter's sink timeout (C09's amendment of this
   date). The domain reads it only in tests, to time a stall's error.
@@ -665,7 +694,8 @@ won once, by about 1 ms. rtmp2 counts bytes only when a whole message is written
 - The 15 s budget (`tests/links.rs`): a stall's recovery from the last bytes is the sink's timeout
   plus the recovery from an error, 10 499 ms, then 16 499 ms through one failed connect.
 - **Not covered any more** (the implementer's note): a sink that sends nothing and never errors stays
-  Connected.
+  Connected. (Amended 2026-10-25: while the encoders starve; with both delivering, Owed 94's backstop
+  swaps it.)
 
 ## Do not touch
 

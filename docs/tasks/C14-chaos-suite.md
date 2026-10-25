@@ -906,15 +906,24 @@ none an owner ruling. Decision log "C14 case 16 wired".
 
 Owner, 2026-10-24, in chat, relayed by the coordinator: "B": a sink whose egress stays flat while
 both encoders deliver is swapped, and the beat says so (`docs/_INDEX.md` Owed 94, decision log
-"Owed 94 built"; C04's and C09's amendments of this date). The threshold, `output_egress_flat_ms`,
-is pending with the owner (the coordinator recommended the derived 9 000 ms, 2026-10-25).
+"Owed 94 built"; C04's and C09's amendments of this date). The threshold, `output_egress_flat_ms`:
+owner 2026-10-25: 9 s, keeps worst outage under 15 s (owner, 2026-10-25, in chat, relayed by the
+coordinator: "Apply rec", the coordinator's recommendation of the derived value); it stays the single
+derived constant.
 - **Case 18, `output-hung`** (n 18; legs `output-hung-hold` and `output-hung-hang`, so 37 legs): on
   the `relay-test-hooks` image (`RELAY_TEST_HOOKS_IMAGE`, `harness/compose.output-hung.yml`), Owed
   94's hook stalls sink 1 `OUTPUT_HUNG_AFTER_MS` (25 s) after its build: `hold` holds its writes,
-  `hang` hangs its streaming thread (its teardown hangs too). 70 s live, no drive. 16 checks:
+  `hang` hangs its streaming thread (its teardown hangs too). 70 s live, no drive. 18 checks
+  (16 as first built; fix round 1 added `destination_outwaits` and `beat_playing_again`):
+  - `destination_outwaits` (the PR #76 review's I-1): MediaMTX closes a publisher idle for its
+    `readTimeout`, 10 s by default in 1.21.2, which CI measured 9 978-9 983 ms after the plant,
+    inside the backstop's window. Case 18 alone (`compose.output-hung.yml`) sets `MTX_READTIMEOUT` to
+    four of output_gap_budget_ms (60 s), and this guard pins `hung_swap`'s ceiling under it on
+    every run;
   - `armed` and `planted` (preconditions: the arming line once, the variant's stall and ms; one
-    plant, on sink 1), and `planted_in_drive` (after the drive's start, with output_gap_budget_ms
-    before the end);
+    plant, on sink 1), and `planted_in_drive` (after the drive's start, with room before the end:
+    the window's ceiling, `beat_playing_again`'s wait and a heartbeat, longer than
+    output_gap_budget_ms);
   - `backstop_swap` (`hung_swap_judged`, lib.jq): the first swap after the plant reads
     `egress_stalled`, the reason lines pair the swap lines, sink 1 logged no error before it, and the
     plant to the swap on the lines' own `ts=` is from output_egress_flat_ms + output_backoff_base_ms −
@@ -924,8 +933,12 @@ is pending with the owner (the coordinator recommended the derived 9 000 ms, 202
     could earn Connected (output_connected_after_ms after the swap), a tick in from each end, and
     every one reads `stalled`;
   - `gap_in_budget` (one outage between the plant and the swap, at most output_gap_budget_ms, the
-    owner's 15 s target), `no_outage_outside_hang`, `one_swap`; the false-positive sweep,
-    `no_restarts` and `ended_beat`; measures `gap_ms` (the key) and `lost_ms`.
+    owner's 15 s target), `no_outage_outside_hang`, `one_swap`;
+  - `beat_playing_again` (the review's m-3, the plan's "and `playing` again"): from the swap plus
+    output_connect_timeout_ms, output_connected_after_ms and two ticks until the end request, at least
+    one beat, all `playing`;
+  - the false-positive sweep, `no_restarts` and `ended_beat`; measures `gap_ms` (the key) and
+    `lost_ms`.
 - **b-1 (the PR #73 confirm pass):** `stall_swap`'s `error_to_swap_ms` is read from the two lines'
   own `ts=` (logfacts `GenAt.ts_ms`), with the floor exactly output_backoff_base_ms: an interval
   inside one process belongs on its clock. The cut-anchored bounds stay on docker's stamps (two
@@ -940,17 +953,24 @@ is pending with the owner (the coordinator recommended the derived 9 000 ms, 202
   reached (false premises, 2026-10-25); a backstop swap there is a red to read.
 - thresholds.json gains `output_egress_flat_ms`, `output_progress_poll_ms` (back, for the window)
   and `tick_widest_ms`.
-- **Host mutants**, 24, all KILLED, each with a named FAIL in a `case_verdicts.rs` sim: lib.jq's
+- **Host mutants**, 29, all KILLED, each with a named FAIL in a `case_verdicts.rs` sim: lib.jq's
   `hung_swap` (the reason, the pairing, the error-first, the floor, the ceiling, `ts=` against
   docker, the floor's tick term), case 18's checks (the beat's state and its count, the gap's budget
   and its one outage, the drive's two bounds, one swap, the arming's stall and ms, the plant's count,
-  flag and stall, the outage before and after), and b-1's floor, `ts=` and c-2's `<=`.
+  flag and stall, the outage before and after), and b-1's floor, `ts=` and c-2's `<=` (H1-H24); fix
+  round 1's H25-H29: `beat_playing_again`'s state, its count and its connect term, the destination's
+  deadline (MTX_READ_TIMEOUT_MS at 0 reds `destination_outwaits` in the good worlds), and the room's
+  heartbeat term.
 - **CI mutants** (a throwaway `mut/owed94` PR, the `mut/c14-case16` workflow's shape: the target check
   PASSes unmutated, then FAILs mutated with its controls still PASS): (a) the case on the plain relay
   image reds `armed`; (b) the backstop's Connected arm removed reds `backstop_swap` on `hold`; (c)
   progress readings without the encoded counts red `backstop_swap` on `hold`; (d) the threshold
   typed in as 15 000 reds `backstop_swap` on `hang`; (e) the hung sink torn down on the swapping
-  thread, not a reaper, reds `gap_in_budget` on `hang`.
+  thread, not a reaper, reds `gap_in_budget` on `hang`. All five KILLED (run 40149017532), but b, c
+  and d by MediaMTX's idle close at about 9.98 s (reason `error`, errors_before non-empty), not by the
+  backstop's absence (the PR #76 review's I-1). Fix round 1 re-runs b, c and d under the raised
+  deadline, each leg also asserting the mechanism on its verdict: b and c no swap after the plant and
+  no sink 1 error; d the swap `egress_stalled`, no error first, past the window's ceiling.
 
 ## Files
 
@@ -1017,7 +1037,9 @@ is pending with the owner (the coordinator recommended the derived 9 000 ms, 202
   read `stalled` until sink 2 could earn Connected, and the viewer's gap is one outage inside
   output_gap_budget_ms. Product mutants without the backstop, without the encoded counts, or with
   the threshold typed in red `backstop_swap`; one tearing the hung sink down on the swapping thread reds
-  `gap_in_budget`.
+  `gap_in_budget`. (Fix round 1, the PR #76 review) The destination outwaits the window
+  (`destination_outwaits`: MediaMTX's readTimeout raised for case 18 alone), and the beats read
+  `playing` again once sink 2 could have earned Connected (`beat_playing_again`).
 - (Amended 2026-10-18, Owed 20) Case 6 asserts the score stays on air through the stress and
   after it, and every beat's `rung` is `full`/`overlay_half_rate`, never back to `full` after a step.
 - (Amended 2026-10-20, C11b; Owed 62, 68, 69) Case 8 takes case 9's shape, with a non-zero, non-75 exit and no core
