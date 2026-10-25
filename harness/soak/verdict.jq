@@ -184,26 +184,32 @@ if ($page != "real" and $page != "test") then error("verdict: page must be real 
   # 1.projection. Memory at the session cap (owner ruling A, 2026-10-25): the drive's memMb fitted
   #    against time by least squares (x: hours since the start action), and the line projected to
   #    memory_projection.session_cap_min (a livestream's 5 h), within memory_budget_fraction of the
-  #    Machine's $memory_mb. The fit needs check 5.beats's floor of memMb beats, and a spread in time
-  #    to fit; fewer, none, or all at one instant fail (never a projection of nothing).
+  #    smaller of the Machine's $memory_mb and the production guest's (memory_projection's
+  #    production_guest in compositor_guest), so a bigger soak guest never loosens the budget. The
+  #    projection is judged as it is reported, to 0.1 MB: exactly at the budget passes. The fit needs
+  #    check 5.beats's floor of memMb beats, and a spread in time to fit; fewer, none, or all at one
+  #    instant fail (never a projection of nothing), and so does a production_guest soak.json lacks.
   ($soak.memory_projection) as $p
   | [$drive_beats[] | select((.body.memMb | type) == "number") | {x: ((.received_ms - $s) / 3600000), y: .body.memMb}] as $pts
   | ($pts | length) as $n
-  | ($memory_mb * $p.memory_budget_fraction) as $budget
+  | (if ($p.production_guest | type) == "string" then $soak.compositor_guest[$p.production_guest].memory_mb else null end) as $prod_mb
+  | (if ($prod_mb | type) == "number" then ([$memory_mb, $prod_mb] | min) * $p.memory_budget_fraction else null end) as $budget
   | (if $n == 0 then null else ([$pts[] | .x] | add) / $n end) as $xm
   | (if $n == 0 then null else ([$pts[] | .y] | add) / $n end) as $ym
   | (if $n == 0 then 0 else [$pts[] | (.x - $xm) * (.x - $xm)] | add end) as $sxx
   | (if $sxx == 0 then null else ([$pts[] | (.x - $xm) * (.y - $ym)] | add) / $sxx end) as $slope
   | (if $slope == null then null else $ym - $slope * $xm end) as $intercept
-  | (if $slope == null then null else $intercept + $slope * $p.session_cap_min / 60 end) as $projected
+  | (if $slope == null then null else $intercept + $slope * $p.session_cap_min / 60 | round1 end) as $projected
   | check("1.projection"; "memory projection";
       $no_report + $no_start
       + (if $n < $want_beats then ["memory projection: \($n) drive beats carry memMb, want at least \($want_beats) (check 5.beats's floor)"] else [] end)
       + (if $n > 0 and $slope == null then ["memory projection: \($n) memMb beat(s) with no spread in time to fit"] else [] end)
-      + (if $projected != null and $projected > $budget
-         then ["memory projection: the drive's fit (\($slope | round1) MB/h from \($intercept | round1) MB, \($n) beats) reaches \($projected | round1) MB at the session cap of \($p.session_cap_min) min, over the budget of \($budget) MB (\($p.memory_budget_fraction * 100) % of the Machine's \($memory_mb) MB)"] else [] end);
+      + (if $budget == null then ["memory projection: no budget: soak.json's memory_projection.production_guest (\($p.production_guest | tojson)) names no compositor_guest with a memory_mb"] else [] end)
+      + (if $projected != null and $budget != null and $projected > $budget
+         then ["memory projection: the drive's fit (\($slope | round1) MB/h from \($intercept | round1) MB, \($n) beats) reaches \($projected) MB at the session cap of \($p.session_cap_min) min, over the budget of \($budget) MB (\($p.memory_budget_fraction * 100) % of \([$memory_mb, $prod_mb] | min) MB: the Machine's \($memory_mb), production's \($prod_mb))"] else [] end);
       {beats_fitted: $n, want_beats: $want_beats, slope_mb_per_h: ($slope | round1), intercept_mb: ($intercept | round1),
-       session_cap_min: $p.session_cap_min, projected_mb: ($projected | round1), budget_mb: $budget, machine_memory_mb: $memory_mb}),
+       session_cap_min: $p.session_cap_min, projected_mb: $projected, budget_mb: $budget, machine_memory_mb: $memory_mb,
+       production_guest: $p.production_guest, production_memory_mb: $prod_mb}),
 
   # 1.split. The memory experiment's evidence (schedule dropouts or none; never the soak's, whose
   #    page=real log the runner may withhold): in the drive, lines carrying the compositor's RSS and

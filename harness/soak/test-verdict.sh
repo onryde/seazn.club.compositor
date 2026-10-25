@@ -40,9 +40,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 JQ="${JQ:-jq}"
 GREEN="$HERE/fixtures/green"
-# The compositor Machine's memory the verdict is told (soak.yml passes its C_MEM): the production
-# guest's, performance-4x (soak.yml's default guest; test-workflow.sh pins that default).
-MEM="$("$JQ" -er '.compositor_guest["performance-4x"].memory_mb' "$HERE/soak.json")"
+# The compositor Machine's memory the verdict is told (soak.yml passes its C_MEM): by default the
+# production guest's (soak.json's memory_projection.production_guest, soak.yml's default guest;
+# test-workflow.sh pins both). The check 1.projection section moves it for one case at a time.
+MEM_PROD="$("$JQ" -er '.compositor_guest[.memory_projection.production_guest].memory_mb' "$HERE/soak.json")"
+MEM="$MEM_PROD"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -241,12 +243,14 @@ case_ overlay-unsampled real fail '5d' 'overlay' 'del(.samples[9])'
 
 # --- check 1's bound and check 1.projection (owner rulings, 2026-10-25) -----------------------------
 # `measured <name> <out> <check id> <jq test>`: one check's `measured`, with soak.json as $soak, the
-# thresholds as $t and the Machine's memory as $mem, against numbers the case planted.
+# thresholds as $t, the Machine's memory the case ran with as $mem and the production guest's as
+# $prod, against numbers the case planted.
 measured() {
   local name="$1" out="$2" id="$3" test="$4"
   cases=$((cases + 1))
   checks=$((checks + 1))
-  if "$JQ" -e --arg id "$id" --slurpfile soak "$HERE/soak.json" --slurpfile t "$ROOT/harness/thresholds.json" --argjson mem "$MEM" \
+  if "$JQ" -e --arg id "$id" --slurpfile soak "$HERE/soak.json" --slurpfile t "$ROOT/harness/thresholds.json" \
+    --argjson mem "$MEM" --argjson prod "$MEM_PROD" \
     '$soak[0] as $soak | $t[0] as $t | [.checks[] | select(.id == $id) | .measured] as $m | ($m | length) == 1 and ($m[0] | '"$test"')' \
     "$out" >/dev/null 2>&1; then
     echo "PASS measured $name"
@@ -265,14 +269,23 @@ measured "exactly at the bound" "$WORK/case-drift-at-bound.out" 1 \
 measured "0.1 point over the bound" "$WORK/case-memory-drift.out" 1 \
   '.hour1_median_mb == 500 and .hour3_median_mb == 500 + 500 * $soak.memory_drift_max + 0.5 and (.drift_pct * 10 | round) == ($soak.memory_drift_max * 1000 + 1 | round)'
 # The two readings the owner ruled on: the 3 h soak 40139563554 (hour 1's median 994 MB, hour 3's
-# 1220 MB: 22.7 %) and memory arm 1 40166664556 (13.2 %; its medians are not in this repo, so on
-# 1000 MB). Both pass.
-case_ drift-soak-40139563554 real pass '' '' 'def m1: 994; def m3($max): 1220; '"$DRIFT"
-measured "the 3 h soak's 22.7 % passes" "$WORK/case-drift-soak-40139563554.out" 1 \
-  '.hour1_median_mb == 994 and .hour3_median_mb == 1220 and .drift_pct == 22.7'
-case_ drift-arm1-40166664556 real pass '' '' 'def m1: 1000; def m3($max): 1132; '"$DRIFT"
+# 1220 MB: 22.7 %) and memory arm 1 40166664556 (13.2 %). Both pass. Check 1 reads a ratio, so each
+# is planted on about 500 MB, like the bound's cases: the soak's medians halved (497 and 610 MB,
+# still 22.7 %), arm 1's on 500 MB (its medians are not in this repo). The reason (PR #88 review
+# m3): these are whole-verdict cases, and in a 30-minute fixture a part-3 step fits about 6 times
+# the real run's slope (the step comes 20 minutes in, not 2 hours). On the real 994 MB the soak's
+# step projects 3932 MB, 4 % under check 1.projection's budget, so a change to the cap or the
+# fraction would red a case named for check 1; halved it projects about 1966 MB (the real run fits
+# 108.4 MB/h from 945.9 MB: 1487.8 MB). The bound's own cases project about 3100 MB.
+case_ drift-soak-40139563554 real pass '' '' 'def m1: 497; def m3($max): 610; '"$DRIFT"
+measured "the 3 h soak's 22.7 % passes (its medians halved)" "$WORK/case-drift-soak-40139563554.out" 1 \
+  '.hour1_median_mb == 497 and .hour3_median_mb == 610 and .drift_pct == 22.7'
+# The coupling, watched: the case keeps a quarter of the budget to spare, or this names it.
+measured "the 3 h soak's case is not carried by a near miss on the budget (a quarter to spare)" "$WORK/case-drift-soak-40139563554.out" 1.projection \
+  '.projected_mb <= .budget_mb * 0.75'
+case_ drift-arm1-40166664556 real pass '' '' 'def m1: 500; def m3($max): 566; '"$DRIFT"
 measured "memory arm 1's 13.2 % passes" "$WORK/case-drift-arm1-40166664556.out" 1 \
-  '.hour1_median_mb == 1000 and .hour3_median_mb == 1132 and .drift_pct == 13.2'
+  '.hour1_median_mb == 500 and .hour3_median_mb == 566 and .drift_pct == 13.2'
 
 # Check 1.projection: memMb = a + b * h over the drive (h: hours since the start action), and 99999
 # on the beats outside it (12 before, 4 after), which the fit must not read. A perfect line fits
@@ -289,7 +302,9 @@ fitted() {
 }
 # The floor: check 5.beats's (the drive's beats at heartbeat_interval_ms, times heartbeat_min_ratio).
 PROJ_FLOOR='.want_beats == 1800000 / $t.heartbeat_interval_ms * $soak.heartbeat_min_ratio'
-PROJ_BUDGET='.budget_mb == $mem * $soak.memory_projection.memory_budget_fraction and .machine_memory_mb == $mem
+# The budget: the fraction of the smaller of the Machine's memory and the production guest's.
+PROJ_BUDGET='.budget_mb == ([$mem, $prod] | min) * $soak.memory_projection.memory_budget_fraction and .machine_memory_mb == $mem
+  and .production_memory_mb == $prod and .production_guest == $soak.memory_projection.production_guest
   and .session_cap_min == $soak.memory_projection.session_cap_min'
 # Flat: 0 MB/h, so the projection is the level.
 case_ projection-flat real pass '' '' 'def a: 1000; def b: 0; '"$PROJ"
@@ -302,13 +317,86 @@ measured "104 MB/h from 954 MB projects 954 + 104 * cap / 60 MB, the beats outsi
    and .beats_fitted == $(fitted "$WORK/case-projection-104.json") and $PROJ_BUDGET"
 # Steep: 600 MB/h from 1500 MB projects over the budget, while check 1 still passes (part 1's median
 # about 1550 MB, part 3's about 1750: 12.9 %), so only the projection reds.
-STEEP_REASON="$("$JQ" -r --argjson mem "$MEM" '.memory_projection as $p
-  | "reaches \(1500 + 600 * $p.session_cap_min / 60) MB at the session cap of \($p.session_cap_min) min, over the budget of \($mem * $p.memory_budget_fraction) MB"' \
+STEEP_REASON="$("$JQ" -r --argjson prod "$MEM_PROD" '.memory_projection as $p
+  | "reaches \(1500 + 600 * $p.session_cap_min / 60) MB at the session cap of \($p.session_cap_min) min, over the budget of \($prod * $p.memory_budget_fraction) MB"' \
   "$HERE/soak.json")"
 case_ projection-steep real fail '1.projection' "1.projection:$STEEP_REASON" 'def a: 1500; def b: 600; '"$PROJ"
 measured "a steep run: 600 MB/h from 1500 MB, its projection over the budget" "$WORK/case-projection-steep.out" 1.projection \
   '.slope_mb_per_h == 600 and .intercept_mb == 1500 and .projected_mb == 1500 + 600 * $soak.memory_projection.session_cap_min / 60
    and .projected_mb > .budget_mb and '"$PROJ_BUDGET"
+# The budget's edge (PR #88 review m1): the projection is judged as it is reported, to 0.1 MB, and
+# the gate is `>`. 500 MB/h from the budget less 500 * cap / 60, plus d: 0.1 under the budget and
+# exactly at it pass, 0.1 over it fails (check 1 reads about 10 %). The budget here is the
+# production guest's, from soak.json.
+AT_BUDGET='$soak[0] as $k | ($k.compositor_guest[$k.memory_projection.production_guest].memory_mb * $k.memory_projection.memory_budget_fraction) as $budget
+  | def b: 500; def a: $budget - b * $k.memory_projection.session_cap_min / 60 + d; '
+case_ projection-under-budget real pass '' '' 'def d: -0.1; '"$AT_BUDGET$PROJ"
+case_ projection-at-budget real pass '' '' 'def d: 0; '"$AT_BUDGET$PROJ"
+case_ projection-over-budget real fail '1.projection' \
+  "1.projection:over the budget of $("$JQ" -r '.compositor_guest[.memory_projection.production_guest].memory_mb * .memory_projection.memory_budget_fraction' "$HERE/soak.json") MB" \
+  'def d: 0.1; '"$AT_BUDGET$PROJ"
+measured "0.1 MB under the budget" "$WORK/case-projection-under-budget.out" 1.projection \
+  '(.projected_mb * 10 | round) == (.budget_mb * 10 - 1) and .budget_mb == $prod * $soak.memory_projection.memory_budget_fraction'
+measured "exactly at the budget passes" "$WORK/case-projection-at-budget.out" 1.projection \
+  '.projected_mb == .budget_mb and .budget_mb == $prod * $soak.memory_projection.memory_budget_fraction and .slope_mb_per_h == 500'
+measured "0.1 MB over the budget" "$WORK/case-projection-over-budget.out" 1.projection \
+  '(.projected_mb * 10 | round) == (.budget_mb * 10 + 1)'
+# The guest (the coordinator's decision, 2026-10-25): a soak on a bigger guest budgets the production
+# guest's memory, never its own. performance-8x's 16384 MB still budgets production's fraction, so
+# the steep run still reds. A smaller Machine than production's (none is in compositor_guest; the
+# smaller side of the rule) budgets its own: a flat run at three quarters of production's budget
+# reds on half production's memory.
+MEM_8X="$("$JQ" -er '.compositor_guest["performance-8x"].memory_mb' "$HERE/soak.json")"
+cases=$((cases + 1))
+checks=$((checks + 1))
+if [ "$MEM_8X" -gt "$MEM_PROD" ]; then echo "PASS the 8x guest is bigger than production's ($MEM_8X > $MEM_PROD MB)"
+else fail "the 8x guest's $MEM_8X MB is not bigger than production's $MEM_PROD MB: the next cases prove nothing"; fi
+MEM="$MEM_8X"
+case_ projection-steep-8x real fail '1.projection' "1.projection:$STEEP_REASON" 'def a: 1500; def b: 600; '"$PROJ"
+measured "an 8x run (C_MEM $MEM_8X) still budgets production's memory" "$WORK/case-projection-steep-8x.out" 1.projection \
+  '.machine_memory_mb == $mem and $mem > $prod and .budget_mb == $prod * $soak.memory_projection.memory_budget_fraction
+   and .projected_mb > .budget_mb and '"$PROJ_BUDGET"
+MEM=$((MEM_PROD / 2))
+case_ projection-small-guest real fail '1.projection' \
+  "1.projection:over the budget of $("$JQ" -r --argjson m "$MEM" '$m * .memory_projection.memory_budget_fraction' "$HERE/soak.json") MB" \
+  '$soak[0] as $k | ($k.compositor_guest[$k.memory_projection.production_guest].memory_mb * $k.memory_projection.memory_budget_fraction * 0.75) as $level
+   | def a: $level; def b: 0; '"$PROJ"
+measured "a Machine smaller than production's budgets its own memory" "$WORK/case-projection-small-guest.out" 1.projection \
+  '.machine_memory_mb == $mem and $mem < $prod and .budget_mb == $mem * $soak.memory_projection.memory_budget_fraction
+   and .projected_mb < $prod * $soak.memory_projection.memory_budget_fraction and '"$PROJ_BUDGET"
+MEM="$MEM_PROD"
+# The floor's edge (PR #88 review m2): memMb on exactly the floor's beats (check 5.beats's, rounded
+# up to a whole beat) passes; one fewer fails. The beats after the kept ones lose memMb.
+FLOOR_N="$("$JQ" -n --slurpfile t "$ROOT/harness/thresholds.json" --slurpfile s "$HERE/soak.json" \
+  '1800000 / $t[0].heartbeat_interval_ms * $s[0].heartbeat_min_ratio | ceil')"
+KEEP='(.actions[] | select(.kind == "start") | .at_ms) as $s
+  | ([.report.heartbeats.series[] | select(.received_ms >= $s and .received_ms < $s + 1800000 and (.body.memMb | type) == "number")][keep].received_ms) as $cut
+  | .report.heartbeats.series |= map(if .received_ms >= $cut and .received_ms < $s + 1800000 then del(.body.memMb) else . end)'
+case_ projection-at-floor real pass '' '' "def keep: $FLOOR_N; $KEEP"
+case_ projection-under-floor real fail '1.projection' "1.projection:$((FLOOR_N - 1)) drive beats carry memMb, want at least" \
+  "def keep: $((FLOOR_N - 1)); $KEEP"
+measured "exactly the floor's beats" "$WORK/case-projection-at-floor.out" 1.projection \
+  ".beats_fitted == $FLOOR_N and .beats_fitted == $(fitted "$WORK/case-projection-at-floor.json") and .beats_fitted >= .want_beats and $PROJ_FLOOR"
+measured "one beat under the floor" "$WORK/case-projection-under-floor.out" 1.projection \
+  ".beats_fitted == $((FLOOR_N - 1)) and .beats_fitted == $(fitted "$WORK/case-projection-under-floor.json")"
+# A production_guest soak.json's compositor_guest lacks is a named red, never a jq error or a pass:
+# the verdict run from a copy of the harness whose soak.json names performance-2x.
+cases=$((cases + 1))
+checks=$((checks + 1))
+ALT="$WORK/alt-harness/soak"
+mkdir -p "$ALT"
+cp "$HERE/verdict.sh" "$HERE/verdict.jq" "$HERE/schedule.jq" "$ALT/"
+"$JQ" '.memory_projection.production_guest = "performance-2x"' "$HERE/soak.json" >"$ALT/soak.json"
+rc=0
+"$ALT/verdict.sh" --dir "$GREEN" --page real --drive-min 30 --memory-mb "$MEM" --thresholds "$ROOT/harness/thresholds.json" --jq "$JQ" \
+  >"$WORK/alt.out" 2>"$WORK/alt.err" || rc=$?
+if [ "$rc" -eq 1 ] && "$JQ" -e '[.checks[] | select(.status == "fail") | .id] == ["1.projection"]
+    and ([.checks[] | select(.id == "1.projection") | .reason | contains("no budget: soak.json'"'"'s memory_projection.production_guest (\"performance-2x\") names no compositor_guest")] == [true])
+    and ([.checks[] | select(.id == "1.projection") | .measured.budget_mb] == [null])' "$WORK/alt.out" >/dev/null 2>&1; then
+  echo "PASS a production_guest not in compositor_guest: 1.projection fails by name, no budget"
+else
+  fail "a production_guest not in compositor_guest: exit $rc: $(head -c 300 "$WORK/alt.err") $("$JQ" -c '[.checks[] | select(.status == "fail") | {id, reason}]' "$WORK/alt.out" 2>/dev/null | head -c 400)"
+fi
 # Anti-vacuity: memMb on every fourth drive beat only (check 1 still has both parts' medians) is
 # under the floor; none fits nothing; one has no spread in time to fit (and check 1 has no part 3).
 case_ projection-few real fail '1.projection' '1.projection:drive beats carry memMb, want at least' \

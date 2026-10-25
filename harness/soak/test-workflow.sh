@@ -136,6 +136,13 @@ check "the compositor's guest: the input, production's performance-4x by default
    and .jobs.plan.outputs.c_cpus == "${{ steps.runs.outputs.c_cpus }}" and .jobs.soak.env.GUEST == "${{ inputs.guest }}"'
 jq -e '.compositor_guest == {"performance-4x": {cpus: 4, memory_mb: 8192}, "performance-8x": {cpus: 8, memory_mb: 16384}}' "$HERE/soak.json" >/dev/null \
   && pass "soak.json: performance-4x is 4 CPUs, 8192 MB (R1's RUNNER_DEFAULT_GUEST), performance-8x 8 and 16384" || fail "soak.json's compositor_guest"
+# Check 1.projection budgets the production guest's memory at most: soak.json names it, and it is
+# the workflow's default guest and one of compositor_guest's.
+pg="$(jq -r '.memory_projection.production_guest' "$HERE/soak.json")"
+[ "$pg" = "$(jq -r '(.on // .["true"]).workflow_dispatch.inputs.guest.default' "$W/wf.json")" ] \
+  && jq -e --arg g "$pg" '.compositor_guest | has($g)' "$HERE/soak.json" >/dev/null \
+  && pass "soak.json's production_guest ($pg) is the workflow's default guest, in compositor_guest" \
+  || fail "soak.json's production_guest" "$pg"
 
 # --- the job token ---------------------------------------------------------------------------------
 grep -qE 'job_token="\$\(od -An -N32 -tx1 /dev/urandom' <<<"$launch" && pass "the job token: 32 random bytes" || fail "the job token's source"
@@ -528,7 +535,7 @@ vsoak() { # <green dir> <schedule>: rc; the summary in $W/summary.md, outputs in
     GITHUB_OUTPUT="$W/v.out" GITHUB_STEP_SUMMARY="$W/summary.md" bash -eo pipefail -c "$verdict" >/dev/null 2>&1)
 }
 vsoak "$HERE/fixtures/green" soak && grep -qx 'status=pass' "$W/v.out" \
-  && grep -qF "PASS 1.projection memory projection" "$W/summary.md" && grep -qF "\"machine_memory_mb\":$VMEM}" "$W/summary.md" \
+  && grep -qF "PASS 1.projection memory projection" "$W/summary.md" && grep -qF "\"machine_memory_mb\":$VMEM," "$W/summary.md" \
   && grep -qF 'MEASURE per-dropout step (the lines): 6 of 6 dropouts measured, mean span 60 s; rss mean +9 MB' "$W/summary.md" \
   && grep -qF 'MEASURE compositor only: rss +36 MB, anon +32 MB' "$W/summary.md" && grep -qF 'MEASURE cef only: pss +4 MB' "$W/summary.md" \
   && pass "verdict, the soak: the green passes, the memory split's measures in the summary" || fail "verdict, the soak" "$(cat "$W/v.out") $(head -c 600 "$W/summary.md")"

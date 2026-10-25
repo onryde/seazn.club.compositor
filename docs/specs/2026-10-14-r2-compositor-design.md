@@ -26,7 +26,7 @@ Success, in the PDF's ranked order (a higher rank wins a conflict):
    slate appears within 3 s with the score still on screen. No single process failure ends the
    broadcast.
 2. **Bounded resources.** Every buffer has a limit, and memory stays flat over a 3 h soak (~~±10 %~~
-   ±40 %, and its growth projected to the 5 h session cap stays within half the Machine's memory:
+   ±40 %, and its growth projected to the 5 h session cap stays within half the production guest's memory:
    owner rulings 2026-10-25, `docs/_INDEX.md`).
 3. **Latency.** The compositor adds ≤500 ms. A score change appears on screen within one frame of its
    scheduled time.
@@ -397,7 +397,7 @@ dropout every 5 min and one destination disconnect per hour. One GitHub Actions 
 media runs on Fly Machines (the real image on the production guest, plus a harness Machine), because
 private-repo runners have 2 vCPU. It uploads a report. It can't run through real stg web: R1 caps a
 session at `MAX_DURATION_MINUTES = 300`, and admission needs a paired, beating phone. Pass: memory within ~~±10 %~~ ±40 % of the first hour
-and its fitted growth projected to 300 min within half the Machine's memory (owner rulings 2026-10-25),
+and its fitted growth projected to 300 min within half the production guest's memory (owner rulings 2026-10-25),
 zero output gaps, zero programme-pipeline rebuilds caused by input events, dropped frames <0.1 %.
 
 ### 9.6 Main-repo PRs

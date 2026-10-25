@@ -11,9 +11,10 @@
   "memory_step": {"before_s": [-90, -10], "after_s": [30, 110]},
   "memory_drift_max": 0.40,
   "memory_projection": {
-    "source": "Check 1.projection (owner ruling A, 2026-10-25, docs/_INDEX.md): the drive's memMb fitted against time (least squares) and projected to session_cap_min after the drive's start must stay within memory_budget_fraction of the compositor Machine's memory (verdict.sh --memory-mb: soak.yml's C_MEM, from compositor_guest). session_cap_min is a livestream's cap, 5 hours (the context the owner ruled with, 2026-10-25, relayed by the coordinator): relay-job.v1.json's maxDurationMinutes declares no maximum of its own (9007199254740991), and five of its six session fixtures in contracts/fixtures/relay-job.v1/ carry 300 (session-composed-720p, session-passthrough and the three refused or invalid ones; session-composed-1080p carries 120). The fit needs check 5.beats's floor of memMb beats (heartbeat_min_ratio).",
+    "source": "Check 1.projection (owner ruling A, 2026-10-25, docs/_INDEX.md): the drive's memMb fitted against time (least squares) and projected to session_cap_min after the drive's start must stay within memory_budget_fraction of the smaller of the compositor Machine's memory (verdict.sh --memory-mb: soak.yml's C_MEM) and the production guest's (compositor_guest[production_guest]), so a soak on a bigger guest never loosens the budget (the coordinator's decision, 2026-10-25). session_cap_min is web's MAX_DURATION_MINUTES = 300 (seazn.club apps/web/src/server/relay/config.ts:43, 'Design §6.1 default and ruling E: 5 h'; spec §9.5, docs/specs/2026-10-14-r2-compositor-design.md:399), a livestream's 5 hours. The session clock runs from startedAt (apps/web/src/server/relay/domain/expiry.ts:33-35, deadlineOf), which the drive's start stands for. relay-job.v1.json's maxDurationMinutes declares no maximum of its own (9007199254740991); five of its six session fixtures in contracts/fixtures/relay-job.v1/ corroborate 300 (session-composed-1080p carries 120). production_guest is web's RUNNER_DEFAULT_GUEST (config.ts:39: 4 CPUs, 8192 MB, C7 / owner ruling 2026-09-13), soak.yml's default guest. memMb sums VmRSS over the compositor's process tree, not the Machine's whole use. The fit needs check 5.beats's floor of memMb beats (heartbeat_min_ratio), and the projection is judged as reported, to 0.1 MB.",
     "session_cap_min": 300,
-    "memory_budget_fraction": 0.5
+    "memory_budget_fraction": 0.5,
+    "production_guest": "performance-4x"
   },
   "dropped_frames_max_ratio": 0.001,
   "heartbeat_min_ratio": 0.95,

@@ -98,9 +98,12 @@ The job's `timeout-minutes` is `minutes + 40`, well under GitHub's 360.
   `memory_drift_max`, 0.40: `test-verdict.sh` passes 0.1 point under it and exactly at it, fails
   0.1 over it, and passes the 3 h soak 40139563554's 22.7 % and memory arm 1 40166664556's 13.2 %.
   Criterion 1.projection passes a flat run and 104 MB/h from 954 MB, and fails a run that projects
-  over half the Machine's memory at the 300-minute cap, and a fit with fewer memMb beats than
-  `5.beats`'s floor, none, or one. The `>` mutant on criterion 1 reds the at-the-bound case; on
-  1.projection, dropping the cap multiplication and flipping the comparison each red.
+  over half the production guest's memory at the 300-minute cap (an 8x run's too), and a fit with
+  fewer memMb beats than `5.beats`'s floor, none, or one. 0.1 MB under the budget and exactly at it
+  pass and 0.1 over it fails; exactly the floor's beats pass and one fewer fails. The `>` mutant on
+  criterion 1 reds the at-the-bound case; on 1.projection, dropping the cap multiplication,
+  flipping the comparison, `>` to `>=` on the budget, `<` to `<=` on the floor and the budget
+  without the production guest each red.
 - (Amended 2026-10-23, C13 CI round 2) The cost legs' camera ran once with `--pattern snow` and
   once with `--pattern noise` on the production guest. Both numbers are pasted, and the heavier
   pattern is the one the legs used.
@@ -266,13 +269,18 @@ reads green.
   994 MB, hour 3's 1220 MB) and memory arm 1 40166664556 read 13.2 %; both now pass.
 - **Criterion 1.projection (added).** Fit `memMb` against time over the drive (least squares on the
   beats in `report.json`; x is hours since the start action), and project the line to the session
-  cap: `soak.json` `memory_projection.session_cap_min`, 300. `relay-job.v1.json`'s
-  `maxDurationMinutes` declares no maximum of its own, and its session fixtures carry 300 (one, the
-  1080p composed one, carries 120); a livestream is capped at 5 hours. The budget is
+  cap: `soak.json` `memory_projection.session_cap_min`, 300, which is web's `MAX_DURATION_MINUTES`
+  (`seazn.club` `apps/web/src/server/relay/config.ts:43`, "Design §6.1 default and ruling E: 5 h").
+  The session clock runs from `startedAt` (`domain/expiry.ts:33-35`), which the drive's start stands
+  for. `relay-job.v1.json`'s `maxDurationMinutes` declares no maximum of its own, and its session
+  fixtures corroborate 300 (one, the 1080p composed one, carries 120). The budget is
   `memory_budget_fraction` (0.5) of the compositor Machine's memory, which `verdict.sh` takes as
-  `--memory-mb` and `soak.yml` passes as `C_MEM`. Over the budget fails. The check reports the slope
-  in MB/h, the intercept, the projection, the budget and the beats fitted; fewer memMb beats than
-  `5.beats`'s floor, none, or no spread in time fail.
+  `--memory-mb` and `soak.yml` passes as `C_MEM`, and at most the production guest's (PR #88's fix
+  round 1, the coordinator's decision: `memory_projection.production_guest`, web's
+  `RUNNER_DEFAULT_GUEST`, so an 8x soak still budgets 4096 MB). Over the budget, as reported to
+  0.1 MB, fails; exactly at it passes. The check reports the slope in MB/h, the intercept, the
+  projection, the budget, both memories and the beats fitted; fewer memMb beats than `5.beats`'s
+  floor, none, no spread in time, or a `production_guest` that `compositor_guest` lacks fail.
 - **Owed after memory arm 3.** The per-dropout bound, the other half of ruling A, waits on memory
   arm 3 (run 40172443534, the no-dropout control). It is not built here.
 
