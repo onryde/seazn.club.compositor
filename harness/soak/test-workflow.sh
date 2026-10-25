@@ -24,6 +24,13 @@
 #   leak gate run for real eight ways (page=real or test with no harness scan, a leak, clean, and the
 #   runner's compositor log kept only when the harness scanned its bytes); and
 #   soak.json's watch, hard stop, timeout and post-check reserve in order;
+# - the memory experiment (soak 40139563554's drift): the schedule, malloc_arena_max and gst_tracers
+#   inputs; the knobs step run for real (each knob alone and together, twelve refusals by reason,
+#   and the names guard on a soak.json that would smuggle another name or a non-string value); the
+#   compositor's config built for real from the launch step's own jq (the knobs added, its own keys
+#   winning a clash, nothing added when empty); the schedule through the runs step (a leg refused
+#   on dropouts) to the harness's SOAK_SCHEDULE and the verdict's --schedule; and the verdict step
+#   run for real on both greens, the memory split's MEASURE lines in the summary;
 # - flylog.py on a recorded-shape stream: pretty-printed entries, a replayed buffer, another
 #   Machine's entry, a cut-off tail, stamps with 9 and 3 fraction digits and an offset, a bare and a
 #   reasoned `overlay hidden`; and an empty stream refused.
@@ -159,7 +166,7 @@ grep -qF 'flyctl machine destroy "$id" -a "$FLY_APP" --force' <<<"$destroy" \
 bad="$(jq -r '[.jobs[].steps[]? | .run // empty] | join("\n")' "$W/wf.json" | grep -n -F '${{ inputs.' || true)"
 [ -z "$bad" ] && pass "no input expanded inside a run" || fail "an input inside a run" "$bad"
 verdict="$(step soak "Verdict")"
-grep -qF 'harness/soak/verdict.sh --dir "$OUT" --page "$PAGE" --drive-min "$DRIVE_MIN"' <<<"$verdict" \
+grep -qF 'harness/soak/verdict.sh --dir "$OUT" --page "$PAGE" --drive-min "$DRIVE_MIN" --schedule "$SCHEDULE"' <<<"$verdict" \
   && grep -qF '::warning::PLUMBING ONLY' <<<"$verdict" && pass "the verdict: verdict.sh, PLUMBING ONLY on the test page" || fail "the verdict step"
 
 # --- page=real's page source ---------------------------------------------------------------------
@@ -218,8 +225,11 @@ miss=""; for f in deliveries.jsonl score.log seed.json web-up.log web.log postgr
 grep -qF SOAK_OVERLAY_URL "$YML" && fail "no SOAK_OVERLAY_URL is left" "it is" || pass "no SOAK_OVERLAY_URL is left"
 
 # --- the run list, re-runs, the deadline, the leak gate -------------------------------------------
-check "run-name: the page and the minutes, PLUMBING ONLY on page=test; the cost legs and the guest by name" \
-  '.["run-name"] | contains("format('"'"'soak page={0} {1} min{2}{3}'"'"', inputs.page, inputs.minutes, inputs.page == '"'"'test'"'"' && '"'"' (PLUMBING ONLY)'"'"'")
+check "run-name: the page and the minutes, PLUMBING ONLY on page=test; the cost legs, the guest and the memory experiment's knobs by name" \
+  '.["run-name"] | contains("format('"'"'soak page={0} {1} min{2}{3}{4}{5}{6}'"'"', inputs.page, inputs.minutes, inputs.page == '"'"'test'"'"' && '"'"' (PLUMBING ONLY)'"'"'")
+   and contains("inputs.schedule == '"'"'dropouts'"'"' && '"'"', dropouts only'"'"'")
+   and contains("inputs.malloc_arena_max != '"'"''"'"' && format('"'"', MALLOC_ARENA_MAX={0}'"'"', inputs.malloc_arena_max)")
+   and contains("inputs.gst_tracers != '"'"''"'"' && format('"'"', GST_TRACERS {0}'"'"', inputs.gst_tracers)")
    and contains("inputs.legs != '"'"''"'"' && format('"'"'cost legs {0} on {1}, {2} min'"'"', inputs.legs, inputs.guest, inputs.minutes)")
    and contains("inputs.guest != '"'"'performance-4x'"'"' && format('"'"' on {0}'"'"', inputs.guest)")'
 grep -qF '# PLUMBING ONLY — NOT A SOAK PASS' <<<"$verdict" && pass "the step summary heads a plumbing run PLUMBING ONLY" || fail "the summary heading"
@@ -292,9 +302,10 @@ jq -e '.poll_after_min >= 20 and .poll_after_min < .hard_stop_after_min and .har
 
 # --- the cost legs --------------------------------------------------------------------------------
 runs_step="$(step plan "The runs")"
-runs() { # <legs> <camera> <page> <guest>: the runs step for real
+runs() { # <legs> <camera> <page> <guest> [schedule, default soak]: the runs step for real
   : >"$W/runs.out"
-  (cd "$ROOT" && LEGS="$1" CAMERA="$2" PAGE="$3" GUEST="$4" GITHUB_OUTPUT="$W/runs.out" bash -eo pipefail -c "$runs_step" >"$W/runs.err" 2>&1)
+  (cd "$ROOT" && LEGS="$1" CAMERA="$2" PAGE="$3" GUEST="$4" SCHEDULE="${5:-soak}" GITHUB_OUTPUT="$W/runs.out" \
+    bash -eo pipefail -c "$runs_step" >"$W/runs.err" 2>&1)
 }
 out() { sed -n "s/^$1=//p" "$W/runs.out"; }
 runs "" ball test performance-4x && [ "$(out mode)" = soak ] && [ "$(out runs)" = '[{"leg":"","camera":"ball"}]' ] \
@@ -338,7 +349,7 @@ check "the soak job: a matrix of the plan's runs, one at a time, none cancelling
   '.jobs.soak.strategy == {"fail-fast": false, "max-parallel": 1, matrix: {run: "${{ fromJSON(needs.plan.outputs.runs) }}"}}
    and .jobs.soak.env.LEG == "${{ matrix.run.leg }}" and .jobs.soak.env.CAMERA == "${{ matrix.run.camera }}"
    and .jobs.plan.outputs.runs == "${{ steps.runs.outputs.runs }}"'
-grep -qF 'SOAK_PAGE: $ENV.PAGE, CAMERA_PATTERN: $ENV.CAMERA, SOAK_LEG: $ENV.LEG}}' <<<"$launch" \
+grep -qF 'SOAK_PAGE: $ENV.PAGE, CAMERA_PATTERN: $ENV.CAMERA, SOAK_LEG: $ENV.LEG,' <<<"$launch" \
   && grep -qF 'leg_tag="${LEG:+-${LEG,,}-$CAMERA}"' <<<"$launch" \
   && pass "launch: the harness gets SOAK_LEG; the Machines' names carry the leg and the camera" || fail "launch: the leg"
 legblock="$(sed -n '/if \[ -n "\$LEG" \]; then/,/^fi$/p' <<<"$launch")"
@@ -411,6 +422,119 @@ if vleg cpu-over; then fail "verdict, a red leg" "exit 0"; else
   grep -qx 'status=fail' "$W/v.out" && grep -qF '**FAIL**: cpu' "$W/summary.md" \
     && pass "verdict, a leg: a p95 over the size rule fails the step, named in the summary" || fail "verdict, a red leg" "$(cat "$W/v.out")"
 fi
+
+# --- the memory experiment (soak 40139563554's drift) ------------------------------------------------
+check "inputs: schedule (soak by default, or dropouts), malloc_arena_max and gst_tracers (empty by default)" \
+  '((.on // .["true"]).workflow_dispatch.inputs) as $i
+   | ($i.schedule | .type == "choice" and .options == ["soak", "dropouts"] and .default == "soak")
+   and $i.malloc_arena_max.default == "" and $i.gst_tracers.default == ""'
+check "the knobs and the schedule: plan outputs from their steps, to the soak job's env" \
+  '.jobs.plan.outputs.schedule == "${{ steps.runs.outputs.schedule }}" and .jobs.plan.outputs.c_env == "${{ steps.knobs.outputs.c_env }}"
+   and .jobs.soak.env.SCHEDULE == "${{ needs.plan.outputs.schedule }}" and .jobs.soak.env.C_ENV == "${{ needs.plan.outputs.c_env }}"
+   and ([.jobs.plan.steps[] | select(.id == "knobs") | .env] == [{MALLOC: "${{ inputs.malloc_arena_max }}", TRACERS: "${{ inputs.gst_tracers }}"}])
+   and ([.jobs.plan.steps[] | select(.name == "The runs") | .env.SCHEDULE] == ["${{ inputs.schedule }}"])'
+check "the knobs step reads soak.json after the checkout" \
+  '[.jobs.plan.steps | to_entries[] | select((.value.uses // "" | startswith("actions/checkout")) or .value.id == "knobs") | .value.id // "checkout"]
+   == ["checkout", "knobs"]'
+knobs_step="$(jq -r '.jobs.plan.steps[] | select(.id == "knobs") | .run' "$W/wf.json")"
+knobs() { # <malloc> <tracers> [root, default the repo]: the knobs step for real; its c_env, sorted, in $W/knobs.env
+  : >"$W/knobs.out"
+  (cd "${3:-$ROOT}" && MALLOC="$1" TRACERS="$2" GITHUB_OUTPUT="$W/knobs.out" bash -eo pipefail -c "$knobs_step" >"$W/knobs.err" 2>&1) || return 1
+  sed -n 's/^c_env=//p' "$W/knobs.out" | jq -cS . >"$W/knobs.env"
+}
+ok=0
+while IFS='|' read -r m t want; do
+  if knobs "$m" "$t" && [ "$(cat "$W/knobs.env")" = "$want" ]; then ok=$((ok + 1))
+  else echo "  knobs '$m' '$t': want $want, got $(cat "$W/knobs.env" 2>/dev/null) $(head -c 300 "$W/knobs.err")"; fi
+done <<'CASES'
+||{}
+2||{"MALLOC_ARENA_MAX":"2"}
+9999||{"MALLOC_ARENA_MAX":"9999"}
+|leaks|{"GST_DEBUG":"GST_TRACER:7","GST_TRACERS":"leaks"}
+2|leaks|{"GST_DEBUG":"GST_TRACER:7","GST_TRACERS":"leaks","MALLOC_ARENA_MAX":"2"}
+CASES
+[ "$ok" -eq 5 ] && pass "knobs: none, MALLOC_ARENA_MAX alone (2, 9999), the leaks tracers alone, both: the extra environment exactly (5 of 5)" \
+  || fail "knobs: the accepted cases" "$ok of 5"
+refused=0
+while IFS='|' read -r m t why; do
+  if knobs "$m" "$t"; then echo "  accepted: '$m' '$t': $(cat "$W/knobs.env")"
+  elif grep -qF -- "$why" "$W/knobs.err" && ! grep -q '^c_env=' "$W/knobs.out"; then refused=$((refused + 1))
+  else echo "  refused without '$why': '$m' '$t': $(head -c 300 "$W/knobs.err")"; fi
+done <<'CASES'
+0||malloc_arena_max must be a positive integer
+-1||malloc_arena_max must be a positive integer
+02||malloc_arena_max must be a positive integer
+10000||malloc_arena_max must be a positive integer
+2 ||malloc_arena_max must be a positive integer
+abc||malloc_arena_max must be a positive integer
+2;LD_PRELOAD=x||malloc_arena_max must be a positive integer
+|bogus|gst_tracers 'bogus' is not one of soak.json's gst_tracers (leaks)
+|LEAKS|gst_tracers 'LEAKS' is not one of soak.json's gst_tracers
+|leaks,stats|gst_tracers 'leaks,stats' is not one of soak.json's gst_tracers
+|GST_DEBUG|gst_tracers 'GST_DEBUG' is not one of soak.json's gst_tracers
+2|nope|gst_tracers 'nope' is not one of soak.json's gst_tracers
+CASES
+[ "$refused" -eq 12 ] && pass "knobs: refused 12 of 12, each by its reason, no c_env written (a zero, a sign, a leading zero, 5 digits, a space, a word, a smuggled name; four unknown tracer sets and one with a good malloc)" \
+  || fail "knobs: the refusals" "$refused of 12"
+# The names guard: a soak.json whose tracer set would carry another name, or a non-string value.
+guarded=0
+for bad in '.gst_tracers.leaks += {LD_PRELOAD: "/tmp/x.so"}' '.gst_tracers.leaks.GST_DEBUG = 7' '.gst_tracers.leaks = "GST_TRACERS=leaks"'; do
+  rm -rf "$W/kroot" && mkdir -p "$W/kroot/harness/soak"
+  jq "$bad" "$HERE/soak.json" >"$W/kroot/harness/soak/soak.json"
+  if knobs "" leaks "$W/kroot"; then echo "  the names guard let through ($bad): $(cat "$W/knobs.env")"
+  elif grep -qF 'may hold only GST_DEBUG, GST_TRACERS and MALLOC_ARENA_MAX (strings)' "$W/knobs.err" && ! grep -q '^c_env=' "$W/knobs.out"; then guarded=$((guarded + 1))
+  else echo "  refused for another reason ($bad): $(head -c 300 "$W/knobs.err")"; fi
+done
+[ "$guarded" -eq 3 ] && pass "knobs: the names guard refuses a soak.json set with another name, a number, a string for a set (3 of 3)" \
+  || fail "knobs: the names guard" "$guarded of 3"
+# The compositor's config, from the launch step's own jq program: the knobs merged under its keys.
+cprog="$(python3 -I -c '
+import re, sys
+m = re.search(r"DEADLINE_AT=\"\$deadline_at\" jq -n (\x27.*?\x27) \\\n\s*> \"\$RUNNER_TEMP/compositor.machine.json\"", sys.stdin.read(), re.S)
+print(m.group(1)[1:-1] if m else "")' <<<"$launch")"
+cconf() { # <C_ENV>: the compositor's config env, sorted keys
+  JOB_TOKEN=tjt_made_up SESSION_ID=s-1 APP_URL=http://h:7000 DEADLINE_AT=2026-10-25T00:00:00.000Z C_CPUS=4 C_MEM=8192 C_ENV="$1" \
+    jq -cS -n "$cprog | .env"
+}
+base='{"APP_URL":"http://h:7000","COMPOSITOR_DRIVERS":"live","JOB_TOKEN":"tjt_made_up","RELAY_DEADLINE_AT":"2026-10-25T00:00:00.000Z","SESSION_ID":"s-1"}'
+if [ -n "$cprog" ] && [ "$(cconf "")" = "$base" ] && [ "$(cconf '{}')" = "$base" ] \
+  && [ "$(cconf '{"MALLOC_ARENA_MAX":"2","GST_TRACERS":"leaks","GST_DEBUG":"GST_TRACER:7"}')" = \
+       '{"APP_URL":"http://h:7000","COMPOSITOR_DRIVERS":"live","GST_DEBUG":"GST_TRACER:7","GST_TRACERS":"leaks","JOB_TOKEN":"tjt_made_up","MALLOC_ARENA_MAX":"2","RELAY_DEADLINE_AT":"2026-10-25T00:00:00.000Z","SESSION_ID":"s-1"}' ] \
+  && [ "$(cconf '{"COMPOSITOR_DRIVERS":"fake","JOB_TOKEN":"other","MALLOC_ARENA_MAX":"2"}' | jq -c '{COMPOSITOR_DRIVERS, JOB_TOKEN, MALLOC_ARENA_MAX}')" = \
+       '{"COMPOSITOR_DRIVERS":"live","JOB_TOKEN":"tjt_made_up","MALLOC_ARENA_MAX":"2"}' ]; then
+  pass "the compositor's config: no knob adds nothing, the knobs are added, and its own keys win a clash (the launch step's jq, run)"
+else
+  fail "the compositor's config" "program found: $([ -n "$cprog" ] && echo yes || echo no); empty: $(cconf "" 2>&1 | head -c 300)"
+fi
+grep -qF 'SOAK_SCHEDULE: $ENV.SCHEDULE}}' <<<"$launch" && pass "launch: the harness gets SOAK_SCHEDULE" || fail "launch: SOAK_SCHEDULE"
+# The schedule through the runs step: the soak's by default, dropouts out as asked, refused on a leg
+# and by an unknown name.
+runs "" ball test performance-4x dropouts && [ "$(out schedule)" = dropouts ] && [ "$(out mode)" = soak ] \
+  && runs "" ball test performance-4x && [ "$(out schedule)" = soak ] \
+  && pass "runs: the schedule out as asked (dropouts), soak by default" || fail "runs: the schedule" "$(cat "$W/runs.out") $(cat "$W/runs.err")"
+refused=0
+runs "A" snow real performance-4x dropouts || { grep -qF 'the cost legs run no schedule: schedule=dropouts with legs' "$W/runs.err" && refused=$((refused + 1)); }
+runs "" ball test performance-4x weekly || { grep -qF "schedule must be soak or dropouts: 'weekly'" "$W/runs.err" && refused=$((refused + 1)); }
+[ "$refused" -eq 2 ] && pass "runs: dropouts on a leg and an unknown schedule are refused, each by its reason" || fail "runs: the schedule refusals" "$refused of 2"
+# The verdict step's soak path, run for real on both greens: the schedule reaches verdict.sh, and the
+# memory split's MEASURE lines reach the summary.
+vsoak() { # <green dir> <schedule>: rc; the summary in $W/summary.md, outputs in $W/v.out
+  rm -rf "$W/vout" && mkdir -p "$W/vout/out"
+  cp "$1"/* "$W/vout/out/"
+  echo '{"ok":true,"checker_exit":0,"ended_early":null}' >"$W/vout/out/done"
+  : >"$W/v.out"; : >"$W/summary.md"
+  (cd "$ROOT" && RUNNER_TEMP="$W/vout" LEG="" PAGE=real DRIVE_MIN=30 SCHEDULE="$2" \
+    GITHUB_OUTPUT="$W/v.out" GITHUB_STEP_SUMMARY="$W/summary.md" bash -eo pipefail -c "$verdict" >/dev/null 2>&1)
+}
+vsoak "$HERE/fixtures/green" soak && grep -qx 'status=pass' "$W/v.out" \
+  && grep -qF 'MEASURE per-dropout step: 6 of 6 dropouts measured; rss mean +9 MB' "$W/summary.md" \
+  && grep -qF 'MEASURE compositor only: rss +36 MB, anon +32 MB' "$W/summary.md" && grep -qF 'MEASURE cef only: pss +4 MB' "$W/summary.md" \
+  && pass "verdict, the soak: the green passes, the memory split's measures in the summary" || fail "verdict, the soak" "$(cat "$W/v.out") $(head -c 600 "$W/summary.md")"
+vsoak "$HERE/fixtures/green-dropouts" dropouts && grep -qx 'status=pass' "$W/v.out" \
+  && grep -qF 'MEASURE per-dropout step: 14 of 14 dropouts measured' "$W/summary.md" \
+  && pass "verdict, the dropouts schedule: its green passes when judged as dropouts, 14 steps measured" || fail "verdict, dropouts" "$(cat "$W/v.out")"
+if vsoak "$HERE/fixtures/green-dropouts" soak; then fail "verdict, the dropouts run judged as the soak" "exit 0"
+else grep -qx 'status=fail' "$W/v.out" && pass "verdict: the dropouts run judged as the soak fails (the schedule reached verdict.sh)" || fail "verdict, a schedule mismatch" "$(cat "$W/v.out")"; fi
 
 # --- flylog.py ---------------------------------------------------------------------------------
 cat >"$W/stream.json" <<'EOF'

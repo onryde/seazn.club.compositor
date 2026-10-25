@@ -134,15 +134,27 @@ kind:
 | 180 min | 36 | 1800, 5400, 9000 |
 | 25 min (the 30-min rehearsal) | 5 | 300, 900, 1200 |
 
+`schedule=dropouts` (soak.yml; `SOAK_SCHEDULE` on the harness) runs the memory experiment's schedule
+instead (`dropout_plan`): a dropout every `dropout_only.every_s` (120: 30 an hour, against the soak's
+12) from `dropout_only.phase_s` (60), each `dropout_pause_s` long, and no disconnect. Each dropout
+owns a whole period, so the minute-apart memory split lines land in every gap between two dropouts
+and after the last. A cost leg runs no schedule: `dropouts` with a leg is refused.
+
+| Drive | Dropouts | Disconnects |
+|---|---|---|
+| 25 min (`minutes=30`) | 12, at 60 to 1380 s | none |
+| 180 min | 89 | none |
+
 ## The verdict
 
-`verdict.sh --dir <out> --page real|test --drive-min N` produces the checks below. Every number
-comes from `thresholds.json`, `soak.json` or the drive.
+`verdict.sh --dir <out> --page real|test --drive-min N [--schedule soak|dropouts]` produces the
+checks below. Every number comes from `thresholds.json`, `soak.json` or the drive.
 
 | Check | What it requires |
 |---|---|
 | `inputs` | — |
 | 1 memory | Part 3's median `memMb` within ±10 % of part 1's. |
+| 1.split | The compositor log's `memory split` lines exist in the drive, one with the compositor's RSS and one with a CEF poll. Zero lines read fails. |
 | 2 | Every output outage overlaps a disconnect and ends within `budget_output_reconnect_ms` of it. `pts_gaps` is empty. |
 | 3 | Exactly 1 session GET (reason "programme rebuilt"). |
 | 4 | The final `droppedFrames` is under 0.1 % of drive × fps. |
@@ -157,6 +169,55 @@ comes from `thresholds.json`, `soak.json` or the drive.
 It does not say the payload advanced. A page polling an answer that never changes reads false all
 the same. What shows the score moving is (c)'s deliveries landing (the ledger's seq advancing) and
 (d)'s overlay on air; a witness that the painted score follows the ledger is owed (below).
+
+`inputs` also fails when the driver's start action names another schedule than `--schedule` (a
+start action without one is the soak's), and `5.disconnects` names a disconnect the plan does not
+have (the dropout schedule has none).
+
+### The memory split (soak 40139563554's drift, 2026-10-25)
+
+The 3 h soak 40139563554 failed only check 1 (hour 1's median 994 MB, hour 3's 1220 MB). `memMb` is
+the sum of VmRSS over the whole process tree, so it cannot tell the compositor from CEF. The
+compositor now logs, once a minute (the first beat with a sample, then the first beat a minute after
+the last line), one line beside the beat's unchanged `memMb`:
+
+    memory split input_gen=<g> tree_mb=<n> rss_kb=<n> anon_kb=<n> file_kb=<n> shmem_kb=<n> threads=<n>
+      cef_poll=<n> cef_renderer_kb=<n> cef_renderer_n=<n> cef_gpu_process_kb=… cef_utility_kb=…
+      cef_zygote_kb=… cef_other_kb=… (each with its _n)
+
+The compositor's own fields come from its `/proc/self/status`, read in the beat's existing tree walk.
+CEF's are the PSS the CEF child poll already reads for its memory cap (`smaps_rollup`), bucketed by
+`--type=`. `input_gen` is the last input generation rebuilt, so a step can be tied to a rebuild. An
+absent value prints `-`, never 0. A kind the poll found no child of prints `kb=-` and `n=0`.
+
+The verdict's `measures.memory_split` reads those lines, and `verdict.sh` prints them as `MEASURE`
+lines under the checks (in the step summary too). They are evidence, not a gate:
+
+- **Compositor only** and **CEF only**: part 3's median against part 1's, as check 1 reads `memMb`.
+  That is RSS, anon, file, shmem and threads for the compositor, and the PSS total and each kind for
+  CEF.
+- **Per dropout**: the first line after the dropout ended, less the last line before it began. Each
+  line sits inside the gap between that dropout and its neighbouring faults, and a gap with no line
+  leaves the dropout unmeasured. This gives the RSS, anon, file and CEF steps and the input
+  generations either side. The summary gives the mean, median and sum, the first half's mean against
+  the second half's, and the rebuilds.
+
+Check 1 is unchanged. The owner rules on it after the evidence.
+
+### The memory experiment's knobs
+
+`soak.yml` takes `malloc_arena_max` (a positive integer up to 9999, or empty for unset) and
+`gst_tracers` (the name of one of `soak.json`'s `gst_tracers` sets: `leaks` is `GST_TRACERS=leaks`
+and `GST_DEBUG=GST_TRACER:7`). The plan job's knobs step turns them into the compositor Machine's
+extra environment. Any other name refuses the run, and the compositor's own keys win a clash. The
+entrypoint runs the compositor (`supervise`) without clearing its environment, and CEF's children
+inherit it, so `MALLOC_ARENA_MAX` reaches them as well as the compositor.
+
+`gst_tracers=leaks` sets the leaks tracer, but it reports only at `gst_deinit`, or on a SIGUSR1/2
+checkpoint when `GST_LEAKS_TRACER_SIG` is set (it is not). The compositor never calls `gst_deinit`:
+it leaves by `hard_exit` (F-017). SIGUSR1/2 are its stop signals (F-016), so they cannot serve. So as built the tracer adds its per-object bookkeeping and prints no
+leak report. A per-rebuild count needs a compositor-side checkpoint, such as the tracer's
+`get-live-objects` action at each rebuild (owed below).
 
 On `page=test`, checks 5a–5d read `pending: page source`, and the best status is `plumbing`, not
 `pass`. The workflow then prints `::warning::PLUMBING ONLY`, heads the step summary "PLUMBING ONLY —
@@ -418,6 +479,12 @@ first measurement, legs A and C from run 40153136892. Legs B and D are still owe
     of milliseconds.
 
 ## Owed (not in this PR)
+
+- **The memory gate's ruling**: check 1 is unchanged. Run the dropout experiment with and without
+  `malloc_arena_max=2`, then rule from the memory split's measures.
+- **A leaks-tracer checkpoint**: `gst_tracers=leaks` prints nothing as built (see "The memory
+  experiment's knobs"). A per-rebuild live-object count needs the compositor to call the tracer's
+  `get-live-objects` action, for example at each input rebuild.
 
 - **The cost legs' numbers**: built here (see "The cost legs"); the F-entry and Owed 93's closure
   wait for the dispatches.

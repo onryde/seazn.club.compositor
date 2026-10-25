@@ -21,6 +21,10 @@
 # fake-control, the camera's size follows the output, no dropout or disconnect is scheduled, the
 # leg's score driver runs at its pace (rally.mjs every 3 s; score.mjs --boundaries every 6 s), and
 # done names the leg and its stills. Runs 11 and 12 refuse an unknown leg and a leg on page=test.
+# Run 13 (page=test, in parallel) takes SOAK_SCHEDULE=dropouts (the memory experiment's schedule,
+# compressed to a dropout every 4 s from 2 s): every dropout dropout_plan holds, on its planned time,
+# no disconnect and no firewall rule, and the start action names the schedule (run 1's names soak, a
+# leg's names leg). Runs 14 and 15 refuse an unknown schedule and the dropouts schedule on a leg.
 #
 #   HARNESS_BASH=<bash 5> harness/soak/test-driver.sh     (driver.sh needs bash 5: mapfile, EPOCHREALTIME)
 #
@@ -44,6 +48,7 @@ cp "$HERE/driver.sh" "$HERE/schedule.jq" "$HERE/mediamtx.yml" "$HERE/sampler.py"
 cp "$ROOT/contracts/fixtures/relay-job.v1/session-composed-720p.json" "$ROOT/contracts/fixtures/relay-job.v1/session-composed-1080p.json" "$W/soak/"
 cp "$ROOT/harness/pages/overlay-test.html" "$W/soak/pages/"
 jq '. + {min_drive_min: 1, dropout_every_s: 6, dropout_phase_s: 3, dropout_pause_s: 1, disconnect_hold_s: 2,
+         dropout_only: {every_s: 4, phase_s: 2},
          control_wait_s: 3, live_wait_s: 20, end_wait_s: 10, log_wait_s: 20, lost_beats_end_s: 5,
          sample_offsets_s: [6], sample_margin_s: 0, post_check_reserve_s: 5}' "$HERE/soak.json" >"$W/soak/soak.json"
 
@@ -252,6 +257,19 @@ stub_run "$W/out5" "$W/state5"
   echo "$rc $t $(now_ms)" >"$W/rc5"
 ) &
 real_pids="$real_pids $!"
+# Run 13: page=test on the dropout-only schedule.
+mkdir -p "$W/out13" "$W/state13"
+stub_run "$W/out13" "$W/state13"
+(
+  t="$(now_ms)"
+  rc=0
+  env -i PATH="$PATH_STUB" HOME="$W" STATE="$W/state13" SOAK_ROOT="$W/soak" SOAK_OUT="$W/out13" \
+    SESSION_ID="11111111-2222-4333-8444-555555555513" JOB_TOKEN="$JOB_TOKEN" SOAK_DRIVE_MIN=1 \
+    SOAK_DEADLINE_MS=$((t + 600000)) SOAK_HARD_STOP_MS=$((t + 100000)) SOAK_PAGE=test SOAK_SCHEDULE=dropouts \
+    FLY_MACHINE_ID=m0 FLY_APP_NAME=soak-test "$BASH5" "$W/soak/driver.sh" >"$W/driver13.out" 2>&1 || rc=$?
+  echo "$rc" >"$W/rc13"
+) &
+real_pids="$real_pids $!"
 # Run 6: page=real, the page source fails after leaking its key into /out; the hard stop is near.
 mkdir -p "$W/out6" "$W/state6"
 touch "$W/state6/web-fail" "$W/state6/plant-key"
@@ -301,7 +319,7 @@ plan="$(jq -c -n -L "$W/soak" --slurpfile soak "$W/soak/soak.json" 'include "sch
 echo "driver exit $rc; plan $plan"
 [ "$rc" -eq 0 ] || { echo "FAIL the driver exited $rc"; tail -n 30 "$W/driver.out"; failures=$((failures + 1)); }
 A="$W/out/actions.jsonl"
-check "one start, drive 60 s" '[.[] | select(.kind == "start")] | length == 1 and .[0].drive_s == 60' "$A"
+check "one start, drive 60 s, the soak schedule named" '[.[] | select(.kind == "start")] | length == 1 and .[0].drive_s == 60 and .[0].schedule == "soak"' "$A"
 check "one end, last, not early" '(last | .kind == "end" and (has("ended_early") | not)) and ([.[] | select(.kind == "end")] | length == 1)' "$A"
 check "every planned dropout, ok, in slot order" \
   "[.[] | select(.kind == \"dropout\")] | (map(.slot) == [range(0; $(jq '.dropouts | length' <<<"$plan"))]) and all(.ok and .pause == 200 and .resume == 200)" "$A"
@@ -505,6 +523,30 @@ if grep -q "cost leg B (bug on badminton, session-composed-720p.json)" "$W/drive
 else
   echo "FAIL leg B: the boot or stills line"; grep -E 'boot|stills' "$W/driver9.out"; failures=$((failures + 1)); fi
 check "the soak names no leg in done" '.[0] | has("leg") | not' "$W/out3/done"
+check "leg B: the start action names no schedule but the leg" '[.[] | select(.kind == "start") | .schedule] == ["leg"]' "$W/out9/actions.jsonl"
+# Run 13: the dropout-only schedule, against dropout_plan on the same compressed soak.json.
+dplan="$(jq -c -n -L "$W/soak" --slurpfile soak "$W/soak/soak.json" 'include "schedule"; dropout_plan($soak[0]; 60)')"
+checked=$((checked + 1))
+if [ "$(cat "$W/rc13")" -eq 0 ] && grep -q "schedule dropouts" "$W/driver13.out"; then echo "PASS dropouts run 13: exit 0, the boot line names the schedule"; else
+  echo "FAIL dropouts run 13: exit $(cat "$W/rc13")"; tail -n 20 "$W/driver13.out"; failures=$((failures + 1)); fi
+check "dropouts: the plan holds dropouts and no disconnect (anti-vacuity: at least 10)" \
+  "($dplan) as \$p | (\$p.dropouts | length) >= 10 and \$p.disconnects == []" <(echo null)
+check "dropouts: one start naming the schedule, every planned dropout ok on its planned time, no disconnect" \
+  "(.[0]) as \$st | ($dplan) as \$p
+   | \$st.kind == \"start\" and \$st.schedule == \"dropouts\" and \$st.drive_s == 60
+     and ([.[] | select(.kind == \"dropout\")] | map(.slot) == [range(0; \$p.dropouts | length)])
+     and ([.[] | select(.kind == \"dropout\") | .planned_ms - \$st.at_ms] == (\$p.dropouts | map(. * 1000)))
+     and all(.[] | select(.kind == \"dropout\"); .ok and (.at_ms - .planned_ms) >= 0 and (.at_ms - .planned_ms) < 1500)
+     and ([.[] | select(.kind == \"disconnect\")] == [])
+     and (last | .kind == \"end\" and (has(\"ended_early\") | not))" "$W/out13/actions.jsonl"
+checked=$((checked + 1))
+if grep -q ' -I INPUT ' "$W/state13/calls"; then
+  echo "FAIL dropouts: a firewall rule was inserted on the dropout-only schedule"; grep -- '-I INPUT' "$W/state13/calls"; failures=$((failures + 1))
+elif grep -q '^curl POST http://127.0.0.1:7001/pause' "$W/state13/calls"; then
+  echo "PASS dropouts: the camera paused, no firewall rule inserted"
+else
+  echo "FAIL dropouts: no camera pause reached fake-camera"; failures=$((failures + 1))
+fi
 # Runs 11 and 12: an unknown leg, and a leg on page=test, refused before anything starts.
 for case in "11 E real" "12 A test"; do
   set -- $case
@@ -521,12 +563,33 @@ if [ "$(cat "$W/rc11")" -eq 64 ] && grep -q "FAIL SOAK_LEG 'E' is not one of soa
   echo "PASS legs: an unknown leg and a leg on page=test are refused (64), by name"
 else
   echo "FAIL legs: the refusals"; tail -n 3 "$W/driver11.out" "$W/driver12.out"; failures=$((failures + 1)); fi
+# Runs 14 and 15: an unknown schedule, and the dropouts schedule on a cost leg, refused before
+# anything starts.
+for case in "14 weekly -" "15 dropouts A"; do
+  set -- $case
+  leg="$3"
+  [ "$leg" != - ] || leg=""
+  rc=0
+  env -i PATH="$PATH_STUB" HOME="$W" STATE="$W/state$1" SOAK_ROOT="$W/soak" SOAK_OUT="$W/out$1" SOAK_WEB_STATE="$W/web$1" \
+    SESSION_ID="11111111-2222-4333-8444-5555555555$1" JOB_TOKEN="$JOB_TOKEN" SOAK_DRIVE_MIN=1 SOAK_DEADLINE_MS=1 \
+    SOAK_HARD_STOP_MS=1 SOAK_PAGE=real SOAK_SCHEDULE="$2" SOAK_LEG="$leg" FLY_MACHINE_ID=m0 FLY_APP_NAME=soak-test \
+    "$BASH5" "$W/soak/driver.sh" >"$W/driver$1.out" 2>&1 || rc=$?
+  echo "$rc" >"$W/rc$1"
+done
+checked=$((checked + 1))
+if [ "$(cat "$W/rc14")" -eq 64 ] && grep -q "FAIL SOAK_SCHEDULE must be soak or dropouts" "$W/driver14.out" \
+  && [ "$(cat "$W/rc15")" -eq 64 ] && grep -q "FAIL a cost leg runs no schedule: SOAK_SCHEDULE=dropouts with SOAK_LEG" "$W/driver15.out" \
+  && [ ! -s "$W/out14/actions.jsonl" ] && [ ! -s "$W/out15/actions.jsonl" ]; then
+  echo "PASS schedules: an unknown schedule and the dropouts schedule on a leg are refused (64), by name, before any action"
+else
+  echo "FAIL schedules: the refusals"; tail -n 3 "$W/driver14.out" "$W/driver15.out"; failures=$((failures + 1)); fi
 
 checked=$((checked + 1))
 if printf '%s\n' "$JOB_TOKEN" | grep -rqF -f - "$W/out" "$W/out2" "$W/out3" "$W/out4" "$W/out5" "$W/out6" "$W/driver.out" "$W/driver2.out" \
   "$W/driver3.out" "$W/driver4.out" "$W/driver5.out" "$W/driver6.out" "$W/driver7.out" "$W/out7" "$STATE/calls" "$W/state3/calls" \
   "$W/state4/calls" "$W/state5/calls" "$W/state6/calls" "$W/state7/calls" "$W/out8" "$W/out9" "$W/out10" "$W/driver8.out" \
-  "$W/driver9.out" "$W/driver10.out" "$W/driver11.out" "$W/driver12.out" "$W/state8/calls" "$W/state9/calls" "$W/state10/calls"; then
+  "$W/driver9.out" "$W/driver10.out" "$W/driver11.out" "$W/driver12.out" "$W/state8/calls" "$W/state9/calls" "$W/state10/calls" \
+  "$W/out13" "$W/driver13.out" "$W/state13/calls" "$W/driver14.out" "$W/driver15.out"; then
   echo "FAIL the job token reached a file"
   failures=$((failures + 1))
 else

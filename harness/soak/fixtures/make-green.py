@@ -2,13 +2,24 @@
 """Generates harness/soak/fixtures/green/: a 30-minute miniature soak run (C15), synthetic.
 
 Only the report fields verdict.jq reads, under the checker's own names (harness::checker::Report).
+With `dropouts`, the same run on the memory experiment's schedule (schedule.jq's dropout_plan):
+camera dropouts every 2 minutes from minute 1, no disconnect, so no output outage.
+
+The compositor log (compositor.log, flylog.py's shape) carries a `memory split` line a minute,
+from before the drive to after it, with a planted step at every dropout: the compositor's RSS
+STEP_RSS_KB and its anon STEP_ANON_KB, CEF's renderer STEP_CEF_KB, and the input generation one
+higher, after each dropout has ended (file, shmem and threads stay put).
 Run: python3 -I harness/soak/fixtures/make-green.py harness/soak/fixtures/green
+     python3 -I harness/soak/fixtures/make-green.py harness/soak/fixtures/green-dropouts dropouts
 """
+import datetime
 import json
 import os
 import sys
 
 OUT = sys.argv[1]
+SCHEDULE = sys.argv[2] if len(sys.argv) > 2 else "soak"
+assert SCHEDULE in ("soak", "dropouts"), SCHEDULE
 os.makedirs(OUT, exist_ok=True)
 
 S = 1792800000000  # the drive's start (epoch ms)
@@ -17,6 +28,11 @@ HB = 5000  # heartbeat_interval_ms
 ALIVE = 2000  # cef_alive_every_ms
 PHASE, EVERY, PAUSE, HOLD = 150, 300, 10, 30
 DISCONNECTS = [300, 900, 1500]  # schedule.jq's plan for a 30-minute drive
+if SCHEDULE == "dropouts":
+    PHASE, EVERY = 60, 120  # soak.json's dropout_only
+    DISCONNECTS = []
+STEP_RSS_KB, STEP_ANON_KB, STEP_CEF_KB = 9216, 8192, 1024
+LINE_FROM_MS, LINE_EVERY_MS = S - 55000, 60000  # the memory split's lines: drive start + 5 s, + k min
 CRASH_S = 720  # one CEF crash at minute 12: its hide is printed, never failed
 
 beats = []
@@ -71,9 +87,10 @@ with open(os.path.join(OUT, "report.json"), "w") as f:
     json.dump(report, f, separators=(",", ":"))
     f.write("\n")
 
-actions = [{"kind": "start", "at_ms": S, "drive_s": D}]
+actions = [{"kind": "start", "at_ms": S, "drive_s": D, "schedule": SCHEDULE}]
 k = 0
-while PHASE + k * EVERY + PAUSE <= D:
+# soak_plan's count, or dropout_plan's (each dropout owns a whole period).
+while (PHASE + k * EVERY + PAUSE <= D) if SCHEDULE == "soak" else (PHASE + (k + 1) * EVERY <= D):
     at = S + (PHASE + k * EVERY) * 1000
     actions.append({"kind": "dropout", "slot": k, "planned_ms": at, "at_ms": at + 3, "end_ms": at + PAUSE * 1000 + 5,
                     "ok": True, "pause": 200, "resume": 200})
@@ -108,4 +125,25 @@ with open(os.path.join(OUT, "overlay-samples.jsonl"), "w") as f:
 with open(os.path.join(OUT, "logscan.json"), "w") as f:
     json.dump({"lines": 2400, "overlay_hidden_lines": 1}, f, separators=(",", ":"))
     f.write("\n")
-print(f"{len(beats)} beats, {len(actions)} actions, {len(alive)} cef alive")
+
+
+def stamp(ms, digits):
+    t = datetime.datetime.fromtimestamp(ms / 1000, tz=datetime.timezone.utc)
+    return t.strftime("%Y-%m-%dT%H:%M:%S.") + f"{t.microsecond:06d}"[:digits] + "Z"
+
+
+ends = [a["end_ms"] for a in actions if a["kind"] == "dropout"]
+lines = []
+t = LINE_FROM_MS
+while t <= S + D * 1000 + 60000:
+    n = sum(1 for e in ends if e <= t)
+    msg = (f"memory split input_gen={1 + n} tree_mb={910 + n * 10} rss_kb={612000 + n * STEP_RSS_KB} "
+           f"anon_kb={500000 + n * STEP_ANON_KB} file_kb=100000 shmem_kb=12000 threads=87 cef_poll={(t - S) // 1000 + 600} "
+           f"cef_renderer_kb={200000 + n * STEP_CEF_KB} cef_renderer_n=1 cef_gpu_process_kb=90000 cef_gpu_process_n=1 "
+           f"cef_utility_kb=40000 cef_utility_n=2 cef_zygote_kb=15000 cef_zygote_n=2 cef_other_kb=- cef_other_n=0")
+    lines.append(f"{stamp(t + 2, 6)} ts={stamp(t, 3)} level=info msg={msg}")
+    lines.append(f"{stamp(t + 3002, 6)} ts={stamp(t + 3000, 3)} level=info msg=output fps beat=29.97 floor=27.00")
+    t += LINE_EVERY_MS
+with open(os.path.join(OUT, "compositor.log"), "w") as f:
+    f.write("\n".join(lines) + "\n")
+print(f"{SCHEDULE}: {len(beats)} beats, {len(actions)} actions, {len(alive)} cef alive, {len(lines)} log lines")
