@@ -3025,6 +3025,78 @@ fn cpu_starved_reds_on_its_drive_and_measures_a_lost_clock() {
     assert_eq!(checked, 4);
 }
 
+// A page that goes off air after the quota (Owed 96, PR #79's finding): the changes due are bounded
+// by the last PROGRAMME frame, not by the last frame whose overlay read, so the changes the page
+// never showed are measured missing, not dropped from the due set. Each expected index comes from
+// the world's own schedule (the timeline's `at` plus its delay), never from the verdict.
+#[test]
+fn cpu_starved_counts_the_changes_due_after_the_page_goes_off_air() {
+    let on_air = judge(
+        &cpu_starved(true, false, Felt::Honest),
+        "cpu-starved",
+        "",
+        "cpu-on-air",
+    );
+    assert_pass(&on_air, "cpu-on-air");
+    let shown = &on_air.json["measures"]["scheduled_changes_shown"];
+    assert_eq!(shown["missing"], json!([]), "cpu-on-air: {shown}");
+    let mut w = cpu_starved(true, false, Felt::Honest);
+    let done = w
+        .marks
+        .iter()
+        .find(|m| m.0 == "stress_done")
+        .map(|m| m.1)
+        .unwrap();
+    let delay = w.delay_ms;
+    let due: Vec<(u16, i64)> = w
+        .timeline_events()
+        .iter()
+        .map(|&(i, at)| (i, at + delay))
+        .collect();
+    // The first change due a second past the quota with half a second clear before it; the page
+    // goes off air 50 ms before it is due, so every change before it was shown and none from it on.
+    let k = (0..due.len())
+        .find(|&j| due[j].1 > done + 1_000 && (j == 0 || due[j].1 - due[j - 1].1 > 500))
+        .expect("a change due after the quota with a gap before it");
+    let off = due[k].1 - 50;
+    // The guard on the programme's last frame: no change is due in its last second, so "due by the
+    // last frame less the frame-to-encoder lag" cannot turn on a frame's phase.
+    let tail = w.end - 1_000;
+    assert!(
+        due.iter().all(|&(_, d)| d <= tail || d > w.end),
+        "a change is due in the programme's last second: {due:?}"
+    );
+    w.overlay_none.push((off, w.end + 1_000));
+    let v = judge(&w, "cpu-starved", "", "cpu-off-air-later");
+    let expected: Vec<u16> = due[k..]
+        .iter()
+        .filter(|&&(_, d)| d <= tail)
+        .map(|&(i, _)| i)
+        .collect();
+    let m = &v.json["measures"]["scheduled_changes_shown"];
+    eprintln!(
+        "cpu-off-air-later: off air {} ms after the quota, {} changes unshown of {} due",
+        off - done,
+        expected.len(),
+        m["due"]
+    );
+    assert!(!expected.is_empty(), "no change due after the page went off air");
+    assert!(m["due"].as_u64() >= Some(expected.len() as u64), "{m}");
+    assert_eq!(m["missing"], json!(expected), "cpu-off-air-later: {m}");
+    assert_eq!(
+        v.json["measures"]["clock_measured"]["unshown"],
+        expected.len(),
+        "cpu-off-air-later: the key measure"
+    );
+    // Off air is still case 6's red, by its own check; the clock is measured, not judged.
+    assert_fails(&v, "score_on_air", "cpu-off-air-later");
+    assert!(
+        !failed_checks(&v).contains(&json!("clock_measured")),
+        "cpu-off-air-later: {:?}",
+        failed_checks(&v)
+    );
+}
+
 fn score_down(page_says: bool, overlay_drops: bool) -> World {
     let mut w = World::new(100);
     let down = w.at(20.0);

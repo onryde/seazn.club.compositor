@@ -194,12 +194,13 @@ LADDER='([beats[] | select(.received_ms < mark_at("stress"))] | last | .body.dro
 # The programme clock in the quota's window (measured, not judged: see the verdict), each value with
 # its sample count: the window's recorded frame rate against the recording's mean bar
 # (BUDGET_FPS_MEAN_MIN) over its frames; the recording's PTS gaps over the frames the checker read;
-# and the score changes the timeline schedules from `stress` to the last overlaid frame (less the
-# frame-to-encoder lag) against those the overlay showed. `sampled` is the anti-vacuity: a window, at
+# and the score changes the timeline schedules from `stress` to the programme's last frame (less the
+# frame-to-encoder lag; Owed 96: never the last frame whose overlay read, which a page gone off air
+# would cut short) against those the overlay showed. `sampled` is the anti-vacuity: a window, at
 # least two recorded frames (a gap is between two) and a scheduled change.
 CLOCK='less(mark_at("stress_done"); mark_at("stress")) as $w
   | (.frames_table // []) as $ft
-  | ($ft | map(select(.[2] != null)) | last | .[0]) as $last
+  | ($ft | last | .[0]) as $last
   | (if $w == null or $w <= 0 then null else (frames_between(mark_at("stress"); mark_at("stress_done")) | length) end) as $n
   | (if $last == null or mark_at("stress") == null then []
      else [scheduled[] | select(.due_ms >= mark_at("stress") and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] end) as $due
