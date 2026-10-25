@@ -5,8 +5,14 @@ name: deploy-stg
 # only through promote.yml, behind the relay-stg environment's reviewers (decision log 2026-10-14,
 # owner ruling: the bump is explicit, never automatic).
 #
-# - The token guard: FLY_API_TOKEN_STG unset (today) is a warning and a skipped push, never a red.
-#   The token is a repository secret: this workflow has no environment.
+# - The token guard: FLY_API_TOKEN_RELAY_STG_PUSH unset (today) is a warning and a skipped push,
+#   never a red. It is a repository secret minted `fly tokens create deploy -a seazn-relay-stg`, so
+#   it reaches that one app (its registry) and never seazn-club-stg: the token that sets web's
+#   RELAY_IMAGE is an environment secret of relay-stg, which only promote.yml names (the PR #85
+#   review's I-1; scripts/check-workflows.sh refuses it anywhere else).
+# - Main only (the review's I-2): a push from any other ref is refused. A dispatch runs the
+#   dispatched branch's copy of this file, so this catches a mistake, not a rewrite; promote.yml's
+#   own check that the ref is on main is the one that holds.
 # - The CEF bump gate (amendment 2026-10-18, Owed 22) runs right after every checkout, so a CEF bump
 #   with no recorded C11 Step 0 re-run is never pushed.
 # - The build reads and writes no cache: image.yml's GHCR cache is writable by any repository writer
@@ -43,13 +49,21 @@ jobs:
         with: { persist-credentials: false }
       - name: CEF bump gate (Owed 22)
         run: scripts/check-cef-bump.sh
-      - name: The Fly token
+      - name: The ref is main
+        id: provenance
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::deploy-stg pushes main only, not $GITHUB_REF: nothing pushed"
+            exit 1
+          fi
+          echo "$GITHUB_REF ($GITHUB_SHA)"
+      - name: The Fly push token
         id: token
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_STG }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_STG_PUSH }}
         run: |
           if [ -z "$FLY_API_TOKEN" ]; then
-            echo "::warning::FLY_API_TOKEN_STG unset — push skipped"
+            echo "::warning::FLY_API_TOKEN_RELAY_STG_PUSH unset — push skipped"
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -94,17 +108,26 @@ jobs:
       - name: Already pushed?
         id: exists
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_STG }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_STG_PUSH }}
         run: |
           flyctl auth docker
           ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
-          if digest=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}' 2> /dev/null) \
-            && [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          # Only the registry's 404 means absent: containerd's resolver reports it as "<ref>: not
+          # found" (it never reads the body, so "manifest unknown" never surfaces). Any other error
+          # (auth, network, a 5xx) is a red, never a rebuild that would move the tag.
+          if digest=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}' 2> "$RUNNER_TEMP/inspect.err"); then
+            if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::$ref resolved to no manifest digest: '$digest'"
+              exit 1
+            fi
             echo "::notice::$ref is already pushed ($digest): nothing to build"
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "digest=$digest" >> "$GITHUB_OUTPUT"
-          else
+          elif grep -qF "$ref: not found" "$RUNNER_TEMP/inspect.err"; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::the registry could not be read for $ref (only 'not found' means not pushed): $(head -c 300 "$RUNNER_TEMP/inspect.err")"
+            exit 1
           fi
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         if: steps.exists.outputs.exists != 'true'
@@ -144,8 +167,10 @@ jobs:
             echo "Promote it (stg's web app takes it for every new session once a relay-stg reviewer approves; not run):"
             echo
             echo '```'
-            echo "gh workflow run promote.yml --ref main -f env=stg -f ref=$TAG"
+            echo "gh workflow run promote.yml --ref main -f env=stg -f ref=$TAG@$DIGEST"
             echo '```'
             echo
-            echo "which sets \`RELAY_IMAGE=$ref@$DIGEST\` on seazn-club-stg with \`flyctl secrets set --stage\`, then \`flyctl secrets deploy\`."
+            echo "The digest pins what the reviewer approves: promote refuses if the tag moved since this push."
+            echo
+            echo "It sets \`RELAY_IMAGE=$ref@$DIGEST\` on seazn-club-stg with \`flyctl secrets set --stage\`, then \`flyctl secrets deploy\`."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -8,15 +8,23 @@
 # passed on (outcome (a), or (a) with a recorded grant), and that run's _FINDINGS.md F-id. Never
 # update it over a failing run. This gate fails when:
 #   - docker/GSTCEF_COMMIT is not 40 hex, or the record is missing or is not exactly two lines;
-#   - GSTCEF_COMMIT differs from the record's line 1 (a bump with no Step 0 re-run on it);
-#   - line 2 is not an F-id with a `## F-0xx` heading in _FINDINGS.md.
+#   - line 2 is not an F-id with a `## F-0xx` heading in _FINDINGS.md;
+#   - that heading does not say "C11 Step 0" (the record names a finding that is no Step 0 run:
+#     F-004, the YouTube audio finding, would otherwise pass);
+#   - that finding's section (its heading to the next `## `) does not name line 1's commit in full
+#     (every Step 0 run prints the image's BUILDINFO, `gstcefsrc_commit=<sha>`; F-009 names
+#     204b01b…), so a bump recorded as `<new sha>` + an old run's F-id fails;
+#   - GSTCEF_COMMIT differs from the record's line 1 (a bump with no Step 0 re-run on it).
+# It cannot see whether the run PASSED: the F-id's outcome is the recorder's word (never record a
+# failing run).
 # check.yml runs it, and so do deploy-stg.yml, deploy-prod.yml and promote.yml, as the step right
 # after each checkout (scripts/check-workflows.sh checks that they do).
 #
 #   scripts/check-cef-bump.sh [ROOT]     (ROOT: the repo root; scripts/deploy_checks_test.sh points
 #                                         it at scratch copies)
 #
-# Prints `cef bump gate: GSTCEF_COMMIT=<sha> step0=<sha> <F-id>` on a pass.
+# Prints `cef bump gate: GSTCEF_COMMIT=<sha> step0=<sha> <F-id> (a C11 Step 0 finding naming <sha>)`
+# on a pass.
 set -euo pipefail
 
 root=${1:-$(cd "$(dirname "$0")/.." && pwd)}
@@ -47,11 +55,16 @@ fid=${lines[1]}
 [[ "$fid" =~ ^F-[0-9]{3}$ ]] || fail "docker/CEF_STEP0_PASS line 2 is not an F-id: '$fid'"
 
 [ -f "$findings" ] || fail "no _FINDINGS.md under $root"
-grep -Eq "^## ${fid}([^0-9]|$)" "$findings" \
-  || fail "_FINDINGS.md has no '## $fid' heading: the record names no finding"
+heading=$(grep -E "^## ${fid}([^0-9]|$)" "$findings" | head -n 1 || true)
+[ -n "$heading" ] || fail "_FINDINGS.md has no '## $fid' heading: the record names no finding"
+[[ "$heading" == *"C11 Step 0"* ]] \
+  || fail "_FINDINGS.md's $fid heading does not say C11 Step 0: the record names a finding that is no Step 0 run"
+section=$(H="$heading" awk '$0 == ENVIRON["H"] { p = 1; next } p && /^## / { exit } p' "$findings")
+grep -qF -- "$step0" <<< "$section" \
+  || fail "_FINDINGS.md's $fid does not name $step0: that finding did not run on the record's commit"
 
 if [ "$commit" != "$step0" ]; then
   fail "docker/GSTCEF_COMMIT=$commit, but C11 Step 0 last passed on $step0 ($fid): re-run Step 0 on the bump and record it"
 fi
 
-echo "cef bump gate: GSTCEF_COMMIT=$commit step0=$step0 $fid"
+echo "cef bump gate: GSTCEF_COMMIT=$commit step0=$step0 $fid (a C11 Step 0 finding naming $step0)"

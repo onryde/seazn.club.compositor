@@ -12,24 +12,46 @@
 #  2. The Fly token guard: every workflow that names a secrets.FLY_API_TOKEN* has, for each one, a
 #     step that warns "::warning::<NAME> unset" and exits 0 when it is empty, and every other step
 #     that holds the token runs only when that guard said enabled (its job's `if` reads the guard
-#     job's `enabled` output, or its own `if` reads the guard step's, earlier in the same job). A
-#     job-level env never holds a Fly token, and no expression names two (`a && X || Y` hands a run
-#     Y's token whenever X's is empty: a prod run would reach stg, or the reverse).
+#     job's `enabled` output, or its own `if` reads the guard step's, earlier in the same job; in a
+#     deploy workflow that `if` is exactly the guard's condition, nothing more). A job-level env
+#     never holds a Fly token, and no expression names two (`a && X || Y` hands a run Y's token
+#     whenever X's is empty: a prod run would reach stg, or the reverse).
 #  3. No secret is echoed: no workflow-level env holds a secret, no run block interpolates
-#     ${{ secrets.* }} (a secret goes in by env), and no run line that names a secret-holding env
-#     var prints it (echo, printf, tee, a >> redirect) or runs under xtrace. One print is not an
-#     echo: into a file under $RUNNER_TEMP, with no tee and no GitHub command file on the line
-#     (soak.yml's leak gate writes the token to a umask-077 pattern file to grep the outputs for it).
-#     Into the log, $GITHUB_OUTPUT, $GITHUB_ENV or the step summary is.
-#  4. promote.yml: every job that holds a Fly token declares a relay-* environment, whose required
-#     reviewers are the human approval (the owner ruling: the RELAY_IMAGE bump is explicit).
+#     ${{ secrets.* }} (a secret goes in by env), and no run line that names a secret-holding var
+#     prints it (echo, printf, tee, a >> redirect) or runs under xtrace. A secret-holding var is an
+#     env key whose value names a secret, any FLY_API_TOKEN*, GH_TOKEN or GITHUB_TOKEN, and any var
+#     a run line assigns from one (an alias launders nothing). A step that holds a secret never
+#     dumps the environment (env, printenv, declare/export -p, a bare set) and never hands flyctl a
+#     token in argv (-t, --access-token). One print is not an echo: into a file under $RUNNER_TEMP,
+#     with no tee and no GitHub command file on the line (soak.yml's leak gate writes the token to a
+#     umask-077 pattern file to grep the outputs for it). Into the log, $GITHUB_OUTPUT, $GITHUB_ENV
+#     or the step summary is.
+#  4. promote.yml: every job that holds a Fly token declares exactly `relay-${{ inputs.env }}`, and
+#     inputs.env is the choice [stg, prod], so the environment is relay-stg or relay-prod, whose
+#     required reviewers are the human approval (the owner ruling: the RELAY_IMAGE bump is explicit).
 #  5. The CEF bump gate (Owed 22): in every deploy workflow, every job that holds a Fly token checks
-#     out before it uses the token, and each checkout's very next step runs scripts/check-cef-bump.sh.
+#     out before it uses the token, and each checkout's very next step is exactly
+#     `run: scripts/check-cef-bump.sh` with nothing but a name or id (no if, continue-on-error, shell
+#     or env, no `|| true`). Such a job and its steps set no continue-on-error, and no step `if`
+#     calls always(), failure() or cancelled() (a step that runs past a failed gate).
 #  6. No deploy workflow names the CI build cache, seazn-relay-cache (amendment 2026-10-23).
 #  7. No deploy workflow names a test-hooks target (relay-test-hooks, rust-build-test-hooks,
 #     test-hooks), and every build target it names is `relay` (amendment 2026-10-24).
 #  8. The registry is the RELAY_REGISTRY variable (ADR 0007): a deploy workflow writes
 #     registry.fly.io only on a line that reads vars.RELAY_REGISTRY (its default).
+#  9. The tokens by blast radius (the PR #85 review's I-1): a deploy workflow names only the four
+#     Fly tokens below, whose reach the C16 handoff's minting steps fix; a web token
+#     (FLY_API_TOKEN_WEB_*, which sets seazn-club-<env>'s secrets) appears in promote.yml alone, in a
+#     job behind relay-${{ inputs.env }}; and no workflow names a secret by expression (secrets[...],
+#     toJSON(secrets)), which no rule here could read.
+# 10. promote.yml's refusals come first: exactly one step holds a web token past the guard, and its
+#     script reads the environment's required reviewers and deployment branch policies, checks the
+#     ref's commit is on main (merge-base --is-ancestor) and runs the CEF bump gate on that commit's
+#     tree, each on a line before its first flyctl.
+# 11. Provenance in the push workflows (I-2): deploy-stg.yml's and deploy-prod.yml's guard job runs a
+#     step with id `provenance` before the guard (stg: the ref is refs/heads/main; prod: the tag's
+#     commit is on main, by merge-base --is-ancestor), which exits 1 on a refusal and carries no if,
+#     continue-on-error or shell.
 #
 # The deploy workflows are deploy-stg.yml, deploy-prod.yml and promote.yml, each required, plus any
 # other workflow that names the stg or prod relay or web app, or their tokens: a new one is held to
@@ -41,7 +63,9 @@ set -euo pipefail
 ACTIONLINT_VERSION=1.7.12
 SHELLCHECK_VERSION=0.11.0
 REQUIRED_DEPLOY=(deploy-stg.yml deploy-prod.yml promote.yml)
-DEPLOY_PATTERN='seazn-(relay|club)-(stg|prod)|FLY_API_TOKEN_(STG|PROD)'
+DEPLOY_PATTERN='seazn-(relay|club)-(stg|prod)|FLY_API_TOKEN_(RELAY_|WEB_)?(STG|PROD)'
+# Rule 9: each name's reach is fixed by how the C16 handoff mints it (fly tokens create deploy -a <app>).
+DEPLOY_TOKENS=(FLY_API_TOKEN_RELAY_STG_PUSH FLY_API_TOKEN_RELAY_PROD_PUSH FLY_API_TOKEN_WEB_STG FLY_API_TOKEN_WEB_PROD)
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 
@@ -127,7 +151,9 @@ echo "deploy workflows: ${#deploy[@]} ($(for f in ${deploy[@]+"${deploy[@]}"}; d
 
 # Each workflow as JSON (YAML.load reads `on:` as the key true; nothing here reads triggers).
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+# A run that stops before its verdict is a red: bash 3.2 exits 0 after a `set -u` abort under an
+# EXIT trap.
+trap 'rm -rf "$tmp"; if [ "${finished:-0}" != 1 ]; then echo "check-workflows: FAIL: stopped before its verdict" >&2; exit 1; fi' EXIT
 json() { echo "$tmp/$(basename "$1").json"; }
 for f in "${files[@]}"; do
   if ! ruby -ryaml -rjson -e 'puts JSON.generate(YAML.load(File.read(ARGV[0])))' "$f" > "$(json "$f")" 2> "$tmp/yaml.err"; then
@@ -166,12 +192,19 @@ def strip: sub("^\\s+"; "") | sub("\\s+$"; "");
 def needs_list: (.needs // []) | if type == "string" then [.] else . end;
 def step_name($i): (.name // .id // .uses // "step \($i)");
 # A guard reads the token as `${{ secrets.X }}`, or as `${{ inputs.env == '<env>' && secrets.X || '' }}`
-# where <env> is X's own suffix (promote.yml: each env's token reaches only its own runs).
+# where X's name carries <env> as a word (_STG, _PROD): promote.yml's tokens reach only their own runs.
 def token_value($x):
   (tostring | strip) as $v
   | ($v | test("^\\$\\{\\{ *secrets\\." + $x + " *\\}\\}$"))
     or (([$v | capture("^\\$\\{\\{ *inputs\\.env *== *'(?<e>[a-z]+)' *&& *secrets\\." + $x + " *\\|\\| *'' *\\}\\}$")][0]) as $c
-        | $c != null and $c.e == ($x | sub("^FLY_API_TOKEN_"; "") | ascii_downcase));
+        | $c != null and ($x | test("_" + ($c.e | ascii_upcase) + "(_|$)")));
+# An `if` without its ${{ }}, for an exact comparison.
+def norm_if: tostring | strip | sub("^\\$\\{\\{\\s*"; "") | sub("\\s*\\}\\}$"; "") | strip;
+def has_status_fn: tostring | test("(always|failure|cancelled)\\(\\)");
+# Rule 3: the names that hold a secret, and the names a line assigns.
+def secret_names($keys): ["FLY_API_TOKEN[A-Za-z0-9_]*", "GH_TOKEN", "GITHUB_TOKEN"] + $keys;
+def refs_secret($names): test("\\$\\{?(" + ($names | join("|")) + ")([^A-Za-z0-9_]|$)");
+def assigned: [match("(?:^|[\\s;(&|])(?:(?:export|local|readonly|declare|typeset)\\s+(?:-[A-Za-z]+\\s+)*)?([A-Za-z_][A-Za-z0-9_]*)=(?!=)"; "g") | .captures[0].string];
 def guard_key($x): [(.env // {}) | to_entries[] | select(.value | token_value($x)) | .key][0];
 def is_guard($x):
   guard_key($x) as $k
@@ -187,7 +220,9 @@ guarded=0 gated=0
 for f in "${files[@]}"; do
   tokens=$({ grep -oE 'secrets\.FLY_API_TOKEN[A-Z0-9_]*' "$f" || true; } | sed 's/^secrets\.//' | LC_ALL=C sort -u)
   for x in $tokens; do
-    out=$(jq -r --arg x "$x" "$JQ_LIB"'
+    strict=false
+    for d in ${deploy[@]+"${deploy[@]}"}; do [ "$d" = "$f" ] && strict=true; done
+    out=$(jq -r --arg x "$x" --argjson strict "$strict" "$JQ_LIB"'
       . as $w
       | [ $w.jobs | to_entries[] | .key as $j | (.value.steps // []) | to_entries[]
           | select(.value | is_guard($x)) | {job: $j, idx: .key, id: .value.id} ] as $guards
@@ -205,8 +240,15 @@ for f in "${files[@]}"; do
                 | [ $guards[] | select(.job as $g | .id as $id | ($J | needs_list | any(.[]; . == $g))
                       and (($w.jobs[$g].outputs.enabled // "") | tostring | contains("steps.\($id).outputs.enabled")))
                     | "needs.\(.job).outputs.enabled == '"'"'true'"'"'" ] as $job_gates
-                | if any($step_gates[]; . as $g | (($s.if // "") | tostring | contains($g)))
+                | (if $strict then
+                     any($step_gates[]; . as $g | (($s.if // "") | norm_if) == $g)
+                     or (any($job_gates[]; . as $g | (($J.if // "") | norm_if) == $g)
+                       and ((($s.if // "") | has_status_fn) | not))
+                   else
+                     any($step_gates[]; . as $g | (($s.if // "") | tostring | contains($g)))
                      or any($job_gates[]; . as $g | (($J.if // "") | tostring | contains($g)))
+                   end) as $ok
+                | if $ok
                   then "GATED \($j).\($s | step_name($i))"
                   else "FAIL \($j).\($s | step_name($i)) holds \($x) but runs whether or not the guard found it" end ) )
         end' "$(json "$f")")
@@ -244,17 +286,28 @@ for f in "${files[@]}"; do
         | [ ($J.env // {}) | to_entries[] | select(.value | tostring | test("secrets\\.")) | .key ] as $job_keys
         | ($J.steps // []) | to_entries[] | .key as $i | .value as $s | select($s.run != null)
         | ($job_keys + [ ($s.env // {}) | to_entries[] | select(.value | tostring | test("secrets\\.")) | .key ]) as $keys
+        | ($s.run | split("\n")) as $lines
+        # The aliases: a var a line assigns from a secret-holding var holds the secret too.
+        | (reduce range(0; 3) as $_ ($keys; . as $k
+            | (. + [ $lines[] | select(refs_secret(secret_names($k))) | assigned[] ]) | unique)) as $held
+        | secret_names($held) as $names
         | "RUN",
           ( if ($s.run | test("\\$\\{\\{[^}]*secrets\\.")) then
               "FAIL \($j).\($s | step_name($i)) interpolates a secret into its script: pass it by env" else empty end ),
-          ( ($s.run | split("\n")[]) as $line | $keys[] as $k
-            | select($line | test("\\$\\{?" + $k + "([^A-Za-z0-9_]|$)"))
+          ( $lines[] as $line
+            | select($line | refs_secret($names))
             | select($line | test("(^|[^A-Za-z0-9_])(echo|printf|tee)([^A-Za-z0-9_]|$)|>>"))
             | select(($line | test("(^|[^A-Za-z0-9_])tee([^A-Za-z0-9_]|$)|GITHUB_(OUTPUT|ENV|STEP_SUMMARY|PATH|STATE)"))
                 or ($line | test(">>? *\"?\\$\\{?RUNNER_TEMP[}/]") | not))
-            | "FAIL \($j).\($s | step_name($i)) prints \($k): \($line | strip | .[0:100])" ),
+            | "FAIL \($j).\($s | step_name($i)) prints a secret: \($line | strip | .[0:100])" ),
           ( select(($keys | length) > 0 and ($s.run | test("set -[a-z]*x|set -o xtrace|bash -[a-z]*x")))
-            | "FAIL \($j).\($s | step_name($i)) holds a secret under xtrace" ) )' "$(json "$f")")
+            | "FAIL \($j).\($s | step_name($i)) holds a secret under xtrace" ),
+          ( select(($keys | length) > 0) | $lines[] as $line
+            | select($line | test("(^|[\\s;&|(!]|\\$\\()printenv([\\s;&|)]|$)|(^|[;&|(!]|\\$\\(|\\b(then|do|else|if|time)\\s)\\s*(env|set)\\s*($|[|>;&)])|\\b(declare|typeset|export|readonly)\\s+-[A-Za-z]*p"))
+            | "FAIL \($j).\($s | step_name($i)) dumps the environment while it holds a secret: \($line | strip | .[0:100])" ),
+          ( select(($keys | length) > 0) | $lines[] as $line
+            | select($line | test("(^|[\\s;&|(])(flyctl|fly)\\s.*\\s(-t|--access-token)(\\s|=|$)"))
+            | "FAIL \($j).\($s | step_name($i)) hands flyctl a token in argv: \($line | strip | .[0:100])" ) )' "$(json "$f")")
   while IFS= read -r line; do
     case "$line" in
       FAIL*) failed "$(basename "$f"): ${line#FAIL }" ;;
@@ -269,12 +322,15 @@ echo "no secret echoed: $runs run blocks read"
 if [ -f "$dir/promote.yml" ]; then
   envs=0
   out=$(jq -r "$JQ_LIB"'
-    [ .jobs | to_entries[] | select(.value | holds_fly)
-      | {job: .key, env: ((.value.environment // "") | if type == "object" then (.name // "") else . end | tostring)} ]
-    | if length == 0 then "FAIL no job holds a Fly token"
-      else .[] | if (.env | test("^relay-")) then "ENV \(.job) \(.env)"
-        else "FAIL job \(.job) holds a Fly token and declares no relay-* environment: no reviewer approves the promote" end
-      end' "$(json "$dir/promote.yml")")
+    ( (.["true"].workflow_dispatch.inputs.env // {}) as $in
+      | if ($in.type == "choice" and $in.options == ["stg", "prod"]) then empty
+        else "FAIL inputs.env is not the choice [stg, prod]: relay-${{ inputs.env }} could name an environment nobody protects" end ),
+    ( [ .jobs | to_entries[] | select(.value | holds_fly)
+        | {job: .key, env: ((.value.environment // "") | if type == "object" then (.name // "") else . end | tostring)} ]
+      | if length == 0 then "FAIL no job holds a Fly token"
+        else .[] | if (.env | test("^relay-\\$\\{\\{ *inputs\\.env *\\}\\}$")) then "ENV \(.job) \(.env)"
+          else "FAIL job \(.job) holds a Fly token and declares environment \u0027\(.env)\u0027, not exactly relay-${{ inputs.env }}: no reviewer of relay-stg or relay-prod approves the promote" end
+        end )' "$(json "$dir/promote.yml")")
   while IFS= read -r line; do
     case "$line" in
       FAIL*) failed "promote.yml: ${line#FAIL }" ;;
@@ -293,13 +349,19 @@ for f in ${deploy[@]+"${deploy[@]}"}; do
       else $jobs[] | .key as $j | (.value.steps // []) as $steps
         | [ $steps | to_entries[] | select((.value.uses // "") | startswith("actions/checkout@")) | .key ] as $cos
         | ([ $steps | to_entries[] | select(.value | holds_fly) | .key ] | min) as $first
-        | if ($cos | length) == 0 then "FAIL job \($j) holds a Fly token and checks nothing out, so it never runs the CEF bump gate"
-          elif ($cos | min) > $first then "FAIL job \($j) uses its Fly token before it checks out and runs the CEF bump gate"
-          else $cos[] as $c
-            | if (($steps[$c + 1].run // "") | strip | test("^scripts/check-cef-bump\\.sh( |$)"))
-              then "GATE \($j)"
-              else "FAIL job \($j): the step after its checkout (step \($c + 1)) is not scripts/check-cef-bump.sh" end
-          end
+        | ( if ($cos | length) == 0 then "FAIL job \($j) holds a Fly token and checks nothing out, so it never runs the CEF bump gate"
+            elif ($cos | min) > $first then "FAIL job \($j) uses its Fly token before it checks out and runs the CEF bump gate"
+            else $cos[] as $c | ($steps[$c + 1] // {}) as $g | (($g | keys) - ["name", "id", "run"]) as $extra
+              | if (($g.run // "") | strip) != "scripts/check-cef-bump.sh"
+                then "FAIL job \($j): the step after its checkout (step \($c + 1)) is not exactly `run: scripts/check-cef-bump.sh`"
+                elif ($extra | length) > 0
+                then "FAIL job \($j): the CEF bump gate step (step \($c + 1)) carries \($extra | join(", ")): it runs bare, or a failed gate could pass"
+                else "GATE \($j)" end
+            end ),
+          ( if (.value["continue-on-error"] != null) then "FAIL job \($j) holds a Fly token and sets continue-on-error" else empty end ),
+          ( $steps | to_entries[] | .key as $i | .value as $s
+            | ( if ($s["continue-on-error"] != null) then "FAIL job \($j): \($s | step_name($i)) sets continue-on-error, so its failure would not stop the job" else empty end ),
+              ( if (($s.if // "") | has_status_fn) then "FAIL job \($j): \($s | step_name($i)) runs past a failed step (if: \($s.if | tostring))" else empty end ) )
       end' "$(json "$f")")
   while IFS= read -r line; do
     case "$line" in
@@ -338,6 +400,95 @@ done
 echo "deploy build targets read: $targets; registry.fly.io lines read: $registry_lines"
 [ "$registry_lines" -gt 0 ] || failed "no deploy workflow sets RELAY_REGISTRY's default: the registry rule read nothing"
 
+# 9. The tokens by blast radius.
+names_read=0 web_jobs=0
+for f in "${files[@]}"; do
+  b=$(basename "$f")
+  if hits=$(grep -n -E 'secrets *\[|toJSON\( *secrets *\)' "$f"); then
+    failed "$b names a secret by expression, which no rule here can read: $hits"
+  fi
+  if [ "$b" != promote.yml ] && hits=$(grep -n -E 'secrets\.FLY_API_TOKEN_WEB_' "$f"); then
+    failed "$b names a web token (it sets seazn-club-<env>'s secrets; only promote.yml, behind relay-<env>, may): $hits"
+  fi
+done
+for f in ${deploy[@]+"${deploy[@]}"}; do
+  for x in $({ grep -oE 'secrets\.FLY_API_TOKEN[A-Z0-9_]*' "$f" || true; } | sed 's/^secrets\.//' | LC_ALL=C sort -u); do
+    names_read=$((names_read + 1))
+    case " ${DEPLOY_TOKENS[*]} " in
+      *" $x "*) ;;
+      *) failed "$(basename "$f") names $x: a deploy workflow names only ${DEPLOY_TOKENS[*]} (what any other name reaches is unknown)" ;;
+    esac
+  done
+done
+if [ -f "$dir/promote.yml" ]; then
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL*) failed "promote.yml: ${line#FAIL }" ;;
+      WEB*) web_jobs=$((web_jobs + 1)) ;;
+    esac
+  done < <(jq -r '.jobs | to_entries[] | select(.value | tostring | test("secrets\\.FLY_API_TOKEN_WEB_"))
+    | ((.value.environment // "") | if type == "object" then (.name // "") else . end | tostring) as $e
+    | if ($e | test("^relay-\\$\\{\\{ *inputs\\.env *\\}\\}$")) then "WEB \(.key)"
+      else "FAIL job \(.key) holds a web token outside relay-${{ inputs.env }} (environment \u0027\($e)\u0027)" end' "$(json "$dir/promote.yml")")
+fi
+echo "deploy token names read: $names_read; promote jobs holding a web token, behind relay-<env>: $web_jobs"
+[ "$names_read" -gt 0 ] || failed "no Fly token name read in the deploy workflows: the token rule read nothing"
+
+# 10. promote.yml's refusals come before its first flyctl.
+if [ -f "$dir/promote.yml" ]; then
+  checks=0
+  out=$(jq -r "$JQ_LIB"'
+    [ .jobs[] | (.steps // [])[] | . as $s
+      | select(($s | tostring | test("secrets\\.FLY_API_TOKEN_WEB_"))
+          and ([ "FLY_API_TOKEN_WEB_STG", "FLY_API_TOKEN_WEB_PROD" ] | any(. as $x | $s | is_guard($x)) | not)) ] as $users
+    | if ($users | length) != 1 then "FAIL \($users | length) steps hold a web token past the guard, not exactly 1 (the one whose refusals this rule reads)"
+      else ($users[0].run // "" | split("\n") | to_entries | map(select(.value | test("^\\s*#") | not))) as $lines
+        | ([ $lines[] | select(.value | test("(^|[^A-Za-z0-9_])flyctl([^A-Za-z0-9_]|$)")) | .key ] | min) as $fly
+        | if $fly == null then "FAIL the promote step runs no flyctl"
+          else ( ["environments/", "required_reviewers", "deployment-branch-policies", "merge-base --is-ancestor", "scripts/check-cef-bump.sh"][] as $want
+            | ([ $lines[] | select(.value | contains($want)) | .key ] | min) as $at
+            | if $at != null and $at < $fly then "CHECK \($want)"
+              else "FAIL the promote step does not read \u0027\($want)\u0027 before its first flyctl (line \($fly + 1)): a refusal after a Fly call refuses nothing" end )
+          end
+      end' "$(json "$dir/promote.yml")")
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL*) failed "promote.yml: ${line#FAIL }" ;;
+      CHECK*) checks=$((checks + 1)) ;;
+    esac
+  done <<< "$out"
+  echo "promote refusals before the first flyctl: $checks of 5"
+fi
+
+# 11. Provenance in the push workflows.
+provenance=0
+for pair in "deploy-stg.yml:refs/heads/main" "deploy-prod.yml:merge-base --is-ancestor"; do
+  b=${pair%%:*} want=${pair#*:}
+  [ -f "$dir/$b" ] || continue
+  out=$(jq -r --arg want "$want" "$JQ_LIB"'
+    [ .jobs | to_entries[] | select(any((.value.steps // [])[]; .id == "token")) ] as $jobs
+    | if ($jobs | length) != 1 then "FAIL \($jobs | length) jobs hold a step with id token (the guard), not 1"
+      else $jobs[0] | .key as $j | (.value.steps // []) as $steps
+        | ([ $steps | to_entries[] | select(.value.id == "token") | .key ][0]) as $guard
+        | ([ $steps | to_entries[] | select(.value.id == "provenance") | .key ][0]) as $p
+        | if $p == null then "FAIL job \($j) has no step with id provenance: nothing refuses an image that is not from main"
+          elif $p > $guard then "FAIL job \($j): the provenance step comes after the token guard"
+          elif (($steps[$p] | keys) - ["name", "id", "env", "run"] | length) > 0
+          then "FAIL job \($j): the provenance step carries \((($steps[$p] | keys) - ["name", "id", "env", "run"]) | join(", ")): it runs bare, or a refusal could pass"
+          elif ((($steps[$p].run // "") | contains($want)) and (($steps[$p].run // "") | test("(^|[;\\s])exit 1([;\\s]|$)"))) | not
+          then "FAIL job \($j): the provenance step does not check \u0027\($want)\u0027 and exit 1"
+          else "PROVENANCE \($j)" end
+      end' "$(json "$dir/$b")")
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL*) failed "$b (provenance): ${line#FAIL }" ;;
+      PROVENANCE*) provenance=$((provenance + 1)) ;;
+    esac
+  done <<< "$out"
+done
+echo "provenance steps before a push guard: $provenance"
+
+finished=1
 if [ "$fails" -gt 0 ]; then
   echo "check-workflows: $fails failure(s)" >&2
   exit 1

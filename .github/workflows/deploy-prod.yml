@@ -6,6 +6,11 @@ name: deploy-prod
 #
 # deploy-stg.yml's rules hold here too (the token guard, the CEF bump gate after every checkout, no
 # cache, the relay target, a tag never pushed twice), plus: the tag must point at a commit on main.
+# The token is FLY_API_TOKEN_RELAY_PROD_PUSH, a repository secret minted
+# `fly tokens create deploy -a seazn-relay-prod`: it reaches that one app, never seazn-club-prod.
+# A tag push runs the tagged commit's copy of this file, so the main check holds only for a tagged
+# commit whose copy keeps it: the owner's tag ruleset for v* (docs/_INDEX.md, C16 handoff) and
+# promote.yml's own check of the tag's commit are what hold.
 # scripts/check-workflows.sh (check.yml) holds this file to them.
 on:
   push:
@@ -36,7 +41,7 @@ jobs:
       - name: CEF bump gate (Owed 22)
         run: scripts/check-cef-bump.sh
       - name: The tag is a release on main
-        id: tag
+        id: provenance
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -50,13 +55,13 @@ jobs:
             exit 1
           fi
           echo "$TAG ($GITHUB_SHA) is on main"
-      - name: The Fly token
+      - name: The Fly push token
         id: token
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PROD }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_PROD_PUSH }}
         run: |
           if [ -z "$FLY_API_TOKEN" ]; then
-            echo "::warning::FLY_API_TOKEN_PROD unset — push skipped"
+            echo "::warning::FLY_API_TOKEN_RELAY_PROD_PUSH unset — push skipped"
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -101,17 +106,26 @@ jobs:
       - name: Already pushed?
         id: exists
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PROD }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_PROD_PUSH }}
         run: |
           flyctl auth docker
           ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
-          if digest=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}' 2> /dev/null) \
-            && [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          # Only the registry's 404 means absent: containerd's resolver reports it as "<ref>: not
+          # found" (it never reads the body, so "manifest unknown" never surfaces). Any other error
+          # (auth, network, a 5xx) is a red, never a rebuild that would move the tag.
+          if digest=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}' 2> "$RUNNER_TEMP/inspect.err"); then
+            if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::$ref resolved to no manifest digest: '$digest'"
+              exit 1
+            fi
             echo "::notice::$ref is already pushed ($digest): nothing to build"
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "digest=$digest" >> "$GITHUB_OUTPUT"
-          else
+          elif grep -qF "$ref: not found" "$RUNNER_TEMP/inspect.err"; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::the registry could not be read for $ref (only 'not found' means not pushed): $(head -c 300 "$RUNNER_TEMP/inspect.err")"
+            exit 1
           fi
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         if: steps.exists.outputs.exists != 'true'
@@ -151,8 +165,10 @@ jobs:
             echo "Promote it only after C17 passes (prod's web app takes it for every new session once a relay-prod reviewer approves; not run):"
             echo
             echo '```'
-            echo "gh workflow run promote.yml --ref main -f env=prod -f ref=$TAG"
+            echo "gh workflow run promote.yml --ref main -f env=prod -f ref=$TAG@$DIGEST"
             echo '```'
             echo
-            echo "which sets \`RELAY_IMAGE=$ref@$DIGEST\` on seazn-club-prod with \`flyctl secrets set --stage\`, then \`flyctl secrets deploy\`."
+            echo "The digest pins what the reviewer approves: promote refuses if the tag moved since this push."
+            echo
+            echo "It sets \`RELAY_IMAGE=$ref@$DIGEST\` on seazn-club-prod with \`flyctl secrets set --stage\`, then \`flyctl secrets deploy\`."
           } >> "$GITHUB_STEP_SUMMARY"
