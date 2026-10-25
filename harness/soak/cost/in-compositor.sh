@@ -8,17 +8,25 @@
 #   in-compositor.sh sample <max_s>   one JSON line a second for at most max_s seconds (F-005's method:
 #                                     the whole Machine from /proc/stat's first line, and the process
 #                                     tree from each /proc/<pid>/stat's utime + stime)
-#   in-compositor.sh kill-renderer    SIGKILL the CEF renderer (`--type=renderer`) with the highest
+#   in-compositor.sh kill-renderer <not_before_ms>
+#                                     SIGKILL the CEF renderer (`--type=renderer`) with the highest
 #                                     `--renderer-client-id` (the newest page's: client ids only
 #                                     grow, as C14's in-container.sh kill-renderer), and nothing
 #                                     else: the compositor reads CefCrashed and rebuilds the page.
 #                                     Never the GPU process or a zygote: killing every CEF child
 #                                     aborts the compositor (Owed 62), a process restart, not a page
-#                                     reload. Prints its target and every renderer seen before it
-#                                     kills (`at_ms`), then its status (`rc_at_ms`, `rc`); fails when
-#                                     no renderer has a numeric client id. Once: the lines go to
-#                                     COST_KILL_MARK (/tmp/seazn-cost-kill.jsonl), and a later call
-#                                     prints them again with `repeat_at_ms` and kills nothing
+#                                     reload. Never before not_before_ms by this Machine's clock, the
+#                                     one `at_ms` is read from: a call that lands early waits for it
+#                                     (its at_ms is the reading that passed), so the verdict's
+#                                     at_ms - planned_ms is never negative whatever the caller's
+#                                     clock; one more than KILL_EARLY_MAX_MS early is refused
+#                                     (`early_at_ms`, exit 1, nothing killed), never a wait into
+#                                     flyctl's exec timeout and a retry's second kill. Prints its
+#                                     target and every renderer seen before it kills (`at_ms`), then
+#                                     its status (`rc_at_ms`, `rc`); fails when no renderer has a
+#                                     numeric client id. Once: the lines go to COST_KILL_MARK
+#                                     (/tmp/seazn-cost-kill.jsonl), and a later call prints them again
+#                                     with `repeat_at_ms` and kills nothing
 #
 # A sample line (cores are CPU-seconds a second, three decimals):
 #
@@ -34,12 +42,13 @@
 # The first read prints nothing (no interval yet).
 #
 # COST_PROC_SEQ (test-cost.sh only) replaces /proc with numbered trees: read k uses
-# $COST_PROC_SEQ/k, and its clock is that tree's `now_ms`; COST_SELF_PID names the sampler's pid
-# there. COST_PROC moves /proc to one fake tree on the real clock (the cadence's test). The Machine
+# $COST_PROC_SEQ/k, and its clock is that tree's `now_ms` (kill-renderer's wait moves to the next
+# tree); COST_SELF_PID names the sampler's pid there. COST_PROC moves /proc to one fake tree on the real clock (the cadence's test). The Machine
 # sets none of them.
 set -euo pipefail
 
 CLK_TCK="${COST_CLK_TCK:-$(getconf CLK_TCK)}"
+KILL_EARLY_MAX_MS=10000 # kill-renderer waits at most this long for its not_before
 PROC="${COST_PROC:-/proc}"
 NOW_MS=0
 
@@ -278,7 +287,9 @@ cmd_sample() {
 }
 
 cmd_kill_renderer() {
-  local d p chosen="" best=-1 seen="" rc=0 mark="${COST_KILL_MARK:-/tmp/seazn-cost-kill.jsonl}" line
+  local not_before="$1" d p chosen best seen rc=0 mark="${COST_KILL_MARK:-/tmp/seazn-cost-kill.jsonl}" line k=0 sleep_fd="" fifo wait_ms dd
+  [[ $not_before =~ ^[0-9]+$ ]] || { echo '{"error":"kill-renderer <not_before_ms>"}'; exit 64; }
+  [ -z "${COST_PROC_SEQ:-}" ] || PROC="$COST_PROC_SEQ/0"
   # One kill a leg: a call after one that killed (leg.sh's retry when the reply was lost) repeats
   # that call's lines and kills nothing, so the product sees one crash.
   if [ -s "$mark" ]; then
@@ -287,17 +298,44 @@ cmd_kill_renderer() {
     printf '{"repeat_at_ms":%s}\n' "$NOW_MS"
     return 0
   fi
-  for d in "$PROC"/[0-9]*; do
-    p=${d##*/}
-    type_of "$p"
-    [ "$TYPE" = renderer ] || continue
-    seen="${seen:+$seen,}{\"pid\":$p,\"client\":${CLIENT:-null}}"
-    if [ -n "$CLIENT" ] && [ "$CLIENT" -gt "$best" ]; then
-      best=$CLIENT
-      chosen=$p
+  # The newest renderer, read just before the clock reading that lets the kill go: a call that lands
+  # before not_before reads again after each wait, so the kill's at_ms is that reading itself.
+  while :; do
+    [ -z "${COST_PROC_SEQ:-}" ] || PROC="$COST_PROC_SEQ/$k"
+    chosen="" best=-1 seen=""
+    for d in "$PROC"/[0-9]*; do
+      p=${d##*/}
+      type_of "$p"
+      [ "$TYPE" = renderer ] || continue
+      seen="${seen:+$seen,}{\"pid\":$p,\"client\":${CLIENT:-null}}"
+      if [ -n "$CLIENT" ] && [ "$CLIENT" -gt "$best" ]; then
+        best=$CLIENT
+        chosen=$p
+      fi
+    done
+    clock
+    [ "$NOW_MS" -lt "$not_before" ] || break
+    if [ $((not_before - NOW_MS)) -gt "$KILL_EARLY_MAX_MS" ]; then
+      printf '{"early_at_ms":%s,"not_before_ms":%s,"killed":[]}\n' "$NOW_MS" "$not_before"
+      exit 1
+    fi
+    if [ -n "${COST_PROC_SEQ:-}" ]; then
+      k=$((k + 1))
+      [ -d "$COST_PROC_SEQ/$k" ] || { echo '{"error":"COST_PROC_SEQ: no tree after the last read, and the clock is short of not_before"}'; exit 70; }
+    else
+      if [ -z "$sleep_fd" ]; then
+        # A builtin sleep, as the sampler's: a read with a timeout on a FIFO opened read-write.
+        fifo="/tmp/seazn-cost-kill-sleep.$$"
+        mkfifo "$fifo"
+        exec {sleep_fd}<>"$fifo"
+        rm -f "$fifo"
+      fi
+      wait_ms=$((not_before - NOW_MS))
+      [ "$wait_ms" -le 1000 ] || wait_ms=1000
+      printf -v dd '%d.%03d' $((wait_ms / 1000)) $((wait_ms % 1000))
+      read -r -t "$dd" -u "$sleep_fd" _ || true
     fi
   done
-  clock
   if [ -z "$chosen" ]; then
     printf '{"at_ms":%s,"killed":[],"clients":[],"renderers":[%s]}\n' "$NOW_MS" "$seen"
     clock
@@ -317,12 +355,9 @@ cmd_kill_renderer() {
 
 case "${1:-}" in
   sample) cmd_sample "${2:-}" ;;
-  kill-renderer)
-    [ -z "${COST_PROC_SEQ:-}" ] || PROC="$COST_PROC_SEQ/0"
-    cmd_kill_renderer
-    ;;
+  kill-renderer) cmd_kill_renderer "${2:-}" ;;
   *)
-    echo '{"error":"usage: sample <max_s> | kill-renderer"}'
+    echo '{"error":"usage: sample <max_s> | kill-renderer <not_before_ms>"}'
     exit 64
     ;;
 esac

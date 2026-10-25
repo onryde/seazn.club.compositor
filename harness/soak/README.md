@@ -42,7 +42,7 @@ gh workflow run soak.yml --ref <branch> -f sha=<40-hex head> -f page=real -f min
 | `web/bundle-check.sh` | Fails when the web build carries a PostHog key, a Sentry DSN or a Stripe key. |
 | `web/smoke.sh` | `up.sh` and three deliveries inside the built image, on the runner, before the push. |
 | `web/test-bundle-check.sh`, `web/test-overlay-url.sh` | The bundle check on synthetic builds; the signed URL against an independent HS256 verifier. |
-| `cost/in-compositor.sh` | On the compositor Machine (bash builtins only: the relay image has no procps or python). `sample <max_s>`: a JSON line a second from `/proc` (the Machine's cores, the process tree's by kind, the busiest compositor thread, memory). `kill-renderer`: SIGKILL to the CEF renderer with the highest `--renderer-client-id` (the newest page's, as C14's), once a Machine: a second call repeats the first's lines. |
+| `cost/in-compositor.sh` | On the compositor Machine (bash builtins only: the relay image has no procps or python). `sample <max_s>`: a JSON line a second from `/proc` (the Machine's cores, the process tree's by kind, the busiest compositor thread, memory). `kill-renderer`: SIGKILL to the CEF renderer with the highest `--renderer-client-id` (the newest page's, as C14's), once a Machine: a second call repeats the first's lines. `kill-renderer <not_before_ms>` never kills before that instant by the Machine's own clock (it waits, at most 10 s; a call more than 10 s early is refused). |
 | `cost/leg.sh` | On the runner, in the background: puts `in-compositor.sh` on the compositor Machine, keeps its sampler running over `flyctl ssh console`, and kills the renderer at the drive's midpoint over `flyctl machine exec`. |
 | `cost/verdict.sh`, `cost/cost.jq` | A leg's verdict (the size rule, the moments, the reload, the samples) and its F-005 column. |
 | `cost/table.sh` | The legs' columns as one F-005-shaped table (the `cost-table` job). |
@@ -268,10 +268,13 @@ pace: cricket a boundary every `cost_ball_every_s` (6 s; fours and sixes alterna
 moment of about 5 s, so the bar's cards run nearly back to back, and the compositor's 5 s poll sees
 each), badminton a rally every `cost_rally_every_s` (3 s; the game kept level, so a fresh game
 point every second rally from 19-19). `leg.sh` kills the newest page's CEF renderer once at the
-drive's midpoint; the compositor reads CefCrashed and rebuilds the page as a new generation. A try
-whose reply was lost is retried, but `kill-renderer` keeps a mark on the Machine, so a retry gets the
-first kill's lines back and kills nothing; and no try starts unless its kill can land inside the
-verdict's window (`cost_kill_late_max_s`, 100 s: three tries of 30 s).
+drive's midpoint; the compositor reads CefCrashed and rebuilds the page as a new generation. The
+midpoint is decided on the compositor Machine, by the clock the kill's `at_ms` is read from: `leg.sh`
+sends the try 2 s early as `kill-renderer <planned_ms>`, and the Machine holds it until its own clock
+reaches `planned_ms` (finding 18). A try whose reply was lost is retried, but `kill-renderer` keeps a
+mark on the Machine, so a retry gets the first kill's lines back and kills nothing; and no try starts
+unless its kill can land inside the verdict's window (`cost_kill_late_max_s`, 100 s: three tries of
+30 s).
 
 **The verdict** (`cost/verdict.sh`, every number from `soak.json`):
 
@@ -394,6 +397,23 @@ patterns per profile, the sport reason or the football leg), and Owed 93's closu
 17. **The stills were the only on-screen witness of a moment, and nothing judged them.** A leg now
     fails with no still written, and the column counts them. Whether a still shows a moment card is
     still a person's look, not a check.
+18. **The kill's midpoint was decided on the wrong clock, and up to a second early.** Run
+    40153136892's A:noise leg went red on `the kill came -0.08 s from the midpoint (0 to 100)` while
+    the product reloaded correctly (crash 0.023 s and ready 5.197 s after the kill); A:snow's kill
+    read +0.401 s. The two causes, both in `leg.sh`'s wait: it ended when `(planned - now) / 1000`,
+    an integer division, reached 0, so up to 999 ms before the midpoint, and only the exec's latency
+    (about a second) usually covered it; and it read this runner's clock while the verdict compares
+    the compositor Machine's `at_ms` with `planned_ms`. The fix moves the decision to the Machine:
+    `kill-renderer <planned_ms>` waits there until the Machine's own clock reaches it, and its
+    `at_ms` is the reading that passed, so `at_ms - planned_ms` is never negative by construction.
+    `leg.sh` sends the try 2 s early (to the ms), so the exec's latency no longer delays the kill
+    either. **The window's late bound** has no such defect: the verdict reads it on the same pair as
+    the early one (the Machine's `at_ms` against `planned_ms`), and `leg.sh`'s try guard, on this
+    runner's clock, keeps 15 s for a try to land, against a skew of milliseconds between NTP-synced
+    hosts. A try whose exec took over 15 s would land late, and the verdict's red would then be true
+    (the kill was late), not a misreading. What remains between the two Machines is `planned_ms`
+    itself: the harness Machine's drive start, compared with the compositor Machine's clock, a skew
+    of milliseconds.
 
 ## Owed (not in this PR)
 
