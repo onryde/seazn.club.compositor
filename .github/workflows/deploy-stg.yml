@@ -1,0 +1,151 @@
+name: deploy-stg
+# C16 (docs/tasks/C16-deploy.md): build the relay image at this commit and push it to the stg relay
+# app's registry as <RELAY_REGISTRY>/seazn-relay-stg:<sha>. A push changes nothing live: a relay
+# Machine takes an image only when web creates one, from web's RELAY_IMAGE, and RELAY_IMAGE changes
+# only through promote.yml, behind the relay-stg environment's reviewers (decision log 2026-10-14,
+# owner ruling: the bump is explicit, never automatic).
+#
+# - The token guard: FLY_API_TOKEN_STG unset (today) is a warning and a skipped push, never a red.
+#   The token is a repository secret: this workflow has no environment.
+# - The CEF bump gate (amendment 2026-10-18, Owed 22) runs right after every checkout, so a CEF bump
+#   with no recorded C11 Step 0 re-run is never pushed.
+# - The build reads and writes no cache: image.yml's GHCR cache is writable by any repository writer
+#   (amendment 2026-10-23), so every layer is built from source here.
+# - The target is relay and nothing else: never the image that carries the C14 hooks (amendment
+#   2026-10-24).
+# - A sha already in the registry is never pushed again: promote.yml pins RELAY_IMAGE by digest, and
+#   a tag that never moves keeps a rollback's ref meaning what it meant.
+# scripts/check-workflows.sh (check.yml) holds this file to all of the above.
+on:
+  push: { branches: [main] }
+  workflow_dispatch: {}
+permissions: { contents: read }
+concurrency:
+  group: deploy-stg
+  cancel-in-progress: false
+defaults:
+  run: { shell: bash }
+env:
+  RELAY_APP: seazn-relay-stg
+  # ADR 0007: the one place the registry is named; moving host changes the variable.
+  RELAY_REGISTRY: ${{ vars.RELAY_REGISTRY || 'registry.fly.io' }}
+  # flyctl, pinned with its release checksum (soak.yml's: superfly/flyctl v0.4.116).
+  FLYCTL_VERSION: 0.4.116
+  FLYCTL_SHA256: ab929c80ef0c1f7d623052267885632f47b4c5dd7c0ed8383d16f42472abe7b9
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.token.outputs.enabled }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false }
+      - name: CEF bump gate (Owed 22)
+        run: scripts/check-cef-bump.sh
+      - name: The Fly token
+        id: token
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_STG }}
+        run: |
+          if [ -z "$FLY_API_TOKEN" ]; then
+            echo "::warning::FLY_API_TOKEN_STG unset — push skipped"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+  push:
+    needs: gate
+    if: needs.gate.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04
+    # A cold CEF build: no cache, by rule.
+    timeout-minutes: 90
+    env:
+      TAG: ${{ github.sha }}
+      LOCAL_IMAGE: seazn-relay:${{ github.sha }}
+    steps:
+      # Actions pinned by commit: this job holds a Fly token (image.yml's cache job, the PR #47 review's m7).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false }
+      - name: CEF bump gate (Owed 22)
+        run: scripts/check-cef-bump.sh
+      # CEF's build tree does not fit the runner's free disk otherwise (image.yml).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: gstcefsrc pin (F-001)
+        id: pin
+        run: |
+          commit=$(tr -d '[:space:]' < docker/GSTCEF_COMMIT)
+          if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::docker/GSTCEF_COMMIT is not a 40-hex commit: '$commit'"
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: flyctl
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/flyctl.tgz" \
+            "https://github.com/superfly/flyctl/releases/download/v${FLYCTL_VERSION}/flyctl_${FLYCTL_VERSION}_Linux_x86_64.tar.gz"
+          echo "$FLYCTL_SHA256  $RUNNER_TEMP/flyctl.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin" && tar -xzf "$RUNNER_TEMP/flyctl.tgz" -C "$RUNNER_TEMP/bin" flyctl
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Already pushed?
+        id: exists
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_STG }}
+        run: |
+          flyctl auth docker
+          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          if digest=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}' 2> /dev/null) \
+            && [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::notice::$ref is already pushed ($digest): nothing to build"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        if: steps.exists.outputs.exists != 'true'
+      - name: Build the relay image
+        if: steps.exists.outputs.exists != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: relay
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          tags: ${{ env.LOCAL_IMAGE }}
+          load: true
+          push: false
+      - name: Push
+        id: push
+        if: steps.exists.outputs.exists != 'true'
+        # No token here: "Already pushed?"'s `flyctl auth docker` logged docker in for this job.
+        run: |
+          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          docker tag "$LOCAL_IMAGE" "$ref"
+          docker push -q "$ref"
+          digest=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::$ref has no manifest digest after the push: '$digest'"; exit 1; }
+          echo "pushed $ref ($digest)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Summary
+        env:
+          DIGEST: ${{ steps.push.outputs.digest || steps.exists.outputs.digest }}
+        run: |
+          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          {
+            echo "## Relay image, stg"
+            echo
+            echo "Pushed: \`$ref\` (\`$DIGEST\`). Nothing live changed."
+            echo
+            echo "Promote it (stg's web app takes it for every new session once a relay-stg reviewer approves; not run):"
+            echo
+            echo '```'
+            echo "gh workflow run promote.yml --ref main -f env=stg -f ref=$TAG"
+            echo '```'
+            echo
+            echo "which sets \`RELAY_IMAGE=$ref@$DIGEST\` on seazn-club-stg with \`flyctl secrets set --stage\`, then \`flyctl secrets deploy\`."
+          } >> "$GITHUB_STEP_SUMMARY"

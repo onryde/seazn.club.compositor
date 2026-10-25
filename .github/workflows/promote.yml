@@ -1,0 +1,201 @@
+name: promote
+# The run list reads what each run asked for; the next promote reads the previous ref from it.
+run-name: promote ${{ inputs.env }} ${{ inputs.ref }}
+# C16 (docs/tasks/C16-deploy.md): point a web app's RELAY_IMAGE at a relay image deploy-stg.yml or
+# deploy-prod.yml already pushed. This is the live change: every NEW relay session on that web app
+# takes the image (running Machines keep theirs). Owner ruling (decision log 2026-10-14): the bump is
+# explicit, never automatic, so the job runs in the GitHub environment relay-<env>, whose required
+# reviewers (the owner) approve each run before any step starts. Rollback is this workflow with the
+# previous ref, which each run's summary names.
+#
+#   gh workflow run promote.yml --ref main -f env=stg -f ref=<40-hex sha from deploy-stg>
+#   gh workflow run promote.yml --ref main -f env=prod -f ref=<vX.Y.Z from deploy-prod>  (after C17)
+#
+# RELAY_IMAGE is set as a Fly secret on seazn-club-<env>: re-pinned 2026-10-25, it is no [env] entry
+# in seazn.club's fly.stg.toml or fly.toml (nor in either app's deployed config), and stg's relay
+# settings (FLY_RELAY_APP, RELAY_DRIVERS, RELAY_KEK) are secrets. If it ever becomes an [env] entry,
+# promotion is a seazn.club PR: this workflow then refuses and prints the diff. The value is pinned
+# by digest (<image>:<ref>@sha256:...), so nothing but another promote changes what web runs.
+#
+# The token guard (FLY_API_TOKEN_<ENV> unset is a warning and a skipped promote; an environment
+# secret of that name on relay-<env> wins over a repository one) and the CEF bump gate after the
+# checkout (Owed 22) hold here as in the deploy workflows; scripts/check-workflows.sh checks them and
+# the environment. scripts/deploy_checks_test.sh runs the "Promote RELAY_IMAGE" step under fakes.
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "The deployment: stg or prod (prod only after C17 passes)"
+        type: choice
+        options: [stg, prod]
+        required: true
+      ref:
+        description: "The pushed image's tag: a 40-hex sha (deploy-stg) or vX.Y.Z (deploy-prod)"
+        type: string
+        required: true
+# actions: read lets the step read this workflow's earlier runs for the previous ref.
+permissions: { contents: read, actions: read }
+concurrency:
+  group: promote-${{ inputs.env }}
+  cancel-in-progress: false
+defaults:
+  run: { shell: bash }
+env:
+  # ADR 0007: the one place the registry is named; moving host changes the variable.
+  RELAY_REGISTRY: ${{ vars.RELAY_REGISTRY || 'registry.fly.io' }}
+  # flyctl, pinned with its release checksum (soak.yml's: superfly/flyctl v0.4.116).
+  FLYCTL_VERSION: 0.4.116
+  FLYCTL_SHA256: ab929c80ef0c1f7d623052267885632f47b4c5dd7c0ed8383d16f42472abe7b9
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # The human approval: relay-stg / relay-prod with the owner as a required reviewer. GitHub creates
+    # an environment named here on its first run WITH NO REVIEWERS, so create both, with reviewers,
+    # before the first dispatch.
+    environment: relay-${{ inputs.env }}
+    steps:
+      # Actions pinned by commit: this job holds a Fly token (image.yml's cache job, the PR #47 review's m7).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false }
+      - name: CEF bump gate (Owed 22)
+        run: scripts/check-cef-bump.sh
+      # Each env's token reaches only its own runs: `x && secret || ''` falls back to empty, never to
+      # the other env's token (the `a && b || c` form would hand a prod run stg's token when prod's is
+      # unset).
+      - name: The Fly token
+        id: token
+        env:
+          FLY_API_TOKEN_STG: ${{ inputs.env == 'stg' && secrets.FLY_API_TOKEN_STG || '' }}
+          FLY_API_TOKEN_PROD: ${{ inputs.env == 'prod' && secrets.FLY_API_TOKEN_PROD || '' }}
+          RELAY_ENV: ${{ inputs.env }}
+        run: |
+          if [ "$RELAY_ENV" = prod ]; then
+            if [ -z "$FLY_API_TOKEN_PROD" ]; then
+              echo "::warning::FLY_API_TOKEN_PROD unset — promote skipped"
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          elif [ -z "$FLY_API_TOKEN_STG" ]; then
+            echo "::warning::FLY_API_TOKEN_STG unset — promote skipped"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+      - name: flyctl
+        if: steps.token.outputs.enabled == 'true'
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/flyctl.tgz" \
+            "https://github.com/superfly/flyctl/releases/download/v${FLYCTL_VERSION}/flyctl_${FLYCTL_VERSION}_Linux_x86_64.tar.gz"
+          echo "$FLYCTL_SHA256  $RUNNER_TEMP/flyctl.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin" && tar -xzf "$RUNNER_TEMP/flyctl.tgz" -C "$RUNNER_TEMP/bin" flyctl
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      # Inputs reach the script by env only (no expression inside it), so a ref cannot inject shell,
+      # and scripts/deploy_checks_test.sh can run this block as written.
+      - name: Promote RELAY_IMAGE
+        id: promote
+        if: steps.token.outputs.enabled == 'true'
+        env:
+          FLY_API_TOKEN_STG: ${{ inputs.env == 'stg' && secrets.FLY_API_TOKEN_STG || '' }}
+          FLY_API_TOKEN_PROD: ${{ inputs.env == 'prod' && secrets.FLY_API_TOKEN_PROD || '' }}
+          GH_TOKEN: ${{ github.token }}
+          RELAY_ENV: ${{ inputs.env }}
+          REF: ${{ inputs.ref }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          case "$RELAY_ENV" in stg | prod) ;; *) fail "env must be stg or prod: '$RELAY_ENV'" ;; esac
+          if ! [[ "$REF" =~ ^[0-9a-f]{40}$ || "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            fail "ref must be a 40-hex sha (deploy-stg) or a vX.Y.Z tag (deploy-prod): '$REF'"
+          fi
+          [ "$GITHUB_REF" = refs/heads/main ] || fail "promote runs from main only, not $GITHUB_REF"
+          # flyctl reads FLY_API_TOKEN from the environment (never argv).
+          if [ "$RELAY_ENV" = prod ]; then FLY_API_TOKEN=$FLY_API_TOKEN_PROD; else FLY_API_TOKEN=$FLY_API_TOKEN_STG; fi
+          export FLY_API_TOKEN
+          [ -n "$FLY_API_TOKEN" ] || fail "no Fly token for $RELAY_ENV past the guard"
+          web="seazn-club-$RELAY_ENV"
+          repo="$RELAY_REGISTRY/seazn-relay-$RELAY_ENV"
+          resolve() { docker buildx imagetools inspect "$repo:$1" --format '{{.Manifest.Digest}}'; }
+
+          flyctl auth docker
+          if ! digest=$(resolve "$REF" 2> "$RUNNER_TEMP/inspect.err") || ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            fail "not pushed: $repo:$REF ($(head -c 300 "$RUNNER_TEMP/inspect.err"))"
+          fi
+          new="$repo:$REF@$digest"
+
+          # An [env] entry would make this a seazn.club PR, not a secret (C16 brief, step 3).
+          config=$(flyctl config show -a "$web")
+          if jq -e '(.env // {}) | has("RELAY_IMAGE")' <<< "$config" > /dev/null; then
+            toml=fly.toml
+            [ "$RELAY_ENV" = prod ] || toml="fly.$RELAY_ENV.toml"
+            {
+              echo "## promote $RELAY_ENV: not promoted"
+              echo
+              echo "RELAY_IMAGE is an [env] entry in $web's config. Promote it by a seazn.club PR to \`$toml\`:"
+              echo
+              echo '```diff'
+              echo "-  RELAY_IMAGE = \"$(jq -r '.env.RELAY_IMAGE' <<< "$config")\""
+              echo "+  RELAY_IMAGE = \"$new\""
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            fail "RELAY_IMAGE is an [env] entry in $web's config, not a secret: promotion is a seazn.club PR (the diff is in the summary)"
+          fi
+
+          # `secrets deploy` ships EVERY staged secret: refuse unless RELAY_IMAGE will be the only one.
+          secrets=$(flyctl secrets list -a "$web" --json)
+          staged=$(jq -r '[.[] | select((.status // "") | ascii_downcase == "staged") | .name] | join(" ")' <<< "$secrets")
+          [ -z "$staged" ] || fail "$web has staged secrets ($staged): flyctl secrets deploy would ship them with RELAY_IMAGE; deploy or unstage them first"
+          before=$(jq -r '[.[] | select(.name == "RELAY_IMAGE") | .digest][0] // "unset"' <<< "$secrets")
+
+          # The previous ref: the newest earlier run of this workflow for this env whose promote step
+          # succeeded (a skipped or failed run changed nothing). Fly's secret values are write-only.
+          prev='' prev_run='' prev_note=''
+          if runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/promote.yml/runs?status=success&per_page=50" \
+              --jq '.workflow_runs[] | "\(.id) \(.display_title)"' 2> "$RUNNER_TEMP/gh.err"); then
+            while read -r id word env_word ref_word; do
+              [ "$word" = promote ] && [ "$env_word" = "$RELAY_ENV" ] && [ -n "$ref_word" ] && [ "$id" != "$GITHUB_RUN_ID" ] || continue
+              if ! n=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs" \
+                  --jq '[.jobs[].steps[]? | select(.name == "Promote RELAY_IMAGE" and .conclusion == "success")] | length' 2>> "$RUNNER_TEMP/gh.err"); then
+                prev_note="unknown: run $id's jobs could not be read"
+                break
+              fi
+              if [ "$n" -ge 1 ]; then prev=$ref_word prev_run=$id; break; fi
+            done <<< "$runs"
+          else
+            prev_note="unknown: this workflow's runs could not be read ($(head -c 200 "$RUNNER_TEMP/gh.err"))"
+          fi
+          if [ -n "$prev" ]; then
+            if prev_digest=$(resolve "$prev" 2> /dev/null) && [[ "$prev_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              previous="\`$repo:$prev@$prev_digest\` (promote run $prev_run)"
+            else
+              previous="\`$repo:$prev\` (promote run $prev_run; no longer in the registry)"
+            fi
+          elif [ -n "$prev_note" ]; then
+            previous=$prev_note
+          elif [ "$before" = unset ]; then
+            previous="unset (this is $web's first RELAY_IMAGE)"
+          else
+            previous="set outside promote.yml (Fly digest $before; the value is write-only)"
+          fi
+
+          flyctl secrets set "RELAY_IMAGE=$new" -a "$web" --stage
+          flyctl secrets deploy -a "$web"
+          after=$(flyctl secrets list -a "$web" --json | jq -r '[.[] | select(.name == "RELAY_IMAGE") | .digest][0] // "unset"')
+          [ "$after" != unset ] || fail "RELAY_IMAGE is not set on $web after the deploy"
+          [ "$after" != "$before" ] || echo "::warning::RELAY_IMAGE's Fly digest did not change ($after): $web already had this value"
+          echo "promoted $new to $web (Fly digest $before -> $after)"
+          {
+            echo "## promote $RELAY_ENV"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| web app | $web |"
+            echo "| new RELAY_IMAGE | \`$new\` |"
+            echo "| previous RELAY_IMAGE | $previous |"
+            echo "| RELAY_IMAGE's Fly digest | $before → $after |"
+            echo
+            if [ -n "$prev" ]; then
+              echo "Rollback: \`gh workflow run promote.yml --ref main -f env=$RELAY_ENV -f ref=$prev\` (a relay-$RELAY_ENV reviewer approves it)."
+            else
+              echo "Rollback: no earlier promote of $RELAY_ENV to return to."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
