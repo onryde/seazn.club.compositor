@@ -29,11 +29,13 @@ export class Door {
     writeFileSync(path, JSON.stringify(this.cookies), { mode: 0o600 });
   }
 
-  async call(path, method = "GET", body) {
+  // opts.cookies false: an anonymous read (the public routes), the jar neither sent nor updated.
+  async call(path, method = "GET", body, opts = {}) {
+    const withJar = opts.cookies !== false;
     for (let attempt = 0; ; attempt++) {
       const headers = { "content-type": "application/json" };
       const jar = Object.entries(this.cookies).map(([k, v]) => `${k}=${v}`).join("; ");
-      if (jar) headers.cookie = jar;
+      if (jar && withJar) headers.cookie = jar;
       let res;
       try {
         res = await fetch(this.base + path, {
@@ -43,7 +45,7 @@ export class Door {
       } catch (e) {
         return { status: 0, json: { ok: false, error: { code: "NETWORK", message: String(e?.cause?.code ?? e?.name ?? e) } } };
       }
-      for (const sc of res.headers.getSetCookie?.() ?? []) {
+      for (const sc of withJar ? res.headers.getSetCookie?.() ?? [] : []) {
         const m = sc.match(/^([^=]+)=([^;]*)/);
         if (!m) continue;
         if (m[2] === "") delete this.cookies[m[1]];
@@ -68,6 +70,34 @@ export class Door {
     }
     return r.json.data;
   }
+}
+
+// The moments the overlay page makes of one event, read from the page's own feed: the public
+// overlay route's `recent` item (web apps/web/src/server/overlay/recent.ts) whose payload and
+// derived facts the page's rules read (apps/web/src/lib/overlay-moments.ts MOMENT_RULES, at
+// 7dcb3c42e2): a cricket ball's wicket, six or four (`payload.wicketKind`, `payload.boundary`; runs
+// of 4 without `boundary` make none), a game won (`derived.setWon`) and a fresh game or match point
+// (`derived.pointState.fresh`). The page shows them only for events after its own load. An event
+// the feed does not carry reads null, never [].
+export function momentsOf(item) {
+  if (!item || typeof item !== "object") return null;
+  const out = [];
+  if (item.type === "cricket.ball") {
+    if (item.payload?.wicketKind) out.push("wicket");
+    else if (item.payload?.boundary === 6) out.push("six");
+    else if (item.payload?.boundary === 4) out.push("four");
+  }
+  if (item.derived?.setWon) out.push("gameWon");
+  if (item.derived?.pointState?.fresh === true) out.push(`point.${item.derived.pointState.kind}`);
+  return out;
+}
+
+// The moments of the event with this seq, from the public overlay route (the fixture's competition
+// is public: no token). null when the route or the item is missing.
+export async function momentsAt(door, fixture, seq) {
+  const r = await door.call(`/api/v1/public/fixtures/${fixture}/overlay`, "GET", undefined, { cookies: false });
+  const item = (r.json?.ok ? r.json.data?.recent ?? [] : []).find((x) => x?.seq === seq);
+  return momentsOf(item);
 }
 
 const b64url = (buf) => Buffer.from(buf).toString("base64url");

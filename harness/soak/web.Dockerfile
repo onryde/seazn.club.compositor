@@ -27,7 +27,8 @@ COPY harness/soak/web/build/node /usr/local/bin/node
 ADD harness/soak/web/build/app.tgz /web/app/
 COPY harness/soak/web/build/db /web/db
 COPY harness/soak/web/build/web.json /web/web.json
-COPY harness/soak/web/lib.mjs harness/soak/web/seed.mjs harness/soak/web/score.mjs harness/soak/web/overlay-url.mjs \
+COPY harness/soak/web/lib.mjs harness/soak/web/seed.mjs harness/soak/web/score.mjs harness/soak/web/rally.mjs \
+     harness/soak/web/overlay-url.mjs \
      harness/soak/web/serve.sh harness/soak/web/up.sh harness/soak/web/smoke.sh harness/soak/web/session.sql /soak/web/
 # Every shared library the copied node links must resolve here, and so must every native add-on's
 # (`*.node`: sharp at 7dcb3c42e2, which loads lazily, on the first route that needs it): a missing

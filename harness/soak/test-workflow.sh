@@ -28,7 +28,9 @@
 #   Machine's entry, a cut-off tail, stamps with 9 and 3 fraction digits and an offset, a bare and a
 #   reasoned `overlay hidden`; and an empty stream refused.
 #
-#   harness/soak/test-workflow.sh                 (SOAK_YML=<file> checks another copy: mutants)
+#   harness/soak/test-workflow.sh                 (SOAK_YML=<file> checks another copy: mutants;
+#                                                  HARNESS_BASH=<bash 5> runs the cost table's step,
+#                                                  which needs bash 4+ as the runner's has)
 #
 # Needs ruby (YAML), jq and python3. Prints `checked: N` and fails on zero.
 set -euo pipefail
@@ -115,9 +117,16 @@ if [ "$(grep -c 'restart: {policy: "no"}' <<<"$launch" || true)" -eq 2 ] && [ "$
 else
   fail "both configs" "restart no / auto_destroy not in both"
 fi
-grep -qF 'guest: {cpu_kind: "performance", cpus: 4, memory_mb: 8192}' <<<"$launch" \
+grep -qF 'guest: {cpu_kind: "performance", cpus: ($ENV.C_CPUS | tonumber), memory_mb: ($ENV.C_MEM | tonumber)}' <<<"$launch" \
+  && grep -qF 'run_machine "$name_c" "registry.fly.io/$FLY_APP:relay-$SHA" "$RUNNER_TEMP/compositor.machine.json" "$C_CPUS" "$C_MEM"' <<<"$launch" \
   && grep -qF 'COMPOSITOR_DRIVERS: "live"' <<<"$launch" \
-  && pass "the compositor: performance, 4 CPUs, 8192 MB, live drivers" || fail "the compositor's guest"
+  && pass "the compositor: performance, the plan's CPUs and memory in its config and its run line, live drivers" || fail "the compositor's guest"
+check "the compositor's guest: the input, production's performance-4x by default, through the plan to the soak job" \
+  '((.on // .["true"]).workflow_dispatch.inputs.guest | .default == "performance-4x" and .options == ["performance-4x", "performance-8x"])
+   and .jobs.soak.env.C_CPUS == "${{ needs.plan.outputs.c_cpus }}" and .jobs.soak.env.C_MEM == "${{ needs.plan.outputs.c_mem }}"
+   and .jobs.plan.outputs.c_cpus == "${{ steps.runs.outputs.c_cpus }}" and .jobs.soak.env.GUEST == "${{ inputs.guest }}"'
+jq -e '.compositor_guest == {"performance-4x": {cpus: 4, memory_mb: 8192}, "performance-8x": {cpus: 8, memory_mb: 16384}}' "$HERE/soak.json" >/dev/null \
+  && pass "soak.json: performance-4x is 4 CPUs, 8192 MB (R1's RUNNER_DEFAULT_GUEST), performance-8x 8 and 16384" || fail "soak.json's compositor_guest"
 
 # --- the job token ---------------------------------------------------------------------------------
 grep -qE 'job_token="\$\(od -An -N32 -tx1 /dev/urandom' <<<"$launch" && pass "the job token: 32 random bytes" || fail "the job token's source"
@@ -209,9 +218,10 @@ miss=""; for f in deliveries.jsonl score.log seed.json web-up.log web.log postgr
 grep -qF SOAK_OVERLAY_URL "$YML" && fail "no SOAK_OVERLAY_URL is left" "it is" || pass "no SOAK_OVERLAY_URL is left"
 
 # --- the run list, re-runs, the deadline, the leak gate -------------------------------------------
-check "run-name: the page and the minutes, PLUMBING ONLY on page=test" \
-  '.["run-name"] | contains("page=${{ inputs.page }}") and contains("${{ inputs.minutes }} min")
-   and contains("inputs.page == '"'"'test'"'"' && '"'"' (PLUMBING ONLY)'"'"'")'
+check "run-name: the page and the minutes, PLUMBING ONLY on page=test; the cost legs and the guest by name" \
+  '.["run-name"] | contains("format('"'"'soak page={0} {1} min{2}{3}'"'"', inputs.page, inputs.minutes, inputs.page == '"'"'test'"'"' && '"'"' (PLUMBING ONLY)'"'"'")
+   and contains("inputs.legs != '"'"''"'"' && format('"'"'cost legs {0} on {1}, {2} min'"'"', inputs.legs, inputs.guest, inputs.minutes)")
+   and contains("inputs.guest != '"'"'performance-4x'"'"' && format('"'"' on {0}'"'"', inputs.guest)")'
 grep -qF '# PLUMBING ONLY — NOT A SOAK PASS' <<<"$verdict" && pass "the step summary heads a plumbing run PLUMBING ONLY" || fail "the summary heading"
 check "the page source's artifact: one name per run, replaced by a re-run (no run_attempt)" \
   '[.jobs.web.steps[], .jobs.images.steps[] | select((.uses // "") | test("actions/(up|down)load-artifact")) | .with]
@@ -224,7 +234,8 @@ else
 fi
 gate="$(step soak "Leak gate")"
 leakgate() { # <page> <secrets.json content or ""> [compositor.log content]: runs the step on a fake
-  # /out; rc, then what is left. @LOGSUM@ in the secrets is the log's own sha256.
+  # /out; rc, then what is left. @LOGSUM@ in the secrets is the log's own sha256. LG_FLY: the Fly
+  # token in the step's environment.
   rm -rf "$W/lg"; mkdir -p "$W/lg/out"
   printf 'tok_%s\n' "$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')" >"$W/lg/job-token"
   for f in status.json done driver.log web.log report.json; do echo '{}' >"$W/lg/out/$f"; done
@@ -237,7 +248,7 @@ leakgate() { # <page> <secrets.json content or ""> [compositor.log content]: run
   [ -z "$sec" ] || printf '%s\n' "$sec" >"$W/lg/out/secrets.json"
   : >"$W/lg/gh-out"
   local rc=0
-  RUNNER_TEMP="$W/lg" PAGE="$1" GITHUB_OUTPUT="$W/lg/gh-out" bash -eo pipefail -c "$gate" >"$W/lg/log" 2>&1 || rc=$?
+  RUNNER_TEMP="$W/lg" PAGE="$1" GITHUB_OUTPUT="$W/lg/gh-out" FLY_API_TOKEN="${LG_FLY:-}" bash -eo pipefail -c "$gate" >"$W/lg/log" 2>&1 || rc=$?
   echo "$rc $(cd "$W/lg/out" && ls | sort | tr '\n' ' ')"
 }
 got="$(leakgate real "")"
@@ -252,6 +263,14 @@ got="$(leakgate real '{"scanned":24,"leaks":1,"skipped":[],"leaked":[{"kind":"WE
   && pass "leak gate: a leak uploads nothing and prints the harness's redacted report" || fail "leak gate, a leak" "$got: $(head -c 400 "$W/lg/log")"
 got="$(leakgate real '{"scanned":24,"leaks":0,"skipped":[],"leaked":[]}')"
 [ "${got%% *}" = 0 ] && grep -qx 'ok=true' "$W/lg/gh-out" && pass "leak gate: a clean scan uploads" || fail "leak gate, clean" "$got"
+# The Fly token: a cost leg's flyctl output in a kept file is a leak; set and absent, a clean run uploads.
+fly="FlyV1 fm2_$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
+got="$(LG_FLY="$fly" leakgate real '{"scanned":24,"leaks":0,"skipped":[],"leaked":[]}' "ts=2026-10-24T12:00:00.000Z level=info msg=cef alive gen=1 ${fly}")"
+[ "${got%% *}" = 1 ] && ! grep -qx 'ok=true' "$W/lg/gh-out" && grep -qF 'the job token or the Fly token is in a fetched file' "$W/lg/log" \
+  && ! grep -qF -- "$fly" "$W/lg/log" && pass "leak gate: the Fly token in a fetched file uploads nothing (and is not printed)" || fail "leak gate, the Fly token" "$got"
+got="$(LG_FLY="$fly" leakgate real '{"scanned":24,"leaks":0,"skipped":[],"leaked":[]}')"
+[ "${got%% *}" = 0 ] && grep -qx 'ok=true' "$W/lg/gh-out" && [ "$(stat -c %a "$W/lg/scan-patterns" 2>/dev/null || stat -f %Lp "$W/lg/scan-patterns")" = 600 ] \
+  && pass "leak gate: with the Fly token set, a clean run uploads; the pattern file is mode 600" || fail "leak gate, the Fly token clean" "$got"
 # The runner's own compositor log (page=real): up only when the harness scanned those bytes.
 clog='ts=2026-10-24T12:00:00.000Z level=info msg=cef alive gen=1'
 got="$(leakgate real '{"scanned":24,"leaks":0,"skipped":[],"leaked":[],"compositor_log_sha256":"@LOGSUM@"}' "$clog")"
@@ -270,6 +289,128 @@ jq -e '.poll_after_min >= 20 and .poll_after_min < .hard_stop_after_min and .har
        and .post_check_reserve_s > 60 and .post_check_reserve_s < (.hard_stop_after_min - .poll_after_min) * 60' "$HERE/soak.json" >/dev/null \
   && pass "soak.json: watch 20+ min past the run, then the hard stop, then the job's timeout; the post-check reserve fits" \
   || fail "soak.json's watch, stop and reserve" "$(jq -c '{poll_after_min, hard_stop_after_min, timeout_after_min, post_check_reserve_s}' "$HERE/soak.json")"
+
+# --- the cost legs --------------------------------------------------------------------------------
+runs_step="$(step plan "The runs")"
+runs() { # <legs> <camera> <page> <guest>: the runs step for real
+  : >"$W/runs.out"
+  (cd "$ROOT" && LEGS="$1" CAMERA="$2" PAGE="$3" GUEST="$4" GITHUB_OUTPUT="$W/runs.out" bash -eo pipefail -c "$runs_step" >"$W/runs.err" 2>&1)
+}
+out() { sed -n "s/^$1=//p" "$W/runs.out"; }
+runs "" ball test performance-4x && [ "$(out mode)" = soak ] && [ "$(out runs)" = '[{"leg":"","camera":"ball"}]' ] \
+  && [ "$(out c_cpus)" = 4 ] && [ "$(out c_mem)" = 8192 ] \
+  && pass "runs: no legs is the soak, one run, on performance-4x" || fail "runs: the soak" "$(cat "$W/runs.out")"
+runs "A:snow,A:noise" ball real performance-4x && [ "$(out mode)" = legs ] \
+  && [ "$(out runs)" = '[{"leg":"A","camera":"snow"},{"leg":"A","camera":"noise"}]' ] \
+  && pass "runs: A:snow,A:noise is two runs of leg A, a camera each" || fail "runs: A:snow,A:noise" "$(cat "$W/runs.out")"
+runs "A,B,C,D" noise real performance-8x \
+  && [ "$(out runs)" = '[{"leg":"A","camera":"noise"},{"leg":"B","camera":"noise"},{"leg":"C","camera":"noise"},{"leg":"D","camera":"noise"}]' ] \
+  && [ "$(out c_cpus)" = 8 ] && [ "$(out c_mem)" = 16384 ] \
+  && pass "runs: A,B,C,D on camera noise, on performance-8x (8 CPUs, 16384 MB)" || fail "runs: four legs on 8x" "$(cat "$W/runs.out")"
+# Each refused for its own reason (the reason printed), never for another (a jq error refuses too).
+refused=0
+while IFS='|' read -r bad why; do
+  # shellcheck disable=SC2086
+  set -- $bad
+  if runs "$1" "$2" "$3" "$4"; then echo "  accepted: $bad"
+  elif grep -qF -- "$why" "$W/runs.err"; then refused=$((refused + 1))
+  else echo "  refused without '$why': $bad: $(head -c 300 "$W/runs.err")"; fi
+done <<'CASES'
+A ball real performance-4x|camera ball for leg A: one of snow, noise
+A snow test performance-4x|the cost legs run the production page: page=real
+E snow real performance-4x|no leg E in soak.json
+A:ball snow real performance-4x|camera ball for leg A
+A,A snow real performance-4x|a leg and camera twice
+a snow real performance-4x|legs: a is not <leg>[:<camera>]
+A snow real performance-16x|guest 'performance-16x' is not in soak.json's compositor_guest
+A;B snow real performance-4x|legs: A;B is not <leg>[:<camera>]
+CASES
+[ "$refused" -eq 8 ] && pass "runs: refused 8 of 8, each by its reason (camera ball, page=test, leg E, :ball, a repeat, lower case, an unknown guest, a ; list)" \
+  || fail "runs: the refusals" "$refused of 8"
+for case in "15 A 0" "14 A 1" "15 '' 1"; do
+  eval "set -- $case"
+  : >"$W/plan.out"
+  (cd "$ROOT" && MINUTES="$1" LEGS="$2" GITHUB_OUTPUT="$W/plan.out" bash -eo pipefail -c "$numbers" >/dev/null 2>&1) && rc=0 || rc=1
+  [ "$rc" -eq "$3" ] || { fail "numbers: $1 minutes, legs '$2'" "exit $rc, want $3"; continue; }
+  pass "numbers: $1 minutes, legs '${2}': $([ "$3" -eq 0 ] && echo "drive $(sed -n 's/^drive=//p' "$W/plan.out") min, at least leg_min_drive_min" || echo refused)"
+done
+check "the soak job: a matrix of the plan's runs, one at a time, none cancelling the rest; LEG and CAMERA from it" \
+  '.jobs.soak.strategy == {"fail-fast": false, "max-parallel": 1, matrix: {run: "${{ fromJSON(needs.plan.outputs.runs) }}"}}
+   and .jobs.soak.env.LEG == "${{ matrix.run.leg }}" and .jobs.soak.env.CAMERA == "${{ matrix.run.camera }}"
+   and .jobs.plan.outputs.runs == "${{ steps.runs.outputs.runs }}"'
+grep -qF 'SOAK_PAGE: $ENV.PAGE, CAMERA_PATTERN: $ENV.CAMERA, SOAK_LEG: $ENV.LEG}}' <<<"$launch" \
+  && grep -qF 'leg_tag="${LEG:+-${LEG,,}-$CAMERA}"' <<<"$launch" \
+  && pass "launch: the harness gets SOAK_LEG; the Machines' names carry the leg and the camera" || fail "launch: the leg"
+legblock="$(sed -n '/if \[ -n "\$LEG" \]; then/,/^fi$/p' <<<"$launch")"
+grep -qF 'setsid harness/soak/cost/leg.sh --app "$FLY_APP" --harness "$hid" --compositor "$cid"' <<<"$legblock" \
+  && grep -qF -- '--out "$RUNNER_TEMP/out" --until-ms "$hard_stop_ms"' <<<"$legblock" \
+  && grep -qF 'echo "$!" > "$RUNNER_TEMP/leg.pid"' <<<"$legblock" \
+  && grep -qF 'kill -- "-$(cat "$RUNNER_TEMP/leg.pid")"' <<<"$destroy" \
+  && pass "launch: a leg starts leg.sh in its own group, bounded by the hard stop; the destroy step stops the group" \
+  || fail "launch: leg.sh" "$legblock"
+grep -qE '(^| )stills\.tar( |;|$)' <<<"$fetch" && pass "the fetch takes a leg's stills" || fail "the fetch: stills.tar"
+check "the outputs' artifact: a name per leg and camera on the legs, the soak's unchanged" \
+  '[.jobs.soak.steps[] | select((.uses // "") | startswith("actions/upload-artifact")) | .with.name]
+   == ["soak-${{ github.run_id }}-${{ github.run_attempt }}${{ matrix.run.leg != '"'"''"'"' && format('"'"'-{0}-{1}'"'"', matrix.run.leg, matrix.run.camera) || '"'"''"'"' }}"]'
+check "the cost-table job: after every leg (not after a cancel), on the legs only and only with the token, over the run's artifacts" \
+  '.jobs["cost-table"] | .needs == ["plan", "soak"]
+   and .if == "${{ !cancelled() && needs.plan.outputs.enabled == '"'"'true'"'"' && needs.plan.outputs.mode == '"'"'legs'"'"' }}"
+   and ([.steps[] | select((.uses // "") | startswith("actions/download-artifact")) | .with.pattern] == ["soak-${{ github.run_id }}-*"])
+   and ([.steps[] | .run // empty] | join("\n") | contains("harness/soak/cost/table.sh \"${f[@]}\""))'
+# Every leg's session reaches the harness image (driver.sh reads /soak/session-composed-<output>.json).
+outputs="$(jq -r '[.legs[] | .output] | unique[]' "$HERE/soak.json")"
+n_out=0 missing=""
+for o in $outputs; do
+  n_out=$((n_out + 1))
+  grep -qxF "COPY contracts/fixtures/relay-job.v1/session-composed-$o.json /soak/session-composed-$o.json" "$HERE/Dockerfile" \
+    && [ -f "$ROOT/contracts/fixtures/relay-job.v1/session-composed-$o.json" ] || missing="$missing $o"
+done
+[ "$n_out" -ge 2 ] && [ -z "$missing" ] && pass "the image: every leg's session fixture copied ($n_out outputs: $(echo $outputs))" \
+  || fail "the image: the legs' session fixtures" "checked $n_out, missing:$missing"
+# The cost table's step, run for real: each leg:camera's latest attempt, and a red naming a run with
+# no verdict.
+table_step="$(step cost-table "The cost table")"
+ctab() { # <runs json> <artifact dir:verdict>...: rc; the summary in $W/ct/summary.md
+  local runs="$1" a; shift
+  rm -rf "$W/ct" && mkdir -p "$W/ct/legs"
+  for a in "$@"; do mkdir -p "$W/ct/legs/${a%%:*}"; [ -z "${a#*:}" ] || cp "${a#*:}" "$W/ct/legs/${a%%:*}/cost.json"; done
+  : >"$W/ct/summary.md"
+  (cd "$ROOT" && RUNNER_TEMP="$W/ct" GITHUB_RUN_ID=77 GUEST=performance-4x RUNS="$runs" GITHUB_STEP_SUMMARY="$W/ct/summary.md" \
+    "${HARNESS_BASH:-bash}" -eo pipefail -c "$table_step" >"$W/ct/log" 2>&1)
+}
+mkdir -p "$W/ctv"
+python3 -I "$HERE/cost/fixture.py" "$W/ctv/g" && python3 -I "$HERE/cost/fixture.py" "$W/ctv/r" cpu-over
+"$HERE/cost/verdict.sh" --dir "$W/ctv/g" --leg A --camera snow --guest performance-4x >"$W/ctv/green.json" 2>/dev/null || true
+"$HERE/cost/verdict.sh" --dir "$W/ctv/r" --leg A --camera snow --guest performance-4x >"$W/ctv/red.json" 2>/dev/null || true
+jq -c '.camera = "noise"' "$W/ctv/green.json" >"$W/ctv/green-noise.json"
+two='[{"leg":"A","camera":"snow"},{"leg":"A","camera":"noise"}]'
+# Attempt 10 lists before attempt 2 (by name), so taking the last one listed would be wrong.
+if ctab "$two" "soak-77-2-A-snow:$W/ctv/red.json" "soak-77-10-A-snow:$W/ctv/green.json" "soak-77-1-A-noise:$W/ctv/green-noise.json" \
+  && grep -qF '# cost legs on performance-4x: 2 of 2 run(s), each its latest attempt' "$W/ct/summary.md" \
+  && grep -qF '| **Size rule verdict** | **PASS** | **PASS** |' "$W/ct/summary.md"; then
+  pass "cost table: a re-run leg's latest attempt only (attempt 10 over attempt 2's red, by number), 2 of 2 runs"
+else fail "cost table: the latest attempt" "$(head -c 500 "$W/ct/summary.md") $(tail -n 3 "$W/ct/log")"; fi
+if ctab "$two" "soak-77-1-A-snow:$W/ctv/green.json" "soak-77-1-A-noise:"; then fail "cost table: a missing verdict" "exit 0"
+else
+  grep -qF '::error::no verdict for A-noise' "$W/ct/log" && grep -qF '1 of 2 run(s)' "$W/ct/summary.md" \
+    && pass "cost table: a run with no verdict is named and fails the job, the rest still tabled" || fail "cost table: a missing verdict" "$(cat "$W/ct/log")"
+fi
+# The verdict step's leg path, run for real on fixture.py's green leg and on one red.
+vleg() { # <fixture mutation or ''>: rc; the summary in $W/summary.md, outputs in $W/v.out
+  rm -rf "$W/vout" && mkdir -p "$W/vout/out"
+  python3 -I "$HERE/cost/fixture.py" "$W/vout/out" ${1:+"$1"}
+  : >"$W/v.out"; : >"$W/summary.md"
+  (cd "$ROOT" && RUNNER_TEMP="$W/vout" LEG=A CAMERA=snow GUEST=performance-4x PAGE=real DRIVE_MIN=10 \
+    GITHUB_OUTPUT="$W/v.out" GITHUB_STEP_SUMMARY="$W/summary.md" bash -eo pipefail -c "$verdict" >/dev/null 2>&1)
+}
+vleg "" && grep -qx 'status=pass' "$W/v.out" && grep -qF '# cost leg A: pass (camera snow, performance-4x, 10 min drive)' "$W/summary.md" \
+  && grep -qF '| **Size rule verdict** | **PASS** |' "$W/summary.md" && [ -s "$W/vout/out/cost.json" ] \
+  && pass "verdict, a leg: cost/verdict.sh passes the green leg, its F-005 column in the summary, cost.json kept" \
+  || fail "verdict, a green leg" "$(cat "$W/v.out") $(head -c 400 "$W/summary.md")"
+if vleg cpu-over; then fail "verdict, a red leg" "exit 0"; else
+  grep -qx 'status=fail' "$W/v.out" && grep -qF '**FAIL**: cpu' "$W/summary.md" \
+    && pass "verdict, a leg: a p95 over the size rule fails the step, named in the summary" || fail "verdict, a red leg" "$(cat "$W/v.out")"
+fi
 
 # --- flylog.py ---------------------------------------------------------------------------------
 cat >"$W/stream.json" <<'EOF'

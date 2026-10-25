@@ -13,10 +13,14 @@
 // A refused delivery is recorded, the position re-read from the ledger, and the next one tried at
 // once (three refusals running wait out the interval instead).
 //
+// --boundaries (the cost legs A and C): every delivery is a boundary, 4 and 6 in turn, carrying
+// `boundary` as a scorer's four or six does, so every ball fires the bar's moment; and each row
+// carries the `moments` the page makes of it, read from the page's own feed (lib.mjs momentsAt).
+//
 //   node score.mjs --base http://127.0.0.1:3000 --cookies <file> --seed <seed.json> --every-s 30 \
-//     --until-ms <epoch ms> --out <deliveries.jsonl> [--max <n>]
+//     --until-ms <epoch ms> --out <deliveries.jsonl> [--max <n>] [--boundaries]
 import { appendFileSync, readFileSync } from "node:fs";
-import { Door, arg } from "./lib.mjs";
+import { Door, arg, momentsAt } from "./lib.mjs";
 
 const base = arg("base");
 const seed = JSON.parse(readFileSync(arg("seed"), "utf8"));
@@ -24,6 +28,7 @@ const everyMs = Number(arg("every-s")) * 1000;
 const untilMs = Number(arg("until-ms"));
 const out = arg("out");
 const max = Number(arg("max", "0"));
+const boundaries = process.argv.includes("--boundaries");
 if (!(everyMs >= 0) || !Number.isSafeInteger(untilMs)) throw new Error("score: --every-s and --until-ms are numbers");
 const door = Door.fromCookieFile(base, arg("cookies"));
 const fx = seed.cricket.fixture_id;
@@ -72,11 +77,13 @@ const deliver = async () => {
   const field = sides[other(batting)];
   const over = Math.floor(balls / perOver);
   const ballInOver = (balls % perOver) + 1;
-  const runs = innings % 2 === 0 ? RUNS[balls % RUNS.length] : (balls % 6 === 3 ? 4 : 0);
+  const runs = boundaries ? (balls % 2 === 0 ? 4 : 6)
+    : innings % 2 === 0 ? RUNS[balls % RUNS.length] : (balls % 6 === 3 ? 4 : 0);
   const payload = {
     over, ballInOver,
     striker: bat[striker], nonStriker: bat[1 - striker], bowler: field[over % 5],
     runs: { bat: runs },
+    ...(boundaries ? { boundary: runs } : {}),
   };
   const at = Date.now();
   const r = await door.call(`/api/v1/fixtures/${fx}/events`, "POST", { expected_seq: seq, type: "cricket.ball", payload });
@@ -86,6 +93,7 @@ const deliver = async () => {
     row.seq = seq;
     balls += 1;
     if (balls % perOver === 0) striker = 1 - striker; // the ends change at the over's end
+    if (boundaries) row.moments = await momentsAt(door, fx, seq);
   } else {
     row.code = r.json?.error?.code ?? null;
     // Carry on from the ledger: the next attempt goes at once, from its position.

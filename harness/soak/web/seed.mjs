@@ -8,7 +8,9 @@
 //   balls would end the match at minute 120 of a 180-minute drive, while ODI's first innings alone
 //   is 300 balls. Five bowlers a side cover an innings (10 overs each, never two overs running);
 //   no wicket falls, so two batters suffice;
-// - a badminton division (bwf) with two players and its fixture started, for the cost legs.
+// - a badminton division (bwf, made best of 5 through the division's config, which the module's own
+//   schema checks) with two players and its fixture started, for the cost legs: rally.mjs records a
+//   rally every 3 s for at least 10 minutes, and bwf's best of 3 lasts at most about 8.9 (rally.mjs).
 //
 // It writes the ids (nothing secret) to --out, and the session cookies to --cookies (mode 600).
 // The magic-link token is used once, in memory, and never printed.
@@ -71,11 +73,11 @@ for (const [entrant, ids] of [[cfx.home_entrant_id, home], [cfx.away_entrant_id,
 }
 const cStart = await door.must(`/api/v1/fixtures/${cfx.id}/events`, "POST", { expected_seq: 0, type: "core.start", payload: {} });
 
-// Badminton, for the cost legs: two players, one fixture, started.
+// Badminton, for the cost legs: two players, one fixture, started; best of 5 (rally.mjs).
 const p1 = await person(`Soak P1 ${tag}`);
 const p2 = await person(`Soak P2 ${tag}`);
 const badminton = await door.must(`/api/v1/competitions/${comp.id}/divisions`, "POST", {
-  name: "Soak badminton", sport_key: "badminton", variant_key: "bwf",
+  name: "Soak badminton", sport_key: "badminton", variant_key: "bwf", config: { bestOf: 5 },
 });
 await door.must(`/api/v1/divisions/${badminton.id}/entrants`, "POST", [
   { kind: "individual", display_name: `Soak P1 ${tag}`, seed: 1, members: [{ person_id: p1 }] },

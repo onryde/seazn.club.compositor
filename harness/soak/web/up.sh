@@ -7,7 +7,8 @@
 # 2. The web server (serve.sh: an allowlisted environment, a per-run signing key, telemetry off).
 # 3. The seed (seed.mjs): one e2e account, a public competition, a cricket fixture and a badminton
 #    one, both started.
-# 4. The composed stream session the relay door checks (session.sql), with id SESSION_ID.
+# 4. The composed stream session the relay door checks (session.sql), with id SESSION_ID, on the
+#    WEB_SPORT fixture (cricket; badminton for the cost legs' corner bug).
 # 5. The relay door's URL (overlay-url.mjs), signed with this run's key, valid until half an hour
 #    past the hard stop, at this Machine's private name (the compositor's CEF loads it from there).
 # 6. A pre-flight: the page, one of its scripts and its overlay poll each answer 200.
@@ -17,7 +18,8 @@
 #
 #   SESSION_ID, SOAK_HARD_STOP_MS, OUT, WEB_STATE, HOST (this Machine's private name)
 #   WEB_ROOT (/web), WEB_PORT (3000), WEB_PG_PORT (5432), WEB_PG_DATA (/var/lib/soak-pg)
-#   WEB_TEMPLATE (bar), WEB_DELAY_MS (the session's overlayDelayMs)
+#   WEB_TEMPLATE (bar), WEB_SPORT (cricket or badminton: the seeded fixture the session and the URL
+#   name), WEB_DELAY_MS (the session's overlayDelayMs)
 set -euo pipefail
 : "${SESSION_ID:?}" "${SOAK_HARD_STOP_MS:?}" "${OUT:?}" "${WEB_STATE:?}" "${HOST:?}" "${WEB_DELAY_MS:?}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -26,6 +28,8 @@ WEB_PORT="${WEB_PORT:-3000}"
 WEB_PG_PORT="${WEB_PG_PORT:-5432}"
 WEB_PG_DATA="${WEB_PG_DATA:-/var/lib/soak-pg}"
 WEB_TEMPLATE="${WEB_TEMPLATE:-bar}"
+WEB_SPORT="${WEB_SPORT:-cricket}"
+case "$WEB_SPORT" in cricket | badminton) ;; *) echo "soak-web: WEB_SPORT must be cricket or badminton" >&2; exit 64 ;; esac
 PG_BIN="${PG_BIN:-/usr/lib/postgresql/16/bin}"
 log() { echo "soak-web $(date -u +%H:%M:%S) $*"; }
 mkdir -p "$WEB_STATE"
@@ -49,13 +53,13 @@ WEB_APP="$WEB_ROOT/app/apps/web" WEB_DB="postgresql://postgres@127.0.0.1:$WEB_PG
 email="delivered+soak-${SESSION_ID:0:8}@resend.dev"
 node "$HERE/seed.mjs" --base "http://127.0.0.1:$WEB_PORT" --email "$email" --out "$OUT/seed.json" \
   --cookies "$WEB_STATE/cookies.json"
-fixture="$(jq -er '.cricket.fixture_id' "$OUT/seed.json")"
+fixture="$(jq -er --arg s "$WEB_SPORT" '.[$s].fixture_id' "$OUT/seed.json")"
 
 # 4. The composed stream session.
 psql -h 127.0.0.1 -p "$WEB_PG_PORT" -U postgres -d seazn -XAt -v ON_ERROR_STOP=1 -v sid="$SESSION_ID" \
-  -v fixture="$fixture" -v sport=cricket -v delay="$WEB_DELAY_MS" -v email="$email" -f "$HERE/session.sql" \
+  -v fixture="$fixture" -v sport="$WEB_SPORT" -v delay="$WEB_DELAY_MS" -v email="$email" -f "$HERE/session.sql" \
   | grep -q "^$SESSION_ID|$fixture|composed|live$" || { log "FAIL the stream session was not written"; exit 1; }
-log "session: $SESSION_ID on fixture $fixture (composed, live)"
+log "session: $SESSION_ID on the $WEB_SPORT fixture $fixture (composed, live)"
 
 # 5. The relay door's URL, signed with this run's key (the key through the environment only).
 AUTH_SECRET="$(cat "$WEB_STATE/auth-secret")" node "$HERE/overlay-url.mjs" --base "http://$HOST:$WEB_PORT" \

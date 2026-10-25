@@ -35,5 +35,21 @@
   "web_port": 3000,
   "web_cookies_inert": ["seazn_org", "seazn_signed_in"],
   "scan_min_chars": 16,
-  "harness_guest": {"test": {"cpus": 4, "memory_mb": 8192}, "real": {"cpus": 8, "memory_mb": 16384}}
+  "harness_guest": {"test": {"cpus": 4, "memory_mb": 8192}, "real": {"cpus": 8, "memory_mb": 16384}},
+  "compositor_guest": {"performance-4x": {"cpus": 4, "memory_mb": 8192}, "performance-8x": {"cpus": 8, "memory_mb": 16384}},
+  "legs": {
+    "A": {"output": "720p", "template": "bar", "sport": "cricket"},
+    "B": {"output": "720p", "template": "bug", "sport": "badminton"},
+    "C": {"output": "1080p", "template": "bar", "sport": "cricket"},
+    "D": {"output": "1080p", "template": "bug", "sport": "badminton"}
+  },
+  "leg_cameras": ["snow", "noise"],
+  "leg_min_drive_min": 10,
+  "cost_ball_every_s": 6,
+  "cost_rally_every_s": 3,
+  "cost_sample_from_s": 15,
+  "cost_samples_min_ratio": 0.9,
+  "cost_cpu_p95_max_share": 0.5,
+  "cost_moments_min_per_min": 1,
+  "cost_kill_late_max_s": 100
 }
