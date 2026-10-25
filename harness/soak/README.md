@@ -154,13 +154,16 @@ would have had. A cost leg runs no schedule: `dropouts` or `none` with a leg is 
 
 ## The verdict
 
-`verdict.sh --dir <out> --page real|test --drive-min N [--schedule soak|dropouts|none]` produces the
-checks below. Every number comes from `thresholds.json`, `soak.json` or the drive.
+`verdict.sh --dir <out> --page real|test --drive-min N --memory-mb MB [--schedule soak|dropouts|none]`
+produces the checks below. `--memory-mb` is the compositor Machine's memory (`soak.yml` passes its
+`C_MEM`, from `soak.json`'s `compositor_guest`); it is required, whole MB above 0. Every number comes
+from `thresholds.json`, `soak.json`, the drive or that memory.
 
 | Check | What it requires |
 |---|---|
 | `inputs` | — |
-| 1 memory | Part 3's median `memMb` within ±10 % of part 1's. |
+| 1 memory | Part 3's median `memMb` within ±40 % of part 1's (`memory_drift_max`; owner, 2026-10-25: "Up to 20% grew is fine", then "Machine is solely for relay so 40% is fine"; it was ±10 %). A drift exactly at the bound passes. |
+| 1.projection | The drive's `memMb` fitted against time by least squares (hours since the start action), projected to `memory_projection.session_cap_min` (300: a livestream's 5 h cap), is within `memory_budget_fraction` (half) of the Machine's memory, whatever guest the run used (owner ruling A, 2026-10-25). It reports the slope in MB/h, the intercept, the projection, the budget and the beats fitted. Fewer memMb beats than `5.beats`'s floor, none, or no spread in time fail. |
 | 1.split | Schedules `dropouts` and `none` only (the memory experiment; the soak's page=real log may be withheld). The compositor log's `memory split` lines in the drive carry the compositor's RSS and a CEF poll; the poll advances from line to line; a CEF child's PSS was read; no kind was listed with none of its children read; and at least one instant's step was measured from the lines and one from the beats' windows. Zero read fails. |
 | 2 | Every output outage overlaps a disconnect and ends within `budget_output_reconnect_ms` of it. `pts_gaps` is empty. |
 | 3 | Exactly 1 session GET (reason "programme rebuilt"). |
@@ -231,7 +234,9 @@ The memory line's `ts=` is the compositor Machine's clock; the actions' and the 
 harness Machine's. The skew between them is not measured: the line windows' margins (10 s, 30 s)
 assume it is far smaller.
 
-Check 1 is unchanged. The owner rules on it after the evidence.
+The owner ruled on check 1 on 2026-10-25 (`docs/_INDEX.md`): the drift bound is 40 %, and check
+1.projection bounds where the growth would reach at the 5 h session cap. A per-dropout bound (the
+other half of ruling A) is owed after memory arm 3, the no-dropout control.
 
 ### The memory experiment's knobs
 

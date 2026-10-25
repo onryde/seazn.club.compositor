@@ -36,7 +36,7 @@ The driver writes every scheduled action to `actions.jsonl`, with its wall time.
 
 | # | Criterion | How it's measured |
 |---|---|---|
-| 1 | Memory | median `memMb` of hour 3 within ±10 % of the hour-1 median (from heartbeats) |
+| 1 | Memory | median `memMb` of hour 3 within ~~±10 %~~ ±40 % of the hour-1 median (from heartbeats) (amended 2026-10-25: see "Amendment 2026-10-25", which also adds criterion 1.projection) |
 | 2 | Zero unexplained output gaps | every `output_outages` entry overlaps a dest-disconnect action, and ends ≤ `BUDGET_OUTPUT_RECONNECT_MS` after that action's end; `pts_gaps == []` |
 | 3 | No programme rebuild | fake-control saw **exactly one** session GET, so the process never restarted, and C09 guarantees the programme is built once per process (`start()` refuses a second build, and C09's mutant pins it) |
 | 4 | Dropped frames | final `droppedFrames` < 0.1 % of `3 h × fps` frames (from thresholds) |
@@ -94,6 +94,13 @@ The job's `timeout-minutes` is `minutes + 40`, well under GitHub's 360.
 ## Acceptance
 
 - `test-verdict.sh` is 1 green / 4 red, with reasons.
+- (Amended 2026-10-25, owner rulings on memory) Criterion 1's bound is soak.json's
+  `memory_drift_max`, 0.40: `test-verdict.sh` passes 0.1 point under it and exactly at it, fails
+  0.1 over it, and passes the 3 h soak 40139563554's 22.7 % and memory arm 1 40166664556's 13.2 %.
+  Criterion 1.projection passes a flat run and 104 MB/h from 954 MB, and fails a run that projects
+  over half the Machine's memory at the 300-minute cap, and a fit with fewer memMb beats than
+  `5.beats`'s floor, none, or one. The `>` mutant on criterion 1 reds the at-the-bound case; on
+  1.projection, dropping the cap multiplication and flipping the comparison each red.
 - (Amended 2026-10-23, C13 CI round 2) The cost legs' camera ran once with `--pattern snow` and
   once with `--pattern noise` on the production guest. Both numbers are pasted, and the heavier
   pattern is the one the legs used.
@@ -249,6 +256,25 @@ reads green.
 - **The leg.** Run one cost leg per profile with each pattern on the production guest, and record
   both numbers in the F-entry. The legs and the size rule then use the heavier pattern. On the
   `noise` run, the strip facts (`camera_strips`, latency) are reported, not judged.
+
+## Amendment 2026-10-25 (owner rulings on memory: drift 40 %, and a 5-hour projection)
+
+- **The rulings.** Owner, 2026-10-25, in chat, relayed by the coordinator, in this order: "Up to
+  20% grew is fine"; then "A" on top of it (ruling A: the projection below, and a per-dropout bound);
+  then "Machine is solely for relay so 40% is fine". Criterion 1's bound moves from ±10 % to ±40 %
+  (`soak.json` `memory_drift_max`: 0.40). The 3 h soak 40139563554 read 22.7 % (hour 1's median
+  994 MB, hour 3's 1220 MB) and memory arm 1 40166664556 read 13.2 %; both now pass.
+- **Criterion 1.projection (added).** Fit `memMb` against time over the drive (least squares on the
+  beats in `report.json`; x is hours since the start action), and project the line to the session
+  cap: `soak.json` `memory_projection.session_cap_min`, 300. `relay-job.v1.json`'s
+  `maxDurationMinutes` declares no maximum of its own, and its session fixtures carry 300 (one, the
+  1080p composed one, carries 120); a livestream is capped at 5 hours. The budget is
+  `memory_budget_fraction` (0.5) of the compositor Machine's memory, which `verdict.sh` takes as
+  `--memory-mb` and `soak.yml` passes as `C_MEM`. Over the budget fails. The check reports the slope
+  in MB/h, the intercept, the projection, the budget and the beats fitted; fewer memMb beats than
+  `5.beats`'s floor, none, or no spread in time fail.
+- **Owed after memory arm 3.** The per-dropout bound, the other half of ruling A, waits on memory
+  arm 3 (run 40172443534, the no-dropout control). It is not built here.
 
 ## Do not touch
 
