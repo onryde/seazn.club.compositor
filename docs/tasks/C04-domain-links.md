@@ -506,6 +506,55 @@ happen" turned into a tested guard.
   `a_proving_sink_that_goes_silent_waits_for_its_error`). A destination stall swaps one base back-off
   after the sink's own error at `OUTPUT_SINK_TIMEOUT_MS` (`a_destination_stall_swaps_on_the_sinks_timeout_error`).
   Each mutant went red: a stall path re-added in Proving, one in Connected, and the constant at 20 s.
+- (Amended 2026-10-25, Owed 94.) The egress backstop, not a stall rule. Owner, 2026-10-24, in chat,
+  relayed by the coordinator: "B". A Proving or Connected sink whose total has not grown for
+  `output_egress_flat_ms` while both encoded tracks grew at every reading backs off with
+  `SwapReason::EgressStalled` (from Connected it is failure 1, waiting the base; from Proving the
+  failures before it count). A starved
+  reading restarts the clock, each new sink starts it again, and another generation's readings never
+  touch it (`a_hung_output_is_swapped_by_the_egress_backstop_while_the_encoders_deliver`,
+  `a_proving_sink_that_stops_growing_is_swapped_too_and_carries_its_failures`,
+  `the_backstop_never_counts_while_the_encoders_starve`, `a_starved_reading_restarts_the_backstops_clock`,
+  `the_backstop_restarts_with_each_sink_and_ignores_other_generations`). A destination stall still swaps
+  on the sink's error (`a_destination_stall_still_swaps_on_the_sinks_error_with_the_encoders_delivering`).
+  See the amendment below.
+
+## Amendment 2026-10-25 (Owed 94: the egress backstop)
+
+**Why.** Owed 87 retired the stall rule (owner, 2026-10-24, in chat, relayed by the coordinator: "A"),
+which left one gap: an output pipeline that hangs while the encoders keep delivering never raises a bus
+error, so nothing swapped it. The coordinator asked the owner: (A) accept and record the gap, or (B) add
+a backstop, "no egress bytes for about 15 s while the encoders deliver", matching the 15 s outage
+target. Owner, 2026-10-24, in chat, relayed by the coordinator: "B".
+
+**As built.**
+- `config.rs`: `output_egress_flat_ms(backoff_base_ms, connect_timeout_ms)`, one derived constant: the
+  15 s gap budget less a failed reconnect (the connect timeout), the base back-off, one progress poll and
+  two widest ticks, floored to the poll. With today's constants that is 9 000 ms; the value is pending
+  with the owner, so the answer changes one place. `OUTPUT_PROGRESS_POLL_MS` and `TICK_WIDEST_MS` move
+  into `domain::config` so the derivation reads them (adapters re-exports the poll). `Thresholds` gains
+  `output_egress_flat_ms`.
+- Two assertions from independent sums: `the_egress_backstop_is_the_longest_threshold_that_keeps_the_15_s_budget`
+  (the worst hung gap stays inside the budget, and one poll more would not) and
+  `a_destination_stall_reaches_the_sinks_error_before_the_backstop` (the threshold sits above the sink
+  timeout plus a poll and a tick). The poll's pin moved with it: `the_progress_poll_is_owed_15s_250_ms`.
+- `OutputLink::on_delivery(now, gen, Encoded)`: a reading whose two encoded totals both grew keeps
+  `delivering_since`; any other reading clears it. `egress_flat` reads elapsed(now, max(grew_at,
+  delivering_since)), and a build clears the egress, so the new sink's clock starts at its first growth.
+- The supervisor's `OutputProgress` carries `encoded`; the beat stops reading `playing` the tick the
+  backstop fires (`a_hung_output_is_swapped_by_the_backstop_and_the_beat_stops_reading_playing`).
+- `links.rs` sweeps: `the_egress_backstop_ends_only_a_flowing_sink_and_only_while_the_encoders_deliver`
+  (the delivery/egress pairs) and, for the PR #73 review's P-3,
+  `a_multi_wake_trickle_is_swapped_by_the_backstop_only_where_no_socket_wait_reaches_the_timeout`
+  (26 rows: 10 errored at +5 508 ms, 12 swapped by the backstop at +9 520 ms, 4 never). A trickle
+  whose every socket wait is under the sink timeout was never swapped before; the backstop now swaps it,
+  with the reason `egress_stalled`, not `error`.
+- Mutants D1 to D7, each red with named tests: the threshold below the sink timeout (4 reds, the two
+  ordering/budget assertions among them), counting during starvation (5), no swap from Connected (6),
+  the supervisor dropping the encoded counts (1), the egress not cleared at a build
+  (`the_backstop_restarts_with_each_sink_and_ignores_other_generations`), no swap from Proving
+  (`a_proving_sink_that_stops_growing_is_swapped_too_and_carries_its_failures`), and a starved reading
+  not restarting the clock (2).
 
 ## Amendment 2026-10-19 (Owed 38: Connected is earned by sustained growth)
 
