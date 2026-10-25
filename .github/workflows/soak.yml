@@ -1,6 +1,6 @@
 name: soak
 # The run list reads what the run can prove: a page=test run is PLUMBING ONLY, never a soak pass.
-run-name: ${{ inputs.legs != '' && format('cost legs {0} on {1}, {2} min', inputs.legs, inputs.guest, inputs.minutes) || format('soak page={0} {1} min{2}{3}', inputs.page, inputs.minutes, inputs.page == 'test' && ' (PLUMBING ONLY)' || '', inputs.guest != 'performance-4x' && format(' on {0}', inputs.guest) || '') }}
+run-name: ${{ inputs.legs != '' && format('cost legs {0} on {1}, {2} min{3}', inputs.legs, inputs.guest, inputs.minutes, inputs.malloc_arena_max != '' && format(', MALLOC_ARENA_MAX={0}', inputs.malloc_arena_max) || '') || format('soak page={0} {1} min{2}{3}{4}{5}', inputs.page, inputs.minutes, inputs.page == 'test' && ' (PLUMBING ONLY)' || '', inputs.guest != 'performance-4x' && format(' on {0}', inputs.guest) || '', inputs.schedule == 'dropouts' && ', dropouts only' || inputs.schedule == 'none' && ', no dropouts (the control)' || '', inputs.malloc_arena_max != '' && format(', MALLOC_ARENA_MAX={0}', inputs.malloc_arena_max) || '') }}
 # The soak (C15, docs/tasks/C15-soak.md, spec 9.5): the real relay image on the production guest, as
 # one Fly Machine, against a harness Machine beside it (harness/soak: MediaMTX, fake-camera,
 # fake-control, the checker and driver.sh), in the dedicated app seazn-relay-soak. This job drives
@@ -14,6 +14,21 @@ run-name: ${{ inputs.legs != '' && format('cost legs {0} on {1}, {2} min', input
 #     legs' picture, once each on the production guest)
 #   gh workflow run soak.yml --ref <branch> -f page=real -f minutes=16 -f legs=A,B,C,D -f camera=<heavier>
 #     [-f guest=performance-8x]                                                      (the cost legs)
+#   gh workflow run soak.yml --ref <branch> -f minutes=80 -f schedule=dropouts -f sha=<40-hex head>
+#     [-f malloc_arena_max=2]                                                        (the memory experiment)
+#   gh workflow run soak.yml --ref <branch> -f minutes=80 -f schedule=none -f sha=<40-hex head>
+#                                                                                    (its control: no dropout)
+#
+# The memory experiment (soak 40139563554's drift, 2026-10-25): schedule=dropouts runs camera
+# dropouts only, every 125 s (schedule.jq's dropout_plan: 35 in an 80-minute run), and schedule=none
+# the same drive with nothing in it, as the control. The verdict prints the memory split's measures
+# beside its checks: the compositor's own growth and CEF's, each dropout's step (from the minute
+# lines, against a control from the gaps between dropouts) and the diagnosis's windowed step on the
+# beats' memMb; on none, the same steps at the instants the dropouts would have had. Check 1.split
+# judges those runs' evidence; the soak's own checks are unchanged. malloc_arena_max (a positive
+# integer, or empty for unset) sets MALLOC_ARENA_MAX in the compositor Machine's environment, for the
+# soak or the legs (the run's name says so). Nothing else reaches the compositor's environment from
+# an input, and the compositor's own keys win over it.
 #
 # legs (C15's cost legs, harness/soak/cost): one job per leg, one at a time (max-parallel 1, since each
 # destroys every Machine in the app at its end), each its own pair of Machines: soak.json's legs
@@ -67,6 +82,15 @@ on:
         type: choice
         options: [performance-4x, performance-8x]
         default: performance-4x
+      schedule:
+        description: "soak (dropouts and disconnects, schedule.jq's soak_plan), dropouts (the memory experiment: camera dropouts every 125 s, no disconnect) or none (its control: nothing in the drive)"
+        type: choice
+        options: [soak, dropouts, none]
+        default: soak
+      malloc_arena_max:
+        description: "MALLOC_ARENA_MAX for the compositor process: a positive integer, or empty for unset (the memory experiment)"
+        required: false
+        default: ""
 permissions: { contents: read }
 concurrency:
   # One soak at a time: the cleanup destroys every Machine in the app, and a second run's would be
@@ -95,6 +119,8 @@ jobs:
       mode: ${{ steps.runs.outputs.mode }}
       c_cpus: ${{ steps.runs.outputs.c_cpus }}
       c_mem: ${{ steps.runs.outputs.c_mem }}
+      schedule: ${{ steps.runs.outputs.schedule }}
+      c_env: ${{ steps.knobs.outputs.c_env }}
     steps:
       - name: The Fly token
         id: gate
@@ -127,6 +153,29 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ steps.args.outputs.sha }}
+      # The memory experiment's knob: the compositor Machine's extra environment, as JSON. Only
+      # MALLOC_ARENA_MAX (a positive integer); any other name refuses the run, so no input injects an
+      # environment variable of its choosing. (GST_TRACERS left with PR #82's review I4: the leaks
+      # tracer reports at gst_deinit, which the compositor's hard exit never reaches. It comes back
+      # with the compositor-side checkpoint, README Owed.)
+      - name: The compositor's knobs
+        id: knobs
+        env:
+          MALLOC: ${{ inputs.malloc_arena_max }}
+        run: |
+          if [ -n "$MALLOC" ] && ! [[ "$MALLOC" =~ ^[1-9][0-9]{0,3}$ ]]; then
+            echo "::error::malloc_arena_max must be a positive integer (1 to 9999) or empty: '$MALLOC'"; exit 1
+          fi
+          parts="$(jq -cn --arg m "$MALLOC" '[(if $m == "" then empty else {MALLOC_ARENA_MAX: $m} end)]')"
+          # The names guard: whatever built the parts, objects only, this one name only, each a string.
+          if ! jq -e 'all(.[]; type == "object")
+                and ((add // {}) | (keys - ["MALLOC_ARENA_MAX"]) == [] and all(.[]; type == "string"))' \
+            <<<"$parts" > /dev/null; then
+            echo "::error::the compositor's extra environment may hold only MALLOC_ARENA_MAX (a string): $parts"; exit 1
+          fi
+          c_env="$(jq -c 'add // {}' <<<"$parts")"
+          echo "c_env=$c_env" >> "$GITHUB_OUTPUT"
+          echo "the compositor's extra environment: $c_env"
       # GitHub's expressions have no arithmetic: the numbers are made here, from soak.json.
       # The soak, or one run per cost leg: [{leg, camera}] for the soak job's matrix ({leg: ""} is the
       # soak), and the compositor's guest.
@@ -137,11 +186,14 @@ jobs:
           CAMERA: ${{ inputs.camera }}
           PAGE: ${{ inputs.page }}
           GUEST: ${{ inputs.guest }}
+          SCHEDULE: ${{ inputs.schedule }}
         run: |
           s=harness/soak/soak.json
           jq -e --arg g "$GUEST" '.compositor_guest | has($g)' "$s" > /dev/null || { echo "::error::guest '$GUEST' is not in soak.json's compositor_guest"; exit 1; }
           echo "c_cpus=$(jq -r --arg g "$GUEST" '.compositor_guest[$g].cpus' "$s")" >> "$GITHUB_OUTPUT"
           echo "c_mem=$(jq -r --arg g "$GUEST" '.compositor_guest[$g].memory_mb' "$s")" >> "$GITHUB_OUTPUT"
+          case "$SCHEDULE" in soak | dropouts | none) ;; *) echo "::error::schedule must be soak, dropouts or none: '$SCHEDULE'"; exit 1 ;; esac
+          echo "schedule=$SCHEDULE" >> "$GITHUB_OUTPUT"
           if [ -z "$LEGS" ]; then
             echo "mode=soak" >> "$GITHUB_OUTPUT"
             echo "runs=$(jq -cn --arg c "$CAMERA" '[{leg: "", camera: $c}]')" >> "$GITHUB_OUTPUT"
@@ -149,6 +201,7 @@ jobs:
             exit 0
           fi
           [ "$PAGE" = real ] || { echo "::error::the cost legs run the production page: page=real"; exit 1; }
+          [ "$SCHEDULE" = soak ] || { echo "::error::the cost legs run no schedule: schedule=$SCHEDULE with legs"; exit 1; }
           runs="$(LEGS="$LEGS" jq -cn --slurpfile s "$s" --arg c "$CAMERA" '
             $s[0] as $s | $ENV.LEGS | split(",") | map(
               capture("^(?<leg>[A-Z])(:(?<camera>[a-z]+))?$") // error("legs: \(.) is not <leg>[:<camera>]")
@@ -440,6 +493,8 @@ jobs:
       GUEST: ${{ inputs.guest }}
       C_CPUS: ${{ needs.plan.outputs.c_cpus }}
       C_MEM: ${{ needs.plan.outputs.c_mem }}
+      SCHEDULE: ${{ needs.plan.outputs.schedule }}
+      C_ENV: ${{ needs.plan.outputs.c_env }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -498,7 +553,8 @@ jobs:
               guest: {cpu_kind: "performance", cpus: ($ENV.H_CPUS | tonumber), memory_mb: ($ENV.H_MEM | tonumber)},
               env: {SESSION_ID: $ENV.SESSION_ID, JOB_TOKEN: $ENV.JOB_TOKEN, SOAK_DRIVE_MIN: $ENV.DRIVE,
                     SOAK_DEADLINE_MS: $ENV.DEADLINE, SOAK_HARD_STOP_MS: $ENV.HARD_STOP,
-                    SOAK_PAGE: $ENV.PAGE, CAMERA_PATTERN: $ENV.CAMERA, SOAK_LEG: $ENV.LEG}}' \
+                    SOAK_PAGE: $ENV.PAGE, CAMERA_PATTERN: $ENV.CAMERA, SOAK_LEG: $ENV.LEG,
+                    SOAK_SCHEDULE: $ENV.SCHEDULE}}' \
             > "$RUNNER_TEMP/harness.machine.json"
           machine_id() {
             flyctl machine list -a "$FLY_APP" --json | jq -r --arg n "$1" '(. // [])[] | select(.name == $n) | .id' | head -n 1
@@ -543,12 +599,16 @@ jobs:
           [ "$deadline_c_ms" -lt "$hard_stop_ms" ] || { echo "::error::the compositor's deadline is past the hard stop"; exit 1; }
           deadline_at="$(iso "$deadline_c_ms")"
           echo "deadline_ms=$deadline_c_ms" >> "$GITHUB_OUTPUT"
+          # The plan's knob (C_ENV: MALLOC_ARENA_MAX) under the compositor's own keys, which win on a
+          # clash.
+          echo "compositor extra environment: ${C_ENV:-none}"
           JOB_TOKEN="$job_token" SESSION_ID="$session_id" APP_URL="http://$host:7000" DEADLINE_AT="$deadline_at" jq -n '{
               auto_destroy: true, restart: {policy: "no"},
               guest: {cpu_kind: "performance", cpus: ($ENV.C_CPUS | tonumber), memory_mb: ($ENV.C_MEM | tonumber)},
               stop_config: {signal: "SIGTERM", timeout: "20s"},
-              env: {COMPOSITOR_DRIVERS: "live", SESSION_ID: $ENV.SESSION_ID, JOB_TOKEN: $ENV.JOB_TOKEN,
-                    APP_URL: $ENV.APP_URL, RELAY_DEADLINE_AT: $ENV.DEADLINE_AT}}' \
+              env: ((($ENV.C_ENV // "") | if . == "" then {} else fromjson end)
+                    + {COMPOSITOR_DRIVERS: "live", SESSION_ID: $ENV.SESSION_ID, JOB_TOKEN: $ENV.JOB_TOKEN,
+                       APP_URL: $ENV.APP_URL, RELAY_DEADLINE_AT: $ENV.DEADLINE_AT})}' \
             > "$RUNNER_TEMP/compositor.machine.json"
           run_machine "$name_c" "registry.fly.io/$FLY_APP:relay-$SHA" "$RUNNER_TEMP/compositor.machine.json" "$C_CPUS" "$C_MEM" \
             || { tail -n 20 "$RUNNER_TEMP/$name_c.run.log"; exit 1; }
@@ -714,7 +774,8 @@ jobs:
             fi
             exit "$rc"
           fi
-          harness/soak/verdict.sh --dir "$OUT" --page "$PAGE" --drive-min "$DRIVE_MIN" > "$OUT/verdict.json" 2> "$OUT/verdict.txt" || rc=$?
+          harness/soak/verdict.sh --dir "$OUT" --page "$PAGE" --drive-min "$DRIVE_MIN" --schedule "$SCHEDULE" \
+            > "$OUT/verdict.json" 2> "$OUT/verdict.txt" || rc=$?
           cat "$OUT/verdict.txt"
           status="$(jq -r '.status // "none"' "$OUT/verdict.json" 2> /dev/null || echo none)"
           echo "status=$status" >> "$GITHUB_OUTPUT"

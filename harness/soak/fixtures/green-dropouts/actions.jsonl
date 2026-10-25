@@ -1,0 +1,15 @@
+{"kind":"start","at_ms":1792800000000,"drive_s":1800,"schedule":"dropouts"}
+{"kind":"dropout","slot":0,"planned_ms":1792800060000,"at_ms":1792800060003,"end_ms":1792800070005,"ok":true,"pause":200,"resume":200}
+{"kind":"dropout","slot":1,"planned_ms":1792800185000,"at_ms":1792800185003,"end_ms":1792800195005,"ok":true,"pause":200,"resume":200}
+{"kind":"dropout","slot":2,"planned_ms":1792800310000,"at_ms":1792800310003,"end_ms":1792800320005,"ok":true,"pause":200,"resume":200}
+{"kind":"dropout","slot":3,"planned_ms":1792800435000,"at_ms":1792800435003,"end_ms":1792800445005,"ok":true,"pause":200,"resume":200}
+{"kind":"dropout","slot":4,"planned_ms":1792800560000,"at_ms":1792800560003,"end_ms":1792800570005,"ok":true,"pause":200,"resume":200}
+{"kind":"dropout","slot":5,"planned_ms":1792800685000,"at_ms":1792800685003,"end_ms":1792800695005,"ok":true,"pause":200,"resume":200}
+{"kind":"dropout","slot":6,"planned_ms":1792800810000,"at_ms":1792800810003,"end_ms":1792800820005,"ok":true,"pause":200,"resume":200}
+{"kind":"dropout","slot":7,"planned_ms":1792800935000,"at_ms":1792800935003,"end_ms":1792800945005,"ok":true,"pause":200,"resume":200}
+{"kind":"dropout","slot":8,"planned_ms":1792801060000,"at_ms":1792801060003,"end_ms":1792801070005,"ok":true,"pause":200,"resume":200}
+{"kind":"dropout","slot":9,"planned_ms":1792801185000,"at_ms":1792801185003,"end_ms":1792801195005,"ok":true,"pause":200,"resume":200}
+{"kind":"dropout","slot":10,"planned_ms":1792801310000,"at_ms":1792801310003,"end_ms":1792801320005,"ok":true,"pause":200,"resume":200}
+{"kind":"dropout","slot":11,"planned_ms":1792801435000,"at_ms":1792801435003,"end_ms":1792801445005,"ok":true,"pause":200,"resume":200}
+{"kind":"dropout","slot":12,"planned_ms":1792801560000,"at_ms":1792801560003,"end_ms":1792801570005,"ok":true,"pause":200,"resume":200}
+{"kind":"end","at_ms":1792801800000}

@@ -13,8 +13,8 @@ use adapters::phase_http::{origin_of, AllowedOrigin, PhaseHttp};
 use adapters::stats::Stats;
 use app::driver::Driver;
 use app::ports::{
-    ControlPlane, ControlRequest, GraphicsRenderer, HeartbeatError, Inbound, InputSource, Measured,
-    ProgrammeOutput,
+    CefPoll, CefPss, ControlPlane, ControlRequest, GraphicsRenderer, HeartbeatError, Inbound, InputSource,
+    KindPss, Measured, ProgrammeOutput,
 };
 use compositor::clock::Clock;
 use compositor::env::Drivers;
@@ -900,4 +900,69 @@ fn the_real_output_fps_reaches_the_log_and_the_beat_through_the_real_sampler() {
     }
     eprintln!("output fps beats checked through the real sampler: {checked}");
     assert_eq!(checked, 2);
+}
+
+/// The soak's memory split, the seam from the sampler to the log: the real `ProcMetrics` (a CEF reader
+/// handed in as `run` hands it `CefGraphics::memory`) through the real driver over `assemble`'s ports
+/// and the stderr log sink. The first beat writes one `memory split` line carrying this process's
+/// own `VmRSS` (a number) and the CEF poll's fields as the reader gave them; off Linux there is no
+/// `/proc`, so no split and no line.
+#[test]
+fn the_memory_split_reaches_the_log_through_the_real_sampler() {
+    let calls = Log::default();
+    let (log, buf) = logger();
+    let (tx, _rx): (Sender<Inbound>, Receiver<Inbound>) = bounded(64);
+    let mut parts = fake_parts(&calls, &CefKnob::default());
+    let poll = CefPoll {
+        poll: 7,
+        pss: CefPss {
+            renderer: Some(KindPss {
+                kb: 61_000,
+                n: 1,
+                listed: 1,
+            }),
+            ..CefPss::default()
+        },
+    };
+    parts.metrics = Box::new(ProcMetrics::new(Arc::new(Stats::default())).with_cef(move || Some(poll)));
+    let ports = assemble(Drivers::Live, parts, &log, &tx, None);
+    let mut d = Driver::new(Thresholds::default(), ports, FAR, 0);
+    assert_eq!(d.tick_due(0), None);
+    assert_eq!(d.step(Inbound::Session(session_720p()), SESSION_AT), None);
+    let beats = || {
+        calls
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, Call::Control(ControlRequest::Heartbeat(..))))
+            .count()
+    };
+    while beats() == 0 {
+        let at = d.next_tick_at();
+        assert!(at < FAR, "no beat");
+        assert_eq!(d.tick_due(at), None);
+    }
+    let lines: Vec<String> = buf
+        .messages()
+        .into_iter()
+        .filter(|l| l.starts_with("memory split"))
+        .collect();
+    eprintln!("memory split lines after the first beat: {lines:?}");
+    if cfg!(target_os = "linux") {
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        let rss = line
+            .split(' ')
+            .find_map(|f| f.strip_prefix("rss_kb="))
+            .expect("an rss_kb field");
+        assert!(rss.parse::<u64>().is_ok_and(|kb| kb > 0), "{line}");
+        assert!(
+            line.contains(
+                " cef_poll=7 cef_renderer_kb=61000 cef_renderer_n=1 cef_renderer_listed=1 cef_gpu_process_kb=- \
+                 cef_gpu_process_n=0 cef_gpu_process_listed=0 "
+            ),
+            "{line}"
+        );
+    } else {
+        assert!(lines.is_empty(), "no /proc, no split: {lines:?}");
+    }
 }

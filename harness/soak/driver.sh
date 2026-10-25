@@ -29,6 +29,11 @@
 #                           Machine. Its score driver records a moment-making event at the page's
 #                           pace (cost_ball_every_s for cricket, cost_rally_every_s for badminton),
 #                           and the run ends with programme stills for a person to look at
+#   SOAK_SCHEDULE           soak (the default: schedule.jq's soak_plan), dropouts (dropout_plan:
+#                           the memory experiment's camera dropouts every 125 s and no disconnect;
+#                           soak 40139563554's drift) or none (the experiment's control: the same
+#                           drive with nothing in it). A cost leg runs no schedule, so dropouts or
+#                           none with SOAK_LEG is refused
 #   FLY_MACHINE_ID, FLY_APP_NAME   set by the platform: this Machine's private name
 #
 # Every scheduled action is a line of /out/actions.jsonl with its wall time (ms, this Machine's
@@ -62,6 +67,15 @@ action() { jq -cn "$@" >>"$OUT/actions.jsonl"; }
 SOAK_PAGE="${SOAK_PAGE:-test}"
 CAMERA_PATTERN="${CAMERA_PATTERN:-ball}"
 SOAK_LEG="${SOAK_LEG:-}"
+SOAK_SCHEDULE="${SOAK_SCHEDULE:-soak}"
+case "$SOAK_SCHEDULE" in
+  soak | dropouts | none) ;;
+  *) log "FAIL SOAK_SCHEDULE must be soak, dropouts or none"; exit 64 ;;
+esac
+if [ -n "$SOAK_LEG" ] && [ "$SOAK_SCHEDULE" != soak ]; then
+  log "FAIL a cost leg runs no schedule: SOAK_SCHEDULE=$SOAK_SCHEDULE with SOAK_LEG"
+  exit 64
+fi
 # The session fake-control hands out (a vendored relay-job fixture: the output profile), and the
 # overlay's sport and template. The soak: 720p, bar on cricket.
 SESSION_SRC="$SOAK/session-composed-720p.json"
@@ -90,16 +104,18 @@ DRIVE_S=$((SOAK_DRIVE_MIN * 60))
 soak() { jq -r --arg k "$1" '.[$k]' "$SOAK/soak.json"; }
 if [ -n "$SOAK_LEG" ]; then
   PLAN='{"dropouts":[],"disconnects":[]}'
+  RAN=leg
 else
-  PLAN="$(jq -c -n -L "$SOAK" --slurpfile soak "$SOAK/soak.json" --argjson d "$DRIVE_S" \
-    'include "schedule"; soak_plan($soak[0]; $d)')"
+  PLAN="$(jq -c -n -L "$SOAK" --slurpfile soak "$SOAK/soak.json" --argjson d "$DRIVE_S" --arg s "$SOAK_SCHEDULE" \
+    'include "schedule"; schedule_plan($soak[0]; $s; $d)')"
+  RAN="$SOAK_SCHEDULE"
 fi
 CAMERA_SIZE="$(jq -r '.output | "\(.width)x\(.height)"' "$SESSION_SRC")"
 : >"$OUT/actions.jsonl"
 : >"$OUT/heartbeats.jsonl"
 : >"$OUT/emit.jsonl"
 status booting "plan $(jq -c '{dropouts: (.dropouts | length), disconnects}' <<<"$PLAN")"
-log "boot: drive $SOAK_DRIVE_MIN min, page $SOAK_PAGE, camera $CAMERA_PATTERN $CAMERA_SIZE, ${SOAK_LEG:+cost leg $SOAK_LEG ($LEG_TEMPLATE on $LEG_SPORT, $(basename "$SESSION_SRC")), }host $HOST, plan $(jq -c '{dropouts: (.dropouts | length), disconnects}' <<<"$PLAN")"
+log "boot: drive $SOAK_DRIVE_MIN min, schedule $RAN, page $SOAK_PAGE, camera $CAMERA_PATTERN $CAMERA_SIZE, ${SOAK_LEG:+cost leg $SOAK_LEG ($LEG_TEMPLATE on $LEG_SPORT, $(basename "$SESSION_SRC")), }host $HOST, plan $(jq -c '{dropouts: (.dropouts | length), disconnects}' <<<"$PLAN")"
 log "disk: $(df -h "$OUT" | tail -n 1 | awk '{print $2" total, "$4" free"}')"
 
 # The SRT passphrase: made here, handed to MediaMTX, fake-camera and fake-control (which puts it in
@@ -352,7 +368,7 @@ lost_beats_ms=$(($(soak lost_beats_end_s) * 1000))
 ended_early=""
 score_pid=""
 if [ "$went_live" -eq 1 ]; then
-  action --argjson at "$start_ms" --argjson d "$DRIVE_S" '{kind: "start", at_ms: $at, drive_s: $d}'
+  action --argjson at "$start_ms" --argjson d "$DRIVE_S" --arg s "$RAN" '{kind: "start", at_ms: $at, drive_s: $d, schedule: $s}'
   read_last_beat
   log "live: the drive starts, $DRIVE_S s, ${#steps[@]} actions"
   # Check (c)'s deliveries, through the standalone app's API, for the whole drive. A cost leg's: a

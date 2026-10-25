@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use app::driver::Driver;
-use app::ports::{ControlRequest, Inbound, Measured, Metrics, SessionConfig};
+use app::ports::{ControlRequest, Inbound, Measured, MemorySplit, Metrics, ProcStatus, SessionConfig};
 use domain::config::{OutputProfile, Thresholds, OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS};
 use domain::health::{ExitDetail, GraphicsStatus, HealthReport, LinkStatus};
 use domain::input_link::LossReason;
@@ -1829,6 +1829,200 @@ fn nothing_skipped_or_dropped_logs_no_tally() {
     assert!(lines_starting(&log, "heartbeats dropped").is_empty());
     eprintln!("ticks driven: {ticks}, beats requested: {beats}");
     assert!(ticks > 0 && beats > 1);
+}
+
+/// The beat's tree total beside every memory split here (the beat's `memMb`, unchanged).
+const TREE_MB: u64 = 990;
+
+/// The brief's cadence for the memory split (soak 40139563554's drift, 2026-10-25): once a minute.
+const MEMORY_EVERY_MS: u64 = 60_000;
+
+/// A `Metrics` whose memory split the test sets between beats; the tree total stays `TREE_MB`.
+struct ScriptedMemory(Arc<Mutex<Option<MemorySplit>>>);
+
+impl Metrics for ScriptedMemory {
+    fn sample(&mut self) -> Measured {
+        Measured {
+            mem_mb: Some(TREE_MB),
+            ..metrics()
+        }
+    }
+
+    fn memory(&mut self) -> Option<MemorySplit> {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+fn split_with_rss(kb: u64) -> MemorySplit {
+    MemorySplit {
+        status: ProcStatus {
+            vm_rss_kb: Some(kb),
+            ..ProcStatus::default()
+        },
+        cef: None,
+    }
+}
+
+/// Ticks `d` until a heartbeat is requested after `log`'s current end: that beat's instant.
+fn next_beat(d: &mut Driver, log: &Log) -> u64 {
+    let mark = log.len();
+    loop {
+        let at = d.next_tick_at();
+        assert!(at < FAR, "no beat");
+        assert_eq!(d.tick_due(at), None);
+        if log
+            .calls_from(mark)
+            .iter()
+            .any(|c| matches!(c, Call::Control(ControlRequest::Heartbeat(..))))
+        {
+            return at;
+        }
+    }
+}
+
+/// The soak's memory split, through the real driver: a beat whose metrics have one writes `memory
+/// split …` when no line was written yet or the last is at least a minute old (the brief's cadence,
+/// typed here), and no other beat does, so a minute of 5 s beats writes one line. The line is that
+/// beat's own sample (each beat's `rss_kb` differs), beside the beat's tree total, and names the
+/// input generation the driver last asked the input to build: no input ever connects here, so the
+/// connect timeout gives each generation up and the next is built, and the generation moves between
+/// lines. Each line's generation is read from the input port's own calls before it, never from the
+/// driver.
+#[test]
+fn the_memory_split_is_logged_once_a_minute_with_the_input_generation() {
+    let log = Log::default();
+    let split = Arc::new(Mutex::new(None));
+    let set = |s: Option<MemorySplit>| *split.lock().unwrap_or_else(PoisonError::into_inner) = s;
+    let mut p = ports(&log, metrics());
+    p.metrics = Box::new(ScriptedMemory(Arc::clone(&split)));
+    let mut d = Driver::new(th(), p, FAR, 0);
+    assert_eq!(d.tick_due(0), None);
+    assert_eq!(d.step(Inbound::Session(session_720p()), SESSION_AT), None);
+    let is_memory = |c: &Call| matches!(c, Call::Log(l) if l.starts_with("memory split "));
+    // (the beat's instant, the rss it sampled, the memory line it wrote)
+    let mut beats: Vec<(u64, u64, Option<String>)> = Vec::new();
+    for rss in 1..=50u64 {
+        set(Some(split_with_rss(rss)));
+        let mark = log.len();
+        let at = next_beat(&mut d, &log);
+        let line = log.calls_from(mark).into_iter().find_map(|c| match c {
+            Call::Log(l) if l.starts_with("memory split ") => Some(l),
+            _ => None,
+        });
+        beats.push((at, rss, line));
+    }
+    let mut last: Option<u64> = None;
+    let mut want = Vec::new();
+    for (at, _, _) in &beats {
+        let due = last.is_none_or(|l| at - l >= MEMORY_EVERY_MS);
+        if due {
+            last = Some(*at);
+        }
+        want.push(due);
+    }
+    let got: Vec<bool> = beats.iter().map(|b| b.2.is_some()).collect();
+    assert_eq!(
+        got,
+        want,
+        "beats at {:?}",
+        beats.iter().map(|b| b.0).collect::<Vec<_>>()
+    );
+    for (at, rss, line) in &beats {
+        if let Some(l) = line {
+            assert!(
+                l.contains(&format!(" tree_mb={TREE_MB} rss_kb={rss} ")),
+                "the beat at {at} sampled rss {rss}: {l}"
+            );
+        }
+    }
+    let mut gen: Option<u64> = None;
+    let mut gens = Vec::new();
+    for c in log.calls() {
+        match c {
+            Call::InputRebuild(g, _) => gen = Some(g),
+            Call::Log(l) if l.starts_with("memory split ") => {
+                let named = gen.map_or_else(|| "-".to_owned(), |g| g.to_string());
+                assert!(
+                    l.starts_with(&format!("memory split input_gen={named} ")),
+                    "the last rebuild before it was {gen:?}: {l}"
+                );
+                gens.push(gen);
+            }
+            _ => {}
+        }
+    }
+    let lines = log.count(is_memory);
+    eprintln!(
+        "beats: {}, memory lines: {lines}, their generations: {gens:?}",
+        beats.len()
+    );
+    assert!(lines >= 4, "four minutes of beats, {lines} lines");
+    assert!(
+        gens.windows(2).any(|w| w[0] != w[1]),
+        "the generation never moved between two lines: {gens:?}"
+    );
+}
+
+/// The empty case: a sample with no memory split (fake drivers off Linux: no `/proc`) writes no
+/// memory line, over minutes of beats and at the drain's final beat; the beats still go out.
+#[test]
+fn a_sample_without_a_memory_split_writes_no_memory_line() {
+    let log = Log::default();
+    let mut p = ports(&log, metrics());
+    p.metrics = Box::new(ScriptedMemory(Arc::new(Mutex::new(None))));
+    let mut d = Driver::new(th(), p, FAR, 0);
+    assert_eq!(d.tick_due(0), None);
+    assert_eq!(d.step(Inbound::Session(session_720p()), SESSION_AT), None);
+    let mut at = SESSION_AT;
+    for _ in 0..30 {
+        at = next_beat(&mut d, &log);
+    }
+    assert_eq!(d.step(ev(Event::Signal(SignalKind::Term)), at + 1), None);
+    assert_eq!(d.step(ev(Event::OutputDrained), at + 2), Some(0));
+    let beats = log.count(|c| matches!(c, Call::Control(ControlRequest::Heartbeat(..))));
+    eprintln!("beats without a memory split: {beats}");
+    assert!(beats > 30, "{beats}");
+    assert!(lines_starting(&log, "memory split").is_empty());
+}
+
+/// The sequence: a split that is missing for a while (no CEF poll or status yet) does not use up the
+/// minute, so the first beat that has one writes its line at once; a split that goes missing when a
+/// line is due writes nothing, and the next beat that has one writes it then; between two lines a
+/// changed split writes nothing.
+#[test]
+fn a_memory_split_missing_for_a_while_is_logged_on_the_first_beat_that_has_one() {
+    let log = Log::default();
+    let split = Arc::new(Mutex::new(None));
+    let set = |s: Option<MemorySplit>| *split.lock().unwrap_or_else(PoisonError::into_inner) = s;
+    let mut p = ports(&log, metrics());
+    p.metrics = Box::new(ScriptedMemory(Arc::clone(&split)));
+    let mut d = Driver::new(th(), p, FAR, 0);
+    assert_eq!(d.tick_due(0), None);
+    assert_eq!(d.step(Inbound::Session(session_720p()), SESSION_AT), None);
+    let lines = |log: &Log| lines_starting(log, "memory split").len();
+    for _ in 0..3 {
+        next_beat(&mut d, &log);
+    }
+    assert_eq!(lines(&log), 0, "no split, no line");
+    set(Some(split_with_rss(7)));
+    let first = next_beat(&mut d, &log);
+    let written = lines_starting(&log, "memory split");
+    assert_eq!(written.len(), 1, "the first beat with a split writes it");
+    assert!(written[0].contains(" rss_kb=7 "), "{written:?}");
+    set(Some(split_with_rss(8)));
+    let mut at = next_beat(&mut d, &log);
+    assert_eq!(lines(&log), 1, "a changed split within the minute: no line");
+    set(None);
+    while at < first + MEMORY_EVERY_MS + 10_000 {
+        at = next_beat(&mut d, &log);
+    }
+    assert_eq!(lines(&log), 1, "due, but no split: no line");
+    set(Some(split_with_rss(9)));
+    next_beat(&mut d, &log);
+    let written = lines_starting(&log, "memory split");
+    assert_eq!(written.len(), 2, "the split is back: its line at once");
+    assert!(written[1].contains(" rss_kb=9 "), "{written:?}");
+    eprintln!("memory lines over the sequence: {}", written.len());
 }
 
 // ---------------------------------------------------------------------------------------------

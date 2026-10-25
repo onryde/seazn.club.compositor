@@ -1,4 +1,4 @@
-{"kind":"start","at_ms":1792800000000,"drive_s":1800}
+{"kind":"start","at_ms":1792800000000,"drive_s":1800,"schedule":"soak"}
 {"kind":"dropout","slot":0,"planned_ms":1792800150000,"at_ms":1792800150003,"end_ms":1792800160005,"ok":true,"pause":200,"resume":200}
 {"kind":"disconnect","slot":0,"planned_ms":1792800300000,"at_ms":1792800300004,"end_ms":1792800330006,"ok":true,"dropped_packets":412,"families":["ipv4","ipv6"]}
 {"kind":"dropout","slot":1,"planned_ms":1792800450000,"at_ms":1792800450003,"end_ms":1792800460005,"ok":true,"pause":200,"resume":200}

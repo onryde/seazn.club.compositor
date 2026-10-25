@@ -25,11 +25,11 @@ gh workflow run soak.yml --ref <branch> -f sha=<40-hex head> -f page=real -f min
 | `mediamtx.yml` | `harness/mediamtx.yml` on one Machine. SRT `cam` in, RTMP `live/dest` out. Both are recorded: `live/dest` under `/out/rec` (which the checker reads) and `cam` under `/out/camrec` (the sampler's reference). |
 | `driver.sh` | The harness Machine's main process. See its header and "The run" below. |
 | `soak.json` | The soak's own numbers: schedule, waits, ratios and the workflow's margins. The domain's numbers stay in `harness/thresholds.json`. |
-| `schedule.jq` | `soak_plan($soak; $drive_s)`: the dropout and disconnect times for a drive. It refuses a plan that cannot hold every action kind. |
+| `schedule.jq` | `soak_plan($soak; $drive_s)`: the dropout and disconnect times for a drive. It refuses a plan that cannot hold every action kind. `schedule_plan` picks it, the memory experiment's `dropout_plan`, or `none` (its control) by name. |
 | `verdict.jq`, `verdict.sh` | The verdict over one run's files. `soak.yml` and `test-verdict.sh` call the same command. |
 | `sampler.py` | Check (d): once a minute, compares the programme with the camera-only recording over the camera's still bands (see "The overlay sampler"). |
 | `flylog.py` | Turns the platform's log stream into the `docker logs --timestamps` shape that logfacts reads, plus `logscan.json` for check (b). |
-| `test-verdict.sh` | Runs the verdict on `fixtures/green` (a 30-min miniature) and on one jq patch per red. Each case asserts its status, its exact failing ids, its reason and the check list. |
+| `test-verdict.sh` | Runs the verdict on `fixtures/green` (a 30-min miniature; `green-dropouts` and `green-none` are the same run on the experiment's schedules) and on one jq patch per red. Each case asserts its status, its exact failing ids, its reason and the check list. |
 | `test-driver.sh` | Runs the driver under stubs on a 1-minute compressed schedule. It also covers the error path, which holds `/out` until the hard stop, the secrets scan's jars, and cost legs B and C. |
 | `test-sampler.sh` | Runs `sampler.py` on synthetic recordings made with ffmpeg: a moving square and a noise strip, with an overlay bar that goes off air for one minute, a disconnect, and a missing segment. It also covers an all-noise camera and a run with no start. |
 | `test-workflow.sh` | Checks `soak.yml`'s shape: the gate and the plan step, run for real; `--restart no`; the job token; the `always()` destroy; the page source's job. It also runs `flylog.py` on a recorded-shape stream. |
@@ -134,15 +134,34 @@ kind:
 | 180 min | 36 | 1800, 5400, 9000 |
 | 25 min (the 30-min rehearsal) | 5 | 300, 900, 1200 |
 
+`schedule=dropouts` (soak.yml; `SOAK_SCHEDULE` on the harness) runs the memory experiment's schedule
+instead (`dropout_plan`): a dropout every `dropout_only.every_s` (125: 28.8 an hour, against the
+soak's 12) from `dropout_only.phase_s` (60), each `dropout_pause_s` long, and no disconnect. Each
+dropout owns a whole period. The period is deliberately not a whole number of minutes: the memory
+split's lines come a minute apart on the compositor's beat grid, so a 120 s period would hold every
+dropout at the same place between two lines for the whole run, and either every gap between two
+dropouts would hold two lines (a control) or none would. At 125 s the lines walk 5 s a period.
+
+`schedule=none` is its control: the same drive with nothing in it, so growth over time alone can be
+told from growth per dropout. The verdict measures the same steps at the instants `dropout_plan`
+would have had. A cost leg runs no schedule: `dropouts` or `none` with a leg is refused.
+
+| Drive | Dropouts | Disconnects |
+|---|---|---|
+| 75 min (`minutes=80`, the experiment) | 35, at 60 to 4310 s | none |
+| 25 min (`minutes=30`) | 11, at 60 to 1310 s | none |
+| 180 min | 85 | none |
+
 ## The verdict
 
-`verdict.sh --dir <out> --page real|test --drive-min N` produces the checks below. Every number
-comes from `thresholds.json`, `soak.json` or the drive.
+`verdict.sh --dir <out> --page real|test --drive-min N [--schedule soak|dropouts|none]` produces the
+checks below. Every number comes from `thresholds.json`, `soak.json` or the drive.
 
 | Check | What it requires |
 |---|---|
 | `inputs` | — |
 | 1 memory | Part 3's median `memMb` within ±10 % of part 1's. |
+| 1.split | Schedules `dropouts` and `none` only (the memory experiment; the soak's page=real log may be withheld). The compositor log's `memory split` lines in the drive carry the compositor's RSS and a CEF poll; the poll advances from line to line; a CEF child's PSS was read; no kind was listed with none of its children read; and at least one instant's step was measured from the lines and one from the beats' windows. Zero read fails. |
 | 2 | Every output outage overlaps a disconnect and ends within `budget_output_reconnect_ms` of it. `pts_gaps` is empty. |
 | 3 | Exactly 1 session GET (reason "programme rebuilt"). |
 | 4 | The final `droppedFrames` is under 0.1 % of drive × fps. |
@@ -157,6 +176,80 @@ comes from `thresholds.json`, `soak.json` or the drive.
 It does not say the payload advanced. A page polling an answer that never changes reads false all
 the same. What shows the score moving is (c)'s deliveries landing (the ledger's seq advancing) and
 (d)'s overlay on air; a witness that the painted score follows the ledger is owed (below).
+
+`inputs` also fails when the driver's start action names another schedule than `--schedule` (a
+start action without one is the soak's). `5.dropouts` and `5.disconnects` each name an action the
+plan does not have (the dropout schedule has no disconnect; none has neither).
+
+### The memory split (soak 40139563554's drift, 2026-10-25)
+
+The 3 h soak 40139563554 failed only check 1 (hour 1's median 994 MB, hour 3's 1220 MB). `memMb` is
+the sum of VmRSS over the whole process tree, so it cannot tell the compositor from CEF. The
+compositor now logs, once a minute (the first beat with a sample, then the first beat a minute after
+the last line), one line beside the beat's unchanged `memMb`:
+
+    memory split input_gen=<g> tree_mb=<n> rss_kb=<n> anon_kb=<n> file_kb=<n> shmem_kb=<n> threads=<n>
+      cef_poll=<n> cef_renderer_kb=<n> cef_renderer_n=<n> cef_renderer_listed=<n> cef_gpu_process_kb=…
+      cef_utility_kb=… cef_zygote_kb=… cef_other_kb=… (each with its _n and _listed)
+
+The compositor's own fields come from its `/proc/self/status`, read in the beat's existing tree walk.
+CEF's are the PSS the CEF child poll already reads for its memory cap (`smaps_rollup`), bucketed by
+`--type=`. Per kind, `listed` is how many children of it the poll found, `n` how many of those it
+read the PSS of, and `kb` that PSS's sum. `kb` is `-` when it read none: a kind listed and unread is
+unknown, never 0. A kind the poll found no child of prints `kb=- n=0 listed=0`. `input_gen` is the
+last input generation rebuilt, so a step can be tied to a rebuild. Any absent value prints `-`.
+
+The verdict's `measures.memory_split` reads those lines and the beats' `memMb`, and `verdict.sh`
+prints them as `MEASURE` lines under the checks (in the step summary too). They are evidence, not a
+gate:
+
+- **Compositor only** and **CEF only**: part 3's median against part 1's, as check 1 reads `memMb`.
+  That is RSS, anon, file, shmem and threads for the compositor, and the PSS total and each kind for
+  CEF. A kind listed and unread is left out of its median, never counted as 0. CEF's children by
+  RSS (`tree_mb` less the compositor's RSS) needs no PSS read, and cross-checks it.
+- **Per instant, from the lines**: an instant is a dropout that was done (`ok`), or on
+  `schedule=none` each instant `dropout_plan` would have had. Its step is the first line at least
+  `memory_step.after_s[0]` (30 s) after the instant, less the last line at most
+  `memory_step.before_s[1]` (10 s) before it. Each line sits inside the gap between that instant and
+  its neighbouring faults, and a gap with no line leaves the instant unmeasured. This gives the RSS,
+  anon, file, CEF and children's steps, each step's span, and the input generations either side. The
+  summary gives the mean, median and sum, the first half's mean against the second half's, and the
+  rebuilds. A failed dropout bounds its neighbours and is not a step.
+- **The control, from the lines**: in each gap between two instants that holds two distinct lines,
+  the later line less the earlier. Pooled into a rate, it gives the growth the steps' own mean span
+  would show with no dropout at all, and the steps' mean less that is the **excess**. Steady growth
+  with no dropout effect reads an excess of about 0. A run whose gaps never hold two lines says "NO
+  CONTROL".
+- **The windowed step, from the beats** (the diagnosis's `epoch.py`): the median `memMb` over
+  `memory_step.after_s` ([30, 110) s after the instant) less the median over `before_s` ([-90, -10)
+  s), so this run compares like for like with soak 40139563554's 9.3 MB a dropout. On
+  `schedule=dropouts` these windows meet the next dropout's, so the windowed step's control is a
+  `schedule=none` run of the same length: the same windows at the same instants, where nothing
+  happened.
+
+The memory line's `ts=` is the compositor Machine's clock; the actions' and the beats' times are the
+harness Machine's. The skew between them is not measured: the line windows' margins (10 s, 30 s)
+assume it is far smaller.
+
+Check 1 is unchanged. The owner rules on it after the evidence.
+
+### The memory experiment's knobs
+
+`soak.yml` takes `malloc_arena_max` (a positive integer up to 9999, or empty for unset). The plan
+job's knobs step turns it into the compositor Machine's extra environment; a names guard admits
+`MALLOC_ARENA_MAX` alone, and the compositor's own keys win a clash. The run's name carries it, for
+the soak and for the cost legs. The entrypoint runs the compositor (`supervise`) without clearing
+its environment, and CEF's children inherit it, so `MALLOC_ARENA_MAX` reaches them as well as the
+compositor. Reaching is not affecting: if Chromium's children allocate through PartitionAlloc
+rather than glibc's malloc, the knob changes nothing there, so a flat CEF line under the knob is no
+evidence either way (unverified).
+
+There is no GStreamer tracer knob. The leaks tracer reports only at `gst_deinit`, or on a SIGUSR1/2
+checkpoint when `GST_LEAKS_TRACER_SIG` is set. The compositor never calls `gst_deinit` (it leaves by
+`hard_exit`, F-017), and SIGUSR1/2 are its stop signals (F-016). So a tracer set from the workflow
+would add its per-object bookkeeping, on the very allocator this experiment measures, and print
+nothing: a silent run that reads as "no leak". PR #82's review I4 took it out; it comes back with
+the compositor-side checkpoint (owed below).
 
 On `page=test`, checks 5a–5d read `pending: page source`, and the best status is `plumbing`, not
 `pass`. The workflow then prints `::warning::PLUMBING ONLY`, heads the step summary "PLUMBING ONLY —
@@ -418,6 +511,16 @@ first measurement, legs A and C from run 40153136892. Legs B and D are still owe
     of milliseconds.
 
 ## Owed (not in this PR)
+
+- **The memory gate's ruling**: check 1 is unchanged. Run the dropout experiment (`minutes=80`) with
+  and without `malloc_arena_max=2`, and its `schedule=none` control of the same length, then rule
+  from the memory split's measures.
+- **A leaks-tracer checkpoint, and the tracer knob with it**: no GStreamer tracer reaches the
+  compositor (see "The memory experiment's knobs"). A per-rebuild count of the objects a rebuild
+  adds needs the compositor to drive the leaks tracer itself: its `activity-start-tracking` and
+  `activity-log-checkpoint` actions around each input rebuild fit "objects added per rebuild" better
+  than `get-live-objects`. The workflow knob (`GST_TRACERS=leaks`, `GST_DEBUG=GST_TRACER:7`, from an
+  allowlist) comes back in the same PR.
 
 - **The cost legs' numbers**: built here (see "The cost legs"); the F-entry and Owed 93's closure
   wait for the dispatches.

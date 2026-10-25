@@ -8,6 +8,7 @@
 //! | `fps` | the programme's REAL output rate (Owed 86): the video frames that left the encoder since the last sample, over the wall time since it (`BeatRate`, fed `Stats::snapshot()`'s `encoded_frames`), never the profile's nominal rate; absent until a window has both ends |
 //! | `bitrate_kbps`, `egress_bytes`, `encoder_speed` | `Stats::snapshot()`, unchanged: a `None` there stays absent on the wire |
 //! | `camera_frames_replaced` | `Stats::snapshot()`, unchanged; logged by the driver, never on the wire (Owed 90) |
+//! | `memory()` (not a `Measured` field) | the last sample's `/proc/<pid>/status` read of this process (`VmRSS`, `RssAnon`, `RssFile`, `RssShmem`, `Threads`: the read `mem_mb` already makes) and the CEF child poll's last PSS by kind (`with_cef`); logged by the driver once a minute, never on the wire (the soak's memory split) |
 //! | `measured_latency_ms` | never: it needs SEI (F-003), so it is omitted, never 0 |
 //!
 //! The driver samples once a beat (`Effect::SendHeartbeat`, the only caller), so "since the last
@@ -16,13 +17,13 @@
 //! the old one. A descendant that started since the last sample counts all of its ticks (it ran only
 //! since then); one that ended in between is lost, which only ever under-reads. A CEF process
 //! orphaned to pid 1 (F-013) has left the tree and is not counted. Off Linux there is no `/proc`, and
-//! `cpu_pct` and `mem_mb` stay `None`.
+//! `cpu_pct`, `mem_mb` and `memory` stay `None`.
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
-use app::ports::{Measured, Metrics};
+use app::ports::{CefPoll, Measured, MemorySplit, Metrics, ProcStatus};
 
 use crate::stats::{BeatRate, Stats};
 
@@ -58,6 +59,30 @@ pub fn parse_vm_rss_kb(status: &str) -> Option<u64> {
     let mut it = line["VmRSS:".len()..].split_whitespace();
     let kb = it.next()?.parse::<u64>().ok()?;
     (it.next() == Some("kB")).then_some(kb)
+}
+
+/// A `<name>  <n>[ <unit>]` line of a `/proc/<pid>/status` text: `n`, when the line is there, its
+/// number reads and its unit is `unit` (`None`: no unit).
+fn status_field(status: &str, name: &str, unit: Option<&str>) -> Option<u64> {
+    let line = status
+        .lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(':'))?;
+    let mut it = line.split_whitespace();
+    let n = it.next()?.parse::<u64>().ok()?;
+    (it.next() == unit && it.next().is_none()).then_some(n)
+}
+
+/// The memory split's fields of a `/proc/<pid>/status` text (proc(5)): `VmRSS`, `RssAnon`, `RssFile`
+/// and `RssShmem` in kB, and `Threads`. A missing or malformed line leaves its field absent, never 0.
+pub fn parse_proc_status(status: &str) -> ProcStatus {
+    let kb = |name| status_field(status, name, Some("kB"));
+    ProcStatus {
+        vm_rss_kb: kb("VmRSS"),
+        rss_anon_kb: kb("RssAnon"),
+        rss_file_kb: kb("RssFile"),
+        rss_shmem_kb: kb("RssShmem"),
+        threads: status_field(status, "Threads", None),
+    }
 }
 
 /// This process and every descendant, each with its `stat` fields, read from `/proc`. Empty off
@@ -107,7 +132,14 @@ pub struct ProcMetrics {
     last: Option<(Instant, BTreeMap<ProcKey, u64>)>,
     /// The beat's real output rate (Owed 86).
     rate: BeatRate,
+    /// The CEF child poll's last PSS by kind, for the memory split (`with_cef`; none with no CEF).
+    cef: Option<CefReader>,
+    /// This process's own status fields, from the last sample's `status` read (the memory split).
+    own: Option<ProcStatus>,
 }
+
+/// Reads the CEF child poll's last PSS by kind (`CefGraphics::memory`).
+type CefReader = Box<dyn Fn() -> Option<CefPoll> + Send>;
 
 impl fmt::Debug for ProcMetrics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -117,6 +149,7 @@ impl fmt::Debug for ProcMetrics {
             .field("cpus", &self.cpus)
             .field("sampled", &self.last.is_some())
             .field("rate", &self.rate)
+            .field("cef", &self.cef.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -131,7 +164,15 @@ impl ProcMetrics {
             cpus: std::thread::available_parallelism().map_or(1.0, |n| n.get() as f64),
             last: None,
             rate: BeatRate::default(),
+            cef: None,
+            own: None,
         }
+    }
+
+    /// The memory split's CEF part: `read` gives the child poll's last PSS by kind, once a beat.
+    pub fn with_cef(mut self, read: impl Fn() -> Option<CefPoll> + Send + 'static) -> Self {
+        self.cef = Some(Box::new(read));
+        self
     }
 }
 
@@ -169,16 +210,20 @@ impl Metrics for ProcMetrics {
             }
             _ => None,
         };
+        // One `status` read per process: the tree's VmRSS sum, and this process's own split.
+        let mut own: Option<ProcStatus> = None;
         let mem_kb: Option<u64> = (!tree.is_empty()).then(|| {
             tree.keys()
                 .filter_map(|pid| {
-                    std::fs::read_to_string(format!("/proc/{pid}/status"))
-                        .ok()
-                        .as_deref()
-                        .and_then(parse_vm_rss_kb)
+                    let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+                    if *pid == self.root {
+                        own = Some(parse_proc_status(&text));
+                    }
+                    parse_vm_rss_kb(&text)
                 })
                 .sum()
         });
+        self.own = own;
         self.last = (!ticks.is_empty()).then_some((now, ticks));
         Measured {
             fps,
@@ -190,5 +235,12 @@ impl Metrics for ProcMetrics {
             mem_mb: mem_kb.map(|kb| kb / 1024),
             camera_frames_replaced: s.camera_frames_replaced,
         }
+    }
+
+    fn memory(&mut self) -> Option<MemorySplit> {
+        Some(MemorySplit {
+            status: self.own?,
+            cef: self.cef.as_ref().and_then(|read| read()),
+        })
     }
 }

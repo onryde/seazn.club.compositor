@@ -35,6 +35,17 @@
 //!   on the first beat at or above the recovery level after it. A beat with no session (a refused
 //!   bootstrap's final beat) has no profile and writes neither. The beat itself carries the same
 //!   `fps`. The ladder is not told: its only input stays the encoder queue's overruns.
+//! - **The memory split** (soak 40139563554's drift, 2026-10-25): a beat whose metrics have a
+//!   memory split (`Metrics::memory`, read after the beat's sample) writes `memory split input_gen=<g> tree_mb=<n> rss_kb=… anon_kb=… file_kb=…
+//!   shmem_kb=… threads=… cef_poll=<n> cef_<kind>_kb=… cef_<kind>_n=… cef_<kind>_listed=…`
+//!   (`memory_line`, the kinds `renderer`, `gpu_process`, `utility`, `zygote`, `other`) on the first
+//!   such beat and then on the first beat at least a minute after the last line. `input_gen` is the
+//!   last input generation the domain rebuilt, so a step in the soak's memory can be tied to a
+//!   rebuild; `tree_mb` is the beat's own `memMb`, unchanged. Per kind, `listed` is how many children
+//!   of that kind the poll found, `n` how many of them it read the PSS of, and `kb` that PSS's sum,
+//!   `-` when it read none (unknown, never 0). A kind the poll found none of writes `kb=- n=0
+//!   listed=0`; a kind it found and could not read writes `kb=- n=0 listed=<k>`. An absent value
+//!   writes `-`, never 0. A sample without a split writes nothing.
 //! - **CEF's health** (C11b) is read from the graphics port once per `tick_due` that ran a tick, after
 //!   its ticks, and handed to `decide` every time (the domain decides the in-place restart, never the
 //!   driver), with one line when it changes (`cef health zygote_gone=<gen|-> leaked_teardowns=<n>
@@ -53,13 +64,16 @@ use domain::programme::ProgrammePhase;
 use domain::starvation::{Alarm, StarvationAlarm};
 use domain::supervisor::{Decision, Effect, Event, Refusal, Supervisor};
 
-use crate::ports::{ControlRequest, Inbound, Ports, SessionConfig, FINAL_BEAT_TIMEOUT_MS};
+use crate::ports::{ControlRequest, Inbound, MemorySplit, Ports, SessionConfig, FINAL_BEAT_TIMEOUT_MS};
 
 /// Ticks per second before the session gives a profile.
 const BOOT_RATE: u64 = 10;
 
 /// The least time between two lines of one counter (review round 1, item 4).
 const TALLY_EVERY_MS: u64 = 60_000;
+
+/// The least time between two memory split lines (the soak's memory split).
+const MEMORY_LINE_EVERY_MS: u64 = 60_000;
 
 /// The fatal text for a wiring effect with no session to wire from.
 pub(crate) const NO_SESSION: &str = "a session effect arrived before a session";
@@ -134,6 +148,10 @@ pub struct Driver {
     phase_seq: u64,
     /// CEF's health as last read (C11b): its line is written when it changes.
     cef: CefHealth,
+    /// The last input generation the domain rebuilt (the memory split's `input_gen`).
+    input_gen: Option<u64>,
+    /// When the last memory split line was written.
+    memory_at: Option<u64>,
     exited: bool,
 }
 
@@ -157,6 +175,8 @@ impl Driver {
             phase: ProgrammePhase::Waiting,
             phase_seq: 0,
             cef: CefHealth::default(),
+            input_gen: None,
+            memory_at: None,
             exited: false,
         }
     }
@@ -322,6 +342,7 @@ impl Driver {
                 let Some(cfg) = &self.session else {
                     return self.no_session(now);
                 };
+                self.input_gen = Some(gen);
                 p.input.rebuild(gen, &cfg.input);
             }
             // The domain gave the generation up (C10b): the adapter shuts it out. No session needed.
@@ -363,6 +384,15 @@ impl Driver {
                     self.replaced_at_beat = total;
                     p.log
                         .info(&format!("camera frames replaced beat={beat} total={total}"));
+                }
+                if self
+                    .memory_at
+                    .is_none_or(|at| now.saturating_sub(at) >= MEMORY_LINE_EVERY_MS)
+                {
+                    if let Some(split) = p.metrics.memory() {
+                        self.memory_at = Some(now);
+                        p.log.info(&memory_line(&split, m.mem_mb, self.input_gen));
+                    }
                 }
                 let reading = m.fps.filter(|f| f.is_finite());
                 if let (Some(fps), Some(cfg)) = (reading, &self.session) {
@@ -412,6 +442,48 @@ impl Driver {
         let detail = Some(ExitDetail::new(NO_SESSION));
         self.decide(Event::Fatal { detail }, now)
     }
+}
+
+/// The memory split's line (the module doc says which fields, in this order). `tree_mb` is the beat's
+/// `memMb`; `input_gen` the last generation rebuilt. Absent is `-`.
+pub fn memory_line(split: &MemorySplit, tree_mb: Option<u64>, input_gen: Option<u64>) -> String {
+    fn v(x: Option<u64>) -> String {
+        x.map_or_else(|| "-".to_owned(), |n| n.to_string())
+    }
+    let s = &split.status;
+    let mut line = format!(
+        "memory split input_gen={} tree_mb={} rss_kb={} anon_kb={} file_kb={} shmem_kb={} threads={} cef_poll={}",
+        v(input_gen),
+        v(tree_mb),
+        v(s.vm_rss_kb),
+        v(s.rss_anon_kb),
+        v(s.rss_file_kb),
+        v(s.rss_shmem_kb),
+        v(s.threads),
+        v(split.cef.map(|c| c.poll)),
+    );
+    let polled = split.cef.map(|c| c.pss);
+    for (name, kind) in polled.unwrap_or_default().kinds() {
+        // No poll: nothing is known. A poll that found no child of this kind: none listed, none read.
+        // Listed with none read: the PSS is unknown, so `-`, never the 0 it sums to.
+        let (kb, n, listed) = match (polled, kind) {
+            (None, _) => ("-".to_owned(), "-".to_owned(), "-".to_owned()),
+            (Some(_), None) => ("-".to_owned(), "0".to_owned(), "0".to_owned()),
+            (Some(_), Some(k)) => (
+                if k.n == 0 {
+                    "-".to_owned()
+                } else {
+                    k.kb.to_string()
+                },
+                k.n.to_string(),
+                k.listed.to_string(),
+            ),
+        };
+        line.push_str(&format!(
+            " cef_{name}_kb={kb} cef_{name}_n={n} cef_{name}_listed={listed}"
+        ));
+    }
+    line
 }
 
 /// Owed 87 (and Owed 94's backstop): the domain's swap reason as the log line names it.

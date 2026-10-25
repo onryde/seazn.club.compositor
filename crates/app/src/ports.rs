@@ -198,6 +198,94 @@ pub struct Measured {
     pub camera_frames_replaced: Option<u64>,
 }
 
+/// This process's memory from `/proc/self/status` (the soak's memory split). Each field is absent
+/// when its line is missing or unreadable, never 0.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcStatus {
+    /// `VmRSS`, kB.
+    pub vm_rss_kb: Option<u64>,
+    /// `RssAnon`, kB: the heap and the threads' stacks (glibc's arenas among them).
+    pub rss_anon_kb: Option<u64>,
+    /// `RssFile`, kB: mapped files (the shared libraries, CEF's among them).
+    pub rss_file_kb: Option<u64>,
+    /// `RssShmem`, kB: shared memory.
+    pub rss_shmem_kb: Option<u64>,
+    /// `Threads`.
+    pub threads: Option<u64>,
+}
+
+/// One kind of CEF child in one poll: how many children of that kind the poll listed (`listed`), how
+/// many of them had their PSS read (`n`), and the PSS summed over those, in kB (`kb`). A kind listed
+/// with none read has `n == 0`: its PSS is unknown, never 0 (PR #82 review I2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KindPss {
+    pub kb: u64,
+    pub n: u32,
+    pub listed: u32,
+}
+
+/// CEF's child processes' PSS by Chromium's `--type=`, from one child poll. A kind the poll listed no
+/// child of is absent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CefPss {
+    pub renderer: Option<KindPss>,
+    pub gpu_process: Option<KindPss>,
+    pub utility: Option<KindPss>,
+    pub zygote: Option<KindPss>,
+    /// A `--type=` none of the other four names.
+    pub other: Option<KindPss>,
+}
+
+impl CefPss {
+    /// One listed child under its `--type=`, with its PSS (kB) when it was read. Every child counts
+    /// as listed. One whose PSS was not read (`None`: it ended between the listing and the read, or
+    /// its `smaps_rollup` could not be read) adds no PSS and is not counted as read, so a kind
+    /// listed with none read stays visible as such: the soak's verdict refuses it rather than read
+    /// CEF as flat.
+    pub fn add(&mut self, kind: &str, pss_kb: Option<u64>) {
+        let slot = match kind {
+            "renderer" => &mut self.renderer,
+            "gpu-process" => &mut self.gpu_process,
+            "utility" => &mut self.utility,
+            "zygote" => &mut self.zygote,
+            _ => &mut self.other,
+        };
+        let k = slot.get_or_insert_with(KindPss::default);
+        k.listed = k.listed.saturating_add(1);
+        if let Some(kb) = pss_kb {
+            k.kb = k.kb.saturating_add(kb);
+            k.n = k.n.saturating_add(1);
+        }
+    }
+
+    /// Each kind, named as the memory split's line names it, in the line's order.
+    pub fn kinds(&self) -> [(&'static str, Option<KindPss>); 5] {
+        [
+            ("renderer", self.renderer),
+            ("gpu_process", self.gpu_process),
+            ("utility", self.utility),
+            ("zygote", self.zygote),
+            ("other", self.other),
+        ]
+    }
+}
+
+/// The graphics adapter's last child poll: its number (1 the first) and its PSS by kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CefPoll {
+    pub poll: u64,
+    pub pss: CefPss,
+}
+
+/// The soak's memory split, one sample: this process's status fields and, when a CEF adapter has
+/// polled its children, that poll (absent with no CEF, as with the fake drivers, or before the first
+/// poll).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemorySplit {
+    pub status: ProcStatus,
+    pub cef: Option<CefPoll>,
+}
+
 /// The two outbound calls to R1 (spec §5): the session GET and the heartbeat POST.
 pub trait ControlPlane: Send {
     fn fetch_session(&mut self) -> Result<SessionConfig, FetchError>;
@@ -255,6 +343,15 @@ pub trait GraphicsRenderer: Send {
 /// The heartbeat's measured values (C12's `/proc` sampler plus C09's counters), sampled per beat.
 pub trait Metrics: Send {
     fn sample(&mut self) -> Measured;
+
+    /// The soak's memory split (soak 40139563554's drift, 2026-10-25) as of the last `sample`: the
+    /// compositor's own memory and CEF's children's PSS by kind, which `mem_mb` (the whole tree's
+    /// VmRSS) cannot tell apart. The driver logs it once a minute (`memory split …`,
+    /// `driver::memory_line`). It is not part of `Measured`, so it can never reach the heartbeat, and
+    /// `mem_mb` is unchanged beside it. None by default, and off Linux (no `/proc`).
+    fn memory(&mut self) -> Option<MemorySplit> {
+        None
+    }
 }
 
 /// The compositor's programme phase, served to the overlay page on loopback (overlay templates spec

@@ -7,6 +7,8 @@
   "dropout_phase_s": 150,
   "dropout_pause_s": 10,
   "disconnect_hold_s": 30,
+  "dropout_only": {"every_s": 125, "phase_s": 60},
+  "memory_step": {"before_s": [-90, -10], "after_s": [30, 110]},
   "memory_drift_max": 0.10,
   "dropped_frames_max_ratio": 0.001,
   "heartbeat_min_ratio": 0.95,
