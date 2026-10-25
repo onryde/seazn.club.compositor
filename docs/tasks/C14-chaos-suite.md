@@ -771,7 +771,9 @@ socket timeout is the only detector of a destination stall (`docs/_INDEX.md` Owe
   - the outgoing sink's `output gen=<g> error:` line came before the swap;
   - the swap came output_backoff_base_ms − frame_period_ms to budget_output_reconnect_ms (§6, 5 s)
     after the error (the floor less one frame: the docker stamps cannot resolve the product's tick;
-    PR #71's run 40137725801 read 499 ms for a swap whose own `ts=` stamps were 500 ms apart), and
+    PR #71's run 40137725801 read 499 ms for a swap whose own `ts=` stamps were 500 ms apart;
+    **amended 2026-10-25**, the amendment "Owed 94's backstop": the cause was docker's per-line read
+    latency, and the interval is now read from the lines' own `ts=` with the floor exactly the base), and
     within `bound_ms` (output_sink_timeout_ms + output_backoff_base_ms + frame_period_ms) of the
     last growth;
   - the error came no sooner than output_sink_timeout_ms − frame_period_ms after the cut, and no
@@ -900,6 +902,56 @@ none an owner ruling. Decision log "C14 case 16 wired".
   _INDEX rows are kept. **Expected reds of the next run:** cpu-starved (Owed 86) only. Both
   cef-leaks legs must pass, and no Owed 87 red is expected. Anything else is NOT OWED.
 
+## Amendment 2026-10-25, Owed 94's backstop (branch `feat/owed94-egress-backstop`)
+
+Owner, 2026-10-24, in chat, relayed by the coordinator: "B": a sink whose egress stays flat while
+both encoders deliver is swapped, and the beat says so (`docs/_INDEX.md` Owed 94, decision log
+"Owed 94 built"; C04's and C09's amendments of this date). The threshold, `output_egress_flat_ms`,
+is pending with the owner (the coordinator recommended the derived 9 000 ms, 2026-10-25).
+- **Case 18, `output-hung`** (n 18; legs `output-hung-hold` and `output-hung-hang`, so 37 legs): on
+  the `relay-test-hooks` image (`RELAY_TEST_HOOKS_IMAGE`, `harness/compose.output-hung.yml`), Owed
+  94's hook stalls sink 1 `OUTPUT_HUNG_AFTER_MS` (25 s) after its build: `hold` holds its writes,
+  `hang` hangs its streaming thread (its teardown hangs too). 70 s live, no drive. 16 checks:
+  - `armed` and `planted` (preconditions: the arming line once, the variant's stall and ms; one
+    plant, on sink 1), and `planted_in_drive` (after the drive's start, with output_gap_budget_ms
+    before the end);
+  - `backstop_swap` (`hung_swap_judged`, lib.jq): the first swap after the plant reads
+    `egress_stalled`, the reason lines pair the swap lines, sink 1 logged no error before it, and the
+    plant to the swap on the lines' own `ts=` is from output_egress_flat_ms + output_backoff_base_ms −
+    output_progress_poll_ms − tick_widest_ms to output_egress_flat_ms + output_backoff_base_ms + 2 ×
+    output_progress_poll_ms + 2 × tick_widest_ms;
+  - `beat_stalled`: at least one beat from the firing (a back-off before the swap) until sink 2
+    could earn Connected (output_connected_after_ms after the swap), a tick in from each end, and
+    every one reads `stalled`;
+  - `gap_in_budget` (one outage between the plant and the swap, at most output_gap_budget_ms, the
+    owner's 15 s target), `no_outage_outside_hang`, `one_swap`; the false-positive sweep,
+    `no_restarts` and `ended_beat`; measures `gap_ms` (the key) and `lost_ms`.
+- **b-1 (the PR #73 confirm pass):** `stall_swap`'s `error_to_swap_ms` is read from the two lines'
+  own `ts=` (logfacts `GenAt.ts_ms`), with the floor exactly output_backoff_base_ms: an interval
+  inside one process belongs on its clock. The cut-anchored bounds stay on docker's stamps (two
+  clocks, a frame of slack). Sims: `stall-err-early` (base − 1) reds, `stall-err-base` passes,
+  `stall-ci-499` (docker 499, ts 500) passes, `stall-ts-499` (docker 500, ts 499) reds alone.
+- **c-2:** `rule-ceiling` passes at exactly output_sink_timeout_ms + budget_output_lost_max_ms.
+- **r-1 (the #71 confirm pass):** the RELAY_IMAGE sweep's `soak/` exemption excused no file and is
+  dropped; the sweep now allows the image's variable, each hook's keys and overlay, and a
+  `RELAY_IMAGE` assignment only in the two hook cases' files.
+- **Cases 5, 12 and 17 keep `reason == "error"`** (the PR #73 review's P-3 (b), the implementer's
+  choice): the backstop beats the sink's error only in the multi-wake trickle, which CI's 720p never
+  reached (false premises, 2026-10-25); a backstop swap there is a red to read.
+- thresholds.json gains `output_egress_flat_ms`, `output_progress_poll_ms` (back, for the window)
+  and `tick_widest_ms`.
+- **Host mutants**, 24, all KILLED, each with a named FAIL in a `case_verdicts.rs` sim: lib.jq's
+  `hung_swap` (the reason, the pairing, the error-first, the floor, the ceiling, `ts=` against
+  docker, the floor's tick term), case 18's checks (the beat's state and its count, the gap's budget
+  and its one outage, the drive's two bounds, one swap, the arming's stall and ms, the plant's count,
+  flag and stall, the outage before and after), and b-1's floor, `ts=` and c-2's `<=`.
+- **CI mutants** (a throwaway `mut/owed94` PR, the `mut/c14-case16` workflow's shape: the target check
+  PASSes unmutated, then FAILs mutated with its controls still PASS): (a) the case on the plain relay
+  image reds `armed`; (b) the backstop's Connected arm removed reds `backstop_swap` on `hold`; (c)
+  progress readings without the encoded counts red `backstop_swap` on `hold`; (d) the threshold
+  typed in as 15 000 reds `backstop_swap` on `hang`; (e) the hung sink torn down on the swapping
+  thread, not a reaper, reds `gap_in_budget` on `hang`.
+
 ## Files
 
 - Create: `harness/cases/{camera-stop,camera-flap,reader-kicked,dest-disconnect,dest-stall,cpu-starved,score-down,cef-killed,process-killed,input-impaired}.{sh,jq}` (amended 2026-10-24: all 16, cases 11–16 too, as `.sh` files with `require` lines over `harness/cases/lib.jq`; and `harness/chaos.json`, the legs)
@@ -957,7 +1009,15 @@ none an owner ruling. Decision log "C14 case 16 wired".
   output_sink_timeout_ms + output_backoff_base_ms + frame_period_ms of the last growth, and the error
   no sooner than output_sink_timeout_ms − frame_period_ms after the cut and no later than
   output_sink_timeout_ms + budget_output_lost_max_ms, each read from `thresholds.json`. m9
-  (`OUTPUT_SINK_TIMEOUT_MS` 20 s) is KILLED on case 17.
+  (`OUTPUT_SINK_TIMEOUT_MS` 20 s) is KILLED on case 17. (Amended 2026-10-25, b-1: the error to the
+  swap is read from the lines' own `ts=`, and its floor is output_backoff_base_ms itself.)
+- (Amended 2026-10-25, Owed 94) Case 18 (`output-hung`, `hold` and `hang`) runs on the
+  `relay-test-hooks` image; its arming line and plant are preconditions; the first swap after the
+  plant reads `egress_stalled` inside the domain's window on the process's own clock, the beats
+  read `stalled` until sink 2 could earn Connected, and the viewer's gap is one outage inside
+  output_gap_budget_ms. Product mutants without the backstop, without the encoded counts, or with
+  the threshold typed in red `backstop_swap`; one tearing the hung sink down on the swapping thread reds
+  `gap_in_budget`.
 - (Amended 2026-10-18, Owed 20) Case 6 asserts the score stays on air through the stress and
   after it, and every beat's `rung` is `full`/`overlay_half_rate`, never back to `full` after a step.
 - (Amended 2026-10-20, C11b; Owed 62, 68, 69) Case 8 takes case 9's shape, with a non-zero, non-75 exit and no core

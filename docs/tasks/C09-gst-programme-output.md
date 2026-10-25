@@ -473,6 +473,23 @@ amendment of this date).
   `GstProgramme::set_output_sink_timeout_s`, reads back from every sink built after it and never from
   one built before. Only that last test sees the set, since the production value equals the default.
 
+## Amendment 2026-10-25 (Owed 94: the encoded counts, and a hook that hangs sink 1)
+
+Owner, 2026-10-24, in chat, relayed by the coordinator: "B": the domain swaps a sink whose egress stays
+flat while the encoders deliver (C04's amendment of this date). The adapters' side:
+- The encoded ring counts each track's pushes, and every `OutputProgress` reading carries them
+  (`Encoded`). `OUTPUT_PROGRESS_POLL_MS` now lives in `domain::config` (the backstop's derivation reads
+  it); `gst_output.rs` re-exports it, and `the_progress_poll_is_owed_15s_choice` stays.
+- A `test-hooks`-only seam, `GstProgramme::stall_first_sink(SinkStall::{Hold, Hang}, after)`, out of the
+  release image as in #62. It reuses `hold_sink_writes` and the hang pad probe rather than a new hook,
+  and plants the stall at sink gen 1's first push past `after`, logging
+  `WARN test hook (Owed 94): sink gen=1 stalls (...)` when armed and `WARN test hook (Owed 94): sink
+  stall=... gen=1 planted=...` when planted. The compositor reads `COMPOSITOR_TEST_HOLD_SINK_AFTER_MS` /
+  `COMPOSITOR_TEST_HANG_SINK_AFTER_MS` (empty is unset, both set is refused with exit 78).
+- Tests (CI, GStreamer): `a_held_sink_reads_flat_while_the_encoders_deliver_and_the_link_backs_it_off`
+  folds the real readings through `OutputLink`; `a_swap_away_from_a_hung_sink_does_not_wait_for_its_teardown`.
+  C14's case 18 (`harness/cases/output-hung.sh`) drives both stalls end to end.
+
 ## Do not touch
 
 Domain and app crates. If you find a port signature problem, report it as a deviation and don't

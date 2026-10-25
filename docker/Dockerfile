@@ -6,9 +6,9 @@
 # cef-test (rust-build plus the plugin: image.yml runs C11's graphics tests there), harness-build
 # and harness (C13's fakes and checker, `--target harness`; test tooling the runtime never
 # carries), rust-build-test-hooks (the binary with its `test-hooks` feature, Owed 82), relay (the
-# runtime), relay-test-hooks (relay with that binary instead: C14 case 16's image, never shipped),
-# and last an unnamed `FROM relay`, so a build with no target is the relay image. image.yml checks
-# that relay's binary carries no test hook and relay-test-hooks' does.
+# runtime), relay-test-hooks (relay with that binary instead: C14 cases 16 and 18's image, never
+# shipped), and last an unnamed `FROM relay`, so a build with no target is the relay image.
+# image.yml checks that relay's binary carries no test hook and relay-test-hooks' does.
 #
 # Never set GST_CEF_LOG_SEVERITY or GST_DEBUG here (Owed 52, F-013): the first overrides the
 # element's log-severity=disable and CEF then writes every console line, the job token included, to
@@ -86,7 +86,8 @@ RUN for e in appsrc x264enc h264parse mpegtsmux srtsink audioconvert voaacenc aa
       gst-inspect-1.0 "$e" >/dev/null 2>&1 || { echo "missing element $e"; exit 1; }; done
 
 # Owed 82 (owner option A, 2026-10-24): the held-teardown hook (`COMPOSITOR_TEST_HOLD_TEARDOWNS`) is
-# compiled in only here. Built from rust-build's tree, so only the two crates the feature changes
+# compiled in only here, as is Owed 94's sink stall (`COMPOSITOR_TEST_HOLD_SINK_AFTER_MS`,
+# `COMPOSITOR_TEST_HANG_SINK_AFTER_MS`). Built from rust-build's tree, so only the two crates the feature changes
 # (adapters, compositor) build again.
 FROM rust-build AS rust-build-test-hooks
 RUN cargo build --release --locked -p compositor --features test-hooks \
@@ -122,7 +123,7 @@ RUN for e in cefsrc srtsrc tsdemux queue h264parse avdec_h264 videoconvertscale 
 # alone, which forwards the stops (F-016).
 ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/entrypoint.sh"]
 
-# C14 case 16 only (Owed 82): the relay image with the test-hooks binary. `--target relay-test-hooks`;
+# C14 cases 16 (Owed 82) and 18 (Owed 94) only: the relay image with the test-hooks binary. `--target relay-test-hooks`;
 # never pushed, never deployed.
 FROM relay AS relay-test-hooks
 COPY --from=rust-build-test-hooks /usr/local/bin/compositor-test-hooks /usr/local/bin/compositor
