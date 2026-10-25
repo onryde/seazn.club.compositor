@@ -47,13 +47,21 @@
 //! back on air. No event is sent (the domain decided it), and no rule of the domain's is read here:
 //! however long a connection goes quiet, this adapter gives nothing up by itself.
 //!
-//! **Never blocks the caller.** Each build has one thread of its own, which starts it, reads its bus
-//! and then tears it down: `srtsrc` resolves its host inside `set_state(PAUSED)`, and a hanging
-//! resolver held that for 10 s (`_FINDINGS.md` F-012); a teardown can hang as long (F-001). With the
-//! start and the teardown on one thread, a build retired mid-start never goes PLAYING after its
-//! teardown (review M1). `rebuild`, `stop` and the drop only close the gate and set the build's stop
-//! flag; nothing here joins a thread. The plugins are loaded once, when the adapter is built, so no
+//! **Never blocks the caller.** Each build runs on one thread, which starts it, reads its bus and
+//! then tears it down: `srtsrc` resolves its host inside `set_state(PAUSED)`, and a hanging resolver
+//! held that for 10 s (`_FINDINGS.md` F-012); a teardown can hang as long (F-001). With the start and
+//! the teardown on one thread, a build retired mid-start never goes PLAYING after its teardown
+//! (review M1). `rebuild`, `stop` and the drop only close the gate and set the build's stop flag;
+//! nothing here joins a thread. The plugins are loaded once, when the adapter is built, so no
 //! `rebuild` loads one on the driver's thread (review M4).
+//!
+//! **The threads outlive the builds** (Owed 100, F-031; `input_threads`). A build's thread is an idle
+//! one from an earlier build, or a new one when every earlier one is still busy (a hung start or
+//! teardown holds up nothing), and so are its streaming tasks' threads: each task is handed the
+//! input's own task pool for its role (the source, the video queue, the audio queue) as it is
+//! created. On new threads every build parked its frames in another glibc arena, +1.2 MB of the
+//! process's memory per camera dropout; on the same threads the next build reuses what the last one
+//! freed.
 //!
 //! **Secrets.** The URI carries the SRT stream id and passphrase, so it is never logged: each build logs
 //! the URL's scheme and authority alone, and every GStreamer text this adapter forwards passes the
@@ -63,8 +71,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "test-hooks")]
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+#[cfg(feature = "test-hooks")]
 use std::thread;
-use std::time::{Duration, Instant};
+#[cfg(feature = "test-hooks")]
+use std::time::Duration;
+use std::time::Instant;
 
 use app::ports::{redacted_origin, Inbound, InputSource, InputSpec};
 use crossbeam_channel::Sender;
@@ -77,6 +88,11 @@ use gstreamer_app as gst_app;
 
 use crate::frame_store::{FrameStore, AUDIO_CHANNELS, AUDIO_RATE};
 use crate::gst_output::LogFn;
+#[cfg(feature = "test-hooks")]
+pub use crate::input_threads::WorkerCounts;
+#[cfg(feature = "test-hooks")]
+use crate::input_threads::{role_counts, task_counts};
+use crate::input_threads::{task_pool, TaskRole, BUILDS};
 use crate::redact::{percent_encoded, Scrubber};
 
 /// The leaky queue before the video decoder holds at most 1 s (plan, Global Constraints: "decoded video
@@ -123,7 +139,7 @@ struct Shared {
     frames: FrameStore,
     log: LogFn,
     scrubber: Arc<Mutex<Scrubber>>,
-    /// Retired builds whose teardown (`set_state(NULL)` on the build's own thread) has not returned.
+    /// Retired builds whose teardown (`set_state(NULL)` on its build thread) has not returned.
     reapers: Arc<AtomicUsize>,
     /// `InputFrame` events not delivered: the inbound channel was full.
     frames_dropped: AtomicU64,
@@ -252,6 +268,9 @@ impl GstInput {
     /// Loads every factory's plugin now: a plugin's first use otherwise loads it inside `make`, on
     /// the driver's thread (the review measured 48–77 ms for the first `rebuild`). A factory that
     /// does not load is logged; the build that needs it then fails as a loss.
+    ///
+    /// The input's task pool is made here too, once a process (Owed 100): a pool that cannot be had is
+    /// logged, and the streaming tasks then run on GStreamer's default pool.
     fn preload(&self) {
         if let Err(e) = gst::init() {
             self.shared.log(&format!("gstreamer did not initialise: {e}"));
@@ -263,6 +282,10 @@ impl GstInput {
                 self.shared
                     .log(&format!("input: the {name} element did not load"));
             }
+        }
+        if task_pool(TaskRole::Other).is_none() {
+            self.shared
+                .log("input: no task pool of its own; the streaming tasks run on GStreamer's default pool");
         }
     }
 
@@ -335,6 +358,20 @@ impl GstInput {
     /// Retired builds whose teardown has not returned yet.
     pub fn teardowns_in_flight(&self) -> usize {
         self.shared.reapers.load(Ordering::SeqCst)
+    }
+
+    /// Test hook (Owed 100): the input's reused threads, process-wide (every `GstInput` shares them):
+    /// the build threads and the streaming tasks' threads.
+    #[cfg(feature = "test-hooks")]
+    pub fn threads() -> InputThreads {
+        InputThreads {
+            builds: BUILDS.counts(),
+            tasks: task_counts(),
+            source: role_counts(TaskRole::Source),
+            video: role_counts(TaskRole::Video),
+            audio: role_counts(TaskRole::Audio),
+            other: role_counts(TaskRole::Other),
+        }
     }
 
     /// Test hook: the counter `teardowns_in_flight` reads, to watch after a drop.
@@ -668,6 +705,7 @@ impl GstInput {
                         errored.store(true, Ordering::SeqCst);
                     }
                 }
+                gst::MessageView::StreamStatus(st) => use_the_input_pool(st),
                 #[cfg(feature = "test-hooks")]
                 gst::MessageView::StateChanged(s) => hold_at_the_start(&shared, msg, s),
                 _ => {}
@@ -677,8 +715,9 @@ impl GstInput {
         Ok(())
     }
 
-    /// Hands the build to a thread of its own (`run_build`). If no thread can be had, the generation
-    /// is lost at once and its pipeline, never started, is let go.
+    /// Hands the build to a build thread (`run_build` on `BUILDS`): an idle one from an earlier build,
+    /// or a new one (Owed 100). If no thread can be had, the generation is lost at once and its
+    /// pipeline, never started, is let go.
     fn start(&mut self, live: &mut Live) {
         let gen = live.gen;
         let Some(bus) = live.pipeline.bus() else {
@@ -688,11 +727,9 @@ impl GstInput {
         let pipeline = live.pipeline.clone();
         let stop = Arc::clone(&live.stop);
         let errored = Arc::clone(&live.errored);
-        let spawned = thread::Builder::new()
-            .name("input-build".to_owned())
-            .spawn(move || run_build(&shared, &pipeline, &bus, &stop, &errored, gen));
-        match spawned {
-            Ok(_) => live.running = true,
+        let started = BUILDS.run(move || run_build(&shared, &pipeline, &bus, &stop, &errored, gen));
+        match started {
+            Ok(()) => live.running = true,
             Err(_) => self.lost_unstarted(gen, "no thread"),
         }
     }
@@ -708,7 +745,8 @@ impl GstInput {
     }
 }
 
-/// One build's thread, from its start to its teardown, so the two can never cross (review M1).
+/// One build, from its start to its teardown, on one thread, so the two can never cross (review M1).
+/// The thread is `BUILDS`'s and outlives the build (Owed 100).
 ///
 /// 1. The start. READY→PAUSED is where `srtsrc` resolves its host, opens its socket and issues its
 ///    connect (F-012: a hanging resolver held it 10 s); the handshake completes asynchronously, and
@@ -921,6 +959,51 @@ fn note_frame(shared: &Shared, delivered: bool) {
         shared
             .log("the inbound channel is full: frames still reach the camera slot, their events are dropped");
     }
+}
+
+/// A streaming task about to be made runs on the input's own task pool for its role (Owed 100), by
+/// the name of the element that owns it. `STREAM_STATUS` `Create` is posted from
+/// `gst_pad_start_task` on the thread that makes the task, before it starts, so the pool is set while
+/// it can still take effect. Every other stream status changes nothing.
+fn use_the_input_pool(st: &gst::message::StreamStatus) {
+    let (kind, owner) = st.get();
+    if kind != gst::StreamStatusType::Create {
+        return;
+    }
+    let Some(task) = st.stream_status_object().and_then(|v| v.get::<gst::Task>().ok()) else {
+        return;
+    };
+    if let Some(pool) = task_pool(task_role(&owner.name())) {
+        task.set_pool(&pool);
+    }
+}
+
+/// The role of the task that `owner` (an element of `build_pipeline`'s, by name) starts.
+fn task_role(owner: &str) -> TaskRole {
+    match owner {
+        "src" => TaskRole::Source,
+        "vqueue" => TaskRole::Video,
+        "aqueue" => TaskRole::Audio,
+        _ => TaskRole::Other,
+    }
+}
+
+/// Test hook (Owed 100): `GstInput::threads`.
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputThreads {
+    /// The build threads (`run_build`).
+    pub builds: WorkerCounts,
+    /// The streaming tasks' threads, every role together.
+    pub tasks: WorkerCounts,
+    /// The SRT source's task (`src`), which also runs the demuxer.
+    pub source: WorkerCounts,
+    /// The video queue's task (`vqueue`): the parser, the decoder, the converter.
+    pub video: WorkerCounts,
+    /// The audio queue's task (`aqueue`).
+    pub audio: WorkerCounts,
+    /// A task of any other element.
+    pub other: WorkerCounts,
 }
 
 /// Test hook (`hold_starts`): a start is held at its SRT source's READY→PAUSED state message.

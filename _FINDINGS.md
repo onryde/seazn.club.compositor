@@ -2264,3 +2264,124 @@ with the test page. The camera, the page and the process differ, so the gap (0.5
 seazn-relay-soak` was empty on 2026-10-25. The `cost-table` job was green.
 
 ---
+
+## F-031: each input rebuild left 1.2 to 2.4 MB in glibc's thread arenas; reusing the input's threads, one set per streaming role, takes it away (CI runs 40176756299 to 40194261349, 2026-10-25)
+
+**Question.** Soak arm 1 (run 40166664556; schedule `dropouts`, page `test`, 75 min) grew the
+compositor's anon memory by +118 MB in shrinking steps, against +18.7 MB with no dropouts (arm 3,
+run 40172443534) and +23.7 MB with dropouts and `MALLOC_ARENA_MAX=2` (arm 2, run 40172425373): about
+2.8 MB a dropout with glibc's default, 0.14 MB with the arenas capped. CEF did not grow. A dropout is
+one input rebuild (`gst_input.rs` `abandon`, then `rebuild`). Leak or retention, and where?
+
+**Method.** A diagnostic on throwaway branches (`loop/input-heap-diag-1` to `-3`, deleted); its gate
+form is `crates/adapters/tests/input_heap.rs`. A listener child sends fake-camera's picture (1280×720
+ball, 30 fps, AAC, `mpegtsmux alignment=7`) over SRT; a measuring child holds the adapter alone
+(`GstInput`, P720, `Thresholds::default()`, latency 1 000 ms). Each cycle is one dropout: a rebuild
+held past the handshake (Owed 97), `InputConnected`, N s of frames (about 30 a second), `abandon`,
+the build before it torn down, then one sample: `RssAnon` and `Threads` (`/proc/self/status`), and
+`/proc/self/smaps`' anon pages split into the main `[heap]`, glibc's thread-arena heaps (64
+MiB-aligned mappings, `HEAP_MAX_SIZE`) and the rest. ubuntu-24.04, 4 vCPU, glibc 2.39, GStreamer
+1.24.2.
+
+**The diagnosis** (60 cycles of 2 s decode unless noted; least-squares slope over cycles 11 to 60):
+
+| Variant | RssAnon KB a rebuild | Anon at the end (MB) | CPU ms a cycle | Shape |
+|---|---|---|---|---|
+| default (rounds 1, 2, 3) | **1 503 / 1 187 / 1 193** | 144 / 140 / 159 | — / 178 / 155 | a staircase, all in thread arenas (17, flat); `[heap]` and the rest flat; threads flat |
+| default, 10 s decode (30 cycles) | 2 190 | 125 | — | the same |
+| `MALLOC_ARENA_MAX=1` / `=2` | 20 / 23 and −17 | 35 / 42 and 40 | — / 190 | flat |
+| `MALLOC_ARENA_MAX=2`, 10 s decode (30 cycles) | −9 | 41 | 541 | flat |
+| `MALLOC_ARENA_MAX=4` / `=8` | 180 / 349 | 58 / 89 | 185 / 191 | |
+| `MALLOC_MMAP_THRESHOLD_=131072` | 113 / 87 | 40 | — / 209 | a slow creep |
+| a listener that handshakes and sends nothing | 8 | 30, flat | — | |
+| nothing listening (a refused connect, 30 cycles) | 3 | 18 | — | |
+| one long-lived build thread | 195 | 57 | 104 | flat 44 to 47 to cycle 52, then +10 MB |
+| `avdec_h264 max-threads=1` | 80 | about 65 | 130 | oscillating |
+| a task pool of reused threads | 180 | 83 | 176 | a plateau of 77 to 83 from cycle 25 |
+| the same, 10 s decode (30 cycles) | 29 | about 75 | 441 | a plateau of 69 to 75 (the default: 2 190) |
+| task pool + one build thread | 97 | 48 | 124 | a 40/46 oscillation to cycle 51, then 47 to 48 |
+| task pool + one build thread + `max-threads=1` | 29 | 46 | 124 | a 39/45 oscillation |
+| `GST_TRACERS=leaks`, `log-live-objects` at cycles 10 and 40 | 752 | — | — | 164 live objects at both, every type +0 |
+
+**The gate and its mutants** (the gate's own form: 8 rebuilds to warm up, 1 s decode, the median of
+the pairwise slopes of `RssAnon` over the measured rebuilds, in KiB a rebuild; rounds 1 and 2
+measured 24 rebuilds, rounds 3 to 5 measured 32):
+
+| Build | Runs (KiB a rebuild) | Anon after 40 rebuilds (MiB) |
+|---|---|---|
+| **the fix** (reused build threads; a task pool and a set of threads per role) | round 4 (run 40191976912), 7 runs: 7.4, 8.6, 26.8, 29.4, 45.5, 78.9, 118.5; round 5 (run 40194261349), 5 runs: 6.4, 8.8, 10.2, 11.3, 35.1 | 46 to 52, level from about rebuild 10 |
+| one shared task pool for every role (the fix as first built) | rounds 1 to 4 (runs 40182839995, 40185312932, 40189274326, 40191976912), 24 runs: 2.0 to 619.9, median 293 | 65 to 83 (rounds 3 and 4), still climbing |
+| **both halves removed** (a build thread per build, GStreamer's default pool) | 6 runs to round 4: 1 592, 1 765, 1 952, 2 028, 2 060, 2 447; round 5, 1 run: 2 284 | 126 to 149 |
+| the fix + `MALLOC_ARENA_MAX=2` | 1 run: 78.6 | 39.5 |
+| the fix + `avdec_h264 max-threads=1` | 2 runs: 34.1, 59.2 | 50 to 52 |
+| one shared pool + `max-threads=1` | 2 runs: 125, 354 | — |
+| one shared pool, the build threads per build | 1 run: 10 | — |
+| reused build threads only (GStreamer's default pool) | 1 run: 925 | — |
+| no reuse in `Workers` (a new thread per job) | 1 run: 5 398 (threads 46 → 138) | — |
+
+The fix's series alternates between two levels about 6 MiB apart (44 and 50, say): the gate's
+rebuild tears the last build down while it starts the next, so each role runs on two threads in
+turn, and each of their two arenas holds a frame pool. The gate bounds the median slope at 512 KiB
+(`tests/input_heap.rs`, `BOUND_KIB`): the power of two nearest the geometric middle of the fix's
+highest reading and the cause's lowest (434 KiB), so each clears it by about the same factor (4.3
+and 3.1). Both readings are measurements, so the bound is also held under a declared budget
+(`the_bound_is_under_the_soaks_memory_budget`, PR #91 fix round 1): soak.json declares no
+per-dropout budget yet, and check 1.projection's, 4 096 MB at the 5 h cap shared over 144 dropouts
+(one every 125 s), is 29 127 KiB a dropout. The gate reds by name, not as heap growth, when a
+rebuild's predecessor is not torn down within 10 s, when the stop's teardown does not return, and
+when the measuring child passes its budget (280 s: 40 s plus one connect timeout and one decode
+window a rebuild).
+
+Round 5 ran each guard's mutant on the final code against the test that must kill it, and each
+was red on its message: both halves removed (the gate: "the heap grows", 2 284 KiB); one pool for
+every role (the reuse test: "each build's source task ran on the source threads"); the pools made
+without their roles (the same); `vqueue` renamed in the role table ("each build's video task ran
+on the video threads"); a build thread per build ("the three builds ran on the adapter's
+threads"); no task pool ("every build's streaming tasks ran on the adapter's pool"); and no reuse
+in `Workers` ("no build thread was started"). The input suites on the final code: the lib's 4, the
+preload's 1, the heap's 2 and the input's 40, all passed.
+
+**Findings.**
+1. **Not a leak.** With one or two arenas the same 50 rebuilds hold flat (−17 to 23 KB a rebuild),
+   so every byte the default run grew was freed and could be reused; and GStreamer's live objects
+   are the same 164, type by type, 30 rebuilds apart.
+2. **It needs decoded video.** A build that connects and receives nothing costs 8 KB; a refused
+   connect 3 KB. Longer decoding costs more (2.2 MB a rebuild at 10 s, 1.2 to 1.5 at 2 s).
+3. **Mechanism (inferred, consistent with every row).** A 720p I420 frame is 1 382 400 B, above
+   glibc's first mmap threshold (128 KiB); glibc raises the threshold to the size of the first mmapped
+   block freed, so later frames come from the arena of the thread that allocates them. Each build
+   allocated its frames on threads the last build had not used: a build thread of its own, and the
+   streaming tasks of `srtsrc` and the two queues on GStreamer's default pool. A thread keeps the
+   arena it first lands on, and an arena keeps its high-water mark, so one build's freed frames stay
+   resident in one arena while the next build fills another. A fixed mmap threshold removes 93 % of
+   it, and capping the arenas removes all of it.
+4. **Reusing the threads removes it in code.** The streaming tasks carry most of it (the task pool
+   alone reads 10 KiB a rebuild in the gate's form, the build threads alone 925). The fix keeps
+   both.
+5. **One pool for every task was not enough.** With one shared set of task threads, the source,
+   video and audio tasks took whichever thread was idle, so the video task (the parser, the decoder
+   and the converter run on it) moved between threads from build to build, and every arena it
+   visited kept a frame pool: 2 to 620 KiB a rebuild in 24 runs, in steps of 6 to 10 MiB, and 65 to
+   83 MiB after 40 rebuilds, still climbing. One pool and one set of threads per role (by the name
+   of the element that owns the task: `src`, `vqueue`, `aqueue`, any other) keeps each kind of
+   buffer on the same two threads: 6 to 119 KiB in 12 runs, 46 to 52 MiB after 40 rebuilds, and
+   level. The arena cap on top of that reads 39.5 MiB, the floor for this harness.
+6. **The decoder's slice threads are not what is left** (`max-threads=1` with the fix: 34 and 59
+   KiB; 50 to 52 MiB, inside the fix's own spread). They are new with each build, but taking them
+   away moves nothing measurable here. Not traced: libsrt's own threads, which are new with each
+   connection.
+7. **The arena cap is the other remedy, and costs nothing measurable in CPU here** (178 to 191 ms a
+   cycle across 1, 2, 4 and 8 arenas). As the environment variable it changes the allocator of the
+   whole process tree, since the compositor's environment reaches the CEF children; set in the
+   process (`mallopt(M_ARENA_MAX)`) it would not reach them, but it would still cap the arenas of
+   cefsrc's in-process browser threads. It is not used: the fix removes the cause, and the cap stays
+   the measured fallback.
+8. **Two tools failed here.** heaptrack 1.5 aborted the Rust test binary 0.1 s in ("fatal runtime
+   error: stack overflow") under its preload. The leaks tracer's `get-live-objects` action in 1.24.2
+   hands its list over without a ref on each object: the objects were disposed while PLAYING, and the
+   process died on SIGSEGV. The `log-live-objects` action, with `GST_DEBUG=GST_TRACER:7`, works.
+
+**Not measured here.** A dropout soak on the fix; the production Machine's core count; the output's
+swaps (about 3 MB each in soak run 40139563554's diagnosis).
+
+---

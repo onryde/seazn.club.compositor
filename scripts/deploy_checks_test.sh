@@ -254,7 +254,7 @@ fresh; rm "$W/wf/$PROD"
 expect_red "e14 deploy-prod.yml missing" 'deploy workflow missing: deploy-prod.yml'
 
 # e15. actionlint (shellcheck off) on every workflow: a bad value in check.yml.
-fresh; edit "$W/wf/check.yml" '    timeout-minutes: 25' '    timeout-minutes: soon'
+fresh; edit "$W/wf/check.yml" '    timeout-minutes: 30' '    timeout-minutes: soon'
 expect_red "e15 actionlint on a non-deploy workflow" 'check-workflows: FAIL: actionlint:'
 
 # e16. shellcheck on a deploy workflow: an unquoted expansion.
