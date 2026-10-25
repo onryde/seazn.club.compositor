@@ -402,11 +402,13 @@ fn frames_before_ready_never_reach_the_slot() {
     r.g.stop();
 }
 
-// Owed 99: a page that paints before its ready and never after (`static=1`) still puts its frame on
-// air at its ready (the adapter's latch), and a build reports its first frame in the slot once, after
-// its ready (`CefPainted`, which ends the domain's blank-page watch). Whether cefsrc delivered any
-// sample after the ready is printed: when it delivered none (F-001: a sample only on paint), the frame
-// on air is the latched one, and the test asserts it.
+// Owed 99: a page that paints before its ready (`static=1`) puts its newest pre-ready frame on air at
+// its ready (the adapter's latch), and a build reports its first frame in the slot once, after its
+// ready (`CefPainted`, which ends the domain's blank-page watch). The latch is asserted whatever the
+// page painted after its ready (the PR #92 review's I-2: CI's run 40229667029 printed `delivered: 2,
+// dropped: 1, written: 2`, one sample after the ready, so a latch-only branch never ran): at least
+// one sample dropped before the ready, and exactly one more written than cefsrc delivered after it,
+// the latched one. Without the latch the slot holds only post-ready samples, one fewer.
 #[test]
 fn a_static_page_puts_its_first_frame_on_air_at_its_ready_and_reports_it_once() {
     let _s = serial();
@@ -422,18 +424,28 @@ fn a_static_page_puts_its_first_frame_on_air_at_its_ready_and_reports_it_once() 
         .iter()
         .filter(|(_, e)| *e == Event::CefPainted { gen: 1 })
         .count();
+    // A sample counted delivered may still be converting when the counts are read: wait for the
+    // latch's count to hold. Without the latch it never can (every written sample was delivered after
+    // the gate opened, so `written <= delivered - dropped`).
+    let latched = wait_for(beat(), || {
+        let s = r.g.samples(1);
+        s.refused == 0 && s.dropped >= 1 && s.written == s.delivered - s.dropped + 1
+    });
     let s = r.g.samples(1);
-    let latched_only = s.delivered == s.dropped;
-    eprintln!("static page: {s:?}; painted reports after the ready: {painted}; no sample after the ready: {latched_only}");
+    eprintln!(
+        "static page: {s:?}; painted reports after the ready: {painted}; samples after the ready: {}; the latched one written: {latched}",
+        s.delivered.saturating_sub(s.dropped)
+    );
     assert_eq!(painted, 1, "events after the ready: {after:?}");
     assert!(
         r.frames.overlay().is_some(),
         "the static page's frame never reached the slot"
     );
-    assert!(s.delivered >= 1 && s.written >= 1, "{s:?}");
-    if latched_only {
-        assert_eq!(s.written, 1, "the frame on air is the latched one: {s:?}");
-    }
+    assert!(s.dropped >= 1, "the page painted nothing before its ready: {s:?}");
+    assert!(
+        latched,
+        "one more written than delivered after the ready (the latched one): {s:?}"
+    );
     r.g.stop();
 }
 
