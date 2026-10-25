@@ -208,31 +208,41 @@ environments of fix rounds 1 and 2 (PR #85) and the promote workflow.
 - **Main only, as hygiene.** The push job runs on `if: github.ref == 'refs/heads/main'` (prod:
   `startsWith(github.ref, 'refs/tags/v')`), and its provenance step refuses any other ref. **This is
   not a guard.** Any branch's own copy of a workflow can drop both and read a repository secret. The
-  owner accepted that risk. What it can do is bounded by the next bullet.
+  owner accepted that risk. Its reach includes the stream keys of every live session on that relay
+  app (each Machine's env holds its session's job token: the `_INDEX.md` row, the PR #93 review's
+  I-2), so whether prod's token is ever a repository secret is owed to the owner. What it can ship
+  is bounded by the next bullet.
 - **A squat never ships.** Every push is attested (`actions/attest`, with `id-token` and
   `attestations` write on the push job alone). Both paths, pushed and found in the registry, verify
   the record with `gh attestation verify --cert-identity
   https://github.com/onryde/seazn.club.compositor/.github/workflows/deploy-<env>.yml@<refs/heads/main
   or refs/tags/<tag>>`, `--source-ref`, `--source-digest` and `--signer-digest` at the commit, and
   `--deny-self-hosted-runners`. An image a branch pushed under a future main sha's tag fails main's
-  own run, and promote refuses it before it calls the web app.
+  own run, and promote refuses it before it calls the web app. The Push step's digest is the one its
+  own `docker push` printed; the tag is read back only as a race check that fails the job before the
+  attest (the PR #93 review's C-1). Every step that logs docker in logs out on EXIT, and every action
+  in the push job is pinned by commit (m-2).
 - **Promote is `scripts/promote.sh`, run by the owner on their machine** with their stored flyctl
   login (`flyctl auth login`), so no web-app token is ever in GitHub. `promote.yml` is removed.
   - `scripts/promote.sh stg <sha>@sha256:<digest>`, or `scripts/promote.sh prod
     <vX.Y.Z>@sha256:<digest> --confirm-prod`: the command deploy-<env>'s summary prints.
   - In order, it refuses: a ref without its digest; prod without `--confirm-prod`, and stg with it; a
-    missing tool (git, jq, flyctl, gh, docker with buildx); a copy of itself that is not main's; a
-    commit not on `main`, or whose own tree fails the CEF bump gate (main's copy of the gate); a tag
-    that does not resolve to the pin (read with flyctl's docker login, since Fly's registry refuses
-    anonymous reads; only "not found" means not pushed); a digest with no deploy-<env>.yml
-    attestation for that commit at its ref; an `[env]` RELAY_IMAGE on the web app (it prints the
-    seazn.club diff); and any other secret on the web app that is not Deployed.
+    test seam set in the shell; a missing tool (git, jq, curl, flyctl, gh, sha256sum or shasum: no
+    docker, the PR #93 review's I-1); a copy of itself that is not main's; a commit not on `main`, or
+    whose own tree fails the CEF bump gate (main's copy of the gate); a pinned manifest that is not in
+    the registry, read by its digest with curl (only a 404 means not pushed), or whose body does not
+    hash to the pin; a manifest with no deploy-<env>.yml attestation for that commit at its ref
+    (`gh attestation verify` on the manifest file); an `[env]` RELAY_IMAGE on the web app (it prints
+    the seazn.club diff); and any other secret on the web app that is not Deployed. The tag is never
+    read. The registry read takes a 10-minute deploy token for the relay app alone, minted on the
+    operator's login into a 0600 curl config that is removed on exit, never in argv or any output.
   - Then it prints the previous RELAY_IMAGE, from its own log (`~/.local/state/seazn-relay-promote/<env>.log`,
     matched by Fly's digest of the live value, which is write-only), stages
     `RELAY_IMAGE=registry.fly.io/seazn-relay-<env>@sha256:<pin>` (the digest alone), runs
-    `flyctl secrets deploy`, and proves the new digest reads Deployed.
+    `flyctl secrets deploy`, and proves the new digest reads Deployed. A secret list it cannot read
+    after the set or the deploy is a refusal that says what may be live.
   - It drops FLY_API_TOKEN and FLY_ACCESS_TOKEN from its own environment, and never reads, prints or
-    needs a token value.
+    needs a token value from the shell.
 - **Rollback** is `scripts/promote.sh` with the previous ref, which it prints.
 - **The gate.** `check-workflows.sh` adds these rules:
   - no `environment:` in any workflow;
@@ -244,9 +254,14 @@ environments of fix rounds 1 and 2 (PR #85) and the promote workflow.
     cache job's `packages: write`;
   - the attest step comes after the push, and the record check after the attest, with no `if` but
     the guard's own;
-  - no promote workflow exists, by name or by a `flyctl secrets set|deploy` line.
+  - no promote workflow exists, by name or by a `flyctl secrets set|deploy` line;
+  - no secret is named by `toJSON(secrets)` (any case), and none is handed to a reusable workflow
+    outside this repository (m-1);
+  - every step that runs `flyctl auth docker` logs out on EXIT, and every action in a push job is
+    pinned by commit (m-2).
 
-  `deploy_checks_test.sh` runs promote.sh under fake flyctl, docker and gh, reaching every refusal.
+  `deploy_checks_test.sh` runs promote.sh under fake flyctl, curl and gh, reaching every refusal, and
+  runs the workflows' own steps (the Push step's race included) under fake flyctl, docker and gh.
 - **Mutants 2 and 4 retarget** (promote.yml is gone):
   2. Add `environment: relay-stg-push` to deploy-stg.yml's push job. Expected: `check-workflows.sh`
      red.

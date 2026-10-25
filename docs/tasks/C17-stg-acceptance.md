@@ -207,7 +207,9 @@ yet merged.
   acceptance doc, plus the pointer-row update, as a PR in each repo.
 - [ ] **Step 7: Prod.** Prod promotion is **not** part of this task. Ask the owner whether to tag
   `v0.1.0` and run `scripts/promote.sh prod v0.1.0@sha256:<digest> --confirm-prod` (C16, amendment
-  2026-10-25), and only after FLY_API_TOKEN_RELAY_PROD exists: the owner mints it after this task passes.
+  2026-10-25), and only after FLY_API_TOKEN_RELAY_PROD exists: the owner mints it after this task passes, if the
+  owner decides a repository token is acceptable for prod (compositor `_INDEX.md`, C16 open item (f):
+  its reach includes every live prod session's stream key).
 
 ## Acceptance
 
