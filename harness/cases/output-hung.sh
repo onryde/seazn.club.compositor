@@ -28,7 +28,19 @@
 # for the other cases): CI measured the close 9 978-9 983 ms after the plant, inside the backstop's
 # own window, so a destination deadline, not the backstop, could swap sink 1 (reason `error`). This
 # case alone (harness/compose.output-hung.yml) raises it to MTX_READ_TIMEOUT_MS, derived from the
-# owner's outage target, and `destination_outwaits` pins the window's ceiling under it.
+# owner's outage target. `destination_outwaits` reads MediaMTX's own: the drive asks its running
+# config (`GET /v3/config/global/get`, the `mtx_read_timeout` mark), so a setting MediaMTX ignored (a
+# renamed key, an image bump: its 10 s default) reds there, not as a swap with the wrong reason (the
+# PR #76 confirm pass's n-1: the check compared two numbers the case derived, true by construction).
+# That what the case asks outwaits the window, at this threshold and at a whole budget's, is
+# case_verdicts.rs's to pin: both numbers come from harness/thresholds.json.
+#
+# The programme lost beyond the hang's outage is inside spec §6's output stall row (`output_lost`,
+# budget_output_lost_max_ms; the confirm pass's n-2), as cases 4, 5 and 12 judge theirs. CI read it
+# -2 002, -1 992, +56 and +84 ms (runs 40154724972, 40154728288): sink 2's first segment arrives
+# as a burst the checker re-dates to its name (about 2 s of PTS, as every connection's first
+# segment does, the boot's too), and when the burst shows the camera its first counter is that much
+# older than the date (about -2 s); when it shows the slate, the first counter is the burst's end.
 
 case "$CASE_VARIANT" in
   hold | hang) ;;
@@ -59,6 +71,9 @@ if [ "$CASE_REJUDGE" != 1 ]; then
 fi
 
 case_drive() {
+  # MediaMTX's readTimeout as its running config reports it (redacted by MediaMTX; only the one
+  # field is kept). An unread value is a null mark, and `destination_outwaits` reds on it.
+  mark mtx_read_timeout "$(mtx GET /v3/config/global/get | jq -c '.readTimeout')"
   at_s "$CASE_LIVE_S"
 }
 
@@ -72,12 +87,17 @@ ROOM='([$t.output_gap_budget_ms, hung_swap.ceiling_ms + $t.output_connect_timeou
 # `x < null` false).
 GAP="hung_swap as \$s | [.output_outages[] | select(.to_wall_ms > \$s.planted_ms and .from_wall_ms < \$s.swap_ms)]"
 
-CASE_CHECKS=18
+# MediaMTX's reading, in ms (null when unread or not a duration: jq sorts it below every number).
+MTX_READ='(mark_value("mtx_read_timeout") | mtx_duration_ms)'
+
+CASE_CHECKS=19
 case_verdict() {
-  # A guard, judged on every run: the destination's idle deadline is past the latest swap the
-  # window accepts, so only the backstop (or its absence) decides `backstop_swap`.
-  require destination_outwaits "hung_swap.ceiling_ms < $MTX_READ_TIMEOUT_MS" \
-    "{ceiling_ms: hung_swap.ceiling_ms, mtx_read_timeout_ms: $MTX_READ_TIMEOUT_MS}"
+  # A guard, judged on every run: MediaMTX applied at least the idle deadline the case asks for,
+  # which is past the latest swap the window accepts, so only the backstop (or its absence) decides
+  # `backstop_swap`.
+  require destination_outwaits "($MTX_READ) >= $MTX_READ_TIMEOUT_MS" \
+    "{read: mark_value(\"mtx_read_timeout\"), read_ms: ($MTX_READ), asked_ms: $MTX_READ_TIMEOUT_MS,
+      ceiling_ms: hung_swap.ceiling_ms}"
   require armed "(.log.sink_stall_armed | length) == 1 and .log.sink_stall_armed[0].stall == \"$CASE_VARIANT\"
     and .log.sink_stall_armed[0].after_ms == $OUTPUT_HUNG_AFTER_MS" \
     "{armed: .log.sink_stall_armed, boots: (.log.boots | length), want: {stall: \"$CASE_VARIANT\", after_ms: $OUTPUT_HUNG_AFTER_MS}}"
@@ -116,6 +136,10 @@ case_verdict() {
     | ($b | length) >= 1 and all($b[]; .body.state == "playing")' \
     'hung_swap as $s | [beats[] | select($s.swap_ms != null and .received_ms >= $s.swap_ms
       and .received_ms < $run.end_request_ms) | {received_ms, state: .body.state, output: .body.output}]'
+  # Spec §6's output stall row, "≤2 s of programme lost" (the header's n-2). No outage, or one with
+  # no camera counter on a side, reads null, and null passes `<=` in jq: the first conjunct reds it.
+  require output_lost "(($GAP) | first | .lost_ms) as \$l | \$l != null and \$l <= \$t.budget_output_lost_max_ms" \
+    "{lost_ms: (($GAP) | first | .lost_ms), budget: \$t.budget_output_lost_max_ms}"
   measure gap_ms "($GAP) | first | .to_wall_ms - .from_wall_ms"
   measure lost_ms "($GAP) | first | .lost_ms"
   require_no_false_restart
