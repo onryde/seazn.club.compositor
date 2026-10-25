@@ -1,0 +1,343 @@
+name: promote
+# The run list reads what each run asked for; the next promote reads the previous ref from it, and
+# the reviewer reads it before approving.
+run-name: promote ${{ inputs.env }} ${{ inputs.ref }}
+# C16 (docs/tasks/C16-deploy.md): point a web app's RELAY_IMAGE at a relay image deploy-stg.yml or
+# deploy-prod.yml already pushed. This is the live change: every NEW relay session on that web app
+# takes the image (running Machines keep theirs). Owner ruling (decision log 2026-10-14): the bump is
+# explicit, never automatic, so the job runs in the GitHub environment relay-<env>, whose required
+# reviewers (the owner) approve each run before any step starts. Rollback is this workflow with the
+# previous ref, which each run's summary names.
+#
+#   gh workflow run promote.yml --ref main -f env=stg -f ref=<40-hex main sha>@<digest from deploy-stg>
+#   gh workflow run promote.yml --ref main -f env=prod -f ref=<vX.Y.Z>@<digest from deploy-prod>  (after C17)
+#
+# The `@sha256:<digest>` pin is required (the PR #85 review's I-4): promote refuses unless the tag
+# still resolves to that digest AND the digest carries the attestation deploy-<env>.yml signs for
+# every push (stg: deploy-stg.yml at refs/heads/main; prod: deploy-prod.yml at refs/tags/<tag>; in
+# both, the ref's own commit). A branch's workflow cannot sign as either, so an image it planted
+# under a main sha's or a future release's tag is refused here, however its commit checks out.
+#
+# Two tokens per env, split by what they can reach (the PR #85 review's I-1), both ENVIRONMENT
+# secrets of relay-<env>, never repository ones (any branch's workflow reads a repository secret):
+#   - FLY_API_TOKEN_RELAY_<ENV>_PUSH, minted `fly tokens create deploy -a seazn-relay-<env>`: here it
+#     only reads the relay registry, which answers no one without credentials (HTTP 401, re-pinned
+#     2026-10-25), and `gh attestation verify oci://...` reads the manifest through that login. The
+#     deploy workflow's own copy is relay-<env>-push's.
+#   - FLY_API_TOKEN_WEB_<ENV>, minted `fly tokens create deploy -a seazn-club-<env>`: it sets web's
+#     secrets. Each expression names one secret, never a fallback.
+# GitHub creates an environment a job names, with no rules, on its first run, so the step refuses
+# unless relay-<env> has a required reviewer and deploys from main alone; it reads both through the
+# REST API, and any API error is a refusal.
+#
+# Before any Fly call the step also proves where the image came from (I-2): the ref is a commit on
+# main (stg: a 40-hex sha; prod: a vX.Y.Z tag, nothing else), and that commit's own tree passes the
+# CEF bump gate (main's copy of the gate reads the promoted commit's record, not main's). Before any
+# call to web, the pinned digest's attestation verifies as that commit's build by deploy-<env>.yml.
+#
+# RELAY_IMAGE is set as a Fly secret on seazn-club-<env>: re-pinned 2026-10-25, it is no [env] entry
+# in seazn.club's fly.stg.toml or fly.toml (nor in either app's deployed config), and stg's relay
+# settings (FLY_RELAY_APP, RELAY_DRIVERS, RELAY_KEK) are secrets. If it ever becomes an [env] entry,
+# promotion is a seazn.club PR: this workflow then refuses and prints the diff. The value is pinned
+# by digest (<image>:<ref>@sha256:...), so nothing but another promote changes what web runs.
+#
+# The token guard (a token unset is a warning and a skipped promote) and the CEF bump gate after the
+# checkout (Owed 22) hold here as in the deploy workflows; scripts/check-workflows.sh checks them, the
+# environment and the token split. scripts/deploy_checks_test.sh runs the "Promote RELAY_IMAGE"
+# step under fakes.
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "The deployment: stg or prod (prod only after C17 passes)"
+        type: choice
+        options: [stg, prod]
+        required: true
+      ref:
+        description: "stg: <40-hex main sha>@sha256:<digest>; prod: <vX.Y.Z>@sha256:<digest> (the digest is required: the deploy's summary prints the ref)"
+        type: string
+        required: true
+# actions: read covers this workflow's earlier runs (the previous ref) and relay-<env>'s environment
+# and deployment branch policies (GitHub's fine-grained permission table lists both GETs under
+# Actions: read, re-pinned 2026-10-25); attestations: read, the deploy's build record.
+permissions: { contents: read, actions: read, attestations: read }
+concurrency:
+  group: promote-${{ inputs.env }}
+  cancel-in-progress: false
+defaults:
+  run: { shell: bash }
+env:
+  # ADR 0007: the one place the registry is named; moving host changes the variable.
+  RELAY_REGISTRY: ${{ vars.RELAY_REGISTRY || 'registry.fly.io' }}
+  # flyctl, pinned with its release checksum (soak.yml's: superfly/flyctl v0.4.116).
+  FLYCTL_VERSION: 0.4.116
+  FLYCTL_SHA256: ab929c80ef0c1f7d623052267885632f47b4c5dd7c0ed8383d16f42472abe7b9
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # The human approval: relay-stg / relay-prod with the owner as a required reviewer and main as
+    # the only deployment branch. The step below refuses an environment without both.
+    environment: relay-${{ inputs.env }}
+    steps:
+      # Actions pinned by commit: this job holds Fly tokens (image.yml's cache job, the PR #47 review's m7).
+      # The whole history and the tags: the ref's commit must be on main, and its tree is read.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false, fetch-depth: 0 }
+      - name: CEF bump gate (Owed 22)
+        run: scripts/check-cef-bump.sh
+      # Each env's tokens reach only its own runs: `x && secret || ''` falls back to empty, never to
+      # another secret (the `a && b || c` form would hand a prod run stg's token when prod's is unset).
+      - name: The Fly tokens
+        id: token
+        env:
+          FLY_API_TOKEN_RELAY_STG_PUSH: ${{ inputs.env == 'stg' && secrets.FLY_API_TOKEN_RELAY_STG_PUSH || '' }}
+          FLY_API_TOKEN_RELAY_PROD_PUSH: ${{ inputs.env == 'prod' && secrets.FLY_API_TOKEN_RELAY_PROD_PUSH || '' }}
+          FLY_API_TOKEN_WEB_STG: ${{ inputs.env == 'stg' && secrets.FLY_API_TOKEN_WEB_STG || '' }}
+          FLY_API_TOKEN_WEB_PROD: ${{ inputs.env == 'prod' && secrets.FLY_API_TOKEN_WEB_PROD || '' }}
+          RELAY_ENV: ${{ inputs.env }}
+        run: |
+          skipped() {
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          if [ "$RELAY_ENV" = prod ]; then
+            if [ -z "$FLY_API_TOKEN_RELAY_PROD_PUSH" ]; then
+              echo "::warning::FLY_API_TOKEN_RELAY_PROD_PUSH unset (an environment secret of relay-prod) — promote skipped"
+              skipped
+            fi
+            if [ -z "$FLY_API_TOKEN_WEB_PROD" ]; then
+              echo "::warning::FLY_API_TOKEN_WEB_PROD unset (an environment secret of relay-prod) — promote skipped"
+              skipped
+            fi
+          else
+            if [ -z "$FLY_API_TOKEN_RELAY_STG_PUSH" ]; then
+              echo "::warning::FLY_API_TOKEN_RELAY_STG_PUSH unset (an environment secret of relay-stg) — promote skipped"
+              skipped
+            fi
+            if [ -z "$FLY_API_TOKEN_WEB_STG" ]; then
+              echo "::warning::FLY_API_TOKEN_WEB_STG unset (an environment secret of relay-stg) — promote skipped"
+              skipped
+            fi
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+      - name: flyctl
+        if: steps.token.outputs.enabled == 'true'
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/flyctl.tgz" \
+            "https://github.com/superfly/flyctl/releases/download/v${FLYCTL_VERSION}/flyctl_${FLYCTL_VERSION}_Linux_x86_64.tar.gz"
+          echo "$FLYCTL_SHA256  $RUNNER_TEMP/flyctl.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin" && tar -xzf "$RUNNER_TEMP/flyctl.tgz" -C "$RUNNER_TEMP/bin" flyctl
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      # Inputs reach the script by env only (no expression inside it), so a ref cannot inject shell,
+      # and scripts/deploy_checks_test.sh can run this block as written. Every refusal comes before
+      # the first flyctl (scripts/check-workflows.sh checks the order).
+      - name: Promote RELAY_IMAGE
+        id: promote
+        if: steps.token.outputs.enabled == 'true'
+        env:
+          FLY_API_TOKEN_RELAY_STG_PUSH: ${{ inputs.env == 'stg' && secrets.FLY_API_TOKEN_RELAY_STG_PUSH || '' }}
+          FLY_API_TOKEN_RELAY_PROD_PUSH: ${{ inputs.env == 'prod' && secrets.FLY_API_TOKEN_RELAY_PROD_PUSH || '' }}
+          FLY_API_TOKEN_WEB_STG: ${{ inputs.env == 'stg' && secrets.FLY_API_TOKEN_WEB_STG || '' }}
+          FLY_API_TOKEN_WEB_PROD: ${{ inputs.env == 'prod' && secrets.FLY_API_TOKEN_WEB_PROD || '' }}
+          GH_TOKEN: ${{ github.token }}
+          RELAY_ENV: ${{ inputs.env }}
+          REF: ${{ inputs.ref }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          # 1. The inputs: each env takes its own ref shape, pinned to a digest (required, I-4).
+          case "$RELAY_ENV" in
+            stg) shape='^[0-9a-f]{40}$' what="a 40-hex main sha (deploy-stg's tag)" ;;
+            prod) shape='^v[0-9]+\.[0-9]+\.[0-9]+$' what="a vX.Y.Z release tag (deploy-prod's tag)" ;;
+            *) fail "env must be stg or prod: '$RELAY_ENV'" ;;
+          esac
+          tag=${REF%%@*} pin=${REF#*@}
+          [ "$tag" != "$REF" ] || fail "a $RELAY_ENV ref names its digest, <ref>@sha256:<digest> as deploy-$RELAY_ENV.yml's summary prints it: the pin is required: '$REF'"
+          [[ "$tag" =~ $shape ]] || fail "a $RELAY_ENV ref is $what@sha256:<digest>: '$REF'"
+          [[ "$pin" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "the part after @ must be sha256:<64 hex>: '$REF'"
+          [ "$GITHUB_REF" = refs/heads/main ] || fail "promote runs from main only, not $GITHUB_REF"
+
+          # 2. The approval is real (I-1): relay-<env> has a required reviewer and deploys from main
+          #    alone. Any error reading it is a refusal.
+          envname="relay-$RELAY_ENV"
+          env_api="repos/$GITHUB_REPOSITORY/environments/$envname"
+          environment=$(gh api "$env_api" 2> "$RUNNER_TEMP/gh.err") \
+            || fail "the $envname environment could not be read, so nobody's approval is proven: $(head -c 300 "$RUNNER_TEMP/gh.err")"
+          reviewers=$(jq -er '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?] | length' <<< "$environment") \
+            || fail "the $envname environment did not read as GitHub's environment object"
+          [ "$reviewers" -ge 1 ] || fail "$envname has no required reviewer, so nobody approves this promote: the owner adds one"
+          jq -e '.deployment_branch_policy.custom_branch_policies == true' <<< "$environment" > /dev/null \
+            || fail "$envname does not limit its deployment branches to a chosen list: the owner sets it to main alone"
+          branches=$(gh api "$env_api/deployment-branch-policies" \
+              --jq '[.branch_policies[] | "\(.type):\(.name)"] | sort | join(",")' 2> "$RUNNER_TEMP/gh.err") \
+            || fail "$envname's deployment branch policies could not be read: $(head -c 300 "$RUNNER_TEMP/gh.err")"
+          [ "$branches" = branch:main ] || fail "$envname deploys from '$branches', not main alone: the owner sets it to main alone"
+
+          # 3. Where the image came from (I-2): the ref's commit is on main, and its own tree passes
+          #    the CEF bump gate.
+          git rev-parse -q --verify origin/main > /dev/null || fail "no origin/main to check $tag against"
+          if [ "$RELAY_ENV" = prod ]; then
+            commit=$(git rev-parse -q --verify "refs/tags/$tag^{commit}") || fail "no tag $tag in this checkout"
+          else
+            commit=$(git rev-parse -q --verify "$tag^{commit}") || fail "no commit $tag in main's history"
+          fi
+          git merge-base --is-ancestor "$commit" origin/main || fail "$tag ($commit) is not on main: images are promoted from main only"
+          tree="$RUNNER_TEMP/promoted-tree"
+          rm -rf "$tree" && mkdir -p "$tree/docker"
+          for f in docker/GSTCEF_COMMIT docker/CEF_STEP0_PASS _FINDINGS.md; do
+            git show "$commit:$f" > "$tree/$f" 2> /dev/null || fail "$tag ($commit) has no $f, so the CEF bump gate cannot read its tree"
+          done
+          scripts/check-cef-bump.sh "$tree" || fail "$tag ($commit) fails the CEF bump gate (Owed 22) in its own tree"
+
+          # 4. The tokens, each for its own app. flyctl reads FLY_API_TOKEN from the environment
+          #    (never argv).
+          if [ "$RELAY_ENV" = prod ]; then
+            push_token=$FLY_API_TOKEN_RELAY_PROD_PUSH web_token=$FLY_API_TOKEN_WEB_PROD
+          else
+            push_token=$FLY_API_TOKEN_RELAY_STG_PUSH web_token=$FLY_API_TOKEN_WEB_STG
+          fi
+          [ -n "$push_token" ] && [ -n "$web_token" ] || fail "no Fly tokens for $RELAY_ENV past the guard"
+          web="seazn-club-$RELAY_ENV"
+          repo="$RELAY_REGISTRY/seazn-relay-$RELAY_ENV"
+          web_fly() { FLY_API_TOKEN=$web_token flyctl "$@"; }
+          # resolve TAG: its manifest digest. Returns 2 when the registry says "not found" (containerd's
+          # "<ref>: not found", the only text that means absent) and 1 on any other error.
+          resolve() {
+            local d
+            if d=$(docker buildx imagetools inspect "$repo:$1" --format '{{.Manifest.Digest}}' 2> "$RUNNER_TEMP/inspect.err"); then
+              [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "$repo:$1 resolved to no manifest digest: '$d'" > "$RUNNER_TEMP/inspect.err"; return 1; }
+              echo "$d"
+            elif grep -qF "$repo:$1: not found" "$RUNNER_TEMP/inspect.err"; then
+              return 2
+            else
+              return 1
+            fi
+          }
+
+          FLY_API_TOKEN=$push_token flyctl auth docker
+          if digest=$(resolve "$tag"); then rc=0; else rc=$?; fi
+          case $rc in
+            0) ;;
+            2) fail "not pushed: $repo:$tag (deploy-$RELAY_ENV.yml pushes it)" ;;
+            *) fail "the registry could not be read for $repo:$tag (only 'not found' means not pushed): $(head -c 300 "$RUNNER_TEMP/inspect.err")" ;;
+          esac
+          [ "$digest" = "$pin" ] || fail "$repo:$tag resolves to $digest, not the $pin this promote names: the tag moved, nothing promoted"
+          new="$repo:$tag@$digest"
+
+          # 4b. Main built it (I-4): the pinned digest carries the attestation deploy-<env>.yml signs
+          #     for each push, at this commit (stg: from refs/heads/main; prod: from refs/tags/<tag>).
+          #     A tag planted by anything else (a branch's workflow, a hand push) has none.
+          if [ "$RELAY_ENV" = prod ]; then source_ref="refs/tags/$tag"; else source_ref=refs/heads/main; fi
+          identity="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/deploy-$RELAY_ENV.yml@$source_ref"
+          gh attestation verify "oci://$repo@$pin" --repo "$GITHUB_REPOSITORY" --cert-identity "$identity" \
+              --source-ref "$source_ref" --source-digest "$commit" --signer-digest "$commit" --deny-self-hosted-runners \
+              > "$RUNNER_TEMP/attest.out" 2>&1 \
+            || fail "$repo:$tag@$pin is not main's own build: no attestation from $identity for $commit (a squat, or an image deploy-$RELAY_ENV.yml never pushed), nothing promoted: $(tail -c 300 "$RUNNER_TEMP/attest.out")"
+
+          # 5. An [env] entry would make this a seazn.club PR, not a secret (C16 brief, step 3).
+          config=$(web_fly config show -a "$web")
+          if jq -e '(.env // {}) | has("RELAY_IMAGE")' <<< "$config" > /dev/null; then
+            toml=fly.toml
+            [ "$RELAY_ENV" = prod ] || toml="fly.$RELAY_ENV.toml"
+            {
+              echo "## promote $RELAY_ENV: not promoted"
+              echo
+              echo "RELAY_IMAGE is an [env] entry in $web's config. Promote it by a seazn.club PR to \`$toml\`:"
+              echo
+              echo '```diff'
+              echo "-  RELAY_IMAGE = \"$(jq -r '.env.RELAY_IMAGE' <<< "$config")\""
+              echo "+  RELAY_IMAGE = \"$new\""
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            fail "RELAY_IMAGE is an [env] entry in $web's config, not a secret: promotion is a seazn.club PR (the diff is in the summary)"
+          fi
+
+          # 6. `secrets deploy` ships EVERY staged secret: refuse unless every secret but RELAY_IMAGE
+          #    reads Deployed (I-3). Staged, Unknown, Partial or no status all refuse; RELAY_IMAGE's
+          #    own status never does, so a promote whose deploy failed after --stage can be rolled back.
+          secrets=$(web_fly secrets list -a "$web" --json)
+          pending=$(jq -er 'if type == "array" then [.[] | select(.name != "RELAY_IMAGE" and ((.status // "") | ascii_downcase) != "deployed")
+              | "\(.name) (\(.status // "no status"))"] | join(", ") else error("not a list") end' <<< "$secrets") \
+            || fail "$web's secret list did not read as a list"
+          [ -z "$pending" ] || fail "$web has secrets that are not Deployed: $pending. A promote would ship them with RELAY_IMAGE: the owner must resolve staged secrets on $web first."
+          before=$(jq -r '[.[] | select(.name == "RELAY_IMAGE") | .digest][0] // "unset"' <<< "$secrets")
+
+          # 7. The previous ref: the newest earlier run of this workflow, dispatched from main, for this
+          #    env, whose promote step succeeded (a skipped or failed run changed nothing). Fly's secret
+          #    values are write-only.
+          prev='' prev_run='' prev_note=''
+          if runs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/promote.yml/runs?branch=main&event=workflow_dispatch&status=success&per_page=100" \
+              --jq '.workflow_runs[] | select(.head_branch == "main" and .event == "workflow_dispatch") | "\(.id) \(.display_title)"' 2> "$RUNNER_TEMP/gh.err"); then
+            while read -r id word env_word ref_word; do
+              [ "$word" = promote ] && [ "$env_word" = "$RELAY_ENV" ] && [ -n "$ref_word" ] && [ "$id" != "$GITHUB_RUN_ID" ] || continue
+              if ! n=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs" \
+                  --jq '[.jobs[].steps[]? | select(.name == "Promote RELAY_IMAGE" and .conclusion == "success")] | length' 2>> "$RUNNER_TEMP/gh.err"); then
+                prev_note="unknown: run $id's jobs could not be read"
+                break
+              fi
+              if [ "$n" -ge 1 ]; then prev=$ref_word prev_run=$id; break; fi
+            done <<< "$runs"
+          else
+            prev_note="unknown: this workflow's runs could not be read ($(head -c 200 "$RUNNER_TEMP/gh.err"))"
+          fi
+          # A rollback is offered only as the pinned ref that run promoted, and only while its tag
+          # still resolves to that pin (a run before the pin was required named none: no rollback).
+          rollback=''
+          if [ -n "$prev" ]; then
+            prev_tag=${prev%%@*}
+            if prev_digest=$(resolve "$prev_tag"); then rc=0; else rc=$?; fi
+            if [ "$prev" = "$prev_tag" ]; then
+              previous="\`$repo:$prev_tag\` (promote run $prev_run; it named no digest, so nothing can be verified now)"
+            elif [ "$rc" -eq 2 ]; then
+              previous="\`$repo:$prev\` (promote run $prev_run; no longer in the registry)"
+            elif [ "$rc" -ne 0 ]; then
+              previous="\`$repo:$prev\` (promote run $prev_run; the registry could not be read for it)"
+            elif [ "${prev#*@}" != "$prev_digest" ]; then
+              previous="\`$repo:$prev\` (promote run $prev_run; the tag has moved since, to $prev_digest)"
+            else
+              previous="\`$repo:$prev\` (promote run $prev_run)"
+              rollback=$prev
+            fi
+          elif [ -n "$prev_note" ]; then
+            previous=$prev_note
+          elif [ "$before" = unset ]; then
+            previous="unset (this is $web's first RELAY_IMAGE)"
+          else
+            previous="set outside promote.yml (Fly digest $before; the value is write-only)"
+          fi
+
+          # 8. Stage, deploy, and prove it took (m-7): RELAY_IMAGE reads Deployed with the digest Fly
+          #    gave the staged value.
+          web_fly secrets set "RELAY_IMAGE=$new" -a "$web" --stage
+          staged=$(web_fly secrets list -a "$web" --json | jq -r '[.[] | select(.name == "RELAY_IMAGE") | .digest][0] // ""')
+          [ -n "$staged" ] || fail "RELAY_IMAGE is not on $web's secret list after the set"
+          web_fly secrets deploy -a "$web"
+          after=$(web_fly secrets list -a "$web" --json | jq -c '[.[] | select(.name == "RELAY_IMAGE")][0] // {}')
+          after_digest=$(jq -r '.digest // ""' <<< "$after")
+          after_status=$(jq -r '.status // "no status"' <<< "$after")
+          [ -n "$after_digest" ] || fail "RELAY_IMAGE is not set on $web after the deploy"
+          [ "$after_digest" = "$staged" ] || fail "RELAY_IMAGE's Fly digest on $web is $after_digest after the deploy, not the $staged this promote staged"
+          [ "$(tr '[:upper:]' '[:lower:]' <<< "$after_status")" = deployed ] || fail "RELAY_IMAGE on $web reads '$after_status' after the deploy, not Deployed: not proven live"
+          [ "$after_digest" != "$before" ] || echo "::warning::RELAY_IMAGE's Fly digest did not change ($after_digest): $web already had this value"
+          echo "promoted $new to $web (Fly digest $before -> $after_digest, Deployed)"
+          {
+            echo "## promote $RELAY_ENV"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| web app | $web |"
+            echo "| commit | $commit (on main; CEF bump gate passed in its tree) |"
+            echo "| build record | attested by \`$identity\` |"
+            echo "| new RELAY_IMAGE | \`$new\` |"
+            echo "| previous RELAY_IMAGE | $previous |"
+            echo "| RELAY_IMAGE's Fly digest | $before → $after_digest (Deployed) |"
+            echo
+            if [ -n "$rollback" ]; then
+              echo "Rollback: \`gh workflow run promote.yml --ref main -f env=$RELAY_ENV -f ref=$rollback\` (a relay-$RELAY_ENV reviewer approves it; it refuses if that tag has moved or its attestation does not verify)."
+            elif [ -n "$prev" ]; then
+              echo "Rollback: the previous ref cannot be verified now ($previous)."
+            else
+              echo "Rollback: no earlier promote of $RELAY_ENV to return to."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,249 @@
+name: deploy-stg
+# C16 (docs/tasks/C16-deploy.md): build the relay image at this commit and push it to the stg relay
+# app's registry as <RELAY_REGISTRY>/seazn-relay-stg:<sha>. A push changes nothing live: a relay
+# Machine takes an image only when web creates one, from web's RELAY_IMAGE, and RELAY_IMAGE changes
+# only through promote.yml, behind the relay-stg environment's reviewers (decision log 2026-10-14,
+# owner ruling: the bump is explicit, never automatic).
+#
+# - The token guard: FLY_API_TOKEN_RELAY_STG_PUSH unset (today) is a warning and a skipped push,
+#   never a red. It is minted `fly tokens create deploy -a seazn-relay-stg`, so it reaches that one
+#   app (its registry) and never seazn-club-stg. It is an ENVIRONMENT secret of relay-stg-push,
+#   whose deployment branches are main alone, and never a repository secret: a repository secret
+#   reaches every branch's workflow, which could push a main sha's tag before main does (the PR #85
+#   review's I-4). Both jobs name the environment, so only main's runs see the token; the push job
+#   refuses unless relay-stg-push still deploys from main alone.
+# - Main only (the review's I-2): a push from any other ref is refused. A dispatch runs the
+#   dispatched branch's copy of this file, so this catches a mistake, not a rewrite; the
+#   environment's branch rule is what holds.
+# - Main's build record (I-4): every push is attested (actions/attest: a Sigstore-signed SLSA
+#   provenance naming this workflow, refs/heads/main and the commit). A tag found already in the
+#   registry is taken only when such an attestation of its digest verifies for this commit; anything
+#   else is a squat or a lost record, and a red. promote.yml verifies the same before it sets
+#   RELAY_IMAGE.
+# - The CEF bump gate (amendment 2026-10-18, Owed 22) runs right after every checkout, so a CEF bump
+#   with no recorded C11 Step 0 re-run is never pushed.
+# - The build reads and writes no cache: image.yml's GHCR cache is writable by any repository writer
+#   (amendment 2026-10-23), so every layer is built from source here.
+# - The target is relay and nothing else: never the image that carries the C14 hooks (amendment
+#   2026-10-24).
+# - A sha already in the registry is never pushed again: promote.yml pins RELAY_IMAGE by digest, and
+#   a tag that never moves keeps a rollback's ref meaning what it meant.
+# scripts/check-workflows.sh (check.yml) holds this file to all of the above.
+on:
+  push: { branches: [main] }
+  workflow_dispatch: {}
+permissions: { contents: read }
+concurrency:
+  group: deploy-stg
+  cancel-in-progress: false
+defaults:
+  run: { shell: bash }
+env:
+  RELAY_APP: seazn-relay-stg
+  # ADR 0007: the one place the registry is named; moving host changes the variable.
+  RELAY_REGISTRY: ${{ vars.RELAY_REGISTRY || 'registry.fly.io' }}
+  # flyctl, pinned with its release checksum (soak.yml's: superfly/flyctl v0.4.116).
+  FLYCTL_VERSION: 0.4.116
+  FLYCTL_SHA256: ab929c80ef0c1f7d623052267885632f47b4c5dd7c0ed8383d16f42472abe7b9
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # The token is relay-stg-push's: the guard sees it only inside the environment.
+    environment: relay-stg-push
+    outputs:
+      enabled: ${{ steps.token.outputs.enabled }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false }
+      - name: CEF bump gate (Owed 22)
+        run: scripts/check-cef-bump.sh
+      - name: The ref is main
+        id: provenance
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::deploy-stg pushes main only, not $GITHUB_REF: nothing pushed"
+            exit 1
+          fi
+          echo "$GITHUB_REF ($GITHUB_SHA)"
+      - name: The Fly push token
+        id: token
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_STG_PUSH }}
+        run: |
+          if [ -z "$FLY_API_TOKEN" ]; then
+            echo "::warning::FLY_API_TOKEN_RELAY_STG_PUSH unset (an environment secret of relay-stg-push) — push skipped"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+  push:
+    needs: gate
+    if: needs.gate.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04
+    # A cold CEF build: no cache, by rule.
+    timeout-minutes: 90
+    environment: relay-stg-push
+    # actions: read for relay-stg-push's rules; id-token and attestations for main's build record.
+    permissions: { contents: read, actions: read, id-token: write, attestations: write }
+    env:
+      TAG: ${{ github.sha }}
+      LOCAL_IMAGE: seazn-relay:${{ github.sha }}
+    steps:
+      # Actions pinned by commit: this job holds a Fly token (image.yml's cache job, the PR #47 review's m7).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false }
+      - name: CEF bump gate (Owed 22)
+        run: scripts/check-cef-bump.sh
+      # GitHub creates an environment a job names, with no rules, on its first run: the token is
+      # main's alone only while relay-stg-push deploys from main alone. Any API error refuses.
+      - name: The push environment
+        id: environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          envname=relay-stg-push want=branch:main
+          env_api="repos/$GITHUB_REPOSITORY/environments/$envname"
+          environment=$(gh api "$env_api" 2> "$RUNNER_TEMP/gh.err") \
+            || fail "the $envname environment could not be read, so the push token is not proven main's: $(head -c 300 "$RUNNER_TEMP/gh.err")"
+          jq -e '.deployment_branch_policy.custom_branch_policies == true' <<< "$environment" > /dev/null \
+            || fail "$envname does not limit its deployments to a chosen list, so any branch reads its token: nothing pushed; the owner sets it to $want alone"
+          policies=$(gh api "$env_api/deployment-branch-policies" \
+              --jq '[.branch_policies[] | "\(.type):\(.name)"] | sort | join(",")' 2> "$RUNNER_TEMP/gh.err") \
+            || fail "$envname's deployment policies could not be read: $(head -c 300 "$RUNNER_TEMP/gh.err")"
+          [ "$policies" = "$want" ] || fail "$envname deploys from '$policies', not $want alone: nothing pushed; the owner sets it to $want alone"
+          echo "$envname deploys from $want alone"
+      # CEF's build tree does not fit the runner's free disk otherwise (image.yml).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: gstcefsrc pin (F-001)
+        id: pin
+        run: |
+          commit=$(tr -d '[:space:]' < docker/GSTCEF_COMMIT)
+          if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::docker/GSTCEF_COMMIT is not a 40-hex commit: '$commit'"
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: flyctl
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/flyctl.tgz" \
+            "https://github.com/superfly/flyctl/releases/download/v${FLYCTL_VERSION}/flyctl_${FLYCTL_VERSION}_Linux_x86_64.tar.gz"
+          echo "$FLYCTL_SHA256  $RUNNER_TEMP/flyctl.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin" && tar -xzf "$RUNNER_TEMP/flyctl.tgz" -C "$RUNNER_TEMP/bin" flyctl
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Already pushed?
+        id: exists
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_STG_PUSH }}
+        run: |
+          flyctl auth docker
+          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          # Only the registry's 404 means absent: containerd's resolver reports it as "<ref>: not
+          # found" (it never reads the body, so "manifest unknown" never surfaces). Any other error
+          # (auth, network, a 5xx) is a red, never a rebuild that would move the tag.
+          if digest=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}' 2> "$RUNNER_TEMP/inspect.err"); then
+            if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::$ref resolved to no manifest digest: '$digest'"
+              exit 1
+            fi
+            # Found is not pushed: "Main's build record" takes it only with main's attestation.
+            echo "::notice::$ref was found in the registry, not built by this run ($digest)"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          elif grep -qF "$ref: not found" "$RUNNER_TEMP/inspect.err"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::the registry could not be read for $ref (only 'not found' means not pushed): $(head -c 300 "$RUNNER_TEMP/inspect.err")"
+            exit 1
+          fi
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        if: steps.exists.outputs.exists != 'true'
+      - name: Build the relay image
+        if: steps.exists.outputs.exists != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: relay
+          build-args: GSTCEF_COMMIT=${{ steps.pin.outputs.commit }}
+          tags: ${{ env.LOCAL_IMAGE }}
+          load: true
+          push: false
+      - name: Push
+        id: push
+        if: steps.exists.outputs.exists != 'true'
+        # No token here: "Already pushed?"'s `flyctl auth docker` logged docker in for this job.
+        run: |
+          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          docker tag "$LOCAL_IMAGE" "$ref"
+          docker push -q "$ref"
+          digest=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::$ref has no manifest digest after the push: '$digest'"; exit 1; }
+          echo "pushed $ref ($digest)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      # Main's build record: signed with this run's OIDC identity (this workflow's path at
+      # refs/heads/main, this commit), which no other ref's run can sign as. Kept in GitHub's
+      # attestation API, never in the registry.
+      - name: Attest the push
+        id: attest
+        if: steps.exists.outputs.exists != 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.RELAY_REGISTRY }}/${{ env.RELAY_APP }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: false
+      # Both paths: the digest this run pushed, or the one it found, must verify as main's own build
+      # of this commit. A found tag that does not is a squat (or a push whose record never landed),
+      # and nothing downstream may take it.
+      - name: Main's build record
+        id: record
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.push.outputs.digest || steps.exists.outputs.digest }}
+          FOUND: ${{ steps.exists.outputs.exists }}
+        run: |
+          identity="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/deploy-stg.yml@refs/heads/main"
+          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no digest for $ref: '$DIGEST'"; exit 1; }
+          if gh attestation verify "oci://$RELAY_REGISTRY/$RELAY_APP@$DIGEST" --repo "$GITHUB_REPOSITORY" \
+              --cert-identity "$identity" --source-ref refs/heads/main --source-digest "$GITHUB_SHA" \
+              --signer-digest "$GITHUB_SHA" --deny-self-hosted-runners > "$RUNNER_TEMP/attest.out" 2>&1; then
+            echo "$ref@$DIGEST: attested by $identity for $GITHUB_SHA"
+          elif [ "$FOUND" = true ]; then
+            echo "::error::$ref is in the registry ($DIGEST) but is not main's own build: no attestation from $identity for $GITHUB_SHA. A squat, or a push whose record never landed: nothing pushed, nothing to promote; the owner must resolve it (the next commit on main gets a tag of its own). $(tail -c 300 "$RUNNER_TEMP/attest.out")"
+            exit 1
+          else
+            echo "::error::this run's push of $ref ($DIGEST) has no attestation that verifies, so promote.yml would refuse it: $(tail -c 300 "$RUNNER_TEMP/attest.out")"
+            exit 1
+          fi
+      - name: Summary
+        id: summary
+        env:
+          DIGEST: ${{ steps.push.outputs.digest || steps.exists.outputs.digest }}
+          FOUND: ${{ steps.exists.outputs.exists }}
+        run: |
+          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          {
+            echo "## Relay image, stg"
+            echo
+            if [ "$FOUND" = true ]; then
+              echo "Found in the registry, not built by this run: \`$ref\` (\`$DIGEST\`), attested earlier as main's build of $TAG. Nothing pushed, nothing live changed."
+            else
+              echo "Pushed and attested as main's build of $TAG: \`$ref\` (\`$DIGEST\`). Nothing live changed."
+            fi
+            echo
+            echo "Promote it (stg's web app takes it for every new session once a relay-stg reviewer approves; not run):"
+            echo
+            echo '```'
+            echo "gh workflow run promote.yml --ref main -f env=stg -f ref=$TAG@$DIGEST"
+            echo '```'
+            echo
+            echo "The digest is required: promote refuses unless the tag still resolves to it and main's attestation of it verifies."
+            echo
+            echo "It sets \`RELAY_IMAGE=$ref@$DIGEST\` on seazn-club-stg with \`flyctl secrets set --stage\`, then \`flyctl secrets deploy\`."
+          } >> "$GITHUB_STEP_SUMMARY"

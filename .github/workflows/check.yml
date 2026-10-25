@@ -180,6 +180,31 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 -I scripts/supervise_test.py --bash /bin/bash --require-procfs --races 500
 
+  # C16, beside the check job so a red here hides no other check and none hides it. The CEF bump gate
+  # (Owed 22): a PR that bumps docker/GSTCEF_COMMIT stays red until C11 Step 0 is re-run on the bump
+  # and recorded in docker/CEF_STEP0_PASS. The workflow check: actionlint and shellcheck (pinned, the
+  # script installs them with their checksums) and the deploy workflows' static rules; then its own
+  # test, which reds each rule with a mutant on a scratch copy, runs the gate's cases, and runs
+  # promote.yml's and the deploy workflows' scripts under fake flyctl, docker and gh.
+  deploy-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run: { shell: bash }
+    steps:
+      - uses: actions/checkout@v4
+      - name: CEF bump gate (Owed 22)
+        run: scripts/check-cef-bump.sh
+      - name: Workflow check (C16)
+        if: ${{ !cancelled() }}
+        run: |
+          scripts/check-workflows.sh --install "$RUNNER_TEMP/lint-bin"
+          echo "$RUNNER_TEMP/lint-bin" >> "$GITHUB_PATH"
+          PATH="$RUNNER_TEMP/lint-bin:$PATH" scripts/check-workflows.sh
+      - name: The workflow check's own test (C16 mutants)
+        if: ${{ !cancelled() }}
+        run: scripts/deploy_checks_test.sh
+
   # harness/soak (C15), beside the check job so its minutes do not eat that job's bound: the verdict
   # on its fixtures (the green, the brief's reds and each guard's red, by reason), the driver under
   # stubs on a 1-minute schedule, its error path and page=real (about 2 minutes), soak.yml's shape
