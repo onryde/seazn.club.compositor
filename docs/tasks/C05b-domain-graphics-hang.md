@@ -367,6 +367,22 @@ blank-overlay watchdog). The rules below are implementer decisions under that di
   page is Ready and has shown no frame, so it keeps its own bound past that ready; the new page's
   first frame clears it. A page that showed no frame holds none of its own at its end.
 
+## Amendment 2026-10-25, PR #92 fix round 1 (m-4, m-5: the order, said precisely)
+
+The PR #92 review of `bdc4588` (Needs fixes: tests and docs only, the code approved), adopted
+by the coordinator; the coordinator's fix-round dispatch, implementer decisions under it
+(`docs/_INDEX.md`, decision row "PR #92 fix round 1").
+
+- **Order** (amends the bullet of Owed 99's amendment above). The hang rule runs first, so a page
+  silent since its ready, with no frame, is a hang, counted once. A page that beat after its ready
+  and then went silent with no frame is blank at its ready's bound, which comes before its own hang
+  bound (its last beat's), and is counted once too: its reload ends it. Test:
+  `a_page_that_beat_then_went_silent_unpainted_is_blank_once_and_never_a_hang`
+  (`crates/domain/tests/cef_health.rs`, both thresholds).
+- **A blank and a recycle never share a tick** (`cef_hang_after_ms < cef_recycle_every_ms`, the
+  config's own test), so their order after the bound is not load-bearing; `on_tick`'s comment says
+  so and no longer claims an order it cannot reach.
+
 ## Do not touch
 
 - The ladder, the links, the programme and the supervisor (C06 routes the event).

@@ -469,6 +469,24 @@ on branch `fix/owed99-blank-overlay-watchdog`; implementer decisions under the d
   (<left> more to withhold)` per build), armed from `COMPOSITOR_TEST_WITHHOLD_PAGES` (C12's
   `TestHooks`). C14's case 19 is its one reader.
 
+## Amendment 2026-10-25, PR #92 fix round 1 (I-2: the latch's witness)
+
+The PR #92 review of `bdc4588` (Needs fixes: tests and docs only, the code approved), adopted
+by the coordinator; the coordinator's fix-round dispatch, implementer decisions under it
+(`docs/_INDEX.md`, decision row "PR #92 fix round 1").
+
+- **The latch is asserted, whatever the page painted after its ready.** The image test
+  `a_static_page_puts_its_first_frame_on_air_at_its_ready_and_reports_it_once`
+  (`crates/adapters/tests/graphics.rs`) asserted the latch only when cefsrc delivered nothing after
+  the ready, and CI's run 40229667029 printed `delivered: 2, dropped: 1, written: 2`: one sample
+  after the ready, so that branch never ran. It now asserts `dropped >= 1` and
+  `written == delivered - dropped + 1` (one more written than delivered after the ready: the latched
+  one), waiting for the count to settle. Without the latch `written <= delivered - dropped`.
+- **Its mutant** (the latch's write at the ready removed in `cef_graphics.rs`) runs on CI only (this
+  host cannot link GStreamer), on a throwaway branch whose `image.yml` runs the image tests on a
+  dispatch; the PR #92 handoff names the run. The production page's post-ready paint is unmeasured;
+  C15's check 5e is its witness on the soak.
+
 ## Do not touch
 
 The programme and input adapters, and the page in `seazn.club` (that's R2005). (Amended 2026-10-15)

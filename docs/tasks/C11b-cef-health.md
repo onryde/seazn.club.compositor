@@ -220,6 +220,25 @@ built"), built on branch `fix/owed99-blank-overlay-watchdog`.
 - **Only while Running.** The hold runs no blank rule; its painted reports still replace a held
   frame. No wire or contract change: the beat carries no blank state (Owed 103).
 
+## Amendment 2026-10-25, PR #92 fix round 1 (m-2, m-3: the shared count and the restart's text)
+
+The PR #92 review of `bdc4588` (Needs fixes: tests and docs only, the code approved), adopted
+by the coordinator; the coordinator's fix-round dispatch, implementer decisions under it
+(`docs/_INDEX.md`, decision row "PR #92 fix round 1").
+
+- **Owed 96's "A" counts against the shared count** (m-2; amends nothing in the code, corrects the
+  text that called it unchanged). A GPU-process death below `cef_gpu_deaths_to_restart` reloads,
+  as Owed 96 ruled, until blank pages bring blank + deaths to the count: then it restarts in place
+  and reloads nothing. The dispatch sanctioned the one count.
+- **The restart names both causes** (m-3). With a blank page counted, a health report whose GPU
+  deaths alone reach the count restarts with `RestartCause::PageFaults`
+  (`restart in place: <b> blank CEF pages, <g> GPU-process deaths`), never the deaths' text alone.
+  A dead zygote still outranks it; leaks below the shared count do not. Test:
+  `a_restart_after_a_blank_page_names_the_blank_page` (`crates/domain/tests/cef_health.rs`, 5
+  cases at both thresholds; red before the fix with `left: "restart in place: 3 CEF GPU-process
+  deaths"`).
+- **The supervisor's test helper** `builds` lists `Effect::ReloadGraphicsNoFrames` (m-5).
+
 ## Output cap
 
 Under 15 lines.
