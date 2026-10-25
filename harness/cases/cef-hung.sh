@@ -40,7 +40,7 @@ HUNG='(.log.page_hangs[0]) as $h
   | ([.log.cef_ready[] | select(.gen == $h.gen + 1)] | first) as $ready
   | ([.overlay.runs[] | select(.index == null and .from_ms >= $h.at_ms)] | first) as $gap'
 
-CASE_CHECKS=17
+CASE_CHECKS=19
 case_verdict() {
   require hang_started '(.log.page_hangs | length) == 1 and $run.control_state.page_hang_served_ms != null' \
     '{page_hangs: (.log.page_hangs | length), served: $run.control_state.page_hang_served_ms}'

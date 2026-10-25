@@ -45,13 +45,17 @@ case_drive() {
 # restarted process arms N again).
 P1='(.log.boots | if length > 1 then .[1] else 1e18 end) as $p1 | ($t.cef_gpu_deaths_to_restart - 1) as $n'
 # Each withheld page: its gen and countdown, its ready (the first `cef ready` of its gen after its
-# withheld line), and the blank reload that replaced it (the `cef reload ... reason=no_frames` of
-# the next gen). Read after P1, whose $p1 it uses, as `"$P1 | ($PAGES)" as $p`.
-PAGES='. as $r | [.log.pages_withheld[] | select(.at_ms < $p1) | . as $w
+# withheld line), and the blank reload that replaced it: the k-th `cef reload ... reason=no_frames`
+# of the first process for the k-th withheld page, paired by order, so `blank_reloads` alone judges
+# the gen each names (the PR #92 review's m-6: paired by gen, a reload naming the wrong gen was
+# never paired, and the gen clause was dead). Read after P1, whose $p1 it uses, as
+# `"$P1 | ($PAGES)" as $p`.
+PAGES='. as $r | [.log.blank_reloads[] | select(.at_ms < $p1)] as $bls
+  | [.log.pages_withheld[] | select(.at_ms < $p1)] | to_entries | map(.key as $k | .value as $w
   | ([$r.log.cef_ready[] | select(.gen == $w.gen and .at_ms >= $w.at_ms)] | first) as $rd
-  | ([$r.log.blank_reloads[] | select(.gen == $w.gen + 1)] | first) as $bl
-  | {gen, left, ready_ms: $rd.at_ms, reload_ms: $bl.at_ms, blank_pages: $bl.blank_pages,
-     reload_after_ready_ms: less($bl.at_ms; $rd.at_ms)}]'
+  | $bls[$k] as $bl
+  | {gen: $w.gen, left: $w.left, ready_ms: $rd.at_ms, reload_ms: $bl.at_ms, reload_gen: $bl.gen,
+     blank_pages: $bl.blank_pages, reload_after_ready_ms: less($bl.at_ms; $rd.at_ms)})'
 # The page after the last withheld one (`$g`), its ready and its painted report, the last withheld
 # page's ready (`$from`, the budget's start) and blank reload (`$reload`), and the back frame: the
 # first strip frame at or after that ready.
@@ -66,7 +70,7 @@ BACK="$P1 | ($PAGES)"' as $p | (($p | last | .gen // 0) + 1) as $g
 DUE_AFTER_BACK="$BACK"' | ([(.frames_table | last | .[0]), $run.end_request_ms] | min) as $last
   | [scheduled[] | select($back != null and $last != null and .due_ms > $back and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due'
 
-CASE_CHECKS=19
+CASE_CHECKS=20
 case_verdict() {
   require armed "$P1"' | .log.boots as $b | .log.withhold_armed as $a
     | ($b | length) >= 1 and ($a | length) == ($b | length)

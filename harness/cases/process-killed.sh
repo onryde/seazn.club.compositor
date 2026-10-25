@@ -26,7 +26,7 @@ case_drive() {
   at_s "$CASE_LIVE_S"
 }
 
-CASE_CHECKS=19
+CASE_CHECKS=21
 case_verdict() {
   require kill_applied 'mark_value("kill").pid != null and (mark("kill_rc") | all(.value.rc == 0))' \
     '{target: mark_value("kill"), rc: [mark("kill_rc")[] | .value.rc]}'

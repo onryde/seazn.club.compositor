@@ -26,7 +26,7 @@ case_drive() {
   at_s "$CASE_LIVE_S"
 }
 
-CASE_CHECKS=11
+CASE_CHECKS=13
 case_verdict() {
   require fault_applied 'mark_value("netem_in") | .present and .sent_pkts > 0 and .dropped > 0' 'mark_value("netem_in")'
   require retransmitted '(mark_value("readers_before") | first) as $a | (mark_value("readers_at_clear") | first) as $b

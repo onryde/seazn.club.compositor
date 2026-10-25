@@ -210,7 +210,7 @@ CLOCK='less(mark_at("stress_done"); mark_at("stress")) as $w
      scheduled_changes_shown: {due: ($due | length), missing: ($due - ((.overlay.score_index_changes // []) | map(.index)))},
      sampled: ($w != null and $w > 0 and ($ft | length) >= 2 and ($due | length) >= 1)}'
 
-CASE_CHECKS=23
+CASE_CHECKS=25
 case_verdict() {
   # Anti-vacuity: the quota was requested under the demand, held for STRESS_S, and put back (the
   # drive's marks; `starvation_applied` is the witness that it was applied).

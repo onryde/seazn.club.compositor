@@ -68,7 +68,7 @@ case_drive() {
   at_s "$CASE_LIVE_S"
 }
 
-CASE_CHECKS=16
+CASE_CHECKS=18
 case_verdict() {
   require buffer_capped 'mark_value("send_buffer") as $b
     | $b.read == $b.wanted and $b.before_cut.sockets >= 1

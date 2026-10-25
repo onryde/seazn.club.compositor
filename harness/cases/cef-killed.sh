@@ -28,7 +28,7 @@ case_drive() {
   at_s "$CASE_LIVE_S"
 }
 
-CASE_CHECKS=20
+CASE_CHECKS=22
 case_verdict() {
   # Anti-vacuity: the kill reached CEF's children, and the container died.
   require kill_applied '(mark_value("kill") | (.killed | length) >= 1) and (mark("kill_rc") | all(.value.rc == 0))' \
@@ -57,4 +57,5 @@ case_verdict() {
     'beats_between(mark_at("kill"); $run.end_request_ms + 1) | map(.body.graphics) | unique'
   require_restart_outage 'mark_at("kill")'
   require_same_session_and_no_core '(starts_after(mark_at("kill")) | first | .at_ms)'
+  require_no_false_blank
 }
