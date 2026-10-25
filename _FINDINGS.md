@@ -1724,6 +1724,11 @@ INT and TERM also `wait`ed on the compositor, and re-waited after each trap.
     `reader-kicked`); `GET /v3/srt/conns/get/{id}`; the RTMP twins are `/v3/rtmp/conns/list`,
     `/v3/rtmp/conns/get/{id}` and `/v3/rtmp/conns/kick/{id}`; also `GET /v3/paths/list` and
     `GET /v3/recordings/list`.
+  - `GET /v3/config/global/get` (C14 case 18, the PR #76 confirm pass's n-1; read from the tag's
+    source 2026-10-25, `internal/api/api_config_global.go`): the running global config, redacted by
+    MediaMTX (`conf.Redact`). Durations are `conf.Duration` strings (`internal/conf/duration.go`: a
+    day count `<n>d` when there is one, then Go's `time.Duration` String(), e.g. `1m0s`); its
+    `readTimeout` defaults to 10 s (`internal/conf/conf.go`'s `setDefaults`).
   - An `SRTConn` carries `id`, `created`, `remoteAddr`, `state`, `path`, `query`, `user` and the
     SRT statistics (`msRTT`, `packetsReceivedLoss`, `packetsRetrans`, `mbpsReceiveRate`, …). The
     compositor's reader is the connection whose `remoteAddr` is 172.28.0.10 and whose `path` is

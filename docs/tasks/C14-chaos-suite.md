@@ -914,13 +914,18 @@ derived constant.
 - **Case 18, `output-hung`** (n 18; legs `output-hung-hold` and `output-hung-hang`, so 37 legs): on
   the `relay-test-hooks` image (`RELAY_TEST_HOOKS_IMAGE`, `harness/compose.output-hung.yml`), Owed
   94's hook stalls sink 1 `OUTPUT_HUNG_AFTER_MS` (25 s) after its build: `hold` holds its writes,
-  `hang` hangs its streaming thread (its teardown hangs too). 70 s live, no drive. 18 checks
-  (16 as first built; fix round 1 added `destination_outwaits` and `beat_playing_again`):
+  `hang` hangs its streaming thread (its teardown hangs too). 70 s live; the drive reads MediaMTX's
+  readTimeout. 19 checks (16 as first built; fix round 1 added `destination_outwaits` and
+  `beat_playing_again`; the PR #76 confirm pass's n-2 added `output_lost`):
   - `destination_outwaits` (the PR #76 review's I-1): MediaMTX closes a publisher idle for its
     `readTimeout`, 10 s by default in 1.21.2, which CI measured 9 978-9 983 ms after the plant,
     inside the backstop's window. Case 18 alone (`compose.output-hung.yml`) sets `MTX_READTIMEOUT` to
-    four of output_gap_budget_ms (60 s), and this guard pins `hung_swap`'s ceiling under it on
-    every run;
+    four of output_gap_budget_ms (60 s). The drive reads what MediaMTX applied from its running
+    config (`GET /v3/config/global/get`, the `mtx_read_timeout` mark; lib.jq's `mtx_duration_ms`
+    reads its duration format), and the guard reds unless that is at least what the case asks (the
+    confirm pass's n-1: as first built it compared two numbers the case derived, true by
+    construction). That the asked value outwaits `hung_swap`'s ceiling, at this threshold and at a
+    whole budget's, is pinned in `case_verdicts.rs`;
   - `armed` and `planted` (preconditions: the arming line once, the variant's stall and ms; one
     plant, on sink 1), and `planted_in_drive` (after the drive's start, with room before the end:
     the window's ceiling, `beat_playing_again`'s wait and a heartbeat, longer than
@@ -938,6 +943,10 @@ derived constant.
   - `beat_playing_again` (the review's m-3, the plan's "and `playing` again"): from the swap plus
     output_connect_timeout_ms, output_connected_after_ms and two ticks until the end request, at least
     one beat, all `playing`;
+  - `output_lost` (the confirm pass's n-2): the hang's outage's `lost_ms` is read and at most
+    budget_output_lost_max_ms, spec §6's output stall row, as cases 4, 5 and 12 judge theirs. No
+    floor: CI's −2 s readings are Owed 92's dating (`docs/_INDEX.md` Owed 94, Owed 92), and Owed 92's
+    risk holds here too;
   - the false-positive sweep, `no_restarts` and `ended_beat`; measures `gap_ms` (the key) and
     `lost_ms`.
 - **b-1 (the PR #73 confirm pass):** `stall_swap`'s `error_to_swap_ms` is read from the two lines'
@@ -961,7 +970,13 @@ derived constant.
   flag and stall, the outage before and after), and b-1's floor, `ts=` and c-2's `<=` (H1-H24); fix
   round 1's H25-H29: `beat_playing_again`'s state, its count and its connect term, the destination's
   deadline (MTX_READ_TIMEOUT_MS at 0 reds `destination_outwaits` in the good worlds), and the room's
-  heartbeat term.
+  heartbeat term. The PR #76 confirm pass's n-1/n-2 follow-up's N1-N6: `destination_outwaits` back
+  to the ceiling against the case's own number (the tautology; `hung-asked`, a world with no
+  reading, passes), its `>=` as `>` (`hung-hold-good`), `output_lost`'s null conjunct dropped
+  (`hung-lost-unread`) and its `<=` as `<` (`hung-lost-at-budget`), `mtx_duration_ms` without its
+  whole-string test (`hung-mtx-junk`), and the asked value at one budget, not four (the good world's
+  "outwaits this window and a 15 s threshold's"). H28's mutant (the asked value at 0) now dies in
+  `go_duration`'s range assertion, not in `destination_outwaits`.
 - **CI mutants** (a throwaway `mut/owed94` PR, the `mut/c14-case16` workflow's shape: the target check
   PASSes unmutated, then FAILs mutated with its controls still PASS): (a) the case on the plain relay
   image reds `armed`; (b) the backstop's Connected arm removed reds `backstop_swap` on `hold`; (c)
