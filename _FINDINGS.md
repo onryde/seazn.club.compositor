@@ -2226,7 +2226,9 @@ four legs' `cost.json` artifacts, in F-005's shape:
 
 **CPU, rung, drops: within the size rule on all four.** The Machine's p95 is 1.451 to 1.752 cores of
 4 (36 % to 44 %, against 50 %). Every beat is `full` and the final `droppedFrames` is 0. The busiest
-compositor thread peaks at 0.21 cores, so no single thread is near a core.
+compositor thread peaks at 0.21 cores, so no single thread is near a core. The Machine figure
+over-reports a little: it includes the sampler itself, its ssh session, Fly's init and hallpass (the
+"sampler itself / the rest" row, 0.052 to 0.086 cores together).
 
 **The two reload reds are the harness's timing, not the product.** A:noise read `the kill came
 -0.08 s from the midpoint` and C:noise `-0.016 s`. In both, the compositor logged exactly one
@@ -2235,20 +2237,22 @@ compositor thread peaks at 0.21 cores, so no single thread is near a core.
 `leg.sh`'s midpoint wait ended up to 999 ms early, by an integer division, on the runner's clock.
 PR #81 moves the decision to the compositor Machine's clock (`harness/soak/README.md` finding 18).
 
-**Snow against noise: no consistent heavier camera.** At 720p snow is heavier (p95 1.557 against
-1.451); at 1080p noise is (1.752 against 1.704). Both gaps are about 0.1 core or less.
+**Snow against noise: the heavier camera differs by profile.** At 720p snow is heavier (p95 1.557
+against 1.451), so leg B runs on snow; at 1080p noise is heavier (1.752 against 1.704), so leg D
+runs on noise. Both gaps are about 0.1 core or less.
 
 **Owed 93** (two held pages at the live renderer's cost) is within the size rule on all four: at
 most 1.821 against 2.0, on C:noise.
 
 **Against F-005:** F-005's chain read a p95 of 0.902 (720p) and 1.193 (1080p) on the ball camera
-with the test page. The camera, the page and the process differ, so the 0.5 to 0.6 core gap is not
-the overlay's cost alone.
+with the test page. The camera, the page and the process differ, so the gap (0.55 to 0.66 cores at
+720p, 0.51 to 0.56 at 1080p) is not the overlay's cost alone.
 
 **Still owed:**
-- Legs B and D (`bug` on badminton, a rally every 3 s), after PR #81.
-- The size verdict for performance-4x needs all four legs passing. A:noise and C:noise passed every
-  check but the kill's timing, so they want a re-run after PR #81.
+- Legs B and D (`bug` on badminton, a rally every 3 s), after PR #81: B on snow, D on noise.
+- The size verdict for performance-4x needs all six runs passing: A and C on both cameras, then B on
+  snow and D on noise. A:noise and C:noise passed every check but the kill's timing, so they want a
+  re-run after PR #81. If B or D measures above A or C, a football leg is owed (the README's rule).
 - The stills: 8 of 8 written per leg, not yet looked at for this entry.
 
 **Teardown:** done. Each leg's "Destroy every Machine" step succeeded, and `flyctl machine list -a

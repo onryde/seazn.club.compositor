@@ -24,9 +24,12 @@
 #                                     flyctl's exec timeout and a retry's second kill. Prints its
 #                                     target and every renderer seen before it kills (`at_ms`), then
 #                                     its status (`rc_at_ms`, `rc`); fails when no renderer has a
-#                                     numeric client id. Once: the lines go to COST_KILL_MARK
-#                                     (/tmp/seazn-cost-kill.jsonl), and a later call prints them again
-#                                     with `repeat_at_ms` and kills nothing
+#                                     numeric client id. Once: a call claims the kill (mkdir
+#                                     COST_KILL_MARK.claim) before it waits, its lines go to
+#                                     COST_KILL_MARK (/tmp/seazn-cost-kill.jsonl), and a later call
+#                                     prints them again with `repeat_at_ms` and kills nothing; one
+#                                     that lands while the claim's holder waits waits for those lines
+#                                     (at most KILL_CLAIM_WAIT_MS, then `busy_at_ms`, exit 1)
 #
 # A sample line (cores are CPU-seconds a second, three decimals):
 #
@@ -48,7 +51,8 @@
 set -euo pipefail
 
 CLK_TCK="${COST_CLK_TCK:-$(getconf CLK_TCK)}"
-KILL_EARLY_MAX_MS=10000 # kill-renderer waits at most this long for its not_before
+KILL_EARLY_MAX_MS=10000  # kill-renderer waits at most this long for its not_before
+KILL_CLAIM_WAIT_MS=15000 # and for another call's lines: that call's wait, its scan and its kill
 PROC="${COST_PROC:-/proc}"
 NOW_MS=0
 
@@ -286,22 +290,68 @@ cmd_sample() {
   done
 }
 
+# The kill's waits: the next whole tree under COST_PROC_SEQ (test-cost.sh), else a builtin sleep of
+# <ms> (at most 1 s), as the sampler's: a read with a timeout on a FIFO opened read-write.
+KILL_TREE=0
+KILL_SLEEP_FD=""
+kill_pause() {
+  local ms="$1" fifo dd
+  if [ -n "${COST_PROC_SEQ:-}" ]; then
+    KILL_TREE=$((KILL_TREE + 1))
+    PROC="$COST_PROC_SEQ/$KILL_TREE"
+    [ -d "$PROC" ] || { echo '{"error":"COST_PROC_SEQ: no tree after the last read, and the wait is not over"}'; kill_release; exit 70; }
+    return 0
+  fi
+  if [ -z "$KILL_SLEEP_FD" ]; then
+    fifo="/tmp/seazn-cost-kill-sleep.$$"
+    mkfifo "$fifo"
+    exec {KILL_SLEEP_FD}<>"$fifo"
+    rm -f "$fifo"
+  fi
+  [ "$ms" -le 1000 ] || ms=1000
+  printf -v dd '%d.%03d' $((ms / 1000)) $((ms % 1000))
+  read -r -t "$dd" -u "$KILL_SLEEP_FD" _ || true
+}
+KILL_CLAIM=""
+kill_release() { [ -z "$KILL_CLAIM" ] || rmdir "$KILL_CLAIM" 2>/dev/null || true; }
+# The mark is complete once its status line is in (the target line is written before the kill).
+mark_done() {
+  local line
+  [ -s "$1" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do [[ $line == *'"rc_at_ms"'* ]] && return 0; done <"$1"
+  return 1
+}
+
 cmd_kill_renderer() {
-  local not_before="$1" d p chosen best seen rc=0 mark="${COST_KILL_MARK:-/tmp/seazn-cost-kill.jsonl}" line k=0 sleep_fd="" fifo wait_ms dd
+  local not_before="$1" d p chosen best seen rc=0 mark="${COST_KILL_MARK:-/tmp/seazn-cost-kill.jsonl}" line claimed_wait_from=""
   [[ $not_before =~ ^[0-9]+$ ]] || { echo '{"error":"kill-renderer <not_before_ms>"}'; exit 64; }
   [ -z "${COST_PROC_SEQ:-}" ] || PROC="$COST_PROC_SEQ/0"
   # One kill a leg: a call after one that killed (leg.sh's retry when the reply was lost) repeats
-  # that call's lines and kills nothing, so the product sees one crash.
-  if [ -s "$mark" ]; then
-    while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line"; done <"$mark"
+  # that call's lines and kills nothing, so the product sees one crash. The kill is claimed before
+  # the wait for not_before (mkdir: atomic), so a call that lands during another's wait waits for
+  # that call's lines rather than killing too.
+  while :; do
+    if mark_done "$mark"; then
+      while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line"; done <"$mark"
+      clock
+      printf '{"repeat_at_ms":%s}\n' "$NOW_MS"
+      return 0
+    fi
+    if mkdir "$mark.claim" 2>/dev/null; then
+      KILL_CLAIM="$mark.claim"
+      break
+    fi
     clock
-    printf '{"repeat_at_ms":%s}\n' "$NOW_MS"
-    return 0
-  fi
+    [ -n "$claimed_wait_from" ] || claimed_wait_from=$NOW_MS
+    if [ $((NOW_MS - claimed_wait_from)) -gt "$KILL_CLAIM_WAIT_MS" ]; then
+      printf '{"busy_at_ms":%s,"killed":[]}\n' "$NOW_MS"
+      exit 1
+    fi
+    kill_pause 100
+  done
   # The newest renderer, read just before the clock reading that lets the kill go: a call that lands
   # before not_before reads again after each wait, so the kill's at_ms is that reading itself.
   while :; do
-    [ -z "${COST_PROC_SEQ:-}" ] || PROC="$COST_PROC_SEQ/$k"
     chosen="" best=-1 seen=""
     for d in "$PROC"/[0-9]*; do
       p=${d##*/}
@@ -317,29 +367,16 @@ cmd_kill_renderer() {
     [ "$NOW_MS" -lt "$not_before" ] || break
     if [ $((not_before - NOW_MS)) -gt "$KILL_EARLY_MAX_MS" ]; then
       printf '{"early_at_ms":%s,"not_before_ms":%s,"killed":[]}\n' "$NOW_MS" "$not_before"
+      kill_release
       exit 1
     fi
-    if [ -n "${COST_PROC_SEQ:-}" ]; then
-      k=$((k + 1))
-      [ -d "$COST_PROC_SEQ/$k" ] || { echo '{"error":"COST_PROC_SEQ: no tree after the last read, and the clock is short of not_before"}'; exit 70; }
-    else
-      if [ -z "$sleep_fd" ]; then
-        # A builtin sleep, as the sampler's: a read with a timeout on a FIFO opened read-write.
-        fifo="/tmp/seazn-cost-kill-sleep.$$"
-        mkfifo "$fifo"
-        exec {sleep_fd}<>"$fifo"
-        rm -f "$fifo"
-      fi
-      wait_ms=$((not_before - NOW_MS))
-      [ "$wait_ms" -le 1000 ] || wait_ms=1000
-      printf -v dd '%d.%03d' $((wait_ms / 1000)) $((wait_ms % 1000))
-      read -r -t "$dd" -u "$sleep_fd" _ || true
-    fi
+    kill_pause $((not_before - NOW_MS))
   done
   if [ -z "$chosen" ]; then
     printf '{"at_ms":%s,"killed":[],"clients":[],"renderers":[%s]}\n' "$NOW_MS" "$seen"
     clock
     printf '{"rc_at_ms":%s,"rc":1}\n' "$NOW_MS"
+    kill_release
     exit 1
   fi
   line="{\"at_ms\":$NOW_MS,\"killed\":[$chosen],\"clients\":[$best],\"renderers\":[$seen]}"

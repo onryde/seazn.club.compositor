@@ -271,8 +271,9 @@ point every second rally from 19-19). `leg.sh` kills the newest page's CEF rende
 drive's midpoint; the compositor reads CefCrashed and rebuilds the page as a new generation. The
 midpoint is decided on the compositor Machine, by the clock the kill's `at_ms` is read from: `leg.sh`
 sends the try 2 s early as `kill-renderer <planned_ms>`, and the Machine holds it until its own clock
-reaches `planned_ms` (finding 18). A try whose reply was lost is retried, but `kill-renderer` keeps a
-mark on the Machine, so a retry gets the first kill's lines back and kills nothing; and no try starts
+reaches `planned_ms` (finding 18). A try whose reply was lost is retried, but `kill-renderer` claims
+the kill before it waits and keeps a mark on the Machine, so a retry gets the first kill's lines back
+and kills nothing, even one that lands while the first call still waits; and no try starts
 unless its kill can land inside the verdict's window (`cost_kill_late_max_s`, 100 s: three tries of
 30 s).
 

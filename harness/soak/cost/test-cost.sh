@@ -214,8 +214,8 @@ rm -rf "${K:?}/0/$r2"
 rc=0
 COST_PROC_SEQ="$K" COST_KILL_MARK="$W/kill-mark2.jsonl" "$BASH5" "$IN" kill-renderer 9000 >"$W/kill2.out" 2>&1 || rc=$?
 if [ "$rc" -ne 0 ] && jq -e -s '.[0].killed == [] and .[0].renderers == [{pid: '"$r3"', client: null}] and .[1].rc == 1' "$W/kill2.out" >/dev/null \
-  && alive "$r3" && alive "$g" && [ ! -e "$W/kill-mark2.jsonl" ]; then
-  pass "kill-renderer with no renderer that has a client id: fails, rc 1, kills nothing, leaves no mark"
+  && alive "$r3" && alive "$g" && [ ! -e "$W/kill-mark2.jsonl" ] && [ ! -e "$W/kill-mark2.jsonl.claim" ]; then
+  pass "kill-renderer with no renderer that has a client id: fails, rc 1, kills nothing, leaves no mark or claim"
 else
   fail "kill-renderer with no numbered renderer" "exit $rc, $(cat "$W/kill2.out")"
 fi
@@ -264,8 +264,8 @@ rc=0
 COST_PROC_SEQ="$KF" COST_KILL_MARK="$W/kill-far-mark.jsonl" "$BASH5" "$IN" kill-renderer "$P" >"$W/kill-far.out" 2>&1 || rc=$?
 sleep 0.3
 if [ "$rc" -eq 1 ] && jq -e -s --argjson p "$P" 'length == 1 and .[0] == {early_at_ms: ($p - 10001), not_before_ms: $p, killed: []}' "$W/kill-far.out" >/dev/null \
-  && alive "$rf" && [ ! -e "$W/kill-far-mark.jsonl" ]; then
-  pass "kill-renderer landing 10.001 s early: refused (early_at_ms), exit 1, nothing killed, no mark"
+  && alive "$rf" && [ ! -e "$W/kill-far-mark.jsonl" ] && [ ! -e "$W/kill-far-mark.jsonl.claim" ]; then
+  pass "kill-renderer landing 10.001 s early: refused (early_at_ms), exit 1, nothing killed, no mark, its claim released"
 else
   fail "kill-renderer 10.001 s early" "exit $rc, $(cat "$W/kill-far.out")"
 fi
@@ -290,8 +290,50 @@ mkdir -p "$KN/0"
 echo $((P - 5)) >"$KN/0/now_ms"
 rc=0
 COST_PROC_SEQ="$KN" COST_KILL_MARK="$W/kill-notree.jsonl" "$BASH5" "$IN" kill-renderer "$P" >"$W/kill-notree.out" 2>&1 || rc=$?
-[ "$rc" -eq 70 ] && grep -qF '"error"' "$W/kill-notree.out" && [ ! -e "$W/kill-notree.jsonl" ] \
+[ "$rc" -eq 70 ] && grep -qF '"error"' "$W/kill-notree.out" && [ ! -e "$W/kill-notree.jsonl" ] && [ ! -e "$W/kill-notree.jsonl.claim" ] \
   && pass "kill-renderer (test clock) waiting with no later tree: exit 70, named" || fail "kill-renderer with no later tree" "exit $rc: $(cat "$W/kill-notree.out")"
+
+# One kill a leg while a call waits: the first call claims the kill (mkdir "$mark.claim") before it
+# waits for not_before, so a retry that lands during that wait (try 1's reply lost while it still
+# waits) waits for the first call's lines and repeats them, never a second kill. On the real clock:
+# the first call waits 1.5 s, the second lands 0.3 s after it.
+KR="$W/kill-race"
+sleep 300 & rr=$!
+kids+=("$rr")
+proc "$KR" "$rr" cefsrc 1 0 60 '--type=renderer\0--renderer-client-id=2\0'
+nb=$(($(python3 -I -c 'import time; print(int(time.time() * 1000))') + 1500))
+COST_PROC="$KR" COST_KILL_MARK="$W/kill-race.jsonl" "$BASH5" "$IN" kill-renderer "$nb" >"$W/kill-race-1.out" 2>&1 &
+ka=$!
+sleep 0.3
+COST_PROC="$KR" COST_KILL_MARK="$W/kill-race.jsonl" "$BASH5" "$IN" kill-renderer "$nb" >"$W/kill-race-2.out" 2>&1 &
+kb=$!
+rca=0; wait "$ka" || rca=$?
+rcb=0; wait "$kb" || rcb=$?
+if [ "$rca" -eq 0 ] && [ "$rcb" -eq 0 ] && jq -e -s --argjson nb "$nb" --argjson r "$rr" 'length == 2 and .[0].at_ms >= $nb and .[0].killed == [$r] and .[1].rc == 0' "$W/kill-race-1.out" >/dev/null \
+  && cmp -s "$W/kill-race-1.out" <(head -n 2 "$W/kill-race-2.out") && jq -e -s 'length == 3 and (.[2] | keys) == ["repeat_at_ms"]' "$W/kill-race-2.out" >/dev/null \
+  && ! alive "$rr"; then
+  pass "kill-renderer: a second call landing during the first's wait repeats the first's lines (one kill, the claim held)"
+else
+  fail "kill-renderer: a call during the first's wait" "exit $rca/$rcb; first $(cat "$W/kill-race-1.out"); second $(cat "$W/kill-race-2.out")"
+fi
+# A claim whose lines never come (a first call that died holding it) is waited for at most 15 s
+# (the first call's 10 s wait, its scan and its kill), then refused: nothing killed, no at_ms.
+KB="$W/kill-busy"
+sleep 300 & rb=$!
+kids+=("$rb")
+for t in 0 1; do mkdir -p "$KB/$t"; proc "$KB/$t" "$rb" cefsrc 1 0 60 '--type=renderer\0--renderer-client-id=2\0'; done
+echo "$P" >"$KB/0/now_ms"
+echo $((P + 15001)) >"$KB/1/now_ms"
+mkdir "$W/kill-busy.jsonl.claim"
+rc=0
+COST_PROC_SEQ="$KB" COST_KILL_MARK="$W/kill-busy.jsonl" "$BASH5" "$IN" kill-renderer "$P" >"$W/kill-busy.out" 2>&1 || rc=$?
+sleep 0.3
+if [ "$rc" -eq 1 ] && jq -e -s --argjson p "$P" 'length == 1 and .[0] == {busy_at_ms: ($p + 15001), killed: []}' "$W/kill-busy.out" >/dev/null \
+  && alive "$rb" && [ ! -e "$W/kill-busy.jsonl" ] && [ -d "$W/kill-busy.jsonl.claim" ]; then
+  pass "kill-renderer finding another's claim and no lines for 15.001 s: refused (busy_at_ms), exit 1, nothing killed, the claim left to its holder"
+else
+  fail "kill-renderer with a claim and no lines" "exit $rc, $(cat "$W/kill-busy.out")"
+fi
 
 # --- leg.sh, on a stub flyctl ---------------------------------------------------------------------
 # The stub keeps its state under $FS: the script it was sent, each sampler session (the first drops
