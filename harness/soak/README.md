@@ -42,7 +42,7 @@ gh workflow run soak.yml --ref <branch> -f sha=<40-hex head> -f page=real -f min
 | `web/bundle-check.sh` | Fails when the web build carries a PostHog key, a Sentry DSN or a Stripe key. |
 | `web/smoke.sh` | `up.sh` and three deliveries inside the built image, on the runner, before the push. |
 | `web/test-bundle-check.sh`, `web/test-overlay-url.sh` | The bundle check on synthetic builds; the signed URL against an independent HS256 verifier. |
-| `cost/in-compositor.sh` | On the compositor Machine (bash builtins only: the relay image has no procps or python). `sample <max_s>`: a JSON line a second from `/proc` (the Machine's cores, the process tree's by kind, the busiest compositor thread, memory). `kill-renderer`: SIGKILL to every CEF `--type=renderer` process, once. |
+| `cost/in-compositor.sh` | On the compositor Machine (bash builtins only: the relay image has no procps or python). `sample <max_s>`: a JSON line a second from `/proc` (the Machine's cores, the process tree's by kind, the busiest compositor thread, memory). `kill-renderer`: SIGKILL to the CEF renderer with the highest `--renderer-client-id` (the newest page's, as C14's), once a Machine: a second call repeats the first's lines. |
 | `cost/leg.sh` | On the runner, in the background: puts `in-compositor.sh` on the compositor Machine, keeps its sampler running over `flyctl ssh console`, and kills the renderer at the drive's midpoint over `flyctl machine exec`. |
 | `cost/verdict.sh`, `cost/cost.jq` | A leg's verdict (the size rule, the moments, the reload, the samples) and its F-005 column. |
 | `cost/table.sh` | The legs' columns as one F-005-shaped table (the `cost-table` job). |
@@ -267,8 +267,11 @@ page=real, a drive of at least `leg_min_drive_min` (`minutes=15` is 10 minutes),
 pace: cricket a boundary every `cost_ball_every_s` (6 s; fours and sixes alternate, each a doubled
 moment of about 5 s, so the bar's cards run nearly back to back, and the compositor's 5 s poll sees
 each), badminton a rally every `cost_rally_every_s` (3 s; the game kept level, so a fresh game
-point every second rally from 19-19). `leg.sh` kills the CEF renderer once at the drive's midpoint;
-the page reloads in place.
+point every second rally from 19-19). `leg.sh` kills the newest page's CEF renderer once at the
+drive's midpoint; the compositor reads CefCrashed and rebuilds the page as a new generation. A try
+whose reply was lost is retried, but `kill-renderer` keeps a mark on the Machine, so a retry gets the
+first kill's lines back and kills nothing; and no try starts unless its kill can land inside the
+verdict's window (`cost_kill_late_max_s`, 100 s: three tries of 30 s).
 
 **The verdict** (`cost/verdict.sh`, every number from `soak.json`):
 
@@ -279,27 +282,42 @@ the page reloads in place.
 | `cpu` | The Machine's CPU p95 (nearest rank) at most `cost_cpu_p95_max_share` (50 %) of the guest's cores. |
 | `rung` | Every beat's rung is `full`, the reload included. |
 | `drops` | The final `droppedFrames` is 0. |
-| `moments` | At least `cost_moments_min_per_min` (1) moment a minute, by the page's own feed. A feed that answered for none of the events fails. |
-| `reload` | Exactly one kill, which found a renderer and exited 0, from the midpoint to `cost_kill_late_max_s` after it, inside the drive, and a later beat reads `graphics: ready`. |
+| `moments` | At least `cost_moments_min_per_min` (1) moment a minute over the drive (a mean; see finding 15), by the page's own feed. A feed that answered for none of the events fails. |
+| `reload` | Exactly one kill, which found a renderer and wrote a status of 0, from the midpoint to `cost_kill_late_max_s` after it, inside the drive. Then the compositor's own word, from `compositor.log`: exactly one `cef crashed gen=N` in the drive, after the kill, and a `cef ready gen=N+1` after it (a new build; a held page's in-place reload says ready at its old gen). No log is a red, never a pass. The beats, every 5 s, seldom see a reload, so none is read for it. |
+| `stills` | At least one programme still written (stills.tar against stills.log's instants), so there is something to look at. The count is in the column. |
 
 The step summary gets the leg's F-005 column: the Machine's cores avg / p95 / max, the tree's and
 each kind's (compositor, renderer + gpu + utility + zygote, Xvfb), the busiest compositor thread,
-encoder speed, fps, the final drops, the rungs, the moments a minute by kind, the kill and the
-page's return, memory, and the Owed 93 projection. The `cost-table` job joins every leg's column
-into one table. Each leg's artifact keeps `cost.json`, the raw samples, the kill's lines and
+encoder speed, fps, the final drops, the rungs, the moments a minute by kind and the longest
+stretch without one, the kill and the compositor's crash and ready after it, the live renderers
+before and after the kill (more than one after is a page painting beside the live one: the Owed
+82/93 shape, reported and never judged), the stills, memory, and the Owed 93 projection. The
+sampler and its ssh session are inside the Machine's p95 (the column's "sampler itself / the
+rest"), so the figure over-reports a little; the F-entry says so. The `cost-table` job joins every leg's column
+into one table, each leg:camera's latest attempt (a re-run of a failed leg leaves both artifacts),
+and fails naming any run asked for that has no verdict. Each leg's artifact keeps `cost.json`, the raw samples, the kill's lines and
 `stills.tar`: eight programme stills (six a second apart at a quarter of the drive, one 45 s after
 the kill, one 30 s before the end), to look at and never commit.
 
 **The dispatch.** The 2026-10-23 amendment asks for each pattern once per profile on the
 production guest, then the heavier one. So: `A:snow,A:noise,C:snow,C:noise` first, then B on 720p's
 heavier pattern and D on 1080p's. If B or D measures above A or C, the brief's sport hypothesis
-failed and a football leg is owed before a size is chosen. A leg over the size rule on
-performance-4x reruns with `-f guest=performance-8x`.
+failed and a football leg is owed before a size is chosen; that leg cannot run as built (no
+football driver, and `momentsOf` has no football rule), so it would fail closed on its moments,
+never pass. A leg over the size rule on performance-4x reruns with `-f guest=performance-8x`.
+GitHub keeps one pending run per concurrency group (`soak`): a dispatch queued behind a running
+one replaces any run already pending, silently. Dispatch the next only after the previous has
+started. A running run is never cancelled (`cancel-in-progress: false`).
+
+**Dispatch a cost leg before any page=real soak re-run after this merges.** The images job runs
+`web/smoke.sh` on every page=real dispatch, and its new boundary and rally checks have never met the
+real app (check.yml does not build `web.Dockerfile`; finding 16). A wrong guess there fails the
+images job before any Machine starts, so it costs no Fly money, but it blocks the soak too.
 
 **Owed 93** (a held teardown's page keeps painting at about the live renderer's CPU) is measured,
 not judged (owner ruling 4A kept): each column's "p95 + two held pages" adds twice the leg's mean
-renderer cores to its p95 and compares it with the size rule. Its row is on
-`feat/c14-case16-leaks`, not on `main`, so it closes there, from these numbers.
+renderer cores to its p95 and compares it with the size rule. Its row is on `main` (`docs/_INDEX.md`,
+Owed 93, since #71), and closes from these numbers.
 
 **Owed after the runs:** the F-entry "real overlay cost" in `_FINDINGS.md` (the table, both
 patterns per profile, the sport reason or the football leg), and Owed 93's closure.
@@ -349,8 +367,9 @@ patterns per profile, the sport reason or the football leg), and Owed 93's closu
 11. **The brief's renderer kill, `pkill -KILL -f cef`, kills the compositor, not the page.** Every
     CEF child dying aborts the compositor (Owed 62), a process restart, and the soak's compositor
     Machine runs `--restart no` and `--rm`, so the leg would end there. `kill-renderer` kills only
-    the `--type=renderer` processes: cefsrc logs "Render subprocess terminated, reloading URL!",
-    the compositor reads CefCrashed and the page reloads, which is the reload the brief asks for.
+    the `--type=renderer` process with the highest client id (the newest page's, as C14 case 16's
+    driver): the compositor reads CefCrashed and rebuilds the page as a new generation, which is
+    the reload the brief asks for, and the verdict reads it from the compositor's own log.
 12. **The page emits no moment signal.** Its console lines are `seazn:ready`, `seazn:alive`,
     `seazn:score-stale` and the phase channel only (web at `7dcb3c42e2`), so nothing outside the page
     sees a moment play. The legs count moments from the page's own feed instead: the public overlay
@@ -363,6 +382,18 @@ patterns per profile, the sport reason or the football leg), and Owed 93's closu
     over the preset), about 14.8 minutes at most.
 14. **A four needs `boundary: 4` to be a moment.** `runs.bat` 4 alone gives none, so
     `score.mjs --boundaries` sends `boundary` with each four and six.
+15. **"At least one moment a minute" is the drive's mean, not a floor for every minute.** A floor is
+    impossible on badminton at a level game: each game runs 0-0 to 19-19 (38 rallies, about 114 s)
+    with no moment, then a game point every second rally, so the corner bug carries a slab about a
+    third of the time, in bursts, against cricket's nearly back-to-back cards. The column reports
+    the longest stretch without a moment, and the F-entry's comparison of B with A has to say it.
+16. **The web-side drivers have not met the real app.** `rally.mjs`, `score.mjs --boundaries`,
+    `momentsOf` and the seed's `config: {bestOf: 5}` run only on a dispatch (soak.yml's images
+    job smoke, then the legs). Their premises were read against web `7dcb3c42e2` (the PR #75
+    review) and hold; the first cost-leg dispatch is their first run.
+17. **The stills were the only on-screen witness of a moment, and nothing judged them.** A leg now
+    fails with no still written, and the column counts them. Whether a still shows a moment card is
+    still a person's look, not a check.
 
 ## Owed (not in this PR)
 
