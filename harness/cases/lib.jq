@@ -26,6 +26,64 @@ def beats_between($a; $b): [beats[] | select(.received_ms >= $a and .received_ms
 # The recording's frames, each [wall_ms, counter, score] (null where a strip did not read).
 def frames_between($a; $b): [.frames_table[] | select(.[0] >= $a and .[0] < $b)];
 
+# "Back" is held, not one frame (the PR #79 review's gap hunt: a page that paints one frame and goes
+# off air passed every "back" check). On air from $b for $w: every frame from the first strip frame
+# at or after $b through $b + $w shows the strip, and there are at least hold_frames_needed($w) of
+# them: the output's own fps floor (`output_fps_floor`, below which the product raises its
+# starvation alarm) over the window. That count is what makes a window with no frames prove nothing:
+# a recording that ends inside the hold, or an output gap inside it, has too few (the PR #79 confirm
+# pass's C-2; CI's restart legs show 64 to 68, their catch-up burst included). Frame ORDER, not wall
+# time: a restart's catch-up burst lands many frames on one wall ms, the strip-less ones first, so a
+# wall-ms window starting at $b re-reads the outage (every real restart leg of run 40154210504 did),
+# while a strip-less frame AFTER the back frame on its own wall ms is off air after back (C-1). The
+# callers pass $t.resume_after_ms, the domain's own hold-off before a returning source counts as
+# back. A null $b is never back.
+def back_frame($b): .frames_table as $f
+  | if $b == null then null
+    else first(range(0; $f | length) | select($f[.][0] >= $b and $f[.][2] != null)) // null end;
+def hold_frames_needed($w): $t.output_fps_floor * $w / 1000 | ceil;
+def hold_window($b; $w): .frames_table as $f | back_frame($b) as $i
+  | if $i == null then null else $f[$i:] | map(select(.[0] <= $b + $w)) end;
+def on_air_for($b; $w): hold_window($b; $w) as $h
+  | $h != null and ($h | length) >= hold_frames_needed($w) and ($h | all(.[2] != null));
+# How long the strip stayed on air from $b: to the first strip-less frame after its back frame, or
+# null when none follows (or $b is null).
+def stayed_ms($b): .frames_table as $f | back_frame($b) as $i
+  | if $i == null then null else less(first($f[$i:][] | select(.[2] == null) | .[0]) // null; $b) end;
+# The held window's evidence for a measure: its frames, and how many the hold needs.
+def hold_evidence($b; $w): {stayed_ms: stayed_ms($b), hold_ms: $w,
+  hold_frames: (hold_window($b; $w) | if . == null then null else length end), hold_frames_needed: hold_frames_needed($w)};
+
+# Stays on air after back (the PR #79 confirm pass's C-4, a coordinator decision: a restart that came
+# back for 1.5 s and then died passed every restart leg). From the back frame of $b up to the last
+# programme frame or the end request, whichever is first, in frame order: the strip-less runs, each
+# {from_ms, frames}. Their TOTAL must be no more than the allowance: the frames the frame-to-encoder
+# budget holds (`budget_frame_to_encoder_ms` / `frame_period_ms`, 4; healthy runs show 1 or 2
+# strip-less frames at a GPU kill and none after back). A total, not a per-run cap, so a strobe (4
+# off, 1 on, again and again) reds, and it bounds the longest run too. No run is set aside at a kill:
+# no leg with a back check kills after its back, and a blip at a later kill fits the allowance
+# (the approval's F-1 dropped the exclusion that set aside a run of any length there). No back, no
+# end request or no frame in the span is null or empty: the caller reds it (zero frames proves
+# nothing).
+def off_air_allowance_frames: $t.budget_frame_to_encoder_ms / $t.frame_period_ms | floor;
+def stays_on_air_from($b):
+  ([(.frames_table | last | .[0]), $run.end_request_ms] | min) as $end
+  | .frames_table as $f | back_frame($b) as $i
+  | (if $i == null or $end == null then null else $f[$i:] | map(select(.[0] <= $end)) end) as $span
+  | (if $span == null then null
+     else reduce $span[] as $x ({runs: [], cur: null};
+       if $x[2] == null then (if .cur == null then .cur = {from_ms: $x[0], frames: 1} else .cur.frames += 1 end)
+       elif .cur != null then .runs += [.cur] | .cur = null
+       else . end)
+     | .runs + (if .cur == null then [] else [.cur] end) end) as $runs
+  | {until_ms: $end, span_frames: ($span | if . == null then null else length end),
+     allowance_frames: off_air_allowance_frames,
+     off_air_frames: (if $runs == null then null else [$runs[].frames] | add // 0 end),
+     runs: ($runs | if . == null then null else length end),
+     longest_frames: (if $runs == null then null else [$runs[].frames] | max // 0 end),
+     longest_from_ms: (if $runs == null then null else $runs | max_by(.frames) | .from_ms end)};
+def stays_on_air_ok: .span_frames >= 1 and .off_air_frames <= .allowance_frames;
+
 # The output outage that spans a process restart: its last packet before the start, its first
 # after the die.
 def restart_outage($die; $start):

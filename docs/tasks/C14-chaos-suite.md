@@ -1192,8 +1192,8 @@ now runs 23 checks.
   Each clause was mutated once. Deleting the floor clause is killed by cpu-sags-after; deleting the
   recovered clause is killed by cpu-clears-at-floor. Under the old rule, cpu-healthy-dip's red run
   failed `alarm_cleared`.
-- **Expected reds of the next run:** none. Case 6 is expected green. Anything red is NOT OWED. This
-  supersedes the line above.
+- ~~**Expected reds of the next run:** none. Case 6 is expected green. Anything red is NOT OWED. This
+  supersedes the line above.~~ (Superseded by the rebase entry's line below.)
 - **Rebased onto 069b0cb, 2026-10-25** (#76 merged: Owed 94's backstop, case 18).
   - thresholds.json was regenerated on the merged tree through `harness::thresholds::render`,
     dump-thresholds' own function (the GStreamer deviation above). It was never merged by hand, and

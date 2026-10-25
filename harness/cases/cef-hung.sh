@@ -40,7 +40,7 @@ HUNG='(.log.page_hangs[0]) as $h
   | ([.log.cef_ready[] | select(.gen == $h.gen + 1)] | first) as $ready
   | ([.overlay.runs[] | select(.index == null and .from_ms >= $h.at_ms)] | first) as $gap'
 
-CASE_CHECKS=16
+CASE_CHECKS=17
 case_verdict() {
   require hang_started '(.log.page_hangs | length) == 1 and $run.control_state.page_hang_served_ms != null' \
     '{page_hangs: (.log.page_hangs | length), served: $run.control_state.page_hang_served_ms}'
@@ -65,9 +65,16 @@ case_verdict() {
     "$HUNG"' | {log_from_last_alive_ms: less($hid.at_ms; $alive.at_ms), strip_from_log_ms: less($gap.from_ms; $hid.at_ms),
       log_bounds: [($t.cef_hang_after_ms - $t.frame_period_ms), ($t.cef_hang_after_ms + 2 * $t.frame_period_ms)],
       strip_budget: $t.budget_frame_to_encoder_ms}'
-  require overlay_back "$HUNG"' | $ready != null and $gap.to_ms >= $ready.at_ms
-    and ([.overlay.runs[] | select(.from_ms >= $gap.to_ms and .index != null)] | length) >= 1' \
-    "$HUNG"' | {gap_to_ms: $gap.to_ms, ready_ms: $ready.at_ms}'
+  # Back after the new generation's ready, and held for resume_after_ms (lib.jq's on_air_for).
+  require overlay_back "$HUNG"' | ([.overlay.runs[] | select(.from_ms >= $gap.to_ms and .index != null)] | first | .from_ms) as $b
+    | $ready != null and $gap.to_ms >= $ready.at_ms and $b != null and on_air_for($b; $t.resume_after_ms)' \
+    "$HUNG"' | ([.overlay.runs[] | select(.from_ms >= $gap.to_ms and .index != null)] | first | .from_ms) as $b
+    | {gap_to_ms: $gap.to_ms, ready_ms: $ready.at_ms, back_ms: $b} + hold_evidence($b; $t.resume_after_ms)'
+  # And on air from that frame to the end request (lib.jq's stays_on_air_from; the confirm pass's C-4).
+  require stays_on_air "$HUNG"' | ([.overlay.runs[] | select(.from_ms >= $gap.to_ms and .index != null)] | first | .from_ms) as $b
+    | stays_on_air_from($b) | stays_on_air_ok' \
+    "$HUNG"' | ([.overlay.runs[] | select(.from_ms >= $gap.to_ms and .index != null)] | first | .from_ms) as $b
+    | {back_ms: $b} + stays_on_air_from($b)'
   require camera_continues "$HUNG"' | [.camera.freezes[] | select(.from_ms >= $h.at_ms and .from_ms <= $gap.to_ms + $t.budget_return_to_live_ms and .frames > 2)] == []' \
     "$HUNG"' | [.camera.freezes[] | select(.from_ms >= $h.at_ms and .from_ms <= $gap.to_ms + $t.budget_return_to_live_ms) | .frames]'
   require no_output_outages '.output_outages == []' '.output_outages | length'

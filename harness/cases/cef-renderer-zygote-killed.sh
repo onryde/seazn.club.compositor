@@ -33,7 +33,7 @@ case_after_kill() {
   in_compositor tree | mark_lines tree_after || true
 }
 
-CASE_CHECKS=19
+CASE_CHECKS=20
 case_verdict() {
   zygote_verdict
   require old_tree_gone '[mark("tree_after")[] | .value] as $all

@@ -362,24 +362,32 @@ require_clear_phase() {
 # whose CEF never started, red here; PR #54 fixed that cause (main 263b08a), so no owed tag excuses
 # such a red now. Its evidence is still measured beside it: `graphics_failed_after_start`, the
 # `overlay hidden reason=failed` lines after <start> (graphics gave up after CEF_FAIL_COUNT builds;
-# the re-review's I-3). 2 checks.
+# the re-review's I-3). And back means held: on air for `resume_after_ms` from that first frame
+# (lib.jq's on_air_for; a page that paints one frame and goes off air is not back). And it stays on
+# air to the end request (`stays_on_air`, lib.jq's stays_on_air_from: a page back for 1.5 s that
+# then dies is no recovery; the confirm pass's C-4). 3 checks.
 require_overlay_back() {
   local die="$1" start="$2"
   measure graphics_failed_after_start "($start) as \$s
     | if \$s == null then null else [.log.overlay_hidden[] | select(.reason == \"failed\" and .at_ms > \$s)] | length end"
   require overlay_back "restart_outage($die; $start) as \$o | ($start) as \$s
     | (if \$s == null then null else [.frames_table[] | select(.[0] > \$s and .[2] != null)] | first | .[0] end) as \$back
-    | \$o != null and \$back != null and (\$back - \$o.from_wall_ms) <= \$t.budget_process_restart_output_ms" \
+    | \$o != null and \$back != null and (\$back - \$o.from_wall_ms) <= \$t.budget_process_restart_output_ms
+    and on_air_for(\$back; \$t.resume_after_ms)" \
     "restart_outage($die; $start) as \$o | ($start) as \$s
-    | {back_ms: less(if \$s == null then null else [.frames_table[] | select(.[0] > \$s and .[2] != null)] | first | .[0] end;
-         \$o.from_wall_ms), budget: \$t.budget_process_restart_output_ms}"
+    | (if \$s == null then null else [.frames_table[] | select(.[0] > \$s and .[2] != null)] | first | .[0] end) as \$back
+    | {back_ms: less(\$back; \$o.from_wall_ms), budget: \$t.budget_process_restart_output_ms}
+      + hold_evidence(\$back; \$t.resume_after_ms)"
+  local back="($start) as \$s
+    | (if \$s == null then null else [.frames_table[] | select(.[0] > \$s and .[2] != null)] | first | .[0] end) as \$back"
+  require stays_on_air "$back | stays_on_air_from(\$back) | stays_on_air_ok" "$back | {back_ms: \$back} + stays_on_air_from(\$back)"
 }
 
 # C11b's in-place restart after <after> (a jq expression): the final beat says why, with
 # `exitReason` "restart" (Owed 66, closed: web's word; the brief's "fatal" is a false premise) and
 # `exitDetail` equal to <detail> (a jq string expression, the domain's `RestartCause::detail`), the
 # container dies 75 once and compose starts it again, Chromium never aborts, and the overlay is back
-# (`require_overlay_back`, over the restart's outage). 6 checks.
+# (`require_overlay_back`, over the restart's outage, and on air after it). 7 checks.
 require_in_place_restart() {
   local after="$1" detail="$2"
   require final_beat_detail "($detail) as \$want

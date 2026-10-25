@@ -170,7 +170,7 @@ require_common() {
   measure retirements "$RETIREMENTS"
 }
 
-if [ "$RESTART_EXPECTED" = 1 ]; then CASE_CHECKS=24; else CASE_CHECKS=16; fi
+if [ "$RESTART_EXPECTED" = 1 ]; then CASE_CHECKS=25; else CASE_CHECKS=16; fi
 case_verdict() {
   require_common
   if [ "$RESTART_EXPECTED" = 1 ]; then
@@ -187,19 +187,23 @@ case_verdict() {
       "{last: ([.log.cef_health[] | select(.at_ms < \$run.end_request_ms)] | last), want: $HOLD}"
     # The build after the last kill is on air: its ready after that kill, then every score change
     # the timeline schedules after it shown (case 15's one-fewer: a page that stops painting and
-    # keeps beating holds a stale score on air), and graphics never gave up.
+    # keeps beating holds a stale score on air), and graphics never gave up. Due up to the last
+    # PROGRAMME frame, never the last frame whose overlay read: that bound passed a page that went
+    # off air partway, and read "0 due" for one that went off at once (case 15's Owed 96). And no
+    # later than the end request (the final hold is not this check's; the PR #79 review's m-1). No
+    # end request: nothing due, a red that prints it (C-3).
     local newest='(mark("kill") | last | .at_ms) as $k
       | ([.log.cef_loading[] | select($k != null and .at_ms > $k)] | last) as $n
       | (if $n == null then null else [.log.cef_ready[] | select(.gen == $n.gen and .at_ms > $n.at_ms)] | first | .at_ms end) as $ready'
     require overlay_on_air "$newest"' | . as $r
       | ($r.overlay.score_index_changes | map(.index)) as $shown
-      | ($r.frames_table | map(select(.[2] != null)) | last | .[0]) as $last
-      | [scheduled[] | select($ready != null and .due_ms > $ready and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due
+      | ([($r.frames_table | last | .[0]), $run.end_request_ms] | min) as $last
+      | [scheduled[] | select($ready != null and $last != null and .due_ms > $ready and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due
       | ($due | length) >= 1 and ($due - $shown) == []
       and ([.log.overlay_hidden[] | select(.reason == "failed")] == [])' \
-      "$newest"' | . as $r | ($r.frames_table | map(select(.[2] != null)) | last | .[0]) as $last
-      | [scheduled[] | select($ready != null and .due_ms > $ready and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due
-      | {newest_gen: $n.gen, ready_ms: $ready, due_after_ready: ($due | length),
+      "$newest"' | . as $r | ([($r.frames_table | last | .[0]), $run.end_request_ms] | min) as $last
+      | [scheduled[] | select($ready != null and $last != null and .due_ms > $ready and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due
+      | {newest_gen: $n.gen, ready_ms: $ready, due_after_ready: ($due | length), end_request_ms: $run.end_request_ms,
          missing: ($due - ($r.overlay.score_index_changes | map(.index))),
          failed: ([.log.overlay_hidden[] | select(.reason == "failed")] | length)}'
     require on_air_to_end '.output_outages == []' '.output_outages | length'
