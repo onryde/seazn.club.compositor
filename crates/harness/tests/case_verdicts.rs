@@ -1835,7 +1835,8 @@ fn output_hung_swaps_on_the_egress_backstop_and_reds_on_any_other_path() {
         );
         assert_eq!(
             (s["floor_ms"].as_i64(), s["ceiling_ms"].as_i64()),
-            (Some(floor), Some(ceiling))
+            (Some(floor), Some(ceiling)),
+            "{tag}: the window's floor and ceiling"
         );
         let gap = m["gap_ms"].as_i64().unwrap();
         assert!(gap > flat && gap <= budget, "{tag}: gap {gap}");
