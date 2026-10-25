@@ -3,9 +3,21 @@
 //! there. `copies_every_stats_field_into_measured` runs everywhere.
 use std::sync::Arc;
 
-use adapters::metrics_proc::{parse_proc_stat, parse_vm_rss_kb, ProcMetrics};
+use adapters::metrics_proc::{parse_proc_stat, parse_proc_status, parse_vm_rss_kb, ProcMetrics};
 use adapters::stats::{Stats, StatsSnapshot};
-use app::ports::Metrics;
+use app::ports::{CefPoll, CefPss, KindPss, Metrics, ProcStatus};
+
+/// A CEF poll as the graphics adapter hands it (made-up numbers).
+fn a_cef_poll() -> CefPoll {
+    CefPoll {
+        poll: 7,
+        pss: CefPss {
+            renderer: Some(KindPss { kb: 61_000, n: 1 }),
+            zygote: Some(KindPss { kb: 9_000, n: 2 }),
+            ..CefPss::default()
+        },
+    }
+}
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -45,6 +57,32 @@ mod linux {
         let mb = m.sample().mem_mb.expect("VmRSS read");
         eprintln!("tree VmRSS: {mb} MB");
         assert!(mb > 0, "{mb}");
+    }
+
+    /// The soak's memory split: this process's own status fields (a test process has a heap and a
+    /// thread), and the CEF poll exactly as `with_cef`'s reader gives it; with no reader, no CEF part.
+    #[test]
+    fn the_memory_split_reads_this_process_and_the_cef_poll() {
+        let mut m = ProcMetrics::new(Arc::new(Stats::default())).with_cef(|| Some(a_cef_poll()));
+        assert_eq!(m.memory(), None, "no sample yet: no status read");
+        let got = m.sample();
+        let split = m.memory().expect("this process's status read");
+        let s = split.status;
+        eprintln!("own status: {s:?}; tree {:?} MB", got.mem_mb);
+        assert!(s.vm_rss_kb.is_some_and(|kb| kb > 0), "{s:?}");
+        assert!(s.rss_anon_kb.is_some_and(|kb| kb > 0), "{s:?}");
+        assert!(s.rss_file_kb.is_some(), "{s:?}");
+        assert!(s.rss_shmem_kb.is_some(), "{s:?}");
+        assert!(s.threads.is_some_and(|n| n >= 1), "{s:?}");
+        let own_mb = s.vm_rss_kb.unwrap_or(0) / 1024;
+        assert!(
+            got.mem_mb.is_some_and(|tree| tree >= own_mb),
+            "the tree holds this process"
+        );
+        assert_eq!(split.cef, Some(a_cef_poll()));
+        let mut alone = ProcMetrics::new(Arc::new(Stats::default()));
+        alone.sample();
+        assert_eq!(alone.memory().map(|m| m.cef), Some(None), "no CEF: no CEF part");
     }
 
     #[test]
@@ -87,6 +125,10 @@ mod linux {
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn proc_tests_need_linux() {
+    // No `/proc`: no status read, so no memory split, a CEF reader or not.
+    let mut m = ProcMetrics::new(Arc::new(Stats::default())).with_cef(|| Some(a_cef_poll()));
+    m.sample();
+    assert_eq!(m.memory(), None);
     eprintln!("skipped: not linux");
 }
 
@@ -196,4 +238,58 @@ fn proc_stat_fields_are_read_after_the_last_paren() {
         None,
         "a kernel thread has none"
     );
+}
+
+/// The memory split's `/proc/<pid>/status` fields (proc(5)'s layout, made-up values): each read in
+/// kB (`Threads` bare), and a missing or malformed line absent, never 0.
+#[test]
+fn proc_status_fields_are_read_and_a_missing_one_is_absent() {
+    let full = "Name:\tcompositor\nUmask:\t0022\nState:\tS (sleeping)\nVmPeak:\t 2100000 kB\n\
+                VmRSS:\t  812345 kB\nRssAnon:\t  700001 kB\nRssFile:\t  100002 kB\n\
+                RssShmem:\t   12342 kB\nVmSwap:\t       0 kB\nThreads:\t87\nSigQ:\t0/31\n";
+    let cases: [(&str, &str, ProcStatus); 5] = [
+        (
+            "every field",
+            full,
+            ProcStatus {
+                vm_rss_kb: Some(812_345),
+                rss_anon_kb: Some(700_001),
+                rss_file_kb: Some(100_002),
+                rss_shmem_kb: Some(12_342),
+                threads: Some(87),
+            },
+        ),
+        (
+            "a kernel thread: no memory lines",
+            "Name:\tkthreadd\nThreads:\t1\n",
+            ProcStatus {
+                threads: Some(1),
+                ..ProcStatus::default()
+            },
+        ),
+        (
+            "a measured zero stays 0",
+            "VmRSS:\t0 kB\nRssAnon:\t0 kB\nRssFile:\t0 kB\nRssShmem:\t0 kB\nThreads:\t0\n",
+            ProcStatus {
+                vm_rss_kb: Some(0),
+                rss_anon_kb: Some(0),
+                rss_file_kb: Some(0),
+                rss_shmem_kb: Some(0),
+                threads: Some(0),
+            },
+        ),
+        (
+            "malformed: a word, another unit, a unit on Threads, a longer name",
+            "VmRSS:\tlots kB\nRssAnon:\t5 MB\nRssFile:\t7\nRssShmemX:\t9 kB\nThreads:\t3 kB\n",
+            ProcStatus::default(),
+        ),
+        ("empty", "", ProcStatus::default()),
+    ];
+    let mut checked = 0;
+    for (name, text, want) in cases {
+        assert_eq!(parse_proc_status(text), want, "{name}");
+        checked += 1;
+    }
+    eprintln!("status texts checked: {checked}");
+    assert_eq!(checked, 5);
 }

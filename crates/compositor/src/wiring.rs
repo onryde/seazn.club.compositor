@@ -24,7 +24,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
-use adapters::cef_graphics::CefGraphics;
+use adapters::cef_graphics::{CefGraphics, CefMemory};
 use adapters::control_http::{HttpControlPlane, DECLARED_PROFILES};
 use adapters::frame_store::FrameStore;
 use adapters::gst_input::GstInput;
@@ -434,6 +434,8 @@ struct Media {
     programme: Box<dyn ProgrammeOutput>,
     graphics: Box<dyn GraphicsRenderer>,
     stats: Arc<Stats>,
+    /// CEF's child polls' PSS by kind, for the metrics' memory split (none with no CEF).
+    cef: Option<CefMemory>,
 }
 
 fn live_media(t: &Thresholds, tx: &Sender<Inbound>, log: &Logger, hooks: &TestHooks) -> Media {
@@ -442,6 +444,7 @@ fn live_media(t: &Thresholds, tx: &Sender<Inbound>, log: &Logger, hooks: &TestHo
     let graphics = CefGraphics::new(frames.clone(), tx.clone(), cef_fps(), t.cef_rss_cap_mb)
         .with_log(log.adapter_sink());
     arm_test_hooks(&graphics, hooks);
+    let cef = graphics.memory();
     let mut programme = GstProgramme::new(frames.clone(), tx.clone()).with_log(log.adapter_sink());
     arm_programme_hooks(&mut programme, hooks);
     let stats = programme.stats();
@@ -458,6 +461,7 @@ fn live_media(t: &Thresholds, tx: &Sender<Inbound>, log: &Logger, hooks: &TestHo
         programme: Box::new(ProfileTap::new(Box::new(programme), slot)),
         graphics: Box::new(graphics),
         stats,
+        cef: Some(cef),
     }
 }
 
@@ -510,6 +514,7 @@ fn fake_media(env: &Env) -> Media {
         }),
         graphics: Box::new(FakeGraphics(calls, knob)),
         stats: Arc::new(Stats::default()),
+        cef: None,
     }
 }
 
@@ -531,11 +536,15 @@ pub fn run(env: &Env, clock: &Arc<Clock>, log: &Logger, signals: Signals) -> i32
         Drivers::Fake => fake_media(env),
     };
     let control = control_worker::spawn(Box::new(LoggedPlane::new(plane, log.clone())), tx.clone());
+    let metrics = match media.cef {
+        Some(cef) => ProcMetrics::new(media.stats).with_cef(move || cef.read()),
+        None => ProcMetrics::new(media.stats),
+    };
     let parts = Parts {
         input: media.input,
         programme: media.programme,
         graphics: media.graphics,
-        metrics: Box::new(ProcMetrics::new(media.stats)),
+        metrics: Box::new(metrics),
         control: Box::new(control),
         phase,
     };

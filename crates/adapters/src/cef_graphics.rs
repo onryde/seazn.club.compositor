@@ -87,7 +87,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use app::ports::{redacted_origin, GraphicsRenderer, Inbound};
+use app::ports::{redacted_origin, CefPoll, CefPss, GraphicsRenderer, Inbound};
 use crossbeam_channel::Sender;
 use domain::health::PhaseChannel;
 use domain::supervisor::Event;
@@ -447,6 +447,24 @@ pub struct Guarded {
     /// The part the memory cap reads: every child but the renderers of other builds (a retiring
     /// or leaked one; PR #32 review G2).
     pub pss_counted_mb: u64,
+    /// The same PSS reads by `--type=`, in kB (the soak's memory split): a child whose PSS was not
+    /// read counts 0 in the sums above and is left out here (`CefPss::add`).
+    pub pss_by_kind: CefPss,
+}
+
+/// The last child poll's number and its PSS by kind (the soak's memory split): the child poll writes
+/// it, the metrics read it once a beat. Absent until the first poll.
+#[derive(Debug, Clone, Default)]
+pub struct CefMemory(Arc<Mutex<Option<CefPoll>>>);
+
+impl CefMemory {
+    pub fn read(&self) -> Option<CefPoll> {
+        *locked(&self.0)
+    }
+
+    fn set(&self, p: CefPoll) {
+        *locked(&self.0) = Some(p);
+    }
 }
 
 /// Whether a child's memory counts against `current`'s cap: shared processes and unclaimed
@@ -496,10 +514,11 @@ fn guard(kids: &[CefChild], counts: impl Fn(&CefChild) -> bool) -> Guarded {
                 }
             }
         }
-        let pss = std::fs::read_to_string(format!("/proc/{}/smaps_rollup", kid.pid))
+        let read = std::fs::read_to_string(format!("/proc/{}/smaps_rollup", kid.pid))
             .ok()
-            .and_then(|r| pss_kb(&r))
-            .unwrap_or(0);
+            .and_then(|r| pss_kb(&r));
+        g.pss_by_kind.add(&kid.kind, read);
+        let pss = read.unwrap_or(0);
         pss_kb_sum += pss;
         if counts(kid) {
             counted_kb += pss;
@@ -1593,6 +1612,8 @@ struct Shared {
     builds: Mutex<BTreeMap<u64, (u64, Arc<SampleStats>)>>,
     reports: Mutex<BTreeMap<u64, ReaperPath>>,
     last_guard: Mutex<Guarded>,
+    /// The last child poll's number and PSS by kind, for the metrics' memory split (`memory`).
+    memory: CefMemory,
     /// What the child poll and each ready list (`ProcTree::live` in production).
     tree: ProcTree,
     /// The process's CEF watch (`cef_watch`).
@@ -1846,6 +1867,7 @@ impl CefGraphics {
             builds: Mutex::new(BTreeMap::new()),
             reports: Mutex::new(BTreeMap::new()),
             last_guard: Mutex::new(Guarded::default()),
+            memory: CefMemory::default(),
             tree: ProcTree::live(),
             watch: cef_watch(),
             #[cfg(feature = "test-hooks")]
@@ -1960,6 +1982,12 @@ impl CefGraphics {
     /// What the last child poll did.
     pub fn last_guard(&self) -> Guarded {
         *locked(&self.shared.last_guard)
+    }
+
+    /// The child polls' PSS by kind, for the metrics' memory split: a handle that outlives `self`'s
+    /// move into the ports, read once a beat.
+    pub fn memory(&self) -> CefMemory {
+        self.shared.memory.clone()
     }
 
     /// The sample counts of generation `gen`'s builds, summed.
@@ -2496,6 +2524,11 @@ fn poll_children(shared: &Shared) {
             ));
         }
         *locked(&shared.last_guard) = g;
+        // This thread alone counts the polls, so this one is the count so far plus one.
+        shared.memory.set(CefPoll {
+            poll: shared.polls.load(Ordering::SeqCst) + 1,
+            pss: g.pss_by_kind,
+        });
         watch_poll(shared, &kids);
         log_unread_stats(shared, &mut unread_seen);
         let cap = shared.rss_cap_mb.load(Ordering::SeqCst);
@@ -4057,6 +4090,81 @@ mod tests {
         cond()
     }
 
+    // The soak's memory split, through the real child poll thread: absent before the first poll;
+    // then each poll's number and its PSS by kind. The fake's children are pids no process has, so
+    // no PSS is read: every kind stays absent (never a 0), with children listed.
+    #[test]
+    fn the_child_poll_hands_the_memory_split_its_number_and_pss_by_kind() {
+        let cef = FakeCef::with(vec![(FAKE_ROOT + 100, 0, None)]);
+        locked(&cef).now_us = 1_000;
+        let (tx, _rx) = crossbeam_channel::bounded(8);
+        let g = unit_adapter(unit_shared(tx, fake_tree_on(&cef, Box::new(monotonic_us))));
+        let memory = g.memory();
+        assert_eq!(memory.read(), None, "no poll yet: absent");
+        let shared = Arc::clone(&g.shared);
+        let poller = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || poll_children(&shared))
+        };
+        let polls = || shared.polls.load(Ordering::SeqCst);
+        assert!(
+            wait_until(Duration::from_millis(3 * CHILD_POLL_MS), || polls() >= 2),
+            "no second child poll"
+        );
+        let first = memory.read().expect("polled: the split has the poll");
+        assert!(
+            first.poll >= 2,
+            "the poll's number: {first:?} after {} polls",
+            polls()
+        );
+        assert_eq!(first.pss, CefPss::default(), "no PSS read: every kind absent");
+        let listed = g.last_guard().children;
+        assert_eq!(listed, 3, "two zygotes and a GPU process listed");
+        assert!(
+            wait_until(Duration::from_millis(3 * CHILD_POLL_MS), || polls() > first.poll),
+            "no later child poll"
+        );
+        let later = memory.read().expect("still polled");
+        assert!(later.poll > first.poll, "{later:?} after {first:?}");
+        shared.retired.store(true, Ordering::SeqCst);
+        assert!(
+            wait_until(Duration::from_millis(2 * CHILD_POLL_MS), || poller.is_finished()),
+            "the poll thread did not stop"
+        );
+        poller.join().expect("the poll thread panicked");
+        eprintln!(
+            "children listed: {listed}, polls read: {} then {}",
+            first.poll, later.poll
+        );
+    }
+
+    // The memory split's PSS by kind, from the guard's own reads: a real child (a `sleep` this test
+    // starts, listed as a renderer) has its PSS under `renderer`, counted once, and the same kB the
+    // guard's sum has; a child whose rollup is unreadable leaves its kind absent. Linux: `/proc`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_guard_buckets_each_childs_pss_under_its_type() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep starts");
+        let me = std::process::id() as i32;
+        let pid = child.id() as i32;
+        let kids = [
+            kid(pid, me, "renderer", None),
+            kid(FAKE_ROOT + 1, me, "gpu-process", None),
+        ];
+        let g = guard(&kids, |_| true);
+        let _ = child.kill();
+        let _ = child.wait();
+        let renderer = g.pss_by_kind.renderer.expect("the sleep's PSS was read");
+        assert_eq!(renderer.n, 1, "{g:?}");
+        assert!(renderer.kb > 0, "a live process has a PSS: {g:?}");
+        assert_eq!(g.pss_mb, renderer.kb / 1024, "the same reads as the sum: {g:?}");
+        assert_eq!(g.pss_by_kind.gpu_process, None, "unread: absent, never 0: {g:?}");
+        assert_eq!(g.children, 2);
+    }
+
     // The seam (Owed 70 (a)): the child poll's own thread runs the GPU watch between its polls. A
     // crash loop on the wall clock, between two polls, of C14's fast leg's length
     // (`CHROMIUM_GPU_DEATHS_ABORT` - 1 deaths): each relaunch is born `RELAUNCH_MS` after a death and
@@ -4280,6 +4388,7 @@ mod tests {
             builds: Mutex::new(BTreeMap::new()),
             reports: Mutex::new(BTreeMap::new()),
             last_guard: Mutex::new(Guarded::default()),
+            memory: CefMemory::default(),
             tree,
             watch,
             #[cfg(feature = "test-hooks")]
