@@ -2192,3 +2192,66 @@ named one cause, claimed a one-line fix and read as settled.
   or two frames (medium; costs 33 to 66 ms of latency), only if a measurement of the programme off a
   real Cloudflare input (the fake camera, once its mux holds nothing, into a CF Live Input, read
   by `input-tap`, `cadence_stages.py`'s input-stage sweep) shows judder worth that.
+
+## F-030: real overlay cost, first measurement: legs A and C on performance-4x (C15 cost run 40153136892, 2026-10-25), PARTIAL
+
+**Run:** https://github.com/onryde/seazn.club.compositor/actions/runs/40153136892. Four cost legs on
+performance-4x, each a 600 s drive: A (720p, `bar` on cricket) and C (1080p, `bar` on cricket), each
+once with the snow camera and once with noise. Method: `harness/soak/README.md`, "The cost legs"
+(a `/proc` sample a second from +15 s, the real web page and templates, a boundary every 6 s, one
+renderer kill at the midpoint). The table is `cost/table.sh`, the `cost-table` job's script, over the
+four legs' `cost.json` artifacts, in F-005's shape:
+
+| Leg | **A** 720p bar on cricket, noise, performance-4x | **A** 720p bar on cricket, snow, performance-4x | **C** 1080p bar on cricket, noise, performance-4x | **C** 1080p bar on cricket, snow, performance-4x |
+|---|---|---|---|---|
+| **Machine cores avg / p95 / max (of N)** | **1.348 / 1.451 / 1.694 (of 4; p95 36.275 %)** | **1.422 / 1.557 / 1.913 (of 4; p95 38.925 %)** | **1.596 / 1.752 / 2.009 (of 4; p95 43.8 %)** | **1.595 / 1.704 / 1.932 (of 4; p95 42.6 %)** |
+| Process tree cores avg | 1.252 | 1.33 | 1.531 | 1.511 |
+| …compositor (GStreamer host, CEF browser) | 1.197 | 1.268 | 1.469 | 1.462 |
+| …CEF renderer + gpu + utility + zygote | 0.031 + 0.022 + 0.001 + 0 | 0.035 + 0.026 + 0.001 + 0 | 0.035 + 0.025 + 0.002 + 0 | 0.028 + 0.02 + 0.001 + 0 |
+| …Xvfb | 0 | 0 | 0 | 0 |
+| The sampler itself / the rest | 0.049 / 0.003 | 0.053 / 0.003 | 0.05 / 0.003 | 0.083 / 0.003 |
+| Busiest compositor thread, p95 / max | pool-compositor 0.14 / 0.18 | queue0:src 0.14 / 0.2 | queue0:src 0.18 / 0.21 | queue0:src 0.2 / 0.21 |
+| Encoder speed, median / worst beat | 1 / 1 | 1 / 0.967 | 1 / 0.967 | 1 / 0.967 |
+| Output fps, median beat | 30 | 30 | 30 | 30 |
+| Final droppedFrames | 0 | 0 | 0 | 0 |
+| Rungs (beats) | full 126 | full 126 | full 126 | full 125 |
+| Moments (by the page's feed), a minute; longest gap, s | 100, 9.983/min; 6.892 | 100, 9.983/min; 6.885 | 100, 9.983/min; 6.872 | 100, 10/min; 6.004 |
+| Renderer kill, s into the drive / cef crashed, then cef ready N+1, s after it (compositor log) | 299.92 / 0.023, 5.197 (1 crash) | 300.401 / 0.027, 5.233 (1 crash) | 299.984 / 0.009, 4.221 (1 crash) | 300.345 / 0.016, 4.252 (1 crash) |
+| Live renderers before / after the kill (max) | 1 / 1 | 1 / 1 | 1 / 1 | 1 / 1 |
+| Stills written / asked | 8 / 8 | 8 / 8 | 8 / 8 | 8 / 8 |
+| Machine memory used, max MB | 735 | 740 | 781 | 792 |
+| Samples / expected | 586 / 586 | 586 / 586 | 586 / 586 | 585 / 585 |
+| Owed 93: p95 + two held pages (2 × renderer) vs the size rule | 1.513 vs 2 (within) | 1.626 vs 2 (within) | 1.821 vs 2 (within) | 1.76 vs 2 (within) |
+| **Size rule verdict** | **FAIL**: reload | **PASS** | **FAIL**: reload | **PASS** |
+
+**CPU, rung, drops: within the size rule on all four.** The Machine's p95 is 1.451 to 1.752 cores of
+4 (36 % to 44 %, against 50 %). Every beat is `full` and the final `droppedFrames` is 0. The busiest
+compositor thread peaks at 0.21 cores, so no single thread is near a core.
+
+**The two reload reds are the harness's timing, not the product.** A:noise read `the kill came
+-0.08 s from the midpoint` and C:noise `-0.016 s`. In both, the compositor logged exactly one
+`cef crashed`, 0.023 s and 0.009 s after the kill, and the new page's `cef ready` 5.197 s and
+4.221 s after it, as on the two passing legs (5.233 s and 4.252 s). The kill landed early because
+`leg.sh`'s midpoint wait ended up to 999 ms early, by an integer division, on the runner's clock.
+PR #81 moves the decision to the compositor Machine's clock (`harness/soak/README.md` finding 18).
+
+**Snow against noise: no consistent heavier camera.** At 720p snow is heavier (p95 1.557 against
+1.451); at 1080p noise is (1.752 against 1.704). Both gaps are about 0.1 core or less.
+
+**Owed 93** (two held pages at the live renderer's cost) is within the size rule on all four: at
+most 1.821 against 2.0, on C:noise.
+
+**Against F-005:** F-005's chain read a p95 of 0.902 (720p) and 1.193 (1080p) on the ball camera
+with the test page. The camera, the page and the process differ, so the 0.5 to 0.6 core gap is not
+the overlay's cost alone.
+
+**Still owed:**
+- Legs B and D (`bug` on badminton, a rally every 3 s), after PR #81.
+- The size verdict for performance-4x needs all four legs passing. A:noise and C:noise passed every
+  check but the kill's timing, so they want a re-run after PR #81.
+- The stills: 8 of 8 written per leg, not yet looked at for this entry.
+
+**Teardown:** done. Each leg's "Destroy every Machine" step succeeded, and `flyctl machine list -a
+seazn-relay-soak` was empty on 2026-10-25. The `cost-table` job was green.
+
+---

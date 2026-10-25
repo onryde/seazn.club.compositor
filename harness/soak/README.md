@@ -323,7 +323,8 @@ renderer cores to its p95 and compares it with the size rule. Its row is on `mai
 Owed 93, since #71), and closes from these numbers.
 
 **Owed after the runs:** the F-entry "real overlay cost" in `_FINDINGS.md` (the table, both
-patterns per profile, the sport reason or the football leg), and Owed 93's closure.
+patterns per profile, the sport reason or the football leg), and Owed 93's closure. F-030 holds the
+first measurement, legs A and C from run 40153136892. Legs B and D are still owed.
 
 ## Findings (the brief's premises that did not hold)
 
