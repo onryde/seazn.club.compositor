@@ -26,7 +26,10 @@
 //!   never return` and each held teardown's `WARN test hook (Owed 82) gen=<g>: this CEF teardown
 //!   never returns (<left> more to hold)`; the reaper's `WARN gen=<g>: teardown has not returned
 //!   after <ms> ms; SIGKILL sent to renderer pids [..] (of [..])` and its leak count
-//!   `WARN gen=<g>: teardown still has not returned <ms> ms after the kill: … (<n> leaked; Owed 55)`.
+//!   `WARN gen=<g>: teardown still has not returned <ms> ms after the kill: … (<n> leaked; Owed 55)`;
+//! - `adapters::gst_programme` (C14 case 18, Owed 94), from a `test-hooks` build: the arming line
+//!   `WARN test hook (Owed 94): sink gen=1 stalls (<hold|hang>) <ms> ms after its build` and the
+//!   plant `WARN test hook (Owed 94): sink stall=<hold|hang> gen=1 planted=<true|false>`.
 use serde::Serialize;
 
 use crate::clock::{log_ts_ms, rfc3339_utc_ms};
@@ -92,7 +95,13 @@ pub fn parse_line(line: &str) -> LogLine<'_> {
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct GenAt {
+    /// The line's stamp ([`LogLine::at_ms`]): docker's, else `ts=`.
     pub at_ms: i64,
+    /// The process's own `ts=` (every formatted line has one): the clock its timers run on, so an
+    /// interval the product counts (a back-off) is judged on it. Docker stamps each line as it reads
+    /// it, one by one, so two of its stamps can sit closer than the product put the lines (the PR
+    /// #73 confirm pass's b-1: 499.38 ms for a 500 ms back-off).
+    pub ts_ms: i64,
     pub gen: u64,
 }
 
@@ -104,7 +113,8 @@ pub struct Hidden {
 }
 
 /// `sink swap reason=<r> gen=<g>`: why generation g was built (the domain's `SwapReason`, named
-/// `first`, `error` or `connect_timeout` by the driver; Owed 87 retired `stall`).
+/// `first`, `error`, `connect_timeout` or `egress_stalled` (Owed 94) by the driver; Owed 87 retired
+/// `stall`).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SwapReasonLine {
     pub at_ms: i64,
@@ -136,6 +146,26 @@ pub struct HeldTeardown {
     pub at_ms: i64,
     pub gen: u64,
     pub left: u64,
+}
+
+/// `WARN test hook (Owed 94): sink gen=1 stalls (<hold|hang>) <ms> ms after its build`: a
+/// `test-hooks` build armed the output-hung stall (case 18's precondition).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SinkStallArmed {
+    pub at_ms: i64,
+    pub stall: String,
+    pub after_ms: u64,
+}
+
+/// `WARN test hook (Owed 94): sink stall=<hold|hang> gen=1 planted=<true|false>`: the stall's moment
+/// came, and whether it went in on sink 1. Case 18's fault, timed on `ts_ms`, the process's own
+/// stamp, as the swap it causes is (both are the product's intervals; [`GenAt::ts_ms`]).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SinkStallPlanted {
+    pub at_ms: i64,
+    pub ts_ms: i64,
+    pub stall: String,
+    pub planted: bool,
 }
 
 /// `WARN gen=<g>: teardown has not returned after <ms> ms; SIGKILL sent to renderer pids [..] (of
@@ -220,6 +250,10 @@ pub struct LogFacts {
     pub reaper_kills: Vec<ReaperKill>,
     /// Each teardown counted leaked, with the count at once.
     pub teardown_leaks: Vec<TeardownLeak>,
+    /// Owed 94's arming line (a `test-hooks` build; case 18's precondition).
+    pub sink_stall_armed: Vec<SinkStallArmed>,
+    /// Owed 94's plant (case 18's fault).
+    pub sink_stall_planted: Vec<SinkStallPlanted>,
     /// Chromium's abort line (`GPU process isn't usable`).
     pub gpu_unusable: Vec<i64>,
     pub exits: Vec<Exit>,
@@ -310,6 +344,39 @@ fn armed(msg: &str, at_ms: i64) -> Option<Armed> {
     Some(Armed { at_ms, n: num(n)? })
 }
 
+/// The stall's word, `hold` or `hang` (gst_programme.rs's `stall_name`).
+fn stall_word(s: &str) -> Option<String> {
+    matches!(s, "hold" | "hang").then(|| s.to_owned())
+}
+
+fn sink_stall_armed(msg: &str, at_ms: i64) -> Option<SinkStallArmed> {
+    let (stall, rest) = msg
+        .strip_prefix("WARN test hook (Owed 94): sink gen=1 stalls (")?
+        .split_once(") ")?;
+    let ms = rest.strip_suffix(" ms after its build")?;
+    Some(SinkStallArmed {
+        at_ms,
+        stall: stall_word(stall)?,
+        after_ms: num(ms)?,
+    })
+}
+
+fn sink_stall_planted(msg: &str, at_ms: i64, ts_ms: i64) -> Option<SinkStallPlanted> {
+    let (stall, planted) = msg
+        .strip_prefix("WARN test hook (Owed 94): sink stall=")?
+        .split_once(" gen=1 planted=")?;
+    Some(SinkStallPlanted {
+        at_ms,
+        ts_ms,
+        stall: stall_word(stall)?,
+        planted: match planted {
+            "true" => true,
+            "false" => false,
+            _ => return None,
+        },
+    })
+}
+
 fn held(msg: &str, at_ms: i64) -> Option<HeldTeardown> {
     let (g, rest) = msg
         .strip_prefix("WARN test hook (Owed 82) gen=")?
@@ -391,10 +458,10 @@ pub fn log_facts(text: &str) -> LogFacts {
         if m.contains("GPU process isn't usable") {
             f.gpu_unusable.push(at_ms);
         }
-        if !l.formatted {
+        let (true, Some(ts_ms)) = (l.formatted, l.ts_ms) else {
             continue;
-        }
-        let ga = |g| GenAt { at_ms, gen: g };
+        };
+        let ga = |g| GenAt { at_ms, ts_ms, gen: g };
         if m.starts_with("compositor started ") {
             f.boots.push(at_ms);
         } else if m == "programme started" {
@@ -444,6 +511,10 @@ pub fn log_facts(text: &str) -> LogFacts {
             f.reaper_kills.push(r);
         } else if let Some(l) = teardown_leak(m, at_ms) {
             f.teardown_leaks.push(l);
+        } else if let Some(a) = sink_stall_armed(m, at_ms) {
+            f.sink_stall_armed.push(a);
+        } else if let Some(p) = sink_stall_planted(m, at_ms, ts_ms) {
+            f.sink_stall_planted.push(p);
         } else if let Some((g, what)) = dispatcher(m) {
             match what {
                 "page console: hang starts" => f.page_hangs.push(ga(g)),
@@ -564,6 +635,7 @@ mod tests {
             f.page_hangs,
             vec![GenAt {
                 at_ms: NOON_MS + 6_000,
+                ts_ms: NOON_MS,
                 gen: 1
             }]
         );
@@ -587,6 +659,7 @@ mod tests {
             f.graphics_restart,
             vec![GenAt {
                 at_ms: NOON_MS + 17_000,
+                ts_ms: NOON_MS,
                 gen: 2
             }]
         );
@@ -602,6 +675,7 @@ mod tests {
             f.sink_swaps,
             vec![GenAt {
                 at_ms: NOON_MS + 22_000,
+                ts_ms: NOON_MS,
                 gen: 2
             }]
         );
@@ -617,6 +691,153 @@ mod tests {
         assert_eq!(f.killed[0].status, 133);
         assert_eq!(f.gpu_unusable, vec![NOON_MS + 500]);
         eprintln!("log lines checked: {}", f.lines);
+    }
+
+    // PR #71's CI run 40137725801 (the PR #73 confirm pass's b-1): the error and the swap the
+    // back-off later, as docker stamped them (read one line at a time, 499.38 ms apart) and as the
+    // process stamped them itself (500 ms apart, the clock its back-off runs on). A fact carries both.
+    #[test]
+    fn a_generation_fact_carries_the_processs_own_stamp_beside_dockers() {
+        let log = "2026-10-24T22:20:28.138389528Z ts=2026-10-24T22:20:28.137Z level=info \
+                   msg=output gen=1 error: Connection error: Socket I/O timed out (x)\n\
+                   2026-10-24T22:20:28.637769066Z ts=2026-10-24T22:20:28.637Z level=info \
+                   msg=sink swap gen=2 target=rtmp://mediamtx:1935/live/****\n";
+        let f = log_facts(log);
+        let ms = |s: &str| rfc3339_utc_ms(s).unwrap();
+        let got = [f.output_errors.as_slice(), f.sink_swaps.as_slice()]
+            .concat()
+            .iter()
+            .map(|g| (g.gen, g.at_ms, g.ts_ms))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            got,
+            vec![
+                (1, ms("2026-10-24T22:20:28.138Z"), ms("2026-10-24T22:20:28.137Z")),
+                (2, ms("2026-10-24T22:20:28.637Z"), ms("2026-10-24T22:20:28.637Z")),
+            ]
+        );
+        assert_eq!((got[1].1 - got[0].1, got[1].2 - got[0].2), (499, 500));
+    }
+
+    /// Case 18's lines (Owed 94's hook; `adapters::gst_programme`): the arming line and the plant,
+    /// each by its exact shape, the plant with the process's own stamp (the case's clock).
+    #[test]
+    fn case_18s_hook_lines_are_read_by_their_exact_shape() {
+        let mut log = String::new();
+        let lines = [
+            (
+                0,
+                "WARN test hook (Owed 94): sink gen=1 stalls (hold) 25000 ms after its build",
+            ),
+            (
+                100,
+                "WARN test hook (Owed 94): sink gen=1 stalls (hang) 7 ms after its build",
+            ),
+            (
+                25_000,
+                "WARN test hook (Owed 94): sink stall=hold gen=1 planted=true",
+            ),
+            (
+                25_100,
+                "WARN test hook (Owed 94): sink stall=hang gen=1 planted=false",
+            ),
+            // Near misses: none is one of these facts.
+            (
+                26_000,
+                "WARN test hook (Owed 94): sink gen=1 stalls (sleep) 25000 ms after its build",
+            ),
+            (
+                26_100,
+                "WARN test hook (Owed 94): sink gen=1 stalls (hold) +25 ms after its build",
+            ),
+            (
+                26_200,
+                "WARN test hook (Owed 94): sink gen=2 stalls (hold) 25 ms after its build",
+            ),
+            (
+                26_300,
+                "WARN test hook (Owed 94): sink gen=1 stalls (hold) 25 ms after its build now",
+            ),
+            (26_400, "test hook (Owed 94): sink stall=hold gen=1 planted=true"),
+            (
+                26_500,
+                "WARN test hook (Owed 94): sink stall=hold gen=1 planted=yes",
+            ),
+            (
+                26_600,
+                "WARN test hook (Owed 94): sink stall=held gen=1 planted=true",
+            ),
+            (
+                26_700,
+                "WARN test hook (Owed 94): sink stall=hold gen=2 planted=true",
+            ),
+            (
+                26_800,
+                "gen=1: page console: WARN test hook (Owed 94): sink stall=hold gen=1 planted=true",
+            ),
+        ];
+        for (at, m) in lines {
+            log.push_str(&line(at, m));
+        }
+        let f = log_facts(&log);
+        assert_eq!(
+            f.sink_stall_armed,
+            vec![
+                SinkStallArmed {
+                    at_ms: NOON_MS,
+                    stall: "hold".into(),
+                    after_ms: 25_000
+                },
+                SinkStallArmed {
+                    at_ms: NOON_MS + 100,
+                    stall: "hang".into(),
+                    after_ms: 7
+                }
+            ]
+        );
+        assert_eq!(
+            f.sink_stall_planted,
+            vec![
+                SinkStallPlanted {
+                    at_ms: NOON_MS + 25_000,
+                    ts_ms: NOON_MS,
+                    stall: "hold".into(),
+                    planted: true
+                },
+                SinkStallPlanted {
+                    at_ms: NOON_MS + 25_100,
+                    ts_ms: NOON_MS,
+                    stall: "hang".into(),
+                    planted: false
+                }
+            ]
+        );
+        // The producers, each once, in the adapter's source: a reworded line reds here, not on CI.
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../adapters/src/gst_programme.rs"
+        ))
+        .expect("gst_programme.rs");
+        let mut pinned = 0;
+        for producer in [
+            "\"WARN test hook (Owed 94): sink gen=1 stalls ({}) {} ms after its build\"",
+            "\"WARN test hook (Owed 94): sink stall={} gen=1 planted={planted}\"",
+            "SinkStall::Hold => \"hold\",",
+            "SinkStall::Hang => \"hang\",",
+        ] {
+            assert_eq!(
+                src.matches(producer).count(),
+                1,
+                "gst_programme.rs's line changed: update logfacts ({producer})"
+            );
+            pinned += 1;
+        }
+        let read = f.sink_stall_armed.len() + f.sink_stall_planted.len();
+        eprintln!(
+            "log lines checked: {}, producers pinned: {pinned}, facts read: {read}",
+            f.lines
+        );
+        assert_eq!((f.lines, pinned, read), (lines.len() as u64, 4, 4));
     }
 
     /// An output sink's bus error (C14 fix round 3, item 2): the line a swap's cause is read from.
@@ -653,10 +874,12 @@ mod tests {
             vec![
                 GenAt {
                     at_ms: NOON_MS + 5_750,
+                    ts_ms: NOON_MS,
                     gen: 1
                 },
                 GenAt {
                     at_ms: NOON_MS + 11_270,
+                    ts_ms: NOON_MS,
                     gen: 2
                 }
             ]
@@ -690,6 +913,7 @@ mod tests {
             (37_067, "sink swap reason=connect_timeout gen=3"),
             (37_067, "sink swap gen=3 target=rtmp://mediamtx:1935/live/****"),
             (40_000, "sink swap reason=error gen=4"),
+            (50_000, "sink swap reason=egress_stalled gen=5"), // Owed 94's backstop
             // Near misses: none is a reason line.
             (41_000, "sink swap reason=error gen=x"),
             (41_100, "sink swap reason= gen=5"),
@@ -712,7 +936,8 @@ mod tests {
                 (0, 1, "first"),
                 (31_066, 2, "error"),
                 (37_067, 3, "connect_timeout"),
-                (40_000, 4, "error")
+                (40_000, 4, "error"),
+                (50_000, 5, "egress_stalled")
             ]
         );
         assert_eq!(
@@ -720,8 +945,8 @@ mod tests {
             vec![1, 2, 3],
             "a reason line is not a swap line"
         );
-        // The producer's own format and its three names, so the parser and the line cannot drift
-        // apart unseen; and not the name Owed 87 retired.
+        // The producer's own format and its four names (Owed 94 added the backstop's), so the parser
+        // and the line cannot drift apart unseen; and not the name Owed 87 retired.
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../app/src/driver.rs"))
             .expect("driver.rs");
         assert_eq!(
@@ -733,6 +958,7 @@ mod tests {
             ("First", "first"),
             ("Error", "error"),
             ("ConnectTimeout", "connect_timeout"),
+            ("EgressStalled", "egress_stalled"),
         ];
         for (variant, name) in names {
             assert!(
@@ -787,10 +1013,12 @@ mod tests {
             vec![
                 GenAt {
                     at_ms: NOON_MS + 100,
+                    ts_ms: NOON_MS,
                     gen: 1
                 },
                 GenAt {
                     at_ms: NOON_MS + 20_010,
+                    ts_ms: NOON_MS,
                     gen: 2
                 }
             ]

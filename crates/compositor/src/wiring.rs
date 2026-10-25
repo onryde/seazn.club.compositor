@@ -442,7 +442,8 @@ fn live_media(t: &Thresholds, tx: &Sender<Inbound>, log: &Logger, hooks: &TestHo
     let graphics = CefGraphics::new(frames.clone(), tx.clone(), cef_fps(), t.cef_rss_cap_mb)
         .with_log(log.adapter_sink());
     arm_test_hooks(&graphics, hooks);
-    let programme = GstProgramme::new(frames.clone(), tx.clone()).with_log(log.adapter_sink());
+    let mut programme = GstProgramme::new(frames.clone(), tx.clone()).with_log(log.adapter_sink());
+    arm_programme_hooks(&mut programme, hooks);
     let stats = programme.stats();
     let slot = ProfileSlot::default();
     let (input_tx, input_log, input_t) = (tx.clone(), log.clone(), t.clone());
@@ -472,6 +473,25 @@ fn arm_test_hooks(graphics: &CefGraphics, hooks: &TestHooks) {
 /// A build without the feature has no hook to arm.
 #[cfg(not(feature = "test-hooks"))]
 fn arm_test_hooks(_: &CefGraphics, _: &TestHooks) {}
+
+/// Owed 94: a `test-hooks` build plants the sink stall its environment asked for on sink
+/// generation 1; the adapter's lines saying so are C14's witness and the case's clock.
+#[cfg(feature = "test-hooks")]
+fn arm_programme_hooks(programme: &mut GstProgramme, hooks: &TestHooks) {
+    use crate::env::SinkStallHook;
+    use adapters::gst_programme::SinkStall;
+    if let Some((stall, after_ms)) = hooks.sink_stall {
+        let stall = match stall {
+            SinkStallHook::Hold => SinkStall::Hold,
+            SinkStallHook::Hang => SinkStall::Hang,
+        };
+        programme.stall_first_sink(stall, std::time::Duration::from_millis(after_ms));
+    }
+}
+
+/// A build without the feature has no hook to arm.
+#[cfg(not(feature = "test-hooks"))]
+fn arm_programme_hooks(_: &mut GstProgramme, _: &TestHooks) {}
 
 fn fake_media(env: &Env) -> Media {
     let calls = Log::default();

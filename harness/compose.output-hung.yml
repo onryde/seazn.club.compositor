@@ -1,0 +1,21 @@
+# Case 18 (harness/cases/output-hung.sh) only, added to compose.yml by run-case.sh (CASE_COMPOSE).
+# The compositor is asked to stall output sink 1 some ms after its build (Owed 94, the owner,
+# 2026-10-24, "B": the hook in crates/adapters/src/gst_programme.rs's `stall_first_sink`, compiled
+# in only by the Dockerfile's `relay-test-hooks` stage): COMPOSITOR_TEST_HOLD_SINK_AFTER_MS holds
+# its writes, COMPOSITOR_TEST_HANG_SINK_AFTER_MS hangs its streaming thread. The case sets one and
+# leaves the other empty (the compositor reads empty as unset, and refuses both set: exit 78), and
+# points RELAY_IMAGE at that image (RELAY_TEST_HOOKS_IMAGE); the relay image ignores the variables,
+# and the case's `armed` check then fails (its arming line is a required precondition).
+#
+# Here and not in compose.yml, so no other leg's compositor sees the variables at all; `?`, so a
+# case that forgot to set one (even empty) refuses to start rather than run unarmed.
+services:
+  compositor:
+    environment:
+      COMPOSITOR_TEST_HOLD_SINK_AFTER_MS: ${COMPOSITOR_TEST_HOLD_SINK_AFTER_MS?case 18 sets the hold (or leaves it empty)}
+      COMPOSITOR_TEST_HANG_SINK_AFTER_MS: ${COMPOSITOR_TEST_HANG_SINK_AFTER_MS?case 18 sets the hang (or leaves it empty)}
+  # MediaMTX closes a publisher idle for its readTimeout (10 s by default in 1.21.2), inside the
+  # backstop's window (the PR #76 review's I-1): case 18 raises it, derived in output-hung.sh.
+  mediamtx:
+    environment:
+      MTX_READTIMEOUT: ${OUTPUT_HUNG_MTX_READTIMEOUT:?case 18 derives MediaMTX's readTimeout}

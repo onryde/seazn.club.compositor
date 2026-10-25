@@ -889,3 +889,70 @@ fn test_hook_a_build_without_the_feature_arms_nothing() {
     eprintln!("hook runs checked: {checked}");
     assert_eq!(checked, 2, "anti-vacuity");
 }
+
+// ---- Owed 94: the sink-stall test hook ----
+
+/// Owed 94 (the owner, 2026-10-24, "B"), the `test-hooks` binary: a live run arms the sink stall
+/// either key asks for, in one line (C14's output-hung witness); both keys at once exit 78 before
+/// the loop.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn test_hook_a_live_run_arms_the_sink_stall_it_is_given() {
+    let _s = serial();
+    let mut checked = 0;
+    for (key, word) in [
+        ("COMPOSITOR_TEST_HOLD_SINK_AFTER_MS", "hold"),
+        ("COMPOSITOR_TEST_HANG_SINK_AFTER_MS", "hang"),
+    ] {
+        let mut v = live_env(None);
+        v.push((key, "12000".to_owned()));
+        let run = Run::spawn(&v);
+        run.wait_line("msg=compositor started drivers=live", Duration::from_secs(20))
+            .unwrap_or_else(|| panic!("{key}: never started:\n{}", run.stderr()));
+        assert_no_secret(&run);
+        let lines: Vec<String> = run
+            .stderr()
+            .lines()
+            .filter(|l| l.contains("test hook"))
+            .map(str::to_owned)
+            .collect();
+        let want = format!("WARN test hook (Owed 94): sink gen=1 stalls ({word}) 12000 ms after its build");
+        assert_eq!(lines.len(), 1, "{key}: {lines:?}");
+        assert!(lines[0].ends_with(&want), "{key}: {lines:?}");
+        checked += 1;
+    }
+    let mut v = live_env(None);
+    v.push(("COMPOSITOR_TEST_HOLD_SINK_AFTER_MS", "12000".to_owned()));
+    v.push(("COMPOSITOR_TEST_HANG_SINK_AFTER_MS", "12000".to_owned()));
+    let mut run = Run::spawn(&v);
+    let (code, _) = run.wait_exit(Duration::from_secs(10));
+    assert_eq!(code, Some(78), "{}", run.stderr());
+    let e = run.stderr();
+    assert!(
+        e.contains("msg=COMPOSITOR_TEST_HANG_SINK_AFTER_MS is not a valid value"),
+        "{e}"
+    );
+    assert!(
+        !e.contains("compositor started") && !e.contains("test hook"),
+        "{e}"
+    );
+    checked += 1;
+    eprintln!("sink-stall hook runs checked: {checked}");
+    assert_eq!(checked, 3, "anti-vacuity");
+}
+
+/// Owed 94: the binary built without the feature (the release image's) plants no sink stall and
+/// says nothing of the keys, whatever they are set to.
+#[cfg(not(feature = "test-hooks"))]
+#[test]
+fn test_hook_a_build_without_the_feature_plants_no_sink_stall() {
+    let _s = serial();
+    let mut v = live_env(None);
+    v.push(("COMPOSITOR_TEST_HOLD_SINK_AFTER_MS", "12000".to_owned()));
+    v.push(("COMPOSITOR_TEST_HANG_SINK_AFTER_MS", "ten".to_owned()));
+    let run = Run::spawn(&v);
+    run.wait_line("msg=compositor started drivers=live", Duration::from_secs(20))
+        .unwrap_or_else(|| panic!("never started:\n{}", run.stderr()));
+    let e = run.stderr();
+    assert!(!e.contains("test hook") && !e.contains("SINK_AFTER_MS"), "{e}");
+}

@@ -9,6 +9,7 @@ use domain::health::{BeatState, ExitDetail, GraphicsStatus};
 use domain::input_link::LossReason;
 use domain::ladder::Rung;
 use domain::lifecycle::{ExitReason, Lifecycle};
+use domain::output_link::Encoded;
 use domain::programme::{FrameChoice, ProgrammePhase, SlateKind};
 use domain::supervisor::{Desired, Effect, Event, HeartbeatRefusal, SignalKind, Supervisor};
 use domain::time::Ms;
@@ -57,6 +58,7 @@ fn event_for(kind: u8, s: &Supervisor, h: &mut Harness) -> Event {
             Event::OutputProgress {
                 gen: s.output_generation(),
                 total_bytes: h.sent,
+                encoded: Encoded::default(),
             }
         }
         13 => Event::CefReady {
@@ -433,6 +435,7 @@ fn resolve(ev: Ev, s: &Supervisor, sent: &mut u64) -> Event {
             Event::OutputProgress {
                 gen: s.output_generation(),
                 total_bytes: *sent,
+                encoded: Encoded::default(),
             }
         }
         Ev::Connected => Event::InputConnected {

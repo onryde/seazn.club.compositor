@@ -1,14 +1,16 @@
 //! Programme push link (RTMPS to CF Input B): a sink is Connected at its first growth at least
 //! `output_connected_after_ms` after its first growth, with no error between (a silence between is
-//! no failure since Owed 87); swap it on its error; back off 0.5 s → 2 s between
-//! failed attempts; ignore every other generation.
+//! no failure since Owed 87 while the encoders starve or are unread; with both delivering, a silence
+//! of `output_egress_flat_ms` is the backstop's, Owed 94); swap it on its error, or when its egress
+//! stays flat while the encoders deliver; back off 0.5 s → 2 s between failed attempts; ignore every
+//! other generation.
 //!
 //! ```text
 //! Backoff --due tick: build--> Connecting --first growth--> Proving --growth >= the bound--> Connected
 //!  ^  ^  ^                         |                           |                                |
 //!  |  |  +-- timeout, or error ----+                           |                                |
-//!  |  +-- error: one more failure -----------------------------+                                |
-//!  +-- error: failure 1 (Connected reset the count) --------------------------------------------+
+//!  |  +-- error, or egress flat: one more failure -------------+                                |
+//!  +-- error, or egress flat: failure 1 (Connected reset the count) ----------------------------+
 //! ```
 //!
 //! - **Liveness is bytes SENT, never bytes acked.** F-005: CF Input B sends no RTMP acknowledgements
@@ -23,14 +25,25 @@
 //!   growth at least `output_connected_after_ms` after its first growth. An error ends the window
 //!   first, and then the sink never connected.
 //! - **The connect timeout** (`output_connect_timeout_ms`; rtmp2sink's "Socket I/O timed out", F-004
-//!   rerun 1) runs from the build to the first growth. It is the link's only timer on a sink.
-//! - **No stall rule** (Owed 87; the owner, 2026-10-24, "A"). Once bytes flow, a sink ends only by its
-//!   own error. A destination that stops taking bytes fails the sink's socket wait after
-//!   `OUTPUT_SINK_TIMEOUT_MS` (rtmp2sink's `timeout`, which C09 sets), and that error is the swap's
-//!   cause. The retired rule ("no growth for 5 s") timed the same gap from the same write: rtmp2 counts
-//!   a message only once all of it is written, and the socket's wait won 17 of 17 CI stalls. A sink
-//!   whose total stops growing with no error (its feed stopped upstream, or a hang inside rtmp2sink) is
-//!   no longer swapped here: docs/_INDEX.md Owed 87 records that trade.
+//!   rerun 1) runs from the build to the first growth; the egress backstop runs after it.
+//! - **No stall rule** (Owed 87; the owner, 2026-10-24, "A"). A destination that stops taking bytes
+//!   fails the sink's socket wait after `OUTPUT_SINK_TIMEOUT_MS` (rtmp2sink's `timeout`, which C09
+//!   sets), and that error is the swap's cause. The retired rule ("no growth for 5 s") timed the same
+//!   gap from the same write: rtmp2 counts a message only once all of it is written, and the socket's
+//!   wait won 17 of 17 CI stalls. Except the multi-wake trickle (the PR #73 review's P-3): a
+//!   destination that drains each message across several waits, each under the timeout, never errors,
+//!   and there the backstop below is the only detector.
+//! - **The egress backstop** (Owed 94; the owner, 2026-10-24, "B"). A Proving or Connected sink whose
+//!   total has not grown for `output_egress_flat_ms` while both encoders kept delivering is swapped
+//!   (`SwapReason::EgressStalled`): a hang inside the output pipeline that no sink error reports. The
+//!   clock runs from the later of the sink's last growth and the start of the encoders' current run
+//!   of delivery, so feed starvation (encoders that deliver nothing) never counts, and it is time, not
+//!   a count of readings: readings that stop altogether leave it running. A reading the full channel
+//!   dropped that carried no growth changes nothing; one that carried growth leaves the last growth
+//!   older, so the backstop can fire up to a poll early for each (the PR #76 review's m-6). It starts
+//!   again with each sink. It fires after the sink's own error would when one socket wait outlasts the
+//!   timeout (`config`'s ordering test), so a stall rtmp2sink reports is still that error's; a
+//!   multi-wake trickle, which never errors, is the backstop's alone.
 //! - **Back-off.** Every end before Connected is one more consecutive failure: a connect that times
 //!   out, or an error. Failure number f waits `delay(f - 1)`: 0.5, 1, 2, 2 s. It never gives up.
 //!   **Only Connected resets it**: an error from Connected is failure 1 again.
@@ -41,9 +54,9 @@
 //!   connect, not two: `tests/links.rs` measures every recovery path, and docs/_INDEX.md records the
 //!   paths that exceed it. The gap ends when the new sink's bytes flow, not when it is Connected.
 //! - **Every build carries its reason** (`SwapReason`, Owed 87): what ended the sink before it. An
-//!   error is the sink's own (rtmp2sink's socket timeout among them); the connect timeout is this
-//!   module's rule. A build after a back-off carries the failure that started it, and the first build
-//!   carries `First`.
+//!   error is the sink's own (rtmp2sink's socket timeout among them); the connect timeout and the
+//!   egress backstop are this module's rules. A build after a back-off carries the failure that
+//!   started it, and the first build carries `First`.
 use crate::backoff::delay;
 use crate::config::Thresholds;
 use crate::time::{elapsed, Ms};
@@ -61,7 +74,7 @@ pub enum OutputState {
         first_progress: Ms,
         sent: u64,
     },
-    /// The sink earned Connected. Only its error ends it.
+    /// The sink earned Connected. Its error ends it, or the egress backstop (Owed 94).
     Connected,
     /// `attempt` consecutive failures so far; the next sink is built at the first tick at or after
     /// `until`.
@@ -78,6 +91,25 @@ pub enum SwapReason {
     Error,
     /// The sink before it sent no byte within `output_connect_timeout_ms` of its build.
     ConnectTimeout,
+    /// The sink before it sent nothing new for `output_egress_flat_ms` while both encoders delivered
+    /// (Owed 94): a hang inside the output pipeline that no sink error reported.
+    EgressStalled,
+}
+
+/// What the encoders have delivered: per track, the encoded samples pushed into the ring so far (C09
+/// counts them for the whole programme, so the totals outlive a sink). Only growth is read: a reading
+/// where both grew since the one before shows the encoders delivering (Owed 94).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Encoded {
+    pub video: u64,
+    pub audio: u64,
+}
+
+/// The current sink's highest total and when it last grew: the egress backstop's clock (Owed 94).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Egress {
+    high: u64,
+    grew_at: Ms,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +120,14 @@ pub struct OutputLink {
     built_for: SwapReason,
     /// What ended the last sink: the reason the next build carries.
     ended: SwapReason,
+    /// The current sink's egress since its first growth; `None` until then, and after each build.
+    egress: Option<Egress>,
+    /// The encoders' totals at the last reading accepted (one from the generation current then). A
+    /// build resets neither this nor `delivering_since`: the totals are the programme's and outlive a
+    /// sink, so a new sink's first reading compares with its predecessor's last.
+    encoded: Option<Encoded>,
+    /// Since when every reading has shown both encoders delivering; `None` after one that did not.
+    delivering_since: Option<Ms>,
 }
 
 impl Default for OutputLink {
@@ -104,6 +144,9 @@ impl OutputLink {
             generation: 0,
             built_for: SwapReason::First,
             ended: SwapReason::First,
+            egress: None,
+            encoded: None,
+            delivering_since: None,
         }
     }
 
@@ -126,11 +169,24 @@ impl OutputLink {
     }
 
     /// The current sink's bytes-sent total, counted from 0 when the sink was built (C09: rtmp2sink
-    /// `out-bytes-total`). Only a total above the highest one reported counts as progress, and only
-    /// until the sink is Connected: after that nothing reads it.
+    /// `out-bytes-total`). Only a total above the highest one reported counts as progress: it starts
+    /// and proves the sink, and restarts the egress backstop's clock (Owed 94).
     pub fn on_progress(&mut self, now: Ms, gen: u64, total_bytes: u64, t: &Thresholds) {
         if gen != self.generation {
             return;
+        }
+        let grew = match self.state {
+            OutputState::Connecting { .. } | OutputState::Proving { .. } | OutputState::Connected => {
+                total_bytes > self.egress.map_or(0, |e| e.high)
+            }
+            // The sink failed: its late bytes change nothing.
+            OutputState::Backoff { .. } => false,
+        };
+        if grew {
+            self.egress = Some(Egress {
+                high: total_bytes,
+                grew_at: now,
+            });
         }
         self.state = match self.state {
             // A new sink counts from 0: its first growth starts the proof, and never connects it.
@@ -176,6 +232,24 @@ impl OutputLink {
         self.back_off(now, failed_before, t, SwapReason::Error);
     }
 
+    /// The encoders' totals, read with the current sink's total (C09's poll). A reading where both
+    /// tracks grew since the last one continues (or starts) the encoders' run of delivery; any other
+    /// reading ends it, so feed starvation never counts toward the egress backstop (Owed 94).
+    pub fn on_delivery(&mut self, now: Ms, gen: u64, encoded: Encoded) {
+        if gen != self.generation {
+            return;
+        }
+        let grew = self
+            .encoded
+            .is_some_and(|e| encoded.video > e.video && encoded.audio > e.audio);
+        self.delivering_since = if grew {
+            Some(self.delivering_since.unwrap_or(now))
+        } else {
+            None
+        };
+        self.encoded = Some(encoded);
+    }
+
     /// `true` ⇒ effect `SwapSink(generation())`, its reason `swap_reason()`.
     pub fn on_tick(&mut self, now: Ms, t: &Thresholds) -> bool {
         match self.state {
@@ -186,16 +260,35 @@ impl OutputLink {
                 self.back_off(now, attempt, t, SwapReason::ConnectTimeout);
                 false
             }
-            // Proving and Connected have no timer: only the sink's error ends them (Owed 87).
+            // Owed 94: the egress backstop. Not yet Connected, the failures before the sink count.
+            OutputState::Proving { attempt, .. } if self.egress_flat(now, t) => {
+                self.back_off(now, attempt, t, SwapReason::EgressStalled);
+                false
+            }
+            OutputState::Connected if self.egress_flat(now, t) => {
+                self.back_off(now, 0, t, SwapReason::EgressStalled);
+                false
+            }
             _ => false,
         }
     }
 
-    /// The next sink generation, carrying the failures before it and the reason for it.
+    /// The sink's total has not grown for `output_egress_flat_ms` while the encoders delivered: timed
+    /// from the later of its last growth and the start of the current run of delivery.
+    fn egress_flat(&self, now: Ms, t: &Thresholds) -> bool {
+        match (self.egress, self.delivering_since) {
+            (Some(e), Some(d)) => elapsed(now, e.grew_at.max(d)) >= t.output_egress_flat_ms,
+            _ => false,
+        }
+    }
+
+    /// The next sink generation, carrying the failures before it and the reason for it. Its egress
+    /// clock starts at its own first growth.
     fn build(&mut self, now: Ms, attempt: u32, reason: SwapReason) -> bool {
         self.generation += 1;
         self.state = OutputState::Connecting { attempt, since: now };
         self.built_for = reason;
+        self.egress = None;
         true
     }
 
@@ -215,7 +308,7 @@ impl OutputLink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::OUTPUT_SINK_TIMEOUT_MS;
+    use crate::config::{OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS};
 
     fn t() -> Thresholds {
         Thresholds::default()
@@ -1084,26 +1177,33 @@ mod tests {
         assert_eq!(checked, 7, "builds checked");
     }
 
-    // ---- Owed 87 (the owner, 2026-10-24, "A"): the link has no stall rule ----
+    // ---- Owed 87 (the owner, 2026-10-24, "A"): the link has no stall rule while the encoders starve.
+    // With both delivering, a flat sink is Owed 94's backstop's (below). ----
 
     /// Far past every timer the link has: the connect timeout, the bound and the capped back-off,
-    /// ten times over. A link that swaps or fails a sink for silence inside it has a stall rule.
+    /// ten times over. A link that swaps or fails a sink for silence inside it while the encoders
+    /// starve has a stall rule.
     fn silence(th: &Thresholds) -> Ms {
         10 * (th.output_connect_timeout_ms + th.output_connected_after_ms + th.output_backoff_cap_ms)
     }
 
-    // The empty case: a Connected sink whose total never grows again is never swapped by the link, on
-    // any tick, however long it is silent. rtmp2sink's own socket timeout is the only detector of a
-    // destination stall (C09 sets it), and the sink's error is what swaps it: failure 1, since
-    // Connected reset the count, then the back-off's build, named `Error`.
+    // The empty case: a Connected sink whose total never grows again while the encoders starve (the
+    // poll's readings repeat their totals too: an encoder hang, Owed 86's shape) is never swapped by
+    // the link, on any tick, however long it is silent. The sink's error is what swaps it: failure 1,
+    // since Connected reset the count, then the back-off's build, named `Error`. The readings are the
+    // production shape (C09's poll carries both totals); with the encoders delivering instead, the
+    // backstop ends the sink (`a_hung_output_is_swapped_by_the_egress_backstop_while_the_encoders_deliver`).
     #[test]
-    fn a_connected_sink_that_sends_nothing_is_swapped_only_by_its_error() {
+    fn a_connected_sink_that_sends_nothing_while_the_encoders_starve_is_swapped_only_by_its_error() {
         let th = t();
         let (mut o, c) = connected(0, 1_000);
+        o.on_delivery(c, 1, delivered(1));
+        o.on_delivery(c, 1, delivered(2)); // the encoders delivered up to the silence
         let quiet = silence(&th);
         let mut ticks = 0;
         for now in (c..=c + quiet).step_by(33) {
             o.on_progress(now, 1, 1_000, &th); // the poll repeats the frozen total
+            o.on_delivery(now, 1, delivered(2)); // and the encoders' totals: starved
             assert!(!o.on_tick(now, &th), "swapped {} ms into the silence", now - c);
             ticks += 1;
         }
@@ -1125,22 +1225,26 @@ mod tests {
         assert_eq!((o.generation(), o.swap_reason()), (2, SwapReason::Error));
     }
 
-    // A sink that goes silent while it proves is not failed by the link either: it stays Proving,
-    // carrying the failures before it, until its own error ends it as one more failure.
+    // A sink that goes silent while it proves, the encoders starved, is not failed by the link
+    // either: it stays Proving, carrying the failures before it, until its own error ends it as one
+    // more failure. (With them delivering, `a_proving_sink_that_stops_growing_is_swapped_too_and_carries_its_failures`.)
     #[test]
-    fn a_proving_sink_that_goes_silent_waits_for_its_error() {
+    fn a_proving_sink_that_goes_silent_while_the_encoders_starve_waits_for_its_error() {
         let th = t();
         let mut o = OutputLink::new();
         assert!(o.on_tick(0, &th));
         o.on_error(10, 1, &th);
         let built = next_build(&mut o, 10, &th);
         o.on_progress(built + 31, 2, 476, &th);
+        o.on_delivery(built + 31, 2, delivered(1));
         let last = built + 1_000;
         o.on_progress(last, 2, 52_000, &th); // then nothing, short of the bound
+        o.on_delivery(last, 2, delivered(2));
         let quiet = silence(&th);
         let mut ticks = 0;
         for now in (last..=last + quiet).step_by(33) {
             o.on_progress(now, 2, 52_000, &th);
+            o.on_delivery(now, 2, delivered(2)); // starved: the totals repeat
             assert!(!o.on_tick(now, &th), "built {} ms into the silence", now - last);
             assert!(
                 matches!(o.state(), OutputState::Proving { attempt: 1, .. }),
@@ -1213,5 +1317,247 @@ mod tests {
         );
         checked += 1;
         assert_eq!(checked, 3);
+    }
+
+    // ---- Owed 94 (the owner, 2026-10-24, "B"): the egress backstop ----
+
+    /// The encoders' totals at reading `k`: both tracks one sample further each reading.
+    fn delivered(k: u64) -> Encoded {
+        Encoded { video: k, audio: k }
+    }
+
+    /// C09's poll from `from` (exclusive) to `to` (inclusive), every `OUTPUT_PROGRESS_POLL_MS`: the
+    /// sink's total stays at `total`, the encoders deliver when `delivering` says so for that instant
+    /// (else their totals repeat), and every tick in between is offered. Returns the first instant a
+    /// tick built, if one did.
+    fn poll_flat(
+        o: &mut OutputLink,
+        (from, to): (Ms, Ms),
+        total: u64,
+        k: &mut u64,
+        delivering: impl Fn(Ms) -> bool,
+        th: &Thresholds,
+    ) -> Option<Ms> {
+        let gen = o.generation();
+        let mut now = from;
+        while now < to {
+            now += 1;
+            if (now - from).is_multiple_of(OUTPUT_PROGRESS_POLL_MS) {
+                o.on_progress(now, gen, total, th);
+                if delivering(now) {
+                    *k += 1;
+                }
+                o.on_delivery(now, gen, delivered(*k));
+            }
+            if o.on_tick(now, th) {
+                return Some(now);
+            }
+        }
+        None
+    }
+
+    /// Connected at generation 1 with the encoders delivering on every poll; the total stops growing
+    /// at the returned instant (its last growth, on a poll).
+    fn connected_delivering(th: &Thresholds) -> (OutputLink, Ms, u64, u64) {
+        let mut o = OutputLink::new();
+        assert!(o.on_tick(0, th));
+        let (mut k, mut total, mut now) = (0u64, 0u64, 0);
+        while now < 2 * th.output_connected_after_ms {
+            now += OUTPUT_PROGRESS_POLL_MS;
+            total += 16_000;
+            k += 1;
+            o.on_progress(now, 1, total, th);
+            o.on_delivery(now, 1, delivered(k));
+            assert!(!o.on_tick(now, th), "built while growing at {now}");
+        }
+        assert!(o.is_connected(), "setup: growth earned Connected");
+        (o, now, total, k)
+    }
+
+    // Owed 94 (ii): a hang inside the output pipeline. The encoders keep delivering, no sink error
+    // comes, and the total stops growing. Nothing swaps before the threshold; the first tick at it
+    // backs off as failure 1 (Connected reset the count) and the build names the backstop.
+    #[test]
+    fn a_hung_output_is_swapped_by_the_egress_backstop_while_the_encoders_deliver() {
+        let th = t();
+        let flat = th.output_egress_flat_ms;
+        let (mut o, last, total, mut k) = connected_delivering(&th);
+        let none = poll_flat(&mut o, (last, last + flat - 1), total, &mut k, |_| true, &th);
+        assert_eq!(none, None, "swapped before the threshold");
+        assert!(o.is_connected(), "still Connected 1 ms before it");
+        assert!(
+            !o.on_tick(last + flat, &th),
+            "the backstop backs off, it does not build at once"
+        );
+        assert_eq!(
+            o.state(),
+            OutputState::Backoff {
+                attempt: 1,
+                until: last + flat + th.output_backoff_base_ms
+            }
+        );
+        let at = swap_for(&mut o, last + flat, &th, 2, SwapReason::EgressStalled);
+        assert_eq!(at, last + flat + th.output_backoff_base_ms);
+    }
+
+    // P-2 (the PR #73 review's confirm pass): the backstop's clock runs in Proving too, from the last
+    // growth, and the failures before the sink still count (it never earned Connected).
+    #[test]
+    fn a_proving_sink_that_stops_growing_is_swapped_too_and_carries_its_failures() {
+        let th = t();
+        let flat = th.output_egress_flat_ms;
+        let mut o = OutputLink::new();
+        assert!(o.on_tick(0, &th));
+        o.on_error(10, 1, &th); // one failure before the sink under test
+        let built = next_build(&mut o, 10, &th);
+        // The encoders were delivering before the sink's first bytes (two readings: the second grew).
+        let mut k = 1;
+        o.on_delivery(built, 2, delivered(0));
+        o.on_delivery(built + 20, 2, delivered(k));
+        o.on_progress(built + 31, 2, 476, &th);
+        let last = built + 31;
+        assert!(matches!(o.state(), OutputState::Proving { attempt: 1, .. }));
+        let none = poll_flat(&mut o, (last, last + flat - 1), 476, &mut k, |_| true, &th);
+        assert_eq!(none, None);
+        assert!(
+            matches!(o.state(), OutputState::Proving { .. }),
+            "{:?}",
+            o.state()
+        );
+        o.on_tick(last + flat, &th);
+        assert_eq!(
+            o.state(),
+            OutputState::Backoff {
+                attempt: 2,
+                until: last + flat + 2 * th.output_backoff_base_ms
+            },
+            "failure 2 waits the second back-off"
+        );
+        swap_for(&mut o, last + flat, &th, 3, SwapReason::EgressStalled);
+    }
+
+    // Owed 94 (i), the owner's reasoning for "A": a flat total while the encoders deliver nothing is
+    // feed starvation, which no swap cures. It never counts: 60 s of it swaps nothing, and once the
+    // encoders deliver again the whole threshold runs from then.
+    #[test]
+    fn the_backstop_never_counts_while_the_encoders_starve() {
+        let th = t();
+        let flat = th.output_egress_flat_ms;
+        let (mut o, last, total, mut k) = connected_delivering(&th);
+        let resume = last + 60_000;
+        let none = poll_flat(&mut o, (last, resume), total, &mut k, |_| false, &th);
+        assert_eq!(none, None, "swapped during starvation");
+        assert!(o.is_connected());
+        let at = poll_flat(&mut o, (resume, resume + 2 * flat), total, &mut k, |_| true, &th);
+        // The first reading after `resume` that shows both encoders grown starts the run, one poll
+        // after it; the swap comes a threshold and a base back-off later.
+        let run = resume + OUTPUT_PROGRESS_POLL_MS;
+        assert_eq!(at, Some(run + flat + th.output_backoff_base_ms));
+        assert_eq!((o.generation(), o.swap_reason()), (2, SwapReason::EgressStalled));
+    }
+
+    // Starvation part-way through the flat interval restarts the clock: the threshold is counted over
+    // one unbroken run of delivery, so no swap lands at `last + flat`.
+    #[test]
+    fn a_starved_reading_restarts_the_backstops_clock() {
+        let th = t();
+        let flat = th.output_egress_flat_ms;
+        let (mut o, last, total, mut k) = connected_delivering(&th);
+        let gap = last + flat / 2;
+        let starving = |now: Ms| now != gap;
+        let none = poll_flat(&mut o, (last, last + flat), total, &mut k, starving, &th);
+        assert_eq!(none, None);
+        assert!(
+            o.is_connected(),
+            "swapped at {} though a reading starved",
+            last + flat
+        );
+        let restart = gap + OUTPUT_PROGRESS_POLL_MS; // the next delivering reading
+        let none = poll_flat(
+            &mut o,
+            (last + flat, restart + flat - 1),
+            total,
+            &mut k,
+            |_| true,
+            &th,
+        );
+        assert_eq!(none, None);
+        assert!(o.is_connected(), "swapped before a whole run");
+        o.on_tick(restart + flat, &th);
+        assert!(
+            matches!(o.state(), OutputState::Backoff { attempt: 1, .. }),
+            "{:?}",
+            o.state()
+        );
+    }
+
+    // The order the coordinator's question asked for, as a run: a destination stall with the encoders
+    // delivering ends by the sink's own error (ruling A's detector), never by the backstop.
+    #[test]
+    fn a_destination_stall_still_swaps_on_the_sinks_error_with_the_encoders_delivering() {
+        let th = t();
+        let (mut o, last, total, mut k) = connected_delivering(&th);
+        let error_at = last + OUTPUT_SINK_TIMEOUT_MS;
+        let none = poll_flat(&mut o, (last, error_at), total, &mut k, |_| true, &th);
+        assert_eq!(none, None);
+        o.on_error(error_at, 1, &th);
+        swap_for(&mut o, error_at, &th, 2, SwapReason::Error);
+    }
+
+    // P-6: the clock is time, not a count of readings (a full channel drops them, gst_output.rs). The
+    // readings stop entirely after the last delivering one, and the backstop still fires on time.
+    #[test]
+    fn the_backstop_fires_on_time_when_the_readings_stop() {
+        let th = t();
+        let flat = th.output_egress_flat_ms;
+        let (mut o, last, _, _) = connected_delivering(&th);
+        for now in last + 1..last + flat {
+            assert!(!o.on_tick(now, &th), "built at {now}");
+        }
+        assert!(o.is_connected());
+        o.on_tick(last + flat, &th);
+        assert!(matches!(o.state(), OutputState::Backoff { attempt: 1, .. }));
+    }
+
+    // The clock resets at each build: the new sink is judged from its own first growth, and while it
+    // connects only the connect timeout ends it. A reading of another generation changes nothing.
+    #[test]
+    fn the_backstop_restarts_with_each_sink_and_ignores_other_generations() {
+        let th = t();
+        let flat = th.output_egress_flat_ms;
+        let (mut o, last, total, mut k) = connected_delivering(&th);
+        poll_flat(&mut o, (last, last + flat), total, &mut k, |_| true, &th);
+        let built = swap_for(&mut o, last + flat, &th, 2, SwapReason::EgressStalled);
+        // Connecting: the old sink's flat clock does not carry over; the connect timeout runs.
+        let none = poll_flat(
+            &mut o,
+            (built, built + th.output_connect_timeout_ms - 1),
+            0,
+            &mut k,
+            |_| true,
+            &th,
+        );
+        assert_eq!(none, None);
+        assert!(
+            matches!(o.state(), OutputState::Connecting { .. }),
+            "{:?}",
+            o.state()
+        );
+        // Its first bytes start its own clock.
+        let first = built + 100;
+        let mut o2 = o.clone();
+        o2.on_progress(first, 2, 476, &th);
+        let none = poll_flat(&mut o2, (first, first + flat - 1), 476, &mut k, |_| true, &th);
+        assert_eq!(none, None);
+        assert!(
+            matches!(o2.state(), OutputState::Proving { .. }),
+            "{:?}",
+            o2.state()
+        );
+        // Gen 1's readings (its encoders still counting) neither start nor feed gen 2's clock.
+        let mut o3 = o.clone();
+        let before = o3.clone();
+        o3.on_delivery(built + 50, 1, delivered(k + 100));
+        assert_eq!(o3, before, "a stale generation's reading changed the link");
     }
 }

@@ -99,6 +99,10 @@ struct World {
     page_hang: Option<i64>,
     beats: Vec<(i64, Value)>,
     log: Vec<(i64, String)>,
+    /// Lines docker stamped late, as (at, the line's start, ms late): `docker logs --timestamps`
+    /// stamps a line when its daemon reads it, so the stamp trails the process's own `ts=` by a
+    /// read latency with no fixed bound (the PR #73 confirm pass's b-1).
+    docker_late: Vec<(i64, String, i64)>,
     /// When the CEF child poll counted a GPU-process death (the `cef health` lines' count).
     gpu_deaths: Vec<i64>,
     /// When a teardown was counted leaked (the `cef health` lines' `leaked_teardowns`, case 16).
@@ -151,6 +155,7 @@ impl World {
             page_hang: None,
             beats: vec![],
             log: vec![],
+            docker_late: vec![],
             gpu_deaths: vec![],
             leaks: vec![],
             events: vec![(live - 9_000, "start", None)],
@@ -219,6 +224,15 @@ impl World {
 
     fn line(&mut self, at: i64, msg: impl Into<String>) {
         self.log.push((at, msg.into()));
+    }
+
+    /// The line at `at` starting `start` reached docker `late` ms after the process wrote it.
+    fn docker_late(&mut self, at: i64, start: &str, late: i64) {
+        assert!(
+            self.log.iter().any(|(a, m)| *a == at && m.starts_with(start)),
+            "no line {start:?} at {at}"
+        );
+        self.docker_late.push((at, start.into(), late));
     }
 
     /// A sink swap as the compositor logs it: the driver's reason line, then the decorator's swap
@@ -449,7 +463,13 @@ impl World {
         lines
             .iter()
             .map(|(at, m)| {
-                let (d, ts) = stamps(*at);
+                let late = self
+                    .docker_late
+                    .iter()
+                    .find(|(a, start, _)| a == at && m.starts_with(start.as_str()))
+                    .map_or(0, |l| l.2);
+                let (d, _) = stamps(*at + late);
+                let (_, ts) = stamps(*at);
                 format!("{d} ts={ts} level=info msg={m}\n")
             })
             .collect()
@@ -1165,13 +1185,6 @@ fn cut_floor_ms(w: &World) -> i64 {
     (w.ms("output_sink_timeout_ms") as f64 - frame).ceil() as i64
 }
 
-/// The shortest error-to-swap the floor accepts: the domain's back-off from Connected less one frame
-/// period (the log's stamps cannot resolve the product's tick), rounded up to the ms the log carries.
-fn backoff_floor_ms(w: &World) -> i64 {
-    let frame = w.t["frame_period_ms"].as_f64().expect("frame_period_ms");
-    (w.ms("output_backoff_base_ms") as f64 - frame).ceil() as i64
-}
-
 /// Case 5 in CI (run 40045826841): at 1 kbit nothing was sent in 30 s, and the queue held the leg.
 fn stalled() -> Value {
     netem_queued(true, 0, 0, 0, 130_862, 45)
@@ -1210,12 +1223,12 @@ fn dest_stall_swaps_on_the_sinks_error_and_reds_without_it_or_a_slow_one() {
     let v = judge(&w, "dest-stall", "", "stall-backoff-as-pending");
     assert_fails(&v, "clear_phase_driven", "stall-backoff-as-pending");
     checked += 2;
-    // The back-off is a floor no product can beat, less one frame of stamping: 1 ms under that reds,
-    // the floor itself and the back-off pass. A swap that skipped the back-off (a tick after the
-    // error) reds.
-    let floor = backoff_floor_ms(&w);
-    assert!(floor < base && floor > TICK_AFTER_BACKOFF_MS, "{floor}");
-    let w = dest_stall_err(0, 1, stalled(), ErrLine::At(1, floor - 1));
+    // The back-off is a floor no product can beat, on the process's own clock (b-1): the error's
+    // `ts=` is no later than the `now` the domain backs off from, and the swap's no earlier than the
+    // tick that builds, so their difference is at least the base, cut to the ms or not. 1 ms under
+    // reds, the base passes, and a swap that skipped the back-off (a tick after the error) reds.
+    assert!(base - 1 > TICK_AFTER_BACKOFF_MS, "{base}");
+    let w = dest_stall_err(0, 1, stalled(), ErrLine::At(1, base - 1));
     assert_fails(
         &judge(&w, "dest-stall", "", "stall-err-early"),
         "stall_swap",
@@ -1227,25 +1240,48 @@ fn dest_stall_swaps_on_the_sinks_error_and_reds_without_it_or_a_slow_one() {
         "stall_swap",
         "stall-err-no-backoff",
     );
-    for (tag, before) in [("stall-err-floor", floor), ("stall-err-base", base)] {
-        let w = dest_stall_err(0, 1, stalled(), ErrLine::At(1, before));
-        assert_pass(&judge(&w, "dest-stall", "", tag), tag);
-    }
-    checked += 4;
-    // PR #71's CI run 40137725801 (dest-stall-backoff, main's harness): the swap 499 ms after the
-    // error by the docker stamps (its lines' own `ts=` read 500), 6 197 ms after the cut. The
-    // product backed off exactly its base; main's floor at the base itself red it, NOT OWED. Here it
-    // passes (judged in the default leg: the clear's phase is not this check's).
-    let w = dest_stall_error_swap_at(6_197 - 499, 499, 0, stalled());
+    let w = dest_stall_err(0, 1, stalled(), ErrLine::At(1, base));
+    assert_pass(&judge(&w, "dest-stall", "", "stall-err-base"), "stall-err-base");
+    checked += 3;
+    // PR #71's CI run 40137725801 (dest-stall-backoff): the lines' own `ts=` 500 ms apart
+    // (`.137Z`, `.637Z`), their docker stamps 499 (`.138389528`, `.637769066`: the error line read
+    // about 1.4 ms late), the swap 6 197 ms after the cut. The product backed off exactly its base;
+    // judged on docker's stamps with the floor at the base it red, NOT OWED. On `ts=` it passes
+    // (judged in the default leg: the clear's phase is not this check's).
+    let mut w = dest_stall_error_swap_at(6_197 - base, base, 0, stalled());
+    let error = w.at(20.0) + 6_197 - base;
+    w.docker_late(error, "output gen=1 error:", 1);
     let v = judge(&w, "dest-stall", "", "stall-ci-499");
     assert_pass(&v, "stall-ci-499");
     let m = &v.json["measures"]["stall_swap"];
+    let docker = m["swap_ms"]
+        .as_i64()
+        .zip(m["error_ms"].as_i64())
+        .map(|(s, e)| s - e);
     assert_eq!(
-        (m["error_to_swap_ms"].as_i64(), m["from_cut_ms"].as_i64()),
-        (Some(499), Some(6_197)),
+        (docker, m["error_to_swap_ms"].as_i64(), m["from_cut_ms"].as_i64()),
+        (Some(base - 1), Some(base), Some(6_197)),
         "stall-ci-499: {m}"
     );
-    checked += 1;
+    // The mirror: docker's stamps a full base apart (the swap line read 1 ms late), the process's
+    // own 1 ms short of it. The interval is the process's, so this reds, and on that alone.
+    let mut w = dest_stall_error_swap_at(6_197 - base, base - 1, 0, stalled());
+    let swap = w.at(20.0) + 6_197 - 1;
+    w.docker_late(swap, "sink swap gen=2 ", 1);
+    let v = judge(&w, "dest-stall", "", "stall-ts-499");
+    assert_fails(&v, "stall_swap", "stall-ts-499");
+    assert_eq!(v.json["failed"], json!(["stall_swap"]), "stall-ts-499");
+    let m = &v.json["measures"]["stall_swap"];
+    let docker = m["swap_ms"]
+        .as_i64()
+        .zip(m["error_ms"].as_i64())
+        .map(|(s, e)| s - e);
+    assert_eq!(
+        (docker, m["error_to_swap_ms"].as_i64()),
+        (Some(base), Some(base - 1)),
+        "stall-ts-499: {m}"
+    );
+    checked += 2;
     // An error sooner after the cut than the sink's timeout allows is not the stall's (the PR #65
     // review's m-3): the floor itself passes, 1 ms sooner reds on the floor alone.
     let w = dest_stall_error_at(cut_floor_ms(&w), 0, stalled());
@@ -1368,7 +1404,8 @@ fn dest_trickle_swaps_under_a_trickle_and_reds_when_nothing_trickled() {
         "trickle-backoff",
     );
     let mut checked = 2;
-    let w = dest_stall_err(5_000, 1, trickling(), ErrLine::At(1, backoff_floor_ms(&w) - 1));
+    let base = w.ms("output_backoff_base_ms");
+    let w = dest_stall_err(5_000, 1, trickling(), ErrLine::At(1, base - 1));
     assert_fails(
         &judge(&w, "dest-trickle", "", "trickle-err-early"),
         "stall_swap",
@@ -1543,7 +1580,23 @@ fn dest_stall_rule_swaps_on_the_sinks_error_and_reds_on_a_slow_one_or_no_cap() {
     // An error later after the cut than the sink's timeout plus the output-lost budget, in a world
     // that kept growing until just before the swap (so the growth bound holds): it reds on the
     // cut-anchored ceiling alone (the PR #73 review's m-1).
-    let late = w.ms("output_sink_timeout_ms") + w.ms("budget_output_lost_max_ms") + 1;
+    let ceiling = w.ms("output_sink_timeout_ms") + w.ms("budget_output_lost_max_ms");
+    // The ceiling itself passes (the PR #73 confirm pass's c-2: `<=`, never `<`).
+    let at_ceiling = with_rule_marks(
+        dest_stall_error_at(ceiling, 1_000, trickling()),
+        capped(),
+        json!([8192]),
+        json!([16_810]),
+    );
+    let v = judge(&at_ceiling, "dest-stall-rule", "", "rule-ceiling");
+    assert_pass(&v, "rule-ceiling");
+    assert_eq!(
+        v.json["measures"]["stall_swap"]["error_from_cut_ms"].as_i64(),
+        Some(ceiling),
+        "rule-ceiling"
+    );
+    checked += 1;
+    let late = ceiling + 1;
     let w = with_rule_marks(
         dest_stall_error_at(late, 1_000, trickling()),
         capped(),
@@ -1676,7 +1729,403 @@ fn dest_stall_rule_swaps_on_the_sinks_error_and_reds_on_a_slow_one_or_no_cap() {
     );
     checked += 1;
     eprintln!("dest-stall-rule sims checked: {checked}");
-    assert_eq!(checked, 21);
+    assert_eq!(checked, 22);
+}
+
+/// Case 18's drive schedule (output-hung.sh's OUTPUT_HUNG_AFTER_MS): the plant's offset from sink 1's
+/// build, read from the case file so the sims and the case cannot drift apart.
+fn output_hung_after_ms() -> i64 {
+    let text = std::fs::read_to_string(repo().join("harness/cases/output-hung.sh")).unwrap();
+    let v: Vec<i64> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("OUTPUT_HUNG_AFTER_MS="))
+        .map(|v| v.parse().expect("OUTPUT_HUNG_AFTER_MS is a number"))
+        .collect();
+    assert_eq!(v.len(), 1, "output-hung.sh sets OUTPUT_HUNG_AFTER_MS once: {v:?}");
+    v[0]
+}
+
+/// MediaMTX's first frame from sink 2 after its build (a connect to the local server).
+const HUNG_FIRST_FRAME_MS: i64 = 300;
+
+/// Case 18's world (Owed 94): the compositor armed to stall sink 1 (`stall`) the case's
+/// OUTPUT_HUNG_AFTER_MS after its build (boot()'s first swap), the plant `after` ms after that build
+/// (the drive's schedule, unless a sim moves it), and the backstop's swap `to_swap` ms after
+/// the plant line, both on the process's own clock: its reason `egress_stalled`, sink 2 connecting
+/// and earning Connected output_connected_after_ms after its first bytes. The beats from the
+/// backstop's firing (one back-off before the swap) until then read `stalled`; MediaMTX has no frame
+/// from just after the plant until sink 2's first.
+fn output_hung_at(stall: &str, after: i64, to_swap: i64) -> World {
+    let mut w = World::new(70);
+    let start = w.live - 9_000;
+    let build = start + 2_400;
+    let armed = output_hung_after_ms();
+    w.line(
+        start + 300,
+        format!("WARN test hook (Owed 94): sink gen=1 stalls ({stall}) {armed} ms after its build"),
+    );
+    let planted = build + after;
+    w.line(
+        planted,
+        format!("WARN test hook (Owed 94): sink stall={stall} gen=1 planted=true"),
+    );
+    let swap = planted + to_swap;
+    let fire = swap - w.ms("output_backoff_base_ms");
+    let connected = swap + HUNG_FIRST_FRAME_MS + w.ms("output_connected_after_ms");
+    w.swap(swap, 2, "egress_stalled");
+    for (at, body) in &mut w.beats {
+        if body["state"] != "playing" {
+            continue;
+        }
+        if *at >= fire && *at < connected {
+            body["state"] = json!("stalled");
+            body["output"] = json!(if *at < swap { "backoff" } else { "connecting" });
+        }
+        body["sinkSwaps"] = json!(i64::from(*at >= swap));
+    }
+    w.outages.push((planted + 30, swap + HUNG_FIRST_FRAME_MS));
+    w
+}
+
+/// The backstop's swap inside its window: the readings' half poll after the plant, then the
+/// threshold, a tick and the back-off.
+fn output_hung(stall: &str) -> World {
+    let w = World::new(1);
+    let to_swap = w.ms("output_egress_flat_ms")
+        + w.ms("output_progress_poll_ms") / 2
+        + TICK_AFTER_BACKOFF_MS
+        + w.ms("output_backoff_base_ms");
+    output_hung_at(stall, output_hung_after_ms(), to_swap)
+}
+
+#[test]
+fn output_hung_swaps_on_the_egress_backstop_and_reds_on_any_other_path() {
+    let w = World::new(1);
+    let (flat, base, poll, tick, budget) = (
+        w.ms("output_egress_flat_ms"),
+        w.ms("output_backoff_base_ms"),
+        w.ms("output_progress_poll_ms"),
+        w.ms("tick_widest_ms"),
+        w.ms("output_gap_budget_ms"),
+    );
+    // The domain's window (lib.jq's `hung_swap`), from its terms: the last growth up to a poll
+    // before the plant and a tick for the plant line; up to two polls and two ticks after.
+    let (floor, ceiling) = (flat + base - poll - tick, flat + base + 2 * poll + 2 * tick);
+    assert!(
+        floor > w.ms("output_sink_timeout_ms") && ceiling < budget,
+        "{floor}..{ceiling}"
+    );
+    let mut checked = 0;
+    for stall in ["hold", "hang"] {
+        let w = output_hung(stall);
+        let tag = format!("hung-{stall}-good");
+        let v = judge(&w, "output-hung", stall, &tag);
+        assert_pass(&v, &tag);
+        let m = &v.json["measures"];
+        let s = &m["backstop_swap"];
+        let to_swap = flat + poll / 2 + TICK_AFTER_BACKOFF_MS + base;
+        assert_eq!(
+            (
+                s["reason"].as_str(),
+                s["swap_gen"].as_i64(),
+                s["planted_to_swap_ms"].as_i64()
+            ),
+            (Some("egress_stalled"), Some(2), Some(to_swap)),
+            "{tag}: {s}"
+        );
+        assert_eq!(
+            (s["floor_ms"].as_i64(), s["ceiling_ms"].as_i64()),
+            (Some(floor), Some(ceiling)),
+            "{tag}: the window's floor and ceiling"
+        );
+        let gap = m["gap_ms"].as_i64().unwrap();
+        assert!(gap > flat && gap <= budget, "{tag}: gap {gap}");
+        // The PR #76 review's I-1: MediaMTX's idle deadline for this case is four outage targets
+        // (output-hung.sh), past the window's ceiling here and at the owner's question's "about 15 s"
+        // (a threshold of a whole budget), so no destination deadline races the backstop.
+        let d = &m["destination_outwaits"];
+        assert_eq!(
+            (d["ceiling_ms"].as_i64(), d["mtx_read_timeout_ms"].as_i64()),
+            (Some(ceiling), Some(4 * budget)),
+            "{tag}: the destination's deadline"
+        );
+        assert!(
+            budget + ceiling - flat < 4 * budget,
+            "{tag}: a 15 s threshold's ceiling"
+        );
+        checked += 1;
+    }
+    // Judged as the other variant: the arming line and the plant name another stall.
+    let v = judge(&output_hung("hold"), "output-hung", "hang", "hung-hold-as-hang");
+    assert_fails(&v, "armed", "hung-hold-as-hang");
+    assert_fails(&v, "planted", "hung-hold-as-hang");
+    checked += 1;
+    // Unarmed (the plain relay image): no arming line, no plant, no backstop swap.
+    let mut w = output_hung("hold");
+    w.log.retain(|(_, m)| !m.contains("test hook (Owed 94)"));
+    let v = judge(&w, "output-hung", "hold", "hung-unarmed");
+    for check in ["armed", "planted", "planted_in_drive", "backstop_swap"] {
+        assert_fails(&v, check, "hung-unarmed");
+    }
+    checked += 1;
+    // Armed, but the stall found no sink 1 to go in on.
+    let mut w = output_hung("hold");
+    for l in &mut w.log {
+        if l.1.ends_with("planted=true") {
+            l.1 = l.1.replace("planted=true", "planted=false");
+        }
+    }
+    let v = judge(&w, "output-hung", "hold", "hung-not-planted");
+    assert_fails(&v, "planted", "hung-not-planted");
+    assert_eq!(v.json["failed"], json!(["planted"]), "hung-not-planted");
+    // Armed for another moment than the drive's; and a second plant.
+    let mut w = output_hung("hold");
+    let armed = output_hung_after_ms();
+    for l in &mut w.log {
+        if l.1.ends_with(" ms after its build") {
+            l.1 =
+                l.1.replace(&format!(" {armed} ms "), &format!(" {} ms ", armed + 1));
+        }
+    }
+    let v = judge(&w, "output-hung", "hold", "hung-armed-other-ms");
+    assert_eq!(v.json["failed"], json!(["armed"]), "hung-armed-other-ms");
+    let mut w = output_hung("hold");
+    let planted = w.log.iter().find(|l| l.1.ends_with("planted=true")).unwrap().0;
+    w.line(
+        planted + 1_000,
+        "WARN test hook (Owed 94): sink stall=hold gen=1 planted=true",
+    );
+    let v = judge(&w, "output-hung", "hold", "hung-planted-twice");
+    assert_eq!(v.json["failed"], json!(["planted"]), "hung-planted-twice");
+    checked += 3;
+    // The plant inside the drive, with room before the end: each boundary reds on that alone, 1 ms
+    // inside it passes (World: boot 9 s before live, sink 1 at +2.4 s, the drive 1 s after live, the
+    // end 70 s after the drive). The room is the latest swap the window accepts, then
+    // `beat_playing_again`'s wait and a heartbeat for its beat (longer than the outage's budget).
+    let to_swap = flat + poll / 2 + TICK_AFTER_BACKOFF_MS + base;
+    let room = ceiling
+        + w.ms("output_connect_timeout_ms")
+        + w.ms("output_connected_after_ms")
+        + 2 * tick
+        + w.ms("heartbeat_interval_ms");
+    assert!(room > budget, "room {room} ms");
+    let at_drive = 9_000 - 2_400 + 1_000;
+    let at_end = at_drive + 70_000 - room;
+    for (tag, after, red) in [
+        ("hung-at-drive", at_drive, true),
+        ("hung-after-drive", at_drive + 1, false),
+        ("hung-no-room", at_end, true),
+        ("hung-room", at_end - 1, false),
+    ] {
+        let v = judge(
+            &output_hung_at("hold", after, to_swap),
+            "output-hung",
+            "hold",
+            tag,
+        );
+        if red {
+            assert_fails(&v, "planted_in_drive", tag);
+            assert_eq!(v.json["failed"], json!(["planted_in_drive"]), "{tag}");
+        } else {
+            assert_pass(&v, tag);
+        }
+        checked += 1;
+    }
+    // The window, on the process's own clock: each bound passes, 1 ms past it reds on it alone.
+    for (tag, to_swap, red) in [
+        ("hung-floor", floor, false),
+        ("hung-early", floor - 1, true),
+        ("hung-ceiling", ceiling, false),
+        ("hung-late", ceiling + 1, true),
+    ] {
+        let w = output_hung_at("hold", output_hung_after_ms(), to_swap);
+        let v = judge(&w, "output-hung", "hold", tag);
+        if red {
+            assert_fails(&v, "backstop_swap", tag);
+            assert_eq!(v.json["failed"], json!(["backstop_swap"]), "{tag}");
+        } else {
+            assert_pass(&v, tag);
+        }
+        checked += 1;
+    }
+    // The window is the process's interval: docker reading the plant line 2 ms late moves nothing.
+    let mut w = output_hung_at("hold", output_hung_after_ms(), floor);
+    let planted = w.log.iter().find(|l| l.1.ends_with("planted=true")).unwrap().0;
+    w.docker_late(planted, "WARN test hook (Owed 94): sink stall=", 2);
+    assert_pass(
+        &judge(&w, "output-hung", "hold", "hung-floor-docker-late"),
+        "hung-floor-docker-late",
+    );
+    checked += 1;
+    // Any other path to the swap reds: the error's reason, the outgoing sink's error line before
+    // the swap, no reason line, and no swap at all.
+    let mut w = output_hung("hold");
+    w.reason_line(2, Some("error"));
+    assert_fails(
+        &judge(&w, "output-hung", "hold", "hung-says-error"),
+        "backstop_swap",
+        "hung-says-error",
+    );
+    let mut w = output_hung("hold");
+    let swap = w
+        .log
+        .iter()
+        .find(|l| l.1 == "sink swap gen=2 target=rtmp")
+        .unwrap()
+        .0;
+    w.line(
+        swap - base,
+        "output gen=1 error: Connection error: Socket I/O timed out (gstrtmp2sink.c)",
+    );
+    assert_fails(
+        &judge(&w, "output-hung", "hold", "hung-error-first"),
+        "backstop_swap",
+        "hung-error-first",
+    );
+    let mut w = output_hung("hold");
+    w.reason_line(2, None);
+    assert_fails(
+        &judge(&w, "output-hung", "hold", "hung-no-reason"),
+        "backstop_swap",
+        "hung-no-reason",
+    );
+    // The reason lines must number the swap lines: the boot's missing, sink 2's still `egress_stalled`.
+    let mut w = output_hung("hold");
+    w.reason_line(1, None);
+    let v = judge(&w, "output-hung", "hold", "hung-unpaired");
+    assert_fails(&v, "backstop_swap", "hung-unpaired");
+    assert_eq!(v.json["failed"], json!(["backstop_swap"]), "hung-unpaired");
+    assert_eq!(v.json["measures"]["backstop_swap"]["reason"], "egress_stalled");
+    let mut w = output_hung("hold");
+    w.log
+        .retain(|(_, m)| !m.starts_with("sink swap") || m.ends_with("gen=1") || m.contains("gen=1 "));
+    let v = judge(&w, "output-hung", "hold", "hung-no-swap");
+    assert_fails(&v, "backstop_swap", "hung-no-swap");
+    assert_fails(&v, "one_swap", "hung-no-swap");
+    checked += 5;
+    // A second swap after sink 2 (its successor failed too).
+    let mut w = output_hung("hold");
+    w.swap(swap + 20_000, 3, "error");
+    w.line(
+        swap + 20_000 - base,
+        "output gen=2 error: Connection error: Socket I/O timed out (gstrtmp2sink.c)",
+    );
+    let v = judge(&w, "output-hung", "hold", "hung-two-swaps");
+    assert_fails(&v, "one_swap", "hung-two-swaps");
+    assert_eq!(v.json["failed"], json!(["one_swap"]), "hung-two-swaps");
+    checked += 1;
+    // A beat in the window reading playing over the dead output, and a window with no beat.
+    let mut w = output_hung("hold");
+    let (fire, earned) = (swap - base, swap + w.ms("output_connected_after_ms"));
+    let window = |at: i64| at >= fire + 2 * tick && at < earned - 2 * tick;
+    let inside = w.beats.iter().filter(|b| window(b.0)).count();
+    assert_eq!(inside, 1, "one beat in the window at a 5 s beat");
+    for b in &mut w.beats {
+        if window(b.0) {
+            b.1["state"] = json!("playing");
+        }
+    }
+    let v = judge(&w, "output-hung", "hold", "hung-beat-playing");
+    assert_fails(&v, "beat_stalled", "hung-beat-playing");
+    assert_eq!(v.json["failed"], json!(["beat_stalled"]), "hung-beat-playing");
+    let mut w = output_hung("hold");
+    w.beats.retain(|b| !window(b.0));
+    let v = judge(&w, "output-hung", "hold", "hung-no-beat");
+    assert_fails(&v, "beat_stalled", "hung-no-beat");
+    checked += 2;
+    // The gap past the owner's 15 s target reds on it alone (the good worlds pass under it; the
+    // checker dates an outage on its frames, so the target itself is not a sim's exact reading).
+    let mut w = output_hung("hold");
+    let planted = w.log.iter().find(|l| l.1.ends_with("planted=true")).unwrap().0;
+    w.outages = vec![(planted + 30, planted + 30 + budget + 100)];
+    let v = judge(&w, "output-hung", "hold", "hung-gap-over");
+    assert_fails(&v, "gap_in_budget", "hung-gap-over");
+    assert_eq!(v.json["failed"], json!(["gap_in_budget"]), "hung-gap-over");
+    assert!(v.json["measures"]["gap_ms"].as_i64().unwrap() > budget);
+    // Frames through mid-hang (two outages between the plant and the swap): nothing passes a held or
+    // hung sink, so the gap is one outage or the hook did not hold.
+    let mut w = output_hung("hold");
+    w.outages = vec![
+        (planted + 30, planted + 3_000),
+        (planted + 3_500, swap + HUNG_FIRST_FRAME_MS),
+    ];
+    let v = judge(&w, "output-hung", "hold", "hung-gap-split");
+    assert_eq!(v.json["failed"], json!(["gap_in_budget"]), "hung-gap-split");
+    checked += 2;
+    let mut w = output_hung("hold");
+    let planted = w.log.iter().find(|l| l.1.ends_with("planted=true")).unwrap().0;
+    w.outages.push((planted - 8_000, planted - 6_000));
+    let v = judge(&w, "output-hung", "hold", "hung-outage-before");
+    assert_fails(&v, "no_outage_outside_hang", "hung-outage-before");
+    assert_eq!(
+        v.json["failed"],
+        json!(["no_outage_outside_hang"]),
+        "hung-outage-before"
+    );
+    // And one after sink 2 was back (a reconnect's budget past the swap).
+    let mut w = output_hung("hold");
+    let back = swap + w.ms("budget_output_reconnect_ms");
+    w.outages.push((back, back + 2_000));
+    let v = judge(&w, "output-hung", "hold", "hung-outage-after");
+    assert_fails(&v, "no_outage_outside_hang", "hung-outage-after");
+    assert_eq!(
+        v.json["failed"],
+        json!(["no_outage_outside_hang"]),
+        "hung-outage-after"
+    );
+    checked += 2;
+    // The PR #76 review's m-3: once sink 2 could have earned Connected at the latest (a whole connect,
+    // the Connected bound and a tick for each after the swap), the beats read `playing` again until
+    // the end request. A beat just before that may still read stalled, one at it may not, and a window
+    // with no beat witnesses nothing.
+    let again = swap + w.ms("output_connect_timeout_ms") + w.ms("output_connected_after_ms") + 2 * tick;
+    let with_stalled_beat = |at: i64| {
+        let mut w = output_hung("hold");
+        let mut body = w
+            .beats
+            .iter()
+            .find(|b| b.1["state"] == "playing")
+            .unwrap()
+            .1
+            .clone();
+        body["state"] = json!("stalled");
+        body["output"] = json!("connecting");
+        w.beats.push((at, body));
+        w.beats.sort_by_key(|b| b.0);
+        w
+    };
+    let v = judge(
+        &with_stalled_beat(again - 1),
+        "output-hung",
+        "hold",
+        "hung-again-before",
+    );
+    assert_pass(&v, "hung-again-before");
+    let v = judge(
+        &with_stalled_beat(again),
+        "output-hung",
+        "hold",
+        "hung-again-stalled",
+    );
+    assert_eq!(
+        v.json["failed"],
+        json!(["beat_playing_again"]),
+        "hung-again-stalled"
+    );
+    let mut w = output_hung("hold");
+    let end_request = w.end;
+    let inside = w
+        .beats
+        .iter()
+        .filter(|b| b.0 >= again && b.0 < end_request)
+        .count();
+    assert!(inside >= 1, "the good world has {inside} beats in the window");
+    w.beats.retain(|b| !(b.0 >= again && b.0 < end_request));
+    let v = judge(&w, "output-hung", "hold", "hung-again-no-beat");
+    assert_fails(&v, "beat_playing_again", "hung-again-no-beat");
+    checked += 3;
+    eprintln!("output-hung sims checked: {checked}");
+    assert_eq!(checked, 31);
 }
 
 /// What the starvation did to the compositor (case 6).
@@ -2765,16 +3214,16 @@ fn a_not_runnable_case_is_reported_never_faked_and_never_a_pass() {
     assert!(cases >= 17, "the sweep read too few case files ({cases})");
 }
 
-/// The PR #71 review's m1: only case 16 runs on the relay-test-hooks image. Every leg's environment
-/// carries `RELAY_TEST_HOOKS_IMAGE` (chaos.yml), and no other verdict reads which image ran, so a
-/// case that copied case 16's pattern, or a shared helper that picked the variable up, would run
-/// the hooks binary while its verdict claims the relay image. Every file under harness/ (out/
-/// aside) is swept: the image's variable, the hold key and case 16's overlay are named only by
-/// case 16's files, and only cef-leaks.sh assigns `RELAY_IMAGE` outside a comment. harness/soak/
-/// (C15) is swept for the names but not for that assignment: it never runs run-case.sh, the one
-/// reader of `RELAY_IMAGE`.
+/// The PR #71 review's m1: only the hook cases run on the relay-test-hooks image, case 16
+/// (cef-leaks, Owed 82's hook) and case 18 (output-hung, Owed 94's). Every leg's environment carries
+/// `RELAY_TEST_HOOKS_IMAGE` (chaos.yml), and no other verdict reads which image ran, so a case that
+/// copied their pattern, or a shared helper that picked the variable up, would run the hooks binary
+/// while its verdict claims the relay image. Every file under harness/ (out/ aside) is swept: the
+/// image's variable is named only by the two cases' files, each hook's keys and overlay only by its
+/// own case's, and only their case files assign `RELAY_IMAGE` outside a comment. harness/soak/ is
+/// swept like every other directory (the #71 confirm pass's r-1: its exemption excused no file).
 #[test]
-fn only_case_16_names_the_test_hooks_image_or_reassigns_the_relay_image() {
+fn only_the_hook_cases_name_the_test_hooks_image_or_reassign_the_relay_image() {
     fn walk(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
         for e in std::fs::read_dir(dir).unwrap() {
             let p = e.unwrap().path();
@@ -2807,10 +3256,21 @@ fn only_case_16_names_the_test_hooks_image_or_reassigns_the_relay_image() {
     let mut files = Vec::new();
     walk(&harness, &mut files);
     let case16 = ["cases/cef-leaks.sh", "compose.cef-leaks.yml"];
-    let names = [
-        ("RELAY_TEST_HOOKS_IMAGE", &case16[..]),
-        ("COMPOSITOR_TEST_HOLD_TEARDOWNS", &case16[..]),
+    let case18 = ["cases/output-hung.sh", "compose.output-hung.yml"];
+    let hooked = [case16[0], case16[1], case18[0], case18[1]];
+    // Each hook's keys, in its overlay's order under the compositor's `environment`.
+    let keys16 = ["COMPOSITOR_TEST_HOLD_TEARDOWNS"];
+    let keys18 = [
+        "COMPOSITOR_TEST_HOLD_SINK_AFTER_MS",
+        "COMPOSITOR_TEST_HANG_SINK_AFTER_MS",
+    ];
+    let names: [(&str, &[&str]); 6] = [
+        ("RELAY_TEST_HOOKS_IMAGE", &hooked),
+        (keys16[0], &case16),
         ("compose.cef-leaks.yml", &case16[..1]),
+        (keys18[0], &case18),
+        (keys18[1], &case18),
+        ("compose.output-hung.yml", &case18[..1]),
     ];
     let (mut swept, mut naming, mut assigning) = (0, Vec::new(), Vec::new());
     for p in &files {
@@ -2821,25 +3281,25 @@ fn only_case_16_names_the_test_hooks_image_or_reassigns_the_relay_image() {
             if text.contains(name) {
                 assert!(
                     allowed.contains(&rel.as_str()),
-                    "harness/{rel} names {name}: only case 16 runs on the relay-test-hooks image"
+                    "harness/{rel} names {name}: only {allowed:?} may"
                 );
                 naming.push(format!("{rel}: {name}"));
             }
         }
-        if !rel.starts_with("soak/") && assigns_relay_image(&text) {
-            assert_eq!(
-                rel, case16[0],
-                "harness/{rel} reassigns RELAY_IMAGE: only case 16 points it at another image"
+        if assigns_relay_image(&text) {
+            assert!(
+                [case16[0], case18[0]].contains(&rel.as_str()),
+                "harness/{rel} reassigns RELAY_IMAGE: only the hook cases point it at another image"
             );
             assigning.push(rel);
         }
     }
     eprintln!("harness files swept: {swept}; names: {naming:?}; RELAY_IMAGE assigned in: {assigning:?}");
     assert!(swept >= 25, "the sweep read too few harness files ({swept})");
-    // The positive pair, read from code and never from a comment (the #71 confirm pass's n2), so a
-    // renamed variable cannot pass this vacuously and a reworded comment cannot red it: cef-leaks.sh
-    // names all three and points RELAY_IMAGE at the image, and the overlay's compositor
-    // `environment` carries the key.
+    // The positive pairs, read from code and never from a comment (the #71 confirm pass's n2), so a
+    // renamed variable cannot pass this vacuously and a reworded comment cannot red it: each hook
+    // case names the image's variable, its keys and its overlay, and points RELAY_IMAGE at the image,
+    // and its overlay's compositor `environment` carries its keys, in order.
     let code = |rel: &str| -> Vec<String> {
         std::fs::read_to_string(harness.join(rel))
             .unwrap()
@@ -2848,29 +3308,44 @@ fn only_case_16_names_the_test_hooks_image_or_reassigns_the_relay_image() {
             .map(str::to_owned)
             .collect()
     };
-    let leaks = code(case16[0]);
-    for (name, _) in names {
+    let mut pairs = 0;
+    for (case, keys) in [(case16, &keys16[..]), (case18, &keys18[..])] {
+        let file = code(case[0]);
+        for name in ["RELAY_TEST_HOOKS_IMAGE", case[1]].iter().chain(keys) {
+            assert!(
+                file.iter().any(|l| l.contains(name)),
+                "harness/{} no longer names {name} outside a comment",
+                case[0]
+            );
+            pairs += 1;
+        }
+        let overlay = code(case[1]);
+        let at = overlay
+            .iter()
+            .position(|l| l.trim_start().starts_with(&format!("{}:", keys[0])));
         assert!(
-            leaks.iter().any(|l| l.contains(name)),
-            "harness/{} no longer names {name} outside a comment",
-            case16[0]
+            at.is_some_and(|i| i >= 2
+                && overlay[i - 1].trim() == "environment:"
+                && overlay[i - 2].trim() == "compositor:"
+                && keys.iter().enumerate().all(|(k, key)| overlay
+                    .get(i + k)
+                    .is_some_and(|l| l.trim_start().starts_with(&format!("{key}:"))))),
+            "harness/{}: the compositor's `environment` no longer carries {keys:?}: {overlay:?}",
+            case[1]
         );
+        pairs += 1;
     }
+    assigning.sort();
     assert_eq!(
         assigning,
-        [case16[0]],
-        "cef-leaks.sh points RELAY_IMAGE at the image"
+        [case16[0], case18[0]],
+        "each hook case points RELAY_IMAGE at the image"
     );
-    let overlay = code(case16[1]);
-    let key = overlay
-        .iter()
-        .position(|l| l.trim_start().starts_with("COMPOSITOR_TEST_HOLD_TEARDOWNS:"));
-    assert!(
-        key.is_some_and(|i| i >= 2
-            && overlay[i - 1].trim() == "environment:"
-            && overlay[i - 2].trim() == "compositor:"),
-        "harness/{}: the compositor's `environment` no longer carries the hold key: {overlay:?}",
-        case16[1]
+    eprintln!("hook cases' positive pairs checked: {pairs}");
+    assert_eq!(
+        pairs,
+        4 + 5,
+        "case 16: three names and its overlay; case 18: four and its overlay"
     );
     // The legs' own image (the #71 confirm pass's n1): chaos.yml sets each leg's RELAY_IMAGE, which
     // the harness/ sweep cannot see. Every job's RELAY_IMAGE is the images job's (the relay image it
@@ -3549,8 +4024,8 @@ fn every_case_file_is_judged_here() {
     }
     eprintln!("case files checked: {n}; not chaos cases: {not_chaos}");
     assert_eq!(
-        n, 17,
-        "the brief's 16 cases (amended 2026-10-20) and case 17 (2026-10-24)"
+        n, 18,
+        "the brief's 16 cases (amended 2026-10-20), case 17 (2026-10-24) and case 18 (Owed 94)"
     );
     // Every name excused is a file, so the list cannot hide a renamed or a deleted case.
     assert_eq!(not_chaos, NOT_CHAOS.len(), "a NOT_CHAOS name with no case file");

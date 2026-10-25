@@ -46,13 +46,26 @@ pub struct Thresholds {
     pub output_connect_timeout_ms: Ms,
     /// F-011 (Owed 38; the coordinator's ruling): a sink is Connected at its first growth at least
     /// this long after its first growth, with no error between (since Owed 87 a silence between is no
-    /// failure and does not restart the proof: only the sink's error ends it). The
+    /// failure and does not restart the proof: while the encoders starve or are unread, only the sink's
+    /// error ends it; with both delivering, Owed 94's backstop ends a sink flat for
+    /// `output_egress_flat_ms`). The
     /// first nonzero `out-bytes-total` is the 476 B RTMP `connect` command (22–69 ms after the build,
     /// n = 10 on CF), and a REFUSED publish keeps counting until its refusal arrives: 262 334 B by
     /// 538 ms on CF (a made-up key) and 1 008 779 B over 2 033 ms on mediamtx (a denied path). No byte
     /// floor tells those apart; time does. 5 s is about 2.5× the slowest refusal measured. It is not
     /// longer because the first `playing` beat and the back-off's reset both wait on Connected.
     pub output_connected_after_ms: Ms,
+    /// Owed 94 (the owner, 2026-10-24, "B", to the coordinator's question: a backstop that swaps the
+    /// sink after about 15 s with no egress bytes while the encoders deliver, the beat saying so): a
+    /// Proving or Connected sink whose bytes-sent total has not grown for this long, while both
+    /// encoders kept delivering, is swapped (`SwapReason::EgressStalled`). It cures a hang inside the
+    /// output pipeline that no sink error reports (Owed 94 (ii)). Derived, in one place
+    /// (`output_egress_flat_ms`), from F-004's 15 s budget: the longest threshold, on the poll's grid,
+    /// that still leaves the swap's back-off and one whole connect inside it. The owner's figure was
+    /// "about 15 s"; that would put the viewer's gap near 20 s, past F-004's split. The owner,
+    /// 2026-10-25, in chat, relayed by the coordinator ("Apply rec", the coordinator's recommendation
+    /// of this derived value): 9 s, keeps the worst outage under 15 s.
+    pub output_egress_flat_ms: Ms,
     /// Spec §4.2: 3 CEF failures in 5 min → graphics Failed.
     pub cef_fail_count: usize,
     /// Spec §4.2: the "5 min" of "3 CEF failures in 5 min".
@@ -164,6 +177,39 @@ pub const OUTPUT_GAP_BUDGET_MS: Ms = 15_000;
 /// not a `Thresholds` field: the domain decides nothing on it (the sink's error is its event).
 pub const OUTPUT_SINK_TIMEOUT_MS: Ms = 5_000;
 
+/// How often C09 reads the output's bytes-sent total (Owed 15, the choice recorded in `_FINDINGS.md`
+/// F-011): 250 ms. The totals prove a new sink Connected (`output_connected_after_ms`, Owed 38), and
+/// their flatness times the egress backstop (`output_egress_flat_ms`, Owed 94), which can see a total
+/// stop growing only on this grid. Here, not in the adapters, because the backstop's budget reads it.
+pub const OUTPUT_PROGRESS_POLL_MS: Ms = 250;
+
+/// The widest gap between two of C08's ticks, which land on the frame period floored to the ms: 34 ms
+/// at ADR 0005's 30 fps, in both modes. A timed step (a back-off ending, the backstop's threshold)
+/// acts on the first tick at or after it, so up to this late.
+pub const TICK_WIDEST_MS: Ms = {
+    let (a, b) = (OutputProfile::P720.fps as Ms, OutputProfile::P1080.fps as Ms);
+    let (a, b) = (1_000u64.div_ceil(a), 1_000u64.div_ceil(b));
+    if a > b {
+        a
+    } else {
+        b
+    }
+};
+
+/// Owed 94's threshold, derived (the one place it is): F-004's budget less the backstop path's other
+/// terms, the next sink's whole connect, the base back-off (the swap is failure 1 from Connected), the
+/// poll that sees the last growth late, and a tick each for the backstop and the build; then floored
+/// to the poll's grid. With today's numbers 15 000 − 5 000 − 500 − 250 − 2 × 34 = 9 182, so 9 000 ms.
+/// A threshold the budget cannot hold is a compile error (the subtraction underflows).
+pub const fn output_egress_flat_ms(backoff_base_ms: Ms, connect_timeout_ms: Ms) -> Ms {
+    let room = OUTPUT_GAP_BUDGET_MS
+        - connect_timeout_ms
+        - backoff_base_ms
+        - OUTPUT_PROGRESS_POLL_MS
+        - 2 * TICK_WIDEST_MS;
+    room / OUTPUT_PROGRESS_POLL_MS * OUTPUT_PROGRESS_POLL_MS
+}
+
 /// F-013 (C11's confirm pass, probe GR, 2 of 2; the final C11 review's probe FD, kills 20 s apart):
 /// with its zygote alive, a killed GPU process is relaunched 5 times, and the 6th death is Chromium's
 /// FATAL "GPU process isn't usable. Goodbye." and SIGTRAP of the whole process. A count over the
@@ -174,6 +220,7 @@ pub const CHROMIUM_GPU_DEATHS_ABORT: usize = 6;
 
 impl Default for Thresholds {
     fn default() -> Self {
+        let (output_backoff_base_ms, output_connect_timeout_ms) = (500, 5_000);
         Self {
             frozen_after_ms: 500,
             slate_after_ms: 3_000,
@@ -185,10 +232,11 @@ impl Default for Thresholds {
             input_srt_latency_ms: 1_000,
             kick_alert_count: 3,
             kick_window_ms: 300_000,
-            output_backoff_base_ms: 500,
+            output_backoff_base_ms,
             output_backoff_cap_ms: 2_000,
-            output_connect_timeout_ms: 5_000,
+            output_connect_timeout_ms,
             output_connected_after_ms: 5_000,
+            output_egress_flat_ms: output_egress_flat_ms(output_backoff_base_ms, output_connect_timeout_ms),
             cef_fail_count: 3,
             cef_fail_window_ms: 300_000,
             cef_load_timeout_ms: 10_000,
@@ -410,6 +458,74 @@ mod tests {
     #[test]
     fn the_sink_timeout_is_rtmp2s_own_default() {
         assert_eq!(OUTPUT_SINK_TIMEOUT_MS, 5 * 1_000, "rtmp2 DEFAULT_TIMEOUT 5 s");
+    }
+
+    // Owed 94 (the owner, 2026-10-24, "B"): the egress backstop's worst path, each term from its own
+    // source and written here, not read from the derivation: the last growth is seen up to one poll late
+    // (C09's poll), the backstop fires on the first tick at or after its threshold, the swap waits the
+    // base back-off (failure 1 from Connected) and then the first tick after it, and the next sink's
+    // first bytes come 1 ms before its connect timeout. All of it stays under F-004's 15 s, and a
+    // threshold one poll longer would not: the threshold is as long as the budget allows, on the poll's
+    // grid (nothing finer can see a flat total).
+    #[test]
+    fn the_egress_backstop_is_the_longest_threshold_that_keeps_the_15_s_budget() {
+        let t = Thresholds::default();
+        let tick = BOTH_MODES
+            .iter()
+            .map(|p| p.frame_period_ms().ceil() as Ms)
+            .max()
+            .expect("two modes");
+        assert_eq!(tick, 34, "30 fps ticks land on whole ms 33 to 34 apart");
+        let worst = |flat: Ms| {
+            OUTPUT_PROGRESS_POLL_MS
+                + flat
+                + tick
+                + t.output_backoff_base_ms
+                + tick
+                + (t.output_connect_timeout_ms - 1)
+        };
+        let flat = t.output_egress_flat_ms;
+        assert!(
+            worst(flat) < OUTPUT_GAP_BUDGET_MS,
+            "backstop path {} ms",
+            worst(flat)
+        );
+        assert!(
+            worst(flat + OUTPUT_PROGRESS_POLL_MS) >= OUTPUT_GAP_BUDGET_MS,
+            "{flat} ms is a poll short of the longest that fits"
+        );
+        assert_eq!(
+            flat % OUTPUT_PROGRESS_POLL_MS,
+            0,
+            "{flat} ms is off the poll's grid"
+        );
+        assert_eq!(TICK_WIDEST_MS, tick, "the tick the derivation reads");
+    }
+
+    // Owed 94: a socket wait that outlasts the sink's timeout reaches the sink's own error first (ruling
+    // A's detector), so the backstop never takes a stall rtmp2sink reports: from the last counted
+    // growth the error lands one socket wait later, seen within a poll, acted on at the next tick. The
+    // coordinator's question bounded it more widely (the timeout, a back-off, a poll); it holds with the
+    // capped back-off too. Not every destination stall: a multi-wake trickle, whose every wait is under
+    // the timeout, never errors, and only the backstop swaps it (the PR #73 review's P-3; links.rs).
+    #[test]
+    fn a_socket_wait_past_the_timeout_errors_before_the_backstop() {
+        let t = Thresholds::default();
+        let flat = t.output_egress_flat_ms;
+        assert!(
+            flat > OUTPUT_SINK_TIMEOUT_MS + OUTPUT_PROGRESS_POLL_MS + TICK_WIDEST_MS,
+            "backstop {flat} ms"
+        );
+        assert!(
+            flat > OUTPUT_SINK_TIMEOUT_MS + t.output_backoff_cap_ms + OUTPUT_PROGRESS_POLL_MS,
+            "backstop {flat} ms"
+        );
+    }
+
+    // Owed 15 (the choice recorded in `_FINDINGS.md` F-011): C09 reads the sink's total every 250 ms.
+    #[test]
+    fn the_progress_poll_is_owed_15s_250_ms() {
+        assert_eq!(OUTPUT_PROGRESS_POLL_MS, 250);
     }
 
     // F-011 (Owed 38): a refused publish counted bytes until its refusal arrived, the last total at

@@ -5,11 +5,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use app::driver::Driver;
 use app::ports::{ControlRequest, Inbound, Measured, Metrics, SessionConfig};
-use domain::config::{OutputProfile, Thresholds, OUTPUT_SINK_TIMEOUT_MS};
-use domain::health::{ExitDetail, GraphicsStatus, HealthReport};
+use domain::config::{OutputProfile, Thresholds, OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS};
+use domain::health::{ExitDetail, GraphicsStatus, HealthReport, LinkStatus};
 use domain::input_link::LossReason;
 use domain::ladder::Rung;
 use domain::lifecycle::ExitReason;
+use domain::output_link::Encoded;
 use domain::programme::{FrameChoice, ProgrammePhase, SlateKind};
 use domain::supervisor::{Desired, Event, HeartbeatRefusal, Refusal, SignalKind};
 use testkit::fakes::{ports, session_720p, Call, FakeControl, FakeGraphics, FakeProgramme, Log};
@@ -2042,19 +2043,34 @@ fn swapped(gen: u64) -> impl Fn(&Call) -> bool {
 }
 
 fn progress(gen: u64, total_bytes: u64) -> Inbound {
-    ev(Event::OutputProgress { gen, total_bytes })
+    ev(Event::OutputProgress {
+        gen,
+        total_bytes,
+        encoded: Encoded::default(),
+    })
+}
+
+/// A reading with both encoders at `k` samples (Owed 94: they deliver while `k` grows).
+fn delivering(gen: u64, total_bytes: u64, k: u64) -> Inbound {
+    ev(Event::OutputProgress {
+        gen,
+        total_bytes,
+        encoded: Encoded { video: k, audio: k },
+    })
 }
 
 fn swaps(sim: &Sim) -> usize {
     sim.calls().iter().filter(|c| matches!(c, Call::Swap(..))).count()
 }
 
-// Five swaps through the real driver and domain, one per way the module doc of
+// Six swaps through the real driver and domain, one per way the module doc of
 // `domain::output_link` ends a sink: the first build, the sink's own error (while connecting, while
-// proving and once Connected) and the connect timeout. Each line comes just before its port call.
-// Since Owed 87 (the owner, 2026-10-24, "A") a silent sink, proving or Connected, is swapped only
-// after its own error (rtmp2sink's socket timeout, for a destination stall), however long it is
-// silent: the silences here run three sink timeouts, past where the retired stall rule swapped.
+// proving and once Connected), the connect timeout and the egress backstop. Each line comes just
+// before its port call. Since Owed 87 (the owner, 2026-10-24, "A") a silent sink whose encoders are
+// not read, proving or Connected, is swapped only after its own error (rtmp2sink's socket timeout,
+// for a destination stall), however long it is silent: the silences here run three sink timeouts,
+// past where the retired stall rule swapped. Owed 94 (the owner, 2026-10-24, "B"): a Connected sink
+// that stops while both encoders keep delivering is swapped by the backstop.
 #[test]
 fn every_sink_swap_is_logged_with_its_reason_just_before_the_swap() {
     let t = th();
@@ -2098,6 +2114,30 @@ fn every_sink_swap_is_logged_with_its_reason_just_before_the_swap() {
         at5 - e4
     );
 
+    // Generation 5 grows on the poll until it is Connected, both encoders delivering on every
+    // reading; then its total stops, the encoders keep delivering, and no error comes.
+    let (first, flat) = (at5 + 31, t.output_egress_flat_ms);
+    let grown = first + t.output_connected_after_ms + 250;
+    let mut readings = Vec::new();
+    let (mut total, mut last) = (0, first);
+    for (k, at) in (0..).map(|k| (k, first + 250 * k)) {
+        if at >= grown + flat - 1 {
+            break;
+        }
+        if at <= grown {
+            (total, last) = (476 + 50_000 * k, at);
+        }
+        readings.push((at, delivering(5, total, k + 1)));
+    }
+    sim.drive(last + flat - 1, readings);
+    assert_eq!(swaps(&sim), 5, "swapped before the backstop's threshold");
+    let at6 = sim.tick_until(last + flat + slack, swapped(6));
+    assert!(
+        (flat + base..flat + base + 100).contains(&(at6 - last)),
+        "the backstop, then failure 1's base back-off: swapped {} ms after the last growth",
+        at6 - last
+    );
+
     let calls = sim.calls();
     let mut checked = 0;
     for (gen, reason) in [
@@ -2106,6 +2146,7 @@ fn every_sink_swap_is_logged_with_its_reason_just_before_the_swap() {
         (3, "connect_timeout"),
         (4, "error"),
         (5, "error"),
+        (6, "egress_stalled"),
     ] {
         let i = calls
             .iter()
@@ -2124,5 +2165,58 @@ fn every_sink_swap_is_logged_with_its_reason_just_before_the_swap() {
         .count();
     let swaps = calls.iter().filter(|c| matches!(c, Call::Swap(..))).count();
     eprintln!("swaps {swaps}, swap lines {lines}, checked {checked}");
-    assert_eq!((checked, lines, swaps), (5, 5, 5), "one line per swap");
+    assert_eq!((checked, lines, swaps), (6, 6, 6), "one line per swap");
+}
+
+// The PR #76 review's m-5: `run()` used to tick before it read what was queued, so a driver thread
+// that stalled for the backstop's threshold or longer (a VM pause, a blocking port call) judged a
+// healthy sink's growth absent on its first tick back, before reading the growth the poll had queued
+// meanwhile. The loop now reads what is queued first. Here sink 1 is Connected and delivering; the
+// driver then stalls for twice the threshold while four growth readings queue, and `run()` resumes on
+// a clock frozen at the stall's end. No beat may read the output backing off, and the last one reads
+// it Connected.
+#[test]
+fn a_driver_stalled_past_the_backstop_reads_its_queued_readings_before_it_ticks() {
+    let t = th();
+    let (flat, poll) = (t.output_egress_flat_ms, OUTPUT_PROGRESS_POLL_MS);
+    let mut sim = Sim::new(t.clone(), session_720p());
+    let at1 = sim.tick_until(SESSION_AT + 1_000, swapped(1));
+    let first = at1 + 31;
+    // Growth past Connected for one heartbeat more, so a beat reads it.
+    let grown = first + t.output_connected_after_ms + t.heartbeat_interval_ms + poll;
+    let readings: Vec<(u64, Inbound)> = (0..)
+        .map(|k| (k, first + poll * k))
+        .take_while(|&(_, at)| at <= grown)
+        .map(|(k, at)| (at, delivering(1, 476 + 50_000 * k, k + 1)))
+        .collect();
+    let (seen, n) = (readings.last().expect("readings").0, readings.len() as u64);
+    sim.drive(seen + 1, readings);
+    let before = beats_in(&sim.calls());
+    assert!(
+        before.last().is_some_and(|h| h.output == LinkStatus::Connected),
+        "sink 1 is Connected before the stall: {:?}",
+        before.last().map(|h| h.output)
+    );
+    let mark = sim.log.len();
+    let stalled_until = seen + 2 * flat;
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let mut queued = 0;
+    for k in n..n + 4 {
+        tx.send(delivering(1, 476 + 50_000 * k, k + 1)).expect("queued");
+        queued += 1;
+    }
+    drop(tx);
+    let code = app::run::run(sim.d, rx, &move || stalled_until);
+    let after = beats_in(&sim.log.calls_from(mark));
+    eprintln!(
+        "queued {queued}, beats after the stall {}, exit {code}",
+        after.len()
+    );
+    assert!(queued > 0 && !after.is_empty(), "nothing was checked");
+    assert!(
+        after.iter().all(|h| h.output != LinkStatus::Backoff),
+        "the backstop fired on the stall: {:?}",
+        after.iter().map(|h| h.output).collect::<Vec<_>>()
+    );
+    assert_eq!(after.last().map(|h| h.output), Some(LinkStatus::Connected));
 }
