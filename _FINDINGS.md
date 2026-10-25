@@ -2324,7 +2324,13 @@ rebuild tears the last build down while it starts the next, so each role runs on
 turn, and each of their two arenas holds a frame pool. The gate bounds the median slope at 512 KiB
 (`tests/input_heap.rs`, `BOUND_KIB`): the power of two nearest the geometric middle of the fix's
 highest reading and the cause's lowest (434 KiB), so each clears it by about the same factor (4.3
-and 3.1).
+and 3.1). Both readings are measurements, so the bound is also held under a declared budget
+(`the_bound_is_under_the_soaks_memory_budget`, PR #91 fix round 1): soak.json declares no
+per-dropout budget yet, and check 1.projection's, 4 096 MB at the 5 h cap shared over 144 dropouts
+(one every 125 s), is 29 127 KiB a dropout. The gate reds by name, not as heap growth, when a
+rebuild's predecessor is not torn down within 10 s, when the stop's teardown does not return, and
+when the measuring child passes its budget (280 s: 40 s plus one connect timeout and one decode
+window a rebuild).
 
 Round 5 ran each guard's mutant on the final code against the test that must kill it, and each
 was red on its message: both halves removed (the gate: "the heap grows", 2 284 KiB); one pool for
@@ -2365,9 +2371,11 @@ preload's 1, the heap's 2 and the input's 40, all passed.
    away moves nothing measurable here. Not traced: libsrt's own threads, which are new with each
    connection.
 7. **The arena cap is the other remedy, and costs nothing measurable in CPU here** (178 to 191 ms a
-   cycle across 1, 2, 4 and 8 arenas). It changes the allocator of the whole process tree, since the
-   compositor's environment reaches the CEF children. It is not used: the fix removes the cause, and
-   the cap stays the measured fallback.
+   cycle across 1, 2, 4 and 8 arenas). As the environment variable it changes the allocator of the
+   whole process tree, since the compositor's environment reaches the CEF children; set in the
+   process (`mallopt(M_ARENA_MAX)`) it would not reach them, but it would still cap the arenas of
+   cefsrc's in-process browser threads. It is not used: the fix removes the cause, and the cap stays
+   the measured fallback.
 8. **Two tools failed here.** heaptrack 1.5 aborted the Rust test binary 0.1 s in ("fatal runtime
    error: stack overflow") under its preload. The leaks tracer's `get-live-objects` action in 1.24.2
    hands its list over without a ref on each object: the objects were disposed while PLAYING, and the
