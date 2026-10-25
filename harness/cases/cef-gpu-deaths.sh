@@ -104,17 +104,31 @@ case_verdict() {
       # schedules after it shows (the re-review's m-1: round 3's `overlay_back` here passed on the
       # held frame, CI's `back_ms` 20 and 22, a frame that never left; a page that stops painting
       # while it beats keeps a stale score on air, and the hang rule never hides a page that beats).
+      # Due up to the last PROGRAMME frame, never the last frame whose overlay read (Owed 96): that
+      # bound fell back to the kill when the page went off air (run 40148980537 read "0 due" for
+      # 27 missing), and passed a page that went off air later. `off_air` is the longest strip-less
+      # run after the first kill (healthy runs show 2-frame blips at a kill), timed from the kill
+      # before it, and whether every missing change fell due inside it: Owed 96's evidence.
       require scheduled_changes_shown '. as $r | (mark("kill") | last | .at_ms) as $k
         | ($r.overlay.score_index_changes | map(.index)) as $shown
-        | ($r.frames_table | map(select(.[2] != null)) | last | .[0]) as $last
+        | ($r.frames_table | last | .[0]) as $last
         | [scheduled[] | select($k != null and .due_ms > $k and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due
         | ($due | length) >= 1 and ($due - $shown) == []' \
         '. as $r | (mark("kill") | last | .at_ms) as $k
-        | ($r.frames_table | map(select(.[2] != null)) | last | .[0]) as $last
+        | ($r.frames_table | last | .[0]) as $last
         | [scheduled[] | select($k != null and .due_ms > $k and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due
-        | {due_after_last_kill: ($due | length), missing: ($due - ($r.overlay.score_index_changes | map(.index))),
+        | ($due - ($r.overlay.score_index_changes | map(.index))) as $missing
+        | (mark("kill") | first | .at_ms) as $k0
+        | ([$r.overlay.runs[] | select(.index == null and .from_ms > $k0)] | max_by(.frames)) as $off
+        | {due_after_last_kill: ($due | length), missing: $missing,
            lag_ms: [$r.overlay.score_index_changes[] | select(.due_wall_ms != null and $k != null and .due_wall_ms > $k)
-             | .frame_wall_ms - .due_wall_ms] | {min: min, max: max}}'
+             | .frame_wall_ms - .due_wall_ms] | {min: min, max: max},
+           off_air: (if $off == null then null
+             else ([mark("kill")[] | select(.at_ms < $off.from_ms) | .at_ms] | last) as $kb
+             | {from_ms: $off.from_ms, after_kill_ms: ($off.from_ms - $kb), ms: ($off.to_ms - $off.from_ms),
+                frames: $off.frames, to_end: ($off == ($r.overlay.runs | last)),
+                covers_missing: all(scheduled[] | select(.index as $i | any($missing[]; . == $i)) | .due_ms;
+                  . + $t.budget_frame_to_encoder_ms >= $off.from_ms and . < $off.to_ms)} end)}'
       ;;
     fast)
       require kills_distinct '(mark("kill") | length) >= 1 and (mark("kill") | map(.value.pid) | repeats) == []' \

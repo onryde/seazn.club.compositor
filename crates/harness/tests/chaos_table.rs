@@ -636,6 +636,94 @@ fn the_decided_owed_rows_left_chaos_json_with_their_tags() {
     assert_eq!(checked, 2 * (2 + legs), "every map and leg read");
 }
 
+/// Owed 96 (2026-10-25): case 15 one-fewer's `scheduled_changes_shown` red reads owed only on its
+/// cause's evidence: an off-air run after a GPU kill that holds every missing change (CI's run
+/// 40148980537, re-judged under the programme bound). A held page, a 2-frame blip at a kill beside
+/// one, and a red with nothing missing read NOT OWED. case_verdicts.rs drives the same signature
+/// through the case's own measure.
+#[test]
+fn owed_96_names_the_one_fewer_off_air_red_and_nothing_else() {
+    let m = manifest();
+    let sig = m["owed_signatures"]["96"].as_str().unwrap().to_owned();
+    let off = |covers: bool| {
+        json!({"from_ms": 1_792_891_584_297_i64, "after_kill_ms": 77, "ms": 82_604, "frames": 2_478,
+            "to_end": true, "covers_missing": covers})
+    };
+    let ci = json!({"due_after_last_kill": 27, "missing": (7..=33).collect::<Vec<u16>>(),
+        "lag_ms": {"min": null, "max": null}, "off_air": off(true)});
+    let mut checked = 0;
+    for (tag, holds, shown) in [
+        ("ci-red", true, ci.clone()),
+        (
+            "held",
+            false,
+            json!({"due_after_last_kill": 27, "missing": [7, 8], "off_air": null}),
+        ),
+        (
+            "blip-held",
+            false,
+            json!({"due_after_last_kill": 27, "missing": [7], "off_air": off(false)}),
+        ),
+        (
+            "nothing-missing",
+            false,
+            json!({"due_after_last_kill": 0, "missing": [], "off_air": off(true)}),
+        ),
+    ] {
+        assert_eq!(
+            signature_holds(&sig, &json!({"measures": {"scheduled_changes_shown": shown}})),
+            Some(holds),
+            "Owed 96 on {tag}: {shown}"
+        );
+        checked += 1;
+    }
+    eprintln!("Owed 96 signature cases checked: {checked}");
+    assert_eq!(checked, 4);
+
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("chaos-table-owed-96");
+    let d = dir.to_str().unwrap();
+    let fail = |shown: Value| {
+        move |v: &mut Value| {
+            v["status"] = json!("fail");
+            v["failed"] = json!(["scheduled_changes_shown"]);
+            v["measures"]["scheduled_changes_shown"] = shown.clone();
+        }
+    };
+    verdicts(&dir, true);
+    edit(&dir, "cef-gpu-deaths-one-fewer", fail(ci));
+    let out = run(&["--table", d]);
+    let s = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "an owed red is still red\n{s}");
+    for line in [
+        "| cef-gpu-deaths-one-fewer | FAIL | 4/4 | outage_ms | failed: scheduled_changes_shown (Owed 96) |",
+        "red, every failed check owed: cef-gpu-deaths-one-fewer\n",
+        "red on a check no Owed row names: none\n",
+        &format!("Owed 96: {}\n", m["owed_titles"]["96"].as_str().unwrap()),
+        "this run does not count",
+    ] {
+        assert!(s.contains(line), "{line}\n{s}");
+    }
+    verdicts(&dir, true);
+    edit(
+        &dir,
+        "cef-gpu-deaths-one-fewer",
+        fail(json!({"due_after_last_kill": 27, "missing": [7, 8], "off_air": null})),
+    );
+    let out = run(&["--table", d]);
+    let s = stdout(&out);
+    assert_eq!(out.status.code(), Some(1));
+    for line in [
+        "| cef-gpu-deaths-one-fewer | FAIL | 4/4 | outage_ms | failed: scheduled_changes_shown (NOT OWED: Owed 96's signature absent) |",
+        "red on a check no Owed row names: cef-gpu-deaths-one-fewer (scheduled_changes_shown)\n",
+    ] {
+        assert!(s.contains(line), "{line}\n{s}");
+    }
+    assert!(
+        !s.contains("Owed 96:"),
+        "a row whose evidence is absent is not titled\n{s}"
+    );
+}
+
 /// Case 17's `stall_swap` measure as CI's run 40121220366 left it (PR #65), in this branch's shape:
 /// the sink's own socket timeout 5 660 ms after the cut, the swap 515 ms later. Owed 87's evidence
 /// once; since its ruling a red with it is as unexplained as any other.
