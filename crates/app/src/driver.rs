@@ -47,9 +47,11 @@
 //!   listed=0`; a kind it found and could not read writes `kb=- n=0 listed=<k>`. An absent value
 //!   writes `-`, never 0. A sample without a split writes nothing.
 //! - **CEF's health** (C11b) is read from the graphics port once per `tick_due` that ran a tick, after
-//!   its ticks, and handed to `decide` every time (the domain decides the in-place restart, never the
-//!   driver), with one line when it changes (`cef health zygote_gone=<gen|-> leaked_teardowns=<n>
-//!   gpu_process_deaths=<n>`). Never after `Exit`.
+//!   its ticks, and handed to `decide` every time (the domain decides the in-place restart and the
+//!   reload after a GPU-process death, never the driver), with one line when it changes (`cef health
+//!   zygote_gone=<gen|-> leaked_teardowns=<n> gpu_process_deaths=<n>`). Never after `Exit`. A reload
+//!   (Owed 96; owner ruling 2026-10-25 "A") writes `cef reload gen=<g> reason=gpu_process_death
+//!   deaths=<n>` before the port's restart: `g` the generation it builds, `n` the process's count.
 //! - **After `Exit`** nothing reaches a port from `step` or `tick_due`. `run()`'s flush follows, and
 //!   logs `final beat not confirmed within 2000 ms` when it times out.
 use std::time::Duration;
@@ -361,14 +363,28 @@ impl Driver {
                 };
                 p.graphics.restart(gen, &cfg.overlay_url);
             }
+            // The reload after a GPU-process death (Owed 96): the same page, the next generation, in
+            // the same process, its cause logged first.
+            Effect::ReloadGraphics {
+                gen,
+                gpu_process_deaths,
+            } => {
+                let Some(cfg) = &self.session else {
+                    return self.no_session(now);
+                };
+                p.log.info(&format!(
+                    "cef reload gen={gen} reason=gpu_process_death deaths={gpu_process_deaths}"
+                ));
+                p.graphics.restart(gen, &cfg.overlay_url);
+            }
             Effect::HideOverlay { reason, gen } => {
                 p.log
                     .info(&format!("overlay hidden reason={} gen={gen}", hide_name(reason)));
                 // A hung or failed page is stopped (Owed 17), BEFORE the slot is cleared: the stop
                 // closes the page's gate and waits out a sample being written, which would otherwise
-                // land after the clear and stay on air (PR #32 review I2, Owed 57). A crashed or
-                // recycled generation is already gone, and the reload now loading must survive (C05b
-                // PR #22 review).
+                // land after the clear and stay on air (PR #32 review I2, Owed 57). A crashed,
+                // recycled or reloaded generation is already gone, and the reload now loading must
+                // survive (C05b PR #22 review; Owed 96).
                 if matches!(reason, HideReason::Hang | HideReason::Failed) {
                     p.graphics.stop();
                 }
@@ -502,6 +518,7 @@ fn hide_name(r: HideReason) -> &'static str {
         HideReason::Failed => "failed",
         HideReason::Crash => "crash",
         HideReason::Recycle => "recycle",
+        HideReason::Reload => "reload",
     }
 }
 

@@ -1095,7 +1095,7 @@ impl World {
                     self.sink_gen = gen;
                     self.sink_total = 0;
                 }
-                Effect::RestartGraphics { gen } => {
+                Effect::RestartGraphics { gen } | Effect::ReloadGraphics { gen, .. } => {
                     self.page_gen = gen;
                     self.pending.push(Event::CefReady { gen });
                 }

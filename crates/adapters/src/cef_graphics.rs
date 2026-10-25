@@ -22,8 +22,11 @@
 //! relayed; a retired page's are logged and dropped. `CefCrashed` is sent once a build, from the first
 //! of: a bus error, cefsrc's "Render subprocess terminated" warning (its `OnRenderProcessTerminated`,
 //! which then reloads the page), or the memory cap. A dead GPU process is no crash: CEF recovers it
-//! and the page keeps painting (F-013), but each is counted (`health()`): the 6th of the process's
-//! life aborts it.
+//! (F-013), but each is counted (`health()`): the 6th of the process's life aborts it. The page does
+//! not always keep painting after one (C14 case 15, run 40148980537: off air 82.6 s while it still
+//! beat), so the domain reloads it below the in-place restart's count (Owed 96; owner ruling
+//! 2026-10-25 "A"): a `restart` like any other, the next build in this process, whose count it never
+//! resets.
 //!
 //! **The gate** (Owed 17; the 2026-10-18 amendment): one field, the build whose samples may reach the
 //! overlay slot. Only that build's own `seazn:ready` opens it, and a build reported crashed never

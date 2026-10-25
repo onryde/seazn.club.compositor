@@ -1,8 +1,8 @@
 //! CEF overlay lifecycle. It never blocks video: a failed page restarts on a back-off while the adapter
-//! holds the last overlay frame (C11); the planned recycle is a restart, never a failure; repeated
-//! failures hide the overlay and retry after a cooldown. Whatever happens, one bound keeps a stale
-//! score off air: a frame stays on air at most `cef_hang_after_ms` after the last proof of life of the
-//! page that produced it.
+//! holds the last overlay frame (C11); the planned recycle, and the reload after a GPU-process death,
+//! are restarts, never failures; repeated failures hide the overlay and retry after a cooldown.
+//! Whatever happens, one bound keeps a stale score off air: a frame stays on air at most
+//! `cef_hang_after_ms` after the last proof of life of the page that produced it.
 //!
 //! ```text
 //! Backoff --due tick: restart, next generation--> Starting --ready signal--> Ready
@@ -13,8 +13,9 @@
 //! Ready --beat--> Ready (the bound moves; the recycle does not)                |
 //! Ready --the bound: failure (a hang) + Hide(Hang)--> Backoff | Failed         |
 //! Ready --recycle due--> Starting (Restart; not a failure)                     |
-//! Starting | Backoff --the bound of a crashed or recycled page's frame:        |
-//!                      Hide(Crash | Recycle), nothing else moves               |
+//! Ready | Starting --GPU-process death: Starting (Restart; not a failure)      |
+//! Starting | Backoff --the bound of a crashed, recycled or reloaded page's     |
+//!                      frame: Hide(Crash | Recycle | Reload), nothing else moves
 //! Failed --retry_at--> Starting (Restart)                                      v
 //! ```
 //!
@@ -32,7 +33,7 @@
 //!   owner-approved 10 s rule). The frame on air may stay on air at most `cef_hang_after_ms` after its
 //!   page's last proof of life (its ready, or a beat). C11 writes the overlay slot only from a page
 //!   after its own ready, so the frame on air is the Ready page's, or the last frame of a Ready page
-//!   whose life a crash or a recycle ended, held through the reload. The first tick at or after the
+//!   whose life a crash, a recycle or a reload ended, held through the reload. The first tick at or after the
 //!   bound hides it, naming its page; nothing extends the bound but a beat of that page while Ready,
 //!   and only a newer page's Ready replaces the frame first. The bound is checked before every other
 //!   timer: a restart, a load timeout or a recycle due on the same tick follows on the next one.
@@ -62,20 +63,34 @@
 //!     owner-approved design, 2026-10-18).
 //!   - `Crash`: a crash of a Ready page below the count, and no newer page Ready within the bound.
 //!   - `Recycle`: a recycle, and no newer page Ready within the bound.
+//!   - `Reload`: a GPU-process death's reload of a Ready page, and no newer page Ready within the
+//!     bound (Owed 96).
 //!   - `Failed`: a crash or a load timeout that enters Failed, naming the generation that failed.
 //!
 //!   The overlay stays hidden from a `Hide` until the next generation's Ready; nothing else lifts it.
 //!   After a `Hang` or `Failed` hide the next action is a `Restart` (at `retry_at` from Failed, at the
-//!   back-off's end from a hang); a `Crash` or `Recycle` hide leaves the reload loading, so the next is
-//!   a `Restart` or that reload's `Failed`. Nothing of the hidden generation may reach the programme
-//!   before it; under F-001's console readiness a page that never signals ready keeps painting, so the
-//!   adapters must hold the hide against its frames, and lift it once a later generation signals ready
-//!   (C08 maps a `Hang` or `Failed` hide to `hide_overlay()` and `graphics.stop()`, and a `Crash` or
-//!   `Recycle` hide to `hide_overlay()` alone, so the reload survives; C11 writes the slot only from a
-//!   generation that signalled its own ready, and closes a generation's slot at its stop, its restart
-//!   or its reported crash; `docs/_INDEX.md` Owed 17).
+//!   back-off's end from a hang); a `Crash`, `Recycle` or `Reload` hide leaves the reload loading, so
+//!   the next is a `Restart` or that reload's `Failed`. Nothing of the hidden generation may reach the
+//!   programme before it; under F-001's console readiness a page that never signals ready keeps
+//!   painting, so the adapters must hold the hide against its frames, and lift it once a later
+//!   generation signals ready
+//!   (C08 maps a `Hang` or `Failed` hide to `hide_overlay()` and `graphics.stop()`, and a `Crash`,
+//!   `Recycle` or `Reload` hide to `hide_overlay()` alone, so the reload survives; C11 writes the slot
+//!   only from a generation that signalled its own ready, and closes a generation's slot at its stop,
+//!   its restart or its reported crash; `docs/_INDEX.md` Owed 17).
 //! - **Recycle.** `cef_recycle_every_ms` after the ready signal the browser is restarted (spec §6, every
 //!   2 h). It is planned, so it records no failure.
+//! - **GPU-process death** (Owed 96; owner ruling 2026-10-25 "A": reload the page after each counted
+//!   GPU-process death). After one, the page can stop painting while it still beats (C14 case 15,
+//!   run 40148980537: the overlay off air 82.6 s while every beat read `graphics: ready`), which no rule
+//!   here can see: the bound runs on beats. So each death the process counts below the in-place
+//!   restart's `cef_gpu_deaths_to_restart` reloads the page (`on_gpu_death`; the supervisor reads the
+//!   count from `CefHealth`, and a death at the count restarts the process instead): a Ready or loading
+//!   page is restarted at once as the next generation, the same page in the same CEF process (C11
+//!   counts GPU-process deaths per process, so a reload never resets the count). Like the recycle it
+//!   records no failure, and a Ready page's last frame stays on air through the reload, to its bound
+//!   (`Reload`). A page backing off or Failed has nothing to reload: its next restart builds after the
+//!   death anyway, and a reload there would cut a back-off or a cooldown short.
 //! - **Generations.** Every restart is a new generation, and every adapter event carries the
 //!   generation of the page that sent it. An event from any other generation is ignored.
 use crate::backoff::delay;
@@ -105,8 +120,8 @@ pub enum GraphicsAction {
     /// overlay frame while it loads (C11).
     Restart,
     /// Take the overlay off air (C06 `HideOverlay { reason, gen }`) until the next generation's Ready.
-    /// `gen` is the page whose frame came off air at its bound (`Hang`, `Crash`, `Recycle`), or the
-    /// generation whose failure entered Failed (`Failed`). C12 logs the one line
+    /// `gen` is the page whose frame came off air at its bound (`Hang`, `Crash`, `Recycle`, `Reload`),
+    /// or the generation whose failure entered Failed (`Failed`). C12 logs the one line
     /// `overlay hidden reason=<r> gen=<g>` for it (PR #22 review I2).
     Hide { reason: HideReason, gen: u64 },
 }
@@ -122,6 +137,9 @@ pub enum HideReason {
     Crash,
     /// A Ready page was recycled, and its last frame reached its bound with no newer generation Ready.
     Recycle,
+    /// A Ready page was reloaded after a GPU-process death (Owed 96), and its last frame reached its
+    /// bound with no newer generation Ready.
+    Reload,
 }
 
 /// What ended a Ready page's life while its last frame stayed on air. A hang ends it at the bound, so
@@ -130,11 +148,13 @@ pub enum HideReason {
 enum Ended {
     Crash,
     Recycle,
+    Reload,
 }
 
-/// The last frame of a page whose life a crash or a recycle ended while it was Ready: it stays on
-/// air through the reload until its bound or the next Ready (C11 writes the slot only from a page
-/// after its own ready, and `hide_overlay` clears it, so the machine tracks it without seeing a frame).
+/// The last frame of a page whose life a crash, a recycle or a reload ended while it was Ready: it
+/// stays on air through the reload until its bound or the next Ready (C11 writes the slot only from a
+/// page after its own ready, and `hide_overlay` clears it, so the machine tracks it without seeing a
+/// frame).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Held {
     /// The generation that produced the frame.
@@ -155,7 +175,7 @@ pub struct Graphics {
     generation: u64,
     failures: Window,
     /// Read only while not Ready: a Ready page's own frames replace any held frame, and each way out
-    /// of Ready (a crash, a recycle, the bound) writes it.
+    /// of Ready (a crash, a recycle, a reload, the bound) writes it.
     held: Option<Held>,
 }
 
@@ -228,9 +248,29 @@ impl Graphics {
         }
     }
 
+    /// The process counted a GPU-process death below the in-place restart's count (Owed 96; owner
+    /// ruling 2026-10-25 "A"). `Some(Restart)` reloads a Ready or loading page: the next generation,
+    /// at once, and no failure recorded. A Ready page's last frame stays on air through the reload, to
+    /// its bound (`Reload`). A page backing off or Failed has nothing to reload: `None`, nothing moves.
+    /// Nor does a Ready page at or past its own bound: it is hung, and the next tick counts the hang
+    /// and backs off (its restart builds after the death anyway), so a hang is never laundered as a
+    /// reload, which records no failure.
+    pub fn on_gpu_death(&mut self, now: Ms, t: &Thresholds) -> Option<GraphicsAction> {
+        match self.state {
+            GraphicsState::Ready { last_alive, .. } if elapsed(now, last_alive) >= t.cef_hang_after_ms => {
+                None
+            }
+            GraphicsState::Starting { .. } | GraphicsState::Ready { .. } => {
+                self.end_life(Ended::Reload);
+                Some(self.restart(now))
+            }
+            GraphicsState::Backoff { .. } | GraphicsState::Failed { .. } => None,
+        }
+    }
+
     /// `Some(Restart)` when a restart is due (the back-off is over, the recycle is due, or the
     /// cooldown is over); `Hide { reason: Failed, .. }` when a load timeout enters Failed; and a hide
-    /// naming its path (`Hang`, `Crash`, `Recycle`) when the frame on air reaches its bound.
+    /// naming its path (`Hang`, `Crash`, `Recycle`, `Reload`) when the frame on air reaches its bound.
     pub fn on_tick(&mut self, now: Ms, t: &Thresholds) -> Option<GraphicsAction> {
         // The bound, checked first: the frame on air comes off on the first tick at or after it, and
         // a restart, a load timeout or a recycle due on the same tick follows on the next one.
@@ -282,15 +322,16 @@ impl Graphics {
                 let reason = match h.ended {
                     Ended::Crash => HideReason::Crash,
                     Ended::Recycle => HideReason::Recycle,
+                    Ended::Reload => HideReason::Reload,
                 };
                 (h.gen, h.proof, reason)
             }),
         }
     }
 
-    /// A crash or a recycle ends the Ready page's life: its last frame stays on air, held, and its
-    /// bound still runs from its last proof of life. A page that is not Ready never showed a frame of
-    /// its own, so a frame already held keeps its page, its bound and its cause.
+    /// A crash, a recycle or a reload ends the Ready page's life: its last frame stays on air, held,
+    /// and its bound still runs from its last proof of life. A page that is not Ready never showed a
+    /// frame of its own, so a frame already held keeps its page, its bound and its cause.
     fn end_life(&mut self, ended: Ended) {
         if let GraphicsState::Ready { last_alive, .. } = self.state {
             self.held = Some(Held {
@@ -338,7 +379,7 @@ impl Graphics {
 mod tests {
     use super::*;
     use GraphicsAction::{Hide, Restart};
-    use HideReason::{Crash, Failed, Hang, Recycle};
+    use HideReason::{Crash, Failed, Hang, Recycle, Reload};
 
     fn t() -> Thresholds {
         Thresholds::default()
@@ -1458,7 +1499,7 @@ mod tests {
     // fall under it, and the load timeouts of their reloads neither end it nor move it ----
 
     /// The ways a Ready page's life ends with its last frame still on air while a reload loads.
-    const ENDINGS: [HideReason; 2] = [Crash, Recycle];
+    const ENDINGS: [HideReason; 3] = [Crash, Recycle, Reload];
 
     /// Generation 1 Ready at `r` (the ready is its last proof of life), crashed at
     /// `c = r + cef_alive_every_ms - 1`, just before its next beat would have come: a first failure,
@@ -1506,9 +1547,27 @@ mod tests {
         (g, beat, recycle)
     }
 
+    /// Generation 1 Ready at `r` (the ready is its last proof of life), and a GPU-process death
+    /// counted at `d = r + cef_alive_every_ms - 1`, just before its next beat (Owed 96): the reload
+    /// restarts generation 2 at once, records no failure, and the page's last frame stays on air. The
+    /// death is late, so a bound timed from it would differ from one timed from the proof by almost a
+    /// beat. Returns the machine, `r` and `d` (the reload's restart).
+    fn reloaded(th: &Thresholds) -> (Graphics, Ms, Ms) {
+        let (mut g, r) = ready_at(th);
+        let d = r + th.cef_alive_every_ms - 1;
+        assert!(d < r + th.cef_hang_after_ms, "the death comes inside the bound");
+        assert_eq!(g.on_gpu_death(d, th), Some(Restart), "the reload");
+        assert_eq!(
+            (g.state(), g.generation()),
+            (GraphicsState::Starting { since: d }, 2)
+        );
+        (g, r, d)
+    }
+
     /// Generation 1's life ended by `ending` with its frame on air, and generation 2 loading: the
-    /// crash of `crashed_ready` and its reload's restart, or `recycled` a beat after the last beat.
-    /// Returns the machine, generation 1's last proof of life and the reload's restart.
+    /// crash of `crashed_ready` and its reload's restart, `recycled` a beat after the last beat, or
+    /// `reloaded` after a GPU-process death. Returns the machine, generation 1's last proof of life
+    /// and the reload's restart.
     fn reloading_after(ending: HideReason, th: &Thresholds) -> (Graphics, Ms, Ms) {
         match ending {
             Crash => {
@@ -1518,6 +1577,7 @@ mod tests {
                 (g, r, restart)
             }
             Recycle => recycled(th, th.cef_alive_every_ms),
+            Reload => reloaded(th),
             other => panic!("a {other:?} hide does not leave a frame on air through a reload"),
         }
     }
@@ -2119,5 +2179,156 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, 2, "cases checked: {checked}");
+    }
+
+    // ---- Owed 96 (owner ruling 2026-10-25 "A"): a GPU-process death reloads the page ----
+
+    // A Ready page is reloaded at once: the next generation, loading from the death's instant, and no
+    // failure recorded (like the recycle): `cef_fail_count - 1` crashes of its reloads, inside one
+    // window with the death, still back off, where a counted reload would make the last one Failed.
+    #[test]
+    fn a_gpu_death_reloads_a_ready_page_at_once_and_records_no_failure() {
+        let th = t();
+        let (mut g, _, d) = reloaded(&th);
+        let mut now = d;
+        for k in 0..th.cef_fail_count - 1 {
+            now += 1;
+            assert_eq!(
+                g.on_crashed(now, g.generation(), &th),
+                None,
+                "crash {} after the reload: no Failed",
+                k + 1
+            );
+            let back = match g.state() {
+                GraphicsState::Backoff { until, .. } => until,
+                other => panic!("expected Backoff, got {other:?}"),
+            };
+            assert!(back - d < th.cef_fail_window_ms, "inside one window");
+            assert_eq!(g.on_tick(back, &th), Some(Restart));
+            now = back;
+        }
+        assert!(matches!(g.state(), GraphicsState::Starting { .. }));
+    }
+
+    // A loading page is reloaded too (the death may have hit it): the next generation, its load
+    // timeout timed from the death. It never showed a frame, so a frame already held keeps its page,
+    // its bound and its cause: a crashed page's frame still comes off as `Crash`, naming generation 1,
+    // at its proof plus the bound. With nothing on air, nothing comes off.
+    #[test]
+    fn a_gpu_death_reloads_a_loading_page_and_keeps_the_held_frame() {
+        let th = t();
+        // Nothing on air: generation 1 loading.
+        let mut g = Graphics::new();
+        assert_eq!(g.on_tick(0, &th), Some(Restart));
+        let d = 500;
+        assert_eq!(g.on_gpu_death(d, &th), Some(Restart));
+        assert_eq!(
+            (g.state(), g.generation()),
+            (GraphicsState::Starting { since: d }, 2)
+        );
+        assert_eq!(
+            g.on_tick(d + th.cef_load_timeout_ms - 1, &th),
+            None,
+            "the load timeout runs from the reload"
+        );
+        assert_eq!(g.on_tick(d + th.cef_load_timeout_ms, &th), None, "a back-off");
+        assert!(matches!(g.state(), GraphicsState::Backoff { .. }));
+        // A crashed page's frame held while its reload loads.
+        let (mut g, r, c) = crashed_ready(&th);
+        let restart = c + wait(&th, 0);
+        assert_eq!(g.on_tick(restart, &th), Some(Restart));
+        let d = restart + 100;
+        assert_eq!(
+            g.on_gpu_death(d, &th),
+            Some(Restart),
+            "the loading reload, reloaded"
+        );
+        assert_eq!(
+            (g.state(), g.generation()),
+            (GraphicsState::Starting { since: d }, 3)
+        );
+        let off = r + th.cef_hang_after_ms;
+        assert_eq!(g.on_tick(off - 1, &th), None);
+        assert_eq!(
+            g.on_tick(off, &th),
+            hide(Crash, 1),
+            "its page, its bound, its cause"
+        );
+    }
+
+    // A page backing off or Failed has nothing to reload: the whole machine is unchanged, so the
+    // back-off and the cooldown keep their ends and nothing is restarted early.
+    #[test]
+    fn a_gpu_death_while_backing_off_or_failed_changes_nothing() {
+        let th = t();
+        let (backing_off, _, _) = crashed_ready(&th);
+        assert!(matches!(backing_off.state(), GraphicsState::Backoff { .. }));
+        let (failed, last) = crashes(&spread(th.cef_fail_count, th.cef_fail_window_ms), &th);
+        assert_eq!(last, hide(Failed, th.cef_fail_count as u64), "setup");
+        let mut checked = 0;
+        for g in [backing_off, failed] {
+            let mut h = g.clone();
+            assert_eq!(h.on_gpu_death(1_000_000, &th), None, "{:?}", g.state());
+            assert_eq!(h, g, "a GPU-process death moved {:?}", g.state());
+            checked += 1;
+        }
+        assert_eq!(checked, 2);
+    }
+
+    // The second call: each death reloads once more. Generation 2 never got ready, so after the
+    // second death generation 3 loads and generation 1's frame is still the one held, its bound from
+    // its own proof, as `Reload`. Then a ready of generation 3 inside the bound replaces it: no hide.
+    #[test]
+    fn each_gpu_death_reloads_again() {
+        let th = t();
+        let (mut g, r, d1) = reloaded(&th);
+        let d2 = d1 + 2_000;
+        assert_eq!(g.on_gpu_death(d2, &th), Some(Restart), "the second death");
+        assert_eq!(
+            (g.state(), g.generation()),
+            (GraphicsState::Starting { since: d2 }, 3)
+        );
+        let mut late = g.clone();
+        let off = r + th.cef_hang_after_ms;
+        assert_eq!(late.on_tick(off - 1, &th), None);
+        assert_eq!(
+            late.on_tick(off, &th),
+            hide(Reload, 1),
+            "generation 1's frame, held"
+        );
+        g.on_ready(off - 1, 2);
+        assert!(
+            matches!(g.state(), GraphicsState::Starting { .. }),
+            "a stale ready"
+        );
+        g.on_ready(off - 1, 3);
+        assert!(matches!(g.state(), GraphicsState::Ready { .. }));
+        assert_eq!(g.on_tick(off, &th), None, "replaced inside the bound");
+    }
+
+    // A Ready page at its bound is hung: a GPU-process death counted before the tick that sees it
+    // reloads nothing (the whole machine is unchanged), and that tick counts the hang and hides it as
+    // `Hang`, a failure, then backs off. 1 ms inside the bound the death still reloads.
+    #[test]
+    fn a_gpu_death_never_launders_a_hang_as_a_reload() {
+        let th = t();
+        let (g, r) = ready_at(&th);
+        let bound = r + th.cef_hang_after_ms;
+        let mut inside = g.clone();
+        assert_eq!(inside.on_gpu_death(bound - 1, &th), Some(Restart), "1 ms inside");
+        let mut checked = 0;
+        for at in [bound, bound + 1] {
+            let mut h = g.clone();
+            assert_eq!(h.on_gpu_death(at, &th), None, "at {at}");
+            assert_eq!(h, g, "a death at {at} moved a hung page");
+            assert_eq!(h.on_tick(at, &th), hide(Hang, 1), "the hang, counted");
+            assert!(
+                matches!(h.state(), GraphicsState::Backoff { attempt: 0, .. }),
+                "{:?}",
+                h.state()
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 2);
     }
 }
