@@ -21,7 +21,7 @@ case_drive() {
   at_s "$CASE_LIVE_S"
 }
 
-CASE_CHECKS=14
+CASE_CHECKS=16
 case_verdict() {
   # Anti-vacuity: the feed refused the page's polls, and the page said so in the log.
   require feed_was_down '$run.control_state.score_refused >= 1 and mark_value("down").score_down_until_ms > mark_at("down")' \

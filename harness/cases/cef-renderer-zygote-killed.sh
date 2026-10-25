@@ -33,7 +33,7 @@ case_after_kill() {
   in_compositor tree | mark_lines tree_after || true
 }
 
-CASE_CHECKS=20
+CASE_CHECKS=22
 case_verdict() {
   zygote_verdict
   require old_tree_gone '[mark("tree_after")[] | .value] as $all
@@ -50,4 +50,5 @@ case_verdict() {
          oldest_after_init_ms: less([$all[] | select(.type != null) | .start_ms] | min; $init.start_ms),
          init_minus_start_event_ms: less($init.start_ms; $start),
          sampled_after_start_ms: less([$all[] | .at_ms] | min; $start)}'
+  require_no_false_blank
 }

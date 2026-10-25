@@ -38,6 +38,17 @@
 //!   counts; a death at the restart's count restarts the process and reloads nothing. The count is
 //!   the process's, never reset (C11), so the threshold restart still comes at the same death (owner
 //!   rulings 2A and 4A stand). The hold ignores it like every `CefHealth`: nothing is rebuilt there.
+//! - **A blank page** (Owed 99; option B, applied by the coordinator 2026-10-25): while Running, a
+//!   Ready page that has shown no frame of its own `cef_hang_after_ms` after its ready (graphics'
+//!   `Blank`, once a page) is a counted page fault. Blank pages and GPU-process deaths count together
+//!   toward `cef_gpu_deaths_to_restart` (`cef_health::page_faults_restart`, the one rule): below it the
+//!   page reloads (`ReloadGraphicsNoFrames`, the next generation, no failure); at it the process
+//!   restarts in place and reloads nothing, so a page that never paints costs in-place restarts, which
+//!   owner ruling 2A caps, and cannot reload forever. The count is the process's, never reset. So
+//!   Owed 96's reload count is now the shared one: a GPU-process death below
+//!   `cef_gpu_deaths_to_restart` restarts in place, reloading nothing, once blank pages bring the
+//!   shared count to it (sanctioned by the Owed 99 dispatch). The hold runs no blank rule (graphics'
+//!   bound alone), and its painted reports still replace a held frame.
 //! - **The final beat** (owner ruling 2026-10-15): every path to `Exit` sends a `Stopped` beat that
 //!   carries its reason first. A drain sends it when the drain starts; an immediate exit sends it in
 //!   the same `Decision`, before `Exit`. A fatal error's text rides its beat as `ExitInfo.detail`
@@ -49,7 +60,7 @@
 //! - **Generations.** Every adapter event carries the generation of the pipeline or page that sent
 //!   it, and each sub-machine ignores any other (C04, C05).
 use crate::backoff::delay;
-use crate::cef_health::CefHealth;
+use crate::cef_health::{page_faults_restart, CefHealth, RestartCause};
 use crate::config::Thresholds;
 use crate::graphics::{Graphics, GraphicsAction, GraphicsState, HideReason};
 use crate::health::{
@@ -142,6 +153,11 @@ pub enum Event {
     CefAlive {
         gen: u64,
     },
+    /// The page of generation `gen` put its first frame in the overlay slot (Owed 99; C11 sends it
+    /// once a build, after that build's `CefReady`).
+    CefPainted {
+        gen: u64,
+    },
     ScoreStale(bool),
     HeartbeatReply(Desired),
     HeartbeatFailed,
@@ -190,6 +206,14 @@ pub enum Effect {
         gen: u64,
         gpu_process_deaths: usize,
     },
+    /// Build the page of graphics generation `gen` because the page before it was blank (Owed 99):
+    /// Ready with no frame of its own `cef_hang_after_ms` after its ready. Applied as
+    /// `RestartGraphics`, and C08 logs `cef reload gen=<g> reason=no_frames blank_pages=<n>` first,
+    /// `n` the process's count of blank pages.
+    ReloadGraphicsNoFrames {
+        gen: u64,
+        blank_pages: usize,
+    },
     /// The domain hide's reason and generation, unchanged (C05b PR #22 review I2): C12 logs
     /// `overlay hidden reason=<r> gen=<g>`, and C08 maps the reason.
     HideOverlay {
@@ -230,6 +254,8 @@ pub struct Supervisor {
     /// The highest GPU-process death count a Running `CefHealth` has reported (Owed 96): a reload is
     /// owed only when the count rises above it.
     gpu_deaths_seen: usize,
+    /// The blank pages counted so far (Owed 99): the process's count, never reset.
+    blank_pages: usize,
 }
 
 impl Supervisor {
@@ -255,6 +281,7 @@ impl Supervisor {
             heartbeat_failures: 0,
             exit_detail: None,
             gpu_deaths_seen: 0,
+            blank_pages: 0,
         }
     }
 
@@ -316,11 +343,16 @@ impl Supervisor {
     }
 
     /// CEF's health while Running: an in-place restart (C11b; the cause rides the final beat, then
-    /// `Exit(75)`), or else, when the GPU-process deaths rose, the reload (Owed 96).
+    /// `Exit(75)`), or else, when the GPU-process deaths rose, the reload (Owed 96). With a blank page
+    /// counted, the shared count's cause names it (the PR #92 review's m-3), even when the deaths alone
+    /// reach the count; only a dead zygote outranks it.
     fn on_cef_health(&mut self, now: Ms, h: CefHealth, fx: &mut Vec<Effect>) {
-        if let Some(cause) = h.restart_cause(&self.t) {
-            self.exit_detail = Some(ExitDetail::new(cause.detail()));
-            self.exit(now, ExitReason::Restart, fx);
+        let cause = match h.restart_cause(&self.t) {
+            Some(zygote @ RestartCause::ZygoteGone { .. }) => Some(zygote),
+            other => page_faults_restart(self.blank_pages, h.gpu_process_deaths, &self.t).or(other),
+        };
+        if let Some(cause) = cause {
+            self.restart_in_place(now, cause, fx);
             return;
         }
         let rose = h.gpu_process_deaths > self.gpu_deaths_seen;
@@ -329,6 +361,27 @@ impl Supervisor {
             fx.push(Effect::ReloadGraphics {
                 gen: self.graphics.generation(),
                 gpu_process_deaths: h.gpu_process_deaths,
+            });
+        }
+    }
+
+    /// An in-place restart (C11b): the cause rides the final beat, then `Exit(75)`.
+    fn restart_in_place(&mut self, now: Ms, cause: RestartCause, fx: &mut Vec<Effect>) {
+        self.exit_detail = Some(ExitDetail::new(cause.detail()));
+        self.exit(now, ExitReason::Restart, fx);
+    }
+
+    /// A blank page while Running (Owed 99): counted with the GPU-process deaths; at the count the
+    /// process restarts in place and nothing reloads, below it the page reloads.
+    fn on_blank_page(&mut self, now: Ms, fx: &mut Vec<Effect>) {
+        self.blank_pages = self.blank_pages.saturating_add(1);
+        if let Some(cause) = page_faults_restart(self.blank_pages, self.gpu_deaths_seen, &self.t) {
+            return self.restart_in_place(now, cause, fx);
+        }
+        if self.graphics.on_blank_reload(now) == Some(GraphicsAction::Restart) {
+            fx.push(Effect::ReloadGraphicsNoFrames {
+                gen: self.graphics.generation(),
+                blank_pages: self.blank_pages,
             });
         }
     }
@@ -456,6 +509,13 @@ impl Supervisor {
                     Some(GraphicsAction::Hide { reason, gen }) => {
                         fx.push(Effect::HideOverlay { reason, gen })
                     }
+                    Some(GraphicsAction::Blank { .. }) => {
+                        self.on_blank_page(now, fx);
+                        if matches!(self.lifecycle, Lifecycle::Exited(_)) {
+                            // The in-place restart's final beat and `Exit` are already pushed.
+                            return None;
+                        }
+                    }
                     None => {}
                 }
                 let choice = self.programme.on_tick(now, &t);
@@ -479,6 +539,7 @@ impl Supervisor {
             Event::CefReady { gen } => self.graphics.on_ready(now, gen),
             Event::CefCrashed { gen } => self.on_cef_crashed(now, gen, fx),
             Event::CefAlive { gen } => self.graphics.on_alive(now, gen),
+            Event::CefPainted { gen } => self.graphics.on_painted(gen),
             Event::ScoreStale(b) => self.score_stale = Some(b),
             Event::PhaseChannel(c) => self.phase_channel = Some(c),
             Event::HeartbeatReply(Desired::Live) => self.heartbeat_failures = 0,
@@ -541,6 +602,9 @@ impl Supervisor {
             // A beat moves the bound of the page on air (Owed 18): without it a healthy page would
             // read as hung during the hold.
             Event::CefAlive { gen } => self.graphics.on_alive(now, gen),
+            // A page Ready in the hold puts its first frame on air: the held frame is replaced, and
+            // its bound no longer runs (Owed 99).
+            Event::CefPainted { gen } => self.graphics.on_painted(gen),
             Event::ScoreStale(b) => self.score_stale = Some(b),
             Event::PhaseChannel(c) => self.phase_channel = Some(c),
             Event::HeartbeatReply(Desired::Live) => self.heartbeat_failures = 0,
@@ -728,6 +792,7 @@ mod tests {
                     | Effect::SwapSink { .. }
                     | Effect::RestartGraphics { .. }
                     | Effect::ReloadGraphics { .. }
+                    | Effect::ReloadGraphicsNoFrames { .. }
             )
         })
     }
@@ -1610,6 +1675,7 @@ mod tests {
         let f = last + 3_000;
         let mut ev = beats_of_1(alive, last);
         ev.push((0, Event::CefReady { gen: 1 }));
+        ev.push((0, Event::CefPainted { gen: 1 }));
         ev.push((f, Event::HeartbeatReply(Desired::Ending)));
         let bound = last + hang;
         assert!(
@@ -1645,6 +1711,7 @@ mod tests {
         let f = crash + 5_000;
         let mut ev = beats_of_1(alive, last);
         ev.push((0, Event::CefReady { gen: 1 }));
+        ev.push((0, Event::CefPainted { gen: 1 }));
         ev.push((crash, Event::CefCrashed { gen: 1 }));
         ev.push((f, Event::HeartbeatReply(Desired::Ending)));
         let bound = last + hang;
@@ -1677,6 +1744,7 @@ mod tests {
         assert_eq!(last % alive, 0, "setup: the last beat is on the page's beat grid");
         let mut ev = beats_of_1(alive, last);
         ev.push((0, Event::CefReady { gen: 1 }));
+        ev.push((0, Event::CefPainted { gen: 1 }));
         ev.push((f, Event::HeartbeatReply(Desired::Ending)));
         let bound = last + hang;
         assert!(recycle_due > f && bound < f + hold, "setup: both inside the hold");
@@ -1706,10 +1774,13 @@ mod tests {
         // Each ready lands 100 ms after its back-off ends, past the restart's tick (the period is 33).
         let mut ev = vec![
             (0, Event::CefReady { gen: 1 }),
+            (0, Event::CefPainted { gen: 1 }),
             (c1, Event::CefCrashed { gen: 1 }),
             (c1 + base + 100, Event::CefReady { gen: 2 }),
+            (c1 + base + 100, Event::CefPainted { gen: 2 }),
             (c2, Event::CefCrashed { gen: 2 }),
             (c2 + 2 * base + 100, Event::CefReady { gen: 3 }),
+            (c2 + 2 * base + 100, Event::CefPainted { gen: 3 }),
         ];
         let f = c2 + 2 * base + 1_000;
         let (s_f, _) = drive(ev.clone(), f, 0);
@@ -1770,6 +1841,7 @@ mod tests {
         );
         let mut ev = ev_beats;
         ev.push((0, Event::CefReady { gen: 1 }));
+        ev.push((0, Event::CefPainted { gen: 1 }));
         ev.push((f, Event::HeartbeatReply(Desired::Ending)));
         let (s, log) = drive(ev, f + hold + 1_000, f - 5_000);
         let (drained, hidden, restarts) = hold_graphics(&log, f);
@@ -1802,6 +1874,7 @@ mod tests {
         let mut s = booted(0).decide(Event::Tick, 0).next;
         assert_eq!(s.graphics_generation(), 1, "setup: generation 1 built");
         s = s.decide(Event::CefReady { gen: 1 }, 0).next;
+        s = s.decide(Event::CefPainted { gen: 1 }, 0).next;
         let beat_for = 30_000;
         let (mut now, mut next_beat, mut last_alive) = (step, alive, 0);
         while now <= beat_for {
@@ -1845,6 +1918,7 @@ mod tests {
             d.effects
         );
         let mut s = d.next.decide(Event::CefReady { gen: 2 }, hung + base).next;
+        s = s.decide(Event::CefPainted { gen: 2 }, hung + base).next;
         assert_eq!(s.health(hung + base).graphics, GraphicsStatus::Ready);
         // Generation 2 beats, so no hide follows (a Ready page that never beats hangs, correctly).
         let (mut now, mut next_beat) = (hung + base + step, hung + base + alive);
@@ -1925,6 +1999,7 @@ mod tests {
         let step = period();
         let (s, at) = reach(Reconnecting);
         let mut s = s.decide(Event::CefReady { gen: 1 }, at).next;
+        s = s.decide(Event::CefPainted { gen: 1 }, at).next;
         let hung = at + th.cef_hang_after_ms;
         // The hide lands up to a period after the bound, and the restart up to a period after its
         // back-off ends.
@@ -2018,6 +2093,7 @@ mod tests {
         let mut hidden = Vec::new();
         for n in 1..=th.cef_fail_count as u64 {
             s = s.decide(Event::CefReady { gen: n }, now).next;
+            s = s.decide(Event::CefPainted { gen: n }, now).next;
             now += 100;
             let d = s.decide(Event::CefCrashed { gen: n }, now);
             hidden.extend(hides(&d.effects));
@@ -2114,6 +2190,7 @@ mod tests {
         );
         let (n, c, _) = on_air(s, 10);
         s = n.decide(Event::CefReady { gen: 1 }, c).next;
+        s = s.decide(Event::CefPainted { gen: 1 }, c).next;
         s = s.decide(Event::ScoreStale(true), c).next;
         s = s.decide(Event::HeartbeatFailed, c).next;
         s = s.decide(Event::HeartbeatFailed, c).next;

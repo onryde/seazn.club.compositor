@@ -675,7 +675,11 @@ fn a_fatal_during_the_drain_sends_a_second_stopped_beat() {
 /// Gen `gen`'s page comes ready at `ready`, beats every `cef_alive_every_ms` while before `until`.
 fn page(gen: u64, ready: u64, until: u64) -> Vec<(u64, Inbound)> {
     let t = th();
-    let mut v = vec![(ready, ev(Event::CefReady { gen }))];
+    // Its latest frame is written at the ready, and reported (C11, Owed 99).
+    let mut v = vec![
+        (ready, ev(Event::CefReady { gen })),
+        (ready, ev(Event::CefPainted { gen })),
+    ];
     v.extend(every(
         ready + t.cef_alive_every_ms,
         until,
@@ -1341,6 +1345,7 @@ fn nothing_is_applied_after_exit_whatever_arrives() {
     let mark = log.len();
     let late = [
         ev(Event::CefReady { gen: 1 }),
+        ev(Event::CefPainted { gen: 1 }),
         ev(Event::CefAlive { gen: 1 }),
         ev(Event::CefCrashed { gen: 1 }),
         frame(1),
@@ -1377,10 +1382,12 @@ fn graphics_events_are_logged_by_name_as_they_are_decided() {
     d.tick_due(SESSION_AT);
     let script = [
         (Event::CefReady { gen: 1 }, "cef ready gen=1"),
+        (Event::CefPainted { gen: 1 }, "cef painted gen=1"),
         (Event::CefAlive { gen: 1 }, "cef alive gen=1"),
         (Event::CefAlive { gen: 7 }, "cef alive gen=7"),
         (Event::CefCrashed { gen: 1 }, "cef crashed gen=1"),
         (Event::CefReady { gen: 9 }, "cef ready gen=9"),
+        (Event::CefPainted { gen: 9 }, "cef painted gen=9"),
     ];
     let mut checked = 0;
     for (i, (e, want)) in script.into_iter().enumerate() {
@@ -1395,7 +1402,8 @@ fn graphics_events_are_logged_by_name_as_they_are_decided() {
     d.step(ev(Event::ScoreStale(true)), 31);
     assert!(log.calls_from(mark).iter().all(|c| !matches!(c, Call::Log(_))));
     eprintln!("graphics lines checked: {checked}");
-    assert_eq!(checked, 5);
+    // Two readies, two painted reports (Owed 99), two beats, a crash: each a line.
+    assert_eq!(checked, 7);
 }
 
 // ---------------------------------------------------------------------------------------------

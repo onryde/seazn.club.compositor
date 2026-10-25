@@ -173,6 +173,7 @@ from `thresholds.json`, `soak.json`, the drive or that memory.
 | 5b | Graphics never `failed`. Every `overlay hidden` names hang, crash or recycle, and none is bare. |
 | 5c | Score deliveries per minute, and the page received them: drive beats carry the page's `scoreStale` (its `seazn:score-stale` signal), and none reads true. |
 | 5d | An on-air sample per `sample_every_s` slot (the sampler's own unit). |
+| 5e | No blank-page reload (`cef reload ... reason=no_frames`, Owed 99), and each page's first ready, per process and generation, has its `cef painted` at or after it in the same process; at least one page checked. Judged on both pages (the PR #92 review's I-1: page=real is the one run on the production page, which paints only on change). A report with no blank-reload facts fails. |
 | 6 | Every beat's rung is `full`. A stepped beat fails with "sizing alarm: the guest is short of CPU (C17 runbook)". |
 
 `scoreStale` is the page's feed health: its last live-data poll succeeded within its stale budget.

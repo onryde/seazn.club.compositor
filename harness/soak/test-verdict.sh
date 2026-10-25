@@ -91,8 +91,8 @@ run_verdict() {
 
 # Every check verdict.jq declares, in order: a dropped one fails the green. Check 1.split is the
 # memory experiment's (schedules dropouts and none), never the soak's.
-ALL_SOAK='inputs,1,1.projection,2,3,4,5.beats,5.dropouts,5.disconnects,5a,5b,5c,5d,6'
-ALL_EXPERIMENT='inputs,1,1.projection,1.split,2,3,4,5.beats,5.dropouts,5.disconnects,5a,5b,5c,5d,6'
+ALL_SOAK='inputs,1,1.projection,2,3,4,5.beats,5.dropouts,5.disconnects,5a,5b,5c,5d,5e,6'
+ALL_EXPERIMENT='inputs,1,1.projection,1.split,2,3,4,5.beats,5.dropouts,5.disconnects,5a,5b,5c,5d,5e,6'
 
 # `case_ <name> <page> <want status> <want failed ids, sorted, comma-joined> <reason> <filter>`
 case_() {
@@ -187,7 +187,7 @@ case_ stepped-beat real fail '6' '6:sizing alarm: the guest is short of CPU' \
 
 # --- guard reds: each other conjunct, alone -------------------------------------------------------
 # No report: every check that reads it fails ("no report"), never passes on nothing.
-case_ no-report real fail '1,1.projection,2,4,5.beats,5.disconnects,5a,5b,5c,6,inputs' 'inputs:no report' '.report = null'
+case_ no-report real fail '1,1.projection,2,4,5.beats,5.disconnects,5a,5b,5c,5e,6,inputs' 'inputs:no report' '.report = null'
 case_ no-frames real fail 'inputs' 'no frames' '.report.frames = 0'
 # No start action: the drive's windows are unknown, so every windowed check fails too.
 case_ no-start real fail '1,1.projection,5.beats,5a,5c,inputs' 'inputs:one start and one end action' 'del(.actions[] | select(.kind == "start"))'
@@ -224,7 +224,7 @@ case_ few-cef-alive real fail '5a' 'cef alive' '.report.log.cef_alive |= [to_ent
 case_ graphics-failed real fail '5b' 'graphics read failed' '.report.heartbeats.series[200].body.graphics = "failed"'
 case_ hidden-failed real fail '5b' 'reason=failed' '.report.log.overlay_hidden[0].reason = "failed"'
 case_ hidden-bare real fail '5b' 'without a reason' '.logscan.overlay_hidden_lines = 2'
-case_ no-log real fail '5b' 'no compositor log' '.report.log.lines = 0 | .logscan.lines = 0'
+case_ no-log real fail '5b,5e' '5e:no compositor log' '.report.log.lines = 0 | .logscan.lines = 0'
 case_ delivery-gap real fail '5c' 'deliveries' \
   '(.actions[] | select(.kind == "start") | .at_ms) as $s
    | .deliveries |= map(select(.at_ms < $s + 420000 or .at_ms >= $s + 480000))'
@@ -240,6 +240,17 @@ case_ score-stale real fail '5c' '5c:score stale: 1 drive beat' \
 case_ score-stale-unreported real fail '5c' 'no drive beat carried scoreStale' '.report.heartbeats.series |= map(del(.body.scoreStale))'
 case_ overlay-off-air real fail '5d' 'overlay' '.samples[9].differs = false'
 case_ overlay-unsampled real fail '5d' 'overlay' 'del(.samples[9])'
+# (e), Owed 99 (the PR #92 review's I-1): a blank-page reload, on either page (the test page judges it
+# too); a page whose first ready has no first frame at or after it; none checked; and a report with no
+# blank-reload facts. A held teardown's late ready of its own generation is no page.
+BLANK_RELOAD='.report.log.blank_reloads = [{at_ms: (.report.log.cef_ready[1].at_ms + 10000), gen: 3, blank_pages: 1}]'
+case_ blank-reload real fail '5e' 'blank-page reload gen=3 blank_pages=1' "$BLANK_RELOAD"
+case_ blank-reload-test-page test fail '5e' 'blank-page reload gen=3' "$BLANK_RELOAD"
+case_ page-unpainted real fail '5e' 'page gen=2 ready at' '.report.log.cef_painted |= map(select(.gen != 2))'
+case_ painted-before-ready real fail '5e' 'reported no first frame' '.report.log.cef_painted[1].at_ms -= 1'
+case_ no-page-checked real fail '5e' 'no page checked' '.report.log.cef_ready = []'
+case_ no-blank-facts real fail '5e' 'no blank-page reload facts' 'del(.report.log.blank_reloads)'
+case_ late-ready-no-page real pass '' '' '.report.log.cef_ready += [{at_ms: (.report.log.cef_ready[1].at_ms + 5000), gen: 2}]'
 
 # --- check 1's bound and check 1.projection (owner rulings, 2026-10-25) -----------------------------
 # `measured <name> <out> <check id> <jq test>`: one check's `measured`, with soak.json as $soak, the

@@ -38,7 +38,7 @@ case_drive() {
   mark readers_after "$(mtx_readers | jq -c 'map(.id)')"
 }
 
-CASE_CHECKS=12
+CASE_CHECKS=14
 case_verdict() {
   # Anti-vacuity: six kicks, each of a distinct connection, and a reader again after the last.
   require kicks_applied "(mark(\"kick\") | length) == $KICKS and (mark(\"kick\") | map(.value) | unique | length) == $KICKS

@@ -265,6 +265,68 @@ fn test_hook_hold_teardowns_is_not_read_without_the_feature() {
     assert_eq!(checked, 2, "anti-vacuity");
 }
 
+/// Owed 99 (option B, owner 2026-10-25 "Apply rec", relayed by the coordinator), a `test-hooks` build:
+/// `COMPOSITOR_TEST_WITHHOLD_PAGES` is a count of ASCII digits, in both modes (C14 case 19's leg sets
+/// one fewer than `cef_gpu_deaths_to_restart`); unset, empty or 0 withholds none; anything else is
+/// refused naming the key, never the value.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn test_hook_withhold_pages_takes_a_count_and_refuses_anything_else() {
+    let key = env::COMPOSITOR_TEST_WITHHOLD_PAGES;
+    let mut checked = 0;
+    for mode in ["live", "fake"] {
+        let mut m = base();
+        m.insert(env::COMPOSITOR_DRIVERS, mode.to_owned());
+        assert_eq!(parse(&m, true).unwrap().hooks.withhold_pages, 0, "{mode}: unset");
+        checked += 1;
+        for (v, want) in [("", 0), ("0", 0), ("1", 1), ("2", 2), ("02", 2), ("12", 12)] {
+            m.insert(key, v.to_owned());
+            assert_eq!(
+                parse(&m, true).unwrap().hooks.withhold_pages,
+                want,
+                "{mode} {v:?}"
+            );
+            checked += 1;
+        }
+        for bad in [
+            "two",
+            "-1",
+            "+2",
+            " 2",
+            "2 ",
+            "2.0",
+            "0x2",
+            "99999999999999999999999",
+        ] {
+            m.insert(key, bad.to_owned());
+            let err = parse(&m, true).expect_err(bad);
+            assert_eq!(err, EnvError::Invalid(key), "{mode} {bad:?}");
+            let text = err.to_string();
+            assert!(text.contains(key), "{text:?} does not name {key}");
+            assert!(!text.contains(bad.trim()), "{text:?} carries the value {bad:?}");
+            checked += 1;
+        }
+    }
+    eprintln!("withhold-pages values checked: {checked}");
+    assert_eq!(checked, 2 * (1 + 6 + 8), "anti-vacuity");
+}
+
+/// Owed 99: a build without the feature does not read the key at all, so a value it would refuse
+/// parses, and nothing is armed (`TestHooks` is empty).
+#[cfg(not(feature = "test-hooks"))]
+#[test]
+fn test_hook_withhold_pages_is_not_read_without_the_feature() {
+    let mut checked = 0;
+    for v in ["2", "two"] {
+        let mut m = base();
+        m.insert("COMPOSITOR_TEST_WITHHOLD_PAGES", v.to_owned());
+        let e = parse(&m, true).unwrap_or_else(|err| panic!("{v:?} refused: {err}"));
+        assert_eq!(e.hooks, env::TestHooks::default(), "{v:?}");
+        checked += 1;
+    }
+    assert_eq!(checked, 2, "anti-vacuity");
+}
+
 /// Owed 94 (the owner, 2026-10-24, "B"), a `test-hooks` build: each sink-stall key takes ms of ASCII
 /// digits, in both modes (C14's output-hung case); unset, empty or 0 plants nothing; anything else,
 /// or both keys at once, is refused naming a key, never the value.

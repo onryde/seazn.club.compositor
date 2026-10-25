@@ -8,8 +8,9 @@ name: chaos
 # The relay and harness images are built once, as harness.yml builds them (image.yml's caches, read
 # only), and handed to the legs as an artifact, with the relay-test-hooks image beside them: the
 # relay image with the test hooks compiled in (the Dockerfile's `relay-test-hooks` target, never
-# pushed): Owed 82's held teardowns and Owed 94's stalled sink. Only case 16 (cef-leaks) and case 18
-# (output-hung) run on it (their RELAY_TEST_HOOKS_IMAGE); every other leg runs the relay image. The compose stack runs here and nowhere local (owner ruling
+# pushed): Owed 82's held teardowns, Owed 94's stalled sink and Owed 99's withheld pages. Only case 16
+# (cef-leaks), case 18 (output-hung) and case 19 (cef-blank) run on it (their RELAY_TEST_HOOKS_IMAGE);
+# every other leg runs the relay image. The compose stack runs here and nowhere local (owner ruling
 # 2026-10-23: no local Docker).
 #
 # Wave gate 3 is three consecutive green full runs. Dispatch each one after the last has finished
@@ -122,9 +123,10 @@ jobs:
           load: true
           push: false
           cache-from: ${{ steps.cache.outputs.from }}
-      # Cases 16 and 18 only (Owed 82, Owed 94): the relay image plus the compositor built with
-      # `--features test-hooks`, so their legs can hold teardowns (COMPOSITOR_TEST_HOLD_TEARDOWNS) or
-      # stall the first sink (COMPOSITOR_TEST_HOLD_SINK_AFTER_MS, COMPOSITOR_TEST_HANG_SINK_AFTER_MS).
+      # Cases 16, 18 and 19 only (Owed 82, Owed 94, Owed 99): the relay image plus the compositor built
+      # with `--features test-hooks`, so their legs can hold teardowns (COMPOSITOR_TEST_HOLD_TEARDOWNS),
+      # stall the first sink (COMPOSITOR_TEST_HOLD_SINK_AFTER_MS, COMPOSITOR_TEST_HANG_SINK_AFTER_MS) or
+      # withhold the first pages' frames (COMPOSITOR_TEST_WITHHOLD_PAGES).
       - name: Build the relay-test-hooks image
         uses: docker/build-push-action@v6
         with:

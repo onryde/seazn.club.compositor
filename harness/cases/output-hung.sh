@@ -94,7 +94,7 @@ HANG_OUTAGES="hung_swap as \$s | [.output_outages[] | select(.to_wall_ms > \$s.p
 # MediaMTX's reading, in ms (null when unread or not a duration: jq sorts it below every number).
 MTX_READ='(mark_value("mtx_read_timeout") | mtx_duration_ms)'
 
-CASE_CHECKS=19
+CASE_CHECKS=21
 case_verdict() {
   # A guard, judged on every run: MediaMTX applied at least the idle deadline the case asks for,
   # which is past the latest swap the window accepts, so only the backstop (or its absence) decides

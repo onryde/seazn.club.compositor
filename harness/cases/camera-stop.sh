@@ -24,7 +24,7 @@ case_drive() {
   at_s "$CASE_LIVE_S"
 }
 
-CASE_CHECKS=12
+CASE_CHECKS=14
 case_verdict() {
   # Anti-vacuity: the pause made exactly one camera gap the checker read, and the programme showed
   # camera frames again after it.

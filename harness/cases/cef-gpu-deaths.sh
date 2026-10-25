@@ -136,9 +136,9 @@ require_restarted() {
 }
 
 case "$CASE_VARIANT" in
-  threshold) CASE_CHECKS=22 ;;
-  one-fewer) CASE_CHECKS=15 ;;
-  fast) CASE_CHECKS=23 ;;
+  threshold) CASE_CHECKS=24 ;;
+  one-fewer) CASE_CHECKS=17 ;;
+  fast) CASE_CHECKS=25 ;;
 esac
 case_verdict() {
   # The loop's own end line, when the exec lived to print it (a restart kills the exec with its
@@ -220,4 +220,5 @@ case_verdict() {
       require_same_session_and_no_core '(starts_after(mark_at("kill")) | first | .at_ms)'
       ;;
   esac
+  require_no_false_blank
 }

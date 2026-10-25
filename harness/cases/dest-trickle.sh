@@ -32,7 +32,7 @@ case_drive() {
   at_s "$CASE_LIVE_S"
 }
 
-CASE_CHECKS=13
+CASE_CHECKS=15
 case_verdict() {
   require trickled 'mark_value("netem_out") as $n | $n.sent_pkts >= 2
     and stall_swap(mark_at("cut")).swap_ms != null' \

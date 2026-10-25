@@ -352,6 +352,33 @@ if ($page != "real" and $page != "test") then error("verdict: page must be real 
       (if ($off | length) > 0 then ["overlay off air: \($off | length) of \($slots) minutes had no sample that differs from the camera-only reference (first: minute \($off[0]))"] else [] end);
       $m) end,
 
+  # (e) No blank-page reload (Owed 99; the PR #92 review's I-1): the soak's page=real is the one run
+  #     on the production page, which paints only on change, the page the adapter's latch exists for.
+  #     A `cef reload ... reason=no_frames` line is the domain calling a page blank, and each one
+  #     spends the shared page-fault count toward an in-place restart while the frame on air stays,
+  #     so no on-air check sees it. Its positive pair: each page's first ready (per process and
+  #     generation) has its generation's `cef painted` at or after it in the same process, and at
+  #     least one page is checked. Both pages judge it (the test page paints at 30 fps). A report
+  #     whose log has no blank-reload facts (an older checker) fails: missing data never passes.
+  ($log.boots // []) as $b
+  | [($log.cef_ready // [])[] | . as $rd
+     | {gen, at_ms, from: ([$b[] | select(. <= $rd.at_ms)] | last // 0),
+        to: ([$b[] | select(. > $rd.at_ms)] | first // 1e18)}]
+  | group_by([.from, .gen]) | map(min_by(.at_ms))
+  | map(. as $p | . + {painted_ms: ([($log.cef_painted // [])[] | select(.gen == $p.gen and .at_ms >= $p.at_ms and .at_ms < $p.to)] | first | .at_ms)}) as $pages
+  | [$pages[] | select(.painted_ms == null)] as $unpainted
+  | ($log.blank_reloads // null) as $blank
+  | {blank_reloads: ($blank | if type == "array" then length else null end), pages_checked: ($pages | length),
+     unpainted: ($unpainted | length)} as $m
+  | check("5e"; "no blank-page reload";
+      $no_report
+      + (if ($log.lines // 0) <= 0 then ["no compositor log (an empty log reads clean)"] else [] end)
+      + (if ($blank | type) != "array" then ["no blank-page reload facts in the report (a checker older than Owed 99)"] else [] end)
+      + [($blank // [])[] | "blank-page reload gen=\(.gen) blank_pages=\(.blank_pages) at \(.at_ms)"]
+      + (if ($pages | length) == 0 then ["no page checked: no `cef ready` line"] else [] end)
+      + [$unpainted[] | "page gen=\(.gen) ready at \(.at_ms) reported no first frame (`cef painted`)"];
+      $m),
+
   # 6. No step down: every beat's rung is rung_ok (`full`); a stepped beat is web's sizing alarm.
   [$beats[] | select(.body | has("rung"))] as $rung_beats
   | [$rung_beats[] | select(.body.rung != $soak.rung_ok)] as $stepped

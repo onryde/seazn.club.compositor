@@ -170,7 +170,7 @@ require_common() {
   measure retirements "$RETIREMENTS"
 }
 
-if [ "$RESTART_EXPECTED" = 1 ]; then CASE_CHECKS=25; else CASE_CHECKS=16; fi
+if [ "$RESTART_EXPECTED" = 1 ]; then CASE_CHECKS=27; else CASE_CHECKS=18; fi
 case_verdict() {
   require_common
   if [ "$RESTART_EXPECTED" = 1 ]; then
@@ -220,4 +220,5 @@ case_verdict() {
              | {type, client_id, ms_per_s: (if $o == null then null
                  else ((.cpu_ms - $o.cpu_ms) * 1000 / ($b.sample_ms - $a.sample_ms) | floor) end)}]} end'
   fi
+  require_no_false_blank
 }

@@ -450,6 +450,43 @@ this brief:
 - **Measured for C11b and C14:** Owed 61 (the 6th GPU-process death aborts the process) and Owed 62 (C14's case 8
   is a process abort).
 
+## Amendment 2026-10-25 (Owed 99: the first frame across the ready, `CefPainted`, and a hook)
+
+Owner, 2026-10-25, in chat, relayed by the coordinator: "Apply rec" on Owed 99 (option B). Built
+on branch `fix/owed99-blank-overlay-watchdog`; implementer decisions under the dispatch.
+
+- **The first frame (a false premise, `docs/_INDEX.md`).** The gate dropped every sample before the
+  build's own ready, and cefsrc emits a buffer only on paint (F-001), so a page that painted once
+  before its ready wrote nothing after it. The build's newest pre-ready sample is now kept under
+  the gate lock (`Gate.latched`; a newer sample replaces it, and a decided crash or a retirement
+  drops it) and written when that build's own ready opens the gate, before `CefReady` is sent.
+  Owed 17's rule holds: nothing of a build reaches air before its own ready.
+- **`CefPainted { gen }`.** The first sample written a build (the latched one at the ready, or the
+  first after it) is reported once, after that build's `CefReady`. The note queue never drops it.
+- **The hook (Owed 99, `test-hooks` only).** `withhold_next_pages(n)` keeps every sample of the next
+  n builds out of the slot (`WARN test hook (Owed 99): the next <n> CEF pages' frames never reach the
+  slot` once, and `WARN test hook (Owed 99) gen=<g>: this CEF page's frames never reach the slot
+  (<left> more to withhold)` per build), armed from `COMPOSITOR_TEST_WITHHOLD_PAGES` (C12's
+  `TestHooks`). C14's case 19 is its one reader.
+
+## Amendment 2026-10-25, PR #92 fix round 1 (I-2: the latch's witness)
+
+The PR #92 review of `bdc4588` (Needs fixes: tests and docs only, the code approved), adopted
+by the coordinator; the coordinator's fix-round dispatch, implementer decisions under it
+(`docs/_INDEX.md`, decision row "PR #92 fix round 1").
+
+- **The latch is asserted, whatever the page painted after its ready.** The image test
+  `a_static_page_puts_its_first_frame_on_air_at_its_ready_and_reports_it_once`
+  (`crates/adapters/tests/graphics.rs`) asserted the latch only when cefsrc delivered nothing after
+  the ready, and CI's run 40229667029 printed `delivered: 2, dropped: 1, written: 2`: one sample
+  after the ready, so that branch never ran. It now asserts `dropped >= 1` and
+  `written == delivered - dropped + 1` (one more written than delivered after the ready: the latched
+  one), waiting for the count to settle. Without the latch `written <= delivered - dropped`.
+- **Its mutant** (the latch's write at the ready removed in `cef_graphics.rs`) runs on CI only (this
+  host cannot link GStreamer), on a throwaway branch whose `image.yml` runs the image tests on a
+  dispatch; the PR #92 handoff names the run. The production page's post-ready paint is unmeasured;
+  C15's check 5e is its witness on the soak.
+
 ## Do not touch
 
 The programme and input adapters, and the page in `seazn.club` (that's R2005). (Amended 2026-10-15)

@@ -16,9 +16,9 @@
 //! `seazn:score-stale=true|false` and `seazn:phase-channel=loopback|web`. Each is matched exactly; any
 //! other `seazn:` text is logged at WARN and mapped to nothing (`page_signal`).
 //!
-//! **Events.** `CefReady`, `CefAlive` and `CefCrashed` carry the generation of the pipeline whose page
-//! or process they come from, a torn-down one included: the domain ignores a generation that is not
-//! its current one. `ScoreStale` and `PhaseChannel` carry none, so only the current build's lines are
+//! **Events.** `CefReady`, `CefAlive`, `CefPainted` and `CefCrashed` carry the generation of the
+//! pipeline whose page or process they come from, a torn-down one included: the domain ignores a
+//! generation that is not its current one. `ScoreStale` and `PhaseChannel` carry none, so only the current build's lines are
 //! relayed; a retired page's are logged and dropped. `CefCrashed` is sent once a build, from the first
 //! of: a bus error, cefsrc's "Render subprocess terminated" warning (its `OnRenderProcessTerminated`,
 //! which then reloads the page), or the memory cap. A dead GPU process is no crash: CEF recovers it
@@ -35,6 +35,13 @@
 //! decided. A sample from a closed build is dropped and counted. The slot is never cleared here: the
 //! last frame stays held (`hide_overlay` is the programme's).
 //!
+//! **The first frame** (Owed 99). cefsrc emits a sample only when the page paints (F-001), and a page
+//! that renders before its ready line and is static after it would never put a frame on air: so the
+//! current build's newest sample from before its ready is kept (the latch, one sample) and written
+//! when its ready opens the gate, in the same critical section, before any later sample. The first
+//! write of each build, that one or the first after it, is reported once as `CefPainted`, after the
+//! build's `CefReady`: the domain's blank-page watchdog counts a Ready page with none by its bound.
+//!
 //! **Never blocks the caller.** Each build has one thread, which starts it (CEF initialises inside the
 //! first build's NULL→READY), waits for its retirement and tears it down. `restart`, `stop` and the
 //! drop only close the gate, set the stop flag and start a reaper watch: when the teardown has not
@@ -42,7 +49,8 @@
 //! and logs their pids at WARN; if it has still not returned `TEARDOWN_LEAK_AFTER_MS` later, it is
 //! counted leaked (`health()`, Owed 55). Nothing here joins a thread. Page lines arrive on CEF's own
 //! UI thread, so the log handler only decides what closes a gate and queues the rest (`NoteQueue`:
-//! bounded, and never dropping a crash or a ready); this adapter's dispatcher thread relays them.
+//! bounded, and never dropping a crash, a ready or a first frame); this adapter's dispatcher thread
+//! relays them.
 //!
 //! **Health** (owner ruling 2026-10-19 "B"): `health()` (the port's) reports what the domain's
 //! events cannot say: either of CEF's zygotes gone, which ends CEF for the process (Owed 56: the
@@ -1403,16 +1411,23 @@ enum Note {
         gen: u64,
         why: String,
     },
+    /// A build's first frame reached the slot after its ready (Owed 99): send `CefPainted`. At most
+    /// one a build (`Gate::painted`).
+    Painted {
+        gen: u64,
+    },
 }
 
 impl Note {
     /// Which notes a full queue gives up first (PR #32 review m6): `Some(0)` only logs, `Some(1)`
     /// is a signal the page repeats or the domain outlives (a beat, a stale or channel value), and
     /// `None` is never dropped: a decided crash (its gate is already shut, so a lost note would
-    /// freeze the overlay unannounced) and a ready (at most one queued per build, below).
+    /// freeze the overlay unannounced), a ready (at most one queued per build, below) and a first
+    /// frame (at most one a build; lost, the domain would count a painted page blank and reload it).
     fn rank(&self) -> Option<u8> {
         match self {
             Note::Crashed { .. }
+            | Note::Painted { .. }
             | Note::Page {
                 signal: PageSignal::Ready,
                 ..
@@ -1440,9 +1455,9 @@ impl Note {
 }
 
 /// The dispatcher's queue: `NOTE_QUEUE_CAP` notes, where a full queue drops a log-only note first,
-/// then a repeatable signal, and never a crash or a ready. A ready of a build that already has one
-/// queued is dropped (the queued one stands for it), so the notes kept past the cap are at most two
-/// a build.
+/// then a repeatable signal, and never a crash, a ready or a first frame. A ready of a build that
+/// already has one queued is dropped (the queued one stands for it), and a build reports one first
+/// frame, so the notes kept past the cap are at most three a build.
 #[derive(Debug, Default)]
 pub(crate) struct NoteQueue {
     q: VecDeque<Note>,
@@ -1492,6 +1507,35 @@ struct Gate {
     open: Option<u64>,
     /// Builds reported crashed: their gate never reopens.
     crashed: BTreeSet<u64>,
+    /// The current build's newest sample from before its ready (Owed 99), written when its ready
+    /// opens the gate. Dropped at its retirement or its crash.
+    latched: Option<Latched>,
+    /// The newest build whose first frame reached the slot (Owed 99): each build reports one.
+    painted: Option<u64>,
+    /// Test hook (Owed 99): builds whose samples never reach the slot, latched or written.
+    #[cfg(feature = "test-hooks")]
+    withheld: BTreeSet<u64>,
+}
+
+/// A build's newest sample from before its ready, and the counts its write at the ready joins.
+struct Latched {
+    build: u64,
+    sample: gst::Sample,
+    stats: Arc<SampleStats>,
+}
+
+impl Gate {
+    /// Records a write of `build`'s: true for its first (to be reported `CefPainted`).
+    fn first_frame(&mut self, build: u64) -> bool {
+        let first = self.painted != Some(build);
+        self.painted = Some(build);
+        first
+    }
+
+    /// The generation of the current build, if it is `build`.
+    fn gen_of(&self, build: u64) -> Option<u64> {
+        self.current.filter(|(b, _)| *b == build).map(|(_, g)| g)
+    }
 }
 
 /// One build's sample counts.
@@ -1508,7 +1552,8 @@ struct SampleStats {
 pub struct Samples {
     /// Samples the appsink delivered.
     pub delivered: u64,
-    /// Samples the gate dropped (before ready, after a retirement or a crash).
+    /// Samples the gate dropped (before ready, after a retirement or a crash). The newest one from
+    /// before the ready is written at the ready all the same (Owed 99), and counted in `written` too.
     pub dropped: u64,
     /// Samples written to the overlay slot.
     pub written: u64,
@@ -1639,6 +1684,9 @@ struct Shared {
     /// Owed 82: retirements whose teardown is still to be held for good (`hold_next_teardowns`).
     #[cfg(feature = "test-hooks")]
     teardowns_to_hold: AtomicUsize,
+    /// Owed 99: builds still to have every sample withheld from the slot (`withhold_next_pages`).
+    #[cfg(feature = "test-hooks")]
+    pages_to_withhold: AtomicUsize,
 }
 
 impl Shared {
@@ -1688,6 +1736,9 @@ impl Shared {
         }
         if g.open == Some(build) {
             g.open = None;
+        }
+        if g.latched.as_ref().is_some_and(|l| l.build == build) {
+            g.latched = None;
         }
         // Builds only grow; keep the recent ones.
         while g.crashed.len() > 64 {
@@ -1746,6 +1797,16 @@ impl Shared {
     #[cfg(feature = "test-hooks")]
     fn take_teardown_hold(&self) -> Option<usize> {
         self.teardowns_to_hold
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .ok()
+            .map(|was| was - 1)
+    }
+
+    /// Test hook (`withhold_next_pages`): takes one withheld page from the budget, if any is left.
+    /// `Some(n)`: this build's samples are withheld, and `n` more builds' will be.
+    #[cfg(feature = "test-hooks")]
+    fn take_page_withhold(&self) -> Option<usize> {
+        self.pages_to_withhold
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .ok()
             .map(|was| was - 1)
@@ -1890,6 +1951,8 @@ impl CefGraphics {
             js_signals: AtomicBool::new(false),
             #[cfg(feature = "test-hooks")]
             teardowns_to_hold: AtomicUsize::new(0),
+            #[cfg(feature = "test-hooks")]
+            pages_to_withhold: AtomicUsize::new(0),
         });
         let g = Self {
             shared,
@@ -2066,6 +2129,19 @@ impl CefGraphics {
         ));
     }
 
+    /// Test hook (Owed 99): the next `n` builds' samples never reach the overlay slot, as if their
+    /// page painted nothing: none is latched or written (each is counted dropped), so no
+    /// `CefPainted` comes, and a build that gets ready and beats is a blank page to the domain (C14
+    /// case 19). Each such build logs a line at its `restart`. A second call replaces what is left of
+    /// the first; 0 withholds none.
+    #[cfg(feature = "test-hooks")]
+    pub fn withhold_next_pages(&self, n: usize) {
+        self.shared.pages_to_withhold.store(n, Ordering::SeqCst);
+        self.shared.log(&format!(
+            "WARN test hook (Owed 99): the next {n} CEF pages' frames never reach the slot"
+        ));
+    }
+
     /// Test hook: while on, the child poll waits before each listing (at most 60 s), so the only
     /// listings CEF's watch gets are the ones at each ready. Set it before the first `restart`, or
     /// that restart's first poll has already listed. Off lets the poll go.
@@ -2125,11 +2201,14 @@ impl CefGraphics {
     /// Closes the gate and tells the current build's thread to tear its pipeline down, with the
     /// reaper's watch behind it. Returns at once.
     fn retire_current(&mut self) {
-        {
+        let latched = {
             let mut g = locked(&self.shared.gate);
             g.open = None;
             g.current = None;
-        }
+            g.latched.take()
+        };
+        // Its sample is let go after the lock.
+        drop(latched);
         if let Some(live) = self.current.take() {
             if live.running {
                 // Counted before the flag is set: the build's thread counts down once it sees it.
@@ -2230,9 +2309,29 @@ impl CefGraphics {
                     // One check, held through the conversion and the write: a gate that closes
                     // (restart, stop, a crash) waits out at most one conversion, and no sample of
                     // a closed build is written after it.
-                    let gate = locked(&shared.gate);
-                    if gate.open != Some(build) {
+                    let mut gate = locked(&shared.gate);
+                    #[cfg(feature = "test-hooks")]
+                    if gate.withheld.contains(&build) {
                         drop(gate);
+                        stats.dropped.fetch_add(1, Ordering::SeqCst);
+                        return Ok(gst::FlowSuccess::Ok);
+                    }
+                    if gate.open != Some(build) {
+                        // Owed 99: the current build's newest sample before its ready is latched for
+                        // the ready; the one it replaces is let go after the lock.
+                        let replaced = if gate.current.is_some_and(|(b, _)| b == build)
+                            && !gate.crashed.contains(&build)
+                        {
+                            gate.latched.replace(Latched {
+                                build,
+                                sample,
+                                stats: Arc::clone(&stats),
+                            })
+                        } else {
+                            None
+                        };
+                        drop(gate);
+                        drop(replaced);
                         stats.dropped.fetch_add(1, Ordering::SeqCst);
                         return Ok(gst::FlowSuccess::Ok);
                     }
@@ -2251,7 +2350,11 @@ impl CefGraphics {
                     // counted (the confirm pass: counted after the unlock, a stop between the two
                     // read one write short).
                     stats.written.fetch_add(1, Ordering::SeqCst);
+                    let painted = gate.first_frame(build).then(|| gate.gen_of(build)).flatten();
                     drop(gate);
+                    if let Some(gen) = painted {
+                        shared.push(Note::Painted { gen });
+                    }
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),
@@ -2408,15 +2511,24 @@ fn dispatch(shared: &Shared) {
             } => match &signal {
                 PageSignal::Ready => {
                     watch_ready(shared);
-                    let opened = {
+                    let (opened, painted, latched) = {
                         let mut g = locked(&shared.gate);
                         let current = g.current.is_some_and(|(b, _)| b == build);
                         let ok = current && !g.crashed.contains(&build);
+                        let mut painted = false;
+                        let mut latched = None;
                         if ok {
                             g.open = Some(build);
+                            // Owed 99: its newest sample from before the ready, written now, before
+                            // any later one can be (both under this lock).
+                            latched = g.latched.take().filter(|l| l.build == build);
+                            if let Some(l) = &latched {
+                                painted = write_latched(shared, &mut g, l);
+                            }
                         }
-                        ok
+                        (ok, painted, latched)
                     };
+                    drop(latched);
                     shared.log(&format!(
                         "gen={gen}: ready{}",
                         if opened {
@@ -2426,6 +2538,9 @@ fn dispatch(shared: &Shared) {
                         }
                     ));
                     shared.send(Event::CefReady { gen });
+                    if painted {
+                        shared.send(Event::CefPainted { gen });
+                    }
                 }
                 PageSignal::Alive => shared.send(Event::CefAlive { gen }),
                 PageSignal::ScoreStale(v) if shared.is_current(build) => {
@@ -2467,12 +2582,29 @@ fn dispatch(shared: &Shared) {
                 shared.log(&format!("gen={gen}: crashed: {}", clip(&why)));
                 shared.send(Event::CefCrashed { gen });
             }
+            Note::Painted { gen } => shared.send(Event::CefPainted { gen }),
         }
         if page_lines.len() > 64 {
             page_lines.clear();
         }
         if storms.len() > 64 {
             storms.clear();
+        }
+    }
+}
+
+/// Owed 99: writes a build's latched sample at its ready, under the gate (`g`), counted as any write;
+/// a sample that is not one frame is refused and counted so. True when it is that build's first frame.
+fn write_latched(shared: &Shared, g: &mut Gate, l: &Latched) -> bool {
+    match straight_alpha(&l.sample) {
+        Some(straight) => {
+            shared.frames.set_overlay(straight);
+            l.stats.written.fetch_add(1, Ordering::SeqCst);
+            g.first_frame(l.build)
+        }
+        None => {
+            l.stats.refused.fetch_add(1, Ordering::SeqCst);
+            false
         }
     }
 }
@@ -2568,6 +2700,13 @@ impl GraphicsRenderer for CefGraphics {
             Ok(mut live) => {
                 self.shared
                     .log(&format!("gen={gen}: loading {}", redacted_origin(url)));
+                #[cfg(feature = "test-hooks")]
+                if let Some(left) = self.shared.take_page_withhold() {
+                    locked(&self.shared.gate).withheld.insert(build);
+                    self.shared.log(&format!(
+                        "WARN test hook (Owed 99) gen={gen}: this CEF page's frames never reach the slot ({left} more to withhold)"
+                    ));
+                }
                 locked(&self.shared.gate).current = Some((build, gen));
                 claims().newest = Some((self.shared.inst, build));
                 self.start(&mut live);
@@ -4310,7 +4449,7 @@ mod tests {
     }
 
     // PR #32 review m6: a full queue gives up log lines first, repeatable signals next, and never a
-    // decided crash or a build's ready.
+    // decided crash, a build's ready or (Owed 99) its first frame.
     #[test]
     fn a_full_note_queue_keeps_every_crash_and_ready() {
         let log = |n: u64| Note::Element {
@@ -4383,6 +4522,22 @@ mod tests {
         }
         assert!(matches!(last, Some(Note::Crashed { gen: 9, .. })));
         checked += 1;
+
+        // Owed 99: a first frame is never dropped either (lost, the domain would call a painted page
+        // blank and reload it): kept through a flood of log lines, and past the cap.
+        let is_painted = |n: &Note| matches!(n, Note::Painted { .. });
+        let mut q = NoteQueue::default();
+        q.push(Note::Painted { gen: 5 });
+        for n in 0..(NOTE_QUEUE_CAP as u64 * 3) {
+            q.push(log(n));
+        }
+        assert_eq!((q.q.len(), count(&q, &is_painted)), (NOTE_QUEUE_CAP, 1));
+        for b in 0..NOTE_QUEUE_CAP as u64 {
+            q.push(page_note(10 + b, PageSignal::Ready));
+        }
+        q.push(Note::Painted { gen: 6 });
+        assert_eq!((q.q.len(), count(&q, &is_painted)), (NOTE_QUEUE_CAP + 2, 2));
+        checked += 2;
         eprintln!("queue cases checked: {checked}");
     }
 
@@ -4437,6 +4592,8 @@ mod tests {
             js_signals: AtomicBool::new(false),
             #[cfg(feature = "test-hooks")]
             teardowns_to_hold: AtomicUsize::new(0),
+            #[cfg(feature = "test-hooks")]
+            pages_to_withhold: AtomicUsize::new(0),
         })
     }
 

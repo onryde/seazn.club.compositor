@@ -347,6 +347,42 @@ this machine keeps the page's life (the beat, the crash count, the bound). One c
 death no longer walks graphics to `Failed` by its storm of `CefCrashed` (Owed 56's road), because the verdict reaches
 the domain within a child poll (1 s) and a tick, and the process exits first.
 
+## Amendment 2026-10-25 (Owed 99: a blank page, and the held frame past a ready)
+
+Owner, 2026-10-25, in chat, relayed by the coordinator: "Apply rec" on Owed 99 (option B, a
+blank-overlay watchdog). The rules below are implementer decisions under that dispatch
+(`docs/_INDEX.md`, decision row "Owed 99 built").
+
+- **A blank page.** A Ready page that has shown no frame of its own `cef_hang_after_ms` after its
+  ready is blank: `on_tick` returns `GraphicsAction::Blank { gen }`, once a page. Its first frame is
+  the event `on_painted(gen)` (the supervisor's `Event::CefPainted`), read only for the current
+  generation while Ready. Frame silence is no rule: cefsrc paints only on change (F-001), so a
+  static page is silent and healthy. The bound is this brief's one bound, from the Ready instant.
+- **Order.** The hang (no beat) is checked before the blank, so a page that neither beats nor paints
+  is a hang, counted once.
+- **The reload.** `on_blank_reload(now)` ends the blank page's life as a reload (no failure) and
+  builds the next generation; the supervisor decides whether to call it (C11b's amendment of this
+  date).
+- **The held frame (Owed 99's shape (b)).** A held frame from the page before is read while the new
+  page is Ready and has shown no frame, so it keeps its own bound past that ready; the new page's
+  first frame clears it. A page that showed no frame holds none of its own at its end.
+
+## Amendment 2026-10-25, PR #92 fix round 1 (m-4, m-5: the order, said precisely)
+
+The PR #92 review of `bdc4588` (Needs fixes: tests and docs only, the code approved), adopted
+by the coordinator; the coordinator's fix-round dispatch, implementer decisions under it
+(`docs/_INDEX.md`, decision row "PR #92 fix round 1").
+
+- **Order** (amends the bullet of Owed 99's amendment above). The hang rule runs first, so a page
+  silent since its ready, with no frame, is a hang, counted once. A page that beat after its ready
+  and then went silent with no frame is blank at its ready's bound, which comes before its own hang
+  bound (its last beat's), and is counted once too: its reload ends it. Test:
+  `a_page_that_beat_then_went_silent_unpainted_is_blank_once_and_never_a_hang`
+  (`crates/domain/tests/cef_health.rs`, both thresholds).
+- **A blank and a recycle never share a tick** (`cef_hang_after_ms < cef_recycle_every_ms`, the
+  config's own test), so their order after the bound is not load-bearing; `on_tick`'s comment says
+  so and no longer claims an order it cannot reach.
+
 ## Do not touch
 
 - The ladder, the links, the programme and the supervisor (C06 routes the event).

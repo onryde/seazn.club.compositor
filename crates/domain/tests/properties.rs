@@ -16,7 +16,7 @@ use domain::time::Ms;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const CASES: u32 = 512;
 /// The exit property's cases: the combinations it must reach in the hold (a hang, a crash at the
@@ -206,6 +206,13 @@ fn programme_and_generation_properties_hold_on_random_streams() {
                     }
                 }
                 s = d.next;
+                // C11 writes the page's latest frame at its ready and reports it (Owed 99), so no page
+                // of this stream is blank. The report alone acts on nothing and yields no frame.
+                if let Event::CefReady { gen } = ev {
+                    let p = s.decide(Event::CefPainted { gen }, now);
+                    prop_assert!(p.effects.is_empty() && p.frame.is_none(), "{:?}", p.effects);
+                    s = p.next;
+                }
             }
             Ok(())
         })
@@ -281,6 +288,8 @@ enum Ev {
     Connected,
     /// `InputFrame` of the current input generation.
     Frame,
+    /// `CefPainted` of the current page (Owed 99).
+    Painted,
 }
 
 /// The stream's events at their instants, in order. Between the steps run the background: a tick
@@ -388,8 +397,21 @@ fn end_events(beating: bool, steps: Vec<(Ms, u8)>, t: &Thresholds) -> Vec<(Ms, E
                 now += span;
                 continue;
             }
-            24..=26 => {
+            // A ready, and C11's report of the frame it writes at the ready (Owed 99).
+            24 | 25 => {
                 st.push(now, Ev::Ready, t);
+                st.push(now, Ev::Painted, t);
+                continue;
+            }
+            // Pages that never paint (Owed 99), as many as the in-place restart's count, each ready
+            // and then ticked past its blank bound: a beating one is blank there, and its reload is
+            // the next one readied; a silent one hangs there first.
+            26 => {
+                for _ in 0..t.cef_gpu_deaths_to_restart {
+                    st.push(now, Ev::Ready, t);
+                    st.ticks(now + 100, t.cef_hang_after_ms + 1_000, t);
+                    now += t.cef_hang_after_ms + 1_200;
+                }
                 continue;
             }
             27 | 28 => {
@@ -438,6 +460,9 @@ fn resolve(ev: Ev, s: &Supervisor, sent: &mut u64) -> Event {
         Ev::Crash => Event::CefCrashed {
             gen: s.graphics_generation(),
         },
+        Ev::Painted => Event::CefPainted {
+            gen: s.graphics_generation(),
+        },
         Ev::Progress => {
             *sent += 1_000;
             Event::OutputProgress {
@@ -455,9 +480,11 @@ fn resolve(ev: Ev, s: &Supervisor, sent: &mut u64) -> Event {
     }
 }
 
-/// The final beat's text a CEF health report asks for (C11b), from the report alone: the stream draws
-/// one cause per restarting report, so there is no urgency order to apply here; `None` is healthy.
-fn restart_text(h: &CefHealth, t: &Thresholds) -> Option<String> {
+/// The final beat's text a CEF health report asks for (C11b), from the report and the blank pages the
+/// harness counted (Owed 99: blank pages and GPU-process deaths count together toward
+/// `cef_gpu_deaths_to_restart`): the stream draws one cause per restarting report, so there is no
+/// urgency order to apply here; `None` is healthy.
+fn restart_text(h: &CefHealth, blanks: usize, t: &Thresholds) -> Option<String> {
     if let Some(gen) = h.unrecoverable {
         return Some(format!("restart in place: a CEF zygote is gone (gen {gen})"));
     }
@@ -473,7 +500,14 @@ fn restart_text(h: &CefHealth, t: &Thresholds) -> Option<String> {
             h.leaked_teardowns
         ));
     }
-    None
+    blank_restart_text(blanks, h.gpu_process_deaths, t)
+}
+
+/// The final beat's text once `blanks` blank pages and `deaths` GPU-process deaths are counted (Owed
+/// 99), if they reach the in-place restart's count; never without a blank page (the deaths' own rule).
+fn blank_restart_text(blanks: usize, deaths: usize, t: &Thresholds) -> Option<String> {
+    (blanks > 0 && blanks + deaths >= t.cef_gpu_deaths_to_restart)
+        .then(|| format!("restart in place: {blanks} blank CEF pages, {deaths} GPU-process deaths"))
 }
 
 /// What the hold froze at its start: the three generations and the rung.
@@ -519,7 +553,8 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
         .run(&end_stream(), |(deadline, beating, steps)| {
             checked.set(checked.get() + 1);
             let mut c = counts.borrow_mut();
-            let mut s = booted(&t, deadline.unwrap_or(Ms::MAX / 2));
+            let deadline_at = deadline.unwrap_or(Ms::MAX / 2);
+            let mut s = booted(&t, deadline_at);
             let mut sent = 0u64;
             let mut seen_exit = false;
             let mut seen_final = false;
@@ -532,6 +567,12 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
             // The highest GPU-process death count a Running report delivered (Owed 96): a reload is
             // owed only when a count rises above it.
             let mut gpu_seen = 0usize;
+            // Owed 99, from the harness's own deliveries: each Ready page's ready, the pages whose
+            // painted report reached them while Ready, the pages counted blank, and how many.
+            let mut ready_at: BTreeMap<u64, Ms> = BTreeMap::new();
+            let mut painted: BTreeSet<u64> = BTreeSet::new();
+            let mut blank: BTreeSet<u64> = BTreeSet::new();
+            let mut blanks = 0usize;
             for (now, ev) in end_events(beating, steps, &t) {
                 let ev = resolve(ev, &s, &mut sent);
                 let in_final = s.programme_phase() == ProgrammePhase::Final;
@@ -559,6 +600,13 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
                     {
                         prop_assert_eq!(d.next.health(now).graphics, GraphicsStatus::Ready);
                         proof.insert(gen, now);
+                        ready_at.insert(gen, now);
+                    }
+                    Event::CefPainted { gen: e }
+                        if *e == gen && g == GraphicsStatus::Ready && on_air(life) =>
+                    {
+                        painted.insert(gen);
+                        c.bump("painted reports");
                     }
                     Event::CefAlive { gen: e } if *e == gen && g == GraphicsStatus::Ready && on_air(life) => {
                         let p = proof.get_mut(&gen).expect("a Ready page with no delivered ready");
@@ -591,10 +639,72 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
                 // C11b: a health report restarts in place from Running only, with its cause as the
                 // final beat's text; the hold, the drain and booting ignore it, a healthy one ignores
                 // everywhere, and Exited is checked above (nothing follows an exit)
-                let restart = match &ev {
-                    Event::CefHealth(h) => restart_text(h, &t),
+                let mut restart = match &ev {
+                    Event::CefHealth(h) => restart_text(h, blanks, &t),
                     _ => None,
                 };
+                // Owed 99: a Running tick finds the Ready page blank iff it has had no painted report
+                // `cef_hang_after_ms` after its ready, is not counted yet, and is not silent (a silent
+                // page hangs at that bound, counted there once) — unless the bound hid a frame on this
+                // tick, which comes first, and then the next tick finds it. Counted with the deaths
+                // seen: at the in-place restart's count the process restarts and nothing reloads; below
+                // it the page reloads, the next generation, naming the count. The hold runs no blank
+                // rule, and nothing else ever reloads a blank page or restarts on a tick.
+                let unpainted_past = ev == Event::Tick
+                    && g == GraphicsStatus::Ready
+                    && !painted.contains(&gen)
+                    && !blank.contains(&gen)
+                    && ready_at
+                        .get(&gen)
+                        .is_some_and(|&r| now - r >= t.cef_hang_after_ms);
+                let silent = proof.get(&gen).is_some_and(|&p| now - p >= t.cef_hang_after_ms);
+                let bound_hid = d.effects.iter().any(|e| matches!(e, Effect::HideOverlay { .. }));
+                let running_tick = life == Lifecycle::Running && now < deadline_at;
+                let blank_due = unpainted_past && running_tick && !silent && !bound_hid;
+                let reloads: Vec<&Effect> = d
+                    .effects
+                    .iter()
+                    .filter(|e| matches!(e, Effect::ReloadGraphicsNoFrames { .. }))
+                    .collect();
+                if blank_due {
+                    blank.insert(gen);
+                    blanks += 1;
+                    if let Some(text) = blank_restart_text(blanks, gpu_seen, &t) {
+                        prop_assert_eq!(next, Lifecycle::Exited(ExitReason::Restart));
+                        prop_assert_eq!(d.effects.last(), Some(&Effect::Exit(75)));
+                        prop_assert!(reloads.is_empty(), "a blank restart also reloaded");
+                        restart = Some(text);
+                        c.bump("blank pages restarting in place");
+                    } else {
+                        let want = Effect::ReloadGraphicsNoFrames {
+                            gen: gen + 1,
+                            blank_pages: blanks,
+                        };
+                        prop_assert_eq!(reloads, vec![&want]);
+                        prop_assert_eq!(d.next.graphics_generation(), gen + 1);
+                        prop_assert_eq!(next, Lifecycle::Running);
+                        c.bump("blank pages reloaded");
+                    }
+                } else {
+                    prop_assert!(
+                        reloads.is_empty(),
+                        "{:?} reloaded a page not blank: {:?}",
+                        ev,
+                        d.effects
+                    );
+                    prop_assert!(
+                        !(ev == Event::Tick
+                            && life != next
+                            && next == Lifecycle::Exited(ExitReason::Restart)),
+                        "a tick restarted in place with no blank page due"
+                    );
+                    if unpainted_past && running_tick && silent {
+                        c.bump("blank pages that hung instead");
+                    }
+                    if unpainted_past && matches!(life, Lifecycle::Holding { .. }) {
+                        c.bump("blank pages in the hold, not reloaded");
+                    }
+                }
                 // Owed 96 (owner ruling 2026-10-25 "A"): short of every restart, a Running report
                 // whose GPU-process deaths rose reloads a Ready or loading page, once, as the next
                 // generation; a page backing off or Failed is not rebuilt, and the death is seen all
@@ -694,6 +804,7 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
                                     | Effect::SwapSink { .. }
                                     | Effect::RestartGraphics { .. }
                                     | Effect::ReloadGraphics { .. }
+                                    | Effect::ReloadGraphicsNoFrames { .. }
                                     | Effect::StepDown(_)
                             ),
                             "a build after Final: {:?}",
@@ -803,6 +914,11 @@ fn exit_is_emitted_at_most_once_and_nothing_follows_it() {
         "restart reports ignored in the hold or the drain",
         "reloads after a GPU-process death",
         "death reports ignored in the hold or the drain",
+        "painted reports",
+        "blank pages reloaded",
+        "blank pages restarting in place",
+        "blank pages that hung instead",
+        "blank pages in the hold, not reloaded",
     ] {
         assert!(
             c.0.get(k).copied().unwrap_or(0) > 0,

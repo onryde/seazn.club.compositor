@@ -2,6 +2,7 @@
   "bootstrap_backoff_base_ms": 1000,
   "bootstrap_backoff_cap_ms": 10000,
   "budget_av_offset_ms": 40,
+  "budget_blank_page_reload_ms": 20184,
   "budget_fps_mean_min": 29.5,
   "budget_frame_to_encoder_ms": 150,
   "budget_gpu_death_reload_ms": 11184,

@@ -39,6 +39,9 @@
      Query switches:
        noready=1            never log seazn:ready (and so never beat)
        ready_after_ms=N     log seazn:ready N ms after load (default 500)
+       static=1             paint once, at load, and never again: no animation, so every frame the
+                            page paints comes before its ready (Owed 99: the adapter keeps it for
+                            the ready)
        crash=1              after ready, block the page in `while (true) {}` (a hang, not a crash:
                             the renderer stays alive, and the beat stops with the rest of the page);
                             it console.warns `hang starts` first, so a test sees the moment
@@ -87,7 +90,7 @@
     strip.textContent = "f" + frames + " t" + Date.now();
     requestAnimationFrame(tick);
   }
-  requestAnimationFrame(tick);
+  if (q.get("static") !== "1") requestAnimationFrame(tick);
 
   function busy(ms) {
     // `ms` absent: the hang never ends.

@@ -139,8 +139,8 @@ fn the_plan_names_every_chaos_case_and_expands_the_repeats() {
     assert_eq!(sorted, files, "chaos.json and harness/cases/*.sh disagree");
     assert_eq!(
         files.len(),
-        18,
-        "the brief's 16 cases (amended 2026-10-20), case 17 (2026-10-24) and case 18 (Owed 94)"
+        19,
+        "the brief's 16 cases (amended 2026-10-20), case 17 (2026-10-24), case 18 (Owed 94) and case 19 (Owed 99)"
     );
 
     let out = run(&["--legs", "all"]);
@@ -997,9 +997,9 @@ fn a_list_of_owed_rows_names_the_first_whose_signature_holds() {
         )),
         "{s}"
     );
-    // Every leg chaos.json expands to (37 since case 18), counted from the manifest itself.
+    // Every leg chaos.json expands to (38 since case 19), counted from the manifest itself.
     let n = expected_legs().len();
-    assert_eq!(n, 37, "chaos.json's legs with their repeats");
+    assert_eq!(n, 38, "chaos.json's legs with their repeats");
     assert!(
         s.contains(&format!(
             "WAVE GATE 3: a run over another manifest (CHAOS_MANIFEST) never counts ({n} of {n} legs PASS)\n"

@@ -35,7 +35,7 @@ case_drive() {
   at_s "$CASE_LIVE_S"
 }
 
-CASE_CHECKS=8
+CASE_CHECKS=10
 case_verdict() {
   # Anti-vacuity: 12 flaps leave at least 10 resumes the strip judged (each judged resume followed a
   # slate, so each pause was long enough to slate), and no pause reached the input's stall rule.

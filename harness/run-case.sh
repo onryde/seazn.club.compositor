@@ -292,7 +292,7 @@ owed() {
 
 # The false-positive sweep (C14 brief, amendment 2026-10-20; Owed 70 (f)), for every case without a
 # CEF kill: since C11b a false zygote verdict, or a GPU death counted that did not happen, costs an
-# outage. 4 checks.
+# outage. 6 checks (5 in case 19): these 4 and the blank-page sweep's.
 fp_swept=false
 require_no_false_restart() {
   fp_swept=true
@@ -301,6 +301,32 @@ require_no_false_restart() {
   require fp_no_zygote_verdict '[.log.cef_health[] | select(.zygote_gone != null)] == []'
   require fp_no_gpu_deaths '[.log.cef_health[] | select(.gpu_process_deaths != 0)] == []'
   require fp_no_exit_75 '[dies_after(0)[] | select(.exit_code == 75)] == []' '[dies_after(0)[] | .exit_code]'
+  require_no_false_blank
+}
+
+# The blank-page sweep (Owed 99; the PR #92 review's I-1, fix round 1), for every case, the CEF kills
+# too (they call it on its own): a blank page's reload spends the shared page-fault count toward an
+# in-place restart, and the frame on air stays in the slot through it, so one false verdict is
+# invisible to every on-air check. Case 19 (cef-blank), whose pages are withheld on purpose, opts out
+# of `fp_no_blank_reload` by name; its own checks judge its reloads. The positive pair, in every case:
+# each page's first ready (per process and generation: a held teardown's page logs late readies of
+# its own generation, case 16) that Owed 99's hook did not withhold has its generation's `cef
+# painted` at or after it in the same process (the adapter's first-frame report, which the latch
+# writes at the ready), and at least one page is checked. 2 checks (1 in case 19).
+PAGES_PAINTED='.log.boots as $b | (.log.pages_withheld // []) as $w | (.log.cef_painted // []) as $c
+  | [(.log.cef_ready // [])[] | . as $rd
+     | {gen, at_ms, from: ([$b[] | select(. <= $rd.at_ms)] | last // 0),
+        to: ([$b[] | select(. > $rd.at_ms)] | first // 1e18)}]
+  | group_by([.from, .gen]) | map(min_by(.at_ms))
+  | map(. as $p | select([$w[] | select(.gen == $p.gen and .at_ms >= $p.from and .at_ms < $p.to)] == [])
+      | . + {painted_ms: ([$c[] | select(.gen == $p.gen and .at_ms >= $p.at_ms and .at_ms < $p.to)] | first | .at_ms)})
+  | {checked: length, unpainted: [.[] | select(.painted_ms == null) | {gen, at_ms}]}'
+require_no_false_blank() {
+  if [ "$CASE" != cef-blank ]; then
+    require fp_no_blank_reload '[(.log.blank_reloads // null)[]] == []' \
+      '[(.log.blank_reloads // [])[] | {at_ms, gen, blank_pages}]'
+  fi
+  require fp_every_ready_painted "$PAGES_PAINTED"' | .checked >= 1 and .unpainted == []' "$PAGES_PAINTED"
 }
 
 # The restart's outage and its parts (C14 brief, amendment 2026-10-20, "The outage measurement"),

@@ -1,0 +1,14 @@
+# Case 19 (harness/cases/cef-blank.sh) only, added to compose.yml by run-case.sh (CASE_COMPOSE).
+# The compositor is asked to keep every frame of its next COMPOSITOR_TEST_WITHHOLD_PAGES CEF pages out
+# of the overlay slot (Owed 99: the hook in crates/adapters/src/cef_graphics.rs's
+# `withhold_next_pages`, compiled in only by the Dockerfile's `relay-test-hooks` stage), so each of
+# those pages is Ready, beats, and puts nothing on air: a blank page. The case points RELAY_IMAGE at
+# that image (RELAY_TEST_HOOKS_IMAGE); the relay image ignores the variable, and the case's `armed`
+# check then fails (its arming line is a required precondition).
+#
+# Here and not in compose.yml, so no other leg's compositor sees the variable at all; `:?`, so a
+# case that forgot to set it refuses to start rather than run unarmed.
+services:
+  compositor:
+    environment:
+      COMPOSITOR_TEST_WITHHOLD_PAGES: ${COMPOSITOR_TEST_WITHHOLD_PAGES:?case 19 sets how many CEF pages to withhold}

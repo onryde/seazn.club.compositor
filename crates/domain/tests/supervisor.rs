@@ -4,6 +4,7 @@
 //! it checked (AGENTS.md §5).
 use domain::cef_health::CefHealth;
 use domain::config::{OutputProfile, Thresholds};
+use domain::graphics::HideReason;
 use domain::health::{BeatState, ExitDetail, ExitInfo, HealthReport, PhaseChannel};
 use domain::input_link::LossReason;
 use domain::ladder::Rung;
@@ -123,6 +124,7 @@ enum Kind {
     CefReady,
     CefCrashed,
     CefAlive,
+    CefPainted,
     ScoreStale,
     PhaseChannel,
     Live,
@@ -139,7 +141,7 @@ enum Kind {
     CefRestart,
 }
 
-const KINDS: [Kind; 27] = [
+const KINDS: [Kind; 28] = [
     Kind::Tick,
     Kind::BootstrapOk,
     Kind::BootstrapFailed,
@@ -156,6 +158,7 @@ const KINDS: [Kind; 27] = [
     Kind::CefReady,
     Kind::CefCrashed,
     Kind::CefAlive,
+    Kind::CefPainted,
     Kind::ScoreStale,
     Kind::PhaseChannel,
     Kind::Live,
@@ -191,6 +194,7 @@ fn kind_of(e: &Event) -> Kind {
         Event::CefReady { .. } => Kind::CefReady,
         Event::CefCrashed { .. } => Kind::CefCrashed,
         Event::CefAlive { .. } => Kind::CefAlive,
+        Event::CefPainted { .. } => Kind::CefPainted,
         Event::ScoreStale(_) => Kind::ScoreStale,
         Event::PhaseChannel(_) => Kind::PhaseChannel,
         Event::HeartbeatReply(Desired::Live) => Kind::Live,
@@ -251,6 +255,9 @@ fn sample(kind: Kind, s: &Supervisor) -> Event {
         Kind::CefAlive => Event::CefAlive {
             gen: s.graphics_generation(),
         },
+        Kind::CefPainted => Event::CefPainted {
+            gen: s.graphics_generation(),
+        },
         Kind::ScoreStale => Event::ScoreStale(true),
         Kind::PhaseChannel => Event::PhaseChannel(PhaseChannel::Web),
         Kind::Live => Event::HeartbeatReply(Desired::Live),
@@ -276,13 +283,14 @@ fn sample(kind: Kind, s: &Supervisor) -> Event {
 /// The supervisor in `setup`, and the instant the event is delivered. On air (Running, Holding),
 /// every generation is 1 and one heartbeat failure is counted, so every routed event visibly changes
 /// the state: the input and the output are connecting, and the page is loading, except for
-/// `CefAlive`, whose page is made Ready first (a beat counts only while Ready). The hold and the drain
+/// `CefAlive` and `CefPainted`, whose page is made Ready first (a beat and a first frame count only
+/// while Ready; Owed 99). The hold and the drain
 /// began 50 ms before the event, well inside `final_hold_ms` and `drain_timeout_ms`.
 fn setup(st: Setup, kind: Kind) -> (Supervisor, Ms) {
     let on_air = || {
         let mut s = booted(0, FAR).decide(Event::Tick, 0).next;
         s = s.decide(Event::HeartbeatFailed, 0).next;
-        if kind == Kind::CefAlive {
+        if matches!(kind, Kind::CefAlive | Kind::CefPainted) {
             s = s.decide(Event::CefReady { gen: 1 }, 0).next;
         }
         s
@@ -765,4 +773,82 @@ fn no_debug_string_shows_a_fatal_detail() {
     }
     eprintln!("Debug strings checked for a fatal detail: {checked}");
     assert!(checked >= 2 * 11, "anti-vacuity: {checked}");
+}
+
+// ---- Owed 99: a first frame in the hold ----
+
+fn step(s: Supervisor, e: Event, at: Ms, fx: &mut Vec<Effect>) -> Supervisor {
+    let d = s.decide(e, at);
+    fx.extend(d.effects);
+    d.next
+}
+
+/// A page crashed while Running (below the count: its last frame held, its bound from its last
+/// beat), its reload built and Ready in the hold, then ticks to past the held frame's bound. Returns
+/// every hide, and that bound. `painted`: the reload reports its first frame at its ready.
+fn hold_reload_hides(painted: bool) -> (Vec<(HideReason, u64)>, Ms) {
+    let th = t();
+    let mut fx = Vec::new();
+    let mut s = booted(0, FAR).decide(Event::Tick, 0).next;
+    s = step(s, Event::CefReady { gen: 1 }, 0, &mut fx);
+    s = step(s, Event::CefPainted { gen: 1 }, 0, &mut fx);
+    let alive = th.cef_alive_every_ms;
+    s = step(s, Event::CefAlive { gen: 1 }, alive, &mut fx);
+    let crash = alive + 100;
+    s = step(s, Event::CefCrashed { gen: 1 }, crash, &mut fx);
+    // The back-off, then the reload's build.
+    let mut now = crash;
+    while !fx.iter().any(|e| matches!(e, Effect::RestartGraphics { gen: 2 })) {
+        now += period();
+        assert!(
+            now <= crash + th.cef_backoff_cap_ms + period(),
+            "setup: no reload after the crash"
+        );
+        s = step(s, Event::Tick, now, &mut fx);
+    }
+    let ending = now + 100;
+    s = step(s, Event::HeartbeatReply(Desired::Ending), ending, &mut fx);
+    let ready = ending + 100;
+    s = step(s, Event::CefReady { gen: 2 }, ready, &mut fx);
+    if painted {
+        s = step(s, Event::CefPainted { gen: 2 }, ready, &mut fx);
+    }
+    let bound = alive + th.cef_hang_after_ms;
+    assert!(
+        bound < ending + th.final_hold_ms && bound + 2 * period() < ready + th.cef_hang_after_ms,
+        "setup: the held frame's bound comes inside the hold, before the reload could hang or be blank"
+    );
+    let mut now = ready;
+    while now <= bound + 2 * period() {
+        now += period();
+        s = step(s, Event::Tick, now, &mut fx);
+    }
+    assert!(
+        matches!(s.lifecycle(), Lifecycle::Holding { .. }),
+        "setup: still holding at {now}"
+    );
+    let hides = fx
+        .iter()
+        .filter_map(|e| match e {
+            Effect::HideOverlay { reason, gen } => Some((*reason, *gen)),
+            _ => None,
+        })
+        .collect();
+    (hides, bound)
+}
+
+// Owed 99: in the hold, a reloaded page's first frame replaces a held frame, as while Running; and
+// its ready alone replaces nothing (the positive pair: the held frame leaves at its own bound).
+#[test]
+fn in_the_hold_a_reloads_first_frame_replaces_the_held_frame_and_its_ready_alone_does_not() {
+    let (unpainted, bound) = hold_reload_hides(false);
+    eprintln!("hold, ready only: hides {unpainted:?} by {bound}");
+    assert_eq!(
+        unpainted,
+        vec![(HideReason::Crash, 1)],
+        "a reload Ready with no frame"
+    );
+    let (painted, _) = hold_reload_hides(true);
+    eprintln!("hold, ready and painted: hides {painted:?}");
+    assert_eq!(painted, vec![], "the reload's first frame is on air");
 }

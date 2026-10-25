@@ -102,6 +102,8 @@ report = {
     "log": {
         "lines": 2400, "boots": [S - 90000], "programme_started": [S - 70000],
         "cef_ready": [{"at_ms": S - 65000, "gen": 1}, {"at_ms": crash_ms + 3500, "gen": 2}],
+        "cef_painted": [{"at_ms": S - 65000, "gen": 1}, {"at_ms": crash_ms + 3500, "gen": 2}],
+        "blank_reloads": [],
         "cef_crashed": [{"at_ms": crash_ms, "gen": 1}],
         "cef_alive": alive,
         "graphics_restart": [{"at_ms": crash_ms + 1000, "gen": 2}],

@@ -402,6 +402,53 @@ fn frames_before_ready_never_reach_the_slot() {
     r.g.stop();
 }
 
+// Owed 99: a page that paints before its ready (`static=1`) puts its newest pre-ready frame on air at
+// its ready (the adapter's latch), and a build reports its first frame in the slot once, after its
+// ready (`CefPainted`, which ends the domain's blank-page watch). The latch is asserted whatever the
+// page painted after its ready (the PR #92 review's I-2: CI's run 40229667029 printed `delivered: 2,
+// dropped: 1, written: 2`, one sample after the ready, so a latch-only branch never ran): at least
+// one sample dropped before the ready, and exactly one more written than cefsrc delivered after it,
+// the latched one. Without the latch the slot holds only post-ready samples, one fewer.
+#[test]
+fn a_static_page_puts_its_first_frame_on_air_at_its_ready_and_reports_it_once() {
+    let _s = serial();
+    let mut r = rig();
+    r.g.restart(1, &page("?static=1"));
+    let before = events_until(&r.rx, load_timeout(), ready(1));
+    assert!(
+        !before.iter().any(|e| matches!(e, Event::CefPainted { .. })),
+        "a first frame reported before its ready: {before:?}"
+    );
+    let after = events_for(&r.rx, beat() * 2);
+    let painted = after
+        .iter()
+        .filter(|(_, e)| *e == Event::CefPainted { gen: 1 })
+        .count();
+    // A sample counted delivered may still be converting when the counts are read: wait for the
+    // latch's count to hold. Without the latch it never can (every written sample was delivered after
+    // the gate opened, so `written <= delivered - dropped`).
+    let latched = wait_for(beat(), || {
+        let s = r.g.samples(1);
+        s.refused == 0 && s.dropped >= 1 && s.written == s.delivered - s.dropped + 1
+    });
+    let s = r.g.samples(1);
+    eprintln!(
+        "static page: {s:?}; painted reports after the ready: {painted}; samples after the ready: {}; the latched one written: {latched}",
+        s.delivered.saturating_sub(s.dropped)
+    );
+    assert_eq!(painted, 1, "events after the ready: {after:?}");
+    assert!(
+        r.frames.overlay().is_some(),
+        "the static page's frame never reached the slot"
+    );
+    assert!(s.dropped >= 1, "the page painted nothing before its ready: {s:?}");
+    assert!(
+        latched,
+        "one more written than delivered after the ready (the latched one): {s:?}"
+    );
+    r.g.stop();
+}
+
 #[test]
 fn restart_holds_the_last_overlay_frame() {
     let _s = serial();

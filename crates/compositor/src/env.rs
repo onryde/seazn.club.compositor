@@ -31,6 +31,14 @@ pub const COMPOSITOR_FAKE_ZYGOTE_GONE: &str = "COMPOSITOR_FAKE_ZYGOTE_GONE";
 #[cfg(feature = "test-hooks")]
 pub const COMPOSITOR_TEST_HOLD_TEARDOWNS: &str = "COMPOSITOR_TEST_HOLD_TEARDOWNS";
 
+/// Owed 99, a `test-hooks` build only (C14 case 19; option B, owner 2026-10-25 "Apply rec", relayed by
+/// the coordinator): a count, `N`. The live graphics adapter's next `N` builds never put a frame in
+/// the overlay slot (`withhold_next_pages`), so each Ready page that beats is a blank page to the
+/// domain, which reloads it. Unset, empty or `0` withholds none; anything but ASCII digits is refused
+/// (78). A build without the feature has neither the key nor the hook: it ignores the variable.
+#[cfg(feature = "test-hooks")]
+pub const COMPOSITOR_TEST_WITHHOLD_PAGES: &str = "COMPOSITOR_TEST_WITHHOLD_PAGES";
+
 /// Owed 94, a `test-hooks` build only (C14's output-hung case; the owner, 2026-10-24, "B"): ms, `N`.
 /// The live programme's sink generation 1 has its writes held for good `N` ms after its build
 /// (`GstProgramme::stall_first_sink`, `SinkStall::Hold`): its total stops, the encoders keep
@@ -73,7 +81,7 @@ pub enum SinkStallHook {
     Hang,
 }
 
-/// The test hooks a `test-hooks` build reads (Owed 82, Owed 94). Empty in a build without the
+/// The test hooks a `test-hooks` build reads (Owed 82, Owed 94, Owed 99). Empty in a build without the
 /// feature, so a release binary has nothing to arm. Read in both modes; only the live adapters have
 /// them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -84,6 +92,9 @@ pub struct TestHooks {
     /// Owed 94: the stall to plant on sink generation 1, and how many ms after its build.
     #[cfg(feature = "test-hooks")]
     pub sink_stall: Option<(SinkStallHook, u64)>,
+    /// `COMPOSITOR_TEST_WITHHOLD_PAGES`: CEF builds whose frames never reach the slot (0: none).
+    #[cfg(feature = "test-hooks")]
+    pub withhold_pages: usize,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -190,10 +201,11 @@ pub fn parse(get: impl Fn(&str) -> Option<String>, release: bool) -> Result<Env,
     })
 }
 
-/// Owed 82 and Owed 94: the hooks a `test-hooks` build was asked for.
+/// Owed 82, Owed 94 and Owed 99: the hooks a `test-hooks` build was asked for.
 #[cfg(feature = "test-hooks")]
 fn test_hooks(get: &impl Fn(&str) -> Option<String>) -> Result<TestHooks, EnvError> {
     let hold_teardowns = digits(get, COMPOSITOR_TEST_HOLD_TEARDOWNS)?;
+    let withhold_pages = digits(get, COMPOSITOR_TEST_WITHHOLD_PAGES)?;
     let hold: u64 = digits(get, COMPOSITOR_TEST_HOLD_SINK_AFTER_MS)?;
     let hang: u64 = digits(get, COMPOSITOR_TEST_HANG_SINK_AFTER_MS)?;
     let sink_stall = match (hold, hang) {
@@ -206,6 +218,7 @@ fn test_hooks(get: &impl Fn(&str) -> Option<String>) -> Result<TestHooks, EnvErr
     Ok(TestHooks {
         hold_teardowns,
         sink_stall,
+        withhold_pages,
     })
 }
 

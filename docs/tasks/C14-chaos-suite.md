@@ -1235,6 +1235,71 @@ now runs 23 checks.
   - **Expected reds of the next run:** none. Case 6 and both case 18 legs must pass. Anything red is
     NOT OWED.
 
+## Amendment 2026-10-25, case 19 (Owed 99's watchdog; branch `fix/owed99-blank-overlay-watchdog`)
+
+Owner, 2026-10-25, in chat, relayed by the coordinator: "Apply rec" on Owed 99 (option B, a
+blank-overlay watchdog). Case 19, `cef-blank`, is its chaos witness; the choices are the
+implementer's under the dispatch.
+
+- **The fault.** Owed 99's hook (C11's amendment of this date) on the relay-test-hooks image, keyed
+  by `harness/compose.cef-blank.yml` (`${COMPOSITOR_TEST_WITHHOLD_PAGES:?}`, case 16's pattern),
+  withholds every frame of the first `cef_gpu_deaths_to_restart` − 1 pages. Each is Ready and beats
+  and shows nothing. 60 s live; the drive does nothing.
+- **No threshold variant.** The hook is armed per process, so a restarted process would withhold
+  its pages again and restart again, to the 2A cap. The restart at the count is the domain's and
+  the app's tests'.
+- **The budget.** `budget_blank_page_reload_ms` (harness::thresholds, derived, never typed): the
+  bound (`cef_hang_after_ms`), a tick (`TICK_WIDEST_MS`), the load timeout (`cef_load_timeout_ms`)
+  and the frame to the encoder (`BUDGET_FRAME_TO_ENCODER_MS`), from the last withheld page's ready.
+  thresholds.json was regenerated through `harness::thresholds::render`, dump-thresholds' own
+  function, with the committed adapter constants (this host cannot link GStreamer; the media drift
+  test checks those on CI). It was never merged by hand.
+- **Verdict** (19 checks, key `overlay_back`): `armed`; `withheld_n` (the first N gens, counting
+  down); `blank_reloads` (each withheld page reloaded once as the next gen, counts 1..N, `reload −
+  ready` in [`cef_hang_after_ms` − a frame period, + two], case 11's bound); `off_air_while_withheld`
+  (no overlay in any programme frame before the last reload, at least one read); `painted_once`
+  (one `cef painted` before the end request, the page after the last withheld, after its ready);
+  `overlay_back` (within the budget, held for `resume_after_ms`); `stays_on_air`;
+  `scheduled_changes_shown`; `no_hide`; `no_restart`; `ended_beat`; `counter_regressions`;
+  `no_core`; `no_output_outages`; the false-positive sweep (4); and `beats_while_blank`, printed and
+  never judged (the beat reads `graphics: ready` through the blank: no wire change, Owed 103).
+- **Tests.** `case_verdicts.rs` judges a good world and 11 reds (no watchdog, the bound early or
+  late, the painted page reloaded, the relay image unarmed, a withheld page painted or on air, the
+  budget one frame past, a hide, a frozen frame, a blank counted early), and its budget edge three
+  frames inside passes. The hook-case sweep, the stays-on-air sweep and the case and leg counts
+  (19 cases, 38 legs) include it.
+- **Expected reds of the next run:** none. Case 19 must pass. Anything red is NOT OWED.
+
+## Amendment 2026-10-25, PR #92 fix round 1 (I-1: the blank-page sweep in every leg; m-6)
+
+The PR #92 review of `bdc4588` (Needs fixes: tests and docs only, the code approved), adopted
+by the coordinator; the coordinator's fix-round dispatch, implementer decisions under it
+(`docs/_INDEX.md`, decision row "PR #92 fix round 1").
+
+- **The blank-page sweep** (`require_no_false_blank`, run-case.sh, 2 checks):
+  `fp_no_blank_reload` (no `reason=no_frames` reload in the leg; case 19 opts out by name) and its
+  positive pair `fp_every_ready_painted`: each page's first `cef ready` per process window and
+  generation, not withheld by Owed 99's hook, has its generation's `cef painted` at or after it in
+  the same process. At least one page is checked, else FAIL; a held teardown's late ready of its
+  own generation (case 16) is no page. Measured: `{checked, unpainted}`.
+- **Where.** `require_no_false_restart` calls it, so it is 6 checks (5 in case 19); the CEF-kill
+  cases (8, 13, 14, 15, 16), which run no false-restart sweep, call it last. Every case's
+  `CASE_CHECKS` grew by 2 (case 19 by 1: 20 checks).
+- **Re-judged on real reports.** The 38 legs of run 40229667029 (this branch's first chaos run),
+  re-judged with `CASE_REJUDGE=1`: 38 pass, 70 pages checked, none unpainted, no false reload in
+  the 37 legs that judge it. Planted in those reports, a false reload (`camera-stop`,
+  `cef-killed`) or a missing `blank_reloads` fact (`camera-flap`) reds `fp_no_blank_reload`; an
+  unpainted page (`process-killed`, `cef-leaks`), no ready at all (`dest-stall`) or a page whose
+  only painted is the page before's (`score-down`) reds `fp_every_ready_painted`; and case 19's
+  painted page unpainted reds `painted_once` with it.
+- **Case 19 (m-6).** `PAGES` pairs the k-th withheld page with the k-th blank reload of the first
+  process, so `blank_reloads` judges the gen each reload names. `case_verdicts.rs` adds five reds
+  (a `cef painted` 1 ms before its ready; a reload naming the wrong gen; the arming one too high;
+  the overlay back but not held for `resume_after_ms`; the countdown one too high) to the 11:
+  16 reds. `the_blank_page_sweep_reds_a_false_reload_and_an_unpainted_page_on_both_paths` judges
+  the sweep on both paths (a false-restart case, a kill case) and case 19's opt-out: 6 worlds.
+- **Expected reds of the next run:** none. Anything red is NOT OWED.
+
 ## Files
 
 - Create: `harness/cases/{camera-stop,camera-flap,reader-kicked,dest-disconnect,dest-stall,cpu-starved,score-down,cef-killed,process-killed,input-impaired}.{sh,jq}` (amended 2026-10-24: all 16, cases 11–16 too, as `.sh` files with `require` lines over `harness/cases/lib.jq`; and `harness/chaos.json`, the legs)

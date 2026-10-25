@@ -302,6 +302,7 @@ fn each_gpu_death_below_the_count_reloads_the_page_once_through_the_driver() {
     let mut r = Rig::on_air();
     r.tick_to(1_000);
     r.step(Inbound::Event(Event::CefReady { gen: 1 }), 1_001);
+    r.step(Inbound::Event(Event::CefPainted { gen: 1 }), 1_001);
     let mut at = 1_001;
     let mut checked = 0;
     for deaths in 1..n {
@@ -332,6 +333,7 @@ fn each_gpu_death_below_the_count_reloads_the_page_once_through_the_driver() {
         );
         // Its page gets ready, so the next death reloads a Ready page again.
         r.step(Inbound::Event(Event::CefReady { gen }), at + 1);
+        r.step(Inbound::Event(Event::CefPainted { gen }), at + 1);
         checked += 1;
     }
     assert!(r.exits.is_empty(), "{:?}", r.exits);
@@ -362,6 +364,7 @@ fn a_reload_that_never_readies_hides_as_reload_and_keeps_loading() {
     let mut r = Rig::on_air();
     r.tick_to(1_000);
     r.step(Inbound::Event(Event::CefReady { gen: 1 }), 1_001);
+    r.step(Inbound::Event(Event::CefPainted { gen: 1 }), 1_001);
     r.cef.set(health(None, 0, 1));
     r.tick_to(1_500);
     assert_eq!(reload_lines(&r.log), vec![reload_line(2, 1)], "setup");
@@ -421,4 +424,101 @@ fn the_final_hold_ends_its_own_way_whatever_the_health() {
         );
         assert_eq!(reload_lines(&r.log), Vec::<String>::new(), "{h:?}");
     }
+}
+
+/// The blank page's reload line (Owed 99), written from the brief's text: the generation it builds and
+/// the process's count of blank pages.
+fn blank_line(gen: u64, blanks: usize) -> String {
+    format!("cef reload gen={gen} reason=no_frames blank_pages={blanks}")
+}
+
+// Owed 99 through the driver: a Ready page that beats but never has a frame reported is reloaded on
+// the first tick at or after its ready + `cef_hang_after_ms`: one line naming the cause, then
+// `restart(next gen, the session's page URL)`, in that order, with nothing stopped or hidden (it was
+// the first page: nothing was on air). Each blank page after it the same, up to one short of the
+// count; the count's page exits 75 with the final beat naming the blank pages (the exit stops the page
+// and the input, as every in-place restart does), and reloads nothing.
+#[test]
+fn blank_pages_reload_through_the_driver_and_the_count_restarts_in_place() {
+    let t = th();
+    let n = t.cef_gpu_deaths_to_restart;
+    let url = session_720p().overlay_url;
+    let mut r = Rig::on_air();
+    r.tick_to(1_000);
+    let mut gen = 1;
+    let mut checked = 0;
+    for k in 1..=n {
+        let ready = r.d.next_tick_at();
+        r.tick_to(ready);
+        r.step(Inbound::Event(Event::CefReady { gen }), ready);
+        let bound = ready + t.cef_hang_after_ms;
+        let mark = r.log.len();
+        let mut beat = ready;
+        loop {
+            let at = r.d.next_tick_at();
+            if at >= bound {
+                break;
+            }
+            r.tick_to(at);
+            if at >= beat + t.cef_alive_every_ms {
+                r.step(Inbound::Event(Event::CefAlive { gen }), at);
+                beat = at;
+            }
+        }
+        assert!(
+            reload_lines(&r.log).len() == k - 1 && r.exits.is_empty(),
+            "page {k}: acted before its bound"
+        );
+        let at = r.d.next_tick_at();
+        r.tick_to(at);
+        assert!(
+            at >= bound && at < bound + 34,
+            "the first tick at or after the bound: {at}"
+        );
+        let after = r.log.calls_from(mark);
+        if k < n {
+            assert!(
+                !after.contains(&Call::GraphicsStop),
+                "page {k}: stopped: {after:?}"
+            );
+            assert!(!after.contains(&Call::HideOverlay), "page {k}: hidden: {after:?}");
+            let line = after.iter().position(|c| *c == Call::Log(blank_line(gen + 1, k)));
+            let restarts: Vec<usize> = after
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| matches!(c, Call::GraphicsRestart(..)))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(restarts.len(), 1, "page {k}: one restart: {after:?}");
+            assert_eq!(after[restarts[0]], Call::GraphicsRestart(gen + 1, url.clone()));
+            assert!(
+                line.is_some_and(|l| l < restarts[0]),
+                "page {k}: the line, then the restart: {after:?}"
+            );
+            assert!(r.exits.is_empty(), "{:?}", r.exits);
+            gen += 1;
+        } else {
+            assert_eq!(r.exits, vec![(at, EX_TEMPFAIL)]);
+            assert!(
+                !after.iter().any(|c| matches!(c, Call::GraphicsRestart(..))
+                    || matches!(c, Call::Log(l) if l.starts_with("cef reload"))),
+                "the restart reloaded too: {after:?}"
+            );
+            let fin = r.finals();
+            assert_eq!(fin.len(), 1);
+            let text = format!("restart in place: {n} blank CEF pages, 0 GPU-process deaths");
+            assert_eq!(
+                fin[0].exit,
+                Some(ExitInfo {
+                    reason: ExitReason::Restart,
+                    detail: Some(ExitDetail::new(text)),
+                })
+            );
+        }
+        checked += 1;
+    }
+    let want: Vec<String> = (1..n).map(|k| blank_line(1 + k as u64, k)).collect();
+    assert_eq!(reload_lines(&r.log), want);
+    eprintln!("blank pages through the driver: {checked}");
+    assert_eq!(checked, n);
 }

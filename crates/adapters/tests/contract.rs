@@ -1095,9 +1095,13 @@ impl World {
                     self.sink_gen = gen;
                     self.sink_total = 0;
                 }
-                Effect::RestartGraphics { gen } | Effect::ReloadGraphics { gen, .. } => {
+                Effect::RestartGraphics { gen }
+                | Effect::ReloadGraphics { gen, .. }
+                | Effect::ReloadGraphicsNoFrames { gen, .. } => {
                     self.page_gen = gen;
+                    // Ready, its latest frame written at the ready and reported (C11, Owed 99).
                     self.pending.push(Event::CefReady { gen });
+                    self.pending.push(Event::CefPainted { gen });
                 }
                 Effect::DrainOutput => self.pending.push(Event::OutputDrained),
                 Effect::SendHeartbeat(h) => self.beats.push(h),
