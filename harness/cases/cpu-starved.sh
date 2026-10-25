@@ -33,27 +33,32 @@
 #
 # The honest beat (Owed 86; the owner, 2026-10-24, "Ok", relayed by the coordinator: the beat's fps
 # is the encoder's real output rate, with a starvation alarm, the ladder unchanged and performance-4x
-# kept). Read from the log (`output fps beat=`, `output starvation alarm raised|cleared`; logfacts),
-# against the profile's own levels (output_fps_floor 0.95 × fps, output_fps_recovered 29.5/30 × fps,
-# dumped from OutputProfile::P720): (a) the run's first raise is inside the quota's window;
-# (b) every beat whose window lies inside the quota's reads under the floor, and at least one does
-# (`fps_beats_read`, the anti-vacuity, names why none did); (c) the first clear after that raise
-# comes after the quota is lifted, within realtime_after's window (BUDGET_LADDER_REALTIME_MS plus a
-# beat), and a beat in that window reads the recovered level; (d) the ladder never moved: every beat
-# that carries a rung reads `full` (the ruling; a step is now a red, whatever the beat read).
+# kept). Read from the log (`output fps beat=`, `output starvation alarm raised|cleared`; logfacts)
+# and from the wire (the heartbeat's `fps`), against the profile's own levels (output_fps_floor
+# 0.95 × fps, output_fps_recovered 29.5/30 × fps, dumped from OutputProfile::P720, and the log's
+# levels must be those: `beat_levels_known`): (a) the run's first raise is inside the quota's window;
+# (b) every beat whose window lies inside the quota's reads under the floor, in the log and on the
+# wire, at least one does (`fps_beats_read`, the anti-vacuity, names why none did), and the two
+# writers agree on each; (c) the first clear after that raise comes after the quota is lifted,
+# within realtime_after's window (BUDGET_LADDER_REALTIME_MS plus a beat), and every beat whose
+# window lies after the quota in that window reads the recovered level (past the catch-up's burst);
+# (d) the ladder's logic is unchanged (the coordinator, medium, 2026-10-25, reading the ruling): a
+# step its own trigger justifies passes, a step without the overruns its rule needs is a red.
 #
-# The programme clock holds (the window's recorded frame rate, BUDGET_FPS_MEAN_MIN, the recording's
-# mean bar; no PTS gap; every change the timeline schedules in the window shows): spec §9.4's "clock
-# holds", still judged. With the ladder ruled out nothing in the product holds it under this quota,
-# so these three red in CI with Owed 86's signature (the honest beat held, the ladder still) until the
-# owner rules whether §9.4's clause stands for this case (docs/_INDEX.md Owed 86). The encoder is back
+# The programme clock (the window's recorded frame rate against BUDGET_FPS_MEAN_MIN, the recording's
+# PTS gaps, the scheduled changes shown) is MEASURED in this case, not judged: the owner, 2026-10-25,
+# "A" (relayed by the coordinator; docs/_INDEX.md Owed 86). The quota starves the CPU below what
+# performance-4x is sized for, with the ladder and lite mode ruled out, so nothing in the product
+# holds spec §9.4's "clock holds" here; the viewer's quality on real CPU is gated by the soak and by
+# C15's cost legs. The three values and their sample counts are printed, and a clock read on nothing
+# is a red (`clock_measured`). Every other case keeps its clock checks. The encoder is back
 # at realtime within BUDGET_LADDER_REALTIME_MS of the end; the score stays on air (no overlay-less
 # frame); every rung is full or overlay_half_rate and never back to full after a step (C05). The last
 # beat's rung is printed. 720p only, as every chaos leg: the harness session is the 720p fixture (a
 # 1080p leg is owed with a 1080p fixture; the PR #52 review's m11).
 
 CASE_LIVE_S=80
-CASE_KEY=window_fps
+CASE_KEY=clock_measured
 STRESS_S=40
 STARVE_SHARE=0.75
 DEMAND_FROM_S=15
@@ -117,44 +122,93 @@ STARVED='less(mark_at("stress_done"); mark_at("stress")) as $w
        or ($speed != null and $speed < $t.encoder_speed_realtime_min) or ($rise != null and $rise > 0))),
      window_fps: $fps, fps_floor: $t.output_fps_floor, min_encoder_speed: $speed,
      speed_min: $t.encoder_speed_realtime_min, dropped_rise: $rise}'
-# The honest beat's evidence (Owed 86), from the log's lines (logfacts' `output_fps`,
-# `starvation_raised`, `starvation_cleared`), on the docker clock the marks share:
+# The honest beat's evidence (Owed 86), on the docker clock the marks share, from both of the beat's
+# writers: the log's lines (logfacts' `output_fps`, `starvation_raised`, `starvation_cleared`, two
+# decimals) and the wire (the heartbeat's `fps`, control_http.rs `fps_wire`, one decimal; the PR #77
+# review's I1: the wire is the beat the owner ruled on, the one the web and the organiser read).
 # - the judged beats: those whose window lies inside the quota's, [stress + heartbeat_interval_ms,
 #   stress_done] (a beat reads the frames since the beat before it, so the first beat after `stress`
-#   straddles it; a judged beat is starved for its whole window). `reason` says why none is.
+#   straddles it; a judged beat is starved for its whole window). `reason` says why none is. The
+#   wire's are its beats received in the same span (about 1 ms after the log's line, in CI).
+# - `pairs`: each judged log beat with the wire beat received within half a beat of it. The two agree
+#   within `tolerance`, half the wire's 0.1 plus half the log's 0.01 (the wire's rounding is pinned
+#   by case_verdicts.rs `the_wire_fps_is_the_reading_to_one_decimal`).
 # - the run's first raise, from `stress`, against the window's span (`window_ms`);
 # - the first clear after that raise, from `stress_done`, against `bound_ms`, realtime_after's window
 #   (BUDGET_LADDER_REALTIME_MS, spec §6's "Real time within 10 s", plus one beat); and `after`, the
-#   beats in that window.
-# A report with no `output_fps` (a checker older than the honest beat) reads no beat, never one.
+#   beats whose window lies after the quota inside that window, [stress_done + heartbeat_interval_ms,
+#   stress_done + bound_ms): past the catch-up, whose burst the first beat after the quota carries
+#   (CI: 83.67 fps; the PR #77 review's m1).
+# The product compares the raw rate and the log prints two decimals, so a reading in [28.495, 28.5)
+# raises the alarm and reads 28.50 here, `above` (the review's m3): at the starved 17 to 21 fps it
+# never arises. A report with no `output_fps` (a checker older than the honest beat) reads no beat,
+# never one.
 HONEST='mark_at("stress") as $s | mark_at("stress_done") as $e
   | $t.heartbeat_interval_ms as $hb
   | ($t.budget_ladder_realtime_ms + $t.heartbeat_interval_ms) as $bound
+  | (0.05 + 0.005) as $tol | (beats // []) as $series
   | .log.output_fps as $all | ($all // []) as $b
   | (if $s == null or $e == null then [] else [$b[] | select(.at_ms >= $s + $hb and .at_ms <= $e)] end) as $in
+  | (if $s == null or $e == null then [] else [$series[] | select(.received_ms >= $s + $hb and .received_ms <= $e) | .body.fps | numbers] end) as $wire
+  | [$in[] | . as $l | {log: $l.fps,
+      wire: ([$series[] | select(.received_ms > $l.at_ms - $hb / 2 and .received_ms <= $l.at_ms + $hb / 2) | .body.fps | numbers] | first)}] as $pairs
   | ((.log.starvation_raised // []) | first) as $r
   | (if $r == null then null else [(.log.starvation_cleared // [])[] | select(.at_ms > $r.at_ms)] | first end) as $c
-  | (if $e == null then [] else [$b[] | select(.at_ms >= $e and .at_ms < $e + $bound)] end) as $after
+  | (if $e == null then [] else [$b[] | select(.at_ms >= $e + $hb and .at_ms < $e + $bound)] end) as $after
   | {reason: (if $all == null then "the report has no output_fps (a checker older than the honest beat)"
        elif ($b | length) == 0 then "no `output fps beat=` line in the log"
+       elif $s == null or $e == null then "no quota window: a `stress` or `stress_done` mark is missing"
        elif ($in | length) == 0 then "no beat inside the starvation window" else null end),
      parsed: ($b | length), checked: ($in | length), fps: ($in | map(.fps)),
      above: ($in | map(select(.fps >= $t.output_fps_floor)) | length),
+     wire: $wire, wire_above: ($wire | map(select(. >= $t.output_fps_floor)) | length),
+     pairs: $pairs, tolerance: $tol, missing: ($pairs | map(select(.wire == null)) | length),
+     disagree: ($pairs | map(select(.wire != null and ((.wire - .log) | abs) > $tol)) | length),
      floor: $t.output_fps_floor, recovered: $t.output_fps_recovered,
      raises: ((.log.starvation_raised // []) | length), raise_fps: ($r.fps // null),
      raise_from_stress_ms: less($r.at_ms // null; $s), window_ms: less($e; $s),
      clear_fps: ($c.fps // null), clear_from_done_ms: less($c.at_ms // null; $e), bound_ms: $bound,
      after: ($after | map(.fps))}'
-# The ladder in the run: every beat that carries a rung, the ones off `full`, and droppedFrames' rise
-# over the window (its input; shown, not judged). Owed 86's signature reads `stepped` (chaos.json).
+# The ladder in the run, against its own rule (C09: `ladder_overruns_to_step` overruns within
+# `ladder_window_ms` step it down; the beats count overruns as droppedFrames). Its first step off
+# `full` is justified when droppedFrames rose by at least the rule's count up to the stepped beat
+# from the last beat a full window before the last `full` one: the overruns that stepped it lie
+# within ladder_window_ms of the step, which falls after that `full` beat. A necessary condition
+# only (the beats do not carry each overrun's time), so a step it calls justified may still be
+# early; a step it calls unjustified is one the rule cannot have taken.
 LADDER='([beats[] | select(.received_ms < mark_at("stress"))] | last | .body.droppedFrames // 0) as $d0
   | beats_between(mark_at("stress"); mark_at("stress_done") + $t.heartbeat_interval_ms) as $w
   | [beats[] | select(.body.rung != null)] as $r
+  | ([$r | to_entries[] | select(.value.body.rung != "full") | .key] | first) as $k
+  | (if $k == null then null else $r[$k] end) as $step
+  | (if $k == null or $k == 0 then null else $r[$k - 1].received_ms - $t.ladder_window_ms end) as $from
+  | ([$r[] | select($from != null and .received_ms <= $from)] | last | .body.droppedFrames // 0) as $base
+  | (if $step == null then null else ($step.body.droppedFrames // 0) - $base end) as $rise
   | {beats: ($r | length), stepped: ($r | map(select(.body.rung != "full")) | length),
-     rungs: ($r | map(.body.rung) | unique), dropped_before: $d0,
+     rungs: ($r | map(.body.rung) | unique), step_from_stress_ms: less($step.received_ms // null; mark_at("stress")),
+     step_rise: $rise, needs: $t.ladder_overruns_to_step,
+     justified: (($r | length) >= 1 and ($step == null or $rise >= $t.ladder_overruns_to_step)),
+     dropped_before: $d0,
      dropped_rise: (if ($w | length) == 0 then null else (($w | map(.body.droppedFrames // 0) | max) - $d0) end)}'
 
-CASE_CHECKS=19
+# The programme clock in the quota's window (measured, not judged: see the verdict), each value with
+# its sample count: the window's recorded frame rate against the recording's mean bar
+# (BUDGET_FPS_MEAN_MIN) over its frames; the recording's PTS gaps over the frames the checker read;
+# and the score changes the timeline schedules from `stress` to the last overlaid frame (less the
+# frame-to-encoder lag) against those the overlay showed. `sampled` is the anti-vacuity: a window, at
+# least two recorded frames (a gap is between two) and a scheduled change.
+CLOCK='less(mark_at("stress_done"); mark_at("stress")) as $w
+  | (.frames_table // []) as $ft
+  | ($ft | map(select(.[2] != null)) | last | .[0]) as $last
+  | (if $w == null or $w <= 0 then null else (frames_between(mark_at("stress"); mark_at("stress_done")) | length) end) as $n
+  | (if $last == null or mark_at("stress") == null then []
+     else [scheduled[] | select(.due_ms >= mark_at("stress") and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] end) as $due
+  | {window_fps: {fps: (if $n == null then null else $n * 1000 / $w end), bar: $t.budget_fps_mean_min, frames: $n, window_ms: $w},
+     pts_gaps: {gaps: ((.pts_gaps // []) | length), frames: ($ft | length)},
+     scheduled_changes_shown: {due: ($due | length), missing: ($due - ((.overlay.score_index_changes // []) | map(.index)))},
+     sampled: ($w != null and $w > 0 and ($ft | length) >= 2 and ($due | length) >= 1)}'
+
+CASE_CHECKS=23
 case_verdict() {
   # Anti-vacuity: the quota was requested under the demand, held for STRESS_S, and put back (the
   # drive's marks; `starvation_applied` is the witness that it was applied).
@@ -166,39 +220,57 @@ case_verdict() {
   require starvation_applied "$STARVED | .applied" "$STARVED"
   # The honest beat (Owed 86). Anti-vacuity first: a beat judged in the window, or the reason none is.
   require fps_beats_read "$HONEST | .checked >= 1" "$HONEST | {reason, parsed, checked}"
+  # The log's levels are the profile's the thresholds were dumped for (P720, the fixture's session):
+  # a session at another profile reds here by name rather than be judged at 720p30's levels (the
+  # PR #77 review's m2).
+  require beat_levels_known '[.log.output_fps[]? | .level] as $b | [.log.starvation_raised[]? | .level] as $r
+    | [.log.starvation_cleared[]? | .level] as $c
+    | ($b | length) >= 1 and ($b + $r | all(. == $t.output_fps_floor)) and ($c | all(. == $t.output_fps_recovered))' \
+    '{floors: ([.log.output_fps[]?, .log.starvation_raised[]? | .level] | unique), floor: $t.output_fps_floor,
+      recovered_levels: ([.log.starvation_cleared[]? | .level] | unique), recovered: $t.output_fps_recovered}'
   # (a) The alarm is raised by the starvation: the run's first raise inside the quota's window (a
   # raise on the healthy clock before it, or only after it, is not the starvation's).
   require alarm_raised "$HONEST | .raise_from_stress_ms >= 0 and .raise_from_stress_ms <= .window_ms" \
     "$HONEST | {raises, raise_fps, raise_from_stress_ms, window_ms}"
-  # (b) The beat reads the starvation: every judged beat under the floor.
+  # (b) The beat reads the starvation: every judged beat under the floor, in the log and on the wire,
+  # and the two writers agree on each judged beat.
   require beats_below_floor "$HONEST | .fps | length >= 1 and all(. < \$t.output_fps_floor)" \
     "$HONEST | {checked, above, floor, fps}"
-  # (c) The alarm clears once the quota is lifted, within realtime_after's window, and a beat there
-  # reads the recovered level.
+  require wire_below_floor "$HONEST | .wire | length >= 1 and all(. < \$t.output_fps_floor)" \
+    "$HONEST | {checked: (.wire | length), above: .wire_above, floor, fps: .wire}"
+  require wire_agrees_with_log "$HONEST | .checked >= 1 and .missing == 0 and .disagree == 0" \
+    "$HONEST | {checked, tolerance, missing, disagree, pairs}"
+  # (c) The alarm clears once the quota is lifted, within realtime_after's window, and every beat
+  # whose window lies after the quota in that window reads the recovered level.
   require alarm_cleared "$HONEST | .clear_from_done_ms >= 0 and .clear_from_done_ms <= .bound_ms
-    and (.after | any(. >= \$t.output_fps_recovered))" \
+    and (.after | length >= 1 and all(. >= \$t.output_fps_recovered))" \
     "$HONEST | {clear_fps, clear_from_done_ms, bound_ms, recovered, after}"
-  # (d) The ladder never moved (the owner's ruling: no ladder change). A step is a red here.
-  require ladder_unmoved '[beats[] | .body.rung | select(. != null)] | length >= 1 and all(. == "full")' "$LADDER"
-  # The clock (spec §9.4's "clock holds"; Owed 86 while the owner has not ruled on it for this case).
-  require window_fps '(mark_at("stress_done") - mark_at("stress")) as $w
-    | (frames_between(mark_at("stress"); mark_at("stress_done")) | length) as $n
-    | $w > 0 and ($n * 1000 / $w) >= $t.budget_fps_mean_min' \
-    '(mark_at("stress_done") - mark_at("stress")) as $w | {fps: ((frames_between(mark_at("stress"); mark_at("stress_done")) | length) * 1000 / $w), floor: $t.budget_fps_mean_min}'
-  require pts_gaps '.pts_gaps == []' '.pts_gaps | length'
+  # (d) The ladder's logic is unchanged (the owner's ruling, no ladder change; the coordinator,
+  # medium, 2026-10-25, on the PR #77 review's I3): a step its own trigger justifies passes, a step
+  # without the overruns its rule needs is a red. rungs_known and rung_holds judge C05's rungs and
+  # its bottom below.
+  require ladder_justified "$LADDER | .justified" "$LADDER"
+  # The programme clock under the induced starvation: MEASURED here, never gated (the owner,
+  # 2026-10-25, "A", relayed by the coordinator). The case starves the CPU below what performance-4x
+  # is sized for, with the ladder and lite mode ruled out, so spec §9.4's "clock holds" is not this
+  # case's gate: the viewer's quality on real CPU is gated by the soak (overlay on air 25/25) and by
+  # C15's cost legs (the size rule; the owner's 2026-10-18 rule, "measure, and raise the CPU size").
+  # Every other case keeps its own clock checks. The three are shown here and, through CASE_KEY, in
+  # run-chaos.sh's table; each carries its sample count, and a clock read on nothing (no window, no
+  # recording, no scheduled change) is `clock_measured`'s red.
+  measure window_fps "$CLOCK | .window_fps"
+  measure pts_gaps "$CLOCK | .pts_gaps"
+  measure scheduled_changes_shown "$CLOCK | .scheduled_changes_shown"
+  require clock_measured "$CLOCK | .sampled" \
+    "$CLOCK | {fps: (if .window_fps.fps == null then null else (.window_fps.fps * 10 | round) / 10 end),
+      pts_gaps: .pts_gaps.gaps, unshown: (.scheduled_changes_shown.missing | length), due: .scheduled_changes_shown.due,
+      frames: .pts_gaps.frames, window_ms: .window_fps.window_ms}"
   require realtime_after 'beats_between(mark_at("stress_done"); mark_at("stress_done") + $t.budget_ladder_realtime_ms + $t.heartbeat_interval_ms)
     | any(.body.encoderSpeed >= $t.encoder_speed_realtime_min)' \
     '{speeds: (beats_between(mark_at("stress_done"); mark_at("stress_done") + $t.budget_ladder_realtime_ms + $t.heartbeat_interval_ms) | map(.body.encoderSpeed)), min: $t.encoder_speed_realtime_min}'
   require score_on_air 'frames_between(mark_at("stress"); $run.end_request_ms) as $f
     | ($f | length) >= 1 and ($f | map(select(.[2] == null)) | length) == 0' \
     'frames_between(mark_at("stress"); $run.end_request_ms) | {frames: length, no_overlay: (map(select(.[2] == null)) | length)}'
-  require scheduled_changes_shown '. as $r | ($r.overlay.score_index_changes | map(.index)) as $shown
-    | ($r.frames_table | map(select(.[2] != null)) | last | .[0]) as $last
-    | [scheduled[] | select(.due_ms >= mark_at("stress") and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due
-    | ($due | length) >= 1 and ($due - $shown) == []' \
-    '. as $r | ($r.frames_table | map(select(.[2] != null)) | last | .[0]) as $last
-    | [scheduled[] | select(.due_ms >= mark_at("stress") and .due_ms <= $last - $t.budget_frame_to_encoder_ms) | .index] as $due
-    | {due: ($due | length), missing: ($due - ($r.overlay.score_index_changes | map(.index)))}'
   require rungs_known '[beats[] | .body.rung | select(. != null)] | length >= 1 and all(. == "full" or . == "overlay_half_rate")' \
     '.heartbeats.rungs'
   require rung_holds '.heartbeats.rung_sequence | (to_entries | map(select(.value == "overlay_half_rate")) | first | .key) as $i
