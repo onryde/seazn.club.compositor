@@ -347,6 +347,26 @@ this machine keeps the page's life (the beat, the crash count, the bound). One c
 death no longer walks graphics to `Failed` by its storm of `CefCrashed` (Owed 56's road), because the verdict reaches
 the domain within a child poll (1 s) and a tick, and the process exits first.
 
+## Amendment 2026-10-25 (Owed 99: a blank page, and the held frame past a ready)
+
+Owner, 2026-10-25, in chat, relayed by the coordinator: "Apply rec" on Owed 99 (option B, a
+blank-overlay watchdog). The rules below are implementer decisions under that dispatch
+(`docs/_INDEX.md`, decision row "Owed 99 built").
+
+- **A blank page.** A Ready page that has shown no frame of its own `cef_hang_after_ms` after its
+  ready is blank: `on_tick` returns `GraphicsAction::Blank { gen }`, once a page. Its first frame is
+  the event `on_painted(gen)` (the supervisor's `Event::CefPainted`), read only for the current
+  generation while Ready. Frame silence is no rule: cefsrc paints only on change (F-001), so a
+  static page is silent and healthy. The bound is this brief's one bound, from the Ready instant.
+- **Order.** The hang (no beat) is checked before the blank, so a page that neither beats nor paints
+  is a hang, counted once.
+- **The reload.** `on_blank_reload(now)` ends the blank page's life as a reload (no failure) and
+  builds the next generation; the supervisor decides whether to call it (C11b's amendment of this
+  date).
+- **The held frame (Owed 99's shape (b)).** A held frame from the page before is read while the new
+  page is Ready and has shown no frame, so it keeps its own bound past that ready; the new page's
+  first frame clears it. A page that showed no frame holds none of its own at its end.
+
 ## Do not touch
 
 - The ladder, the links, the programme and the supervisor (C06 routes the event).

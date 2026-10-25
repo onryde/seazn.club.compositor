@@ -200,6 +200,26 @@ Mutants: 12 domain, 7 app, 8 adapters (4 on the image), all red, each at its own
 
 **C14:** the measurement plan and the cases are in C14's brief ("Amendment 2026-10-20 (C11b)").
 
+## Amendment 2026-10-25 (Owed 99: blank pages count with GPU-process deaths)
+
+Owner, 2026-10-25, in chat, relayed by the coordinator: "Apply rec" on Owed 99 (option B). The
+choices below are implementer decisions under the dispatch (`docs/_INDEX.md`, decision row "Owed 99
+built"), built on branch `fix/owed99-blank-overlay-watchdog`.
+
+- **One count.** A blank page (C05b's amendment of this date) is a counted page fault: blank pages
+  and GPU-process deaths count together toward `cef_gpu_deaths_to_restart`
+  (`cef_health::page_faults_restart`, which needs at least one blank page, so the GPU-death rule
+  alone is unchanged). The count is the process's, never reset.
+- **Below it** the page reloads: `Effect::ReloadGraphicsNoFrames { gen, blank_pages }`, applied as
+  `RestartGraphics`; C08 logs `cef reload gen=<g> reason=no_frames blank_pages=<n>` first.
+- **At it** the process restarts in place (`RestartCause::PageFaults`, the final beat's
+  `restart in place: <b> blank CEF pages, <g> GPU-process deaths`, exit 75) and nothing reloads.
+  The health path reads the same rule, so a GPU death that reaches the count with blank pages
+  already counted restarts too. A page that never paints therefore costs in-place restarts, which
+  owner ruling 2A caps, and cannot reload forever.
+- **Only while Running.** The hold runs no blank rule; its painted reports still replace a held
+  frame. No wire or contract change: the beat carries no blank state (Owed 103).
+
 ## Output cap
 
 Under 15 lines.

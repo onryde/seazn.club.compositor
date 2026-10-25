@@ -450,6 +450,25 @@ this brief:
 - **Measured for C11b and C14:** Owed 61 (the 6th GPU-process death aborts the process) and Owed 62 (C14's case 8
   is a process abort).
 
+## Amendment 2026-10-25 (Owed 99: the first frame across the ready, `CefPainted`, and a hook)
+
+Owner, 2026-10-25, in chat, relayed by the coordinator: "Apply rec" on Owed 99 (option B). Built
+on branch `fix/owed99-blank-overlay-watchdog`; implementer decisions under the dispatch.
+
+- **The first frame (a false premise, `docs/_INDEX.md`).** The gate dropped every sample before the
+  build's own ready, and cefsrc emits a buffer only on paint (F-001), so a page that painted once
+  before its ready wrote nothing after it. The build's newest pre-ready sample is now kept under
+  the gate lock (`Gate.latched`; a newer sample replaces it, and a decided crash or a retirement
+  drops it) and written when that build's own ready opens the gate, before `CefReady` is sent.
+  Owed 17's rule holds: nothing of a build reaches air before its own ready.
+- **`CefPainted { gen }`.** The first sample written a build (the latched one at the ready, or the
+  first after it) is reported once, after that build's `CefReady`. The note queue never drops it.
+- **The hook (Owed 99, `test-hooks` only).** `withhold_next_pages(n)` keeps every sample of the next
+  n builds out of the slot (`WARN test hook (Owed 99): the next <n> CEF pages' frames never reach the
+  slot` once, and `WARN test hook (Owed 99) gen=<g>: this CEF page's frames never reach the slot
+  (<left> more to withhold)` per build), armed from `COMPOSITOR_TEST_WITHHOLD_PAGES` (C12's
+  `TestHooks`). C14's case 19 is its one reader.
+
 ## Do not touch
 
 The programme and input adapters, and the page in `seazn.club` (that's R2005). (Amended 2026-10-15)
