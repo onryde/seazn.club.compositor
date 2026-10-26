@@ -1,0 +1,154 @@
+{"t_ms": 70.7, "wall": 1793048840.445, "kind": "run_start", "part": "probes", "ingest": "srt", "links": "base", "trials": 1, "warm_s": 20.0, "gaps_s": [5.5], "after_s": [20.0], "drop": "clean", "hls": true, "note": "smoke: timeoutSeconds=180, clean", "cooldown_s": 1.0, "probe_life_s": 8, "probe_every_s": 1, "burst": 0, "burst_life_s": 8, "gst": "GStreamer 1.24.2", "origin": "live.cloudflare.com", "streamid_chars": 36, "passphrase_chars": 65, "thresholds": {"stall_ms": 5000, "connect_timeout_ms": 5000, "backoff_base_ms": 1000, "backoff_cap_ms": 10000, "srt_latency_ms": 1000}}
+{"t_ms": 71.8, "wall": 1793048840.446, "kind": "trial_start", "trial": 1, "gap_s": 5.5, "after_s": 20.0, "drop": "clean"}
+{"t_ms": 74.2, "wall": 1793048840.449, "kind": "pub_spawn", "pub": "P1", "n": 1, "pid": 684}
+{"t_ms": 249.9, "wall": 1793048840.624, "kind": "pub_start", "pub": "P1"}
+{"t_ms": 1337.0, "wall": 1793048841.711, "kind": "pub_connected", "pub": "P1", "stats": {"packets-sent": 8, "packets-sent-lost": 0, "packets-retransmitted": 0, "packet-ack-received": 1, "packet-nack-received": 0, "send-duration-us": 12705, "bytes-sent": 8624, "bytes-retransmitted": 0, "bytes-sent-dropped": 0, "packets-sent-dropped": 0, "send-rate-mbps": 0.3397332046465134, "negotiated-latency-ms": 1000, "packets-received": 0, "packets-received-lost": 0, "packets-received-retransmitted": 0, "packets-received-dropped": 0, "packet-ack-sent": 0, "packet-nack-sent": 0, "bytes-received": 0, "bytes-received-lost": 0, "receive-rate-mbps": 0.0, "bandwidth-mbps": 1.5, "rtt-ms": 2.083, "bytes-sent-total": 8272}}
+{"t_ms": 2159.2, "wall": 1793048842.534, "kind": "hls", "trial": 1, "master": 404}
+{"t_ms": 2536.7, "wall": 1793048842.911, "kind": "hls", "trial": 1, "master": 404}
+{"t_ms": 3577.7, "wall": 1793048843.952, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 3747.3, "wall": 1793048844.122, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 111984, "packets-sent": 84, "rtt-ms": 1.997}}
+{"t_ms": 4426.4, "wall": 1793048844.801, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 5482.6, "wall": 1793048845.857, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 6483.8, "wall": 1793048846.858, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 7416.3, "wall": 1793048847.791, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 8380.8, "wall": 1793048848.755, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 8767.5, "wall": 1793048849.142, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 329584, "packets-sent": 244, "rtt-ms": 2.011}}
+{"t_ms": 9608.5, "wall": 1793048849.983, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 1, "endlist": false}
+{"t_ms": 10585.1, "wall": 1793048850.959, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 1, "endlist": false}
+{"t_ms": 11579.4, "wall": 1793048851.954, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 2, "endlist": false}
+{"t_ms": 12475.3, "wall": 1793048852.85, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 2, "endlist": false}
+{"t_ms": 13554.2, "wall": 1793048853.929, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 4, "endlist": false}
+{"t_ms": 13788.6, "wall": 1793048854.163, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 547184, "packets-sent": 404, "rtt-ms": 1.91}}
+{"t_ms": 14579.4, "wall": 1793048854.954, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 4, "endlist": false}
+{"t_ms": 15367.2, "wall": 1793048855.742, "kind": "build", "reader": "R0"}
+{"t_ms": 15373.5, "wall": 1793048855.748, "kind": "build", "reader": "probe1"}
+{"t_ms": 15586.4, "wall": 1793048855.961, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 5, "endlist": false}
+{"t_ms": 15669.6, "wall": 1793048856.044, "kind": "handshake", "reader": "R0", "after_build_ms": 580.1, "rtt_ms": 100.0}
+{"t_ms": 15775.3, "wall": 1793048856.15, "kind": "handshake", "reader": "probe1", "after_build_ms": 407.6, "rtt_ms": 100.0}
+{"t_ms": 15996.7, "wall": 1793048856.371, "kind": "error", "reader": "R0", "t": 15996.6, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:R0/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 15996.8, "wall": 1793048856.371, "kind": "error", "reader": "R0", "t": 15996.8, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:R0/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 16374.3, "wall": 1793048856.749, "kind": "build", "reader": "probe2"}
+{"t_ms": 16534.3, "wall": 1793048856.909, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 5, "endlist": false}
+{"t_ms": 16575.7, "wall": 1793048856.95, "kind": "handshake", "reader": "probe2", "after_build_ms": 207.5, "rtt_ms": 100.0}
+{"t_ms": 17374.8, "wall": 1793048857.749, "kind": "build", "reader": "probe3"}
+{"t_ms": 17472.5, "wall": 1793048857.847, "kind": "first_byte", "reader": "probe1"}
+{"t_ms": 17529.3, "wall": 1793048857.904, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 6, "endlist": false}
+{"t_ms": 17575.9, "wall": 1793048857.95, "kind": "handshake", "reader": "probe3", "after_build_ms": 207.2, "rtt_ms": 100.0}
+{"t_ms": 17991.8, "wall": 1793048858.366, "kind": "first_frame", "reader": "probe1", "after_build_ms": 2624.0}
+{"t_ms": 17991.8, "wall": 1793048858.366, "kind": "closed", "reader": "probe1", "why": "first_frame"}
+{"t_ms": 18374.4, "wall": 1793048858.749, "kind": "build", "reader": "probe4"}
+{"t_ms": 18536.4, "wall": 1793048858.911, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 6, "endlist": false}
+{"t_ms": 18676.4, "wall": 1793048859.051, "kind": "handshake", "reader": "probe4", "after_build_ms": 306.8, "rtt_ms": 2.319}
+{"t_ms": 18808.0, "wall": 1793048859.182, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 766144, "packets-sent": 565, "rtt-ms": 2.164}}
+{"t_ms": 19375.3, "wall": 1793048859.75, "kind": "build", "reader": "probe5"}
+{"t_ms": 19438.5, "wall": 1793048859.813, "kind": "first_byte", "reader": "probe3"}
+{"t_ms": 19442.0, "wall": 1793048859.816, "kind": "first_byte", "reader": "probe2"}
+{"t_ms": 19553.7, "wall": 1793048859.928, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 7, "endlist": false}
+{"t_ms": 19678.1, "wall": 1793048860.052, "kind": "handshake", "reader": "probe5", "after_build_ms": 307.8, "rtt_ms": 2.319}
+{"t_ms": 20074.7, "wall": 1793048860.449, "kind": "pub_killed", "pub": "P1", "pid": 684, "how": "clean"}
+{"t_ms": 20074.8, "wall": 1793048860.449, "kind": "kill", "trial": 1, "warm_ok": false, "how": "clean"}
+{"t_ms": 20074.8, "wall": 1793048860.449, "kind": "trial_invalid", "trial": 1, "why": "no frame in the last second at the kill"}
+{"t_ms": 20074.9, "wall": 1793048860.449, "kind": "pub_closing", "pub": "P1"}
+{"t_ms": 20078.3, "wall": 1793048860.453, "kind": "pub_closed", "pub": "P1", "close_ms": 2.9}
+{"t_ms": 20079.5, "wall": 1793048860.454, "kind": "first_frame", "reader": "probe3", "after_build_ms": 2710.3}
+{"t_ms": 20079.6, "wall": 1793048860.454, "kind": "closed", "reader": "probe3", "why": "first_frame"}
+{"t_ms": 20086.3, "wall": 1793048860.461, "kind": "first_frame", "reader": "probe2", "after_build_ms": 3717.6}
+{"t_ms": 20086.3, "wall": 1793048860.461, "kind": "closed", "reader": "probe2", "why": "first_frame"}
+{"t_ms": 20099.9, "wall": 1793048860.474, "kind": "pub_exit", "pub": "P1", "rc": 1}
+{"t_ms": 20376.4, "wall": 1793048860.751, "kind": "build", "reader": "probe6"}
+{"t_ms": 20570.5, "wall": 1793048860.945, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 7, "endlist": false}
+{"t_ms": 20578.0, "wall": 1793048860.952, "kind": "handshake", "reader": "probe6", "after_build_ms": 206.8, "rtt_ms": 2.178}
+{"t_ms": 21377.1, "wall": 1793048861.751, "kind": "build", "reader": "probe7"}
+{"t_ms": 21517.1, "wall": 1793048861.891, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 7, "endlist": false}
+{"t_ms": 21578.9, "wall": 1793048861.953, "kind": "handshake", "reader": "probe7", "after_build_ms": 207.3, "rtt_ms": 2.178}
+{"t_ms": 22377.1, "wall": 1793048862.751, "kind": "build", "reader": "probe8"}
+{"t_ms": 22626.0, "wall": 1793048863.0, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 7, "endlist": false}
+{"t_ms": 22679.5, "wall": 1793048863.054, "kind": "handshake", "reader": "probe8", "after_build_ms": 307.4, "rtt_ms": 3.462}
+{"t_ms": 23378.0, "wall": 1793048863.752, "kind": "build", "reader": "probe9"}
+{"t_ms": 23500.1, "wall": 1793048863.875, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 7, "endlist": false}
+{"t_ms": 23678.8, "wall": 1793048864.053, "kind": "handshake", "reader": "probe9", "after_build_ms": 305.8, "rtt_ms": 2.178}
+{"t_ms": 24378.7, "wall": 1793048864.753, "kind": "build", "reader": "probe10"}
+{"t_ms": 24523.5, "wall": 1793048864.898, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 7, "endlist": false}
+{"t_ms": 24579.6, "wall": 1793048864.954, "kind": "handshake", "reader": "probe10", "after_build_ms": 206.0, "rtt_ms": 2.178}
+{"t_ms": 25379.5, "wall": 1793048865.754, "kind": "build", "reader": "probe11"}
+{"t_ms": 25549.0, "wall": 1793048865.923, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 7, "endlist": false}
+{"t_ms": 25575.8, "wall": 1793048865.95, "kind": "pub_spawn", "pub": "P2", "n": 1, "pid": 790}
+{"t_ms": 25581.3, "wall": 1793048865.956, "kind": "handshake", "reader": "probe11", "after_build_ms": 207.3, "rtt_ms": 2.178}
+{"t_ms": 25675.3, "wall": 1793048866.05, "kind": "pub_start", "pub": "P2"}
+{"t_ms": 25927.1, "wall": 1793048866.301, "kind": "pub_connected", "pub": "P2", "stats": {"packets-sent": 9, "packets-sent-lost": 0, "packets-retransmitted": 0, "packet-ack-received": 1, "packet-nack-received": 0, "send-duration-us": 18480, "bytes-sent": 9984, "bytes-retransmitted": 0, "bytes-sent-dropped": 0, "packets-sent-dropped": 0, "send-rate-mbps": 0.3190069375381924, "negotiated-latency-ms": 1000, "packets-received": 0, "packets-received-lost": 0, "packets-received-retransmitted": 0, "packets-received-dropped": 0, "packet-ack-sent": 0, "packet-nack-sent": 0, "bytes-received": 0, "bytes-received-lost": 0, "receive-rate-mbps": 0.0, "bandwidth-mbps": 1.5, "rtt-ms": 2.43, "bytes-sent-total": 9588}}
+{"t_ms": 25977.4, "wall": 1793048866.352, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 12704, "packets-sent": 11, "rtt-ms": 2.3}}
+{"t_ms": 26379.6, "wall": 1793048866.754, "kind": "build", "reader": "probe12"}
+{"t_ms": 26379.9, "wall": 1793048866.754, "kind": "closed", "reader": "probe4", "why": "life"}
+{"t_ms": 26485.6, "wall": 1793048866.86, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 7, "endlist": false}
+{"t_ms": 26580.7, "wall": 1793048866.955, "kind": "handshake", "reader": "probe12", "after_build_ms": 206.2, "rtt_ms": 2.319}
+{"t_ms": 27380.6, "wall": 1793048867.755, "kind": "build", "reader": "probe13"}
+{"t_ms": 27380.9, "wall": 1793048867.755, "kind": "closed", "reader": "probe5", "why": "life"}
+{"t_ms": 27582.1, "wall": 1793048867.956, "kind": "handshake", "reader": "probe13", "after_build_ms": 206.6, "rtt_ms": 2.319}
+{"t_ms": 27652.7, "wall": 1793048868.027, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 7, "endlist": false}
+{"t_ms": 28106.2, "wall": 1793048868.481, "kind": "first_byte", "reader": "probe12"}
+{"t_ms": 28380.9, "wall": 1793048868.755, "kind": "build", "reader": "probe14"}
+{"t_ms": 28381.2, "wall": 1793048868.756, "kind": "closed", "reader": "probe6", "why": "life"}
+{"t_ms": 28498.0, "wall": 1793048868.872, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 7, "endlist": false}
+{"t_ms": 28536.4, "wall": 1793048868.911, "kind": "first_frame", "reader": "probe12", "after_build_ms": 2161.8}
+{"t_ms": 28536.5, "wall": 1793048868.911, "kind": "closed", "reader": "probe12", "why": "first_frame"}
+{"t_ms": 28582.1, "wall": 1793048868.956, "kind": "handshake", "reader": "probe14", "after_build_ms": 206.3, "rtt_ms": 2.035}
+{"t_ms": 29382.8, "wall": 1793048869.757, "kind": "build", "reader": "probe15"}
+{"t_ms": 29383.0, "wall": 1793048869.757, "kind": "closed", "reader": "probe7", "why": "life"}
+{"t_ms": 29520.7, "wall": 1793048869.895, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 7, "endlist": false}
+{"t_ms": 29583.5, "wall": 1793048869.958, "kind": "handshake", "reader": "probe15", "after_build_ms": 206.6, "rtt_ms": 2.178}
+{"t_ms": 30383.5, "wall": 1793048870.758, "kind": "build", "reader": "probe16"}
+{"t_ms": 30383.8, "wall": 1793048870.758, "kind": "closed", "reader": "probe8", "why": "life"}
+{"t_ms": 30553.9, "wall": 1793048870.928, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 7, "endlist": false}
+{"t_ms": 30584.6, "wall": 1793048870.959, "kind": "handshake", "reader": "probe16", "after_build_ms": 206.8, "rtt_ms": 3.462}
+{"t_ms": 30996.4, "wall": 1793048871.371, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 228944, "packets-sent": 170, "rtt-ms": 1.98}}
+{"t_ms": 31383.0, "wall": 1793048871.757, "kind": "build", "reader": "probe17"}
+{"t_ms": 31383.3, "wall": 1793048871.758, "kind": "closed", "reader": "probe9", "why": "life"}
+{"t_ms": 31583.6, "wall": 1793048871.958, "kind": "handshake", "reader": "probe17", "after_build_ms": 205.7, "rtt_ms": 2.178}
+{"t_ms": 31641.8, "wall": 1793048872.016, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 8, "endlist": false}
+{"t_ms": 32383.0, "wall": 1793048872.757, "kind": "build", "reader": "probe18"}
+{"t_ms": 32383.3, "wall": 1793048872.758, "kind": "closed", "reader": "probe10", "why": "life"}
+{"t_ms": 32556.8, "wall": 1793048872.931, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 8, "endlist": false}
+{"t_ms": 32584.4, "wall": 1793048872.959, "kind": "handshake", "reader": "probe18", "after_build_ms": 206.3, "rtt_ms": 2.178}
+{"t_ms": 33384.1, "wall": 1793048873.758, "kind": "build", "reader": "probe19"}
+{"t_ms": 33384.4, "wall": 1793048873.759, "kind": "closed", "reader": "probe11", "why": "life"}
+{"t_ms": 33593.3, "wall": 1793048873.968, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 9, "endlist": false}
+{"t_ms": 33684.7, "wall": 1793048874.059, "kind": "handshake", "reader": "probe19", "after_build_ms": 306.2, "rtt_ms": 2.178}
+{"t_ms": 34383.8, "wall": 1793048874.758, "kind": "build", "reader": "probe20"}
+{"t_ms": 34564.0, "wall": 1793048874.938, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 9, "endlist": false}
+{"t_ms": 34584.7, "wall": 1793048874.959, "kind": "handshake", "reader": "probe20", "after_build_ms": 205.9, "rtt_ms": 2.178}
+{"t_ms": 35383.6, "wall": 1793048875.758, "kind": "build", "reader": "probe21"}
+{"t_ms": 35383.8, "wall": 1793048875.758, "kind": "closed", "reader": "probe13", "why": "life"}
+{"t_ms": 35554.1, "wall": 1793048875.928, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 10, "endlist": false}
+{"t_ms": 35685.1, "wall": 1793048876.059, "kind": "handshake", "reader": "probe21", "after_build_ms": 306.2, "rtt_ms": 2.319}
+{"t_ms": 36014.5, "wall": 1793048876.389, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 446544, "packets-sent": 330, "rtt-ms": 2.037}}
+{"t_ms": 36383.8, "wall": 1793048876.758, "kind": "build", "reader": "probe22"}
+{"t_ms": 36384.1, "wall": 1793048876.758, "kind": "closed", "reader": "probe14", "why": "life"}
+{"t_ms": 36571.4, "wall": 1793048876.946, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 10, "endlist": false}
+{"t_ms": 36685.1, "wall": 1793048877.059, "kind": "handshake", "reader": "probe22", "after_build_ms": 306.1, "rtt_ms": 2.095}
+{"t_ms": 37386.2, "wall": 1793048877.761, "kind": "build", "reader": "probe23"}
+{"t_ms": 37386.5, "wall": 1793048877.761, "kind": "closed", "reader": "probe15", "why": "life"}
+{"t_ms": 37587.5, "wall": 1793048877.962, "kind": "handshake", "reader": "probe23", "after_build_ms": 207.6, "rtt_ms": 2.178}
+{"t_ms": 37623.0, "wall": 1793048877.997, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 11, "endlist": false}
+{"t_ms": 38385.7, "wall": 1793048878.76, "kind": "build", "reader": "probe24"}
+{"t_ms": 38386.1, "wall": 1793048878.76, "kind": "closed", "reader": "probe16", "why": "life"}
+{"t_ms": 38567.7, "wall": 1793048878.942, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 11, "endlist": false}
+{"t_ms": 38586.5, "wall": 1793048878.961, "kind": "handshake", "reader": "probe24", "after_build_ms": 205.9, "rtt_ms": 3.462}
+{"t_ms": 39386.2, "wall": 1793048879.761, "kind": "build", "reader": "probe25"}
+{"t_ms": 39386.5, "wall": 1793048879.761, "kind": "closed", "reader": "probe17", "why": "life"}
+{"t_ms": 39582.4, "wall": 1793048879.957, "kind": "hls", "trial": 1, "master": 200, "variant_id": "1342d0a0", "variant": 200, "head": 12, "endlist": false}
+{"t_ms": 39586.9, "wall": 1793048879.961, "kind": "handshake", "reader": "probe25", "after_build_ms": 205.5, "rtt_ms": 2.178}
+{"t_ms": 40075.7, "wall": 1793048880.45, "kind": "pub_killed", "pub": "P2", "pid": 790, "how": "clean"}
+{"t_ms": 40075.8, "wall": 1793048880.45, "kind": "closed", "reader": "R0", "why": "retired"}
+{"t_ms": 40076.0, "wall": 1793048880.45, "kind": "closed", "reader": "probe18", "why": "trial_end"}
+{"t_ms": 40076.1, "wall": 1793048880.45, "kind": "pub_closing", "pub": "P2"}
+{"t_ms": 40076.3, "wall": 1793048880.451, "kind": "closed", "reader": "probe19", "why": "trial_end"}
+{"t_ms": 40076.6, "wall": 1793048880.451, "kind": "closed", "reader": "probe20", "why": "trial_end"}
+{"t_ms": 40077.0, "wall": 1793048880.451, "kind": "closed", "reader": "probe21", "why": "trial_end"}
+{"t_ms": 40077.3, "wall": 1793048880.452, "kind": "closed", "reader": "probe22", "why": "trial_end"}
+{"t_ms": 40077.5, "wall": 1793048880.452, "kind": "closed", "reader": "probe23", "why": "trial_end"}
+{"t_ms": 40078.5, "wall": 1793048880.453, "kind": "closed", "reader": "probe24", "why": "trial_end"}
+{"t_ms": 40078.7, "wall": 1793048880.453, "kind": "closed", "reader": "probe25", "why": "trial_end"}
+{"t_ms": 40079.1, "wall": 1793048880.453, "kind": "summary", "trial": 1, "gap_s": 5.5, "kill_ms": 20074.7, "p2_spawn_rel_kill_ms": 5500.7, "p2_spawns": 1, "p2_connected_rel_kill_ms": 5852.4, "r0": {"tag": "R0", "built": -4985.2, "handshake": -4405.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "retired", "end": 20001.1, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, "probes": [{"tag": "probe1", "built": -4707.0, "handshake": -4299.4, "first_byte": -2602.3, "first_au": -2094.8, "first_frame": -2083.0, "frames": 1, "aus": 2, "bytes": 21056, "ended": "first_frame", "end": -2082.9, "errors": [], "eos": null, "resumes": []}, {"tag": "probe2", "built": -3706.5, "handshake": -3499.0, "first_byte": -632.7, "first_au": 6.4, "first_frame": 11.1, "frames": 1, "aus": 2, "bytes": 25004, "ended": "first_frame", "end": 11.6, "errors": [], "eos": null, "resumes": []}, {"tag": "probe3", "built": -2706.0, "handshake": -2498.8, "first_byte": -636.3, "first_au": -1.6, "first_frame": 4.3, "frames": 1, "aus": 2, "bytes": 25004, "ended": "first_frame", "end": 4.9, "errors": [], "eos": null, "resumes": []}, {"tag": "probe4", "built": -1705.1, "handshake": -1398.3, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 6305.2, "errors": [], "eos": null, "resumes": []}, {"tag": "probe5", "built": -704.4, "handshake": -396.6, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 7306.2, "errors": [], "eos": null, "resumes": []}, {"tag": "probe6", "built": 296.5, "handshake": 503.3, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 8306.5, "errors": [], "eos": null, "resumes": []}, {"tag": "probe7", "built": 1296.9, "handshake": 1504.2, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 9308.3, "errors": [], "eos": null, "resumes": []}, {"tag": "probe8", "built": 2297.3, "handshake": 2604.7, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 10309.1, "errors": [], "eos": null, "resumes": []}, {"tag": "probe9", "built": 3298.3, "handshake": 3604.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 11308.6, "errors": [], "eos": null, "resumes": []}, {"tag": "probe10", "built": 4298.9, "handshake": 4504.9, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 12308.6, "errors": [], "eos": null, "resumes": []}, {"tag": "probe11", "built": 5299.3, "handshake": 5506.6, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 13309.7, "errors": [], "eos": null, "resumes": []}, {"tag": "probe12", "built": 6299.8, "handshake": 6506.0, "first_byte": 8031.4, "first_au": 8456.3, "first_frame": 8461.6, "frames": 1, "aus": 2, "bytes": 22372, "ended": "first_frame", "end": 8461.8, "errors": [], "eos": null, "resumes": []}, {"tag": "probe13", "built": 7300.8, "handshake": 7507.4, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 15309.1, "errors": [], "eos": null, "resumes": []}, {"tag": "probe14", "built": 8301.1, "handshake": 8507.4, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 16309.4, "errors": [], "eos": null, "resumes": []}, {"tag": "probe15", "built": 9302.2, "handshake": 9508.8, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 17311.8, "errors": [], "eos": null, "resumes": []}, {"tag": "probe16", "built": 10303.1, "handshake": 10509.9, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 18311.4, "errors": [], "eos": null, "resumes": []}, {"tag": "probe17", "built": 11303.2, "handshake": 11508.9, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 19311.8, "errors": [], "eos": null, "resumes": []}, {"tag": "probe18", "built": 12303.4, "handshake": 12509.7, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "trial_end", "end": 20001.3, "errors": [], "eos": null, "resumes": []}, {"tag": "probe19", "built": 13303.8, "handshake": 13610.0, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "trial_end", "end": 20001.6, "errors": [], "eos": null, "resumes": []}, {"tag": "probe20", "built": 14304.1, "handshake": 14510.0, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "trial_end", "end": 20001.9, "errors": [], "eos": null, "resumes": []}, {"tag": "probe21", "built": 15304.1, "handshake": 15610.3, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "trial_end", "end": 20002.3, "errors": [], "eos": null, "resumes": []}, {"tag": "probe22", "built": 16304.3, "handshake": 16610.4, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "trial_end", "end": 20002.6, "errors": [], "eos": null, "resumes": []}, {"tag": "probe23", "built": 17305.2, "handshake": 17512.8, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "trial_end", "end": 20002.8, "errors": [], "eos": null, "resumes": []}, {"tag": "probe24", "built": 18305.9, "handshake": 18511.8, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "trial_end", "end": 20003.8, "errors": [], "eos": null, "resumes": []}, {"tag": "probe25", "built": 19306.7, "handshake": 19512.2, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "trial_end", "end": 20004.0, "errors": [], "eos": null, "resumes": []}], "bursts": [], "bursts_checked": 0, "bursts_decoded": 0, "probes_checked": 25, "first_decoded_after_p2_rel_kill_ms": 8461.6, "first_decoding_probe_built_rel_kill_ms": 6299.8, "r0_resumed_rel_kill_ms": null}
+{"t_ms": 40079.4, "wall": 1793048880.454, "kind": "pub_closed", "pub": "P2", "close_ms": 2.9}
+{"t_ms": 40102.3, "wall": 1793048880.477, "kind": "pub_exit", "pub": "P2", "rc": 1}
+{"t_ms": 41080.5, "wall": 1793048881.455, "kind": "run_end", "lines": 153, "withheld": 0}

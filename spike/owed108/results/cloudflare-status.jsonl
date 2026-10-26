@@ -1,0 +1,30 @@
+{"read_at": "2026-10-26T17:39:53Z", "input": "spike Input A (c496c37a\u2026)", "state": "disconnected", "reason": "client_disconnect", "ingestProtocol": "rtmp", "entered": "2026-10-19T11:04:58.895Z"}
+{"read_at": "2026-10-26T17:39:53Z", "input": "spike Input A (c496c37a\u2026)", "state": "connected", "reason": "connected", "ingestProtocol": "rtmp", "entered": "2026-10-19T11:04:14.430Z"}
+{"read_at": "2026-10-26T17:39:53Z", "input": "stg session 4516d82a's Input A (f859e242\u2026)", "state": "disconnected", "reason": "client_disconnect", "ingestProtocol": "srt", "entered": "2026-10-26T16:47:19.219Z"}
+{"read_at": "2026-10-26T17:39:53Z", "input": "stg session 4516d82a's Input A (f859e242\u2026)", "state": "connected", "reason": "connected", "ingestProtocol": "srt", "entered": "2026-10-26T16:26:12.685Z"}
+{"read_at": "2026-10-26T18:06:42Z", "input": "spike Input A (c496c37a\u2026)", "state": "disconnected", "reason": "client_disconnect", "ingestProtocol": "srt", "entered": "2026-10-26T18:06:21.025Z"}
+{"read_at": "2026-10-26T18:10:35Z", "input": "spike Input A (c496c37a\u2026)", "state": "disconnected", "reason": "client_disconnect", "ingestProtocol": "srt", "entered": "2026-10-26T18:09:59.912Z"}
+{"read_at": "2026-10-26T18:10:35Z", "input": "spike Input A (c496c37a\u2026)", "state": "connected", "reason": "connected", "ingestProtocol": "srt", "entered": "2026-10-26T18:08:36.106Z"}
+{"read_at": "2026-10-26T18:21:44Z", "input": "spike Input A (c496c37a\u2026)", "state": "disconnected", "reason": "client_disconnect", "ingestProtocol": "srt", "entered": "2026-10-26T18:21:30.085Z"}
+{"read_at": "2026-10-26T18:21:44Z", "input": "spike Input A (c496c37a\u2026)", "state": "connected", "reason": "connected", "ingestProtocol": "srt", "entered": "2026-10-26T18:20:06.371Z"}
+{"read_at": "2026-10-26T19:07:22Z", "input": "spike Input A (c496c37a\u2026)", "state": "disconnected", "reason": "client_disconnect", "ingestProtocol": "rtmp", "entered": "2026-10-26T19:07:13.723Z"}
+{"read_at": "2026-10-26T19:07:22Z", "input": "spike Input A (c496c37a\u2026)", "state": "connected", "reason": "connected", "ingestProtocol": "rtmp", "entered": "2026-10-26T19:06:19.907Z"}
+{"read_at": "2026-10-26T19:12:06.812Z", "input": "spike Input A (c496c37a\u2026)", "state": "connected", "reason": "connected", "ingestProtocol": "rtmp", "entered": "2026-10-26T19:12:05.067Z"}
+{"read_at": "2026-10-26T19:17:40.005Z", "input": "spike Input A (c496c37a\u2026)", "state": "connected", "reason": "connected", "ingestProtocol": "rtmp", "entered": "2026-10-26T19:17:01.380Z"}
+{"read_at": "2026-10-26T19:17:45.260Z", "input": "spike Input A (c496c37a\u2026)", "state": "disconnected", "reason": "client_disconnect", "ingestProtocol": "rtmp", "entered": "2026-10-26T19:17:43.924Z"}
+{"read_at": "2026-10-26T19:17:50.544Z", "input": "spike Input A (c496c37a\u2026)", "state": "connected", "reason": "connected", "ingestProtocol": "rtmp", "entered": "2026-10-26T19:17:50.206Z"}
+{"read_at": "2026-10-26T19:38:49Z", "input": "spike Input A (c496c37a\u2026)", "state": "disconnected", "reason": "client_disconnect", "ingestProtocol": "srt", "entered": "2026-10-26T19:36:52.710Z"}
+{"read_at": "2026-10-26T21:09:29Z", "input": "spike Input A (c496c37a\u2026)", "state": "disconnected", "reason": "client_disconnect", "ingestProtocol": "srt", "entered": "2026-10-26T21:08:00.735Z"}
+{"read_at": "2026-10-26T21:09:29Z", "input": "spike Input A (c496c37a\u2026)", "state": "connected", "reason": "connected", "ingestProtocol": "srt", "entered": "2026-10-26T21:07:46.971Z"}
+{"read_at": "2026-10-26T21:12:51Z", "input": "spike Input A (c496c37a\u2026)", "state": "connected", "reason": "connected", "ingestProtocol": "srt", "entered": "2026-10-26T21:12:19.006Z"}
+{"read_at": "2026-10-26T21:13:50Z", "input": "spike Input A (c496c37a\u2026)", "state": "disconnected", "reason": "client_disconnect", "ingestProtocol": "srt", "entered": "2026-10-26T21:13:12.849Z"}
+{"read_at": "2026-10-26T21:18:06Z", "input": "spike Input A (c496c37a\u2026)", "state": "connected", "reason": "connected", "ingestProtocol": "srt", "entered": "2026-10-26T21:18:04.130Z"}
+{"read_at": "2026-10-26T21:19:17Z", "input": "spike Input A (c496c37a\u2026)", "state": "disconnected", "reason": "client_disconnect", "ingestProtocol": "srt", "entered": "2026-10-26T21:18:57.960Z"}
+{"read_at": "2026-10-26T21:23:53Z", "input": "spike Input A (c496c37a\u2026)", "state": "connected", "reason": "connected", "ingestProtocol": "srt", "entered": "2026-10-26T21:23:49.236Z"}
+{"read_at": "2026-10-26T21:25:08Z", "input": "spike Input A (c496c37a\u2026)", "state": "disconnected", "reason": "client_disconnect", "ingestProtocol": "srt", "entered": "2026-10-26T21:24:43.075Z"}
+{"read_at": "2026-10-26T21:38:10Z", "input": "spike Input A (c496c37a\u2026)", "state": "disconnected", "reason": "client_disconnect", "ingestProtocol": "srt", "entered": "2026-10-26T21:36:11.168Z"}
+{"read_at": "2026-10-26T21:38:10Z", "input": "spike Input A (c496c37a\u2026)", "state": "connected", "reason": "connected", "ingestProtocol": "srt", "entered": "2026-10-26T21:35:00.128Z"}
+{"read_at": "2026-10-26T21:46:51Z", "input": "spike Input A (c496c37a\u2026)", "state": "disconnected", "reason": "client_disconnect", "ingestProtocol": "srt", "entered": "2026-10-26T21:45:22.283Z"}
+{"read_at": "2026-10-26T21:46:51Z", "input": "spike Input A (c496c37a\u2026)", "state": "connected", "reason": "connected", "ingestProtocol": "srt", "entered": "2026-10-26T21:44:08.465Z"}
+{"read_at": "2026-10-26T22:06:05Z", "input": "spike Input A (c496c37a\u2026)", "state": "disconnected", "reason": "client_disconnect", "ingestProtocol": "rtmp", "entered": "2026-10-26T22:03:34.103Z"}
+{"read_at": "2026-10-26T22:06:05Z", "input": "spike Input A (c496c37a\u2026)", "state": "connected", "reason": "connected", "ingestProtocol": "rtmp", "entered": "2026-10-26T22:02:51.693Z"}

@@ -1,0 +1,592 @@
+{"t_ms": 91.0, "wall": 1793052168.811, "kind": "run_start", "part": "probes", "ingest": "rtmps", "links": "base", "trials": 1, "warm_s": 45.0, "gaps_s": [-1.0], "after_s": [100.0], "drop": "kill", "hls": true, "note": "control: RTMPS, timeoutSeconds=60, recording automatic", "cooldown_s": 1.0, "probe_life_s": 8, "probe_every_s": 1, "burst": 8, "burst_life_s": 8, "gst": "GStreamer 1.24.2", "origin": "live.cloudflare.com", "streamid_chars": 36, "passphrase_chars": 65, "thresholds": {"stall_ms": 5000, "connect_timeout_ms": 5000, "backoff_base_ms": 1000, "backoff_cap_ms": 10000, "srt_latency_ms": 1000}}
+{"t_ms": 92.0, "wall": 1793052168.812, "kind": "trial_start", "trial": 1, "gap_s": -1.0, "after_s": 100.0, "drop": "kill"}
+{"t_ms": 94.4, "wall": 1793052168.815, "kind": "pub_spawn", "pub": "P1", "n": 1, "pid": 684}
+{"t_ms": 281.9, "wall": 1793052169.002, "kind": "pub_start", "pub": "P1"}
+{"t_ms": 511.0, "wall": 1793052169.231, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 1375.5, "wall": 1793052170.096, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 2351.6, "wall": 1793052171.072, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 3299.6, "wall": 1793052172.02, "kind": "pub_connected", "pub": "P1", "stats": {"in-chunk-size": 1024, "out-chunk-size": 128, "in-window-ack-size": 2500000, "out-window-ack-size": 2500000, "in-bytes-total": 409, "out-bytes-total": 100581, "in-bytes-acked": 0, "out-bytes-acked": 0, "rtt-ms": -1}}
+{"t_ms": 3425.2, "wall": 1793052172.145, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 3601.1, "wall": 1793052172.321, "kind": "pub_stats", "pub": "P1", "stats": {"rtt-ms": -1, "out-bytes-acked": 0, "out-bytes-total": 110472}}
+{"t_ms": 4453.7, "wall": 1793052173.174, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 5331.7, "wall": 1793052174.052, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 6316.5, "wall": 1793052175.037, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 7803.5, "wall": 1793052176.524, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 1, "endlist": false}
+{"t_ms": 8226.1, "wall": 1793052176.946, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 1, "endlist": false}
+{"t_ms": 8625.2, "wall": 1793052177.345, "kind": "pub_stats", "pub": "P1", "stats": {"rtt-ms": -1, "out-bytes-acked": 0, "out-bytes-total": 280718}}
+{"t_ms": 9733.8, "wall": 1793052178.454, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 3, "endlist": false}
+{"t_ms": 10249.4, "wall": 1793052178.97, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 3, "endlist": false}
+{"t_ms": 11726.9, "wall": 1793052180.447, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 3, "endlist": false}
+{"t_ms": 12238.3, "wall": 1793052180.958, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 3, "endlist": false}
+{"t_ms": 13651.3, "wall": 1793052182.371, "kind": "pub_stats", "pub": "P1", "stats": {"rtt-ms": -1, "out-bytes-acked": 0, "out-bytes-total": 449464}}
+{"t_ms": 13885.5, "wall": 1793052182.605, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 4, "endlist": false}
+{"t_ms": 14218.2, "wall": 1793052182.938, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 4, "endlist": false}
+{"t_ms": 15562.7, "wall": 1793052184.283, "kind": "build", "reader": "R0"}
+{"t_ms": 15771.0, "wall": 1793052184.491, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 5, "endlist": false}
+{"t_ms": 15864.1, "wall": 1793052184.584, "kind": "handshake", "reader": "R0", "after_build_ms": 753.7, "rtt_ms": 100.0}
+{"t_ms": 16216.0, "wall": 1793052184.936, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 5, "endlist": false}
+{"t_ms": 17515.3, "wall": 1793052186.235, "kind": "first_byte", "reader": "R0"}
+{"t_ms": 17724.8, "wall": 1793052186.445, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 6, "endlist": false}
+{"t_ms": 18048.1, "wall": 1793052186.768, "kind": "first_frame", "reader": "R0", "after_build_ms": 2937.4}
+{"t_ms": 18225.1, "wall": 1793052186.945, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 6, "endlist": false}
+{"t_ms": 18677.1, "wall": 1793052187.397, "kind": "pub_stats", "pub": "P1", "stats": {"rtt-ms": -1, "out-bytes-acked": 0, "out-bytes-total": 618328}}
+{"t_ms": 19714.2, "wall": 1793052188.434, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 7, "endlist": false}
+{"t_ms": 20218.6, "wall": 1793052188.938, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 7, "endlist": false}
+{"t_ms": 22159.2, "wall": 1793052190.879, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 8, "endlist": false}
+{"t_ms": 22290.2, "wall": 1793052191.01, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 8, "endlist": false}
+{"t_ms": 23701.9, "wall": 1793052192.422, "kind": "pub_stats", "pub": "P1", "stats": {"rtt-ms": -1, "out-bytes-acked": 0, "out-bytes-total": 786637}}
+{"t_ms": 23800.4, "wall": 1793052192.52, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 9, "endlist": false}
+{"t_ms": 24275.9, "wall": 1793052192.996, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 9, "endlist": false}
+{"t_ms": 25886.5, "wall": 1793052194.606, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 10, "endlist": false}
+{"t_ms": 26269.2, "wall": 1793052194.989, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 10, "endlist": false}
+{"t_ms": 27831.5, "wall": 1793052196.551, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 11, "endlist": false}
+{"t_ms": 28277.3, "wall": 1793052196.997, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 11, "endlist": false}
+{"t_ms": 28726.8, "wall": 1793052197.446, "kind": "pub_stats", "pub": "P1", "stats": {"rtt-ms": -1, "out-bytes-acked": 0, "out-bytes-total": 955804}}
+{"t_ms": 29858.9, "wall": 1793052198.578, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 12, "endlist": false}
+{"t_ms": 30300.5, "wall": 1793052199.02, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 12, "endlist": false}
+{"t_ms": 31103.5, "wall": 1793052199.823, "kind": "build", "reader": "burst1"}
+{"t_ms": 31110.5, "wall": 1793052199.83, "kind": "build", "reader": "burst2"}
+{"t_ms": 31118.0, "wall": 1793052199.837, "kind": "build", "reader": "burst3"}
+{"t_ms": 31126.6, "wall": 1793052199.846, "kind": "build", "reader": "burst4"}
+{"t_ms": 31134.0, "wall": 1793052199.853, "kind": "build", "reader": "burst5"}
+{"t_ms": 31139.9, "wall": 1793052199.859, "kind": "build", "reader": "burst6"}
+{"t_ms": 31146.9, "wall": 1793052199.866, "kind": "build", "reader": "burst7"}
+{"t_ms": 31153.2, "wall": 1793052199.873, "kind": "build", "reader": "burst8"}
+{"t_ms": 31311.3, "wall": 1793052200.031, "kind": "handshake", "reader": "burst2", "after_build_ms": 207.3, "rtt_ms": 100.0}
+{"t_ms": 31405.5, "wall": 1793052200.125, "kind": "handshake", "reader": "burst1", "after_build_ms": 309.8, "rtt_ms": 100.0}
+{"t_ms": 31420.3, "wall": 1793052200.14, "kind": "handshake", "reader": "burst3", "after_build_ms": 309.6, "rtt_ms": 100.0}
+{"t_ms": 31428.8, "wall": 1793052200.148, "kind": "handshake", "reader": "burst4", "after_build_ms": 310.4, "rtt_ms": 100.0}
+{"t_ms": 31436.2, "wall": 1793052200.156, "kind": "handshake", "reader": "burst5", "after_build_ms": 308.5, "rtt_ms": 100.0}
+{"t_ms": 31442.5, "wall": 1793052200.162, "kind": "handshake", "reader": "burst6", "after_build_ms": 308.3, "rtt_ms": 100.0}
+{"t_ms": 31447.9, "wall": 1793052200.167, "kind": "handshake", "reader": "burst7", "after_build_ms": 307.8, "rtt_ms": 100.0}
+{"t_ms": 31454.2, "wall": 1793052200.174, "kind": "handshake", "reader": "burst8", "after_build_ms": 306.9, "rtt_ms": 100.0}
+{"t_ms": 31809.8, "wall": 1793052200.529, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 13, "endlist": false}
+{"t_ms": 32284.3, "wall": 1793052201.004, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 13, "endlist": false}
+{"t_ms": 33514.9, "wall": 1793052202.234, "kind": "first_byte", "reader": "burst1"}
+{"t_ms": 33518.5, "wall": 1793052202.238, "kind": "first_byte", "reader": "burst4"}
+{"t_ms": 33531.1, "wall": 1793052202.25, "kind": "first_byte", "reader": "burst3"}
+{"t_ms": 33533.3, "wall": 1793052202.253, "kind": "first_byte", "reader": "burst5"}
+{"t_ms": 33534.0, "wall": 1793052202.253, "kind": "first_byte", "reader": "burst2"}
+{"t_ms": 33556.8, "wall": 1793052202.276, "kind": "first_byte", "reader": "burst8"}
+{"t_ms": 33576.9, "wall": 1793052202.296, "kind": "first_byte", "reader": "burst7"}
+{"t_ms": 33580.6, "wall": 1793052202.3, "kind": "first_byte", "reader": "burst6"}
+{"t_ms": 33728.5, "wall": 1793052202.448, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 14, "endlist": false}
+{"t_ms": 33748.8, "wall": 1793052202.468, "kind": "pub_stats", "pub": "P1", "stats": {"rtt-ms": -1, "out-bytes-acked": 0, "out-bytes-total": 1124048}}
+{"t_ms": 34074.8, "wall": 1793052202.794, "kind": "first_frame", "reader": "burst8", "after_build_ms": 2926.3}
+{"t_ms": 34074.9, "wall": 1793052202.794, "kind": "closed", "reader": "burst8", "why": "first_frame"}
+{"t_ms": 34078.2, "wall": 1793052202.798, "kind": "first_frame", "reader": "burst7", "after_build_ms": 2937.7}
+{"t_ms": 34078.3, "wall": 1793052202.798, "kind": "closed", "reader": "burst7", "why": "first_frame"}
+{"t_ms": 34091.1, "wall": 1793052202.81, "kind": "first_frame", "reader": "burst6", "after_build_ms": 2956.2}
+{"t_ms": 34091.2, "wall": 1793052202.811, "kind": "closed", "reader": "burst6", "why": "first_frame"}
+{"t_ms": 34118.6, "wall": 1793052202.838, "kind": "first_frame", "reader": "burst4", "after_build_ms": 3000.2}
+{"t_ms": 34118.6, "wall": 1793052202.838, "kind": "closed", "reader": "burst4", "why": "first_frame"}
+{"t_ms": 34132.5, "wall": 1793052202.852, "kind": "first_frame", "reader": "burst1", "after_build_ms": 3036.5}
+{"t_ms": 34132.5, "wall": 1793052202.852, "kind": "closed", "reader": "burst1", "why": "first_frame"}
+{"t_ms": 34158.4, "wall": 1793052202.878, "kind": "first_frame", "reader": "burst3", "after_build_ms": 3047.3}
+{"t_ms": 34158.4, "wall": 1793052202.878, "kind": "closed", "reader": "burst3", "why": "first_frame"}
+{"t_ms": 34161.2, "wall": 1793052202.881, "kind": "first_frame", "reader": "burst2", "after_build_ms": 3056.1}
+{"t_ms": 34163.2, "wall": 1793052202.883, "kind": "closed", "reader": "burst2", "why": "first_frame"}
+{"t_ms": 34165.2, "wall": 1793052202.885, "kind": "first_frame", "reader": "burst5", "after_build_ms": 3036.2}
+{"t_ms": 34165.4, "wall": 1793052202.885, "kind": "closed", "reader": "burst5", "why": "first_frame"}
+{"t_ms": 34296.4, "wall": 1793052203.016, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 14, "endlist": false}
+{"t_ms": 35818.1, "wall": 1793052204.537, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 15, "endlist": false}
+{"t_ms": 36292.8, "wall": 1793052205.012, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 15, "endlist": false}
+{"t_ms": 37845.6, "wall": 1793052206.565, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 16, "endlist": false}
+{"t_ms": 38294.7, "wall": 1793052207.014, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 16, "endlist": false}
+{"t_ms": 38773.1, "wall": 1793052207.493, "kind": "pub_stats", "pub": "P1", "stats": {"rtt-ms": -1, "out-bytes-acked": 0, "out-bytes-total": 1292793}}
+{"t_ms": 39763.6, "wall": 1793052208.483, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 17, "endlist": false}
+{"t_ms": 40102.5, "wall": 1793052208.822, "kind": "build", "reader": "probe1"}
+{"t_ms": 40274.2, "wall": 1793052208.994, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 17, "endlist": false}
+{"t_ms": 40404.8, "wall": 1793052209.124, "kind": "handshake", "reader": "probe1", "after_build_ms": 308.8, "rtt_ms": 1.139}
+{"t_ms": 41102.9, "wall": 1793052209.822, "kind": "build", "reader": "probe2"}
+{"t_ms": 41405.4, "wall": 1793052210.125, "kind": "handshake", "reader": "probe2", "after_build_ms": 308.6, "rtt_ms": 1.038}
+{"t_ms": 41786.5, "wall": 1793052210.506, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 18, "endlist": false}
+{"t_ms": 42104.2, "wall": 1793052210.824, "kind": "build", "reader": "probe3"}
+{"t_ms": 42304.0, "wall": 1793052211.023, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 18, "endlist": false}
+{"t_ms": 42306.0, "wall": 1793052211.025, "kind": "handshake", "reader": "probe3", "after_build_ms": 208.3, "rtt_ms": 1.423}
+{"t_ms": 43104.1, "wall": 1793052211.823, "kind": "build", "reader": "probe4"}
+{"t_ms": 43305.2, "wall": 1793052212.025, "kind": "handshake", "reader": "probe4", "after_build_ms": 206.7, "rtt_ms": 1.038}
+{"t_ms": 43513.2, "wall": 1793052212.232, "kind": "first_byte", "reader": "probe2"}
+{"t_ms": 43523.3, "wall": 1793052212.242, "kind": "first_byte", "reader": "probe1"}
+{"t_ms": 43796.3, "wall": 1793052212.515, "kind": "pub_stats", "pub": "P1", "stats": {"rtt-ms": -1, "out-bytes-acked": 0, "out-bytes-total": 1460666}}
+{"t_ms": 43820.2, "wall": 1793052212.539, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 20, "endlist": false}
+{"t_ms": 44107.0, "wall": 1793052212.826, "kind": "build", "reader": "probe5"}
+{"t_ms": 44138.4, "wall": 1793052212.857, "kind": "first_frame", "reader": "probe2", "after_build_ms": 3041.3}
+{"t_ms": 44138.5, "wall": 1793052212.857, "kind": "closed", "reader": "probe2", "why": "first_frame"}
+{"t_ms": 44149.4, "wall": 1793052212.868, "kind": "first_frame", "reader": "probe1", "after_build_ms": 4053.3}
+{"t_ms": 44149.5, "wall": 1793052212.868, "kind": "closed", "reader": "probe1", "why": "first_frame"}
+{"t_ms": 44308.2, "wall": 1793052213.027, "kind": "handshake", "reader": "probe5", "after_build_ms": 208.5, "rtt_ms": 6.102}
+{"t_ms": 44532.8, "wall": 1793052213.252, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 20, "endlist": false}
+{"t_ms": 45096.0, "wall": 1793052213.815, "kind": "pub_killed", "pub": "P1", "pid": 684, "how": "kill"}
+{"t_ms": 45096.1, "wall": 1793052213.815, "kind": "kill", "trial": 1, "warm_ok": true, "how": "kill"}
+{"t_ms": 45100.0, "wall": 1793052213.819, "kind": "pub_exit", "pub": "P1", "rc": -9}
+{"t_ms": 45107.7, "wall": 1793052213.827, "kind": "build", "reader": "probe6"}
+{"t_ms": 45295.7, "wall": 1793052214.015, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 20, "endlist": false}
+{"t_ms": 45409.9, "wall": 1793052214.129, "kind": "handshake", "reader": "probe6", "after_build_ms": 309.5, "rtt_ms": 6.102}
+{"t_ms": 45589.8, "wall": 1793052214.309, "kind": "first_byte", "reader": "probe3"}
+{"t_ms": 45590.9, "wall": 1793052214.31, "kind": "first_byte", "reader": "probe5"}
+{"t_ms": 45592.0, "wall": 1793052214.311, "kind": "first_byte", "reader": "probe4"}
+{"t_ms": 46092.2, "wall": 1793052214.811, "kind": "first_frame", "reader": "probe4", "after_build_ms": 2992.0}
+{"t_ms": 46092.3, "wall": 1793052214.811, "kind": "closed", "reader": "probe4", "why": "first_frame"}
+{"t_ms": 46092.5, "wall": 1793052214.811, "kind": "first_frame", "reader": "probe3", "after_build_ms": 3993.3}
+{"t_ms": 46092.5, "wall": 1793052214.811, "kind": "closed", "reader": "probe3", "why": "first_frame"}
+{"t_ms": 46098.3, "wall": 1793052214.817, "kind": "first_frame", "reader": "probe5", "after_build_ms": 1998.4}
+{"t_ms": 46098.3, "wall": 1793052214.817, "kind": "closed", "reader": "probe5", "why": "first_frame"}
+{"t_ms": 46106.8, "wall": 1793052214.826, "kind": "build", "reader": "probe7"}
+{"t_ms": 46308.7, "wall": 1793052215.028, "kind": "handshake", "reader": "probe7", "after_build_ms": 207.6, "rtt_ms": 1.534}
+{"t_ms": 46716.7, "wall": 1793052215.436, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 47108.6, "wall": 1793052215.827, "kind": "build", "reader": "probe8"}
+{"t_ms": 47273.3, "wall": 1793052215.992, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 47409.6, "wall": 1793052216.129, "kind": "handshake", "reader": "probe8", "after_build_ms": 308.3, "rtt_ms": 1.534}
+{"t_ms": 48108.9, "wall": 1793052216.828, "kind": "build", "reader": "probe9"}
+{"t_ms": 48310.5, "wall": 1793052217.029, "kind": "handshake", "reader": "probe9", "after_build_ms": 208.4, "rtt_ms": 1.534}
+{"t_ms": 48803.0, "wall": 1793052217.522, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 49109.1, "wall": 1793052217.828, "kind": "build", "reader": "probe10"}
+{"t_ms": 49291.0, "wall": 1793052218.01, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 49411.4, "wall": 1793052218.13, "kind": "handshake", "reader": "probe10", "after_build_ms": 308.8, "rtt_ms": 1.534}
+{"t_ms": 50109.2, "wall": 1793052218.828, "kind": "build", "reader": "probe11"}
+{"t_ms": 50311.2, "wall": 1793052219.03, "kind": "handshake", "reader": "probe11", "after_build_ms": 208.2, "rtt_ms": 1.534}
+{"t_ms": 50770.2, "wall": 1793052219.489, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 51109.8, "wall": 1793052219.829, "kind": "build", "reader": "probe12"}
+{"t_ms": 51304.7, "wall": 1793052220.024, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 51411.6, "wall": 1793052220.13, "kind": "handshake", "reader": "probe12", "after_build_ms": 308.4, "rtt_ms": 1.534}
+{"t_ms": 52110.0, "wall": 1793052220.829, "kind": "build", "reader": "probe13"}
+{"t_ms": 52311.8, "wall": 1793052221.031, "kind": "handshake", "reader": "probe13", "after_build_ms": 208.2, "rtt_ms": 1.534}
+{"t_ms": 52803.6, "wall": 1793052221.522, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 53110.9, "wall": 1793052221.83, "kind": "build", "reader": "probe14"}
+{"t_ms": 53111.4, "wall": 1793052221.83, "kind": "closed", "reader": "probe6", "why": "life"}
+{"t_ms": 53289.7, "wall": 1793052222.009, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 53311.5, "wall": 1793052222.03, "kind": "handshake", "reader": "probe14", "after_build_ms": 207.7, "rtt_ms": 6.102}
+{"t_ms": 54111.0, "wall": 1793052222.83, "kind": "build", "reader": "probe15"}
+{"t_ms": 54111.4, "wall": 1793052222.83, "kind": "closed", "reader": "probe7", "why": "life"}
+{"t_ms": 54312.3, "wall": 1793052223.031, "kind": "handshake", "reader": "probe15", "after_build_ms": 207.6, "rtt_ms": 1.534}
+{"t_ms": 54775.6, "wall": 1793052223.494, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 55111.5, "wall": 1793052223.83, "kind": "build", "reader": "probe16"}
+{"t_ms": 55111.8, "wall": 1793052223.831, "kind": "closed", "reader": "probe8", "why": "life"}
+{"t_ms": 55284.5, "wall": 1793052224.003, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 55312.7, "wall": 1793052224.032, "kind": "handshake", "reader": "probe16", "after_build_ms": 207.7, "rtt_ms": 1.534}
+{"t_ms": 56111.6, "wall": 1793052224.831, "kind": "build", "reader": "probe17"}
+{"t_ms": 56112.0, "wall": 1793052224.831, "kind": "closed", "reader": "probe9", "why": "life"}
+{"t_ms": 56313.0, "wall": 1793052225.032, "kind": "handshake", "reader": "probe17", "after_build_ms": 207.7, "rtt_ms": 1.525}
+{"t_ms": 56831.8, "wall": 1793052225.551, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 57111.8, "wall": 1793052225.831, "kind": "build", "reader": "probe18"}
+{"t_ms": 57112.5, "wall": 1793052225.831, "kind": "closed", "reader": "probe10", "why": "life"}
+{"t_ms": 57254.5, "wall": 1793052225.973, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 57312.9, "wall": 1793052226.032, "kind": "handshake", "reader": "probe18", "after_build_ms": 207.1, "rtt_ms": 1.534}
+{"t_ms": 58112.1, "wall": 1793052226.831, "kind": "build", "reader": "probe19"}
+{"t_ms": 58112.4, "wall": 1793052226.831, "kind": "closed", "reader": "probe11", "why": "life"}
+{"t_ms": 58413.9, "wall": 1793052227.133, "kind": "handshake", "reader": "probe19", "after_build_ms": 307.6, "rtt_ms": 1.506}
+{"t_ms": 58690.9, "wall": 1793052227.409, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 59113.0, "wall": 1793052227.832, "kind": "build", "reader": "probe20"}
+{"t_ms": 59113.4, "wall": 1793052227.832, "kind": "closed", "reader": "probe12", "why": "life"}
+{"t_ms": 59314.7, "wall": 1793052228.033, "kind": "handshake", "reader": "probe20", "after_build_ms": 207.8, "rtt_ms": 1.534}
+{"t_ms": 59344.3, "wall": 1793052228.063, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 60114.4, "wall": 1793052228.833, "kind": "build", "reader": "probe21"}
+{"t_ms": 60114.8, "wall": 1793052228.833, "kind": "closed", "reader": "probe13", "why": "life"}
+{"t_ms": 60416.1, "wall": 1793052229.135, "kind": "handshake", "reader": "probe21", "after_build_ms": 308.4, "rtt_ms": 1.534}
+{"t_ms": 60713.5, "wall": 1793052229.432, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 61113.9, "wall": 1793052229.832, "kind": "build", "reader": "probe22"}
+{"t_ms": 61114.3, "wall": 1793052229.833, "kind": "closed", "reader": "probe14", "why": "life"}
+{"t_ms": 61276.9, "wall": 1793052229.995, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 61315.6, "wall": 1793052230.034, "kind": "handshake", "reader": "probe22", "after_build_ms": 207.6, "rtt_ms": 6.102}
+{"t_ms": 62114.3, "wall": 1793052230.833, "kind": "build", "reader": "probe23"}
+{"t_ms": 62114.6, "wall": 1793052230.833, "kind": "closed", "reader": "probe15", "why": "life"}
+{"t_ms": 62416.5, "wall": 1793052231.135, "kind": "handshake", "reader": "probe23", "after_build_ms": 307.9, "rtt_ms": 1.534}
+{"t_ms": 62711.5, "wall": 1793052231.43, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 63115.4, "wall": 1793052231.834, "kind": "build", "reader": "probe24"}
+{"t_ms": 63115.9, "wall": 1793052231.834, "kind": "closed", "reader": "probe16", "why": "life"}
+{"t_ms": 63277.5, "wall": 1793052231.996, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 63316.6, "wall": 1793052232.035, "kind": "handshake", "reader": "probe24", "after_build_ms": 207.6, "rtt_ms": 1.429}
+{"t_ms": 64115.5, "wall": 1793052232.834, "kind": "build", "reader": "probe25"}
+{"t_ms": 64116.0, "wall": 1793052232.834, "kind": "closed", "reader": "probe17", "why": "life"}
+{"t_ms": 64418.8, "wall": 1793052233.137, "kind": "handshake", "reader": "probe25", "after_build_ms": 309.1, "rtt_ms": 1.465}
+{"t_ms": 64771.1, "wall": 1793052233.49, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 65117.8, "wall": 1793052233.836, "kind": "build", "reader": "probe26"}
+{"t_ms": 65118.2, "wall": 1793052233.837, "kind": "closed", "reader": "probe18", "why": "life"}
+{"t_ms": 65295.2, "wall": 1793052234.014, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 65318.7, "wall": 1793052234.037, "kind": "handshake", "reader": "probe26", "after_build_ms": 208.1, "rtt_ms": 1.534}
+{"t_ms": 66117.9, "wall": 1793052234.836, "kind": "build", "reader": "probe27"}
+{"t_ms": 66118.3, "wall": 1793052234.837, "kind": "closed", "reader": "probe19", "why": "life"}
+{"t_ms": 66319.5, "wall": 1793052235.038, "kind": "handshake", "reader": "probe27", "after_build_ms": 207.9, "rtt_ms": 1.506}
+{"t_ms": 66831.9, "wall": 1793052235.55, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 67120.1, "wall": 1793052235.839, "kind": "build", "reader": "probe28"}
+{"t_ms": 67120.5, "wall": 1793052235.839, "kind": "closed", "reader": "probe20", "why": "life"}
+{"t_ms": 67280.3, "wall": 1793052235.999, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 67322.2, "wall": 1793052236.041, "kind": "handshake", "reader": "probe28", "after_build_ms": 209.7, "rtt_ms": 1.534}
+{"t_ms": 68119.7, "wall": 1793052236.838, "kind": "build", "reader": "probe29"}
+{"t_ms": 68120.2, "wall": 1793052236.839, "kind": "closed", "reader": "probe21", "why": "life"}
+{"t_ms": 68321.0, "wall": 1793052237.039, "kind": "handshake", "reader": "probe29", "after_build_ms": 207.5, "rtt_ms": 1.534}
+{"t_ms": 68710.3, "wall": 1793052237.429, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 69120.1, "wall": 1793052237.839, "kind": "build", "reader": "probe30"}
+{"t_ms": 69120.5, "wall": 1793052237.839, "kind": "closed", "reader": "probe22", "why": "life"}
+{"t_ms": 69278.7, "wall": 1793052237.997, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 69422.8, "wall": 1793052238.141, "kind": "handshake", "reader": "probe30", "after_build_ms": 308.5, "rtt_ms": 6.102}
+{"t_ms": 70121.3, "wall": 1793052238.84, "kind": "build", "reader": "probe31"}
+{"t_ms": 70121.9, "wall": 1793052238.84, "kind": "closed", "reader": "probe23", "why": "life"}
+{"t_ms": 70323.3, "wall": 1793052239.042, "kind": "handshake", "reader": "probe31", "after_build_ms": 208.0, "rtt_ms": 1.534}
+{"t_ms": 70749.7, "wall": 1793052239.468, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 71123.5, "wall": 1793052239.842, "kind": "build", "reader": "probe32"}
+{"t_ms": 71123.8, "wall": 1793052239.842, "kind": "closed", "reader": "probe24", "why": "life"}
+{"t_ms": 71275.8, "wall": 1793052239.994, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 71425.9, "wall": 1793052240.144, "kind": "handshake", "reader": "probe32", "after_build_ms": 310.2, "rtt_ms": 1.429}
+{"t_ms": 72122.2, "wall": 1793052240.841, "kind": "build", "reader": "probe33"}
+{"t_ms": 72122.7, "wall": 1793052240.841, "kind": "closed", "reader": "probe25", "why": "life"}
+{"t_ms": 72322.9, "wall": 1793052241.041, "kind": "handshake", "reader": "probe33", "after_build_ms": 207.1, "rtt_ms": 1.465}
+{"t_ms": 72678.9, "wall": 1793052241.397, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 73123.5, "wall": 1793052241.842, "kind": "build", "reader": "probe34"}
+{"t_ms": 73123.8, "wall": 1793052241.842, "kind": "closed", "reader": "probe26", "why": "life"}
+{"t_ms": 73283.3, "wall": 1793052242.002, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 73325.2, "wall": 1793052242.044, "kind": "handshake", "reader": "probe34", "after_build_ms": 208.4, "rtt_ms": 1.534}
+{"t_ms": 74124.4, "wall": 1793052242.842, "kind": "build", "reader": "probe35"}
+{"t_ms": 74124.8, "wall": 1793052242.843, "kind": "closed", "reader": "probe27", "why": "life"}
+{"t_ms": 74325.9, "wall": 1793052243.044, "kind": "handshake", "reader": "probe35", "after_build_ms": 208.6, "rtt_ms": 1.435}
+{"t_ms": 74700.1, "wall": 1793052243.418, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 75085.9, "wall": 1793052243.804, "kind": "error", "reader": "probe35", "t": 75085.9, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe35/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 75086.1, "wall": 1793052243.804, "kind": "error", "reader": "probe35", "t": 75086.1, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe35/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 75087.5, "wall": 1793052243.805, "kind": "error", "reader": "R0", "t": 75087.4, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:R0/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 75087.6, "wall": 1793052243.806, "kind": "error", "reader": "R0", "t": 75087.6, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:R0/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 75087.7, "wall": 1793052243.806, "kind": "error", "reader": "probe34", "t": 75087.7, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe34/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 75087.9, "wall": 1793052243.806, "kind": "error", "reader": "probe34", "t": 75087.8, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe34/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 75088.0, "wall": 1793052243.806, "kind": "frames_resume", "reader": "R0", "gap_ms": 29000.4}
+{"t_ms": 75089.1, "wall": 1793052243.807, "kind": "error", "reader": "probe33", "t": 75089.1, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe33/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 75089.4, "wall": 1793052243.807, "kind": "error", "reader": "probe33", "t": 75089.4, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe33/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 75089.6, "wall": 1793052243.808, "kind": "error", "reader": "probe30", "t": 75089.6, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe30/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 75089.7, "wall": 1793052243.808, "kind": "error", "reader": "probe32", "t": 75089.7, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe32/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 75089.8, "wall": 1793052243.808, "kind": "eos", "reader": "R0"}
+{"t_ms": 75089.8, "wall": 1793052243.808, "kind": "error", "reader": "probe30", "t": 75089.8, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe30/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 75089.9, "wall": 1793052243.808, "kind": "error", "reader": "probe32", "t": 75089.9, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe32/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 75094.5, "wall": 1793052243.813, "kind": "error", "reader": "probe29", "t": 75094.5, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe29/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 75094.7, "wall": 1793052243.813, "kind": "error", "reader": "probe29", "t": 75094.7, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe29/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 75094.8, "wall": 1793052243.813, "kind": "error", "reader": "probe31", "t": 75094.8, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe31/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 75094.8, "wall": 1793052243.813, "kind": "error", "reader": "probe31", "t": 75094.8, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe31/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 75098.9, "wall": 1793052243.817, "kind": "error", "reader": "probe28", "t": 75098.9, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe28/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 75099.1, "wall": 1793052243.817, "kind": "error", "reader": "probe28", "t": 75099.1, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe28/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 75124.2, "wall": 1793052243.842, "kind": "build", "reader": "probe36"}
+{"t_ms": 75124.8, "wall": 1793052243.843, "kind": "closed", "reader": "probe28", "why": "life"}
+{"t_ms": 75303.2, "wall": 1793052244.021, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 75325.4, "wall": 1793052244.043, "kind": "handshake", "reader": "probe36", "after_build_ms": 207.1, "rtt_ms": 1.534}
+{"t_ms": 76126.4, "wall": 1793052244.844, "kind": "build", "reader": "probe37"}
+{"t_ms": 76126.7, "wall": 1793052244.845, "kind": "closed", "reader": "probe29", "why": "life"}
+{"t_ms": 76327.5, "wall": 1793052245.046, "kind": "handshake", "reader": "probe37", "after_build_ms": 208.7, "rtt_ms": 1.541}
+{"t_ms": 76817.3, "wall": 1793052245.535, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 77125.4, "wall": 1793052245.843, "kind": "build", "reader": "probe38"}
+{"t_ms": 77125.8, "wall": 1793052245.844, "kind": "closed", "reader": "probe30", "why": "life"}
+{"t_ms": 77296.5, "wall": 1793052246.015, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 77327.3, "wall": 1793052246.045, "kind": "handshake", "reader": "probe38", "after_build_ms": 208.1, "rtt_ms": 1.434}
+{"t_ms": 78126.4, "wall": 1793052246.844, "kind": "build", "reader": "probe39"}
+{"t_ms": 78126.8, "wall": 1793052246.845, "kind": "closed", "reader": "probe31", "why": "life"}
+{"t_ms": 78328.0, "wall": 1793052247.046, "kind": "handshake", "reader": "probe39", "after_build_ms": 207.9, "rtt_ms": 1.541}
+{"t_ms": 78750.3, "wall": 1793052247.468, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 79126.6, "wall": 1793052247.845, "kind": "build", "reader": "probe40"}
+{"t_ms": 79127.4, "wall": 1793052247.845, "kind": "closed", "reader": "probe32", "why": "life"}
+{"t_ms": 79272.1, "wall": 1793052247.99, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 79328.7, "wall": 1793052248.047, "kind": "handshake", "reader": "probe40", "after_build_ms": 208.5, "rtt_ms": 1.541}
+{"t_ms": 80127.3, "wall": 1793052248.845, "kind": "build", "reader": "probe41"}
+{"t_ms": 80127.8, "wall": 1793052248.846, "kind": "closed", "reader": "probe33", "why": "life"}
+{"t_ms": 80328.6, "wall": 1793052249.047, "kind": "handshake", "reader": "probe41", "after_build_ms": 207.5, "rtt_ms": 1.541}
+{"t_ms": 80708.2, "wall": 1793052249.426, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 81127.2, "wall": 1793052249.845, "kind": "build", "reader": "probe42"}
+{"t_ms": 81127.6, "wall": 1793052249.846, "kind": "closed", "reader": "probe34", "why": "life"}
+{"t_ms": 81254.8, "wall": 1793052249.973, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 81328.9, "wall": 1793052250.047, "kind": "handshake", "reader": "probe42", "after_build_ms": 207.2, "rtt_ms": 1.541}
+{"t_ms": 82127.6, "wall": 1793052250.846, "kind": "build", "reader": "probe43"}
+{"t_ms": 82128.0, "wall": 1793052250.846, "kind": "closed", "reader": "probe35", "why": "life"}
+{"t_ms": 82329.7, "wall": 1793052251.048, "kind": "handshake", "reader": "probe43", "after_build_ms": 208.0, "rtt_ms": 1.541}
+{"t_ms": 82643.9, "wall": 1793052251.362, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 83129.0, "wall": 1793052251.847, "kind": "build", "reader": "probe44"}
+{"t_ms": 83129.5, "wall": 1793052251.848, "kind": "closed", "reader": "probe36", "why": "life"}
+{"t_ms": 83281.4, "wall": 1793052251.999, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 83430.8, "wall": 1793052252.149, "kind": "handshake", "reader": "probe44", "after_build_ms": 308.2, "rtt_ms": 1.534}
+{"t_ms": 83974.1, "wall": 1793052252.692, "kind": "error", "reader": "probe43", "t": 83974.0, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe43/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 83974.2, "wall": 1793052252.692, "kind": "error", "reader": "probe43", "t": 83974.2, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe43/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 84131.7, "wall": 1793052252.85, "kind": "build", "reader": "probe45"}
+{"t_ms": 84132.1, "wall": 1793052252.85, "kind": "closed", "reader": "probe37", "why": "life"}
+{"t_ms": 84333.8, "wall": 1793052253.052, "kind": "handshake", "reader": "probe45", "after_build_ms": 210.2, "rtt_ms": 1.541}
+{"t_ms": 84783.7, "wall": 1793052253.502, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 85130.9, "wall": 1793052253.849, "kind": "build", "reader": "probe46"}
+{"t_ms": 85131.4, "wall": 1793052253.849, "kind": "closed", "reader": "probe38", "why": "life"}
+{"t_ms": 85298.6, "wall": 1793052254.017, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 85432.9, "wall": 1793052254.151, "kind": "handshake", "reader": "probe46", "after_build_ms": 308.5, "rtt_ms": 1.395}
+{"t_ms": 86131.2, "wall": 1793052254.849, "kind": "build", "reader": "probe47"}
+{"t_ms": 86131.6, "wall": 1793052254.85, "kind": "closed", "reader": "probe39", "why": "life"}
+{"t_ms": 86332.1, "wall": 1793052255.05, "kind": "handshake", "reader": "probe47", "after_build_ms": 207.2, "rtt_ms": 1.541}
+{"t_ms": 86661.0, "wall": 1793052255.379, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 87131.4, "wall": 1793052255.849, "kind": "build", "reader": "probe48"}
+{"t_ms": 87131.8, "wall": 1793052255.85, "kind": "closed", "reader": "probe40", "why": "life"}
+{"t_ms": 87332.9, "wall": 1793052256.051, "kind": "handshake", "reader": "probe48", "after_build_ms": 207.3, "rtt_ms": 1.541}
+{"t_ms": 87568.3, "wall": 1793052256.286, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 88132.8, "wall": 1793052256.851, "kind": "build", "reader": "probe49"}
+{"t_ms": 88133.2, "wall": 1793052256.851, "kind": "closed", "reader": "probe41", "why": "life"}
+{"t_ms": 88293.1, "wall": 1793052257.011, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 88334.2, "wall": 1793052257.052, "kind": "handshake", "reader": "probe49", "after_build_ms": 207.8, "rtt_ms": 1.541}
+{"t_ms": 88724.6, "wall": 1793052257.442, "kind": "error", "reader": "probe46", "t": 88724.6, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe46/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 88724.7, "wall": 1793052257.442, "kind": "error", "reader": "probe46", "t": 88724.7, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe46/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 89152.1, "wall": 1793052257.87, "kind": "build", "reader": "probe50"}
+{"t_ms": 89152.6, "wall": 1793052257.87, "kind": "closed", "reader": "probe42", "why": "life"}
+{"t_ms": 89353.8, "wall": 1793052258.071, "kind": "handshake", "reader": "probe50", "after_build_ms": 226.5, "rtt_ms": 1.541}
+{"t_ms": 89706.3, "wall": 1793052258.424, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 90135.2, "wall": 1793052258.853, "kind": "build", "reader": "probe51"}
+{"t_ms": 90135.6, "wall": 1793052258.853, "kind": "closed", "reader": "probe43", "why": "life"}
+{"t_ms": 90290.4, "wall": 1793052259.008, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 90337.0, "wall": 1793052259.055, "kind": "handshake", "reader": "probe51", "after_build_ms": 209.2, "rtt_ms": 1.395}
+{"t_ms": 91134.8, "wall": 1793052259.852, "kind": "build", "reader": "probe52"}
+{"t_ms": 91135.2, "wall": 1793052259.853, "kind": "closed", "reader": "probe44", "why": "life"}
+{"t_ms": 91335.9, "wall": 1793052260.053, "kind": "handshake", "reader": "probe52", "after_build_ms": 207.1, "rtt_ms": 1.534}
+{"t_ms": 91704.3, "wall": 1793052260.422, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 92135.8, "wall": 1793052260.853, "kind": "build", "reader": "probe53"}
+{"t_ms": 92141.5, "wall": 1793052260.859, "kind": "closed", "reader": "probe45", "why": "life"}
+{"t_ms": 92304.7, "wall": 1793052261.022, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 92337.1, "wall": 1793052261.055, "kind": "handshake", "reader": "probe53", "after_build_ms": 208.0, "rtt_ms": 1.541}
+{"t_ms": 93136.0, "wall": 1793052261.854, "kind": "build", "reader": "probe54"}
+{"t_ms": 93136.3, "wall": 1793052261.854, "kind": "closed", "reader": "probe46", "why": "life"}
+{"t_ms": 93438.0, "wall": 1793052262.156, "kind": "handshake", "reader": "probe54", "after_build_ms": 307.8, "rtt_ms": 1.541}
+{"t_ms": 93742.1, "wall": 1793052262.46, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 94136.3, "wall": 1793052262.854, "kind": "build", "reader": "probe55"}
+{"t_ms": 94136.8, "wall": 1793052262.854, "kind": "closed", "reader": "probe47", "why": "life"}
+{"t_ms": 94297.6, "wall": 1793052263.015, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 94438.9, "wall": 1793052263.156, "kind": "handshake", "reader": "probe55", "after_build_ms": 308.3, "rtt_ms": 1.541}
+{"t_ms": 95138.7, "wall": 1793052263.856, "kind": "build", "reader": "probe56"}
+{"t_ms": 95139.1, "wall": 1793052263.857, "kind": "closed", "reader": "probe48", "why": "life"}
+{"t_ms": 95339.3, "wall": 1793052264.057, "kind": "handshake", "reader": "probe56", "after_build_ms": 208.5, "rtt_ms": 1.541}
+{"t_ms": 95829.4, "wall": 1793052264.547, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 96137.8, "wall": 1793052264.855, "kind": "build", "reader": "probe57"}
+{"t_ms": 96138.1, "wall": 1793052264.856, "kind": "closed", "reader": "probe49", "why": "life"}
+{"t_ms": 96278.6, "wall": 1793052264.996, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 96339.4, "wall": 1793052265.057, "kind": "handshake", "reader": "probe57", "after_build_ms": 207.7, "rtt_ms": 1.541}
+{"t_ms": 97138.1, "wall": 1793052265.856, "kind": "build", "reader": "probe58"}
+{"t_ms": 97138.5, "wall": 1793052265.856, "kind": "error", "reader": "probe55", "t": 97138.5, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe55/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 97138.6, "wall": 1793052265.856, "kind": "error", "reader": "probe55", "t": 97138.6, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe55/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 97161.5, "wall": 1793052265.879, "kind": "closed", "reader": "probe50", "why": "life"}
+{"t_ms": 97338.9, "wall": 1793052266.056, "kind": "handshake", "reader": "probe58", "after_build_ms": 206.8, "rtt_ms": 1.541}
+{"t_ms": 97672.1, "wall": 1793052266.39, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 98140.2, "wall": 1793052266.858, "kind": "build", "reader": "probe59"}
+{"t_ms": 98140.7, "wall": 1793052266.858, "kind": "closed", "reader": "probe51", "why": "life"}
+{"t_ms": 98297.9, "wall": 1793052267.016, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 98341.8, "wall": 1793052267.059, "kind": "handshake", "reader": "probe59", "after_build_ms": 209.3, "rtt_ms": 1.395}
+{"t_ms": 99139.2, "wall": 1793052267.857, "kind": "build", "reader": "probe60"}
+{"t_ms": 99139.7, "wall": 1793052267.857, "kind": "closed", "reader": "probe52", "why": "life"}
+{"t_ms": 99341.3, "wall": 1793052268.059, "kind": "handshake", "reader": "probe60", "after_build_ms": 207.9, "rtt_ms": 1.541}
+{"t_ms": 99516.0, "wall": 1793052268.234, "kind": "error", "reader": "probe53", "t": 99515.9, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe53/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 99516.1, "wall": 1793052268.234, "kind": "error", "reader": "probe53", "t": 99516.1, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe53/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 99695.4, "wall": 1793052268.413, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 100139.7, "wall": 1793052268.857, "kind": "build", "reader": "probe61"}
+{"t_ms": 100140.0, "wall": 1793052268.858, "kind": "closed", "reader": "probe53", "why": "life"}
+{"t_ms": 100313.8, "wall": 1793052269.031, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 100340.6, "wall": 1793052269.058, "kind": "handshake", "reader": "probe61", "after_build_ms": 207.0, "rtt_ms": 1.541}
+{"t_ms": 100424.0, "wall": 1793052269.142, "kind": "error", "reader": "probe56", "t": 100423.9, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe56/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 100424.1, "wall": 1793052269.142, "kind": "error", "reader": "probe56", "t": 100424.1, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe56/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 101139.3, "wall": 1793052269.857, "kind": "build", "reader": "probe62"}
+{"t_ms": 101139.7, "wall": 1793052269.857, "kind": "closed", "reader": "probe54", "why": "life"}
+{"t_ms": 101251.9, "wall": 1793052269.969, "kind": "error", "reader": "probe59", "t": 101251.9, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe59/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 101252.1, "wall": 1793052269.97, "kind": "error", "reader": "probe59", "t": 101252.1, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe59/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 101341.3, "wall": 1793052270.059, "kind": "handshake", "reader": "probe62", "after_build_ms": 207.6, "rtt_ms": 1.541}
+{"t_ms": 101746.4, "wall": 1793052270.464, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 102140.7, "wall": 1793052270.858, "kind": "build", "reader": "probe63"}
+{"t_ms": 102141.2, "wall": 1793052270.859, "kind": "closed", "reader": "probe55", "why": "life"}
+{"t_ms": 102254.2, "wall": 1793052270.972, "kind": "error", "reader": "probe61", "t": 102254.1, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe61/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 102254.4, "wall": 1793052270.972, "kind": "error", "reader": "probe61", "t": 102254.3, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe61/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 102304.4, "wall": 1793052271.022, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 102342.3, "wall": 1793052271.06, "kind": "handshake", "reader": "probe63", "after_build_ms": 207.6, "rtt_ms": 1.541}
+{"t_ms": 103141.5, "wall": 1793052271.859, "kind": "build", "reader": "probe64"}
+{"t_ms": 103141.8, "wall": 1793052271.859, "kind": "closed", "reader": "probe56", "why": "life"}
+{"t_ms": 103342.5, "wall": 1793052272.06, "kind": "handshake", "reader": "probe64", "after_build_ms": 206.9, "rtt_ms": 1.395}
+{"t_ms": 104007.4, "wall": 1793052272.725, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 104142.3, "wall": 1793052272.859, "kind": "build", "reader": "probe65"}
+{"t_ms": 104142.8, "wall": 1793052272.86, "kind": "closed", "reader": "probe57", "why": "life"}
+{"t_ms": 104275.8, "wall": 1793052272.993, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 104343.3, "wall": 1793052273.06, "kind": "handshake", "reader": "probe65", "after_build_ms": 207.4, "rtt_ms": 1.541}
+{"t_ms": 105092.5, "wall": 1793052273.81, "kind": "error", "reader": "probe65", "t": 105092.4, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe65/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 105092.6, "wall": 1793052273.81, "kind": "error", "reader": "probe65", "t": 105092.6, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe65/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 105142.4, "wall": 1793052273.86, "kind": "build", "reader": "probe66"}
+{"t_ms": 105142.9, "wall": 1793052273.86, "kind": "closed", "reader": "probe58", "why": "life"}
+{"t_ms": 105343.3, "wall": 1793052274.06, "kind": "handshake", "reader": "probe66", "after_build_ms": 207.1, "rtt_ms": 1.541}
+{"t_ms": 105682.8, "wall": 1793052274.4, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 106142.9, "wall": 1793052274.86, "kind": "build", "reader": "probe67"}
+{"t_ms": 106143.2, "wall": 1793052274.86, "kind": "closed", "reader": "probe59", "why": "life"}
+{"t_ms": 106267.2, "wall": 1793052274.984, "kind": "hls", "trial": 1, "master": 200, "variant_id": "9eaca8e6", "variant": 200, "head": 21, "endlist": false}
+{"t_ms": 106344.2, "wall": 1793052275.061, "kind": "handshake", "reader": "probe67", "after_build_ms": 207.1, "rtt_ms": 1.541}
+{"t_ms": 107143.9, "wall": 1793052275.861, "kind": "build", "reader": "probe68"}
+{"t_ms": 107144.2, "wall": 1793052275.861, "kind": "closed", "reader": "probe60", "why": "life"}
+{"t_ms": 107444.8, "wall": 1793052276.162, "kind": "handshake", "reader": "probe68", "after_build_ms": 306.7, "rtt_ms": 1.63}
+{"t_ms": 107501.0, "wall": 1793052276.218, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 107954.8, "wall": 1793052276.672, "kind": "error", "reader": "probe62", "t": 107954.8, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe62/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 107954.9, "wall": 1793052276.672, "kind": "error", "reader": "probe62", "t": 107954.9, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe62/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 108145.5, "wall": 1793052276.863, "kind": "build", "reader": "probe69"}
+{"t_ms": 108146.0, "wall": 1793052276.863, "kind": "closed", "reader": "probe61", "why": "life"}
+{"t_ms": 108446.2, "wall": 1793052277.163, "kind": "handshake", "reader": "probe69", "after_build_ms": 307.0, "rtt_ms": 1.541}
+{"t_ms": 108461.3, "wall": 1793052277.178, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 109145.5, "wall": 1793052277.863, "kind": "build", "reader": "probe70"}
+{"t_ms": 109145.9, "wall": 1793052277.863, "kind": "closed", "reader": "probe62", "why": "life"}
+{"t_ms": 109346.9, "wall": 1793052278.064, "kind": "handshake", "reader": "probe70", "after_build_ms": 207.5, "rtt_ms": 1.541}
+{"t_ms": 109483.4, "wall": 1793052278.2, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 110146.4, "wall": 1793052278.864, "kind": "build", "reader": "probe71"}
+{"t_ms": 110146.8, "wall": 1793052278.864, "kind": "closed", "reader": "probe63", "why": "life"}
+{"t_ms": 110347.3, "wall": 1793052279.064, "kind": "handshake", "reader": "probe71", "after_build_ms": 207.0, "rtt_ms": 1.541}
+{"t_ms": 110449.8, "wall": 1793052279.167, "kind": "error", "reader": "probe64", "t": 110449.8, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe64/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 110449.9, "wall": 1793052279.167, "kind": "error", "reader": "probe64", "t": 110449.9, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe64/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 110469.9, "wall": 1793052279.187, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 110895.0, "wall": 1793052279.612, "kind": "error", "reader": "probe68", "t": 110894.9, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe68/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 110895.1, "wall": 1793052279.612, "kind": "error", "reader": "probe68", "t": 110895.1, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe68/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 111147.4, "wall": 1793052279.864, "kind": "build", "reader": "probe72"}
+{"t_ms": 111147.8, "wall": 1793052279.865, "kind": "closed", "reader": "probe64", "why": "life"}
+{"t_ms": 111349.4, "wall": 1793052280.067, "kind": "handshake", "reader": "probe72", "after_build_ms": 208.5, "rtt_ms": 1.541}
+{"t_ms": 111457.3, "wall": 1793052280.174, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 112147.3, "wall": 1793052280.864, "kind": "build", "reader": "probe73"}
+{"t_ms": 112147.8, "wall": 1793052280.865, "kind": "closed", "reader": "probe65", "why": "life"}
+{"t_ms": 112348.8, "wall": 1793052281.066, "kind": "handshake", "reader": "probe73", "after_build_ms": 207.8, "rtt_ms": 1.395}
+{"t_ms": 112476.6, "wall": 1793052281.194, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 113148.0, "wall": 1793052281.865, "kind": "build", "reader": "probe74"}
+{"t_ms": 113148.4, "wall": 1793052281.866, "kind": "closed", "reader": "probe66", "why": "life"}
+{"t_ms": 113349.5, "wall": 1793052282.067, "kind": "handshake", "reader": "probe74", "after_build_ms": 208.3, "rtt_ms": 1.541}
+{"t_ms": 113394.0, "wall": 1793052282.111, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 114147.8, "wall": 1793052282.865, "kind": "build", "reader": "probe75"}
+{"t_ms": 114148.1, "wall": 1793052282.865, "kind": "closed", "reader": "probe67", "why": "life"}
+{"t_ms": 114349.9, "wall": 1793052283.067, "kind": "handshake", "reader": "probe75", "after_build_ms": 208.0, "rtt_ms": 1.541}
+{"t_ms": 114429.7, "wall": 1793052283.147, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 115149.3, "wall": 1793052283.866, "kind": "build", "reader": "probe76"}
+{"t_ms": 115149.7, "wall": 1793052283.867, "kind": "closed", "reader": "probe68", "why": "life"}
+{"t_ms": 115391.4, "wall": 1793052284.109, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 115451.1, "wall": 1793052284.168, "kind": "handshake", "reader": "probe76", "after_build_ms": 308.2, "rtt_ms": 1.541}
+{"t_ms": 116149.2, "wall": 1793052284.866, "kind": "build", "reader": "probe77"}
+{"t_ms": 116149.6, "wall": 1793052284.867, "kind": "closed", "reader": "probe69", "why": "life"}
+{"t_ms": 116350.7, "wall": 1793052285.068, "kind": "handshake", "reader": "probe77", "after_build_ms": 207.5, "rtt_ms": 1.541}
+{"t_ms": 116515.4, "wall": 1793052285.233, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 117149.7, "wall": 1793052285.867, "kind": "build", "reader": "probe78"}
+{"t_ms": 117150.0, "wall": 1793052285.867, "kind": "closed", "reader": "probe70", "why": "life"}
+{"t_ms": 117350.2, "wall": 1793052286.067, "kind": "handshake", "reader": "probe78", "after_build_ms": 206.2, "rtt_ms": 1.541}
+{"t_ms": 117470.8, "wall": 1793052286.188, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 118149.9, "wall": 1793052286.867, "kind": "build", "reader": "probe79"}
+{"t_ms": 118150.3, "wall": 1793052286.867, "kind": "closed", "reader": "probe71", "why": "life"}
+{"t_ms": 118225.1, "wall": 1793052286.942, "kind": "error", "reader": "probe74", "t": 118225.1, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe74/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 118225.2, "wall": 1793052286.942, "kind": "error", "reader": "probe74", "t": 118225.2, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe74/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 118350.8, "wall": 1793052287.068, "kind": "handshake", "reader": "probe79", "after_build_ms": 206.5, "rtt_ms": 1.541}
+{"t_ms": 118393.3, "wall": 1793052287.11, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 118719.6, "wall": 1793052287.436, "kind": "error", "reader": "probe73", "t": 118719.6, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe73/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 118719.8, "wall": 1793052287.436, "kind": "error", "reader": "probe73", "t": 118719.7, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe73/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 119151.3, "wall": 1793052287.868, "kind": "build", "reader": "probe80"}
+{"t_ms": 119151.8, "wall": 1793052287.868, "kind": "closed", "reader": "probe72", "why": "life"}
+{"t_ms": 119172.2, "wall": 1793052287.889, "kind": "error", "reader": "probe79", "t": 119172.2, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe79/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 119172.4, "wall": 1793052287.889, "kind": "error", "reader": "probe79", "t": 119172.4, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe79/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 119353.5, "wall": 1793052288.07, "kind": "handshake", "reader": "probe80", "after_build_ms": 208.8, "rtt_ms": 1.541}
+{"t_ms": 119437.1, "wall": 1793052288.154, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 120151.8, "wall": 1793052288.868, "kind": "build", "reader": "probe81"}
+{"t_ms": 120152.2, "wall": 1793052288.869, "kind": "closed", "reader": "probe73", "why": "life"}
+{"t_ms": 120353.5, "wall": 1793052289.07, "kind": "handshake", "reader": "probe81", "after_build_ms": 208.2, "rtt_ms": 1.395}
+{"t_ms": 120468.8, "wall": 1793052289.185, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 121151.5, "wall": 1793052289.868, "kind": "build", "reader": "probe82"}
+{"t_ms": 121151.9, "wall": 1793052289.869, "kind": "closed", "reader": "probe74", "why": "life"}
+{"t_ms": 121352.2, "wall": 1793052290.069, "kind": "handshake", "reader": "probe82", "after_build_ms": 206.4, "rtt_ms": 1.541}
+{"t_ms": 121422.8, "wall": 1793052290.139, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 122153.0, "wall": 1793052290.87, "kind": "build", "reader": "probe83"}
+{"t_ms": 122153.6, "wall": 1793052290.87, "kind": "closed", "reader": "probe75", "why": "life"}
+{"t_ms": 122355.0, "wall": 1793052291.072, "kind": "handshake", "reader": "probe83", "after_build_ms": 208.6, "rtt_ms": 1.541}
+{"t_ms": 122441.3, "wall": 1793052291.158, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 122609.3, "wall": 1793052291.326, "kind": "error", "reader": "probe78", "t": 122609.3, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe78/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 122609.5, "wall": 1793052291.326, "kind": "error", "reader": "probe78", "t": 122609.4, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe78/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 123152.5, "wall": 1793052291.869, "kind": "build", "reader": "probe84"}
+{"t_ms": 123152.8, "wall": 1793052291.869, "kind": "closed", "reader": "probe76", "why": "life"}
+{"t_ms": 123353.7, "wall": 1793052292.07, "kind": "handshake", "reader": "probe84", "after_build_ms": 206.9, "rtt_ms": 1.541}
+{"t_ms": 123460.8, "wall": 1793052292.178, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 124155.0, "wall": 1793052292.872, "kind": "build", "reader": "probe85"}
+{"t_ms": 124155.4, "wall": 1793052292.872, "kind": "closed", "reader": "probe77", "why": "life"}
+{"t_ms": 124356.6, "wall": 1793052293.073, "kind": "handshake", "reader": "probe85", "after_build_ms": 208.9, "rtt_ms": 1.541}
+{"t_ms": 124481.3, "wall": 1793052293.198, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 125154.6, "wall": 1793052293.871, "kind": "build", "reader": "probe86"}
+{"t_ms": 125155.1, "wall": 1793052293.872, "kind": "closed", "reader": "probe78", "why": "life"}
+{"t_ms": 125356.9, "wall": 1793052294.074, "kind": "handshake", "reader": "probe86", "after_build_ms": 209.1, "rtt_ms": 1.541}
+{"t_ms": 125438.2, "wall": 1793052294.155, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 126157.2, "wall": 1793052294.874, "kind": "build", "reader": "probe87"}
+{"t_ms": 126157.7, "wall": 1793052294.874, "kind": "closed", "reader": "probe79", "why": "life"}
+{"t_ms": 126358.2, "wall": 1793052295.075, "kind": "handshake", "reader": "probe87", "after_build_ms": 210.2, "rtt_ms": 1.541}
+{"t_ms": 126415.7, "wall": 1793052295.132, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 127063.2, "wall": 1793052295.78, "kind": "error", "reader": "probe80", "t": 127063.1, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe80/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 127063.3, "wall": 1793052295.78, "kind": "error", "reader": "probe80", "t": 127063.3, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe80/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 127154.5, "wall": 1793052295.871, "kind": "build", "reader": "probe88"}
+{"t_ms": 127154.9, "wall": 1793052295.872, "kind": "closed", "reader": "probe80", "why": "life"}
+{"t_ms": 127455.8, "wall": 1793052296.172, "kind": "handshake", "reader": "probe88", "after_build_ms": 307.5, "rtt_ms": 1.541}
+{"t_ms": 127493.9, "wall": 1793052296.211, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 128154.4, "wall": 1793052296.871, "kind": "build", "reader": "probe89"}
+{"t_ms": 128154.9, "wall": 1793052296.872, "kind": "closed", "reader": "probe81", "why": "life"}
+{"t_ms": 128356.2, "wall": 1793052297.073, "kind": "handshake", "reader": "probe89", "after_build_ms": 207.3, "rtt_ms": 1.395}
+{"t_ms": 128407.3, "wall": 1793052297.124, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 129155.3, "wall": 1793052297.872, "kind": "build", "reader": "probe90"}
+{"t_ms": 129155.8, "wall": 1793052297.873, "kind": "closed", "reader": "probe82", "why": "life"}
+{"t_ms": 129356.9, "wall": 1793052298.074, "kind": "handshake", "reader": "probe90", "after_build_ms": 207.9, "rtt_ms": 1.541}
+{"t_ms": 129412.9, "wall": 1793052298.13, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 130155.9, "wall": 1793052298.873, "kind": "build", "reader": "probe91"}
+{"t_ms": 130156.2, "wall": 1793052298.873, "kind": "closed", "reader": "probe83", "why": "life"}
+{"t_ms": 130357.0, "wall": 1793052299.074, "kind": "handshake", "reader": "probe91", "after_build_ms": 207.0, "rtt_ms": 1.541}
+{"t_ms": 130414.5, "wall": 1793052299.131, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 131156.5, "wall": 1793052299.873, "kind": "build", "reader": "probe92"}
+{"t_ms": 131157.0, "wall": 1793052299.874, "kind": "closed", "reader": "probe84", "why": "life"}
+{"t_ms": 131358.1, "wall": 1793052300.075, "kind": "handshake", "reader": "probe92", "after_build_ms": 207.5, "rtt_ms": 1.541}
+{"t_ms": 131423.8, "wall": 1793052300.141, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 132158.9, "wall": 1793052300.876, "kind": "build", "reader": "probe93"}
+{"t_ms": 132159.5, "wall": 1793052300.876, "kind": "closed", "reader": "probe85", "why": "life"}
+{"t_ms": 132360.0, "wall": 1793052301.077, "kind": "handshake", "reader": "probe93", "after_build_ms": 208.8, "rtt_ms": 1.541}
+{"t_ms": 132482.2, "wall": 1793052301.199, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 133160.6, "wall": 1793052301.877, "kind": "build", "reader": "probe94"}
+{"t_ms": 133161.3, "wall": 1793052301.878, "kind": "closed", "reader": "probe86", "why": "life"}
+{"t_ms": 133362.3, "wall": 1793052302.079, "kind": "handshake", "reader": "probe94", "after_build_ms": 210.1, "rtt_ms": 1.541}
+{"t_ms": 133413.9, "wall": 1793052302.131, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 134159.8, "wall": 1793052302.876, "kind": "build", "reader": "probe95"}
+{"t_ms": 134160.3, "wall": 1793052302.877, "kind": "closed", "reader": "probe87", "why": "life"}
+{"t_ms": 134361.6, "wall": 1793052303.078, "kind": "handshake", "reader": "probe95", "after_build_ms": 208.4, "rtt_ms": 1.541}
+{"t_ms": 134444.1, "wall": 1793052303.16, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 135160.0, "wall": 1793052303.876, "kind": "build", "reader": "probe96"}
+{"t_ms": 135160.4, "wall": 1793052303.877, "kind": "closed", "reader": "probe88", "why": "life"}
+{"t_ms": 135361.9, "wall": 1793052304.078, "kind": "handshake", "reader": "probe96", "after_build_ms": 208.5, "rtt_ms": 1.541}
+{"t_ms": 135449.4, "wall": 1793052304.166, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 136160.3, "wall": 1793052304.877, "kind": "build", "reader": "probe97"}
+{"t_ms": 136160.7, "wall": 1793052304.877, "kind": "closed", "reader": "probe89", "why": "life"}
+{"t_ms": 136361.9, "wall": 1793052305.078, "kind": "handshake", "reader": "probe97", "after_build_ms": 207.8, "rtt_ms": 1.395}
+{"t_ms": 136419.7, "wall": 1793052305.136, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 137162.2, "wall": 1793052305.878, "kind": "build", "reader": "probe98"}
+{"t_ms": 137162.5, "wall": 1793052305.879, "kind": "closed", "reader": "probe90", "why": "life"}
+{"t_ms": 137363.4, "wall": 1793052306.08, "kind": "handshake", "reader": "probe98", "after_build_ms": 208.3, "rtt_ms": 1.541}
+{"t_ms": 137421.7, "wall": 1793052306.138, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 137954.6, "wall": 1793052306.671, "kind": "error", "reader": "probe95", "t": 137954.6, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe95/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 137954.8, "wall": 1793052306.671, "kind": "error", "reader": "probe95", "t": 137954.8, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe95/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 138163.1, "wall": 1793052306.879, "kind": "build", "reader": "probe99"}
+{"t_ms": 138163.5, "wall": 1793052306.88, "kind": "closed", "reader": "probe91", "why": "life"}
+{"t_ms": 138364.7, "wall": 1793052307.081, "kind": "handshake", "reader": "probe99", "after_build_ms": 208.8, "rtt_ms": 1.541}
+{"t_ms": 138403.3, "wall": 1793052307.12, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 139164.8, "wall": 1793052307.881, "kind": "build", "reader": "probe100"}
+{"t_ms": 139165.2, "wall": 1793052307.881, "kind": "closed", "reader": "probe92", "why": "life"}
+{"t_ms": 139366.7, "wall": 1793052308.083, "kind": "handshake", "reader": "probe100", "after_build_ms": 210.1, "rtt_ms": 1.541}
+{"t_ms": 139401.9, "wall": 1793052308.118, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 140164.8, "wall": 1793052308.881, "kind": "build", "reader": "probe101"}
+{"t_ms": 140165.1, "wall": 1793052308.881, "kind": "closed", "reader": "probe93", "why": "life"}
+{"t_ms": 140365.9, "wall": 1793052309.082, "kind": "handshake", "reader": "probe101", "after_build_ms": 208.8, "rtt_ms": 1.541}
+{"t_ms": 140402.2, "wall": 1793052309.118, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 141165.2, "wall": 1793052309.881, "kind": "build", "reader": "probe102"}
+{"t_ms": 141165.7, "wall": 1793052309.882, "kind": "closed", "reader": "probe94", "why": "life"}
+{"t_ms": 141366.4, "wall": 1793052310.083, "kind": "handshake", "reader": "probe102", "after_build_ms": 208.3, "rtt_ms": 1.541}
+{"t_ms": 141496.0, "wall": 1793052310.212, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 142131.6, "wall": 1793052310.848, "kind": "error", "reader": "probe100", "t": 142131.5, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe100/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 142131.7, "wall": 1793052310.848, "kind": "error", "reader": "probe100", "t": 142131.7, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe100/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 142164.9, "wall": 1793052310.881, "kind": "build", "reader": "probe103"}
+{"t_ms": 142165.6, "wall": 1793052310.882, "kind": "closed", "reader": "probe95", "why": "life"}
+{"t_ms": 142366.2, "wall": 1793052311.082, "kind": "handshake", "reader": "probe103", "after_build_ms": 207.3, "rtt_ms": 1.541}
+{"t_ms": 142531.5, "wall": 1793052311.248, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 143166.9, "wall": 1793052311.883, "kind": "build", "reader": "probe104"}
+{"t_ms": 143167.5, "wall": 1793052311.884, "kind": "closed", "reader": "probe96", "why": "life"}
+{"t_ms": 143167.9, "wall": 1793052311.884, "kind": "error", "reader": "probe98", "t": 143167.9, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:probe98/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 143168.0, "wall": 1793052311.884, "kind": "error", "reader": "probe98", "t": 143168.0, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:probe98/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 143368.5, "wall": 1793052312.085, "kind": "handshake", "reader": "probe104", "after_build_ms": 208.6, "rtt_ms": 1.541}
+{"t_ms": 143426.1, "wall": 1793052312.142, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 144168.3, "wall": 1793052312.885, "kind": "build", "reader": "probe105"}
+{"t_ms": 144168.7, "wall": 1793052312.885, "kind": "closed", "reader": "probe97", "why": "life"}
+{"t_ms": 144370.2, "wall": 1793052313.086, "kind": "handshake", "reader": "probe105", "after_build_ms": 209.7, "rtt_ms": 1.395}
+{"t_ms": 144519.9, "wall": 1793052313.236, "kind": "hls", "trial": 1, "master": 204}
+{"t_ms": 145096.8, "wall": 1793052313.813, "kind": "closed", "reader": "R0", "why": "retired"}
+{"t_ms": 145097.3, "wall": 1793052313.814, "kind": "closed", "reader": "probe98", "why": "trial_end"}
+{"t_ms": 145097.5, "wall": 1793052313.814, "kind": "closed", "reader": "probe99", "why": "trial_end"}
+{"t_ms": 145097.7, "wall": 1793052313.814, "kind": "closed", "reader": "probe100", "why": "trial_end"}
+{"t_ms": 145098.3, "wall": 1793052313.815, "kind": "closed", "reader": "probe101", "why": "trial_end"}
+{"t_ms": 145098.6, "wall": 1793052313.815, "kind": "closed", "reader": "probe102", "why": "trial_end"}
+{"t_ms": 145099.0, "wall": 1793052313.815, "kind": "closed", "reader": "probe103", "why": "trial_end"}
+{"t_ms": 145099.4, "wall": 1793052313.816, "kind": "closed", "reader": "probe104", "why": "trial_end"}
+{"t_ms": 145099.6, "wall": 1793052313.816, "kind": "closed", "reader": "probe105", "why": "trial_end"}
+{"t_ms": 145100.5, "wall": 1793052313.817, "kind": "summary", "trial": 1, "gap_s": -1.0, "kill_ms": 45095.8, "p2_spawn_rel_kill_ms": null, "p2_spawns": 0, "p2_connected_rel_kill_ms": null, "r0": {"tag": "R0", "built": -29985.4, "handshake": -29231.7, "first_byte": -27580.6, "first_au": -27063.2, "first_frame": -27048.0, "frames": 859, "aus": 859, "bytes": 1106756, "ended": "retired", "end": 100001.0, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": 29994.0, "resumes": [{"t": 29992.1, "gap_ms": 29000.4}]}, "probes": [{"tag": "probe1", "built": -4999.9, "handshake": -4691.1, "first_byte": -1572.6, "first_au": -949.7, "first_frame": -946.6, "frames": 1, "aus": 2, "bytes": 25004, "ended": "first_frame", "end": -946.3, "errors": [], "eos": null, "resumes": []}, {"tag": "probe2", "built": -3999.0, "handshake": -3690.4, "first_byte": -1582.7, "first_au": -960.2, "first_frame": -957.7, "frames": 1, "aus": 2, "bytes": 23688, "ended": "first_frame", "end": -957.3, "errors": [], "eos": null, "resumes": []}, {"tag": "probe3", "built": -2998.1, "handshake": -2789.8, "first_byte": 493.9, "first_au": 991.8, "first_frame": 995.2, "frames": 1, "aus": 2, "bytes": 23688, "ended": "first_frame", "end": 996.7, "errors": [], "eos": null, "resumes": []}, {"tag": "probe4", "built": -1997.3, "handshake": -1790.6, "first_byte": 495.8, "first_au": 991.6, "first_frame": 994.7, "frames": 1, "aus": 2, "bytes": 23688, "ended": "first_frame", "end": 996.5, "errors": [], "eos": null, "resumes": []}, {"tag": "probe5", "built": -996.1, "handshake": -787.6, "first_byte": 495.0, "first_au": 999.3, "first_frame": 1002.3, "frames": 1, "aus": 2, "bytes": 23688, "ended": "first_frame", "end": 1002.5, "errors": [], "eos": null, "resumes": []}, {"tag": "probe6", "built": 4.6, "handshake": 314.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 8015.6, "errors": [], "eos": null, "resumes": []}, {"tag": "probe7", "built": 1005.3, "handshake": 1212.9, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 9015.6, "errors": [], "eos": null, "resumes": []}, {"tag": "probe8", "built": 2005.5, "handshake": 2313.8, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 10016.0, "errors": [], "eos": null, "resumes": []}, {"tag": "probe9", "built": 3006.3, "handshake": 3214.7, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 11016.2, "errors": [], "eos": null, "resumes": []}, {"tag": "probe10", "built": 4006.8, "handshake": 4315.6, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 12016.7, "errors": [], "eos": null, "resumes": []}, {"tag": "probe11", "built": 5007.2, "handshake": 5215.4, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 13016.6, "errors": [], "eos": null, "resumes": []}, {"tag": "probe12", "built": 6007.4, "handshake": 6315.8, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 14017.6, "errors": [], "eos": null, "resumes": []}, {"tag": "probe13", "built": 7007.8, "handshake": 7216.0, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 15019.0, "errors": [], "eos": null, "resumes": []}, {"tag": "probe14", "built": 8008.0, "handshake": 8215.7, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 16018.5, "errors": [], "eos": null, "resumes": []}, {"tag": "probe15", "built": 9008.8, "handshake": 9216.4, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 17018.8, "errors": [], "eos": null, "resumes": []}, {"tag": "probe16", "built": 10009.2, "handshake": 10216.9, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 18020.0, "errors": [], "eos": null, "resumes": []}, {"tag": "probe17", "built": 11009.5, "handshake": 11217.2, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 19020.2, "errors": [], "eos": null, "resumes": []}, {"tag": "probe18", "built": 12010.0, "handshake": 12217.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 20022.4, "errors": [], "eos": null, "resumes": []}, {"tag": "probe19", "built": 13010.5, "handshake": 13318.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 21022.5, "errors": [], "eos": null, "resumes": []}, {"tag": "probe20", "built": 14011.1, "handshake": 14218.9, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 22024.7, "errors": [], "eos": null, "resumes": []}, {"tag": "probe21", "built": 15011.9, "handshake": 15320.3, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 23024.4, "errors": [], "eos": null, "resumes": []}, {"tag": "probe22", "built": 16012.2, "handshake": 16219.8, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 24024.7, "errors": [], "eos": null, "resumes": []}, {"tag": "probe23", "built": 17012.8, "handshake": 17320.7, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 25026.1, "errors": [], "eos": null, "resumes": []}, {"tag": "probe24", "built": 18013.2, "handshake": 18220.8, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 26028.0, "errors": [], "eos": null, "resumes": []}, {"tag": "probe25", "built": 19013.9, "handshake": 19323.0, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 27026.9, "errors": [], "eos": null, "resumes": []}, {"tag": "probe26", "built": 20014.8, "handshake": 20222.9, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 28028.0, "errors": [], "eos": null, "resumes": []}, {"tag": "probe27", "built": 21015.7, "handshake": 21223.6, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 29029.0, "errors": [], "eos": null, "resumes": []}, {"tag": "probe28", "built": 22016.7, "handshake": 22226.4, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 30029.0, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe29", "built": 23017.7, "handshake": 23225.2, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 31030.9, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe30", "built": 24018.5, "handshake": 24327.0, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 32030.0, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe31", "built": 25019.4, "handshake": 25227.4, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 33031.0, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe32", "built": 26019.9, "handshake": 26330.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 34031.5, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe33", "built": 27020.0, "handshake": 27227.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 35032.0, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe34", "built": 28020.9, "handshake": 28229.3, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 36031.8, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe35", "built": 29021.5, "handshake": 29230.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 37032.2, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe36", "built": 30022.5, "handshake": 30229.6, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 38033.7, "errors": [], "eos": null, "resumes": []}, {"tag": "probe37", "built": 31023.0, "handshake": 31231.7, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 39036.3, "errors": [], "eos": null, "resumes": []}, {"tag": "probe38", "built": 32023.4, "handshake": 32231.5, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 40035.6, "errors": [], "eos": null, "resumes": []}, {"tag": "probe39", "built": 33024.3, "handshake": 33232.2, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 41035.8, "errors": [], "eos": null, "resumes": []}, {"tag": "probe40", "built": 34024.4, "handshake": 34232.9, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 42036.0, "errors": [], "eos": null, "resumes": []}, {"tag": "probe41", "built": 35025.3, "handshake": 35232.8, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 43037.4, "errors": [], "eos": null, "resumes": []}, {"tag": "probe42", "built": 36025.8, "handshake": 36233.0, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 44056.8, "errors": [], "eos": null, "resumes": []}, {"tag": "probe43", "built": 37025.9, "handshake": 37233.9, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 45039.8, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe44", "built": 38026.8, "handshake": 38335.0, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 46039.4, "errors": [], "eos": null, "resumes": []}, {"tag": "probe45", "built": 39027.8, "handshake": 39238.0, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 47045.7, "errors": [], "eos": null, "resumes": []}, {"tag": "probe46", "built": 40028.6, "handshake": 40337.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 48040.5, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe47", "built": 41029.1, "handshake": 41236.3, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 49041.0, "errors": [], "eos": null, "resumes": []}, {"tag": "probe48", "built": 42029.8, "handshake": 42237.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 50043.3, "errors": [], "eos": null, "resumes": []}, {"tag": "probe49", "built": 43030.6, "handshake": 43238.4, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 51042.3, "errors": [], "eos": null, "resumes": []}, {"tag": "probe50", "built": 44031.5, "handshake": 44258.0, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 52065.7, "errors": [], "eos": null, "resumes": []}, {"tag": "probe51", "built": 45032.0, "handshake": 45241.2, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 53044.9, "errors": [], "eos": null, "resumes": []}, {"tag": "probe52", "built": 46033.0, "handshake": 46240.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 54043.8, "errors": [], "eos": null, "resumes": []}, {"tag": "probe53", "built": 47033.3, "handshake": 47241.3, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 55044.2, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe54", "built": 48034.4, "handshake": 48342.2, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 56043.9, "errors": [], "eos": null, "resumes": []}, {"tag": "probe55", "built": 49034.8, "handshake": 49343.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 57045.3, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe56", "built": 50035.0, "handshake": 50243.5, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 58046.0, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe57", "built": 51035.9, "handshake": 51243.6, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 59047.0, "errors": [], "eos": null, "resumes": []}, {"tag": "probe58", "built": 52036.3, "handshake": 52243.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 60047.1, "errors": [], "eos": null, "resumes": []}, {"tag": "probe59", "built": 53036.7, "handshake": 53246.0, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 61047.4, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe60", "built": 54037.5, "handshake": 54245.4, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 62048.4, "errors": [], "eos": null, "resumes": []}, {"tag": "probe61", "built": 55037.8, "handshake": 55244.8, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 63050.2, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe62", "built": 56037.9, "handshake": 56245.5, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 64050.1, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe63", "built": 57038.9, "handshake": 57246.5, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 65050.9, "errors": [], "eos": null, "resumes": []}, {"tag": "probe64", "built": 58039.8, "handshake": 58246.7, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 66052.0, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe65", "built": 59040.1, "handshake": 59247.5, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 67052.0, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe66", "built": 60040.4, "handshake": 60247.5, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 68052.6, "errors": [], "eos": null, "resumes": []}, {"tag": "probe67", "built": 61041.2, "handshake": 61248.3, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 69052.3, "errors": [], "eos": null, "resumes": []}, {"tag": "probe68", "built": 62042.3, "handshake": 62349.0, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 70053.9, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe69", "built": 63043.3, "handshake": 63350.3, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 71053.8, "errors": [], "eos": null, "resumes": []}, {"tag": "probe70", "built": 64043.6, "handshake": 64251.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 72054.2, "errors": [], "eos": null, "resumes": []}, {"tag": "probe71", "built": 65044.5, "handshake": 65251.5, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 73054.5, "errors": [], "eos": null, "resumes": []}, {"tag": "probe72", "built": 66045.1, "handshake": 66253.6, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 74056.0, "errors": [], "eos": null, "resumes": []}, {"tag": "probe73", "built": 67045.2, "handshake": 67253.0, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 75056.4, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe74", "built": 68045.4, "handshake": 68253.7, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 76056.1, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe75", "built": 69046.1, "handshake": 69254.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 77057.8, "errors": [], "eos": null, "resumes": []}, {"tag": "probe76", "built": 70047.1, "handshake": 70355.3, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 78057.0, "errors": [], "eos": null, "resumes": []}, {"tag": "probe77", "built": 71047.4, "handshake": 71254.9, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 79059.6, "errors": [], "eos": null, "resumes": []}, {"tag": "probe78", "built": 72048.2, "handshake": 72254.4, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 80059.3, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe79", "built": 73048.5, "handshake": 73255.0, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 81061.9, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe80", "built": 74048.9, "handshake": 74257.7, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 82059.0, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe81", "built": 75049.5, "handshake": 75257.7, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 83059.1, "errors": [], "eos": null, "resumes": []}, {"tag": "probe82", "built": 76050.0, "handshake": 76256.4, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 84060.0, "errors": [], "eos": null, "resumes": []}, {"tag": "probe83", "built": 77050.6, "handshake": 77259.2, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 85060.3, "errors": [], "eos": null, "resumes": []}, {"tag": "probe84", "built": 78051.0, "handshake": 78257.9, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 86061.2, "errors": [], "eos": null, "resumes": []}, {"tag": "probe85", "built": 79051.8, "handshake": 79260.7, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 87063.6, "errors": [], "eos": null, "resumes": []}, {"tag": "probe86", "built": 80052.0, "handshake": 80261.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 88065.5, "errors": [], "eos": null, "resumes": []}, {"tag": "probe87", "built": 81052.2, "handshake": 81262.4, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 89064.5, "errors": [], "eos": null, "resumes": []}, {"tag": "probe88", "built": 82052.5, "handshake": 82360.0, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 90064.6, "errors": [], "eos": null, "resumes": []}, {"tag": "probe89", "built": 83053.0, "handshake": 83260.3, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 91064.8, "errors": [], "eos": null, "resumes": []}, {"tag": "probe90", "built": 84053.2, "handshake": 84261.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 92066.7, "errors": [], "eos": null, "resumes": []}, {"tag": "probe91", "built": 85054.2, "handshake": 85261.2, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 93067.7, "errors": [], "eos": null, "resumes": []}, {"tag": "probe92", "built": 86054.8, "handshake": 86262.3, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 94069.4, "errors": [], "eos": null, "resumes": []}, {"tag": "probe93", "built": 87055.3, "handshake": 87264.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 95069.3, "errors": [], "eos": null, "resumes": []}, {"tag": "probe94", "built": 88056.4, "handshake": 88266.5, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 96069.8, "errors": [], "eos": null, "resumes": []}, {"tag": "probe95", "built": 89057.4, "handshake": 89265.8, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 97069.8, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe96", "built": 90057.6, "handshake": 90266.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 98071.7, "errors": [], "eos": null, "resumes": []}, {"tag": "probe97", "built": 91058.3, "handshake": 91266.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "life", "end": 99072.8, "errors": [], "eos": null, "resumes": []}, {"tag": "probe98", "built": 92059.3, "handshake": 92267.6, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "trial_end", "end": 100001.5, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe99", "built": 93060.1, "handshake": 93268.9, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "trial_end", "end": 100001.7, "errors": [], "eos": null, "resumes": []}, {"tag": "probe100", "built": 94060.8, "handshake": 94270.9, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "trial_end", "end": 100001.9, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "probe101", "built": 95061.3, "handshake": 95270.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "trial_end", "end": 100002.5, "errors": [], "eos": null, "resumes": []}, {"tag": "probe102", "built": 96062.3, "handshake": 96270.6, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "trial_end", "end": 100002.8, "errors": [], "eos": null, "resumes": []}, {"tag": "probe103", "built": 97063.1, "handshake": 97270.4, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "trial_end", "end": 100003.2, "errors": [], "eos": null, "resumes": []}, {"tag": "probe104", "built": 98064.0, "handshake": 98272.6, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "trial_end", "end": 100003.6, "errors": [], "eos": null, "resumes": []}, {"tag": "probe105", "built": 99064.7, "handshake": 99274.4, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "trial_end", "end": 100003.8, "errors": [], "eos": null, "resumes": []}], "bursts": [{"tag": "burst1", "built": -14000.1, "handshake": -13690.3, "first_byte": -11581.1, "first_au": -10972.0, "first_frame": -10963.6, "frames": 1, "aus": 2, "bytes": 25004, "ended": "first_frame", "end": -10963.3, "errors": [], "eos": null, "resumes": []}, {"tag": "burst2", "built": -13991.8, "handshake": -13784.5, "first_byte": -11561.9, "first_au": -10945.7, "first_frame": -10935.7, "frames": 2, "aus": 3, "bytes": 26320, "ended": "first_frame", "end": -10932.7, "errors": [], "eos": null, "resumes": []}, {"tag": "burst3", "built": -13985.1, "handshake": -13675.5, "first_byte": -11566.2, "first_au": -10944.7, "first_frame": -10937.8, "frames": 1, "aus": 2, "bytes": 25004, "ended": "first_frame", "end": -10937.4, "errors": [], "eos": null, "resumes": []}, {"tag": "burst4", "built": -13977.5, "handshake": -13667.1, "first_byte": -11577.4, "first_au": -10980.4, "first_frame": -10977.3, "frames": 1, "aus": 2, "bytes": 25004, "ended": "first_frame", "end": -10977.2, "errors": [], "eos": null, "resumes": []}, {"tag": "burst5", "built": -13968.1, "handshake": -13659.6, "first_byte": -11562.5, "first_au": -10934.9, "first_frame": -10931.9, "frames": 1, "aus": 2, "bytes": 25004, "ended": "first_frame", "end": -10930.4, "errors": [], "eos": null, "resumes": []}, {"tag": "burst6", "built": -13961.6, "handshake": -13653.3, "first_byte": -11515.3, "first_au": -11012.4, "first_frame": -11005.4, "frames": 1, "aus": 2, "bytes": 23688, "ended": "first_frame", "end": -11004.6, "errors": [], "eos": null, "resumes": []}, {"tag": "burst7", "built": -13955.7, "handshake": -13647.9, "first_byte": -11519.3, "first_au": -11025.8, "first_frame": -11018.0, "frames": 1, "aus": 2, "bytes": 23688, "ended": "first_frame", "end": -11017.5, "errors": [], "eos": null, "resumes": []}, {"tag": "burst8", "built": -13948.5, "handshake": -13641.6, "first_byte": -11539.1, "first_au": -11030.7, "first_frame": -11022.2, "frames": 1, "aus": 2, "bytes": 23688, "ended": "first_frame", "end": -11020.9, "errors": [], "eos": null, "resumes": []}], "bursts_checked": 8, "bursts_decoded": 8, "probes_checked": 105, "first_decoded_after_p2_rel_kill_ms": null, "first_decoding_probe_built_rel_kill_ms": null, "r0_resumed_rel_kill_ms": 29992.1}
+{"t_ms": 146102.3, "wall": 1793052314.819, "kind": "run_end", "lines": 591, "withheld": 0}
