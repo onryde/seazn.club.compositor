@@ -1,0 +1,208 @@
+{"t_ms": 100.5, "wall": 1793039126.393, "kind": "run_start", "part": "relay", "ingest": "srt", "links": "base", "trials": 3, "warm_s": 45.0, "gaps_s": [5.5, 5.5, 5.5], "after_s": 90.0, "cooldown_s": 270.0, "probe_life_s": 8, "probe_every_s": 1, "burst": 8, "burst_life_s": 8, "gst": "GStreamer 1.24.2", "origin": "live.cloudflare.com", "streamid_chars": 36, "passphrase_chars": 65, "thresholds": {"stall_ms": 5000, "connect_timeout_ms": 5000, "backoff_base_ms": 1000, "backoff_cap_ms": 10000, "srt_latency_ms": 1000}}
+{"t_ms": 101.5, "wall": 1793039126.394, "kind": "trial_start", "trial": 1, "gap_s": 5.5}
+{"t_ms": 102.8, "wall": 1793039126.395, "kind": "pub_spawn", "pub": "P1", "n": 1, "pid": 681}
+{"t_ms": 281.4, "wall": 1793039126.574, "kind": "pub_start", "pub": "P1"}
+{"t_ms": 1627.7, "wall": 1793039127.92, "kind": "pub_connected", "pub": "P1", "stats": {"packets-sent": 11, "packets-sent-lost": 0, "packets-retransmitted": 0, "packet-ack-received": 1, "packet-nack-received": 0, "send-duration-us": 13549, "bytes-sent": 12704, "bytes-retransmitted": 0, "bytes-sent-dropped": 0, "packets-sent-dropped": 0, "send-rate-mbps": 0.33271568967662096, "negotiated-latency-ms": 1000, "packets-received": 0, "packets-received-lost": 0, "packets-received-retransmitted": 0, "packets-received-dropped": 0, "packet-ack-sent": 0, "packet-nack-sent": 0, "bytes-received": 0, "bytes-received-lost": 0, "receive-rate-mbps": 0.0, "bandwidth-mbps": 1.5, "rtt-ms": 100.0, "bytes-sent-total": 12220}}
+{"t_ms": 3739.8, "wall": 1793039130.032, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 103824, "packets-sent": 78, "rtt-ms": 2.371}}
+{"t_ms": 8771.5, "wall": 1793039135.064, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 321424, "packets-sent": 238, "rtt-ms": 2.103}}
+{"t_ms": 13801.3, "wall": 1793039140.093, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 540384, "packets-sent": 399, "rtt-ms": 2.07}}
+{"t_ms": 15146.8, "wall": 1793039141.439, "kind": "link", "gen": 1, "to": "connecting", "attempt": 0, "policy": "base"}
+{"t_ms": 15548.7, "wall": 1793039141.841, "kind": "build", "reader": "base.gen1"}
+{"t_ms": 15850.1, "wall": 1793039142.142, "kind": "handshake", "reader": "base.gen1", "after_build_ms": 703.3, "rtt_ms": 100.0}
+{"t_ms": 17742.6, "wall": 1793039144.035, "kind": "first_byte", "reader": "base.gen1"}
+{"t_ms": 18235.7, "wall": 1793039144.528, "kind": "first_frame", "reader": "base.gen1", "after_build_ms": 3088.6}
+{"t_ms": 18235.7, "wall": 1793039144.528, "kind": "link", "gen": 1, "to": "running", "after_build_ms": 3088.6, "policy": "base"}
+{"t_ms": 18830.0, "wall": 1793039145.122, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 759344, "packets-sent": 560, "rtt-ms": 2.081}}
+{"t_ms": 23858.1, "wall": 1793039150.15, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 976944, "packets-sent": 720, "rtt-ms": 1.817}}
+{"t_ms": 28888.0, "wall": 1793039155.18, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 1194544, "packets-sent": 880, "rtt-ms": 2.348}}
+{"t_ms": 33916.4, "wall": 1793039160.208, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 1412144, "packets-sent": 1040, "rtt-ms": 2.663}}
+{"t_ms": 38945.4, "wall": 1793039165.237, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 1629744, "packets-sent": 1200, "rtt-ms": 2.202}}
+{"t_ms": 43974.1, "wall": 1793039170.266, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 1848704, "packets-sent": 1361, "rtt-ms": 2.241}}
+{"t_ms": 45103.8, "wall": 1793039171.395, "kind": "pub_killed", "pub": "P1", "pid": 681}
+{"t_ms": 45103.9, "wall": 1793039171.395, "kind": "kill", "trial": 1, "warm_ok": true}
+{"t_ms": 45106.1, "wall": 1793039171.398, "kind": "pub_exit", "pub": "P1", "rc": -9}
+{"t_ms": 50605.3, "wall": 1793039176.897, "kind": "pub_spawn", "pub": "P2", "n": 1, "pid": 716}
+{"t_ms": 50695.0, "wall": 1793039176.987, "kind": "pub_start", "pub": "P2"}
+{"t_ms": 50998.1, "wall": 1793039177.29, "kind": "pub_connected", "pub": "P2", "stats": {"packets-sent": 11, "packets-sent-lost": 0, "packets-retransmitted": 0, "packet-ack-received": 1, "packet-nack-received": 0, "send-duration-us": 13284, "bytes-sent": 12704, "bytes-retransmitted": 0, "bytes-sent-dropped": 0, "packets-sent-dropped": 0, "send-rate-mbps": 0.3372825444867021, "negotiated-latency-ms": 1000, "packets-received": 0, "packets-received-lost": 0, "packets-received-retransmitted": 0, "packets-received-dropped": 0, "packet-ack-sent": 0, "packet-nack-sent": 0, "bytes-received": 0, "bytes-received-lost": 0, "receive-rate-mbps": 0.0, "bandwidth-mbps": 1.5, "rtt-ms": 100.0, "bytes-sent-total": 12220}}
+{"t_ms": 51048.5, "wall": 1793039177.34, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 14064, "packets-sent": 12, "rtt-ms": 1.381}}
+{"t_ms": 52043.9, "wall": 1793039178.335, "kind": "closed", "reader": "base.gen1", "why": "stalled"}
+{"t_ms": 52044.0, "wall": 1793039178.335, "kind": "link", "gen": 1, "to": "backoff", "why": "stalled", "attempt": 1, "wait_ms": 1000, "policy": "base"}
+{"t_ms": 53075.1, "wall": 1793039179.367, "kind": "link", "gen": 2, "to": "connecting", "attempt": 1, "policy": "base"}
+{"t_ms": 53083.0, "wall": 1793039179.375, "kind": "build", "reader": "base.gen2"}
+{"t_ms": 53284.5, "wall": 1793039179.576, "kind": "handshake", "reader": "base.gen2", "after_build_ms": 209.3, "rtt_ms": 2.003}
+{"t_ms": 56078.1, "wall": 1793039182.37, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 231664, "packets-sent": 172, "rtt-ms": 2.112}}
+{"t_ms": 58096.7, "wall": 1793039184.388, "kind": "closed", "reader": "base.gen2", "why": "connect_timeout"}
+{"t_ms": 58096.9, "wall": 1793039184.388, "kind": "link", "gen": 2, "to": "backoff", "why": "connect_timeout", "attempt": 2, "wait_ms": 2000, "policy": "base"}
+{"t_ms": 60125.2, "wall": 1793039186.416, "kind": "link", "gen": 3, "to": "connecting", "attempt": 2, "policy": "base"}
+{"t_ms": 60131.1, "wall": 1793039186.422, "kind": "build", "reader": "base.gen3"}
+{"t_ms": 60433.8, "wall": 1793039186.725, "kind": "handshake", "reader": "base.gen3", "after_build_ms": 308.4, "rtt_ms": 2.003}
+{"t_ms": 61106.0, "wall": 1793039187.397, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 450624, "packets-sent": 333, "rtt-ms": 2.401}}
+{"t_ms": 65148.2, "wall": 1793039191.439, "kind": "closed", "reader": "base.gen3", "why": "connect_timeout"}
+{"t_ms": 65148.3, "wall": 1793039191.439, "kind": "link", "gen": 3, "to": "backoff", "why": "connect_timeout", "attempt": 3, "wait_ms": 4000, "policy": "base"}
+{"t_ms": 66135.1, "wall": 1793039192.426, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 668224, "packets-sent": 493, "rtt-ms": 1.84}}
+{"t_ms": 69172.8, "wall": 1793039195.464, "kind": "link", "gen": 4, "to": "connecting", "attempt": 3, "policy": "base"}
+{"t_ms": 69179.4, "wall": 1793039195.471, "kind": "build", "reader": "base.gen4"}
+{"t_ms": 69583.0, "wall": 1793039195.874, "kind": "handshake", "reader": "base.gen4", "after_build_ms": 410.2, "rtt_ms": 2.003}
+{"t_ms": 71163.0, "wall": 1793039197.454, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 888544, "packets-sent": 655, "rtt-ms": 1.849}}
+{"t_ms": 74193.4, "wall": 1793039200.484, "kind": "closed", "reader": "base.gen4", "why": "connect_timeout"}
+{"t_ms": 74193.5, "wall": 1793039200.484, "kind": "link", "gen": 4, "to": "backoff", "why": "connect_timeout", "attempt": 4, "wait_ms": 8000, "policy": "base"}
+{"t_ms": 76038.1, "wall": 1793039202.329, "kind": "error", "reader": "base.gen4", "t": 76038.1, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:base.gen4/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 76038.3, "wall": 1793039202.329, "kind": "error", "reader": "base.gen4", "t": 76038.2, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:base.gen4/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 76191.6, "wall": 1793039202.483, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 1104784, "packets-sent": 814, "rtt-ms": 1.661}}
+{"t_ms": 81219.6, "wall": 1793039207.511, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 1323744, "packets-sent": 975, "rtt-ms": 2.444}}
+{"t_ms": 82210.9, "wall": 1793039208.502, "kind": "link", "gen": 5, "to": "connecting", "attempt": 4, "policy": "base"}
+{"t_ms": 82217.8, "wall": 1793039208.509, "kind": "build", "reader": "base.gen5"}
+{"t_ms": 82520.1, "wall": 1793039208.811, "kind": "handshake", "reader": "base.gen5", "after_build_ms": 309.2, "rtt_ms": 2.003}
+{"t_ms": 85002.8, "wall": 1793039211.294, "kind": "first_byte", "reader": "base.gen5"}
+{"t_ms": 85399.9, "wall": 1793039211.691, "kind": "first_frame", "reader": "base.gen5", "after_build_ms": 3188.8}
+{"t_ms": 85400.0, "wall": 1793039211.691, "kind": "link", "gen": 5, "to": "running", "after_build_ms": 3188.8, "policy": "base"}
+{"t_ms": 86246.1, "wall": 1793039212.537, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 1539984, "packets-sent": 1134, "rtt-ms": 1.873}}
+{"t_ms": 91276.1, "wall": 1793039217.567, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 1760304, "packets-sent": 1296, "rtt-ms": 1.814}}
+{"t_ms": 96304.8, "wall": 1793039222.596, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 1977904, "packets-sent": 1456, "rtt-ms": 1.704}}
+{"t_ms": 101334.3, "wall": 1793039227.625, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 2195504, "packets-sent": 1616, "rtt-ms": 2.106}}
+{"t_ms": 106364.8, "wall": 1793039232.655, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 2414464, "packets-sent": 1777, "rtt-ms": 2.097}}
+{"t_ms": 111394.1, "wall": 1793039237.685, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 2632064, "packets-sent": 1937, "rtt-ms": 1.912}}
+{"t_ms": 116423.4, "wall": 1793039242.714, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 2851024, "packets-sent": 2098, "rtt-ms": 1.707}}
+{"t_ms": 121453.8, "wall": 1793039247.744, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 3067264, "packets-sent": 2257, "rtt-ms": 2.107}}
+{"t_ms": 126483.5, "wall": 1793039252.774, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 3286224, "packets-sent": 2418, "rtt-ms": 1.695}}
+{"t_ms": 131512.4, "wall": 1793039257.803, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 3503824, "packets-sent": 2578, "rtt-ms": 1.823}}
+{"t_ms": 135104.3, "wall": 1793039261.394, "kind": "pub_killed", "pub": "P2", "pid": 716}
+{"t_ms": 135104.5, "wall": 1793039261.394, "kind": "closed", "reader": "base.gen5", "why": "retired"}
+{"t_ms": 135107.2, "wall": 1793039261.397, "kind": "summary", "trial": 1, "gap_s": 5.5, "kill_ms": 45103.6, "p2_spawn_rel_kill_ms": 5501.1, "p2_spawns": 1, "p2_connected_rel_kill_ms": 5894.5, "generations": [{"tag": "base.gen1", "built": -29956.8, "handshake": -29253.5, "first_byte": -27361.2, "first_au": -26882.2, "first_frame": -26868.2, "frames": 887, "aus": 887, "bytes": 1137024, "ended": "stalled", "end": 6940.3, "errors": [], "eos": null, "resumes": []}, {"tag": "base.gen2", "built": 7971.6, "handshake": 8180.9, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "connect_timeout", "end": 12993.0, "errors": [], "eos": null, "resumes": []}, {"tag": "base.gen3", "built": 15021.7, "handshake": 15330.1, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "connect_timeout", "end": 20044.6, "errors": [], "eos": null, "resumes": []}, {"tag": "base.gen4", "built": 24069.2, "handshake": 24479.4, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "connect_timeout", "end": 29089.8, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "base.gen5", "built": 37107.3, "handshake": 37416.5, "first_byte": 39899.1, "first_au": 40290.0, "first_frame": 40296.1, "frames": 1507, "aus": 1507, "bytes": 1933204, "ended": "retired", "end": 90000.9, "errors": [], "eos": null, "resumes": []}], "generations_checked": 5, "on_air": {"base": [{"t": -26868.2, "gen": 1}, {"t": 40296.1, "gen": 5}]}, "back_on_air_rel_kill_ms": {"base": 40296.1}, "rebuilds_after_kill": {"base": 4}}
+{"t_ms": 135108.0, "wall": 1793039261.398, "kind": "pub_exit", "pub": "P2", "rc": -9}
+{"t_ms": 405158.3, "wall": 1793039531.444, "kind": "trial_start", "trial": 2, "gap_s": 5.5}
+{"t_ms": 405158.9, "wall": 1793039531.444, "kind": "pub_spawn", "pub": "P1", "n": 1, "pid": 763}
+{"t_ms": 405247.9, "wall": 1793039531.533, "kind": "pub_start", "pub": "P1"}
+{"t_ms": 405500.4, "wall": 1793039531.786, "kind": "pub_connected", "pub": "P1", "stats": {"packets-sent": 9, "packets-sent-lost": 0, "packets-retransmitted": 0, "packet-ack-received": 0, "packet-nack-received": 0, "send-duration-us": 0, "bytes-sent": 9984, "bytes-retransmitted": 0, "bytes-sent-dropped": 0, "packets-sent-dropped": 0, "send-rate-mbps": 0.34636600173460536, "negotiated-latency-ms": 1000, "packets-received": 0, "packets-received-lost": 0, "packets-received-retransmitted": 0, "packets-received-dropped": 0, "packet-ack-sent": 0, "packet-nack-sent": 0, "bytes-received": 0, "bytes-received-lost": 0, "receive-rate-mbps": 0.0, "bandwidth-mbps": 12.0, "rtt-ms": 100.0, "bytes-sent-total": 9588}}
+{"t_ms": 405550.7, "wall": 1793039531.836, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 11344, "packets-sent": 10, "rtt-ms": 1.299}}
+{"t_ms": 410581.2, "wall": 1793039536.866, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 230304, "packets-sent": 171, "rtt-ms": 1.437}}
+{"t_ms": 415611.4, "wall": 1793039541.897, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 447904, "packets-sent": 331, "rtt-ms": 1.985}}
+{"t_ms": 420205.9, "wall": 1793039546.491, "kind": "link", "gen": 1, "to": "connecting", "attempt": 0, "policy": "base"}
+{"t_ms": 420211.8, "wall": 1793039546.497, "kind": "build", "reader": "base.gen1"}
+{"t_ms": 420514.4, "wall": 1793039546.799, "kind": "handshake", "reader": "base.gen1", "after_build_ms": 308.4, "rtt_ms": 2.365}
+{"t_ms": 420643.0, "wall": 1793039546.928, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 666864, "packets-sent": 492, "rtt-ms": 1.695}}
+{"t_ms": 423658.0, "wall": 1793039549.943, "kind": "first_byte", "reader": "base.gen1"}
+{"t_ms": 424162.7, "wall": 1793039550.448, "kind": "first_frame", "reader": "base.gen1", "after_build_ms": 3956.6}
+{"t_ms": 424162.8, "wall": 1793039550.448, "kind": "link", "gen": 1, "to": "running", "after_build_ms": 3956.6, "policy": "base"}
+{"t_ms": 425671.7, "wall": 1793039551.957, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 885824, "packets-sent": 653, "rtt-ms": 1.503}}
+{"t_ms": 430699.8, "wall": 1793039556.985, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 1102064, "packets-sent": 812, "rtt-ms": 1.566}}
+{"t_ms": 435727.9, "wall": 1793039562.013, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 1321024, "packets-sent": 973, "rtt-ms": 1.33}}
+{"t_ms": 440756.6, "wall": 1793039567.041, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 1538624, "packets-sent": 1133, "rtt-ms": 1.458}}
+{"t_ms": 445784.2, "wall": 1793039572.069, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 1757584, "packets-sent": 1294, "rtt-ms": 1.52}}
+{"t_ms": 450160.1, "wall": 1793039576.445, "kind": "pub_killed", "pub": "P1", "pid": 763}
+{"t_ms": 450160.2, "wall": 1793039576.445, "kind": "kill", "trial": 2, "warm_ok": true}
+{"t_ms": 450162.7, "wall": 1793039576.447, "kind": "pub_exit", "pub": "P1", "rc": -9}
+{"t_ms": 455661.3, "wall": 1793039581.946, "kind": "pub_spawn", "pub": "P2", "n": 1, "pid": 795}
+{"t_ms": 455767.4, "wall": 1793039582.052, "kind": "pub_start", "pub": "P2"}
+{"t_ms": 456020.6, "wall": 1793039582.305, "kind": "pub_connected", "pub": "P2", "stats": {"packets-sent": 9, "packets-sent-lost": 0, "packets-retransmitted": 0, "packet-ack-received": 0, "packet-nack-received": 0, "send-duration-us": 0, "bytes-sent": 9984, "bytes-retransmitted": 0, "bytes-sent-dropped": 0, "packets-sent-dropped": 0, "send-rate-mbps": 0.3183165949306552, "negotiated-latency-ms": 1000, "packets-received": 0, "packets-received-lost": 0, "packets-received-retransmitted": 0, "packets-received-dropped": 0, "packet-ack-sent": 0, "packet-nack-sent": 0, "bytes-received": 0, "bytes-received-lost": 0, "receive-rate-mbps": 0.0, "bandwidth-mbps": 12.0, "rtt-ms": 100.0, "bytes-sent-total": 9588}}
+{"t_ms": 456071.1, "wall": 1793039582.356, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 12704, "packets-sent": 11, "rtt-ms": 1.375}}
+{"t_ms": 457158.2, "wall": 1793039583.443, "kind": "closed", "reader": "base.gen1", "why": "stalled"}
+{"t_ms": 457158.3, "wall": 1793039583.443, "kind": "link", "gen": 1, "to": "backoff", "why": "stalled", "attempt": 1, "wait_ms": 1000, "policy": "base"}
+{"t_ms": 458189.3, "wall": 1793039584.474, "kind": "link", "gen": 2, "to": "connecting", "attempt": 1, "policy": "base"}
+{"t_ms": 458195.4, "wall": 1793039584.48, "kind": "build", "reader": "base.gen2"}
+{"t_ms": 458497.6, "wall": 1793039584.782, "kind": "handshake", "reader": "base.gen2", "after_build_ms": 308.3, "rtt_ms": 1.472}
+{"t_ms": 461101.0, "wall": 1793039587.385, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 230304, "packets-sent": 171, "rtt-ms": 1.345}}
+{"t_ms": 463214.3, "wall": 1793039589.499, "kind": "closed", "reader": "base.gen2", "why": "connect_timeout"}
+{"t_ms": 463214.4, "wall": 1793039589.499, "kind": "link", "gen": 2, "to": "backoff", "why": "connect_timeout", "attempt": 2, "wait_ms": 2000, "policy": "base"}
+{"t_ms": 465243.5, "wall": 1793039591.528, "kind": "link", "gen": 3, "to": "connecting", "attempt": 2, "policy": "base"}
+{"t_ms": 465250.7, "wall": 1793039591.535, "kind": "build", "reader": "base.gen3"}
+{"t_ms": 465552.8, "wall": 1793039591.837, "kind": "handshake", "reader": "base.gen3", "after_build_ms": 309.2, "rtt_ms": 1.472}
+{"t_ms": 466130.5, "wall": 1793039592.415, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 447904, "packets-sent": 331, "rtt-ms": 1.384}}
+{"t_ms": 470264.6, "wall": 1793039596.549, "kind": "closed", "reader": "base.gen3", "why": "connect_timeout"}
+{"t_ms": 470264.7, "wall": 1793039596.549, "kind": "link", "gen": 3, "to": "backoff", "why": "connect_timeout", "attempt": 3, "wait_ms": 4000, "policy": "base"}
+{"t_ms": 471160.8, "wall": 1793039597.445, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 666864, "packets-sent": 492, "rtt-ms": 1.585}}
+{"t_ms": 474288.5, "wall": 1793039600.573, "kind": "link", "gen": 4, "to": "connecting", "attempt": 3, "policy": "base"}
+{"t_ms": 474294.9, "wall": 1793039600.579, "kind": "build", "reader": "base.gen4"}
+{"t_ms": 474597.3, "wall": 1793039600.882, "kind": "handshake", "reader": "base.gen4", "after_build_ms": 308.7, "rtt_ms": 1.472}
+{"t_ms": 476191.3, "wall": 1793039602.476, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 885824, "packets-sent": 653, "rtt-ms": 1.481}}
+{"t_ms": 479316.8, "wall": 1793039605.601, "kind": "closed", "reader": "base.gen4", "why": "connect_timeout"}
+{"t_ms": 479316.9, "wall": 1793039605.601, "kind": "link", "gen": 4, "to": "backoff", "why": "connect_timeout", "attempt": 4, "wait_ms": 8000, "policy": "base"}
+{"t_ms": 480155.4, "wall": 1793039606.439, "kind": "error", "reader": "base.gen4", "t": 480155.3, "src": "src", "text": "Could not read from resource.", "debug": "../ext/srt/gstsrtsrc.c(206): gst_srt_src_fill (): /GstPipeline:base.gen4/GstSRTSrc:src:\nError on SRT socket: Unknown or erroneous (0)"}
+{"t_ms": 480155.5, "wall": 1793039606.439, "kind": "error", "reader": "base.gen4", "t": 480155.5, "src": "src", "text": "Internal data stream error.", "debug": "../libs/gst/base/gstbasesrc.c(3177): gst_base_src_loop (): /GstPipeline:base.gen4/GstSRTSrc:src:\nstreaming stopped, reason error (-5)"}
+{"t_ms": 481222.3, "wall": 1793039607.506, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 1102064, "packets-sent": 812, "rtt-ms": 1.38}}
+{"t_ms": 486253.8, "wall": 1793039612.538, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 1322384, "packets-sent": 974, "rtt-ms": 1.501}}
+{"t_ms": 487337.6, "wall": 1793039613.622, "kind": "link", "gen": 5, "to": "connecting", "attempt": 4, "policy": "base"}
+{"t_ms": 487345.7, "wall": 1793039613.63, "kind": "build", "reader": "base.gen5"}
+{"t_ms": 487648.3, "wall": 1793039613.932, "kind": "handshake", "reader": "base.gen5", "after_build_ms": 310.5, "rtt_ms": 1.472}
+{"t_ms": 489905.1, "wall": 1793039616.189, "kind": "first_byte", "reader": "base.gen5"}
+{"t_ms": 490531.8, "wall": 1793039616.816, "kind": "first_frame", "reader": "base.gen5", "after_build_ms": 3193.9}
+{"t_ms": 490531.8, "wall": 1793039616.816, "kind": "link", "gen": 5, "to": "running", "after_build_ms": 3193.9, "policy": "base"}
+{"t_ms": 491285.6, "wall": 1793039617.57, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 1538624, "packets-sent": 1133, "rtt-ms": 1.452}}
+{"t_ms": 496315.4, "wall": 1793039622.599, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 1758944, "packets-sent": 1295, "rtt-ms": 1.496}}
+{"t_ms": 501345.4, "wall": 1793039627.629, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 1976544, "packets-sent": 1455, "rtt-ms": 1.398}}
+{"t_ms": 506374.6, "wall": 1793039632.658, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 2192784, "packets-sent": 1614, "rtt-ms": 1.491}}
+{"t_ms": 511404.9, "wall": 1793039637.688, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 2411744, "packets-sent": 1775, "rtt-ms": 1.691}}
+{"t_ms": 516436.7, "wall": 1793039642.72, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 2630704, "packets-sent": 1936, "rtt-ms": 1.458}}
+{"t_ms": 521467.1, "wall": 1793039647.751, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 2849664, "packets-sent": 2097, "rtt-ms": 1.563}}
+{"t_ms": 526498.2, "wall": 1793039652.781, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 3067264, "packets-sent": 2257, "rtt-ms": 1.512}}
+{"t_ms": 531526.4, "wall": 1793039657.81, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 3284864, "packets-sent": 2417, "rtt-ms": 1.42}}
+{"t_ms": 536555.7, "wall": 1793039662.839, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 3502464, "packets-sent": 2577, "rtt-ms": 1.511}}
+{"t_ms": 540161.5, "wall": 1793039666.444, "kind": "pub_killed", "pub": "P2", "pid": 795}
+{"t_ms": 540161.7, "wall": 1793039666.445, "kind": "closed", "reader": "base.gen5", "why": "retired"}
+{"t_ms": 540162.6, "wall": 1793039666.446, "kind": "summary", "trial": 2, "gap_s": 5.5, "kill_ms": 450160.0, "p2_spawn_rel_kill_ms": 5500.8, "p2_spawns": 1, "p2_connected_rel_kill_ms": 5860.6, "generations": [{"tag": "base.gen1", "built": -29954.0, "handshake": -29645.6, "first_byte": -26502.1, "first_au": -26000.6, "first_frame": -25997.4, "frames": 862, "aus": 862, "bytes": 1106756, "ended": "stalled", "end": 6998.2, "errors": [], "eos": null, "resumes": []}, {"tag": "base.gen2", "built": 8029.3, "handshake": 8337.6, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "connect_timeout", "end": 13054.3, "errors": [], "eos": null, "resumes": []}, {"tag": "base.gen3", "built": 15083.6, "handshake": 15392.8, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "connect_timeout", "end": 20104.6, "errors": [], "eos": null, "resumes": []}, {"tag": "base.gen4", "built": 24128.6, "handshake": 24437.3, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "connect_timeout", "end": 29156.8, "errors": ["Could not read from resource.", "Internal data stream error."], "eos": null, "resumes": []}, {"tag": "base.gen5", "built": 37177.7, "handshake": 37488.2, "first_byte": 39745.0, "first_au": 40370.2, "first_frame": 40371.6, "frames": 1505, "aus": 1505, "bytes": 1930572, "ended": "retired", "end": 90001.7, "errors": [], "eos": null, "resumes": []}], "generations_checked": 5, "on_air": {"base": [{"t": -25997.4, "gen": 1}, {"t": 40371.6, "gen": 5}]}, "back_on_air_rel_kill_ms": {"base": 40371.6}, "rebuilds_after_kill": {"base": 4}}
+{"t_ms": 540164.7, "wall": 1793039666.448, "kind": "pub_exit", "pub": "P2", "rc": -9}
+{"t_ms": 810236.7, "wall": 1793039936.515, "kind": "trial_start", "trial": 3, "gap_s": 5.5}
+{"t_ms": 810237.9, "wall": 1793039936.516, "kind": "pub_spawn", "pub": "P1", "n": 1, "pid": 838}
+{"t_ms": 810331.9, "wall": 1793039936.61, "kind": "pub_start", "pub": "P1"}
+{"t_ms": 810634.6, "wall": 1793039936.913, "kind": "pub_connected", "pub": "P1", "stats": {"packets-sent": 11, "packets-sent-lost": 0, "packets-retransmitted": 0, "packet-ack-received": 2, "packet-nack-received": 0, "send-duration-us": 26484, "bytes-sent": 12704, "bytes-retransmitted": 0, "bytes-sent-dropped": 0, "packets-sent-dropped": 0, "send-rate-mbps": 0.35186993221019686, "negotiated-latency-ms": 1000, "packets-received": 0, "packets-received-lost": 0, "packets-received-retransmitted": 0, "packets-received-dropped": 0, "packet-ack-sent": 0, "packet-nack-sent": 0, "bytes-received": 0, "bytes-received-lost": 0, "receive-rate-mbps": 0.0, "bandwidth-mbps": 2.808, "rtt-ms": 1.337, "bytes-sent-total": 12220}}
+{"t_ms": 810685.1, "wall": 1793039936.963, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 14064, "packets-sent": 12, "rtt-ms": 1.396}}
+{"t_ms": 815715.0, "wall": 1793039941.993, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 233024, "packets-sent": 173, "rtt-ms": 2.03}}
+{"t_ms": 820744.8, "wall": 1793039947.023, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 450624, "packets-sent": 333, "rtt-ms": 2.155}}
+{"t_ms": 825285.9, "wall": 1793039951.564, "kind": "link", "gen": 1, "to": "connecting", "attempt": 0, "policy": "base"}
+{"t_ms": 825291.8, "wall": 1793039951.57, "kind": "build", "reader": "base.gen1"}
+{"t_ms": 825493.6, "wall": 1793039951.772, "kind": "handshake", "reader": "base.gen1", "after_build_ms": 207.6, "rtt_ms": 1.695}
+{"t_ms": 825775.2, "wall": 1793039952.053, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 669584, "packets-sent": 494, "rtt-ms": 1.748}}
+{"t_ms": 828693.0, "wall": 1793039954.971, "kind": "first_byte", "reader": "base.gen1"}
+{"t_ms": 829327.5, "wall": 1793039955.606, "kind": "first_frame", "reader": "base.gen1", "after_build_ms": 4041.4}
+{"t_ms": 829327.6, "wall": 1793039955.606, "kind": "link", "gen": 1, "to": "running", "after_build_ms": 4041.4, "policy": "base"}
+{"t_ms": 830805.0, "wall": 1793039957.083, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 887184, "packets-sent": 654, "rtt-ms": 1.905}}
+{"t_ms": 835833.8, "wall": 1793039962.112, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 1104784, "packets-sent": 814, "rtt-ms": 1.649}}
+{"t_ms": 840863.7, "wall": 1793039967.141, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 1323744, "packets-sent": 975, "rtt-ms": 1.607}}
+{"t_ms": 845891.9, "wall": 1793039972.17, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 1539984, "packets-sent": 1134, "rtt-ms": 2.309}}
+{"t_ms": 850920.3, "wall": 1793039977.198, "kind": "pub_stats", "pub": "P1", "stats": {"bytes-sent": 1761664, "packets-sent": 1297, "rtt-ms": 1.977}}
+{"t_ms": 855238.7, "wall": 1793039981.516, "kind": "pub_killed", "pub": "P1", "pid": 838}
+{"t_ms": 855238.8, "wall": 1793039981.516, "kind": "kill", "trial": 3, "warm_ok": true}
+{"t_ms": 855241.5, "wall": 1793039981.519, "kind": "pub_exit", "pub": "P1", "rc": -9}
+{"t_ms": 860739.6, "wall": 1793039987.017, "kind": "pub_spawn", "pub": "P2", "n": 1, "pid": 870}
+{"t_ms": 860824.9, "wall": 1793039987.102, "kind": "pub_start", "pub": "P2"}
+{"t_ms": 861077.9, "wall": 1793039987.355, "kind": "pub_connected", "pub": "P2", "stats": {"packets-sent": 9, "packets-sent-lost": 0, "packets-retransmitted": 0, "packet-ack-received": 2, "packet-nack-received": 0, "send-duration-us": 26112, "bytes-sent": 9984, "bytes-retransmitted": 0, "bytes-sent-dropped": 0, "packets-sent-dropped": 0, "send-rate-mbps": 0.31809221137648, "negotiated-latency-ms": 1000, "packets-received": 0, "packets-received-lost": 0, "packets-received-retransmitted": 0, "packets-received-dropped": 0, "packet-ack-sent": 0, "packet-nack-sent": 0, "bytes-received": 0, "bytes-received-lost": 0, "receive-rate-mbps": 0.0, "bandwidth-mbps": 2.808, "rtt-ms": 1.562, "bytes-sent-total": 9588}}
+{"t_ms": 861128.3, "wall": 1793039987.406, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 12704, "packets-sent": 11, "rtt-ms": 1.537}}
+{"t_ms": 862185.2, "wall": 1793039988.463, "kind": "closed", "reader": "base.gen1", "why": "stalled"}
+{"t_ms": 862185.3, "wall": 1793039988.463, "kind": "link", "gen": 1, "to": "backoff", "why": "stalled", "attempt": 1, "wait_ms": 1000, "policy": "base"}
+{"t_ms": 863216.3, "wall": 1793039989.494, "kind": "link", "gen": 2, "to": "connecting", "attempt": 1, "policy": "base"}
+{"t_ms": 863223.7, "wall": 1793039989.501, "kind": "build", "reader": "base.gen2"}
+{"t_ms": 863526.0, "wall": 1793039989.803, "kind": "handshake", "reader": "base.gen2", "after_build_ms": 309.6, "rtt_ms": 1.505}
+{"t_ms": 866157.4, "wall": 1793039992.435, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 230304, "packets-sent": 171, "rtt-ms": 1.832}}
+{"t_ms": 868237.1, "wall": 1793039994.515, "kind": "closed", "reader": "base.gen2", "why": "connect_timeout"}
+{"t_ms": 868237.3, "wall": 1793039994.515, "kind": "link", "gen": 2, "to": "backoff", "why": "connect_timeout", "attempt": 2, "wait_ms": 2000, "policy": "base"}
+{"t_ms": 870266.4, "wall": 1793039996.544, "kind": "link", "gen": 3, "to": "connecting", "attempt": 2, "policy": "base"}
+{"t_ms": 870274.7, "wall": 1793039996.552, "kind": "build", "reader": "base.gen3"}
+{"t_ms": 870576.8, "wall": 1793039996.854, "kind": "handshake", "reader": "base.gen3", "after_build_ms": 310.4, "rtt_ms": 1.505}
+{"t_ms": 871186.8, "wall": 1793039997.464, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 447904, "packets-sent": 331, "rtt-ms": 1.618}}
+{"t_ms": 875287.9, "wall": 1793040001.565, "kind": "closed", "reader": "base.gen3", "why": "connect_timeout"}
+{"t_ms": 875288.1, "wall": 1793040001.565, "kind": "link", "gen": 3, "to": "backoff", "why": "connect_timeout", "attempt": 3, "wait_ms": 4000, "policy": "base"}
+{"t_ms": 876217.8, "wall": 1793040002.495, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 666864, "packets-sent": 492, "rtt-ms": 1.971}}
+{"t_ms": 879312.2, "wall": 1793040005.589, "kind": "link", "gen": 4, "to": "connecting", "attempt": 3, "policy": "base"}
+{"t_ms": 879318.4, "wall": 1793040005.596, "kind": "build", "reader": "base.gen4"}
+{"t_ms": 879620.9, "wall": 1793040005.898, "kind": "handshake", "reader": "base.gen4", "after_build_ms": 308.6, "rtt_ms": 1.505}
+{"t_ms": 881088.3, "wall": 1793040007.366, "kind": "first_byte", "reader": "base.gen4"}
+{"t_ms": 881246.2, "wall": 1793040007.523, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 887184, "packets-sent": 654, "rtt-ms": 1.839}}
+{"t_ms": 881660.1, "wall": 1793040007.937, "kind": "first_frame", "reader": "base.gen4", "after_build_ms": 2347.8}
+{"t_ms": 881660.2, "wall": 1793040007.937, "kind": "link", "gen": 4, "to": "running", "after_build_ms": 2347.8, "policy": "base"}
+{"t_ms": 886275.3, "wall": 1793040012.552, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 1103424, "packets-sent": 813, "rtt-ms": 1.681}}
+{"t_ms": 891303.4, "wall": 1793040017.58, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 1322384, "packets-sent": 974, "rtt-ms": 1.682}}
+{"t_ms": 896333.1, "wall": 1793040022.61, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 1538624, "packets-sent": 1133, "rtt-ms": 1.774}}
+{"t_ms": 901362.0, "wall": 1793040027.639, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 1758944, "packets-sent": 1295, "rtt-ms": 1.495}}
+{"t_ms": 906389.8, "wall": 1793040032.667, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 1975184, "packets-sent": 1454, "rtt-ms": 1.647}}
+{"t_ms": 911417.9, "wall": 1793040037.695, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 2194144, "packets-sent": 1615, "rtt-ms": 1.674}}
+{"t_ms": 916446.0, "wall": 1793040042.722, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 2413104, "packets-sent": 1776, "rtt-ms": 1.774}}
+{"t_ms": 921475.2, "wall": 1793040047.752, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 2629344, "packets-sent": 1935, "rtt-ms": 1.51}}
+{"t_ms": 926503.7, "wall": 1793040052.78, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 2849664, "packets-sent": 2097, "rtt-ms": 2.102}}
+{"t_ms": 931533.7, "wall": 1793040057.81, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 3065904, "packets-sent": 2256, "rtt-ms": 1.576}}
+{"t_ms": 936563.0, "wall": 1793040062.839, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 3283504, "packets-sent": 2416, "rtt-ms": 2.293}}
+{"t_ms": 941591.5, "wall": 1793040067.868, "kind": "pub_stats", "pub": "P2", "stats": {"bytes-sent": 3502464, "packets-sent": 2577, "rtt-ms": 1.865}}
+{"t_ms": 945239.6, "wall": 1793040071.516, "kind": "pub_killed", "pub": "P2", "pid": 870}
+{"t_ms": 945239.8, "wall": 1793040071.516, "kind": "closed", "reader": "base.gen4", "why": "retired"}
+{"t_ms": 945240.7, "wall": 1793040071.517, "kind": "summary", "trial": 3, "gap_s": 5.5, "kill_ms": 855238.6, "p2_spawn_rel_kill_ms": 5500.5, "p2_spawns": 1, "p2_connected_rel_kill_ms": 5839.3, "generations": [{"tag": "base.gen1", "built": -29952.6, "handshake": -29745.0, "first_byte": -26545.7, "first_au": -25914.1, "first_frame": -25911.2, "frames": 860, "aus": 860, "bytes": 1104124, "ended": "stalled", "end": 6946.6, "errors": [], "eos": null, "resumes": []}, {"tag": "base.gen2", "built": 7977.8, "handshake": 8287.4, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "connect_timeout", "end": 12998.5, "errors": [], "eos": null, "resumes": []}, {"tag": "base.gen3", "built": 15027.8, "handshake": 15338.2, "first_byte": null, "first_au": null, "first_frame": null, "frames": 0, "aus": 0, "bytes": 0, "ended": "connect_timeout", "end": 20049.3, "errors": [], "eos": null, "resumes": []}, {"tag": "base.gen4", "built": 24073.6, "handshake": 24382.2, "first_byte": 25849.6, "first_au": 26419.6, "first_frame": 26421.4, "frames": 1927, "aus": 1927, "bytes": 2471448, "ended": "retired", "end": 90001.2, "errors": [], "eos": null, "resumes": []}], "generations_checked": 4, "on_air": {"base": [{"t": -25911.2, "gen": 1}, {"t": 26421.4, "gen": 4}]}, "back_on_air_rel_kill_ms": {"base": 26421.4}, "rebuilds_after_kill": {"base": 3}}
+{"t_ms": 945243.1, "wall": 1793040071.519, "kind": "pub_exit", "pub": "P2", "rc": -9}
+{"t_ms": 946242.1, "wall": 1793040072.518, "kind": "run_end", "lines": 207, "withheld": 0}
