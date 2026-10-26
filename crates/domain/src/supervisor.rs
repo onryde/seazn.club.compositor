@@ -2370,6 +2370,7 @@ mod tests {
             input_connect_timeout_ms: 5_041,
             input_stall_after_ms: 5_051,
             input_srt_latency_ms: 1_181,
+            input_hold_end_after_ms: 20_021,
             kick_alert_count: 3,
             kick_window_ms: 300_061,
             output_backoff_base_ms: 541,
@@ -2414,6 +2415,7 @@ mod tests {
             th.input_backoff_cap_ms,
             th.input_connect_timeout_ms,
             th.input_stall_after_ms,
+            th.input_hold_end_after_ms,
             th.kick_window_ms,
             th.output_backoff_base_ms,
             th.output_backoff_cap_ms,
@@ -2437,7 +2439,7 @@ mod tests {
         let mut unique = ms.to_vec();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(unique.len(), 26, "setup: every Ms threshold distinct");
+        assert_eq!(unique.len(), 27, "setup: every Ms threshold distinct");
         let base = th.bootstrap_backoff_base_ms;
         assert!(
             2 * base < th.bootstrap_backoff_cap_ms && 4 * base > th.bootstrap_backoff_cap_ms,

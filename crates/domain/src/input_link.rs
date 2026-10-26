@@ -24,6 +24,16 @@
 //!   keeps no copy of the rules. Each generation is given up at most once, since the link then backs
 //!   off and only a rebuild moves it on. A loss the adapter reported (`on_lost`) owes no abandon: the
 //!   adapter decided it, and its gate is shut already.
+//! - **Cloudflare's hold-end close (Owed 108 fix (a), F-032).** When the phone drops, Cloudflare holds
+//!   its SRT broadcast about 30 s, then closes every attached reader with an error. The adapter reports
+//!   an error on the current build, and the first one on the last build the link gave up while that
+//!   build still runs (it is the current generation until the next rebuild), as `on_error`, with the
+//!   build's `BuildFacts`. Between builds (Connecting or Backoff), an error on a build whose handshake
+//!   completed and that never carried media, at least `input_hold_end_after_ms` after the last frame,
+//!   is that close: the link rebuilds a base wait later, its attempt count reset, so a phone already
+//!   back is not left waiting out the 8 or 10 s step. Bound: once an outage, re-armed only when a
+//!   generation reaches Running, and disarmed until the link's first Running. Any other error is
+//!   today's `on_lost(Error)`: a loss while Running or Connecting, nothing in Backoff.
 use crate::backoff::delay;
 use crate::config::Thresholds;
 use crate::time::{elapsed, Ms};
@@ -34,6 +44,19 @@ pub enum LossReason {
     Stalled,
     Eos,
     Error,
+}
+
+/// What a build's SRT connection had shown when its pipeline posted an error (Owed 108, F-032). The
+/// adapter reads both off the build itself. Fix (b) reads `carried_media` too: a connect with media is
+/// never discarded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct BuildFacts {
+    /// The SRT handshake completed: libsrt had connected the socket. A refused connect (a rotated
+    /// passphrase, a deleted input) errors about 20 ms in without one, which is what tells it from
+    /// Cloudflare's hold-end close.
+    pub handshake_completed: bool,
+    /// Bytes reached the build past `srtsrc`, decoded or not.
+    pub carried_media: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +89,9 @@ pub struct InputLink {
     state: InputState,
     generation: u64,
     kicks: Window,
+    /// The hold-end rebuild's one shot an outage (Owed 108): set when a generation reaches Running,
+    /// spent by the rebuild. False until the link's first Running.
+    hold_end_armed: bool,
 }
 
 impl Default for InputLink {
@@ -81,6 +107,7 @@ impl InputLink {
             state: InputState::Backoff { attempt: 0, until: 0 },
             generation: 0,
             kicks: Window::new(KICK_HISTORY_CAP),
+            hold_end_armed: false,
         }
     }
 
@@ -108,7 +135,54 @@ impl InputLink {
     pub fn on_connected(&mut self, now: Ms, gen: u64) {
         if gen == self.generation && matches!(self.state, InputState::Connecting { .. }) {
             self.state = InputState::Running { since: now };
+            self.hold_end_armed = true;
         }
+    }
+
+    /// An error on generation `gen`'s pipeline (Owed 108, F-032): the current build's, or the first one
+    /// of the last build the link gave up while that build still runs. Cloudflare's hold-end close
+    /// (`is_hold_end`) rebuilds a base wait later with the attempt count reset; any other error is
+    /// `on_lost(Error)`. `last_frame_at` is the programme's latest camera frame.
+    pub fn on_error(
+        &mut self,
+        now: Ms,
+        gen: u64,
+        facts: BuildFacts,
+        last_frame_at: Option<Ms>,
+        t: &Thresholds,
+    ) {
+        if gen != self.generation {
+            return;
+        }
+        if !self.is_hold_end(now, facts, last_frame_at, t) {
+            self.on_lost(now, gen, LossReason::Error, t);
+            return;
+        }
+        self.hold_end_armed = false;
+        // A base wait with the count reset, unless a build is already due sooner: the rule cuts a
+        // wait short and never makes one longer.
+        let due = match self.state {
+            InputState::Backoff { until, .. } => Some(until),
+            InputState::Connecting { .. } | InputState::Running { .. } => None,
+        };
+        self.back_off(now, 0, t);
+        if let (Some(due), InputState::Backoff { until, .. }) = (due, &mut self.state) {
+            *until = (*until).min(due);
+        }
+    }
+
+    /// Cloudflare's hold-end close (F-032): between builds, armed, on a build whose handshake
+    /// completed and that never carried media, at least `input_hold_end_after_ms` after the last
+    /// frame. The handshake is the condition that matters most: a refused connect errors without one.
+    /// With no frame to measure from it is never the close (an armed link has had a Running, so has a
+    /// frame; this is the guard on that).
+    fn is_hold_end(&self, now: Ms, facts: BuildFacts, last_frame_at: Option<Ms>, t: &Thresholds) -> bool {
+        let between_builds = !matches!(self.state, InputState::Running { .. });
+        between_builds
+            && self.hold_end_armed
+            && facts.handshake_completed
+            && !facts.carried_media
+            && last_frame_at.is_some_and(|f| elapsed(now, f) >= t.input_hold_end_after_ms)
     }
 
     /// The current generation's pipeline ended: EOS, an error, or the stall rule.
@@ -765,5 +839,388 @@ mod tests {
         assert!(!l.takes_frames_from(2), "lost");
         checked += 1;
         assert_eq!(checked, 13);
+    }
+
+    // ---- Owed 108 fix (a): Cloudflare's hold-end close (F-032) ----
+
+    /// A build whose handshake completed and that carried nothing: what Cloudflare's close finds on a
+    /// relay build attached to its held broadcast (F-032).
+    const HELD: BuildFacts = BuildFacts {
+        handshake_completed: true,
+        carried_media: false,
+    };
+
+    /// F-032's drop: the camera's last frame 1.9 s after the kill at 0.
+    const LAST: Ms = 1_900;
+
+    /// Ticks `l` every 10 ms from `from` through `to`, reading the stall rule against `last` first, as
+    /// the supervisor's Running tick does; returns the instants it built at.
+    fn tick_through(l: &mut InputLink, from: Ms, to: Ms, last: Option<Ms>, th: &Thresholds) -> Vec<Ms> {
+        let mut builds = Vec::new();
+        let mut now = from;
+        while now <= to {
+            l.check_stall(now, last, th);
+            if built(l.on_tick(now, th)) {
+                builds.push(now);
+            }
+            now += 10;
+        }
+        builds
+    }
+
+    /// Running from 0 (so armed), the last frame at `LAST`, then the stall and the rebuilds that each
+    /// time out, ticked through `to`.
+    fn dropped(to: Ms, th: &Thresholds) -> InputLink {
+        let mut l = running(0);
+        tick_through(&mut l, 10, to, Some(LAST), th);
+        l
+    }
+
+    /// The rule's outcome for an error at `at` on `l`: a base wait from `at` with the count reset
+    /// (`backoff::delay(0)`), or a build already due sooner.
+    fn fired_from(l: &InputLink, at: Ms, th: &Thresholds) -> InputState {
+        let wait = delay(0, th.input_backoff_base_ms, th.input_backoff_cap_ms);
+        let until = match l.state() {
+            InputState::Backoff { until, .. } => until.min(at + wait),
+            _ => at + wait,
+        };
+        InputState::Backoff { attempt: 1, until }
+    }
+
+    /// What today's link does with the same error: `on_lost(Error)`.
+    fn today(l: &InputLink, at: Ms, th: &Thresholds) -> InputState {
+        let mut twin = l.clone();
+        twin.on_lost(at, twin.generation(), LossReason::Error, th);
+        twin.state()
+    }
+
+    /// F-032's unlucky schedule: the close, 29 s after the last frame (the drop + 30.9), lands in the
+    /// Backoff after the build from +23.9 was given up at +28.9, its next build due at +36.9.
+    #[test]
+    fn cloudflares_close_on_the_given_up_build_rebuilds_a_base_wait_later_with_the_count_reset() {
+        let th = t();
+        let close = LAST + 29_000;
+        let mut l = dropped(close - 10, &th);
+        let gen = l.generation();
+        let InputState::Backoff { attempt, until } = l.state() else {
+            panic!("setup: backing off at the close, {:?}", l.state());
+        };
+        assert!(
+            attempt > 1 && until > close + th.input_backoff_base_ms,
+            "setup: a long wait to cut"
+        );
+        let want = fired_from(&l, close, &th);
+        assert_ne!(today(&l, close, &th), want, "setup: today's link waits it out");
+
+        l.on_error(close, gen, HELD, Some(LAST), &th);
+        assert_eq!(l.state(), want);
+        assert_eq!(l.generation(), gen, "no build until the tick");
+        let InputState::Backoff { until, .. } = want else {
+            unreachable!()
+        };
+        assert_eq!(tick_through(&mut l, close, until, Some(LAST), &th), vec![until]);
+        assert_eq!(
+            l.state(),
+            InputState::Connecting {
+                attempt: 1,
+                since: until
+            }
+        );
+    }
+
+    /// The close on the build being connected: the same rule, from the Connecting arm.
+    #[test]
+    fn cloudflares_close_on_the_build_being_connected_rebuilds_a_base_wait_later() {
+        let th = t();
+        let at = LAST + th.input_hold_end_after_ms + 3_100;
+        let mut l = dropped(at - 10, &th);
+        let gen = l.generation();
+        assert!(
+            matches!(l.state(), InputState::Connecting { attempt, .. } if attempt > 1),
+            "setup: connecting a later attempt at {at}, {:?}",
+            l.state()
+        );
+        let want = fired_from(&l, at, &th);
+        assert_ne!(
+            today(&l, at, &th),
+            want,
+            "setup: today's link waits its attempt's step"
+        );
+        l.on_error(at, gen, HELD, Some(LAST), &th);
+        assert_eq!(l.state(), want);
+    }
+
+    /// Each error the rule must not read as the close, from Backoff and from Connecting: the outcome
+    /// is today's `on_lost(Error)`, and in every case that differs from the rule's, so a deleted guard
+    /// shows.
+    #[test]
+    fn an_error_the_rule_does_not_read_as_the_close_is_todays_loss() {
+        let th = t();
+        let backing_off = LAST + 29_000;
+        let connecting = LAST + th.input_hold_end_after_ms + 3_100;
+        let mut checked = 0;
+        for at in [backing_off, connecting] {
+            let base = dropped(at - 10, &th);
+            assert!(
+                !matches!(base.state(), InputState::Running { .. }),
+                "setup at {at}"
+            );
+            let cases: [(&str, BuildFacts, Option<Ms>); 4] = [
+                (
+                    "no handshake: a refused connect",
+                    BuildFacts::default(),
+                    Some(LAST),
+                ),
+                (
+                    "no handshake, with bytes",
+                    BuildFacts {
+                        handshake_completed: false,
+                        carried_media: true,
+                    },
+                    Some(LAST),
+                ),
+                (
+                    "the build carried media",
+                    BuildFacts {
+                        handshake_completed: true,
+                        carried_media: true,
+                    },
+                    Some(LAST),
+                ),
+                ("no frame to measure from", HELD, None),
+            ];
+            for (name, facts, last) in cases {
+                let mut l = base.clone();
+                let (was, fired) = (today(&l, at, &th), fired_from(&l, at, &th));
+                assert_ne!(was, fired, "setup: {name} at {at} is a witness");
+                l.on_error(at, l.generation(), facts, last, &th);
+                assert_eq!(l.state(), was, "{name} at {at}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 8, "cases checked: {checked}");
+    }
+
+    /// The 20 s gate's edge: 1 ms before it the error is today's (nothing, in Backoff); at it, the
+    /// rule fires. Read in a Backoff long enough that the two outcomes differ at both instants.
+    #[test]
+    fn the_rule_fires_from_the_gate_and_not_1_ms_before() {
+        let th = t();
+        let at = LAST + th.input_hold_end_after_ms;
+        let base = dropped(at - 10, &th);
+        assert!(
+            matches!(base.state(), InputState::Backoff { .. }),
+            "setup: {:?}",
+            base.state()
+        );
+        let gen = base.generation();
+
+        let mut early = base.clone();
+        assert_ne!(
+            today(&early, at - 1, &th),
+            fired_from(&early, at - 1, &th),
+            "setup: a witness"
+        );
+        early.on_error(at - 1, gen, HELD, Some(LAST), &th);
+        assert_eq!(early.state(), base.state(), "1 ms before the gate");
+
+        let mut on = base.clone();
+        on.on_error(at, gen, HELD, Some(LAST), &th);
+        assert_eq!(on.state(), fired_from(&base, at, &th), "at the gate");
+    }
+
+    /// Once an outage: the build the rule made errors the same way, and that is today's loss, both
+    /// while it connects and once it is given up.
+    #[test]
+    fn a_second_close_in_the_same_outage_is_todays_loss() {
+        let th = t();
+        let close = LAST + 29_000;
+        let mut l = dropped(close - 10, &th);
+        l.on_error(close, l.generation(), HELD, Some(LAST), &th);
+        let InputState::Backoff { until, .. } = l.state() else {
+            panic!("setup: fired, {:?}", l.state());
+        };
+        tick_through(&mut l, close, until, Some(LAST), &th);
+        assert!(
+            matches!(l.state(), InputState::Connecting { .. }),
+            "setup: rebuilt"
+        );
+
+        let at = until + 1_000;
+        let mut c = l.clone();
+        let want = today(&c, at, &th);
+        assert_ne!(want, fired_from(&c, at, &th), "setup: a witness");
+        c.on_error(at, c.generation(), HELD, Some(LAST), &th);
+        assert_eq!(c.state(), want, "connecting: the shot is spent");
+
+        let to = until + th.input_connect_timeout_ms + 500;
+        tick_through(&mut l, until + 10, to, Some(LAST), &th);
+        let parked = l.state();
+        assert!(matches!(parked, InputState::Backoff { .. }), "setup: {parked:?}");
+        assert_ne!(parked, fired_from(&l, to, &th), "setup: a witness");
+        l.on_error(to, l.generation(), HELD, Some(LAST), &th);
+        assert_eq!(l.state(), parked, "given up: the shot is spent");
+    }
+
+    /// Disarmed until the link's first Running: a session started into an idle input (F-032 finding
+    /// 6's no-publisher errors) keeps today's back-off, with no frame or with a frame stamp to measure
+    /// from (the arm alone).
+    #[test]
+    fn before_the_first_running_the_rule_never_fires() {
+        let th = t();
+        let mut checked = 0;
+        for last in [None, Some(0)] {
+            let mut l = InputLink::new();
+            let mut now = 0;
+            let mut errors = 0;
+            // Each build past the gate errors 100 ms in.
+            while now <= 4 * th.input_hold_end_after_ms {
+                if built(l.on_tick(now, &th)) && now >= th.input_hold_end_after_ms {
+                    let at = now + 100;
+                    let want = today(&l, at, &th);
+                    assert_ne!(want, fired_from(&l, at, &th), "setup: a witness at {at}");
+                    l.on_error(at, l.generation(), HELD, last, &th);
+                    assert_eq!(l.state(), want, "never Running, last frame {last:?}, at {at}");
+                    errors += 1;
+                    now = at;
+                }
+                now += 10;
+            }
+            assert!(errors >= 3, "errors checked: {errors}");
+            checked += errors;
+        }
+        assert!(checked >= 6, "errors checked: {checked}");
+    }
+
+    /// An error while Running is today's loss and leaves the shot armed: the builds that follow never
+    /// reach Running, and the close later in that outage still fires. An error from another generation
+    /// changes nothing.
+    #[test]
+    fn a_running_loss_and_another_generation_leave_the_shot_alone() {
+        let th = t();
+        let mut l = running(0);
+        let at = LAST + th.input_hold_end_after_ms;
+        let want = today(&l, at, &th);
+        l.on_error(at, 1, HELD, Some(LAST), &th);
+        assert_eq!(l.state(), want, "a Running build's error is a loss");
+
+        let close = at + 14_100;
+        tick_through(&mut l, at + 10, close - 10, Some(LAST), &th);
+        assert!(
+            matches!(l.state(), InputState::Backoff { attempt, .. } if attempt > 1),
+            "setup: {:?}",
+            l.state()
+        );
+        let parked = l.clone();
+        for gen in [l.generation() - 1, l.generation() + 1] {
+            l.on_error(close, gen, HELD, Some(LAST), &th);
+            assert_eq!(l, parked, "gen {gen}");
+        }
+        assert_ne!(
+            today(&l, close, &th),
+            fired_from(&l, close, &th),
+            "setup: a witness"
+        );
+        l.on_error(close, l.generation(), HELD, Some(LAST), &th);
+        assert_eq!(l.state(), fired_from(&parked, close, &th), "still armed");
+    }
+
+    /// The rule never delays a build: a close in the last base wait of a back-off keeps its due
+    /// instant, the count reset.
+    #[test]
+    fn the_rule_never_delays_a_build_already_due() {
+        let th = t();
+        let l0 = dropped(LAST + 29_000 - 10, &th);
+        let InputState::Backoff { until, .. } = l0.state() else {
+            panic!("setup: {:?}", l0.state())
+        };
+        let at = until - th.input_backoff_base_ms / 2;
+        let mut l = dropped(at - 10, &th);
+        assert_eq!(l.state(), l0.state(), "setup: the same back-off");
+        l.on_error(at, l.generation(), HELD, Some(LAST), &th);
+        assert_eq!(l.state(), InputState::Backoff { attempt: 1, until });
+    }
+
+    /// Re-armed only by Running: Running, a drop, the close fires, the phone back (Running), the next
+    /// drop, and its close fires again, three outages over.
+    #[test]
+    fn running_rearms_the_rule_for_the_next_outage() {
+        let th = t();
+        let mut l = running(0);
+        let mut last = LAST;
+        let mut fired = 0;
+        for outage in 0..3 {
+            let close = last + 29_000;
+            tick_through(&mut l, last + 10, close - 10, Some(last), &th);
+            let want = fired_from(&l, close, &th);
+            assert_ne!(today(&l, close, &th), want, "setup: outage {outage} is a witness");
+            l.on_error(close, l.generation(), HELD, Some(last), &th);
+            assert_eq!(l.state(), want, "outage {outage}'s close");
+            fired += 1;
+            // The phone is back: the rule's build delivers its first frame.
+            let InputState::Backoff { until, .. } = l.state() else {
+                unreachable!()
+            };
+            assert!(built(l.on_tick(until, &th)));
+            l.on_connected(until + 500, l.generation());
+            assert!(matches!(l.state(), InputState::Running { .. }));
+            last = until + 2_000;
+        }
+        assert_eq!(fired, 3, "outages checked: {fired}");
+    }
+
+    /// A phone that never returns: after the rule's one rebuild each build times out, and the builds
+    /// re-run the back-off's steps from the base. Derived from `backoff::delay` and the connect
+    /// timeout, then held against F-032's own schedule (the drop + 31.9, 38.9, 47.9, 60.9, 75.9;
+    /// today's +37, +52, +67, +82). The bound over many horizons is swept in `tests/hold_end.rs`.
+    #[test]
+    fn a_phone_that_never_returns_gets_the_backoffs_steps_once_more() {
+        let th = t();
+        let (base, cap, timeout) = (
+            th.input_backoff_base_ms,
+            th.input_backoff_cap_ms,
+            th.input_connect_timeout_ms,
+        );
+        let close = LAST + 29_000;
+        let horizon = close + 60_000;
+        let mut without = dropped(close - 10, &th);
+        let mut with = without.clone();
+        // Today's: the Backoff the close found runs out, then each step from its count.
+        let InputState::Backoff { attempt, until } = without.state() else {
+            panic!("setup: {:?}", without.state())
+        };
+        let mut want_today = vec![until];
+        for k in attempt.. {
+            let next = want_today[want_today.len() - 1] + timeout + delay(k, base, cap);
+            if next > horizon {
+                break;
+            }
+            want_today.push(next);
+        }
+        let mut want_with = vec![close + delay(0, base, cap)];
+        for k in 1.. {
+            let next = want_with[want_with.len() - 1] + timeout + delay(k, base, cap);
+            if next > horizon {
+                break;
+            }
+            want_with.push(next);
+        }
+        assert_eq!(
+            tick_through(&mut without, close, horizon, Some(LAST), &th),
+            want_today
+        );
+        with.on_error(close, with.generation(), HELD, Some(LAST), &th);
+        assert_eq!(
+            tick_through(&mut with, close, horizon, Some(LAST), &th),
+            want_with
+        );
+        // F-032's numbers, the finding's own.
+        assert_eq!(&want_with[..5], &[31_900, 38_900, 47_900, 60_900, 75_900]);
+        let rounded: Vec<Ms> = want_today.iter().take(4).map(|b| (b + 100) / 1_000).collect();
+        assert_eq!(rounded, vec![37, 52, 67, 82]);
+        // Both then run a capped step apart.
+        let last_gap = |b: &[Ms]| b.windows(2).last().map(|w| w[1] - w[0]);
+        assert_eq!(last_gap(&want_with), Some(timeout + cap));
+        assert_eq!(last_gap(&want_today), Some(timeout + cap));
     }
 }

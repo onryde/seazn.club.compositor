@@ -32,6 +32,15 @@ pub struct Thresholds {
     /// in-chain camera→overlay delay of 3 083–3 105 ms that includes it, so the overlay delay's
     /// default (F-002, ADR 0006) moves with this value.
     pub input_srt_latency_ms: Ms,
+    /// F-032 (Owed 108 fix (a); the coordinator's dispatch of 2026-10-26 relays the owner's approval):
+    /// Cloudflare's SRT playback holds a dropped publisher's broadcast about 30 s, then closes every
+    /// attached reader with an error. An input error at least this long after the last frame, on a
+    /// build whose handshake completed and that carried no media, is read as that close: the link
+    /// rebuilds a base wait later, its attempt count reset, once an outage (`input_link`). F-032's
+    /// bound: the errors at a new publisher's arrival come about 4 s after the last frame, no other
+    /// error fell between the drop + 10 s and the close, and the close came 27.9 to 29.2 s after the
+    /// last frame, which leaves 8 s of margin.
+    pub input_hold_end_after_ms: Ms,
     /// PDF failure table: "alert if it repeats > 3 times in 5 min" (alert when count EXCEEDS this).
     pub kick_alert_count: usize,
     /// PDF failure table: the "5 min" of "> 3 times in 5 min".
@@ -230,6 +239,7 @@ impl Default for Thresholds {
             input_connect_timeout_ms: 5_000,
             input_stall_after_ms: 5_000,
             input_srt_latency_ms: 1_000,
+            input_hold_end_after_ms: 20_000,
             kick_alert_count: 3,
             kick_window_ms: 300_000,
             output_backoff_base_ms,
@@ -438,6 +448,24 @@ mod tests {
     #[test]
     fn input_srt_latency_is_the_one_f002_measured() {
         assert_eq!(Thresholds::default().input_srt_latency_ms, 1_000);
+    }
+
+    // F-032 (Owed 108 fix (a)), each number from the finding, written here: the gate is 20 s; the
+    // errors at a new publisher's arrival came about 4 s after the last frame and no other error fell
+    // between the drop + 10 s and the close; the close came 27.9 to 29.2 s after the last frame. So
+    // the gate sits above every early error and below the earliest close, with the finding's 8 s of
+    // margin to it, and above the stall rule and the connect timeout, which come first in an outage.
+    #[test]
+    fn the_hold_end_gate_sits_between_f032s_early_errors_and_its_closes() {
+        let t = Thresholds::default();
+        assert_eq!(t.input_hold_end_after_ms, 20_000, "F-032's bound");
+        let (latest_early, earliest_close) = (10_000, 27_900);
+        assert!(t.input_hold_end_after_ms > latest_early);
+        assert!(
+            t.input_hold_end_after_ms + 7_900 <= earliest_close,
+            "F-032's 8 s of margin"
+        );
+        assert!(t.input_hold_end_after_ms > t.input_stall_after_ms + t.input_connect_timeout_ms);
     }
 
     // F-004 addendum: YouTube split the organiser's broadcast after a 30 s output gap and kept it

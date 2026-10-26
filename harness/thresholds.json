@@ -41,6 +41,7 @@
   "input_backoff_base_ms": 1000,
   "input_backoff_cap_ms": 10000,
   "input_connect_timeout_ms": 5000,
+  "input_hold_end_after_ms": 20000,
   "input_srt_latency_ms": 1000,
   "input_stall_after_ms": 5000,
   "kick_alert_count": 3,
