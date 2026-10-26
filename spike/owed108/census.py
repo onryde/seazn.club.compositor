@@ -2,18 +2,19 @@
 """census.py <results.jsonl>...: Cloudflare's close, reader by reader (F-032's counts).
 
 For each trial: the close (R0's first error; if R0 got none, the first error at least 10 s after the
-kill on a probe attached at that moment, and the line says R0 missed it; in a relay run the first error
-on a build started after the kill), and every reader still attached when it came: started after P2's
-connect and before the close, not yet decoded, and still running (a probe within its 8 s life; a relay
-build until its link's next build retires it). Each one ends one of three ways: closed (an error from
-1.5 s before the close to 2 s after it), re-attached (decoded after the close with no error) or silent
-(neither). With no close at all, a reader attached through +29.9..+31.2 is closed only by an error in
-that span. Then the readers started after the close (after P2's connect if that came later), and why
-each miss missed: `trial_end` cut it short, it started inside the spread of the close (before the last
-attached reader's error), it got an error later in its life (`error`), or it was silent for its whole
-8 s life. Errors count from the kill to the next trial's start (R0's tag repeats in every trial). Each
-reader's close error is counted once (in a relay run the build that times the close is also an attached
-one). Times are seconds from the kill. Zero readers counted is a failure."""
+kill on a probe started after P2's connect and before that error, and not decoded by it, and the line
+says R0 missed it; in a relay run the first error on a build started after the kill), and every reader
+still attached when it came: started after P2's connect and before the close, not yet decoded, and still
+running (a probe within its 8 s life; a relay build until its link's next build retires it). Each one
+ends one of three ways: closed (an error from 1.5 s before the close to 2 s after it), re-attached
+(decoded after the close with no error) or silent (neither). With no close at all, a reader attached
+through +29.9..+31.2 is closed only by an error in that span. Then the readers started after the close
+(after P2's connect if that came later), and why each miss missed: `trial_end` cut it short, it started
+inside the spread of the close (before the last attached reader's error), it got an error later in its
+life (`error`), or it was silent for its whole 8 s life. Errors count from the kill to the next trial's
+start (R0's tag repeats in every trial). Each reader's close error is counted once (in a relay run the
+build that times the close is also an attached one). Times are seconds from the kill. Zero
+readers counted is a failure."""
 import json
 import sys
 

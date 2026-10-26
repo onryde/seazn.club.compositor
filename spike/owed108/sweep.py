@@ -12,9 +12,10 @@ drop (SIGKILL, or SIGTERM for a clean close) unless named otherwise.
   window    probes started from P2's connect to the close: decoded / started.
   after     the first probe started at or after the close: start -> first frame.
   start     how the trial began: P1's connect after the previous publisher's end (and how it ended),
-            and what the HLS master served at the first poll after P1's connect. `fresh`: no master (the
-            previous broadcast was over). `held`: the previous broadcast's master, still 200; then when
-            it stopped (seconds from P1's connect) and when a new variant appeared.
+            and what the HLS master served at the trial's first poll. Polling starts with the trial, so
+            that poll can come before P1's connect (2.8 s before it in the RTMPS control). `fresh`: no
+            master (the previous broadcast was over). `held`: the previous broadcast's master, still
+            200; then when it stopped (seconds from P1's connect) and when a new variant appeared.
   hls       the HLS head (media sequence + segments) 4 s after the drop, once the segment in flight at
             the drop is out; when it first moved past that (a new publisher's media in HLS); whether
             every variant served after the drop was the one served before it; the first ENDLIST; the

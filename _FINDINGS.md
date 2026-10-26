@@ -2682,7 +2682,7 @@ early?
       RTMPS kill trials (F-032, where Cloudflare knew in 0.3 s) ended at +29.92 to +30.00 the same way.
     - The dead peer does cost 30 s, but elsewhere: in Cloudflare's status, and in HLS (finding 15).
 15. **What follows `timeoutSeconds` is HLS's hold, as R0 found. On SRT it starts only when Cloudflare
-    notices the drop. It is not a reconnect window.**
+    notices the drop.**
     - With no new publisher over SRT, the HLS master turned 204 at the drop + 42.3 at 10 and + 92.3 at
       60 (n=1 each), with no ENDLIST either time. That fits Cloudflare's SRT disconnect + `timeoutSeconds`
       + 2.0 s, with the disconnect at +30.3: measured in the trial at 10 (+30.30), inferred at 60 (no
@@ -2694,29 +2694,40 @@ early?
       still ended at +29.99.
     - So with nobody back, the master stays 200, frozen, for about `timeoutSeconds` + 32 s over SRT
       (n=1 each). About 212 s at 180 is an extrapolation, which matches the P5 session's ~213 s at 180.
-    - A publisher that comes back inside that time does not continue the stream. All 8 that did (each
-      `held` trial's P1, 40.3 to 75.4 s after the previous SIGKILL, after Cloudflare's disconnect read)
-      got a new HLS stream: the held master went 204 2.0 to 3.0 s after their connect, and a new variant
-      came up 8.1 to 9.3 s after their connect. Each trial also made its own recording (16 recordings for round 2's
-      16 trials). A publisher back inside the SRT hold (P2 at +5.8, before the disconnect read) kept the
-      variant, 12 of 12. Returns between those two times (+6 to +40) were not sampled.
-    - So `timeoutSeconds` + 32 is how long HLS shows a dead broadcast as live, not a window inside which
-      a return is seamless. An HLS reader (finding 16's second read path) has to reload the master after
-      a republish: the stream it was reading ends 2 to 3 s after the new publisher arrives, and the new
-      one has a new variant URL. (The old variant's URL was not polled after its master went 204; the
-      poll follows the master.)
+    - A publisher that came back after `timeoutSeconds` had passed did not continue the broadcast. All 8
+      such returns (each `held` trial's P1: 40.3, 45.4 and 75.4 s after the previous SIGKILL, at 10, 30
+      and 60) got a new HLS stream, with a new variant 8.1 to 9.3 s after their connect, and made their
+      own recording (16 recordings for round 2's 16 trials). At 30 and 60 the held master went 204 2.0 to
+      3.0 s after their connect, before its own end. At 10 its 204 (+2.0 to +2.2) fell on the previous
+      broadcast's own HLS end (+42.3), so there it cannot be told from that end. A return inside
+      `timeoutSeconds` (P2 at +5.8, 12 of 12) kept the variant.
+    - What bounds a continuing return is not measured. Two readings fit round 2, since every return that
+      lost the broadcast was past both bounds: it continues until Cloudflare's disconnect read (+30.3),
+      or it continues while the return is inside `timeoutSeconds` of the drop. Round 1 favours the second
+      at 180 (n=1): `probes-gaps` T3's P2 came back at +40.3, after the disconnect read, and made no new
+      recording; neither did any other round-1 P2 (+5.8 to +25.4). HLS was not polled then. That rests on
+      joining Cloudflare's recording list, read during the runs and not committed (the recordings are
+      deleted), to the committed publisher times. The trial that separates them is owed: a return between
+      +30.3 and `timeoutSeconds` (say +45 at 60), with HLS polled.
+    - "Continued" means the HLS variant and the recording, nothing more. Over SRT playback, which the
+      relay reads and on which design C2's property rests, no return was seamless at any time tried: in
+      all 12 trials with a P2, the +5.8 return included, R0 got no frame from about +2 to about +31, and
+      was then closed (in 2, it missed the close: finding 17).
+    - So `timeoutSeconds` + 32 is how long HLS shows a dead broadcast as live when nobody comes back. An
+      HLS reader (finding 16's second read path) has to reload the master after a return that starts a
+      new broadcast, since the new one has a new variant URL. (The old variant's URL was not polled after
+      its master went 204; the poll follows the master.)
     - For web, a recommendation for its owner, not a measured fact about web. Web serves the phone
       `holdWindowSeconds.srt` = 183: `holdWindowFor` (`apps/web/src/server/usecases/capture-phone.ts`:83-92)
       computes `INGEST_TIMEOUT_SECONDS` 180 + `HOLD_SLACK_SECONDS` 3 and never reads the ingest
       capability's `srt: null` (`ingest-cf.ts`:137); `capture-get.test.ts`:402-409 pins that. The field
       is described as how long the ingest holds a dropped publish before the broadcast ends, and design
       C2 relies on it as the window in which a reconnect is invisible on air
-      (`2026-09-07-streaming-programme-design.md`:997-1006). Over SRT with a killed publisher, 183 is
-      neither measured window: a return continued the broadcast at +5.8 and did not at +40.3 or later;
-      HLS shows the broadcast for about `timeoutSeconds` + 32; and SRT playback, which the relay reads,
-      closes at +30 to +31 at every setting tried. If the field means a seamless return, the measured
-      bound is below +40.3 and not yet narrowed. If it means the HLS end, it is about `timeoutSeconds`
-      + 32. Which it should mean is web's call.
+      (`2026-09-07-streaming-programme-design.md`:997-1006). Over SRT with a killed publisher, SRT
+      playback, which the relay reads, closes at +30 to +31 whatever the return, so no window is
+      invisible on air through the relay. For the broadcast's end, if a return continues while it is
+      inside `timeoutSeconds`, 183 fits at 180; if the disconnect read bounds it, the bound is about +30.
+      Which holds is not measured (above), so whether 183 stands is web's call once the owed trial is run.
 16. **HLS shows a new publisher about 19 s before Cloudflare's SRT close.** With P2 at +5.5, the HLS
     head moved again at +10.5 to +12.6 in all 12 trials with a P2, 4.7 to 6.8 s after P2's connect.
     SRT playback held to +30 to +31; the first reader started at or after the close decoded at +32.4 to
@@ -2837,8 +2848,8 @@ from Cloudflare's status and from HLS only.
   publisher's end (all but the first probe trial: the method). Round 2's 8 `held` trials started
   inside the previous broadcast's HLS hold, but 10 to 45 s after Cloudflare's disconnect read, so after
   its SRT hold.
-- The SRT hold at 10, 30 and 60 beyond one fresh broadcast each (finding 13), and a return between +6
-  and +40 s (finding 15).
+- The SRT hold at 10, 30 and 60 beyond one fresh broadcast each (finding 13), and a return between
+  Cloudflare's disconnect read (+30.3) and `timeoutSeconds`, with HLS polled (finding 15).
 - An input idle for minutes: the only no-publisher window is gap 40's 9 s, so how Cloudflare treats
   readers then, and so (a)'s cost for a gone phone, is not measured beyond it.
 - A real network loss, as against SIGKILL.
