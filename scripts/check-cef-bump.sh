@@ -17,8 +17,9 @@
 #   - GSTCEF_COMMIT differs from the record's line 1 (a bump with no Step 0 re-run on it).
 # It cannot see whether the run PASSED: the F-id's outcome is the recorder's word (never record a
 # failing run).
-# check.yml runs it, and so do deploy-stg.yml, deploy-prod.yml and promote.yml, as the step right
-# after each checkout (scripts/check-workflows.sh checks that they do).
+# check.yml runs it, and so do deploy-stg.yml and deploy-prod.yml, as the step right
+# after each checkout (scripts/check-workflows.sh checks that they do), and scripts/promote.sh runs
+# main's copy on the tree of the commit it promotes.
 #
 #   scripts/check-cef-bump.sh [ROOT]     (ROOT: the repo root; scripts/deploy_checks_test.sh points
 #                                         it at scratch copies)

@@ -31,7 +31,7 @@ config is the app itself. `fly/stg.toml` and `fly/prod.toml` record app name, or
 ## Workflows
 
 - **`deploy-stg.yml`:** on `push` to `main`, and `workflow_dispatch`.
-  1. If `secrets.FLY_API_TOKEN_STG` is empty: `echo "::warning::FLY_API_TOKEN_STG unset — push skipped"`,
+  1. (Superseded 2026-10-25: see the amendment "no GitHub environment" below.) If `secrets.FLY_API_TOKEN_STG` is empty: `echo "::warning::FLY_API_TOKEN_STG unset — push skipped"`,
      then exit 0.
   2. `flyctl auth docker`
   3. Build `docker/Dockerfile` (same `GSTCEF_COMMIT` build-arg as `image.yml`, read from one place:
@@ -44,7 +44,7 @@ config is the app itself. `fly/stg.toml` and `fly/prod.toml` record app name, or
 - **`deploy-prod.yml`:** on `push` of tags `v*.*.*`. Same as stg, with
   `registry.fly.io/seazn-relay-prod:<tag>` and secret `FLY_API_TOKEN_PROD`. It refuses unless the tag
   points at a commit on `main` (`git merge-base --is-ancestor $GITHUB_SHA origin/main`).
-- **`promote.yml`:** `workflow_dispatch` with inputs `env` (stg|prod) and `ref` (a sha or tag that
+- **`promote.yml`:** (Superseded 2026-10-25: see the amendment "no GitHub environment" below.) `workflow_dispatch` with inputs `env` (stg|prod) and `ref` (a sha or tag that
   must already exist in the registry), plus a GitHub **environment** `relay-<env>` with required
   reviewers (the owner), so promotion needs a human approval click.
   1. Same secret guard as above.
@@ -57,18 +57,20 @@ config is the app itself. `fly/stg.toml` and `fly/prod.toml` record app name, or
      only prints the diff. Record which one it is in the brief's commit.
   4. Write the previous and new `RELAY_IMAGE` to the summary, for rollback.
 
-**Rollback** is `promote.yml` with the previous ref. The runbook (C17) says so.
+**Rollback** is `promote.yml` with the previous ref. The runbook (C17) says so. (Superseded
+2026-10-25: rollback is `scripts/promote.sh` with the previous ref, which it prints.)
 
 ## Files
 
-- Create: `.github/workflows/{deploy-stg,deploy-prod,promote}.yml`
+- Create: `.github/workflows/{deploy-stg,deploy-prod,promote}.yml` (amended 2026-10-25: no
+  `promote.yml`; create `scripts/promote.sh`)
 - Create: `fly/stg.toml`, `fly/prod.toml`
 - Create: `docker/GSTCEF_COMMIT`. If C12 already created it, use it.
 - Modify: `.github/workflows/image.yml`, to read `docker/GSTCEF_COMMIT`
 - Create: `scripts/check-workflows.sh`. It runs `actionlint` (pinned version) and three static greps:
   - every workflow that uses a Fly token has the `::warning::` guard
   - none of them echo a `secrets.` value
-  - `promote.yml` declares an `environment:`
+  - `promote.yml` declares an `environment:` (superseded 2026-10-25: no workflow declares one)
 
   `check.yml` runs it.
 
@@ -79,13 +81,15 @@ config is the app itself. `fly/stg.toml` and `fly/prod.toml` record app name, or
 - [ ] **Step 2: Write the three workflows and the fly tomls.** Get the check green.
 - [ ] **Step 3: Mutate once each.**
   1. Remove the `::warning::` guard from `deploy-stg.yml`. Expected: check red.
-  2. Remove `environment:` from `promote.yml`. Expected: check red.
+  2. Remove `environment:` from `promote.yml`. Expected: check red. (Retargeted 2026-10-25: add
+     `environment: relay-stg-push` to deploy-stg.yml's push job.)
 - [ ] **Step 4: Live proof.**
   0. Re-pin the relay app: `flyctl apps list | grep seazn-relay`, and confirm `FLY_RELAY_APP` on
      `seazn-club-stg` names it (`flyctl secrets list -a seazn-club-stg`, or its `[env]`). If the app
      has another name, use that name in every registry ref and record the deviation.
   1. Merge to `main`, and confirm `deploy-stg` pushed. Paste the run URL and image ref.
-  2. Run `promote.yml env=stg` with that sha. **This is a live change on stg: confirm with the owner
+  2. Run `promote.yml env=stg` with that sha (amended 2026-10-25: the owner runs
+     `scripts/promote.sh stg <sha>@sha256:<digest>`, the command deploy-stg's summary prints). **This is a live change on stg: confirm with the owner
      first.** Then confirm with `flyctl secrets list -a seazn-club-stg` (digest changed) and paste it.
   3. Do not promote prod in this task. Prod promotion happens after C17 passes.
 - [ ] **Step 5: Commit and open the PR.** `ci(deploy): push relay images per env and promote by explicit approval (C16)`
@@ -141,7 +145,8 @@ that a **required, enforced step**, not a note.
   Never update the record over a failing run.
 - **New mutants:**
   3. Change `docker/GSTCEF_COMMIT` without touching the record. Expected: `check-cef-bump.sh` red.
-  4. Delete the gate step from `promote.yml`. Expected: `check-workflows.sh` red.
+  4. Delete the gate step from `promote.yml`. Expected: `check-workflows.sh` red. (Retargeted
+     2026-10-25: delete it from deploy-prod.yml.)
 
 ## Amendment 2026-10-23 (the CI build cache is untrusted for shipping)
 
@@ -185,6 +190,85 @@ too. This is defense in depth: no deploy workflow exists yet.
 - **New mutant:**
   6. Add `target: relay-test-hooks` to `deploy-stg.yml`'s build. Expected: `check-workflows.sh`
      red.
+
+## Amendment 2026-10-25 (no GitHub environment: a relay-only repository token, and a local promote)
+
+Owner, 2026-10-25, in chat, relayed by the coordinator: "Ok, I don't want to create the environment
+in github. and we cand add the rules in workflow so don't need all C16 rigts?", then, after a GHCR
+design: "No, I want to have Dockerfile and workflow build the image and push to fly". The reasoning
+is the compositor `_INDEX.md` decision row "C16 without GitHub environments". This replaces the
+environments of fix rounds 1 and 2 (PR #85) and the promote workflow.
+
+- **Push.** `deploy-stg.yml` (push to `main`, and `workflow_dispatch`) and `deploy-prod.yml` (`v*`
+  tags) build `docker/Dockerfile`'s relay target as before, log in with `flyctl auth docker`, and
+  push `registry.fly.io/seazn-relay-<env>:<sha or tag>`. The token is a **repository** secret,
+  `FLY_API_TOKEN_RELAY_STG` (prod: `FLY_API_TOKEN_RELAY_PROD`, minted only after C17), and it is a
+  deploy token for the relay app alone: `fly tokens create deploy -a seazn-relay-<env>`. No workflow
+  declares `environment:`, and the step that checked an environment's policy is gone.
+- **Main only, as hygiene.** The push job runs on `if: github.ref == 'refs/heads/main'` (prod:
+  `startsWith(github.ref, 'refs/tags/v')`), and its provenance step refuses any other ref. **This is
+  not a guard.** Any branch's own copy of a workflow can drop both and read a repository secret. The
+  owner accepted that risk. Its reach includes the stream keys of every live session on that relay
+  app (each Machine's env holds its session's job token: the `_INDEX.md` row, the PR #93 review's
+  I-2), so whether prod's token is ever a repository secret is owed to the owner. What it can ship
+  is bounded by the next bullet.
+- **A squat never ships.** Every push is attested (`actions/attest`, with `id-token` and
+  `attestations` write on the push job alone). Both paths, pushed and found in the registry, verify
+  the record with `gh attestation verify --cert-identity
+  https://github.com/onryde/seazn.club.compositor/.github/workflows/deploy-<env>.yml@<refs/heads/main
+  or refs/tags/<tag>>`, `--source-ref`, `--source-digest` and `--signer-digest` at the commit, and
+  `--deny-self-hosted-runners`. An image a branch pushed under a future main sha's tag fails main's
+  own run, and promote refuses it before it calls the web app. The Push step's digest is the one its
+  own `docker push` printed; the tag is read back only as a race check that fails the job before the
+  attest (the PR #93 review's C-1). Every step that logs docker in logs out on EXIT, and every action
+  in the push job is pinned by commit (m-2).
+- **Promote is `scripts/promote.sh`, run by the owner on their machine** with their stored flyctl
+  login (`flyctl auth login`), so no web-app token is ever in GitHub. `promote.yml` is removed.
+  - `scripts/promote.sh stg <sha>@sha256:<digest>`, or `scripts/promote.sh prod
+    <vX.Y.Z>@sha256:<digest> --confirm-prod`: the command deploy-<env>'s summary prints.
+  - In order, it refuses: a ref without its digest; prod without `--confirm-prod`, and stg with it; a
+    test seam set in the shell; a missing tool (git, jq, curl, flyctl, gh, sha256sum or shasum: no
+    docker, the PR #93 review's I-1); a copy of itself that is not main's; a commit not on `main`, or
+    whose own tree fails the CEF bump gate (main's copy of the gate); a pinned manifest that is not in
+    the registry, read by its digest with curl (only a 404 means not pushed), or whose body does not
+    hash to the pin; a manifest with no deploy-<env>.yml attestation for that commit at its ref
+    (`gh attestation verify` on the manifest file); an `[env]` RELAY_IMAGE on the web app (it prints
+    the seazn.club diff); and any other secret on the web app that is not Deployed. The tag is never
+    read. The registry read takes a 10-minute deploy token for the relay app alone, minted on the
+    operator's login into a 0600 curl config that is removed on exit, never in argv or any output.
+  - Then it prints the previous RELAY_IMAGE, from its own log (`~/.local/state/seazn-relay-promote/<env>.log`,
+    matched by Fly's digest of the live value, which is write-only), stages
+    `RELAY_IMAGE=registry.fly.io/seazn-relay-<env>@sha256:<pin>` (the digest alone), runs
+    `flyctl secrets deploy`, and proves the new digest reads Deployed. A secret list it cannot read
+    after the set or the deploy is a refusal that says what may be live.
+  - It drops FLY_API_TOKEN and FLY_ACCESS_TOKEN from its own environment, and never reads, prints or
+    needs a token value from the shell.
+- **Rollback** is `scripts/promote.sh` with the previous ref, which it prints.
+- **The gate.** `check-workflows.sh` adds these rules:
+  - no `environment:` in any workflow;
+  - a deploy workflow names only its own relay token, and only in its push job;
+  - no workflow names a web-app token or hands flyctl a `seazn-club-*` app;
+  - soak.yml's `FLY_API_TOKEN_SOAK` is the one other Fly secret, exempt by name;
+  - every step after the token guard reads it;
+  - write grants appear only as `id-token` and `attestations` on the two push jobs, plus image.yml's
+    cache job's `packages: write`;
+  - the attest step comes after the push, and the record check after the attest, with no `if` but
+    the guard's own;
+  - no promote workflow exists, by name or by a `flyctl secrets set|deploy` line;
+  - no secret is named by `toJSON(secrets)` (any case), and none is handed to a reusable workflow
+    outside this repository (m-1);
+  - every step that runs `flyctl auth docker` logs out on EXIT, and every action in a push job is
+    pinned by commit (m-2).
+
+  `deploy_checks_test.sh` runs promote.sh under fake flyctl, curl and gh, reaching every refusal, and
+  runs the workflows' own steps (the Push step's race included) under fake flyctl, docker and gh.
+- **Mutants 2 and 4 retarget** (promote.yml is gone):
+  2. Add `environment: relay-stg-push` to deploy-stg.yml's push job. Expected: `check-workflows.sh`
+     red.
+  4. Delete the CEF bump gate step from deploy-prod.yml. Expected: `check-workflows.sh` red.
+- **Acceptance, amended.** deploy-stg pushes and attests on `main` with the repository token. The
+  owner runs `scripts/promote.sh stg` once, on their go-ahead. No workflow names an environment or a
+  web-app token. The 6 brief mutants and each new rule's mutant are red.
 
 ## Do not touch
 

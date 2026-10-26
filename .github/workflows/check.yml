@@ -190,7 +190,8 @@ jobs:
   # and recorded in docker/CEF_STEP0_PASS. The workflow check: actionlint and shellcheck (pinned, the
   # script installs them with their checksums) and the deploy workflows' static rules; then its own
   # test, which reds each rule with a mutant on a scratch copy, runs the gate's cases, and runs
-  # promote.yml's and the deploy workflows' scripts under fake flyctl, docker and gh.
+  # the deploy workflows' scripts and scripts/promote.sh (the owner runs it locally: no promote
+  # workflow, C16 amendment 2026-10-25) under fake flyctl, docker and gh.
   deploy-checks:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
