@@ -58,8 +58,9 @@ Also include:
   own flyctl login; promote prints that command as its `Rollback:` line (C16, amendment 2026-10-25:
   promote.yml is removed). (Amended 2026-10-26, C16's moving tags.) While RELAY_IMAGE tracks `:beta`,
   roll back either way: pin a previous build with that command (each deploy-stg summary prints its
-  build's pin; while pinned, `:beta` is not followed), or let the next merge move `:beta` on. Re-running
-  an older deploy-stg run moves `:beta` back to that build
+  build's pin; while pinned, `:beta` is not followed), or let the next merge move `:beta` on. A re-run
+  of an older deploy-stg run never moves `:beta` back: it warns and prints that build's pin (PR #94
+  fix round 1)
 - **manual stop**: end the session in the organiser UI. **Never** `flyctl machine destroy` a live
   session's Machine, because the sweep would book an `r<n+1>`.
 
@@ -188,8 +189,13 @@ yet merged.
      If RELAY_IMAGE is pinned instead, record the pin, and that `:beta` is not followed.
   3. The stg fixture has a YouTube destination with a **private/unlisted** broadcast.
   4. The capture app build is the one in `seazn.club.capture` main.
+  5. (Amended 2026-10-26, the PR #94 review's m-5; this item needs the owner.) **Pin stg for the
+     run's duration**, so no merge during the run changes what new sessions take: on their go-ahead,
+     the owner runs `scripts/promote.sh stg <sha>@sha256:<x>` (the pin that `<x>`'s deploy-stg
+     summary prints) on their own flyctl login. Record its `following:` line (pinned). Step 6
+     re-tracks.
 
-  Record all four, with values (refs and ids only, no secrets).
+  Record all five, with values (refs and ids only, no secrets).
 - [ ] **Step 2: Book the run with the owner.** Book about 25 min. Share the runbook draft first.
 - [ ] **Step 3: Run the script, with the owner watching** YouTube, the organiser panel and the
   public fixture page. The orchestrator records each row's observed time and the owner's verdict.
@@ -209,9 +215,12 @@ yet merged.
   and 1280. Crop them; full-page captures flood context. **Store them in the acceptance PR's comment
   thread or the scratchpad, never in the repo** (house rule: no evidence PNGs in the repo).
 - [ ] **Step 5: Handle reds.** Any red is a finding against its owning task. Fix it there, through
-  the review loop, then re-run **the whole script**, not just the red row.
+  the review loop, then re-run **the whole script**, not just the red row. A fix that merges moves
+  `:beta`, not the pin: re-pin stg to the fix's build (Step 1 item 5) before the re-run.
 - [ ] **Step 6: Finish the paperwork.** Finish the runbook with the timings actually seen. Commit the
-  acceptance doc, plus the pointer-row update, as a PR in each repo.
+  acceptance doc, plus the pointer-row update, as a PR in each repo. (Amended 2026-10-26, the PR #94
+  review's m-5.) Then re-track: the owner runs `scripts/promote.sh stg --track beta`, and the
+  orchestrator records its `following:` line, so stg follows `:beta` again.
 - [ ] **Step 7: Prod.** Prod promotion is **not** part of this task. Ask the owner whether to tag
   `v0.1.0` and run `scripts/promote.sh prod v0.1.0@sha256:<digest> --confirm-prod` (C16, amendment
   2026-10-25), and only after FLY_API_TOKEN_RELAY_PROD exists: the owner mints it after this task passes, if the

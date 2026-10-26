@@ -18,7 +18,9 @@
 # (stg: deploy-stg.yml at refs/heads/main; prod: deploy-prod.yml at a release tag) of a commit on main
 # whose tree passes the CEF bump gate, by the same checks as a pin. From then on Fly runs what the tag
 # names whenever it creates a session's Machine: the bump is automatic, on merge (stg) or release tag
-# (prod), and promote's digest check is replaced by the workflow's own verify before it moves the tag.
+# (prod). deploy-<env>.yml verifies each build before it moves the tag, but nothing checks what the tag
+# names when Fly follows it: a push by any holder of the repository push token is followed too (the
+# owner declined a check at Machine create, 2026-10-26; the next deploy run reds on such a push).
 #
 # A pin is the way to freeze an env or roll it back: RELAY_IMAGE then names one digest, and while
 # pinned the tag is not followed. Rollback while tracking: pin a previous build with this script, or
@@ -400,7 +402,7 @@ echo "  previous RELAY_IMAGE:  $previous"
 echo "  RELAY_IMAGE's digest:  $before -> $after_digest (Deployed)"
 if [ -n "$track" ]; then
   echo "  following:             :$moving, which names $pin now ($tag, main's build of $commit)"
-  echo "Fly runs what it names whenever it creates a session's Machine: deploy-$env.yml moves it on every $event, once that build's record verifies, and running Machines keep theirs. To freeze $env at this build: scripts/promote.sh $env $tag@$pin$suffix"
+  echo "Fly runs what it names whenever it creates a session's Machine: deploy-$env.yml moves it on every $event, once that build's record verifies, and running Machines keep theirs. Nothing checks what it names when Fly follows it: a push by any holder of the repository push token is followed too. To freeze $env at this build: scripts/promote.sh $env $tag@$pin$suffix"
 else
   echo "  following:             no: pinned to $pin. deploy-$env.yml still moves :$moving on every $event, and while pinned it is not followed. To follow it: scripts/promote.sh $env --track $moving$suffix"
 fi

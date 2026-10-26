@@ -11,8 +11,8 @@
 #    deploy-stg.yml, (6) target: relay-test-hooks in deploy-stg.yml; then one per rule or refusal
 #    each review added (e*, m*, i*), and one per rule the 2026-10-25 shape added (n*: no GitHub
 #    environment, the secrets each workflow may name, no web-app token, the steps after the guard,
-#    main only, the build record's order, the write grants, no promote workflow), and t1 to t17 for
-#    rule 16, the moving tags (amendment 2026-10-26).
+#    main only, the build record's order, the write grants, no promote workflow), and t1 to t27 for
+#    rule 16, the moving tags (amendment 2026-10-26, and the PR #94 review's fix round).
 # 2. scripts/check-cef-bump.sh: green on the repo; red on the brief's mutant (3), GSTCEF_COMMIT
 #    changed without the record, on each malformed record, and on a record whose finding is no
 #    Step 0 run on its commit (m-8); green again once the record and its finding follow the bump.
@@ -638,9 +638,9 @@ expect_red "n13b a workflow that changes Fly secrets" 'soak.yml changes Fly secr
 
 PUSH_TRAP="          trap 'docker logout \"\$RELAY_REGISTRY\" > /dev/null 2>&1 || true' EXIT"
 # n16 (the PR #93 review's m-1). Every secret at once, by toJSON in any case: no rule can read it.
-fresh; edit "$W/wf/$STG" '          NEW: ${{ steps.track.outputs.new }}
+fresh; edit "$W/wf/$STG" '          SKIPPED: ${{ steps.track.outputs.skipped }}
         run: |
-          ref=' '          NEW: ${{ steps.track.outputs.new }}
+          ref=' '          SKIPPED: ${{ steps.track.outputs.skipped }}
           ALL: ${{ toJson(secrets) }}
         run: |
           ref='
@@ -724,12 +724,27 @@ fresh; edit "$W/wf/$STG" "      - name: Free disk space
 "
 expect_red "n24b deploy-stg's Free disk space behind a widened guard" 'push.Free disk space comes after the FLY_API_TOKEN_RELAY_STG guard but does not read it'
 
-# t1 to t17 (owner, 2026-10-26: the moving tags, rule 16): each red by its own reason. TRACK_STG and
+# t1 to t27 (owner, 2026-10-26: the moving tags, rule 16): each red by its own reason. TRACK_STG and
 # TRACK_PROD are each push job's track step, up to the summary.
 TRACK_STG='      # The moving tag (owner, 2026-10-26: ":beta" on every merge)'
 TRACK_PROD='      # The moving tag (owner, 2026-10-26: ":stable" on every release tag)'
 SUMMARY_STEP='      - name: Summary
 '
+# move_after_copy FILE START (t25, t26: a check after the copy has already moved the tag): cut the block
+# from the line START to its fi, and paste it after the copy.
+move_after_copy() {
+  python3 -I -c '
+import sys
+p, start = sys.argv[1:3]
+s = open(p).read()
+assert s.count(start) == 1, f"{s.count(start)} matches for {start!r}"
+i = s.index(start)
+j = s.index("\n          fi\n", i) + len("\n          fi\n")
+block, s = s[i:j], s[:i] + s[j:]
+k = s.index("\n", s.index("docker buildx imagetools create --prefer-index=false")) + 1
+open(p, "w").write(s[:k] + block + s[k:])
+' "$1" "$2"
+}
 
 # t1. No track step: nothing moves :beta.
 fresh; cut_block "$W/wf/$STG" "$TRACK_STG" "$SUMMARY_STEP"
@@ -824,6 +839,69 @@ expect_red "t16 deploy-prod.yml missing: 1 of 2 moving tags" 'moving tags: 1 of 
 # t17. Each push job owes its own: deploy-prod without its track step, deploy-stg's still there.
 fresh; cut_block "$W/wf/$PROD" "$TRACK_PROD" "$SUMMARY_STEP"
 expect_red "t17 deploy-prod without its track step" 'deploy-prod.yml (moving tag): job push has 0 steps with id track, not 1: nothing moves :stable'
+
+# t18 to t20 (the PR #94 review's items 2 and 3): the track step checks, before its copy, that this build
+# is the newest (stg: main's tip; prod: the highest release tag) and that the old tag is main's own build.
+
+# t18. deploy-stg without the tip check.
+fresh; edit "$W/wf/$STG" '          if [ "$tip" != "$GITHUB_SHA" ]; then' '          if false; then'
+expect_red "t18 deploy-stg moves :beta without checking main's tip" "deploy-stg.yml (moving tag): job push: the track step never checks, before the copy, that this build is the newest"
+
+# t19. deploy-prod without the highest-tag check.
+fresh; edit "$W/wf/$PROD" '          if [ "$highest" != "$TAG" ]; then' '          if [ "$highest" = "" ]; then'
+expect_red "t19 deploy-prod moves :stable without checking the highest tag" "deploy-prod.yml (moving tag): job push: the track step never checks, before the copy, that this build is the newest"
+
+# t20. deploy-stg without the old tag's check.
+fresh; edit "$W/wf/$STG" '          if [ "$old" != none ] && ! gh attestation verify' '          if false && ! gh attestation verify'
+expect_red "t20 deploy-stg moves :beta without checking the old one" "deploy-stg.yml (moving tag): job push: the track step never checks, before the copy, that the old :beta is main's own build"
+
+# t21. (the review's m-3) The record check's output after its fi, so it is written on every path (rule
+# 16's after-the-elif half; t12 is the before-the-verify half).
+fresh; edit "$W/wf/$STG" '            echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          elif' '          elif'
+edit "$W/wf/$STG" '          fi
+      # The moving tag (owner, 2026-10-26: ":beta"' '          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+      # The moving tag (owner, 2026-10-26: ":beta"'
+expect_red "t21 deploy-stg's record check outputs its digest after its fi" 'deploy-stg.yml (moving tag): job push: the record check does not write digest= to GITHUB_OUTPUT once, on its verified branch alone'
+
+# t22 to t24 (the review's m-4): the other ways a step can write a moving tag, each outside a track step.
+
+# t22. docker image push.
+fresh; edit "$W/wf/$STG" '          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          docker tag' '          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          docker image push "$RELAY_REGISTRY/$RELAY_APP:beta"
+          docker tag'
+expect_red "t22 deploy-stg's Push step runs docker image push :beta" 'deploy-stg.yml (moving tag): push.Push retags outside a track step: docker image push'
+
+# t23. docker manifest push.
+fresh; edit "$W/wf/$PROD" '          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          docker tag' '          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          docker manifest push "$RELAY_REGISTRY/$RELAY_APP:stable"
+          docker tag'
+expect_red "t23 deploy-prod's Push step runs docker manifest push :stable" 'deploy-prod.yml (moving tag): push.Push retags outside a track step: docker manifest push'
+
+# t24. buildx build --push, the tag before the flag.
+fresh; edit "$W/wf/$STG" '          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          docker tag' '          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          docker buildx build -t "$RELAY_REGISTRY/$RELAY_APP:beta" --push .
+          docker tag'
+expect_red "t24 deploy-stg's Push step runs buildx build --push with :beta" 'deploy-stg.yml (moving tag): push.Push retags outside a track step: docker buildx build -t'
+
+# t25. deploy-stg's tip check after the copy (an older run would move :beta, then skip).
+fresh; move_after_copy "$W/wf/$STG" '          if [ "$tip" != "$GITHUB_SHA" ]; then'
+expect_red "t25 deploy-stg checks main's tip after the copy" "deploy-stg.yml (moving tag): job push: the track step never checks, before the copy, that this build is the newest"
+
+# t26. deploy-prod's old-tag check after the copy (it would read the build it just copied).
+fresh; move_after_copy "$W/wf/$PROD" '          if [ "$old" != none ] && ! gh attestation verify'
+expect_red "t26 deploy-prod checks the old :stable after the copy" "deploy-prod.yml (moving tag): job push: the track step never checks, before the copy, that the old :stable is main's own build"
+
+# t27. A plain docker tag onto the moving tag by its variable, not its name.
+fresh; edit "$W/wf/$STG" '          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          docker tag' '          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          docker tag "$ref" "$moving"
+          docker tag'
+expect_red "t27 deploy-stg's Push step tags \$moving" 'deploy-stg.yml (moving tag): push.Push retags outside a track step: docker tag "$ref" "$moving"'
 
 # ---------------------------------------------------------------- 2. check-cef-bump.sh
 pin=$(tr -d '[:space:]' < "$root/docker/GSTCEF_COMMIT")
@@ -1214,10 +1292,10 @@ state() {
   echo "2026-10-21T10:00:00Z prod v1.0.0@$D_GONE $REG/seazn-relay-prod@$D_GONE d0" > "$PLOG/prod.log"
 }
 # run_step SCRIPT VAR=VALUE...: a workflow's block under the runner's shell (bash -eo pipefail), in
-# the scratch repository, fakes first on PATH.
+# the scratch repository (or STEP_DIR, a checkout of it), fakes first on PATH.
 run_step() {
   local script=$1; shift
-  if (cd "$g" && env -i PATH="$W/bin:$PATH" HOME="$W" RUNNER_TEMP="$W/rt" GITHUB_STEP_SUMMARY="$W/summary" \
+  if (cd "${STEP_DIR:-$g}" && env -i PATH="$W/bin:$PATH" HOME="$W" RUNNER_TEMP="$W/rt" GITHUB_STEP_SUMMARY="$W/summary" \
     GITHUB_OUTPUT="$W/output" GITHUB_REPOSITORY=onryde/seazn.club.compositor GITHUB_RUN_ID=999 GITHUB_SERVER_URL=https://github.com \
     GITHUB_REF=refs/heads/main GITHUB_SHA="$H" STATE="$STATE" RELAY_REGISTRY="$REG" GH_TOKEN=fake-gh \
     EXPECT_PUSH=fake-stg-push "$@" \
@@ -1448,6 +1526,16 @@ for wf in "$STG:seazn-relay-stg:$SHA" "$PROD:seazn-relay-prod:v1.2.3"; do
   else
     bad "$file summary with NEW != DIGEST: rc $rc"; show
   fi
+  # A move the track step skipped (an older build: the PR #94 review's item 2) is no red: the summary says
+  # the tag stayed, that nothing live changed, and still prints the pin.
+  moving=beta; [ "$file" = "$STG" ] || moving=stable
+  state; run_step "$W/summary.sh" RELAY_APP="$app" TAG="$tag" FOUND=false DIGEST="$D_NEW" OLD="$D_OLD" NEW= SKIPPED="this build is older"
+  if [ "$rc" -eq 0 ] && has "$W/summary" "\`$REG/$app:$moving\` not moved: this build is older. It still names \`$D_OLD\`, so nothing live changed" \
+    && ! has "$W/summary" 'now runs this build' && has "$W/summary" "scripts/promote.sh ${app#seazn-relay-} $tag@$D_NEW"; then
+    ok "$file summary: a skipped move is reported as not moved, nothing live changed, with the pin"
+  else
+    bad "$file summary with a skipped move: rc $rc"; show
+  fi
 done
 
 # The moving tag (owner, 2026-10-26), each push job's track step. tag_now REF: the digest REF names in the
@@ -1466,34 +1554,57 @@ if [[ "$m1" =~ ^sha256:[0-9a-f]{64}$ ]] && [ "$m1" != "$D_NEW" ] && [ "$m2" = "$
 else
   bad "the copy model: m1 '$m1' m2 '$m2' m3 '$m3'"; show
 fi
-# track_case FILE APP MOVING TAG TOKEN: the step moves MOVING to the DIGEST it is given (the record
-# check's output), never to what TAG names now: here a squat moved the sha's (or release's) tag first.
+# The checkouts a track step runs in: step-h, main at h with the releases v1.0.0, v1.1.0 and v1.2.3 (its
+# origin is the scratch GitHub, whose main is h); step-two, v1.2.4 as well (two release tags pushed
+# together); step-notags, no tag at all; step-c, an origin whose main is c.
+git clone -q "$g" "$W/step-h"; git -C "$W/step-h" tag -d v1.2.4 v1.9.0 > /dev/null
+git clone -q "$g" "$W/step-two"; git -C "$W/step-two" tag -d v1.9.0 > /dev/null
+git clone -q "$g" "$W/step-notags"; git -C "$W/step-notags" tag -l | xargs git -C "$W/step-notags" tag -d > /dev/null
+git clone -q "$g" "$W/main-at-c"; git -C "$W/main-at-c" update-ref refs/heads/main "$C"
+git clone -q "$g" "$W/step-c"; git -C "$W/step-c" remote set-url origin "$W/main-at-c"
+# Each track step's own check of the old tag (the PR #94 review's item 3), as its argv is logged.
+RE_PROD_TAGS='^https://github\.com/onryde/seazn\.club\.compositor/\.github/workflows/deploy-prod\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+# The track steps: each moves its tag to the DIGEST it is given (the record check's output), never to what
+# TAG names now (here a squat moved the sha's, or the release's, tag first); only when this build is the
+# newest (stg: main's tip; prod: the highest release tag); and after checking the old tag is main's own.
 track_checked=0
 for wf in "$STG:seazn-relay-stg:beta:$SHA:fake-stg-push" "$PROD:seazn-relay-prod:stable:v1.2.3:fake-prod-push"; do
   IFS=: read -r file app moving tag token <<< "$wf"
   extract "$file" push track "$W/track.sh"
   args=(RELAY_APP="$app" TAG="$tag" FLY_API_TOKEN="$token" EXPECT_PUSH="$token")
   mv_ref="$REG/$app:$moving"
+  if [ "$file" = "$STG" ]; then
+    oldcheck="--repo $REPO --cert-identity $ID_STG --source-ref refs/heads/main --deny-self-hosted-runners --limit 1000"
+    nonewest_dir=$g nonewest_text="main's tip could not be read"
+    older=(GITHUB_SHA="$OLD" TAG="$OLD") older_pin="scripts/promote.sh stg $OLD@$D_NEW"
+    older_why="$OLD is not main's tip ($H)" squat_text="it is no main build"
+  else
+    oldcheck="--repo $REPO --cert-identity-regex $RE_PROD_TAGS --deny-self-hosted-runners --limit 1000"
+    nonewest_dir=$W/step-notags nonewest_text="no release tag could be read from this checkout"
+    older=(TAG=v1.1.0) older_pin="scripts/promote.sh prod v1.1.0@$D_NEW --confirm-prod"
+    older_why="v1.1.0 is not the highest release tag (v1.2.3)" squat_text="it is no release build"
+  fi
   # The verified build stays addressable by its digest in this app's repository, whatever its tag names.
   seed() { blob "$app" "$B_NEW"; echo "$REG/$app $D_NEW" >> "$STATE/manifests"; }
-  # T1: the verified digest, with the sha's tag already moved to a squat.
+  # T1: the verified digest, with the sha's tag already moved to a squat; the old tag is main's build.
   state; seed; old1=$(tag_now "$mv_ref")
   sed "s|^$REG/$app:$tag .*|$REG/$app:$tag $D_SQ|" "$STATE/registry" > "$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/registry"; blob "$app" "$B_SQ"
-  run_step "$W/track.sh" "${args[@]}" DIGEST="$D_NEW"
+  STEP_DIR=$W/step-h run_step "$W/track.sh" "${args[@]}" DIGEST="$D_NEW"
   r1=$rc o1=$(cat "$W/output") now1=$(tag_now "$mv_ref") l1=false; logs_out && l1=true
   c1=$(grep -c "^docker buildx imagetools create --prefer-index=false --tag $mv_ref $REG/$app@$D_NEW$" "$STATE/log" || true)
+  v1=$(grep -cxF "gh attestation verify oci://$REG/$app@$old1 $oldcheck" "$STATE/log" || true)
   bytag1=$(grep -c "imagetools inspect $REG/$app:$tag" "$STATE/log" || true) said1=false
   has "$W/step.out" "$mv_ref: $old1 -> $D_NEW" && said1=true
-  # T2: the first move: no tag yet.
+  # T2: the first move: no tag yet, so no old tag to check.
   state; seed; awk -v r="$mv_ref" '$1 != r' "$STATE/registry" > "$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/registry"
-  run_step "$W/track.sh" "${args[@]}" DIGEST="$D_NEW"
-  r2=$rc o2=$(cat "$W/output") now2=$(tag_now "$mv_ref")
+  STEP_DIR=$W/step-h run_step "$W/track.sh" "${args[@]}" DIGEST="$D_NEW"
+  r2=$rc o2=$(cat "$W/output") now2=$(tag_now "$mv_ref") v2=$(grep -c '^gh ' "$STATE/log" || true)
   if [ "$r1" -eq 0 ] && [ "$now1" = "$D_NEW" ] && [ "$o1" = "old=$old1"$'\n'"new=$D_NEW" ] && [ "$l1" = true ] && [ "$c1" -eq 1 ] \
-    && [ "$bytag1" -eq 0 ] && [ "$said1" = true ] && [[ "$old1" =~ ^sha256: ]] \
-    && [ "$r2" -eq 0 ] && [ "$now2" = "$D_NEW" ] && [ "$o2" = "old=none"$'\n'"new=$D_NEW" ]; then
-    ok "$file track: :$moving moved $old1 -> $D_NEW, the DIGEST it was given (the sha's tag named a squat: never read), by one carbon copy, read back, logged out after; the first move reads old=none"
+    && [ "$v1" -eq 1 ] && [ "$bytag1" -eq 0 ] && [ "$said1" = true ] && [[ "$old1" =~ ^sha256: ]] \
+    && [ "$r2" -eq 0 ] && [ "$now2" = "$D_NEW" ] && [ "$o2" = "old=none"$'\n'"new=$D_NEW" ] && [ "$v2" -eq 0 ]; then
+    ok "$file track: :$moving moved $old1 -> $D_NEW, the DIGEST it was given (the sha's tag named a squat: never read), by one carbon copy, read back, logged out after, once the old tag verified as main's build; the first move reads old=none and checks nothing old"
   else
-    bad "$file track: rc $r1/$r2, now '$now1'/'$now2', out '$o1' / '$o2', copies $c1, logout $l1"; show
+    bad "$file track: rc $r1/$r2, now '$now1'/'$now2', out '$o1' / '$o2', copies $c1, old checks $v1/$v2, logout $l1"; show
   fi
   track_checked=$((track_checked + 1))
   # The refusals: each leaves the tag where it was, and writes no output.
@@ -1501,29 +1612,92 @@ for wf in "$STG:seazn-relay-stg:beta:$SHA:fake-stg-push" "$PROD:seazn-relay-prod
            "a malformed digest|sha256:xyz|no verified digest to move :$moving to ('sha256:xyz')" \
            "the old tag unreadable|registry-down|the registry could not be read for $mv_ref (only 'not found' means none yet)" \
            "the old tag names no digest|junk|$mv_ref resolved to no manifest digest: 'junk'" \
+           "the newest build unreadable|nonewest|$nonewest_text" \
            "the copy fails|create-fails|" \
            "the tag moved under the copy|squat-after-create|$mv_ref names '$D_SQ' after the move, not the verified $D_NEW"; do
     IFS='|' read -r label how text <<< "$t"
-    state; seed; before=$(tag_now "$mv_ref") digest=$D_NEW
+    state; seed; before=$(tag_now "$mv_ref") digest=$D_NEW sd=$W/step-h
     case "$how" in
       '' | sha256:*) digest=$how ;;
       junk) sed "s|^$mv_ref .*|$mv_ref junk|" "$STATE/registry" > "$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/registry"; before=junk ;;
       squat-after-create) echo "$D_SQ" > "$STATE/squat-after-create"; before=$D_SQ ;;
+      nonewest) sd=$nonewest_dir ;;
       *) touch "$STATE/$how" ;;
     esac
-    run_step "$W/track.sh" "${args[@]}" DIGEST="$digest"
+    STEP_DIR=$sd run_step "$W/track.sh" "${args[@]}" DIGEST="$digest"
     after=$(tag_now "$mv_ref")
     if [ "$rc" -ne 0 ] && [ ! -s "$W/output" ] && [ "$after" = "$before" ] \
       && { [ -z "$text" ] || grep -F '::error::' "$W/step.out" | grep -qF -- "$text"; } \
-      && { [ -n "$how" ] && [[ "$how" != sha256:* ]] || ! grep -q '^docker buildx imagetools create' "$STATE/log"; }; then
+      && { { [ -n "$how" ] && [[ "$how" != sha256:* ]] && [ "$how" != nonewest ]; } || ! grep -q '^docker buildx imagetools create' "$STATE/log"; }; then
       ok "$file track refuses $label: no output, :$moving still '$after'$( [ -z "$text" ] || echo " :: $text")"
     else
       bad "$file track, $label: rc $rc, :$moving '$before' -> '$after', out '$(cat "$W/output")'"; show
     fi
     track_checked=$((track_checked + 1))
   done
+  # T3 (item 2): an older build (stg: not main's tip; prod: not the highest release tag) moves nothing and
+  # is no red: a warning that names the pin, and the skip in its output for the summary.
+  state; seed; before=$(tag_now "$mv_ref")
+  STEP_DIR=$W/step-h run_step "$W/track.sh" "${args[@]}" "${older[@]}" DIGEST="$D_NEW"
+  if [ "$rc" -eq 0 ] && [ "$(tag_now "$mv_ref")" = "$before" ] && [ "$(cat "$W/output")" = "old=$before"$'\n'"skipped=$older_why" ] \
+    && has "$W/step.out" "::warning::$mv_ref not moved: $older_why" && has "$W/step.out" "To run this build anyway, pin it: $older_pin" \
+    && ! grep -q '^docker buildx imagetools create' "$STATE/log" && ! grep -q '^gh ' "$STATE/log"; then
+    ok "$file track: an older build ($older_why) leaves :$moving at $before, warns with the pin, and says so to the summary"
+  else
+    bad "$file track, an older build: rc $rc, out '$(cat "$W/output")'"; show
+  fi
+  track_checked=$((track_checked + 1))
+  # T4 (item 3): the old tag is no main build (a push from outside main's deploy). The move still goes
+  # ahead, which restores main's build, and the step fails so the owner sees it.
+  state; seed; sed "s|^$mv_ref .*|$mv_ref $D_ANY|" "$STATE/registry" > "$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/registry"
+  STEP_DIR=$W/step-h run_step "$W/track.sh" "${args[@]}" DIGEST="$D_NEW"
+  if [ "$rc" -ne 0 ] && [ "$(tag_now "$mv_ref")" = "$D_NEW" ] && [ "$(cat "$W/output")" = "old=$D_ANY"$'\n'"new=$D_NEW" ] \
+    && grep -F '::error::' "$W/step.out" | grep -qF "$mv_ref named $D_ANY before this move, and $squat_text" \
+    && has "$W/step.out" "the owner must check who moved it" \
+    && [ "$(grep -c '^docker buildx imagetools create' "$STATE/log")" -eq 1 ]; then
+    ok "$file track: an old :$moving that is no deploy's build ($D_ANY; $squat_text) is moved back to the verified $D_NEW, and the step fails naming it"
+  else
+    bad "$file track, a squatted old tag: rc $rc, :$moving '$(tag_now "$mv_ref")', out '$(cat "$W/output")'"; show
+  fi
+  track_checked=$((track_checked + 1))
 done
-[ "$track_checked" -eq 14 ] || bad "the track step sweep checked $track_checked cases, not 14"
+# T5 (item 2): two release tags pushed together run in either order; :stable ends on the higher one, and
+# the lower one's run skips in both orders. :stable starts on v1.1.0's build, here D_OLD (its record added).
+extract "$PROD" push track "$W/track.sh"
+two_order() { # two_order FIRST SECOND: run each release's track step in that order; prints what :stable names, and the skips
+  local t d skips=0
+  state; blob seazn-relay-prod "$B_OLD"; blob seazn-relay-prod "$B_NEW"
+  printf '%s\n' "$REG/seazn-relay-prod $D_NEW" "$REG/seazn-relay-prod $D_ANY" >> "$STATE/manifests"
+  sed "s|^$REG/seazn-relay-prod:stable .*|$REG/seazn-relay-prod:stable $D_OLD|" "$STATE/registry" > "$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/registry"
+  attest_line "$D_OLD" "$WFURL/deploy-prod.yml@refs/tags/v1.1.0" refs/tags/v1.1.0 "$B" >> "$STATE/attestations"
+  for t in "$@"; do
+    d=$D_NEW; [ "$t" = v1.2.3 ] || d=$D_ANY
+    : > "$W/output"
+    STEP_DIR=$W/step-two run_step "$W/track.sh" RELAY_APP=seazn-relay-prod TAG="$t" FLY_API_TOKEN=fake-prod-push EXPECT_PUSH=fake-prod-push DIGEST="$d"
+    [ "$rc" -eq 0 ] || { echo "rc$rc"; return; }
+    if grep -q '^skipped=v1.2.3 is not the highest release tag (v1.2.4)$' "$W/output"; then skips=$((skips + 1)); fi
+  done
+  echo "$(tag_now "$REG/seazn-relay-prod:stable") $skips"
+}
+ab=$(two_order v1.2.3 v1.2.4) ba=$(two_order v1.2.4 v1.2.3)
+if [ "$ab" = "$D_ANY 1" ] && [ "$ba" = "$D_ANY 1" ]; then
+  ok "deploy-prod track: v1.2.3 and v1.2.4 pushed together, in either order, leave :stable on v1.2.4's build; v1.2.3's run skips both times"
+else
+  bad "deploy-prod track, two tags at once: v1.2.3 then v1.2.4 '$ab', v1.2.4 then v1.2.3 '$ba'"; show
+fi
+track_checked=$((track_checked + 1))
+# T6 (item 2): release numbers compare as versions, and only vX.Y.Z tags count: v1.10.0 is above v1.9.0,
+# and v9.0.0-rc1 is no release (a plain sort would pick v1.9.0 and skip; no filter would pick the rc).
+git clone -q "$g" "$W/step-ten"; git -C "$W/step-ten" tag v1.10.0 "$C"; git -C "$W/step-ten" tag v9.0.0-rc1 "$C"
+state; blob seazn-relay-prod "$B_NEW"; echo "$REG/seazn-relay-prod $D_NEW" >> "$STATE/manifests"
+STEP_DIR=$W/step-ten run_step "$W/track.sh" RELAY_APP=seazn-relay-prod TAG=v1.10.0 FLY_API_TOKEN=fake-prod-push EXPECT_PUSH=fake-prod-push DIGEST="$D_NEW"
+if [ "$rc" -eq 0 ] && [ "$(tag_now "$REG/seazn-relay-prod:stable")" = "$D_NEW" ] && ! grep -q '^skipped=' "$W/output"; then
+  ok "deploy-prod track: v1.10.0 is the highest release beside v1.9.0 and v9.0.0-rc1, and moves :stable to $D_NEW"
+else
+  bad "deploy-prod track, v1.10.0 beside v1.9.0 and v9.0.0-rc1: rc $rc, :stable '$(tag_now "$REG/seazn-relay-prod:stable")', out '$(cat "$W/output")'"; show
+fi
+track_checked=$((track_checked + 1))
+[ "$track_checked" -eq 22 ] || bad "the track step sweep checked $track_checked cases, not 22"
 echo "track step cases checked: $track_checked"
 
 # The chain, through the steps' own outputs, as the runner threads them (the C-1 rule, then the found
@@ -1532,7 +1706,7 @@ echo "track step cases checked: $track_checked"
 # given its (empty) output refuses.
 out_of() { sed -n "s/^$1=//p" "$W/output"; }
 extract "$STG" push exists "$W/exists.sh"; extract "$STG" push push "$W/push.sh"; extract "$STG" push record "$W/record.sh"; extract "$STG" push track "$W/track.sh"
-chain() { # chain PATH: run the steps for that path; sets c_rec (record's rc), c_track (track's rc), c_beta (what :beta names)
+chain() { # chain PATH DIR: run the steps for that path, the track step in checkout DIR; sets c_rec (record's rc), c_track (track's rc), c_beta (what :beta names)
   local tag=$SHA
   [ "$1" != pushed ] || tag=$UNPUSHED
   local base=(RELAY_APP=seazn-relay-stg TAG="$tag" GITHUB_SHA="$tag" FLY_API_TOKEN=fake-stg-push)
@@ -1547,22 +1721,30 @@ chain() { # chain PATH: run the steps for that path; sets c_rec (record's rc), c
   fi
   : > "$W/output"; run_step "$W/record.sh" "${base[@]}" FOUND="$found" DIGEST="$digest"; c_rec=$rc
   local verified; verified=$(out_of digest)
-  : > "$W/output"; run_step "$W/track.sh" "${base[@]}" DIGEST="$verified"; c_track=$rc
+  : > "$W/output"; STEP_DIR=$2 run_step "$W/track.sh" "${base[@]}" DIGEST="$verified"; c_track=$rc
   c_beta=$(tag_now "$REG/seazn-relay-stg:beta")
 }
-state; chain pushed
+state; chain pushed "$W/step-h"
 if [ "$c_rec" -eq 0 ] && [ "$c_track" -eq 0 ] && [ "$c_beta" = "$D_NEW" ]; then
   ok "chain, pushed: :beta names the digest the push itself printed ($D_NEW), through the record check's output"
 else
   bad "chain, pushed: record $c_rec, track $c_track, :beta '$c_beta'"; show
 fi
-state; chain found
+state; chain found "$W/step-c"
 if [ "$c_rec" -eq 0 ] && [ "$c_track" -eq 0 ] && [ "$c_beta" = "$D_NEW" ]; then
   ok "chain, found and verified: :beta moved to the found digest only through the record check's output"
 else
   bad "chain, found: record $c_rec, track $c_track, :beta '$c_beta'"; show
 fi
-sq_state ""; chain found
+# The same found build re-run once main has moved on (a re-run of an older merge: item 2): verified, and
+# :beta stays on the newer build.
+state; chain found "$W/step-h"
+if [ "$c_rec" -eq 0 ] && [ "$c_track" -eq 0 ] && [ "$c_beta" = "$D_OLD" ] && has "$W/step.out" "::warning::$REG/seazn-relay-stg:beta not moved: $SHA is not main's tip ($H)"; then
+  ok "chain, found on a superseded commit: the record verifies, and :beta stays at $D_OLD with a warning"
+else
+  bad "chain, found superseded: record $c_rec, track $c_track, :beta '$c_beta'"; show
+fi
+sq_state ""; chain found "$W/step-c"
 if [ "$c_rec" -ne 0 ] && [ "$c_track" -ne 0 ] && [ "$c_beta" = "$D_OLD" ] && has "$W/step.out" "::error::no verified digest to move :beta to ('')"; then
   ok "chain, found squat: the record check refuses, writes no digest, and a track step given that output refuses; :beta still $D_OLD"
 else
@@ -1998,6 +2180,7 @@ if [ "$rc" -eq 0 ] && has "$STATE/log" "flyctl secrets set RELAY_IMAGE=$track_va
   && has "$W/step.out" "  new RELAY_IMAGE:       $track_value" \
   && has "$W/step.out" "  following:             :beta, which names $D_OLD now ($OLD, main's build of $OLD)" \
   && has "$W/step.out" "Fly runs what it names whenever it creates a session's Machine" \
+  && has "$W/step.out" "Nothing checks what it names when Fly follows it: a push by any holder of the repository push token is followed too." \
   && [ "$(tail -n 1 "$PLOG/stg.log" | cut -d' ' -f2-)" = "stg track:beta $track_value $(digest_of "$track_value") $D_OLD" ]; then
   ok "promote TR1: stg --track beta reads :beta (one read by tag), verifies its digest as main's build (discovered by identity, then the pin's exact verify at that commit), sets RELAY_IMAGE=$track_value, deploys, proves it, says what it follows, and logs it"
 else

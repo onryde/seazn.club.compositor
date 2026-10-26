@@ -90,9 +90,13 @@
 #     DIGEST, names its tag once (`moving="$RELAY_REGISTRY/$RELAY_APP:<tag>"`), copies it exactly as
 #     `docker buildx imagetools create --prefer-index=false --tag "$moving" "$RELAY_REGISTRY/$RELAY_APP@$DIGEST"`
 #     (one source, by the verified digest: buildx pushes that manifest's own bytes), and reads the tag back
-#     after the copy, exiting 1 when it names another digest. No step in any workflow retags otherwise:
-#     imagetools create, crane, skopeo, regctl or oras, or a docker tag or push naming :beta, :stable or
-#     $moving. Prints `N of 2`.
+#     after the copy, exiting 1 when it names another digest. Before the copy (the PR #94 review's items 2
+#     and 3) it checks that this build is the newest, so no run moves its tag backwards (stg: GITHUB_SHA is
+#     main's tip, by `git ls-remote origin refs/heads/main`; prod: TAG is the highest vX.Y.Z tag, by
+#     `sort -V`), and that the old tag is main's own build (`gh attestation verify` on its digest), each
+#     by its exact lines. No step in any workflow retags otherwise: imagetools create, crane, skopeo,
+#     regctl or oras, or a docker tag or push (`docker image tag|push` too), `docker manifest create|push`
+#     or `docker buildx build ... --push` naming :beta, :stable or $moving. Prints `N of 2`.
 #
 # The deploy workflows are deploy-stg.yml and deploy-prod.yml, each required, plus any other workflow
 # that names the stg or prod relay or web app, or their tokens: a new one is held to the deploy rules
@@ -712,6 +716,12 @@ for pair in deploy-stg.yml:beta deploy-prod.yml:stable; do
         | ("now=$(docker buildx imagetools inspect \"$moving\" --format \u0027{{.Manifest.Digest}}\u0027)") as $readback
         | ("if [ \"$now\" != \"$DIGEST\" ]; then") as $compare
         | ("echo \"digest=$DIGEST\" >> \"$GITHUB_OUTPUT\"") as $output
+        | (if $want == "beta"
+           then ["tip=$(git ls-remote origin refs/heads/main 2> \"$RUNNER_TEMP/tip.err\" | cut -f1) || tip=\u0027\u0027",
+                 "if [ \"$tip\" != \"$GITHUB_SHA\" ]; then"]
+           else ["highest=$(git tag -l \u0027v*\u0027 | grep -E \u0027^v[0-9]+\\.[0-9]+\\.[0-9]+$\u0027 | sort -V | tail -n 1) || highest=\u0027\u0027",
+                 "if [ \"$highest\" != \"$TAG\" ]; then"] end) as $newest
+        | ("if [ \"$old\" != none ] && ! gh attestation verify \"oci://$RELAY_REGISTRY/$RELAY_APP@$old\" ") as $oldcheck
         | if ($ts | length) != 1 then "FAIL job \($j) has \($ts | length) steps with id track, not 1: nothing moves :\($want), or two steps do"
           elif $rec == null or $ts[0] < $rec then "FAIL job \($j): the track step comes before the record check (or there is none): it would move :\($want) to a digest nothing verified"
           elif $sum == null or $sum < $ts[0] then "FAIL job \($j): the summary does not come after the track step"
@@ -740,6 +750,10 @@ for pair in deploy-stg.yml:beta deploy-prod.yml:stable; do
               then "FAIL job \($j): the track step\u0027s copy is \($copies | map("\u0027" + .value + "\u0027") | join(", ")), not exactly \u0027\($copy)\u0027 (one source, by the verified digest: a carbon copy)"
               elif $e == null or $e == "fi"
               then "FAIL job \($j): the track step never reads :\($want) back and exits 1 when it names another digest (after the copy: \u0027\($readback)\u0027, then \u0027\($compare)\u0027 and exit 1)"
+              elif [ $newest[] as $n | [ $l | to_entries[] | select(.value == $n) | .key ] | select(length == 1 and .[0] < $c) ] | length != 2
+              then "FAIL job \($j): the track step never checks, before the copy, that this build is the newest (\($newest | map("\u0027" + . + "\u0027") | join(", ")), once each): an older run would move :\($want) backwards"
+              elif [ $l | to_entries[] | select(.value | startswith($oldcheck)) | .key ] | (length != 1 or .[0] > $c)
+              then "FAIL job \($j): the track step never checks, before the copy, that the old :\($want) is main\u0027s own build (\u0027\($oldcheck)...\u0027, once): a push from outside the deploy would go unseen"
               elif $v == null or ($o | length) != 1 or $x == null or $o[0] < $v or $o[0] > $x
               then "FAIL job \($j): the record check does not write digest= to GITHUB_OUTPUT once, on its verified branch alone (\u0027\($output)\u0027, between \u0027if gh attestation verify\u0027 and its first elif or else)"
               else "TRACK \($j)" end
@@ -765,7 +779,9 @@ for f in "${files[@]}"; do
     (.jobs // {}) | to_entries[] | .key as $j | .value as $J
     | ($J.steps // []) | to_entries[] | .key as $i | .value as $s
     | (($s.run // "") | code_lines | split("\n") | map(strip))[] as $line
-    | select($line | test("imagetools\\s+create|(^|[\\s;&|(])(crane|skopeo|regctl|oras)\\s|(^|[\\s;&|(])docker\\s+(tag|push)\\s.*(:(beta|stable)([^A-Za-z0-9_.-]|$)|\\$\\{?moving([^A-Za-z0-9_]|$))"))
+    | select(($line | test("imagetools\\s+create|(^|[\\s;&|(])(crane|skopeo|regctl|oras)\\s"))
+        or (($line | test("(^|[\\s;&|(])docker\\s+((image\\s+)?(tag|push)|manifest\\s+(create|push)|buildx\\s+build\\s.*--push)(\\s|$)"))
+          and ($line | test(":(beta|stable)([^A-Za-z0-9_.-]|$)|\\$\\{?moving([^A-Za-z0-9_]|$)"))))
     | if $own and $j == "push" and ($s.id // "") == "track" and ($line | test("imagetools\\s+create")) then "RETAG"
       else "FAIL \($j).\($s | step_name($i)) retags outside a track step: \($line | .[0:100])" end' "$(json "$f")")
 done

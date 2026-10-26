@@ -113,7 +113,9 @@ config is the app itself. `fly/stg.toml` and `fly/prod.toml` record app name, or
   and fails on any other digest. `check-workflows.sh` rule 16 holds both push jobs to it, and each of
   its mutants (t1 to t17) is red by its own reason. `scripts/promote.sh --track` refuses a tag whose
   digest is not main's build. The first main run after the merge creates `:beta`, and the
-  coordinator confirms it exists.
+  coordinator confirms it exists. (PR #94 fix round 1) An older build never moves the tag (stg: not
+  main's tip; prod: not the highest release tag), an old tag that is no deploy's build reds the run
+  after the move restores it, and rule 16 holds both checks before the copy (t18 to t27).
 
 ## Amendment 2026-10-18 (a CEF bump is gated on C11 Step 0)
 
@@ -287,8 +289,10 @@ but Fly runs whatever the tag names when a session's Machine is created.** Later
 coordinator relayed that the owner had set seazn-club-stg's RELAY_IMAGE by hand (Fly digest
 `caeaf26ea50ef45e`, status Staged; meant to be `registry.fly.io/seazn-relay-stg:beta`, unverified
 because values are write-only), and the owner's model: "we don't need to set manually ... merge and
-tag process must handle it correctly". The reasoning is the compositor `_INDEX.md` decision row
-"C16b: moving tags".
+tag process must handle it correctly". The coordinator later saw that value **Deployed** (Fly
+digest `caeaf26ea50ef45e`, 2026-10-26): if it names `:beta`, stg composed is down now, until the
+first main deploy-stg run creates `:beta`. The reasoning is the compositor `_INDEX.md` decision rows
+"C16b, the moving tags" and "PR #94 fix round 1".
 
 - **The move.** Each push job gains a track step (`id: track`) after the record check and before
   the summary.
@@ -312,6 +316,25 @@ tag process must handle it correctly". The reasoning is the compositor `_INDEX.m
   and an older buildx refuses the flag, so it fails closed. At run time the read-back is the proof.
   In `deploy_checks_test.sh`, the fake docker models both behaviours, so a step without the flag
   reds on its own read-back.
+- **Never backwards** (PR #94 fix round 1, item 2: the coordinator's medium decision under the
+  owner's standing delegation). deploy-stg moves `:beta` only when `GITHUB_SHA` is main's current
+  tip (`git ls-remote origin refs/heads/main`). The `deploy-stg` concurrency group runs one merge's
+  job at a time, so a newer merge's run comes after and moves it on. deploy-prod moves `:stable`
+  only when its tag is the highest `^v[0-9]+\.[0-9]+\.[0-9]+$` tag in the checkout (`sort -V`;
+  fetch-depth is 0), so two tags pushed together leave it on the higher, in either order. Otherwise
+  the step skips the move with a `::warning::` that names the build's pin. The job stays green, the
+  `:<sha>` or `:<tag>` push is kept, and the summary says nothing live changed. A tip or a tag list
+  that cannot be read fails the step and moves nothing.
+- **A squat in the old tag** (item 3, under the same delegation). Before the copy, the step verifies
+  the old tag's digest with the record check's identity flags (prod: deploy-prod.yml at any release
+  tag). If it does not verify, the tag is still moved, which restores the verified build. The step
+  then exits 1 with an `::error::` that names the old digest: the tag was moved by something other
+  than the deploy, and the owner must check who moved it. No tag yet (`none`) is no error.
+- **Declined: a check at Machine create.** Owner, 2026-10-26, in chat, relayed by the coordinator:
+  "no need to check.". It answered whether a scheduled verify, or web resolving the tag, verifying
+  it and creating the Machine by digest, is owed before prod tracks `:stable`. Nothing is owed. The
+  residual: once tracked, nothing verifies what Fly pulls at Machine create. A push by any holder of
+  the push token is live for new sessions until that env's next deploy run, which reds on it.
 - **RELAY_IMAGE is set once per env, by the owner.** To track, it is
   `registry.fly.io/seazn-relay-stg:beta` (prod: `registry.fly.io/seazn-relay-prod:stable`).
   - `scripts/promote.sh stg --track beta` (prod: `--track stable --confirm-prod`) is the verified
@@ -333,13 +356,14 @@ tag process must handle it correctly". The reasoning is the compositor `_INDEX.m
      every promote prints its own rollback.
   2. Let the next merge (prod: the next release tag) move the tag on.
 
-  No retag-to-old-digest script is built: (1) covers it, with full verification. **Caution:**
-  re-running an older deploy-stg run moves `:beta` back to that run's build, once its record
-  verifies.
+  No retag-to-old-digest script is built: (1) covers it, with full verification. An older build
+  never moves the tag back ("Never backwards" above): to run one, pin it.
 - **The risk this opens (the coordinator, 2026-10-26).** A staged RELAY_IMAGE naming the tag goes
   live with any deploy of the web app. If that happens before deploy-stg has created `:beta`, every
-  composed stg session fails at Machine create. So C16b's first main run must create `:beta`, and
-  the coordinator confirms it exists. If FLY_API_TOKEN_RELAY_STG is unset, the push job skips and
+  composed stg session fails at Machine create. **It has happened:** the coordinator saw the
+  hand-set value Deployed on 2026-10-26, so if it names `:beta`, stg composed is down now. C16b's
+  first main run must create `:beta`: merge, then the coordinator confirms the deploy-stg summary
+  reads `:beta none -> sha256:…`. If FLY_API_TOKEN_RELAY_STG is unset, the push job skips and
   creates nothing.
 - **Prod.** Prod's RELAY_IMAGE is set only after C17 passes and the first `v*` tag has created
   `:stable`. The prod token is still the owner's decision (open item (f)). seazn-club-prod shows all
@@ -351,11 +375,15 @@ tag process must handle it correctly". The reasoning is the compositor `_INDEX.m
   - DIGEST is exactly `${{ steps.record.outputs.digest }}`, and nothing in the run block assigns it;
   - the step moves its own tag (`:beta` or `:stable`) once, by exactly that copy;
   - it reads the tag back and exits 1 on any other digest;
+  - before the copy, it checks that this build is the newest (stg: the tip line and its compare;
+    prod: the highest-tag line and its compare), each once, and verifies the old tag (the line that
+    starts `if [ "$old" != none ] && ! gh attestation verify`), once;
   - the record check writes `digest=` once, between `if gh attestation verify` and its first
     elif or else.
 
   Any other retag line in any workflow is red: `imagetools create`, crane, skopeo, regctl, oras, or
-  a `docker tag` or `docker push` of a moving tag.
+  a `docker tag`, `docker push`, `docker image tag|push`, `docker manifest create|push` or
+  `docker buildx build … --push` that names a moving tag (`:beta`, `:stable` or `$moving`).
 - **The web repo needs no change.** seazn.club `apps/web/src/server/relay/runner-fly.ts:233` reads
   `opts.image ?? process.env.RELAY_IMAGE` and `:267` passes it as `config.image` verbatim (re-read
   at seazn.club origin/main e58eac9be7, 2026-10-26).
