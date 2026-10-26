@@ -10,10 +10,19 @@ window sees. A measurement probe, not product code: nothing in crates/ depends o
       tone, mpegtsmux alignment=7, srtsink. Its uri is SPIKE_A_SRT_PUSH_URL, set as a property.
       rtmps: flvmux -> rtmp2sink to SPIKE_A_RTMPS_PUSH_URL; "connected" is 100 kB written.
 
-  owed108.py run --part probes|relay [--trials 3] [--warm 45] [--gaps 5.5[,g2,...]] [--after 60]
+  owed108.py run --part probes|relay [--trials 3] [--warm 45] [--gaps 5.5[,g2,...]] [--after 60[,a2,...]]
                  [--cooldown 240] [--ingest srt|rtmps] [--links base[,close_rebuild,cap2]]
+                 [--drop kill|clean] [--hls FILE] [--note TEXT]
       Each trial: publisher P1 up; at --warm s P1 is killed; a gap later publisher P2 starts (and is
       started again a second after any exit, as the app retries). The trial ends --after s past the kill.
+      A negative gap starts no P2. --gaps and --after take one value per trial (the last one repeats).
+      --drop clean ends each publisher with SIGTERM instead: it sets its pipeline to NULL, which closes
+      the SRT socket and so sends SRT's shutdown (SIGKILL after 3 s, reported, if it has not exited).
+      --hls FILE polls the input's HLS master and first variant once a second from each trial's start,
+      as R0 section 4a did (seazn.club R0-memo.md): both HTTP statuses, ENDLIST, the media-sequence head
+      and an 8-hex hash of the variant path. FILE holds the URL (a public playback URL, uploaded to the
+      Machine as a file); it is never printed, and any line holding it or its host or uid is withheld.
+      --note is recorded in run_start (the input's recording settings, which this probe cannot read).
       probes: a warm reader R0 from 15 s that is never rebuilt, a burst of 8 simultaneous readers before
               the kill (a control), and a fresh reader every second from 5 s before the kill to the
               end, each living until its first decoded frame or --probe-life s.
@@ -35,11 +44,14 @@ import argparse
 import json
 import os
 import signal
+import hashlib
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 
 import gi
 
@@ -49,6 +61,9 @@ from gi.repository import GLib, Gst  # noqa: E402
 PUSH_ENV = "SPIKE_A_SRT_PUSH_URL"
 PLAY_ENV = "SPIKE_A_SRT_PLAY_URL"
 RTMPS_ENV = "SPIKE_A_RTMPS_PUSH_URL"
+HLS_ENV = "SPIKE_A_HLS_URL"
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36"
+CLEAN_GRACE_S = 3
 
 # Restated from Thresholds::default() (crates/domain/src/config.rs); a probe cannot link the crate.
 STALL_MS = 5_000  # input_stall_after_ms
@@ -123,6 +138,10 @@ def load_forms():
         forms.update([rtmps, urllib.parse.unquote(rtmps)])
         key = rtmps.split("/live/", 1)[-1] if "/live/" in rtmps else ""
         forms.update([key, encode(key, False), encode(key, True)])
+    hls = os.environ.get(HLS_ENV, "")
+    if hls:
+        parts = urllib.parse.urlsplit(hls)
+        forms.update([hls, parts.hostname or ""] + [seg for seg in parts.path.split("/") if len(seg) >= 8])
     STATE["forms"] = sorted((f for f in forms if len(f) >= 8), key=len, reverse=True)
 
 
@@ -232,8 +251,18 @@ def pub(ingest):
             emit("pub_stats", stats={k: f[k] for k in ("bytes-sent", "packets-sent", "rtt-ms", "out-bytes-acked", "out-bytes-total") if k in f})
         return True
 
+    def on_term():
+        # --drop clean: NULL closes srtsink's socket (srt_close), which sends SRT's shutdown to the peer.
+        t = time.monotonic()
+        emit("pub_closing")
+        p.set_state(Gst.State.NULL)
+        emit("pub_closed", close_ms=round((time.monotonic() - t) * 1000, 1))
+        loop.quit()
+        return False
+
     p.get_bus().add_watch(GLib.PRIORITY_DEFAULT, on_msg)
     GLib.timeout_add(50, guarded(poll))
+    GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, guarded(on_term))
     emit("pub_start")
     p.set_state(Gst.State.PLAYING)
     loop.run()
@@ -279,12 +308,69 @@ class Publisher:
         if self.alive and self.respawn:
             GLib.timeout_add(1000, guarded(self.spawn))
 
-    def kill(self):
-        """SIGKILL to the child's process group: a force-quit."""
+    def kill(self, clean=False):
+        """SIGKILL to the child's process group: a force-quit. clean: SIGTERM, so the child closes its SRT
+        socket (SRT's shutdown sent); SIGKILL after CLEAN_GRACE_S if it is still running, reported."""
         self.alive = False
-        if self.proc and self.proc.poll() is None:
-            os.killpg(self.proc.pid, signal.SIGKILL)
-            emit("pub_killed", pub=self.tag, pid=self.proc.pid)
+        proc = self.proc
+        if not (proc and proc.poll() is None):
+            return
+        if not clean:
+            os.killpg(proc.pid, signal.SIGKILL)
+            emit("pub_killed", pub=self.tag, pid=proc.pid, how="kill")
+            return
+        os.kill(proc.pid, signal.SIGTERM)
+        emit("pub_killed", pub=self.tag, pid=proc.pid, how="clean")
+
+        def force():
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                emit("pub_clean_timeout", pub=self.tag, pid=proc.pid)
+        later(CLEAN_GRACE_S * 1000, force)
+
+
+class HlsPoll:
+    """The input's HLS master, then its first variant, once a second (R0 section 4a). Prints statuses,
+    ENDLIST, the media-sequence head (sequence + segments) and an 8-hex hash of the variant path."""
+
+    def __init__(self, url, trial, every=1.0):
+        self.url, self.trial, self.every, self.alive = url, trial, every, True
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    @staticmethod
+    def get(url):
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        try:
+            with urllib.request.urlopen(req, timeout=4) as r:
+                return r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            return e.code, ""
+        except Exception as e:  # noqa: BLE001 - the class only: a message could carry the URL
+            return type(e).__name__, ""
+
+    def loop(self):
+        while self.alive:
+            t = time.monotonic()
+            ms, mbody = self.get(self.url)
+            rec = {"trial": self.trial, "master": ms}
+            if ms == 200:
+                v = next((ln.strip() for ln in mbody.splitlines() if ln.strip() and not ln.startswith("#")), None)
+                if v:
+                    vurl = urllib.parse.urljoin(self.url, v)
+                    rec["variant_id"] = hashlib.sha1(urllib.parse.urlsplit(vurl).path.encode()).hexdigest()[:8]
+                    vs, vbody = self.get(vurl)
+                    rec["variant"] = vs
+                    if vs == 200:
+                        seq = next((int(ln.split(":", 1)[1]) for ln in vbody.splitlines()
+                                    if ln.startswith("#EXT-X-MEDIA-SEQUENCE:")), 0)
+                        rec["head"] = seq + sum(1 for ln in vbody.splitlines() if ln.startswith("#EXTINF"))
+                        rec["endlist"] = "#EXT-X-ENDLIST" in vbody
+            if self.alive:
+                emit("hls", **rec)
+            time.sleep(max(0.0, self.every - (time.monotonic() - t)))
+
+    def stop(self):
+        self.alive = False
 
 
 # ---------------------------------------------------------------------------------------------- reader
@@ -549,10 +635,16 @@ class Link:
 # ---------------------------------------------------------------------------------------------- a run
 
 def run(a):
+    if a.hls:
+        with open(a.hls) as f:
+            os.environ[HLS_ENV] = f.read().strip()
     load_forms()
     play = os.environ.get(PLAY_ENV, "")
     if not play or not os.environ.get(PUSH_ENV):
         emit("fatal", what=f"{PLAY_ENV} and {PUSH_ENV} must both be set")
+        return 2
+    if a.hls and not os.environ.get(HLS_ENV):
+        emit("fatal", what=f"--hls needs {HLS_ENV}")
         return 2
     if os.environ.get("GST_DEBUG"):
         emit("fatal", what="GST_DEBUG is set: srtobject's debug prints both credentials (Owed 47)")
@@ -562,8 +654,11 @@ def run(a):
     del play
     Gst.init(None)
     gaps = [float(g) for g in a.gaps.split(",")]
-    gaps = (gaps * a.trials)[: a.trials] if len(gaps) < a.trials else gaps[: a.trials]
-    emit("run_start", part=a.part, ingest=a.ingest, links=a.links, trials=a.trials, warm_s=a.warm, gaps_s=gaps, after_s=a.after,
+    gaps = (gaps + gaps[-1:] * a.trials)[: a.trials]
+    afters = [float(x) for x in a.after.split(",")]
+    afters = (afters + afters[-1:] * a.trials)[: a.trials]
+    emit("run_start", part=a.part, ingest=a.ingest, links=a.links, trials=a.trials, warm_s=a.warm, gaps_s=gaps, after_s=afters,
+         drop=a.drop, hls=bool(a.hls), note=a.note,
          cooldown_s=a.cooldown, probe_life_s=a.probe_life, probe_every_s=a.probe_every, burst=a.burst,
          burst_life_s=a.burst_life, gst=Gst.version_string(),
          origin=urllib.parse.urlsplit(origin).hostname, streamid_chars=len(sid), passphrase_chars=len(pw),
@@ -580,10 +675,24 @@ def run(a):
             return False
         gap = gaps[i]
         tr = {"i": i + 1, "gap": gap, "t0": now_ms(), "readers": [], "probes": [], "bursts": [], "log": []}
-        emit("trial_start", trial=i + 1, gap_s=gap)
+        emit("trial_start", trial=i + 1, gap_s=gap, after_s=afters[i], drop=a.drop)
+        if a.hls:
+            tr["hls"] = HlsPoll(os.environ[HLS_ENV], i + 1)
         tr["p1"] = Publisher("P1", respawn=True, ingest=a.ingest)
+        def start_r0():
+            # R0 is never rebuilt after the kill; one that fails BEFORE the kill (the burst-style close of a
+            # fresh reader) is rebuilt a second later, so the trial still has a warm reader at the kill.
+            def lost(rd, why):
+                if "kill" in tr:
+                    return
+                rd.close("lost_" + why)
+                rd.teardown()
+                emit("r0_rebuild", trial=i + 1, why=why)
+                later(1000, start_r0)
+            tr["r0"] = Reader("R0", uri, gaps=True, on_lost=lost)
+
         if a.part == "probes":
-            later(15_000, lambda: tr.__setitem__("r0", Reader("R0", uri, gaps=True)))
+            later(15_000, start_r0)
         else:
             policies = a.links.split(",")
             later(15_000, lambda: tr.__setitem__("links", [Link(uri, tr["log"], pol) for pol in policies]))
@@ -592,13 +701,14 @@ def run(a):
             warm_ok = (tr["r0"].last_frame is not None and now_ms() - tr["r0"].last_frame < 1000) \
                 if a.part == "probes" else all(lk.running_fresh() for lk in tr["links"])
             tr["kill"] = now_ms()
-            tr["p1"].kill()
-            emit("kill", trial=i + 1, warm_ok=warm_ok)
+            tr["p1"].kill(clean=a.drop == "clean")
+            emit("kill", trial=i + 1, warm_ok=warm_ok, how=a.drop)
             if not warm_ok:
                 emit("trial_invalid", trial=i + 1, why="no frame in the last second at the kill")
                 rc["code"] = 3
-            GLib.timeout_add(int(gap * 1000), guarded(republish))
-            GLib.timeout_add(int(a.after * 1000), guarded(end))
+            if gap >= 0:
+                GLib.timeout_add(int(gap * 1000), guarded(republish))
+            GLib.timeout_add(int(afters[i] * 1000), guarded(end))
             return False
 
         def republish():
@@ -625,7 +735,9 @@ def run(a):
             tr["ended"] = now_ms()
             for p in ("p1", "p2"):
                 if p in tr:
-                    tr[p].kill()
+                    tr[p].kill(clean=a.drop == "clean")
+            if "hls" in tr:
+                tr["hls"].stop()
             if a.part == "probes":
                 tr["r0"].teardown()
                 for r in tr["probes"] + tr["bursts"]:
@@ -656,7 +768,8 @@ def run(a):
 def summarise(part, tr):
     kill = tr["kill"]
     p2 = tr.get("p2")
-    out = {"trial": tr["i"], "gap_s": tr["gap"], "kill_ms": kill, "p2_spawn_rel_kill_ms": round(tr["p2_spawn"] - kill, 1),
+    out = {"trial": tr["i"], "gap_s": tr["gap"], "kill_ms": kill,
+           "p2_spawn_rel_kill_ms": round(tr["p2_spawn"] - kill, 1) if "p2_spawn" in tr else None,
            "p2_spawns": p2.spawns if p2 else 0,
            "p2_connected_rel_kill_ms": round(p2.connected_at - kill, 1) if p2 and p2.connected_at else None}
 
@@ -680,6 +793,7 @@ def summarise(part, tr):
         out["bursts_checked"] = len(out["bursts"])
         out["bursts_decoded"] = len([r for r in out["bursts"] if r["first_frame"] is not None])
         p2s = out["p2_spawn_rel_kill_ms"]
+        p2s = float("inf") if p2s is None else p2s
         decoded = [r for r in rows if r["first_frame"] is not None and r["first_frame"] > p2s]
         out["probes_checked"] = len(rows)
         out["first_decoded_after_p2_rel_kill_ms"] = min((r["first_frame"] for r in decoded), default=None)
@@ -705,7 +819,7 @@ def main():
     ap.add_argument("--trials", type=int, default=3)
     ap.add_argument("--warm", type=float, default=45)
     ap.add_argument("--gaps", default="5.5")
-    ap.add_argument("--after", type=float, default=60)
+    ap.add_argument("--after", default="60")
     ap.add_argument("--cooldown", type=float, default=240)
     ap.add_argument("--ingest", choices=["srt", "rtmps"], default="srt")
     ap.add_argument("--links", default="base")
@@ -713,6 +827,9 @@ def main():
     ap.add_argument("--probe-every", type=float, default=1)
     ap.add_argument("--burst", type=int, default=8)
     ap.add_argument("--burst-life", type=float, default=8)
+    ap.add_argument("--drop", choices=["kill", "clean"], default="kill")
+    ap.add_argument("--hls", default="")
+    ap.add_argument("--note", default="")
     a = ap.parse_args()
     if a.mode == "pub":
         return pub(a.ingest)

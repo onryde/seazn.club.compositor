@@ -6,12 +6,16 @@
 #   fly machine exec <id> 'cat /out/<part>.jsonl' -a seazn-relay-spike
 # then destroy the Machine (fly machine destroy <id> -a seazn-relay-spike --force). Flags go before the
 # image and the command after `--`, or flyctl takes the probe's --trials for its own.
+# HLS_FILE (local env), if set: a file holding the input's HLS URL, uploaded as /owed108/hls.url for
+# `--hls /owed108/hls.url` (a public playback URL, not a secret; the probe never prints it).
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 name="$1"
 shift
 date -u +%FT%T
+extra=()
+if [ -n "${HLS_FILE:-}" ]; then extra=(--file-local "/owed108/hls.url=$HLS_FILE"); fi
 fly machine run -a seazn-relay-spike -r lhr --name "$name" --restart no --detach \
   --vm-cpu-kind performance --vm-cpus 4 --vm-memory 8192 \
-  --file-local "/owed108/owed108.py=$here/owed108.py" --file-local "/owed108/run.sh=$here/run.sh" \
+  --file-local "/owed108/owed108.py=$here/owed108.py" --file-local "/owed108/run.sh=$here/run.sh" ${extra[@]+"${extra[@]}"} \
   registry.fly.io/seazn-relay-spike:deployment-01M4ZBW92TN0GPMPC9S0KK5TQ3 -- bash /owed108/run.sh "$@"

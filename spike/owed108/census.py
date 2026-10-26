@@ -8,7 +8,8 @@ build retires it). Each one ends one of three ways: closed (an error from 1.5 s 
 re-attached (decoded after the close with no error) or silent (neither). Then the readers started after
 the close (after P2's connect if that came later), and why each miss missed: `trial_end` cut it short,
 it started inside the spread of the close (before the last attached reader's error), or it was silent
-for its whole 8 s life. Times are seconds from the kill. Zero readers counted is a failure."""
+for its whole 8 s life. Each reader's close error is counted once (in a relay run the build that times
+the close is also an attached one). Times are seconds from the kill. Zero readers counted is a failure."""
 import json
 import sys
 
@@ -20,7 +21,8 @@ for path in sys.argv[1:]:
     name = path.rsplit("/", 1)[-1].split(".")[0]
     for t in (r for r in rows if r["kind"] == "summary"):
         k = t["kill_ms"]
-        p2 = t["p2_connected_rel_kill_ms"] / 1000
+        no_pub = t["p2_connected_rel_kill_ms"] is None  # a trial with no P2 (round 2's --gaps -1)
+        p2 = 0.0 if no_pub else t["p2_connected_rel_kill_ms"] / 1000
         errs = {}
         for r in rows:
             if r["kind"] == "error" and k <= r["t_ms"] < k + 120_000:
@@ -31,7 +33,8 @@ for path in sys.argv[1:]:
             for p in t["probes"]:
                 b = p["built"] / 1000
                 f = None if p["first_frame"] is None else p["first_frame"] / 1000
-                readers.append({"tag": p["tag"], "built": b, "frame": f, "until": b + LIFE, "ended": p["ended"]})
+                readers.append({"tag": p["tag"], "built": b, "frame": f, "until": b + LIFE, "ended": p["ended"],
+                                "end": None if p["end"] is None else p["end"] / 1000})
             close = errs.get("R0")
         else:
             gens = sorted(t["generations"], key=lambda g: g["built"])
@@ -41,13 +44,15 @@ for path in sys.argv[1:]:
                            and (h["tag"].rsplit(".", 1)[0] if "." in h["tag"] else "base") == pol), default=1e12)
                 f = None if g["first_frame"] is None else g["first_frame"] / 1000
                 readers.append({"tag": g["tag"], "built": g["built"] / 1000, "frame": f, "until": nxt / 1000,
-                                "ended": g["ended"]})
+                                "ended": g["ended"], "end": None if g["end"] is None else g["end"] / 1000})
             close = min((errs[r["tag"]] for r in readers if r["built"] > 0 and r["tag"] in errs), default=None)
+        close_tag = "R0" if probes else next((r["tag"] for r in readers if r["built"] > 0 and errs.get(r["tag"]) == close), None)
         if close is None:
             # No error to time it by: list the builds that were attached through the hold's measured end
             # (+29.9 to +31.2 in the trials that did show it) and what became of them.
             late = [r for r in readers if p2 <= r["built"] < 29.9 and r["until"] > 31.2
-                    and (r["frame"] is None or r["frame"] > 29.9)]
+                    and (r["frame"] is None or r["frame"] > 29.9)
+                    and not (r["ended"] == "trial_end" and r["end"] is not None and r["end"] < 31.2)]
             for r in late:
                 tot["reattached" if r["frame"] is not None else "silent"] += 1
             print(f"{name} T{t['trial']}: no close error; attached through +29.9..+31.2: "
@@ -61,12 +66,14 @@ for path in sys.argv[1:]:
         for r in att:
             e = errs.get(r["tag"])
             if e is not None and close - 1.5 <= e <= close + 2:
-                out["closed"].append(round(e, 2))
+                out["closed"].append((r["tag"], round(e, 2)))
             elif r["frame"] is not None:
                 out["reattached"].append(f"{r['tag']} frame +{r['frame']:.1f}")
             else:
                 out["silent"].append(r["tag"])
-        closes = [close] + out["closed"]
+        by_reader = {close_tag: close}
+        by_reader.update(dict(out["closed"]))
+        closes = list(by_reader.values())
         tot["closes"] += closes
         spread_end = max(closes)
         for key in ("closed", "reattached", "silent"):
@@ -74,7 +81,7 @@ for path in sys.argv[1:]:
         line = (f"{name} T{t['trial']}: P2 +{p2:.1f}, close +{close:.2f} (attached errors "
                 f"+{min(closes):.2f} to +{spread_end:.2f}); attached {len(att)}: closed {len(out['closed'])}, "
                 f"re-attached {out['reattached']}, silent {out['silent']}")
-        if probes:
+        if probes and not no_pub:
             start = max(close, p2)
             after = [r for r in readers if r["built"] >= start]
             dec = [r for r in after if r["frame"] is not None]
@@ -91,9 +98,9 @@ for path in sys.argv[1:]:
                      f"spread {len(spread)}, silent {len(silent)} {[r['tag'] for r in silent]}")
         print(line)
 cl = tot["closes"]
+if tot["trials"] == 0 or not cl or tot["closed"] + tot["reattached"] + tot["silent"] == 0:
+    raise SystemExit("nothing counted")
 print(f"trials {tot['trials']}; close errors seen +{min(cl):.2f} to +{max(cl):.2f} (n={len(cl)}); attached readers: "
       f"closed {tot['closed']}, re-attached {tot['reattached']}, silent {tot['silent']}; after the close "
       f"{tot['after_decoded']}/{tot['after']} decoded, misses: trial_end {tot['miss_trial_end']}, spread "
       f"{tot['miss_spread']}, silent {tot['miss_silent']}")
-if tot["trials"] == 0 or tot["closed"] + tot["reattached"] + tot["silent"] == 0:
-    raise SystemExit("nothing counted")

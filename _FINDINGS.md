@@ -2442,7 +2442,8 @@ replica, not a relay session. `spike/owed108/owed108.py`:
 | `probes-rtmps` | `781119e7a9e668` | `ea2fceb4…` | RTMPS | 3, 5.5 | 19:05:28 to 19:18:44 |
 | `probes-gaps` | `0805625be2e278` | `ea2fceb4…` | SRT | 3: 15, 25, 40 | 19:22:22 to 19:36:23 |
 
-Only `ea2fceb4…` is committed (as `a8882f79…`: a longer header, the same code, AST-compared). The earlier
+Only `ea2fceb4…` was committed (as `a8882f79…`, in 39faea0: a longer header, the same code, AST-compared;
+round 2's `d32f1b03…` has replaced it on the branch, so read round 1's code at 39faea0). The earlier
 versions are not, so what they changed is this note's word, not a checkable fact: `70f2aaf7…` fixed the
 smoke's dropped-exception bug (`guarded()`); `d1b558d1…` added `--links` and the two fix policies, and
 `--ingest rtmps`; `ea2fceb4…` changed only RTMPS's connect rule to 100 kB written (`rtmp2sink`'s
@@ -2511,23 +2512,25 @@ policies × 5 heartbeat phases). Gaps 15, 25 and 40: one map each, per-trial med
 | cap2 | +38.7, +40.3 | +40.0 / +38.5 / +47.0 |
 | live1 (timeout 4 s, wait 1 s, while live) | +31.3, +37.0 | +39.0 / +35.9 / +48.9 (ungated) |
 | **close (a)** | **+33.8, +34.5** | **+28.1 / +34.1 / +50.8** |
-| nudge (b) | +40.2, +45.0 | +35.8 / +36.2 / +46.7 |
+| nudge (b) | +40.3, +45.0 | +35.8 / +36.2 / +46.7 |
 | **close + nudge** | **+33.3, +34.5** | **+34.1 / +35.9 / +46.7** (gap 40: +42.8 to +49.2) |
 | live1 + close | +29.9, +34.5 | +34.1 / +40.1 / +45.0 |
 
 **Findings.**
 
 1. **Cloudflare holds a dropped publisher's broadcast on SRT playback for 29.9 to 31.2 s after the drop,
-   whatever arrives meanwhile.** In the 14 trials where a reader was attached when it ended, the errors
-   on those readers came at the drop + 29.92 to +31.18 (`Could not read from resource.`, debug `Error on
-   SRT socket: Unknown or erroneous (0)`), spread up to 1 s within one trial (often near +30.0 and
-   +31.0). It is anchored on the drop: gaps 15, 25 and 40 end it at +30.0 to +31.0. Of the 61 readers
-   attached at it (started inside the hold, undecoded, still running), 59 were closed, 1 was re-attached
+   whatever arrives meanwhile.** In the 14 trials where a reader was attached when it ended, the 68
+   errors on those readers (9 R0s and 59 attached readers, each counted once) came at the drop + 29.92
+   to +31.18 (`Could not read from resource.`, debug `Error on SRT socket: Unknown or erroneous (0)`),
+   spread up to 1 s within one trial (often near +30.0 and +31.0). It is anchored on the drop: gaps 15,
+   25 and 40 end it at +30.0 to +31.0. Of the 61 readers attached at it in 15 trials (the 14, plus
+   relay-fixes trial 3, which had no close error; started inside the hold, undecoded, still running and
+   not cut off by the trial's end; `census.py`), 59 were closed, 1 was re-attached
    and decoded (relay-fixes trial 3's abandoned `close_rebuild` build: byte +32.1, frame +32.7), and 1
    stayed silent (relay-fixes trial 1's `cap2` build from +29.0). Of the 8 relay builds among them, 6
    were closed.
 2. **Inside the hold a new reader almost always gets nothing.** All 651 connects after a kill (610
-   probes, 41 relay builds) completed SRT's handshake (0.2 to 0.4 s; once 1.3 s); 302 received payload
+   probes, 41 relay builds) completed SRT's handshake (0.2 to 0.5 s; once 1.3 s); 302 received payload
    and 349 none, the misses mostly inside the hold or before a publisher. Of the readers started inside
    the window, 15 of 163 probes decoded in the 9 trials whose window ran to the close (9 %; 14 of 157 if
    RTMPS's window starts at the replica's +8.5 instead of Cloudflare's +6.5; the recording-off smoke,
@@ -2544,7 +2547,7 @@ policies × 5 heartbeat phases). Gaps 15, 25 and 40: one map each, per-trial med
    37 misses, 29 were cut short by the trial's end (`trial_end`: the trial ended inside their 8 s life),
    1 started inside gap 25's close spread, and 7 (2.3 %) got nothing for 8 s while their neighbours
    were served. A reader started at the close decodes (+31.0 → +34.5; +30.0 → +33.3), but readers see
-   the close up to 1 s apart, and one relay build started 0 ms after its own close error got nothing.
+   the close up to 1 s apart, and one relay build started 13 ms after its own close error got nothing.
 5. **A publisher that arrives after the hold is served at once** (gap 40, n=1: a reader started 0.7 s
    after P2's connect decoded 2.6 s after it). Only a reconnect within about 30 s of the drop pays the
    hold.
@@ -2578,22 +2581,114 @@ policies × 5 heartbeat phases). Gaps 15, 25 and 40: one map each, per-trial med
    relay's own lines are lost (Owed 106), so the verification owed below should time it from the relay's
    log, not from `programme_phase`.
 10. **What would have helped, by the replay.** A shorter cap barely moves it (cap2: median +38.7).
-    Acting on Cloudflare's close, bounded as below, puts the camera back at +33.2 to +34.5 on every map
-    where the close reached the link's build. The nudge alone does nothing for a return inside the hold
-    (median +40.2), and can make it worse (worst +42.7 on the SRT maps, against base's +40.8; +45.0 on
+    Acting on Cloudflare's close, bounded as below, puts the camera back at +33.2 to +34.5 on the six
+    5.5 s maps where the close reached the link's build, and up to +35.9 at gap 25 (one map). The nudge
+    alone does nothing for a return inside the hold (median +40.3), and can make it worse (worst +42.7 on the SRT maps, against base's +40.8; +45.0 on
     the RTMPS maps, where it lands 2 s late): it resets the attempt count mid-schedule. For a late return it takes +55.4 to +46.7 (gap 40, n=1). Together they cost a
-    lucky schedule in two maps (gap 15: +34.1 against the close rule's +28.1; gap 25: +35.9 against
-    +34.1). A flat 5 s cadence while the phone is live (live1) plus the close rule has the best median
+    lucky schedule in three maps (gap 15: +34.1 against the close rule's +28.1; gap 25: +35.9 against
+    +34.1; RTMPS trial 2, whose lucky connect the nudge discards before its first byte: median +33.3
+    against +11.7). A flat 5 s cadence while the phone is live (live1) plus the close rule has the best median
     (+29.9, worst +34.5) for one connect every 5 s to Cloudflare while the phone reports live; whether
     that load is worth about 3 s of median is the owner's call.
-11. **The floor for an SRT-playback reader is the hold + about 3.3 s** (the drop + 33.2 to 34.5), lucky
+11. **The floor for an SRT-playback reader is the hold + about 3.3 s** (the drop + 33.2 to 34.5 on the
+    5.5 s maps; up to +35.9 at gap 25), lucky
     connects aside. No relay rule gets below it for a phone back within 30 s. Getting below it needs
-    another read path (the live input also offers RTMPS and WebRTC playback, unmeasured here) or a shorter
-    hold on Cloudflare's side (the owner's question; nothing filed).
+    another read path (HLS shows the new publisher at about +11, finding 16; RTMPS and WebRTC playback are
+    unmeasured) or a shorter hold on Cloudflare's side (the owner's question; nothing filed).
 12. **Side observation on the trap "SRT push from Fly never starts a CF broadcast"** (`_RULES.md`, R0
     FP-4, measured with ffmpeg): GStreamer `srtsink` pushing SRT from lhr started a broadcast in every
     trial here (Cloudflare's status `connected`, `ingestProtocol` `srt`, a recording each). The trap is
     unchanged (the output leg stays RTMPS); it may be ffmpeg's, not SRT's.
+
+**Round 2 (21:05 to 22:07): does the hold follow `timeoutSeconds`, or a dead SRT peer?** Two
+questions from the coordinator. (1) Does the SRT-playback hold follow `recording.timeoutSeconds`, as R0
+section 4a's HLS hold does on RTMPS (`timeoutSeconds` + about 3 s; web's `holdWindowSeconds.srt` is null)?
+(2) Is it Cloudflare waiting out a dead SRT peer, so that a clean close, with SRT's shutdown sent, ends it
+early?
+
+- *How each F-032 trial dropped its publisher.* By SIGKILL of the publisher's process group, every one:
+  P1 at the drop, and P2 at the trial's end. Over SRT nothing reached Cloudflare: its status read the
+  drop 30.28 to 30.30 s later. Over RTMPS the kernel closed the TCP connection (0.28 to 0.29 s). No
+  F-032 trial closed cleanly. C17's phone was force-quit.
+- *Method.* The same probe and the same measure as above: the close is the errors on R0 and on the
+  probes attached at it (`census.py`). One Machine per run, 6 more, all on Input A.
+  - No scratch input was made. A new input's SRT credentials come back in Cloudflare's API response,
+    and the only way from there to a Machine is through this session, which the credential rule
+    forbids. Input A's credentials are already the app's own secrets. So Input A's
+    `recording.timeoutSeconds` was set before each run instead (mode `automatic`; 180, then 10, 30, 60),
+    and 0 inputs were created.
+  - The script is `d32f1b03…`, committed. (The smoke ran on an earlier, uncommitted step, before R0's
+    rebuild.) It adds four things:
+    - `--drop clean`: SIGTERM. The publisher sets its pipeline to NULL, which closes the SRT socket and
+      so sends SRT's shutdown. It took 2.0 to 2.9 ms, and the SIGKILL fallback never fired.
+    - `--gaps -1` (no P2), and `--after` per trial.
+    - An R0 that fails before the drop is rebuilt. That happened 0 times in these runs; the smoke lost
+      its R0 that way, so it is invalid.
+    - `--hls FILE`: R0 section 4a's poll of the input's HLS master and first variant, once a second
+      (both statuses, ENDLIST, the media-sequence head). The URL is a public playback URL, since the
+      input does not sign. It reached the Machine as an uploaded file and is never printed: 0 lines
+      withheld, and no result line holds it.
+  - `sweep.py` prints the per-trial numbers below. The status entries are in `cloudflare-status.jsonl`
+    (`cfjoin.py`: 26 pairs).
+
+| Run (results) | UTC | Ingest, drop | `timeoutSeconds` | Trials | The close, per trial (errors on R0 and the attached readers) | HLS |
+|---|---|---|---|---|---|---|
+| `r2-smoke` | 21:07 | SRT, clean | 180 | 1, invalid | — | P2's media at +11.6 |
+| `r2-clean180` | 21:11 to 21:25 | SRT, clean | 180 | 3, gap 5.5 | +29.79 to +29.92; +29.99 to +30.03; +29.89 to +29.93 | P2's media at +11.4 to +11.8 |
+| F-032 `probes-prod` (the kill arm) | 18:07 to 18:21 | SRT, kill | 180 | 3, gap 5.5 | +30.93 to +31.01; +30.00 to +30.98; +30.01 to +31.01 | not polled |
+| `r2-t10` | 21:28 to 21:37 | SRT, kill | 10 | 3, gap 5.5; 1 with no P2 | +30.83 to +30.97; silent (finding 17); +30.01 to +31.01; no P2: +30.01 to +31.01 | P2's media at +11.0 to +12.6; no P2: master 204 at +42.3 |
+| `r2-t30` | 21:38 to 21:45 | SRT, kill | 30 | 3, gap 5.5 | +30.89 to +30.91; +30.01 to +30.98; +30.00 to +30.98 | P2's media at +10.5 to +11.4 |
+| `r2-t60` | 21:47 to 21:59 | SRT, kill | 60 | 3, gap 5.5; 1 with no P2 | +30.01 to +30.86; silent; +30.88 to +30.98; no P2: +30.01 to +30.94 | P2's media at +11.1 to +11.7; no P2: master 204 at +92.3 |
+| `r2-ctl-rtmps60` (the control) | 22:02 to 22:05 | RTMPS, kill | 60 | 1, no P2 | +29.99 to +30.00 | master 204 at +62.4 |
+
+13. **The SRT-playback hold does not follow `timeoutSeconds`.** At 10, 30 and 60 it ended at the drop +
+    30.0 to 31.0 (`census.py`: 26, 25 and 25 errors), as it does at 180 (F-032: +29.9 to +31.2). That
+    holds even at 10, where Cloudflare's own recording timeout runs out first. No `timeoutSeconds`
+    shortens it, so fix (a)'s gate and expected numbers stand at any setting. Replayed on the 12 round-2
+    maps with a P2 (`sim.py`), (a) gives a median of +34.4 (+34.3 to +34.6 on every map where no lucky
+    connect came first), against today's +40.2. That is F-032's range again.
+14. **Nor is it a dead SRT peer.**
+    - With a clean close, Cloudflare's status read the disconnect 0.28 s after the SIGTERM (n=4). Each is
+      timed by its trial's end, which closes the same way: a read after each drop came only once P2's
+      `connected` had replaced the entry. For SIGKILL it is 30.28 to 30.30 s (n=6).
+    - The hold still ran to +29.79 to +30.03 (3 trials, 23 errors; 20 of the 22 attached readers
+      closed, 2 re-attached). The kill arm ran to +30.00 to +31.01 (3 trials, 25 errors).
+    - A known end takes off at most the second wave near +31.0, which only SRT-kill trials show. The
+      RTMPS kill trials (F-032, where Cloudflare knew in 0.3 s) ended at +29.92 to +30.00 the same way.
+    - The dead peer does cost 30 s, but elsewhere: in Cloudflare's status, and in HLS (finding 15).
+15. **What follows `timeoutSeconds` is HLS's hold, as R0 found. On SRT it starts only when Cloudflare
+    notices the drop.**
+    - With no new publisher over SRT, the HLS master turned 204 at the drop + 42.3 at 10, and + 92.3 at
+      60. Neither time was there an ENDLIST. That is Cloudflare's SRT disconnect (+30.3) +
+      `timeoutSeconds` + 2.0 s.
+    - The RTMPS control at 60 turned 204 at +62.4 (R0: 63.1 at 60), so the probe sees R0's behaviour.
+      Its SRT playback still ended at +29.99.
+    - So from these two points, web's `holdWindowSeconds.srt` is about `timeoutSeconds` + 32 s: about
+      212 s at 180. That matches the P5 session's ~213 s at 180 (one point each). That window is HLS's,
+      not the relay's.
+16. **HLS shows a new publisher about 19 s before SRT playback does.** With P2 at +5.5, the HLS head
+    moved again at +10.5 to +12.6 in all 12 trials with a P2, 4.7 to 6.8 s after P2's connect. SRT
+    playback held to +30 to +31. HLS is a second read path (finding 11), but its latency as a relay input
+    (LL-HLS, 2 s segments) is not measured.
+17. **A second shape for the hold's end: silent** (2 of 12 trials with a P2, both a trial 2: one at 10,
+    one at 60; 0 of F-032's 9 probe trials).
+    - No reader got the close error. R0 and the 5 to 6 attached probes went silent at +31.0: one buffered
+      frame, then nothing.
+    - Fresh readers were then mostly not served for about 10 s more. At 10, nothing until a reader
+      started at +41.0 decoded at +44.3. At 60, one decode from +34.0, then nothing to the trial's end.
+    - In this shape (a) has no error to act on and falls back to today's schedule. The replay at 10 puts
+      every policy past the trial's end (+50).
+    - The build that was Running at the drop (R0) got the close error in 22 of the 24 probe trials
+      across both rounds. Relay builds attached during a connect got it in 6 of 8. A relay that kept its
+      stalled build open, gate shut, as it already keeps abandoned builds, would hear the close in about
+      11 returns in 12, instead of 3 in 4. Not replayed; one for the fix's design.
+
+So, to the two questions. The SRT hold stays near 30 s at every `timeoutSeconds` from 10 to 180, so no
+setting buys fix (a) anything, and (a) stands as written. A clean close does not shorten it either. Phone
+ingest over RTMPS would not dodge it. In F-032's 3 RTMPS SIGKILL trials (P2 `connected` at +6.5 per
+Cloudflare), SRT playback held to +29.92 to +30.00, 7 of 69 fresh readers decoded inside the hold, and the
+first reader started at the close decoded at +33.3 (+34.5 over SRT). RTMPS removes the dead peer's 30 s
+from Cloudflare's status and from HLS only.
 
 **Recommended fix.** Not built here: the dispatch was measurement only.
 
@@ -2603,13 +2698,20 @@ policies × 5 heartbeat phases). Gaps 15, 25 and 40: one map each, per-trial med
   handshake completed and that never carried media rebuilds 1 s later, with the attempt count reset.
 - *Bound* (chosen): once per outage, re-armed only when a generation reaches Running, and only for an
   error at least 20 s after the last frame.
+  - Disarmed until the link's first Running. Before a first frame there is no broadcast the relay was
+    reading and so no hold of it to end, the gate always has a last frame to measure from, and a session
+    started into an idle input (where finding 6's no-publisher errors live) keeps today's back-off.
   - The finding-6 error comes with no publisher too, so an unbounded rule with the count reset would
     rebuild every 2 to 8 s for a phone that never returns. Only web's 15-minute phone-lost end would stop
     it.
-  - Once per outage costs a gone phone one extra connect.
+  - Once per outage costs a phone that never returns 2 to 3 extra connects: the reset re-runs the 2, 4
+    and 8 s steps, so today's +37, +52, +67, +82 becomes +31.9, +38.9, +47.9, +60.9, +75.9, and both then
+    run every 15 s. A constant, so the bound holds.
   - The 20 s gate keeps that one shot from being spent on the errors at a new publisher's arrival (about
-    4 s after the last frame) or on burst-style closes. The close came 27.9 to 29.2 s after the last
-    frame, which leaves 8 s of margin.
+    4 s after the last frame). Its evidence: in all 17 trials no error fell between the drop + 10 s and
+    the close at +29.9, and the close came 27.9 to 29.2 s after the last frame, which leaves 8 s of
+    margin. (The burst closes are a concurrency effect before the kill; a time gate does not filter
+    those.)
   - It needs no web signal, so (a) ships alone.
   - Not chosen, the gate on web's phone-live report: it would bound a gone phone to zero extra connects,
     but it ties (a) to (b)'s channel, and it does not bound a phone that reports live while nothing
@@ -2634,10 +2736,11 @@ policies × 5 heartbeat phases). Gaps 15, 25 and 40: one map each, per-trial med
   on that event under the bound. (3) The C10b/Owed 50 contract changes, since the adapter now speaks
   about a build the domain gave up. Without (1), (a) is inert in exactly the cases it exists for.
 - *Expected.* A phone back within 30 s of its drop gets its camera's first frame at the drop + 33.2 to
-  34.5 s. In C17's shape (the phone back 5.7 s after its exit) that is 27.5 to 28.8 s, plus 1 s to
+  34.5 s on the six 5.5 s maps (up to +35.9 at gap 25, one map). In C17's shape (the phone back 5.7 s after its exit) that is 27.5 to 28.8 s, plus 1 s to
   `live`: 28.5 to 29.8 s, against the replica's 35.6 s for today (C17's stamps: 33.9 to 38.9). That
   holds only when the close reaches the link's build, which 6 of 8 attached relay builds did, so about 3
-  returns in 4. The rest fall back to today's schedule.
+  returns in 4. The rest fall back to today's schedule, as does the silent end (finding 17, 2 of 12
+  round-2 trials). It holds at any `timeoutSeconds` (finding 13).
 - *Side note.* "Un-abandon" (an abandoned build that delivers its first frame goes back on air) would
   have caught the one re-attached build at +32.7 (n=1).
 
@@ -2651,11 +2754,15 @@ policies × 5 heartbeat phases). Gaps 15, 25 and 40: one map each, per-trial med
   - Never rebuild an input that is still Running with a fresh frame. A live report after a blip that
     never broke Cloudflare's broadcast must not tear down a working camera, so the nudge is latched and
     acts at the stall.
-  - Fire once per phone-live edge, not every beat. At most one connect in progress is discarded.
+  - Fire once per phone-live edge, not every beat.
+  - A connect in progress is discarded only while it has no media (the adapter's media flag from (a)'s
+    change (1)); one already carrying bytes is kept, and the nudge acts at its timeout if it never
+    decodes. At most one is discarded per edge. Without media, a lucky connect not yet served is lost
+    too: the replay counts that cost.
   - Reset the attempt count.
 - *Expected* (the replay over 5 heartbeat phases).
   - A return inside the hold gains little: with (a), median +33.3 and worst +34.5, against (a)
-    alone's +33.8 and +34.5.
+    alone's +33.8 and +34.5; alone, median +40.3.
   - A return after the hold (gap 40, **one trial**, 20 schedules): +42.8 to +49.2 (median +46.7), that
     is 2.5 to 8.9 s after the phone (median 6.4), plus 1 s to `live`. Today it is 15.1 s, and (a) alone
     gives 10.5 s.
@@ -2668,7 +2775,8 @@ policies × 5 heartbeat phases). Gaps 15, 25 and 40: one map each, per-trial med
   readers then, and so (a)'s cost for a gone phone, is not measured beyond it.
 - A real network loss, as against SIGKILL.
 - Any input but the spike's Input A, and any region but lhr.
-- Cloudflare's RTMPS and WebRTC playback.
+- Cloudflare's RTMPS and WebRTC playback, and HLS as a relay input (its latency).
+- A clean close over RTMPS, and the silent end's cause (finding 17, n=2).
 - The full relay, and CI: see the method.
 - The in-window hit rate under the relay's single-connect pattern: 16 % on 32 connects, too few to pin.
 
@@ -2681,6 +2789,10 @@ which means an image rebuild.
   `allowedOrigins` null, `hideLiveViewerCount` false, `deleteRecordingAfterDays` 30.
 - The 15 recordings these trials made (created 18:07:47 to 19:34:24) were deleted once each was
   `ready`. The input's 6 older videos were left alone.
+- Round 2: Input A's recording was set to `automatic` at 21:05:57 (`timeoutSeconds` 180, 10, 30, 60
+  in turn) and went back to `off` at 22:06:37, as found. The 16 recordings round 2 made (created
+  21:07:22 to 22:02:50) were deleted once `ready`, and the 6 older videos were left alone. No live
+  input was created, so 0 remain.
 - Read only, nothing changed: stg session `4516d82a`'s Input A (`f859e242…`). Its status shows the
   phone's republish `connected` at 16:26:12.685 (`cloudflare-status.jsonl`) and one recording of
   1353.9 s, so on Cloudflare's side the republish continued one broadcast.
@@ -2688,7 +2800,10 @@ which means an image rebuild.
 **Teardown record.**
 - 8 Machines were created in `seazn-relay-spike` (the table above), and each was destroyed after its
   results were read. `fly machine list -a seazn-relay-spike` read "No machines are available" at 19:37.
-- The local `fly logs` capture (this session's own PID and its child) was stopped. Its file is
+- Round 2 created 6 more, `784ee917c23ee8` (the smoke), `2862d20b0d2468`, `891244c670d378`,
+  `83d1e66bd2d458`, `d8911630b655e8` and `805610f6403728`, and destroyed each after its results were
+  read. The list read "No machines are available" at 22:06.
+- The local `fly logs` capture (this session's own PID and its child) was stopped, in both rounds. Its file is
   `flylogs.jsonl` in the session scratchpad, outside the repo; it holds the filtered probe lines and
   Fly's platform lines, and goes when the scratchpad does.
 - No stg DB, `stg.yml`, prod or Flyway touched, and no product crate changed.

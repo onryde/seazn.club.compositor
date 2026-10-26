@@ -24,8 +24,10 @@ last frame is at +2.0; a stall waits 1 s, and the k-th connect failure in a row 
                heartbeat after the phone's live edge, PHONE_TO_WEB + 0..HEARTBEAT s after P2's connect
                (the trial's own: the replica's, so +8.5 on the RTMPS maps, where Cloudflare saw +6.5).
                Once per edge. Never tears down an input still Running with a fresh frame (it waits for the
-               stall); otherwise it rebuilds at once, a connect in progress included (once per edge, so at
-               most one is discarded); the attempt count is reset
+               stall). A connect in progress with no media yet is discarded and rebuilt at once, whether or
+               not it would have decoded (at most one per edge); one that already carries media (its first
+               byte is in) is kept, and the nudge acts at its timeout if it never decodes. Then the attempt
+               count is reset. Media is the adapter's new flag from fix (a)'s change (F-032)
   nudge_close  nudge and close together
   live1_close  live1 and close together
 Phases: the schedule is shifted by 0, 0.25, 0.5 and 0.75 s (the stall moves with the last frame); the
@@ -64,6 +66,8 @@ def load(path):
     rows = [json.loads(l) for l in open(path) if l.startswith("{")]
     out = []
     for t in (r for r in rows if r["kind"] == "summary"):
+        if t["p2_connected_rel_kill_ms"] is None:
+            continue  # no P2 (round 2's --gaps -1): nothing to come back to
         k = t["kill_ms"]
         first_err = {}
         for r in rows:
@@ -73,10 +77,12 @@ def load(path):
         for p in t["probes"]:
             b = p["built"] / 1000
             lat = None if p["first_frame"] is None else p["first_frame"] / 1000 - b
+            byte = None if p["first_byte"] is None else p["first_byte"] / 1000 - b
             err = first_err.get(p["tag"])
             no_media = p["first_byte"] is None or (err is not None and p["first_byte"] / 1000 > err)
             hs = p["handshake"] is not None
-            by_s.setdefault(round(b), {"lat": lat, "err": err if (hs and no_media) else None, "built": b})
+            by_s.setdefault(round(b), {"lat": lat, "byte": byte, "err": err if (hs and no_media) else None,
+                                       "built": b})
         out.append({"name": f"{path.rsplit('/', 1)[-1].split('.')[0]} T{t['trial']}", "map": by_s,
                     "p2": t["p2_connected_rel_kill_ms"] / 1000})
     return out
@@ -85,6 +91,8 @@ def load(path):
 def probe(tr, t):
     sec = round(t)
     if sec not in tr["map"]:
+        if sec > max(tr["map"]):
+            return None  # past the trial's end: the outcome is censored, printed as "+inf"
         raise SystemExit(f"{tr['name']}: no probe near +{t:.1f}")
     return tr["map"][sec]
 
@@ -104,7 +112,19 @@ def run(tr, pol, shift, beat):
     while True:
         attempts += 1
         pr = probe(tr, t)
-        if pr["lat"] is not None and pr["lat"] <= p["timeout"]:
+        if pr is None:
+            return float("inf"), attempts
+        decodes = pr["lat"] is not None and pr["lat"] <= p["timeout"]
+        conn_end = t + (pr["lat"] if decodes else p["timeout"])
+        if nudge_at is not None and t <= nudge_at < conn_end:
+            # The nudge lands on a connect in progress.
+            if pr["byte"] is None or t + pr["byte"] > nudge_at:
+                t, k, nudge_at = nudge_at, 0, None  # no media yet: discarded, rebuilt at once
+                continue
+            if not decodes:
+                t, k, nudge_at = conn_end, 0, None  # media but no frame: kept; the nudge acts at its timeout
+                continue
+        if decodes:
             return t + pr["lat"], attempts
         k += 1
         end = t + p["timeout"]
@@ -136,6 +156,8 @@ for pol in POLICIES:
         res.append((tr["name"], row))
         checked += len(row)
     vals = [v for _, row in res for v, _ in row]
+    if not vals:
+        raise SystemExit(f"{pol}: nothing simulated")
     conn = statistics.median(a for _, row in res for _, a in row)
     print(f"{pol:>12}: n={len(vals)} median +{statistics.median(vals):.1f}, mean +{statistics.mean(vals):.1f}, "
           f"min +{min(vals):.1f}, max +{max(vals):.1f}; connects median {conn}")
