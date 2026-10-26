@@ -11,22 +11,27 @@
 #    deploy-stg.yml, (6) target: relay-test-hooks in deploy-stg.yml; then one per rule or refusal
 #    each review added (e*, m*, i*), and one per rule the 2026-10-25 shape added (n*: no GitHub
 #    environment, the secrets each workflow may name, no web-app token, the steps after the guard,
-#    main only, the build record's order, the write grants, no promote workflow).
+#    main only, the build record's order, the write grants, no promote workflow), and t1 to t17 for
+#    rule 16, the moving tags (amendment 2026-10-26).
 # 2. scripts/check-cef-bump.sh: green on the repo; red on the brief's mutant (3), GSTCEF_COMMIT
 #    changed without the record, on each malformed record, and on a record whose finding is no
 #    Step 0 run on its commit (m-8); green again once the record and its finding follow the bump.
 # 3. The deploy workflows' own scripts, extracted as written and run under fake flyctl, docker and gh:
 #    the token guards, the provenance steps, "Already pushed?", the Push step (its digest is the one its
 #    own push printed, and a tag moved under it is a red: the PR #93 review's C-1), the build record
-#    checks (pushed, found, squatted), the login leaving with each step, and the summaries, whose
-#    promote command the real scripts/promote.sh accepts.
+#    checks (pushed, found, squatted), the login leaving with each step, the summaries, whose
+#    promote command the real scripts/promote.sh accepts, and the track steps (amendment 2026-10-26):
+#    each moves its tag to the record check's verified digest by a carbon copy, reads it back, and
+#    refuses every other shape, alone and chained through the steps' own outputs.
 # 4. scripts/promote.sh, as the operator runs it (from a clone of a scratch "GitHub" repository,
 #    main: z, a, b, c, h; side: d), under fake flyctl, curl and gh (no docker: the review's I-1): every
 #    refusal (the arguments and the prod flag, the test seams, the tools, main's copy, provenance, the
 #    registry read by digest and its body's hash, main's build record field by field, the web app's
 #    [env] and staged secrets, the secret list after the set and the deploy), the read token never in
 #    argv, the output or an error, the previous RELAY_IMAGE from the promote log, the deploy and its
-#    proof, and a failed promote followed by its rollback.
+#    proof, and a failed promote followed by its rollback; and --track (TR1 to TR7): the tag's current
+#    digest verified as main's build before RELAY_IMAGE names the tag, each refusal, and the sequence
+#    track, pin, track.
 #
 # Needs bash, ruby (YAML), jq, python3, git, and the pinned actionlint and shellcheck on PATH
 # (scripts/check-workflows.sh --install DIR). Prints `checked: N` and fails on 0.
@@ -66,6 +71,36 @@ s = open(p).read()
 if old not in s:
     sys.exit(f"edit_all: {p}: no match for {old!r}")
 open(p, "w").write(s.replace(old, new))' "$@"
+}
+# edit_after FILE MARKER OLD NEW: replace the first OLD after MARKER, which must occur exactly once.
+edit_after() {
+  python3 -I -c '
+import sys
+p, m, old, new = sys.argv[1:5]
+s = open(p).read()
+if s.count(m) != 1:
+    sys.exit(f"edit_after: {p}: {s.count(m)} matches for marker {m!r}")
+i = s.index(m)
+j = s.find(old, i)
+if j < 0:
+    sys.exit(f"edit_after: {p}: no {old!r} after {m!r}")
+open(p, "w").write(s[:j] + new + s[j + len(old):])' "$@"
+}
+# cut FILE A B: delete the text from marker A up to (not including) marker B, each once; with APPEND=1, put
+# it at the end of the file instead.
+cut_block() {
+  python3 -I -c '
+import os, sys
+p, a, b = sys.argv[1:4]
+s = open(p).read()
+if s.count(a) != 1 or s.count(b) != 1:
+    sys.exit(f"cut_block: {p}: markers {a!r} x{s.count(a)}, {b!r} x{s.count(b)}")
+i, j = s.index(a), s.index(b)
+block = s[i:j]
+s = s[:i] + s[j:]
+if os.environ.get("APPEND") == "1":
+    s = s.rstrip("\n") + "\n" + block
+open(p, "w").write(s)' "$@"
 }
 # move FILE A B: move the text from marker A up to (not including) marker B so it sits before marker C.
 move_before() {
@@ -120,8 +155,9 @@ if [ "$rc" -eq 0 ] && grep -qF "checked $n_repo workflows" "$W/check.out" && gre
   && grep -qF 'build records: 2 of 2 push jobs attest and verify both paths' "$W/check.out" \
   && grep -qF "write grants: 5 of 5 allowed (id-token and attestations on the two push jobs, packages on image.yml's cache job); $n_repo workflows read" "$W/check.out" \
   && grep -qF "promote workflows: 0 lines changing Fly secrets in $n_repo workflows" "$W/check.out" \
-  && grep -qF 'logins that leave with their step: 6; actions in the push jobs pinned by commit: 8' "$W/check.out"; then
-  ok "check-workflows green on the repo ($n_repo workflows, 2 deploy, no environment, 2 relay tokens in their push jobs, no web token, 2 provenance steps, 2 main-only ifs, 2 build records, 5 write grants, no promote workflow, 6 logins that leave with their step, 8 pinned actions)"
+  && grep -qF 'logins that leave with their step: 8; actions in the push jobs pinned by commit: 8' "$W/check.out" \
+  && grep -qF 'moving tags: 2 of 2 push jobs move theirs (deploy-stg.yml :beta, deploy-prod.yml :stable) to the record check'"'"'s verified digest and read it back; retag lines: 2, each a track step'"'"'s own copy' "$W/check.out"; then
+  ok "check-workflows green on the repo ($n_repo workflows, 2 deploy, no environment, 2 relay tokens in their push jobs, no web token, 2 provenance steps, 2 main-only ifs, 2 build records, 5 write grants, no promote workflow, 8 logins that leave with their step, 8 pinned actions, 2 moving tags)"
 else
   bad "check-workflows on the repo: rc $rc"; sed 's/^/    /' "$W/check.out" >&2
 fi
@@ -281,9 +317,9 @@ expect_red "e15 actionlint on a non-deploy workflow" 'check-workflows: FAIL: act
 
 # e16. shellcheck on a deploy workflow: an unquoted expansion.
 fresh; edit "$W/wf/$STG" '          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
-          {' '          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          moving="$RELAY_REGISTRY/$RELAY_APP:beta"' '          ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
           cd $RUNNER_TEMP
-          {'
+          moving="$RELAY_REGISTRY/$RELAY_APP:beta"'
 expect_red "e16 shellcheck on a deploy workflow" 'actionlint with shellcheck on the deploy workflows'
 
 # m1a. The gate step under continue-on-error (deploy-stg).
@@ -602,11 +638,9 @@ expect_red "n13b a workflow that changes Fly secrets" 'soak.yml changes Fly secr
 
 PUSH_TRAP="          trap 'docker logout \"\$RELAY_REGISTRY\" > /dev/null 2>&1 || true' EXIT"
 # n16 (the PR #93 review's m-1). Every secret at once, by toJSON in any case: no rule can read it.
-fresh; edit "$W/wf/$STG" '          DIGEST: ${{ steps.push.outputs.digest || steps.exists.outputs.digest }}
-          FOUND: ${{ steps.exists.outputs.exists }}
+fresh; edit "$W/wf/$STG" '          NEW: ${{ steps.track.outputs.new }}
         run: |
-          ref=' '          DIGEST: ${{ steps.push.outputs.digest || steps.exists.outputs.digest }}
-          FOUND: ${{ steps.exists.outputs.exists }}
+          ref=' '          NEW: ${{ steps.track.outputs.new }}
           ALL: ${{ toJson(secrets) }}
         run: |
           ref='
@@ -689,6 +723,107 @@ fresh; edit "$W/wf/$STG" "      - name: Free disk space
         if: steps.token.outputs.enabled == 'true' && github.event_name == 'push' || always()
 "
 expect_red "n24b deploy-stg's Free disk space behind a widened guard" 'push.Free disk space comes after the FLY_API_TOKEN_RELAY_STG guard but does not read it'
+
+# t1 to t17 (owner, 2026-10-26: the moving tags, rule 16): each red by its own reason. TRACK_STG and
+# TRACK_PROD are each push job's track step, up to the summary.
+TRACK_STG='      # The moving tag (owner, 2026-10-26: ":beta" on every merge)'
+TRACK_PROD='      # The moving tag (owner, 2026-10-26: ":stable" on every release tag)'
+SUMMARY_STEP='      - name: Summary
+'
+
+# t1. No track step: nothing moves :beta.
+fresh; cut_block "$W/wf/$STG" "$TRACK_STG" "$SUMMARY_STEP"
+expect_red "t1 deploy-stg without its track step" 'deploy-stg.yml (moving tag): job push has 0 steps with id track, not 1'
+
+# t2. The track step before the record check: it would move :beta to a digest nothing verified.
+fresh; move_before "$W/wf/$STG" "$TRACK_STG" "$SUMMARY_STEP" '      # Both paths: the digest this run pushed'
+expect_red "t2 deploy-stg moves :beta before its record check" 'deploy-stg.yml (moving tag): job push: the track step comes before the record check'
+
+# t3. The summary before the track step (the track step appended after it).
+fresh; APPEND=1 cut_block "$W/wf/$STG" "$TRACK_STG" "$SUMMARY_STEP"
+expect_red "t3 deploy-stg's summary before its track step" 'deploy-stg.yml (moving tag): job push: the summary does not come after the track step'
+
+# t4. The track step on the pushed path only (rule 2 allows `guard && X`; rule 16 does not).
+fresh; edit "$W/wf/$STG" "      - name: Move :beta to the verified build
+        id: track
+        if: steps.token.outputs.enabled == 'true'" "      - name: Move :beta to the verified build
+        id: track
+        if: steps.token.outputs.enabled == 'true' && steps.exists.outputs.exists != 'true'"
+expect_red "t4 deploy-stg's track step skipped on the found path" "deploy-stg.yml (moving tag): job push: the track step runs on if 'steps.token.outputs.enabled == 'true' && steps.exists.outputs.exists != 'true''"
+
+# t5. The track step reads the push's or the found tag's digest directly, not the record check's output.
+fresh; edit "$W/wf/$STG" '          DIGEST: ${{ steps.record.outputs.digest }}' '          DIGEST: ${{ steps.push.outputs.digest || steps.exists.outputs.digest }}'
+expect_red "t5 deploy-stg's track DIGEST not the record check's" "deploy-stg.yml (moving tag): job push: the track step's DIGEST is"
+
+# t6. The track step re-reads the digest by tag.
+fresh; edit "$W/wf/$STG" '          moving="$RELAY_REGISTRY/$RELAY_APP:beta"
+          # The old :beta' '          DIGEST=$(docker buildx imagetools inspect "$RELAY_REGISTRY/$RELAY_APP:$TAG" --format '"'"'{{.Manifest.Digest}}'"'"')
+          moving="$RELAY_REGISTRY/$RELAY_APP:beta"
+          # The old :beta'
+expect_red "t6 deploy-stg's track step re-reads DIGEST by tag" 'deploy-stg.yml (moving tag): job push: the track step assigns DIGEST: DIGEST=$(docker buildx imagetools inspect'
+
+# t7. The copy without --prefer-index=false: buildx would wrap the manifest in a new index, a new digest.
+fresh; edit "$W/wf/$STG" 'imagetools create --prefer-index=false --tag' 'imagetools create --tag'
+expect_red "t7 deploy-stg's copy without --prefer-index=false" 'deploy-stg.yml (moving tag): job push: the track step'"'"'s copy is '"'"'docker buildx imagetools create --tag "$moving"'
+
+# t8. The copy from the sha's tag, not the verified digest.
+fresh; edit "$W/wf/$STG" '--tag "$moving" "$RELAY_REGISTRY/$RELAY_APP@$DIGEST"' '--tag "$moving" "$RELAY_REGISTRY/$RELAY_APP:$TAG"'
+expect_red "t8 deploy-stg copies from the tag" 'deploy-stg.yml (moving tag): job push: the track step'"'"'s copy is '"'"'docker buildx imagetools create --prefer-index=false --tag "$moving" "$RELAY_REGISTRY/$RELAY_APP:$TAG"'
+
+# t9. stg moves prod's tag name.
+fresh; edit "$W/wf/$STG" '          moving="$RELAY_REGISTRY/$RELAY_APP:beta"
+          # The old :beta' '          moving="$RELAY_REGISTRY/$RELAY_APP:stable"
+          # The old :beta'
+expect_red "t9 deploy-stg moves :stable" 'deploy-stg.yml (moving tag): job push: the track step moves '"'"'moving="$RELAY_REGISTRY/$RELAY_APP:stable"'"'"', not :beta'
+
+# t10. A mismatch after the move that does not fail the job.
+fresh; edit_after "$W/wf/$STG" 'after the move, not the verified' '            exit 1' '            true'
+expect_red "t10 deploy-stg's read-back never exits 1" 'deploy-stg.yml (moving tag): job push: the track step never reads :beta back and exits 1 when it names another digest'
+
+# t11. No read-back at all.
+fresh; edit "$W/wf/$STG" '          now=$(docker buildx imagetools inspect "$moving" --format '"'"'{{.Manifest.Digest}}'"'"')
+          if [ "$now" != "$DIGEST" ]; then' '          now=$DIGEST
+          if [ "$now" != "$DIGEST" ]; then'
+expect_red "t11 deploy-stg's track step reads nothing back" 'deploy-stg.yml (moving tag): job push: the track step never reads :beta back'
+
+# t12. The record check writes its digest before it verifies (a found squat would reach the track step).
+fresh; edit "$W/wf/$STG" '            # The verified digest, written here and nowhere else: the moving tag'"'"'s step reads only this.
+            echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+' ''
+edit "$W/wf/$STG" '          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no digest for $ref: '"'"'$DIGEST'"'"'"; exit 1; }' '          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no digest for $ref: '"'"'$DIGEST'"'"'"; exit 1; }
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"'
+expect_red "t12 deploy-stg's record check outputs its digest before verifying" "deploy-stg.yml (moving tag): job push: the record check does not write digest= to GITHUB_OUTPUT once, on its verified branch alone"
+
+# t13. A retag outside the track step: the Push step pushes :beta before anything is attested.
+fresh; edit "$W/wf/$STG" '          docker push "$ref" | tee "$RUNNER_TEMP/push.out"' '          docker push "$ref" | tee "$RUNNER_TEMP/push.out"
+          docker tag "$LOCAL_IMAGE" "$RELAY_REGISTRY/$RELAY_APP:beta" && docker push "$RELAY_REGISTRY/$RELAY_APP:beta"'
+expect_red "t13 deploy-stg's Push step pushes :beta" 'deploy-stg.yml (moving tag): push.Push retags outside a track step: docker tag "$LOCAL_IMAGE" "$RELAY_REGISTRY/$RELAY_APP:beta"'
+
+# t14. A retag tool in another workflow (any job: rule 5 keeps the relay token out, rule 16 the command).
+fresh; cat >> "$W/wf/check.yml" << 'YML'
+  retag:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: crane copy ghcr.io/x/y@sha256:0 ghcr.io/x/y:beta
+YML
+expect_red "t14 a retag in check.yml" 'check.yml (moving tag): retag.step 0 retags outside a track step: crane copy'
+
+# t15. The track step with a key that changes how it runs.
+fresh; edit "$W/wf/$PROD" "      - name: Move :stable to the verified build
+        id: track
+" "      - name: Move :stable to the verified build
+        id: track
+        working-directory: /tmp
+"
+expect_red "t15 deploy-prod's track step with working-directory" 'deploy-prod.yml (moving tag): job push: the track step carries working-directory'
+
+# t16. A missing deploy workflow: the count (masked per file by e14's red otherwise) says 1 of 2.
+fresh; rm "$W/wf/$PROD"
+expect_red "t16 deploy-prod.yml missing: 1 of 2 moving tags" 'moving tags: 1 of 2 push jobs move theirs'
+
+# t17. Each push job owes its own: deploy-prod without its track step, deploy-stg's still there.
+fresh; cut_block "$W/wf/$PROD" "$TRACK_PROD" "$SUMMARY_STEP"
+expect_red "t17 deploy-prod without its track step" 'deploy-prod.yml (moving tag): job push has 0 steps with id track, not 1: nothing moves :stable'
 
 # ---------------------------------------------------------------- 2. check-cef-bump.sh
 pin=$(tr -d '[:space:]' < "$root/docker/GSTCEF_COMMIT")
@@ -856,7 +991,11 @@ SH
 # docker, for the deploy workflows' own steps only (promote runs no docker): tags in $STATE/registry
 # (`<repo>:<tag> <digest>`). `push` prints docker's PushResult line for $STATE/push-digest and puts
 # that digest under the tag, or, with $STATE/squat-after-push, another push's right after it (the
-# race of the PR #93 review's C-1).
+# race of the PR #93 review's C-1). `buildx imagetools create --tag DST SRC` (one source, by digest) is
+# buildx v0.38.1's combine for one source with no annotations (util/imagetools/create.go): an index
+# ($STATE/index-<digest>) is copied as it is, and so is an image manifest under --prefer-index=false;
+# otherwise (the default, --prefer-index=true) the manifest is wrapped in a new index, a new digest.
+# $STATE/squat-after-create moves DST to its digest right after (another push holding the token).
 cat > "$W/bin/docker" << 'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -875,14 +1014,41 @@ case "$1" in
     exit 0 ;;
 esac
 if [ "$1 ${2:-}" = "buildx version" ]; then echo "github.com/docker/buildx v0.0.0 fake"; exit 0; fi
+if [ "$1 ${2:-} ${3:-}" = "buildx imagetools create" ]; then
+  shift 3; carbon=no dst='' src=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prefer-index=false) carbon=yes ;;
+      --tag | -t) dst=$2; shift ;;
+      -*) echo "fake docker: unexpected create flag $1" >&2; exit 2 ;;
+      *) [ -z "$src" ] || { echo "fake docker: this fake models one source" >&2; exit 2; }; src=$1 ;;
+    esac
+    shift
+  done
+  [ -n "$dst" ] && [[ "$src" == *@sha256:* ]] || { echo "fake docker: create wants --tag and one <repo>@<digest> source" >&2; exit 2; }
+  [ ! -f "$STATE/create-fails" ] || { echo "ERROR: failed to push $dst: 403 Forbidden (fake)" >&2; exit 1; }
+  name=${src%@*} d=${src##*@}
+  { awk -v n="$name:" -v d="$d" 'index($1, n) == 1 && $2 == d {f = 1} END {exit !f}' "$STATE/registry" \
+      || { [ -f "$STATE/manifests" ] && awk -v n="$name" -v d="$d" '$1 == n && $2 == d {f = 1} END {exit !f}' "$STATE/manifests"; }; } \
+    || { echo "ERROR: $src: not found" >&2; exit 1; }
+  if [ "$carbon" = yes ] || [ -f "$STATE/index-$d" ]; then nd=$d
+  elif command -v sha256sum > /dev/null; then nd="sha256:$(printf 'an index over %s' "$d" | sha256sum | cut -d' ' -f1)"
+  else nd="sha256:$(printf 'an index over %s' "$d" | shasum -a 256 | cut -d' ' -f1)"; fi
+  [ ! -f "$STATE/squat-after-create" ] || nd=$(cat "$STATE/squat-after-create")
+  awk -v r="$dst" '$1 != r' "$STATE/registry" > "$STATE/registry.tmp"; echo "$dst $nd" >> "$STATE/registry.tmp"
+  mv "$STATE/registry.tmp" "$STATE/registry"
+  echo "#1 pushing $nd to $dst (fake)" >&2
+  exit 0
+fi
 [ "$1 $2 $3" = "buildx imagetools inspect" ] || { echo "fake docker: unexpected: $*" >&2; exit 2; }
 if [ -f "$STATE/registry-down" ]; then echo "ERROR: failed to authorize: 401 Unauthorized (fake)" >&2; exit 1; fi
 d=$(awk -v r="$4" '$1 == r {print $2}' "$STATE/registry")
 [ -n "$d" ] || { echo "ERROR: $4: not found" >&2; exit 1; }
 echo "$d"
 SH
-# curl, for promote's one registry read: GET https://<registry>/v2/<app>/manifests/<digest>, served from
-# $STATE/blobs/<app>/<digest>; 404 when absent; $STATE/status-<digest> forces a status, $STATE/lie a
+# curl, for promote's registry reads: GET https://<registry>/v2/<app>/manifests/<digest or tag>, served
+# from $STATE/blobs/<app>/<digest> (a tag resolves through $STATE/registry, `<registry>/<app>:<tag>`);
+# 404 when absent; $STATE/status-<digest> forces a status, $STATE/lie a
 # wrong body ($STATE/lie-<digest> for that digest alone), $STATE/curl-fails a curl error whose text
 # carries the credential (it must never be
 # printed). It checks its -K config: mode -rw-------, exactly `user = "x:<the minted token>"`.
@@ -912,9 +1078,11 @@ else
 fi
 if [ -f "$STATE/curl-fails" ]; then echo "curl: (7) Failed to connect as x:$(cat "$STATE/read-token") (fake)" >&2; printf '000'; exit 7; fi
 path=${url#https://*/v2/} app=${path%%/manifests/*} digest=${path##*/manifests/}
+host=${url#https://}; host=${host%%/*} asked=$digest
 if [ -f "$STATE/status-$digest" ]; then printf '{}' > "$out"; cat "$STATE/status-$digest"; exit 0; fi
-if [ -f "$STATE/blobs/$app/$digest" ]; then
-  if [ -f "$STATE/lie" ] || [ -f "$STATE/lie-$digest" ]; then printf '{"not":"it"}' > "$out"; else cp "$STATE/blobs/$app/$digest" "$out"; fi
+if [[ "$digest" != sha256:* ]]; then digest=$(awk -v r="$host/$app:$digest" '$1 == r {print $2}' "$STATE/registry"); fi
+if [ -n "$digest" ] && [ -f "$STATE/blobs/$app/$digest" ]; then
+  if [ -f "$STATE/lie" ] || [ -f "$STATE/lie-$digest" ] || [ -f "$STATE/lie-$asked" ]; then printf '{"not":"it"}' > "$out"; else cp "$STATE/blobs/$app/$digest" "$out"; fi
   printf '200'
 else
   printf '{"errors":[{"code":"MANIFEST_UNKNOWN"}]}' > "$out"; printf '404'
@@ -933,11 +1101,13 @@ echo "gh $*" >> "$STATE/log"
 # $STATE/attestations: one per line, `digest identity source_ref source_digest signer_digest runner repo`.
 [ "$1 ${2:-}" = "attestation verify" ] || { echo "fake gh: unexpected: $*" >&2; exit 2; }
 subject=$3; shift 3
-repo='' ident='' sref='' sdig='' gdig='' deny=no
+repo='' ident='' ident_re='' sref='' sdig='' gdig='' deny=no fmt=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) repo=$2; shift ;;
     --cert-identity) ident=$2; shift ;;
+    --cert-identity-regex) ident_re=$2; shift ;;
+    --format) fmt=$2; shift ;;
     --source-ref) sref=$2; shift ;;
     --source-digest) sdig=$2; shift ;;
     --signer-digest) gdig=$2; shift ;;
@@ -948,7 +1118,9 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ -n "$repo" ] || { echo "fake gh: --repo or --owner is required" >&2; exit 2; }
-[ -n "$ident" ] || { echo "fake gh: this fake models --cert-identity only" >&2; exit 2; }
+{ [ -n "$ident" ] && [ -z "$ident_re" ]; } || { [ -z "$ident" ] && [ -n "$ident_re" ]; } \
+  || { echo "fake gh: one of --cert-identity or --cert-identity-regex (gh: mutually exclusive)" >&2; exit 2; }
+[ -z "$fmt" ] || [ "$fmt" = json ] || { echo "fake gh: --format json only" >&2; exit 2; }
 if [ -f "$STATE/attest-down" ]; then echo "Error: failed to fetch attestations: HTTP 503 (fake)" >&2; exit 1; fi
 if [[ "$subject" == oci://* ]]; then
   name=${subject#oci://} digest=${subject##*@}; name=${name%@*}
@@ -961,10 +1133,21 @@ else
   if command -v sha256sum > /dev/null; then digest="sha256:$(sha256sum < "$subject" | cut -d' ' -f1)"
   else digest="sha256:$(shasum -a 256 < "$subject" | cut -d' ' -f1)"; fi
 fi
-if awk -v d="$digest" -v i="$ident" -v r="$sref" -v s="$sdig" -v g="$gdig" -v deny="$deny" -v repo="$repo" '
-    $1 == d && $2 == i && (r == "" || $3 == r) && (s == "" || $4 == s) && (g == "" || $5 == g) \
-      && (deny == "no" || $6 == "github-hosted") && $7 == repo {f = 1} END {exit !f}' "$STATE/attestations"; then
-  echo "Verification succeeded! (fake)"
+# The regex is passed through the environment: awk would read escapes in a -v value.
+matched=$(RE="$ident_re" awk -v d="$digest" -v i="$ident" -v r="$sref" -v s="$sdig" -v g="$gdig" -v deny="$deny" -v repo="$repo" '
+    $1 == d && ((i != "" && $2 == i) || (i == "" && $2 ~ ENVIRON["RE"])) && (r == "" || $3 == r) && (s == "" || $4 == s) \
+      && (g == "" || $5 == g) && (deny == "no" || $6 == "github-hosted") && $7 == repo' "$STATE/attestations")
+if [ -n "$matched" ]; then
+  # --format json: one result per attestation that matched, as gh 2.95.0 prints them (measured
+  # 2026-10-26 on cli/cli's own release: an array of {attestation, verificationResult}, the
+  # certificate's fields under .verificationResult.signature.certificate).
+  if [ "$fmt" = json ]; then
+    jq -R -s 'split("\n") | map(select(length > 0) | split(" ") | {verificationResult: {signature: {certificate: {
+        subjectAlternativeName: .[1], sourceRepositoryRef: .[2], sourceRepositoryDigest: .[3], buildSignerDigest: .[4],
+        runnerEnvironment: .[5], sourceRepositoryURI: "https://github.com/\(.[6])"}}}})' <<< "$matched"
+  else
+    echo "Verification succeeded! (fake)"
+  fi
   exit 0
 fi
 echo "Error: verifying with issuer \"sigstore.dev\": no attestation matched the policy (fake)" >&2
@@ -1011,11 +1194,13 @@ state() {
   printf '%s\n' "$READ_TOKEN" > "$STATE/read-token"
   printf '%s\n' "$REG/seazn-relay-stg:$SHA $D_NEW" "$REG/seazn-relay-stg:$OLD $D_OLD" "$REG/seazn-relay-stg:$SIDE $D_ANY" \
     "$REG/seazn-relay-stg:$BAD $D_ANY" "$REG/seazn-relay-stg:$PRE $D_ANY" \
-    "$REG/seazn-relay-prod:v1.2.3 $D_PROD" "$REG/seazn-relay-prod:v1.2.4 $D_ANY" "$REG/seazn-relay-prod:v1.1.0 $D_ANY" > "$STATE/registry"
+    "$REG/seazn-relay-prod:v1.2.3 $D_PROD" "$REG/seazn-relay-prod:v1.2.4 $D_ANY" "$REG/seazn-relay-prod:v1.1.0 $D_ANY" \
+    "$REG/seazn-relay-stg:beta $D_OLD" "$REG/seazn-relay-prod:stable $D_PROD" > "$STATE/registry"
   blob seazn-relay-stg "$B_NEW"; blob seazn-relay-stg "$B_OLD"; blob seazn-relay-stg "$B_ANY"
   blob seazn-relay-prod "$B_PROD"; blob seazn-relay-prod "$B_ANY"
   # Main's build records for what main pushed: deploy-stg at refs/heads/main for $SHA and $OLD,
-  # deploy-prod at refs/tags/v1.2.3 for C. Nothing attests the D_ANY images.
+  # deploy-prod at refs/tags/v1.2.3 for C. Nothing attests the D_ANY images. The moving tags: :beta
+  # names $OLD's build, :stable v1.2.3's.
   { attest_line "$D_NEW" "$ID_STG" refs/heads/main "$SHA"; attest_line "$D_OLD" "$ID_STG" refs/heads/main "$OLD"
     attest_line "$D_PROD" "$WFURL/deploy-prod.yml@refs/tags/v1.2.3" refs/tags/v1.2.3 "$C"; } > "$STATE/attestations"
   echo '{"app":"seazn-club-stg","env":{"OAUTH_BASE_URL":"https://stg.example"}}' > "$STATE/config.json"
@@ -1166,8 +1351,10 @@ record_case() { # record_case FILE NAME WANT_RC TEXT VAR=VALUE...
   local file=$1 name=$2 want=$3 text=$4; shift 4
   extract "$file" push record "$W/record.sh"
   run_step "$W/record.sh" "$@"
-  if { [ "$want" = 0 ] && [ "$rc" -eq 0 ] && has "$W/step.out" "$text" && logs_out; } \
-    || { [ "$want" != 0 ] && [ "$rc" -ne 0 ] && grep -F '::error::' "$W/step.out" | grep -qF -- "$text"; }; then
+  # The verified digest is the step's one output (the track step reads only it), written only on success.
+  if { [ "$want" = 0 ] && [ "$rc" -eq 0 ] && has "$W/step.out" "$text" && logs_out \
+         && [ "$(cat "$W/output")" = "digest=$(printf '%s\n' "$@" | sed -n 's/^DIGEST=//p')" ]; } \
+    || { [ "$want" != 0 ] && [ "$rc" -ne 0 ] && grep -F '::error::' "$W/step.out" | grep -qF -- "$text" && [ ! -s "$W/output" ]; }; then
     ok "$file build record $name :: $(head -n 1 "$W/step.out" | cut -c 1-200)"
   else
     bad "$file build record $name: rc $rc, expected rc $want saying: $text"; show
@@ -1215,10 +1402,13 @@ promotes_as_printed() { # promotes_as_printed NAME: run the summary's command th
 }
 for found in true false; do
   extract "$STG" push summary "$W/summary.sh"
-  state; run_step "$W/summary.sh" RELAY_APP=seazn-relay-stg TAG="$SHA" FOUND="$found" DIGEST="$D_NEW"
+  state; run_step "$W/summary.sh" RELAY_APP=seazn-relay-stg TAG="$SHA" FOUND="$found" DIGEST="$D_NEW" OLD="$D_OLD" NEW="$D_NEW"
   common=false
   if [ "$rc" -eq 0 ] && [ "$(summary_cmd)" = "scripts/promote.sh stg $SHA@$D_NEW" ] \
-    && has "$W/summary" "It stages \`RELAY_IMAGE=$REG/seazn-relay-stg@$D_NEW\` (the digest alone) on seazn-club-stg, then deploys it."; then
+    && has "$W/summary" "It stages \`RELAY_IMAGE=$REG/seazn-relay-stg@$D_NEW\` (the digest alone) on seazn-club-stg, then deploys it." \
+    && has "$W/summary" "\`$REG/seazn-relay-stg:beta\` moved: \`$D_OLD\` -> \`$D_NEW\` (this build, after its record verified)." \
+    && has "$W/summary" "If RELAY_IMAGE is pinned to a digest, nothing live changed: while pinned, \`:beta\` is not followed." \
+    && has "$W/summary" "\`scripts/promote.sh stg --track beta\` is the verified way"; then
     common=true
   fi
   if [ "$found" = true ]; then
@@ -1237,8 +1427,10 @@ for found in true false; do
   fi
 done
 extract "$PROD" push summary "$W/summary.sh"
-state; run_step "$W/summary.sh" RELAY_APP=seazn-relay-prod TAG=v1.2.3 FOUND=true DIGEST="$D_PROD"
+state; run_step "$W/summary.sh" RELAY_APP=seazn-relay-prod TAG=v1.2.3 FOUND=true DIGEST="$D_PROD" OLD="$D_PROD" NEW="$D_PROD"
 if [ "$rc" -eq 0 ] && has "$W/summary" 'Found in the registry, not built by this run' && ! has "$W/summary" 'Pushed' \
+  && has "$W/summary" "\`$REG/seazn-relay-prod:stable\` already named this build: \`$D_PROD\` (unchanged)." \
+  && has "$W/summary" "\`scripts/promote.sh prod --track stable --confirm-prod\` is the verified way" && ! has "$W/summary" ':beta' \
   && [ "$(summary_cmd)" = "scripts/promote.sh prod v1.2.3@$D_PROD --confirm-prod" ] \
   && has "$W/summary" "It stages \`RELAY_IMAGE=$REG/seazn-relay-prod@$D_PROD\` (the digest alone) on seazn-club-prod"; then
   ok "deploy-prod summary, found: says found, not built by this run, and never Pushed; prints the prod command with --confirm-prod"
@@ -1246,6 +1438,136 @@ else
   bad "deploy-prod summary, found: rc $rc"; sed 's/^/    /' "$W/summary" >&2
 fi
 promotes_as_printed "deploy-prod summary"
+# The summary's own guard: a track step that reported another digest than this build's gets no summary.
+for wf in "$STG:seazn-relay-stg:$SHA" "$PROD:seazn-relay-prod:v1.2.3"; do
+  IFS=: read -r file app tag <<< "$wf"
+  extract "$file" push summary "$W/summary.sh"
+  state; run_step "$W/summary.sh" RELAY_APP="$app" TAG="$tag" FOUND=false DIGEST="$D_NEW" OLD=none NEW="$D_SQ"
+  if [ "$rc" -ne 0 ] && has "$W/step.out" "::error::the track step reports $REG/$app:" && has "$W/step.out" "as '$D_SQ', not this build's $D_NEW: no summary" && [ ! -s "$W/summary" ]; then
+    ok "$file summary: a track step reporting another digest ($D_SQ) is a red, and no summary is written"
+  else
+    bad "$file summary with NEW != DIGEST: rc $rc"; show
+  fi
+done
+
+# The moving tag (owner, 2026-10-26), each push job's track step. tag_now REF: the digest REF names in the
+# fake registry. The model check first: the fake copies like buildx (a different digest without
+# --prefer-index=false, the same with it, and an index the same either way), so a track step that lost
+# the flag reds on its own read-back below, not by luck.
+tag_now() { awk -v r="$1" '$1 == r {print $2}' "$STATE/registry"; }
+state
+"$W/bin/docker" buildx imagetools create --tag "$REG/seazn-relay-stg:m1" "$REG/seazn-relay-stg@$D_NEW" 2> /dev/null
+"$W/bin/docker" buildx imagetools create --prefer-index=false --tag "$REG/seazn-relay-stg:m2" "$REG/seazn-relay-stg@$D_NEW" 2> /dev/null
+touch "$STATE/index-$D_NEW"
+"$W/bin/docker" buildx imagetools create --tag "$REG/seazn-relay-stg:m3" "$REG/seazn-relay-stg@$D_NEW" 2> /dev/null
+m1=$(tag_now "$REG/seazn-relay-stg:m1") m2=$(tag_now "$REG/seazn-relay-stg:m2") m3=$(tag_now "$REG/seazn-relay-stg:m3")
+if [[ "$m1" =~ ^sha256:[0-9a-f]{64}$ ]] && [ "$m1" != "$D_NEW" ] && [ "$m2" = "$D_NEW" ] && [ "$m3" = "$D_NEW" ]; then
+  ok "the copy model: an image manifest copied with the default --prefer-index=true is a new digest ($m1); with --prefer-index=false, or an index, it is the source's"
+else
+  bad "the copy model: m1 '$m1' m2 '$m2' m3 '$m3'"; show
+fi
+# track_case FILE APP MOVING TAG TOKEN: the step moves MOVING to the DIGEST it is given (the record
+# check's output), never to what TAG names now: here a squat moved the sha's (or release's) tag first.
+track_checked=0
+for wf in "$STG:seazn-relay-stg:beta:$SHA:fake-stg-push" "$PROD:seazn-relay-prod:stable:v1.2.3:fake-prod-push"; do
+  IFS=: read -r file app moving tag token <<< "$wf"
+  extract "$file" push track "$W/track.sh"
+  args=(RELAY_APP="$app" TAG="$tag" FLY_API_TOKEN="$token" EXPECT_PUSH="$token")
+  mv_ref="$REG/$app:$moving"
+  # The verified build stays addressable by its digest in this app's repository, whatever its tag names.
+  seed() { blob "$app" "$B_NEW"; echo "$REG/$app $D_NEW" >> "$STATE/manifests"; }
+  # T1: the verified digest, with the sha's tag already moved to a squat.
+  state; seed; old1=$(tag_now "$mv_ref")
+  sed "s|^$REG/$app:$tag .*|$REG/$app:$tag $D_SQ|" "$STATE/registry" > "$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/registry"; blob "$app" "$B_SQ"
+  run_step "$W/track.sh" "${args[@]}" DIGEST="$D_NEW"
+  r1=$rc o1=$(cat "$W/output") now1=$(tag_now "$mv_ref") l1=false; logs_out && l1=true
+  c1=$(grep -c "^docker buildx imagetools create --prefer-index=false --tag $mv_ref $REG/$app@$D_NEW$" "$STATE/log" || true)
+  bytag1=$(grep -c "imagetools inspect $REG/$app:$tag" "$STATE/log" || true) said1=false
+  has "$W/step.out" "$mv_ref: $old1 -> $D_NEW" && said1=true
+  # T2: the first move: no tag yet.
+  state; seed; awk -v r="$mv_ref" '$1 != r' "$STATE/registry" > "$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/registry"
+  run_step "$W/track.sh" "${args[@]}" DIGEST="$D_NEW"
+  r2=$rc o2=$(cat "$W/output") now2=$(tag_now "$mv_ref")
+  if [ "$r1" -eq 0 ] && [ "$now1" = "$D_NEW" ] && [ "$o1" = "old=$old1"$'\n'"new=$D_NEW" ] && [ "$l1" = true ] && [ "$c1" -eq 1 ] \
+    && [ "$bytag1" -eq 0 ] && [ "$said1" = true ] && [[ "$old1" =~ ^sha256: ]] \
+    && [ "$r2" -eq 0 ] && [ "$now2" = "$D_NEW" ] && [ "$o2" = "old=none"$'\n'"new=$D_NEW" ]; then
+    ok "$file track: :$moving moved $old1 -> $D_NEW, the DIGEST it was given (the sha's tag named a squat: never read), by one carbon copy, read back, logged out after; the first move reads old=none"
+  else
+    bad "$file track: rc $r1/$r2, now '$now1'/'$now2', out '$o1' / '$o2', copies $c1, logout $l1"; show
+  fi
+  track_checked=$((track_checked + 1))
+  # The refusals: each leaves the tag where it was, and writes no output.
+  for t in "no digest||no verified digest to move :$moving to ('')" \
+           "a malformed digest|sha256:xyz|no verified digest to move :$moving to ('sha256:xyz')" \
+           "the old tag unreadable|registry-down|the registry could not be read for $mv_ref (only 'not found' means none yet)" \
+           "the old tag names no digest|junk|$mv_ref resolved to no manifest digest: 'junk'" \
+           "the copy fails|create-fails|" \
+           "the tag moved under the copy|squat-after-create|$mv_ref names '$D_SQ' after the move, not the verified $D_NEW"; do
+    IFS='|' read -r label how text <<< "$t"
+    state; seed; before=$(tag_now "$mv_ref") digest=$D_NEW
+    case "$how" in
+      '' | sha256:*) digest=$how ;;
+      junk) sed "s|^$mv_ref .*|$mv_ref junk|" "$STATE/registry" > "$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/registry"; before=junk ;;
+      squat-after-create) echo "$D_SQ" > "$STATE/squat-after-create"; before=$D_SQ ;;
+      *) touch "$STATE/$how" ;;
+    esac
+    run_step "$W/track.sh" "${args[@]}" DIGEST="$digest"
+    after=$(tag_now "$mv_ref")
+    if [ "$rc" -ne 0 ] && [ ! -s "$W/output" ] && [ "$after" = "$before" ] \
+      && { [ -z "$text" ] || grep -F '::error::' "$W/step.out" | grep -qF -- "$text"; } \
+      && { [ -n "$how" ] && [[ "$how" != sha256:* ]] || ! grep -q '^docker buildx imagetools create' "$STATE/log"; }; then
+      ok "$file track refuses $label: no output, :$moving still '$after'$( [ -z "$text" ] || echo " :: $text")"
+    else
+      bad "$file track, $label: rc $rc, :$moving '$before' -> '$after', out '$(cat "$W/output")'"; show
+    fi
+    track_checked=$((track_checked + 1))
+  done
+done
+[ "$track_checked" -eq 14 ] || bad "the track step sweep checked $track_checked cases, not 14"
+echo "track step cases checked: $track_checked"
+
+# The chain, through the steps' own outputs, as the runner threads them (the C-1 rule, then the found
+# path): Push's digest -> the record check's output -> the track step's DIGEST; a found tag moves :beta
+# only once the record check verified it; a found squat stops at the record check, and a track step
+# given its (empty) output refuses.
+out_of() { sed -n "s/^$1=//p" "$W/output"; }
+extract "$STG" push exists "$W/exists.sh"; extract "$STG" push push "$W/push.sh"; extract "$STG" push record "$W/record.sh"; extract "$STG" push track "$W/track.sh"
+chain() { # chain PATH: run the steps for that path; sets c_rec (record's rc), c_track (track's rc), c_beta (what :beta names)
+  local tag=$SHA
+  [ "$1" != pushed ] || tag=$UNPUSHED
+  local base=(RELAY_APP=seazn-relay-stg TAG="$tag" GITHUB_SHA="$tag" FLY_API_TOKEN=fake-stg-push)
+  : > "$W/output"; run_step "$W/exists.sh" "${base[@]}"
+  local found digest
+  found=$(out_of exists) digest=$(out_of digest)
+  if [ "$found" != true ]; then
+    : > "$W/output"; echo "$D_NEW" > "$STATE/push-digest"
+    run_step "$W/push.sh" "${base[@]}" LOCAL_IMAGE=seazn-relay:local; digest=$(out_of digest)
+    # What the attest step signs: this push's own digest, as main's build of this commit.
+    attest_line "$digest" "$ID_STG" refs/heads/main "$tag" >> "$STATE/attestations"
+  fi
+  : > "$W/output"; run_step "$W/record.sh" "${base[@]}" FOUND="$found" DIGEST="$digest"; c_rec=$rc
+  local verified; verified=$(out_of digest)
+  : > "$W/output"; run_step "$W/track.sh" "${base[@]}" DIGEST="$verified"; c_track=$rc
+  c_beta=$(tag_now "$REG/seazn-relay-stg:beta")
+}
+state; chain pushed
+if [ "$c_rec" -eq 0 ] && [ "$c_track" -eq 0 ] && [ "$c_beta" = "$D_NEW" ]; then
+  ok "chain, pushed: :beta names the digest the push itself printed ($D_NEW), through the record check's output"
+else
+  bad "chain, pushed: record $c_rec, track $c_track, :beta '$c_beta'"; show
+fi
+state; chain found
+if [ "$c_rec" -eq 0 ] && [ "$c_track" -eq 0 ] && [ "$c_beta" = "$D_NEW" ]; then
+  ok "chain, found and verified: :beta moved to the found digest only through the record check's output"
+else
+  bad "chain, found: record $c_rec, track $c_track, :beta '$c_beta'"; show
+fi
+sq_state ""; chain found
+if [ "$c_rec" -ne 0 ] && [ "$c_track" -ne 0 ] && [ "$c_beta" = "$D_OLD" ] && has "$W/step.out" "::error::no verified digest to move :beta to ('')"; then
+  ok "chain, found squat: the record check refuses, writes no digest, and a track step given that output refuses; :beta still $D_OLD"
+else
+  bad "chain, found squat: record $c_rec, track $c_track, :beta '$c_beta'"; show
+fi
 
 # deploy-prod's tag check, on the scratch repository (main z-a-b-c-h, side d).
 extract "$PROD" push provenance "$W/tag.sh"
@@ -1654,6 +1976,144 @@ fi
 state; blob seazn-relay-prod "$B_SQ"
 attest_line "$D_SQ" "$ID_STG" refs/heads/main "$C" >> "$STATE/attestations"
 refused_before_web "P17 (I-4): prod refuses a digest whose only record is stg's build of the same commit" "$REG/seazn-relay-prod@$D_SQ (v1.2.3) is not main's own build: no attestation from $WFURL/deploy-prod.yml@refs/tags/v1.2.3 for $C" -- prod "v1.2.3@$D_SQ" --confirm-prod
+
+# TR (owner, 2026-10-26): promote --track. RELAY_IMAGE names the moving tag, set once, only after the
+# tag's current digest verifies as main's build, field by field like a pin (P17's), plus the commit's
+# place on main and its CEF bump gate. Base state: :beta names $OLD's build (D_OLD), :stable v1.2.3's.
+track_value="$REG/seazn-relay-stg:beta" stable_value="$REG/seazn-relay-prod:stable"
+RE_STG='^https://github\.com/onryde/seazn\.club\.compositor/\.github/workflows/deploy-stg\.yml@refs/heads/main$'
+RE_PROD='^https://github\.com/onryde/seazn\.club\.compositor/\.github/workflows/deploy-prod\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+# TR1: stg, the happy path.
+state; promote_run -- stg --track beta
+if [ "$rc" -eq 0 ] && has "$STATE/log" "flyctl secrets set RELAY_IMAGE=$track_value -a seazn-club-stg --stage (token none)" \
+  && has "$STATE/log" 'flyctl secrets deploy -a seazn-club-stg (token none)' \
+  && has "$STATE/log" "https://$REG/v2/seazn-relay-stg/manifests/beta" \
+  && has "$STATE/log" "--repo $REPO --cert-identity-regex $RE_STG --deny-self-hosted-runners --limit 1000 --format json" \
+  && grep -qE "^gh attestation verify /[^ ]+/manifest\.json --repo $REPO --cert-identity $ID_STG --source-ref refs/heads/main --source-digest $OLD --signer-digest $OLD --deny-self-hosted-runners --limit 1000$" "$STATE/log" \
+  && [ "$(line_of 'manifests/beta')" -lt "$(line_of 'cert-identity-regex')" ] && [ "$(line_of 'cert-identity-regex')" -lt "$(line_of "--cert-identity $ID_STG")" ] \
+  && [ "$(line_of "--cert-identity $ID_STG")" -lt "$(line_of 'flyctl config show')" ] \
+  && ! grep -q '^docker ' "$STATE/log" && no_token_seen \
+  && has "$W/step.out" "  commit:                $OLD (on main; the CEF bump gate passed in its tree)" \
+  && has "$W/step.out" "  build record:          attested by $ID_STG" \
+  && has "$W/step.out" "  new RELAY_IMAGE:       $track_value" \
+  && has "$W/step.out" "  following:             :beta, which names $D_OLD now ($OLD, main's build of $OLD)" \
+  && has "$W/step.out" "Fly runs what it names whenever it creates a session's Machine" \
+  && [ "$(tail -n 1 "$PLOG/stg.log" | cut -d' ' -f2-)" = "stg track:beta $track_value $(digest_of "$track_value") $D_OLD" ]; then
+  ok "promote TR1: stg --track beta reads :beta (one read by tag), verifies its digest as main's build (discovered by identity, then the pin's exact verify at that commit), sets RELAY_IMAGE=$track_value, deploys, proves it, says what it follows, and logs it"
+else
+  bad "promote TR1: rc $rc"; show
+fi
+# TR2: prod, with --confirm-prod.
+state; promote_run -- prod --track stable --confirm-prod
+if [ "$rc" -eq 0 ] && has "$STATE/log" "flyctl secrets set RELAY_IMAGE=$stable_value -a seazn-club-prod --stage (token none)" \
+  && has "$STATE/log" "--cert-identity-regex $RE_PROD" \
+  && has "$STATE/log" "--cert-identity $WFURL/deploy-prod.yml@refs/tags/v1.2.3 --source-ref refs/tags/v1.2.3 --source-digest $C --signer-digest $C" \
+  && ! has "$STATE/log" 'seazn-club-stg' && has "$W/step.out" "  following:             :stable, which names $D_PROD now (v1.2.3, main's build of $C)"; then
+  ok "promote TR2: prod --track stable --confirm-prod follows :stable at v1.2.3's verified build"
+else
+  bad "promote TR2: rc $rc"; show
+fi
+# TR3: the arguments, refused before any call.
+tr_checked=0
+for t in "prod without --confirm-prod|a prod promote needs --confirm-prod (and C17 passed first): nothing promoted|prod --track stable" \
+         "stg with --confirm-prod|--confirm-prod is for a prod promote, and this one is stg|stg --track beta --confirm-prod" \
+         "stg tracking :stable|stg tracks :beta (deploy-stg.yml moves it once main's build record of a merge verifies), not 'stable'|stg --track stable" \
+         "prod tracking :beta|prod tracks :stable (deploy-prod.yml moves it once a release tag's build record verifies), not 'beta'|prod --track beta --confirm-prod" \
+         "another tag name|stg tracks :beta (deploy-stg.yml moves it once main's build record of a merge verifies), not 'latest'|stg --track latest" \
+         "a track and a pin|--track beta follows a moving tag, and '$SHA@$D_NEW' pins a digest: give one or the other|stg --track beta $SHA@$D_NEW" \
+         "no tag after --track|--track names the moving tag to follow: --track beta (stg) or --track stable (prod)|stg --track" \
+         "a flag after --track|--track names the moving tag to follow|stg --track --confirm-prod" \
+         "two --track|one --track, not two|stg --track beta --track beta"; do
+  IFS='|' read -r label text argv <<< "$t"
+  read -r -a words <<< "$argv"
+  refused "TR3: $label" "$text" -- "${words[@]}"
+  tr_checked=$((tr_checked + 1))
+done
+# TR4: the tag's current digest, refused before any call to the web app: absent, unreadable, a body that
+# is not what the tag named, unattested, attested by a branch or a self-hosted runner, two builds, a
+# commit off main or failing the CEF bump gate, and a record whose signer is another commit (discovery
+# passes; the pin's exact verify at that commit refuses).
+set_beta() { sed "s|^$REG/seazn-relay-stg:beta .*|$REG/seazn-relay-stg:beta $1|" "$STATE/registry" > "$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/registry"; }
+tr4=(
+  "absent|rm|not in the registry: $REG/seazn-relay-stg:beta (HTTP 404; deploy-stg.yml creates it once main's build record of a merge verifies)"
+  "unreadable|status-beta 500|the registry could not be read for $REG/seazn-relay-stg:beta (HTTP 500; only 404 means absent)"
+  "a body that is not the tag's|lie-beta|$REG/seazn-relay-stg:beta (sha256:$(sha_hex '{"not":"it"}')) is not main's own build: no attestation from $ID_STG"
+  "unattested|any|$REG/seazn-relay-stg:beta ($D_ANY) is not main's own build: no attestation from $ID_STG"
+  "attested by a branch's workflow|any $D_ANY $WFURL/deploy-stg.yml@refs/heads/feat/x refs/heads/feat/x $SHA $SHA github-hosted $REPO|($D_ANY) is not main's own build"
+  "attested on a self-hosted runner|any $D_ANY $ID_STG refs/heads/main $SHA $SHA self-hosted $REPO|($D_ANY) is not main's own build"
+  "attested as two builds|any2|$REG/seazn-relay-stg:beta ($D_ANY) carries main's attestation for 2 builds, not one"
+  "a commit off main|any $D_ANY $ID_STG refs/heads/main $SIDE $SIDE github-hosted $REPO|$SIDE ($SIDE) is not on main: images are promoted from main only"
+  "a commit failing the CEF bump gate|any $D_ANY $ID_STG refs/heads/main $BAD $BAD github-hosted $REPO|$BAD ($BAD) fails the CEF bump gate (Owed 22) in its own tree"
+  "a signer at another commit|any $D_ANY $ID_STG refs/heads/main $SHA $SIDE github-hosted $REPO|$REG/seazn-relay-stg@$D_ANY ($SHA) is not main's own build: no attestation from $ID_STG for $SHA"
+  "a record naming no commit|any $D_ANY $ID_STG refs/heads/main main main github-hosted $REPO|$REG/seazn-relay-stg:beta ($D_ANY) has a build record that names no commit: 'main'"
+  "a record at another source ref|any $D_ANY $ID_STG refs/heads/feat/x $SHA $SHA github-hosted $REPO|$REG/seazn-relay-stg:beta ($D_ANY) was built at 'refs/heads/feat/x', not main"
+)
+for row in "${tr4[@]}"; do
+  IFS='|' read -r label how text <<< "$row"
+  state
+  case "$how" in
+    rm) awk -v r="$REG/seazn-relay-stg:beta" '$1 != r' "$STATE/registry" > "$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/registry" ;;
+    "status-beta 500") echo 500 > "$STATE/status-beta" ;;
+    lie-beta) touch "$STATE/lie-beta" ;;
+    any) set_beta "$D_ANY" ;;
+    any2) set_beta "$D_ANY"; { attest_line "$D_ANY" "$ID_STG" refs/heads/main "$OLD"; attest_line "$D_ANY" "$ID_STG" refs/heads/main "$SHA"; } >> "$STATE/attestations" ;;
+    any\ *) set_beta "$D_ANY"; echo "${how#any }" >> "$STATE/attestations" ;;
+  esac
+  refused_before_web "TR4: :beta $label" "$text" -- stg --track beta
+  tr_checked=$((tr_checked + 1))
+done
+# TR4's positive pair: the same digest with main's own record of a commit on main follows.
+state; set_beta "$D_ANY"; attest_line "$D_ANY" "$ID_STG" refs/heads/main "$SHA" >> "$STATE/attestations"
+promote_run -- stg --track beta
+if [ "$rc" -eq 0 ] && has "$W/step.out" "  following:             :beta, which names $D_ANY now ($SHA, main's build of $SHA)"; then
+  ok "promote TR4: the positive pair: main's own record of $D_ANY at a commit on main follows it ($tr_checked refusals before it)"
+else
+  bad "promote TR4 positive pair: rc $rc"; show
+fi
+# TR5: prod's tag-shaped refusals: a release off main, and a record at a ref that is not a release tag.
+state; sed "s|^$REG/seazn-relay-prod:stable .*|$REG/seazn-relay-prod:stable $D_ANY|" "$STATE/registry" > "$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/registry"
+attest_line "$D_ANY" "$WFURL/deploy-prod.yml@refs/tags/v1.2.4" refs/tags/v1.2.4 "$SIDE" >> "$STATE/attestations"
+refused_before_web "TR5: :stable built from a release off main" "v1.2.4 ($SIDE) is not on main: images are promoted from main only" -- prod --track stable --confirm-prod
+tr_checked=$((tr_checked + 1))
+state; sed "s|^$REG/seazn-relay-prod:stable .*|$REG/seazn-relay-prod:stable $D_ANY|" "$STATE/registry" > "$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/registry"
+echo "$D_ANY $WFURL/deploy-prod.yml@refs/tags/v1.2.4 refs/heads/main $C $C github-hosted $REPO" >> "$STATE/attestations"
+refused_before_web "TR5: :stable recorded at a ref that is no release tag" "$REG/seazn-relay-prod:stable ($D_ANY) was built at 'refs/heads/main', not a release tag" -- prod --track stable --confirm-prod
+tr_checked=$((tr_checked + 1))
+# A release tag that names another commit in git now than the one its build record was made from ($A is
+# on main and passes the CEF bump gate, so only this compare refuses before the exact verify would).
+state; sed "s|^$REG/seazn-relay-prod:stable .*|$REG/seazn-relay-prod:stable $D_ANY|" "$STATE/registry" > "$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/registry"
+attest_line "$D_ANY" "$WFURL/deploy-prod.yml@refs/tags/v1.2.3" refs/tags/v1.2.3 "$A" >> "$STATE/attestations"
+refused_before_web "TR5: :stable built from a commit its release tag no longer names" "v1.2.3 names $C in $g, and $REG/seazn-relay-prod:stable ($D_ANY) was built from $A: nothing promoted" -- prod --track stable --confirm-prod
+tr_checked=$((tr_checked + 1))
+[ "$tr_checked" -eq 24 ] || bad "promote TR swept $tr_checked refusals, not 24"
+echo "promote --track refusals checked: $tr_checked"
+# TR6 (the sequence, and the two rollbacks): track, then pin a build (rollback (a): RELAY_IMAGE pinned, so
+# :beta is not followed), then track again. Each names the one before as its previous value.
+state; promote_run -- stg --track beta; r1=$rc
+promote_run -- stg "$SHA@$D_NEW"; r2=$rc; out2=$(cat "$W/step.out")
+promote_run -- stg --track beta; r3=$rc
+if [ "$r1" -eq 0 ] && [ "$r2" -eq 0 ] && [ "$r3" -eq 0 ] \
+  && [[ "$out2" == *"  previous RELAY_IMAGE:  $track_value (tracking :beta; --track verifies what it names when it runs)"* ]] \
+  && [[ "$out2" == *"Rollback: scripts/promote.sh stg --track beta (it refuses unless what :beta names then verifies as main's build)"* ]] \
+  && [[ "$out2" == *"  following:             no: pinned to $D_NEW. deploy-stg.yml still moves :beta on every merge to main, and while pinned it is not followed. To follow it: scripts/promote.sh stg --track beta"* ]] \
+  && has "$W/step.out" "  previous RELAY_IMAGE:  $new_value (ref $SHA@$D_NEW)" && has "$W/step.out" "Rollback: scripts/promote.sh stg $SHA@$D_NEW (" \
+  && [ "$(wc -l < "$PLOG/stg.log" | tr -d ' ')" -eq 5 ]; then
+  ok "promote TR6: track, pin, track: the pin says :beta is not followed while pinned and offers --track back; the track after it offers the pin back"
+else
+  bad "promote TR6: rc $r1/$r2/$r3"; echo "$out2" >&2; show
+fi
+# TR7 (a hand-set value, checked): the owner set RELAY_IMAGE to the tag by hand, still Staged. --track sets
+# the same value, so its Fly digest does not move (equal values give equal Fly digests, measured
+# 2026-10-25): the warning is the proof the hand-set value was the tag.
+state; echo "[{\"name\":\"FLY_RELAY_APP\",\"digest\":\"f1\",\"status\":\"Deployed\"},{\"name\":\"RELAY_IMAGE\",\"digest\":\"$(digest_of "$track_value")\",\"status\":\"Staged\"}]" > "$STATE/secrets.json"
+promote_run -- stg --track beta
+if [ "$rc" -eq 0 ] && has "$W/step.out" "promote: warning: RELAY_IMAGE's Fly digest did not change ($(digest_of "$track_value")): seazn-club-stg already had this value" \
+  && has "$W/step.out" "  previous RELAY_IMAGE:  set elsewhere (Fly digest $(digest_of "$track_value");" \
+  && has "$STATE/log" 'flyctl secrets deploy -a seazn-club-stg (token none)'; then
+  ok "promote TR7: a hand-set, staged RELAY_IMAGE equal to the tag: --track verifies :beta, deploys, and its unchanged Fly digest says the hand-set value was $track_value"
+else
+  bad "promote TR7: rc $rc"; show
+fi
 
 echo "checked: $checked, failed: $failures"
 finished=1

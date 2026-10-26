@@ -1,15 +1,31 @@
 #!/usr/bin/env bash
-# Promote a relay image (C16, docs/tasks/C16-deploy.md, amendment 2026-10-25; it replaces promote.yml):
-# point a web app's RELAY_IMAGE at an image deploy-stg.yml or deploy-prod.yml pushed and attested. This
-# is the live change: every NEW relay session on that web app takes the image (running Machines keep
-# theirs). The bump is explicit, never automatic (decision log 2026-10-14): the owner runs this, or the
-# coordinator on the owner's explicit go-ahead, on their own machine.
+# Promote a relay image (C16, docs/tasks/C16-deploy.md, amendments 2026-10-25 and 2026-10-26; it replaces
+# promote.yml): point a web app's RELAY_IMAGE at an image deploy-stg.yml or deploy-prod.yml pushed and
+# attested, or at the moving tag those workflows keep on main's latest verified build. This is the live
+# change: every NEW relay session on that web app takes the image (running Machines keep theirs). The
+# owner runs this, or the coordinator on the owner's explicit go-ahead, on their own machine.
 #
-#   scripts/promote.sh stg  <40-hex main sha>@sha256:<64 hex>
-#   scripts/promote.sh prod <vX.Y.Z>@sha256:<64 hex> --confirm-prod     (only after C17 passes)
+#   scripts/promote.sh stg  <40-hex main sha>@sha256:<64 hex>                (a pin)
+#   scripts/promote.sh prod <vX.Y.Z>@sha256:<64 hex> --confirm-prod         (a pin; only after C17 passes)
+#   scripts/promote.sh stg  --track beta                                     (follow :beta)
+#   scripts/promote.sh prod --track stable --confirm-prod                    (follow :stable; after C17)
 #
-# deploy-<env>.yml's summary prints the exact command. Rollback is this script with the previous ref,
-# which every promote prints when it can prove it.
+# Tracking (owner, 2026-10-26: ":beta" on every merge, ":stable" on every release tag). deploy-stg.yml
+# moves seazn-relay-stg:beta, and deploy-prod.yml seazn-relay-prod:stable, to each build once its build
+# record verifies. RELAY_IMAGE is set ONCE per env, by the owner: by hand, or with --track, which is the
+# verified way and the way to check a hand-set value. --track sets RELAY_IMAGE=<registry>/seazn-relay-
+# <env>:<tag>, and only after that tag's current manifest, read by the tag, verifies as main's build
+# (stg: deploy-stg.yml at refs/heads/main; prod: deploy-prod.yml at a release tag) of a commit on main
+# whose tree passes the CEF bump gate, by the same checks as a pin. From then on Fly runs what the tag
+# names whenever it creates a session's Machine: the bump is automatic, on merge (stg) or release tag
+# (prod), and promote's digest check is replaced by the workflow's own verify before it moves the tag.
+#
+# A pin is the way to freeze an env or roll it back: RELAY_IMAGE then names one digest, and while
+# pinned the tag is not followed. Rollback while tracking: pin a previous build with this script, or
+# let the next merge (or release tag) move the tag on. Every promote prints its own rollback when it
+# can prove the previous value, and says whether the env follows its tag.
+#
+# deploy-<env>.yml's summary prints the exact pin command.
 #
 # No Docker (the owner's standing rule; the PR #93 review's I-1): it needs git, jq, curl, flyctl, gh and
 # sha256sum (or shasum). No web-app token is ever in GitHub (decision log 2026-10-25): flyctl runs on the
@@ -33,7 +49,12 @@
 #      manifests/<pin> with curl (Fly's registry answers an anonymous read 401, Basic). Only a 404 means
 #      not pushed; any other failure is an error (m-5). The body's sha256 must be the pin. The tag is
 #      never read: RELAY_IMAGE is the digest alone, and step 6 binds the digest to the commit and the
-#      workflow, so a moved tag can neither help a squat nor block main's real build or its rollback;
+#      workflow, so a moved tag can neither help a squat nor block main's real build or its rollback.
+#      With --track, the moving tag is read instead (only a 404 means absent) and its body's sha256 is
+#      the digest checked from here on. Which build that is comes from its attestations: `gh attestation
+#      verify --cert-identity-regex <deploy-<env>.yml at main, or at a release tag> --format json` must
+#      name exactly one commit and source ref (stg: refs/heads/main; prod: refs/tags/vX.Y.Z), and step 4
+#      then runs on that commit;
 #   6. main's build record (I-4): `gh attestation verify` on that manifest file, so gh hashes it and
 #      fetches its attestations from GitHub's API by that digest (gh 2.95.0, `gh attestation verify
 #      --help`: a file path is an artifact; attestations come "via the GitHub API using the values
@@ -75,35 +96,55 @@ fail() {
 usage() {
   echo "usage: scripts/promote.sh stg <40-hex main sha>@sha256:<64 hex>"
   echo "       scripts/promote.sh prod <vX.Y.Z>@sha256:<64 hex> --confirm-prod"
+  echo "       scripts/promote.sh stg --track beta"
+  echo "       scripts/promote.sh prod --track stable --confirm-prod"
 }
 
 # 1. The arguments.
-env='' ref='' confirm_prod=no
-for a in "$@"; do
-  case "$a" in
+env='' ref='' confirm_prod=no track=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
     --confirm-prod) confirm_prod=yes ;;
+    --track)
+      [ -z "$track" ] || fail "one --track, not two"
+      { [ "$#" -ge 2 ] && [ -n "$2" ] && [[ "$2" != -* ]]; } \
+        || fail "--track names the moving tag to follow: --track beta (stg) or --track stable (prod)"
+      track=$2
+      shift ;;
     -h | --help) usage; exit 0 ;;
-    -*) fail "unknown flag '$a' ($(usage | head -n 1))" ;;
+    -*) fail "unknown flag '$1' ($(usage | head -n 1))" ;;
     *)
-      if [ -z "$env" ]; then env=$a
-      elif [ -z "$ref" ]; then ref=$a
-      else fail "one env and one ref, not '$a' too"; fi ;;
+      if [ -z "$env" ]; then env=$1
+      elif [ -z "$ref" ]; then ref=$1
+      else fail "one env and one ref, not '$1' too"; fi ;;
   esac
+  shift
 done
 case "$env" in
   stg)
     shape='^[0-9a-f]{40}$' what="a 40-hex main sha (deploy-stg's tag)"
+    moving=beta event="merge to main" moved_when="once main's build record of a merge verifies"
     [ "$confirm_prod" = no ] || fail "--confirm-prod is for a prod promote, and this one is stg: nothing promoted" ;;
   prod)
     shape='^v[0-9]+\.[0-9]+\.[0-9]+$' what="a vX.Y.Z release tag (deploy-prod's tag)"
+    moving=stable event="release tag" moved_when="once a release tag's build record verifies"
     [ "$confirm_prod" = yes ] || fail "a prod promote needs --confirm-prod (and C17 passed first): nothing promoted" ;;
   *) fail "env must be stg or prod: '$env'" ;;
 esac
-[ -n "$ref" ] || fail "no ref: $(usage | head -n 1)"
-tag=${ref%%@*} pin=${ref#*@}
-[ "$tag" != "$ref" ] || fail "a $env ref names its digest, <ref>@sha256:<digest> as deploy-$env.yml's summary prints it: the pin is required: '$ref'"
-[[ "$tag" =~ $shape ]] || fail "a $env ref is $what@sha256:<digest>: '$ref'"
-[[ "$pin" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "the part after @ must be sha256:<64 hex>: '$ref'"
+suffix=''
+[ "$env" = stg ] || suffix=' --confirm-prod'
+if [ -n "$track" ]; then
+  # A track names no build: which one it is comes from the tag's own attestations (step 5).
+  [ -z "$ref" ] || fail "--track $track follows a moving tag, and '$ref' pins a digest: give one or the other (a pin freezes $env; --track follows :$moving)"
+  [ "$track" = "$moving" ] || fail "$env tracks :$moving (deploy-$env.yml moves it $moved_when), not '$track'"
+  tag='' pin=''
+else
+  [ -n "$ref" ] || fail "no ref: $(usage | head -n 1)"
+  tag=${ref%%@*} pin=${ref#*@}
+  [ "$tag" != "$ref" ] || fail "a $env ref names its digest, <ref>@sha256:<digest> as deploy-$env.yml's summary prints it: the pin is required: '$ref'"
+  [[ "$tag" =~ $shape ]] || fail "a $env ref is $what@sha256:<digest>: '$ref'"
+  [[ "$pin" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "the part after @ must be sha256:<64 hex>: '$ref'"
+fi
 
 registry=registry.fly.io remote=$SERVER/$REPO.git state_dir=$HOME/.local/state/seazn-relay-promote
 if [ "${PROMOTE_TEST_SEAMS:-}" = 1 ]; then
@@ -149,21 +190,25 @@ cmp -s "$tmp/main-promote.sh" "$self" \
   || fail "$self is not main's copy (main is $main): update this checkout to main and run it again"
 
 # 4. Where the image came from: the ref's commit is on main, and its own tree passes the CEF bump gate.
-if [ "$env" = prod ]; then
-  G fetch --quiet --no-tags "$remote" "+refs/tags/$tag:refs/promote/tags/$tag" 2> "$tmp/git.err" \
-    || fail "no tag $tag in $remote: $(head -c 200 "$tmp/git.err")"
-  commit=$(G rev-parse -q --verify "refs/promote/tags/$tag^{commit}") || fail "the tag $tag names no commit"
-else
-  commit=$(G rev-parse -q --verify "$tag^{commit}") || fail "no commit $tag in main's history"
-fi
-G merge-base --is-ancestor "$commit" refs/promote/main || fail "$tag ($commit) is not on main: images are promoted from main only"
-tree="$tmp/promoted-tree"
-mkdir -p "$tree/docker"
-for f in docker/GSTCEF_COMMIT docker/CEF_STEP0_PASS _FINDINGS.md; do
-  G show "$commit:$f" > "$tree/$f" 2> /dev/null || fail "$tag ($commit) has no $f, so the CEF bump gate cannot read its tree"
-done
-G show "refs/promote/main:scripts/check-cef-bump.sh" > "$tmp/check-cef-bump.sh" 2> /dev/null || fail "main ($main) has no scripts/check-cef-bump.sh"
-bash "$tmp/check-cef-bump.sh" "$tree" || fail "$tag ($commit) fails the CEF bump gate (Owed 22) in its own tree"
+# A pin names its ref, so this runs now; a track learns its ref from the tag's attestations (step 5).
+provenance() {
+  if [ "$env" = prod ]; then
+    G fetch --quiet --no-tags "$remote" "+refs/tags/$tag:refs/promote/tags/$tag" 2> "$tmp/git.err" \
+      || fail "no tag $tag in $remote: $(head -c 200 "$tmp/git.err")"
+    commit=$(G rev-parse -q --verify "refs/promote/tags/$tag^{commit}") || fail "the tag $tag names no commit"
+  else
+    commit=$(G rev-parse -q --verify "$tag^{commit}") || fail "no commit $tag in main's history"
+  fi
+  G merge-base --is-ancestor "$commit" refs/promote/main || fail "$tag ($commit) is not on main: images are promoted from main only"
+  local tree="$tmp/promoted-tree" f
+  mkdir -p "$tree/docker"
+  for f in docker/GSTCEF_COMMIT docker/CEF_STEP0_PASS _FINDINGS.md; do
+    G show "$commit:$f" > "$tree/$f" 2> /dev/null || fail "$tag ($commit) has no $f, so the CEF bump gate cannot read its tree"
+  done
+  G show "refs/promote/main:scripts/check-cef-bump.sh" > "$tmp/check-cef-bump.sh" 2> /dev/null || fail "main ($main) has no scripts/check-cef-bump.sh"
+  bash "$tmp/check-cef-bump.sh" "$tree" || fail "$tag ($commit) fails the CEF bump gate (Owed 22) in its own tree"
+}
+[ -n "$track" ] || provenance
 
 # 5. The registry: the pinned manifest, by its digest.
 web="seazn-club-$env"
@@ -197,18 +242,62 @@ fetch() {
   echo "$code"
 }
 manifest="$tmp/manifest.json"
-code=$(fetch "$pin" "$manifest")
-case $code in
-  200) ;;
-  404) fail "not in the registry: $repo@$pin (HTTP 404; deploy-$env.yml pushes it)" ;;
-  000) fail "the registry could not be reached for $repo@$pin (curl failed; its error text is not printed, since it could carry the credential)" ;;
-  *) fail "the registry could not be read for $repo@$pin (HTTP $code; only 404 means not pushed)" ;;
-esac
-got="sha256:$(sha256_of < "$manifest")"
-[ "$got" = "$pin" ] || fail "the registry served $repo@$pin as a body whose sha256 is $got: nothing promoted"
-new="$repo@$pin"  # m-10: the attested digest alone; the tag only names the commit
+if [ -n "$track" ]; then
+  # The tag, read once: its body is what it names now, and its sha256 is the digest every check below
+  # binds (a body a registry serves for the tag is verified as it is, never trusted by name).
+  code=$(fetch "$moving" "$manifest")
+  case $code in
+    200) ;;
+    404) fail "not in the registry: $repo:$moving (HTTP 404; deploy-$env.yml creates it $moved_when)" ;;
+    000) fail "the registry could not be reached for $repo:$moving (curl failed; its error text is not printed, since it could carry the credential)" ;;
+    *) fail "the registry could not be read for $repo:$moving (HTTP $code; only 404 means absent)" ;;
+  esac
+  pin="sha256:$(sha256_of < "$manifest")"
+  # Which build it is: the attestations deploy-<env>.yml signed for that digest, at main (stg) or at a
+  # release tag (prod), from a GitHub-hosted runner. They must name one commit and one source ref.
+  if [ "$env" = prod ]; then
+    at='@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' who="$SERVER/$REPO/.github/workflows/deploy-prod.yml at a release tag"
+  else
+    at='@refs/heads/main$' who="$SERVER/$REPO/.github/workflows/deploy-stg.yml@refs/heads/main"
+  fi
+  base="$SERVER/$REPO/.github/workflows/deploy-$env.yml"
+  re="^${base//./\\.}$at"
+  gh attestation verify "$manifest" --repo "$REPO" --cert-identity-regex "$re" --deny-self-hosted-runners \
+      --limit 1000 --format json > "$tmp/found.json" 2> "$tmp/found.err" \
+    || fail "$repo:$moving ($pin) is not main's own build: no attestation from $who (a squat, or a tag deploy-$env.yml never moved), nothing promoted: $(tail -c 300 "$tmp/found.err")"
+  builds=$(jq -ec 'if type == "array" then [.[] | .verificationResult.signature.certificate
+      | [.sourceRepositoryDigest // "", .sourceRepositoryRef // ""]] | unique else error("not a list") end' "$tmp/found.json" 2> /dev/null) \
+    || fail "gh's verification of $repo:$moving ($pin) did not read as a list of results"
+  n=$(jq -r length <<< "$builds")
+  [ "$n" = 1 ] || fail "$repo:$moving ($pin) carries main's attestation for $n builds, not one: pin the build to run instead (scripts/promote.sh $env <ref>@$pin$suffix)"
+  commit=$(jq -r '.[0][0]' <<< "$builds") source_ref=$(jq -r '.[0][1]' <<< "$builds")
+  [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || fail "$repo:$moving ($pin) has a build record that names no commit: '$commit'"
+  if [ "$env" = prod ]; then
+    [[ "$source_ref" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "$repo:$moving ($pin) was built at '$source_ref', not a release tag"
+    tag=${source_ref#refs/tags/}
+  else
+    [ "$source_ref" = refs/heads/main ] || fail "$repo:$moving ($pin) was built at '$source_ref', not main"
+    tag=$commit
+  fi
+  built=$commit
+  provenance
+  [ "$commit" = "$built" ] || fail "$tag names $commit in $remote, and $repo:$moving ($pin) was built from $built: nothing promoted"
+  new="$repo:$moving"  # the tag itself: Fly resolves it whenever it creates a session's Machine
+else
+  code=$(fetch "$pin" "$manifest")
+  case $code in
+    200) ;;
+    404) fail "not in the registry: $repo@$pin (HTTP 404; deploy-$env.yml pushes it)" ;;
+    000) fail "the registry could not be reached for $repo@$pin (curl failed; its error text is not printed, since it could carry the credential)" ;;
+    *) fail "the registry could not be read for $repo@$pin (HTTP $code; only 404 means not pushed)" ;;
+  esac
+  got="sha256:$(sha256_of < "$manifest")"
+  [ "$got" = "$pin" ] || fail "the registry served $repo@$pin as a body whose sha256 is $got: nothing promoted"
+  new="$repo@$pin"  # m-10: the attested digest alone; the tag only names the commit
+fi
 
-# 6. Main built it: the manifest carries deploy-<env>.yml's attestation for this commit.
+# 6. Main built it: the manifest carries deploy-<env>.yml's attestation for this commit (with --track,
+# the commit step 5 found, so its discovery is bound field by field exactly as a pin is).
 if [ "$env" = prod ]; then source_ref="refs/tags/$tag"; else source_ref=refs/heads/main; fi
 identity="$SERVER/$REPO/.github/workflows/deploy-$env.yml@$source_ref"
 # --limit (the PR #93 review's m-6): a branch can mint attestations for any digest; 1000 keeps main's
@@ -246,7 +335,14 @@ if [ "$before" != unset ] && [ -f "$log" ]; then
   prev_line=$(awk -v d="$before" -v e="$env" '$2 == e && $5 == d {l = $0} END {print l}' "$log")
 fi
 rollback=''
-if [ -n "$prev_line" ]; then
+prev_track=''
+if [ -n "$prev_line" ] && [[ "$(awk '{print $3}' <<< "$prev_line")" == track:* ]]; then
+  # A track: what the tag names is checked when it is followed again, so there is nothing to read now.
+  read -r _ _ prev_ref prev_value _ <<< "$prev_line"
+  prev_track=${prev_ref#track:}
+  previous="$prev_value (tracking :$prev_track; --track verifies what it names when it runs)"
+  rollback="--track $prev_track"
+elif [ -n "$prev_line" ]; then
   read -r _ _ prev_ref prev_value _ <<< "$prev_line"
   prev_pin=${prev_ref#*@}
   prev_code=$(fetch "$prev_pin" "$tmp/previous.json")
@@ -286,14 +382,15 @@ after_status=$(jq -r '.status // "no status"' <<< "$after")
 [ "$after_digest" = "$staged" ] || fail "RELAY_IMAGE's Fly digest on $web is $after_digest after the deploy, not the $staged this promote staged"
 [ "$(tr '[:upper:]' '[:lower:]' <<< "$after_status")" = deployed ] || fail "RELAY_IMAGE on $web reads '$after_status' after the deploy, not Deployed: not proven live"
 [ "$after_digest" != "$before" ] || echo "promote: warning: RELAY_IMAGE's Fly digest did not change ($after_digest): $web already had this value"
-if mkdir -p "$state_dir" && printf '%s %s %s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$env" "$ref" "$new" "$after_digest" >> "$log"; then
+# A track logs as track:<tag>, with the digest it verified last.
+log_ref=$ref log_tail=''
+[ -z "$track" ] || log_ref="track:$moving" log_tail=" $pin"
+if mkdir -p "$state_dir" && printf '%s %s %s %s %s%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$env" "$log_ref" "$new" "$after_digest" "$log_tail" >> "$log"; then
   logged="logged in $log"
 else
   logged="NOT logged ($log could not be written): the next promote cannot name this one"
 fi
 
-suffix=''
-[ "$env" = stg ] || suffix=' --confirm-prod'
 echo "promoted $new to $web (Fly digest $before -> $after_digest, Deployed; $logged)"
 echo "  web app:               $web"
 echo "  commit:                $commit (on main; the CEF bump gate passed in its tree)"
@@ -301,7 +398,15 @@ echo "  build record:          attested by $identity"
 echo "  new RELAY_IMAGE:       $new"
 echo "  previous RELAY_IMAGE:  $previous"
 echo "  RELAY_IMAGE's digest:  $before -> $after_digest (Deployed)"
-if [ -n "$rollback" ]; then
+if [ -n "$track" ]; then
+  echo "  following:             :$moving, which names $pin now ($tag, main's build of $commit)"
+  echo "Fly runs what it names whenever it creates a session's Machine: deploy-$env.yml moves it on every $event, once that build's record verifies, and running Machines keep theirs. To freeze $env at this build: scripts/promote.sh $env $tag@$pin$suffix"
+else
+  echo "  following:             no: pinned to $pin. deploy-$env.yml still moves :$moving on every $event, and while pinned it is not followed. To follow it: scripts/promote.sh $env --track $moving$suffix"
+fi
+if [ -n "$prev_track" ]; then
+  echo "Rollback: scripts/promote.sh $env $rollback$suffix (it refuses unless what :$prev_track names then verifies as main's build)"
+elif [ -n "$rollback" ]; then
   echo "Rollback: scripts/promote.sh $env $rollback$suffix (it refuses unless that digest's attestation still verifies)"
 elif [ -n "$prev_line" ]; then
   echo "Rollback: the previous ref cannot be verified now ($previous)"

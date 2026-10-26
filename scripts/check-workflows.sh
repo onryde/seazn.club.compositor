@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The workflow check (C16, docs/tasks/C16-deploy.md, with its amendments 2026-10-18, 2026-10-23,
-# 2026-10-24 and 2026-10-25). check.yml runs it, and scripts/deploy_checks_test.sh runs it on scratch
+# 2026-10-24, 2026-10-25 and 2026-10-26). check.yml runs it, and scripts/deploy_checks_test.sh runs it on scratch
 # copies, each with one mutant that must red one rule below.
 #
 #   scripts/check-workflows.sh [DIR]            check the workflows in DIR (default .github/workflows)
@@ -81,6 +81,18 @@
 #     `flyctl auth docker` sets `trap 'docker logout "$RELAY_REGISTRY" …' EXIT`, so no later step or
 #     third-party action finds the token in docker's config, and every action it uses is pinned by
 #     commit.
+# 16. The moving tag (owner, 2026-10-26: ":beta" on every merge, ":stable" on every release tag): each
+#     push job moves its own tag, :beta (deploy-stg.yml) or :stable (deploy-prod.yml), in exactly one
+#     step with id `track`, after the record check and before the summary, on exactly the token guard's
+#     `if` (both paths, pushed and found), with nothing but a name, id, env, run and that if. Its DIGEST
+#     is exactly ${{ steps.record.outputs.digest }}, which the record check writes once, on its verified
+#     branch alone (between `if gh attestation verify` and its first elif or else); the step never assigns
+#     DIGEST, names its tag once (`moving="$RELAY_REGISTRY/$RELAY_APP:<tag>"`), copies it exactly as
+#     `docker buildx imagetools create --prefer-index=false --tag "$moving" "$RELAY_REGISTRY/$RELAY_APP@$DIGEST"`
+#     (one source, by the verified digest: buildx pushes that manifest's own bytes), and reads the tag back
+#     after the copy, exiting 1 when it names another digest. No step in any workflow retags otherwise:
+#     imagetools create, crane, skopeo, regctl or oras, or a docker tag or push naming :beta, :stable or
+#     $moving. Prints `N of 2`.
 #
 # The deploy workflows are deploy-stg.yml and deploy-prod.yml, each required, plus any other workflow
 # that names the stg or prod relay or web app, or their tokens: a new one is held to the deploy rules
@@ -681,6 +693,84 @@ for f in "${files[@]}"; do
   done < <(grep -n -E '(flyctl|fly)[[:space:]]+secrets[[:space:]]+(set|deploy|unset|import|sync)' "$f" || true)
 done
 echo "promote workflows: $promote_lines lines changing Fly secrets in ${#files[@]} workflows (promotion is scripts/promote.sh)"
+
+# 16. The moving tag (owner, 2026-10-26).
+tracks=0 retags=0
+for pair in deploy-stg.yml:beta deploy-prod.yml:stable; do
+  b=${pair%%:*} want=${pair#*:}
+  [ -f "$dir/$b" ] || continue
+  out=$(jq -r --arg want "$want" "$JQ_LIB$JQ_PUSH"'
+    push_jobs as $jobs
+    | if ($jobs | length) != 1 then "FAIL \($jobs | length) jobs hold a Fly token, not 1 (the push job)"
+      else $jobs[0] | .key as $j | (.value.steps // []) as $steps
+        | [ $steps | to_entries[] | select(.value.id == "track") | .key ] as $ts
+        | ([ $steps | to_entries[] | select(.value.id == "record") | .key ][0]) as $rec
+        | ([ $steps | to_entries[] | select(.value.id == "summary") | .key ][0]) as $sum
+        | ("steps.token.outputs.enabled == \u0027true\u0027") as $gc
+        | ("moving=\"$RELAY_REGISTRY/$RELAY_APP:" + $want + "\"") as $name
+        | ("docker buildx imagetools create --prefer-index=false --tag \"$moving\" \"$RELAY_REGISTRY/$RELAY_APP@$DIGEST\"") as $copy
+        | ("now=$(docker buildx imagetools inspect \"$moving\" --format \u0027{{.Manifest.Digest}}\u0027)") as $readback
+        | ("if [ \"$now\" != \"$DIGEST\" ]; then") as $compare
+        | ("echo \"digest=$DIGEST\" >> \"$GITHUB_OUTPUT\"") as $output
+        | if ($ts | length) != 1 then "FAIL job \($j) has \($ts | length) steps with id track, not 1: nothing moves :\($want), or two steps do"
+          elif $rec == null or $ts[0] < $rec then "FAIL job \($j): the track step comes before the record check (or there is none): it would move :\($want) to a digest nothing verified"
+          elif $sum == null or $sum < $ts[0] then "FAIL job \($j): the summary does not come after the track step"
+          else $steps[$ts[0]] as $s
+            | (($s.run // "") | code_lines | split("\n") | map(strip)) as $l
+            | (($steps[$rec].run // "") | code_lines | split("\n") | map(strip)) as $rl
+            | ((($s.env // {}).DIGEST // "") | tostring | strip) as $digest
+            | [ $l | to_entries[] | select(.value | test("imagetools\\s+create")) ] as $copies
+            | ($copies[0].key // -1) as $c
+            | ([ $l | to_entries[] | select(.key > $c and .value == $readback) | .key ][0]) as $r
+            | ([ $l | to_entries[] | select($r != null and .key > $r and .value == $compare) | .key ][0]) as $k
+            | ([ $l | to_entries[] | select($k != null and .key > $k and (.value == "fi" or (.value | test("(^|[;\\s])exit 1([;\\s]|$)")))) | .value ][0]) as $e
+            | ([ $rl | to_entries[] | select(.value | test("^if gh attestation verify")) | .key ][0]) as $v
+            | [ $rl | to_entries[] | select(.value == $output) | .key ] as $o
+            | ([ $rl | to_entries[] | select($v != null and .key > $v and (.value | test("^(elif|else)([\\s;]|$)"))) | .key ][0]) as $x
+            | if (($s | keys) - ["name", "id", "env", "run", "if"] | length) > 0
+              then "FAIL job \($j): the track step carries \((($s | keys) - ["name", "id", "env", "run", "if"]) | join(", ")): it runs bare"
+              elif (($s.if // "") | norm_if) != $gc
+              then "FAIL job \($j): the track step runs on if \u0027\(($s.if // "") | norm_if)\u0027, not exactly \u0027\($gc)\u0027: it runs on both paths, pushed and found, behind the record check alone"
+              elif $digest != "${{ steps.record.outputs.digest }}"
+              then "FAIL job \($j): the track step\u0027s DIGEST is \u0027\($digest)\u0027, not exactly ${{ steps.record.outputs.digest }}: it moves :\($want) to the record check\u0027s verified digest alone"
+              elif any($l[]; test("(^|[^A-Za-z0-9_])DIGEST=")) then "FAIL job \($j): the track step assigns DIGEST: \([ $l[] | select(test("(^|[^A-Za-z0-9_])DIGEST=")) ][0] | .[0:100])"
+              elif [ $l[] | select(startswith("moving=")) ] != [$name]
+              then "FAIL job \($j): the track step moves \([ $l[] | select(startswith("moving=")) ] | map("\u0027" + . + "\u0027") | join(", ")), not :\($want) (\u0027\($name)\u0027, once)"
+              elif ($copies | length) != 1 or $copies[0].value != $copy
+              then "FAIL job \($j): the track step\u0027s copy is \($copies | map("\u0027" + .value + "\u0027") | join(", ")), not exactly \u0027\($copy)\u0027 (one source, by the verified digest: a carbon copy)"
+              elif $e == null or $e == "fi"
+              then "FAIL job \($j): the track step never reads :\($want) back and exits 1 when it names another digest (after the copy: \u0027\($readback)\u0027, then \u0027\($compare)\u0027 and exit 1)"
+              elif $v == null or ($o | length) != 1 or $x == null or $o[0] < $v or $o[0] > $x
+              then "FAIL job \($j): the record check does not write digest= to GITHUB_OUTPUT once, on its verified branch alone (\u0027\($output)\u0027, between \u0027if gh attestation verify\u0027 and its first elif or else)"
+              else "TRACK \($j)" end
+          end
+      end' "$(json "$dir/$b")")
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL*) failed "$b (moving tag): ${line#FAIL }" ;;
+      TRACK*) tracks=$((tracks + 1)) ;;
+    esac
+  done <<< "$out"
+done
+for f in "${files[@]}"; do
+  b=$(basename "$f")
+  own=false
+  case "$b" in deploy-stg.yml | deploy-prod.yml) own=true ;; esac
+  while IFS= read -r line; do
+    case "$line" in
+      FAIL*) failed "$b (moving tag): ${line#FAIL }" ;;
+      RETAG) retags=$((retags + 1)) ;;
+    esac
+  done < <(jq -r --argjson own "$own" "$JQ_LIB$JQ_PUSH"'
+    (.jobs // {}) | to_entries[] | .key as $j | .value as $J
+    | ($J.steps // []) | to_entries[] | .key as $i | .value as $s
+    | (($s.run // "") | code_lines | split("\n") | map(strip))[] as $line
+    | select($line | test("imagetools\\s+create|(^|[\\s;&|(])(crane|skopeo|regctl|oras)\\s|(^|[\\s;&|(])docker\\s+(tag|push)\\s.*(:(beta|stable)([^A-Za-z0-9_.-]|$)|\\$\\{?moving([^A-Za-z0-9_]|$))"))
+    | if $own and $j == "push" and ($s.id // "") == "track" and ($line | test("imagetools\\s+create")) then "RETAG"
+      else "FAIL \($j).\($s | step_name($i)) retags outside a track step: \($line | .[0:100])" end' "$(json "$f")")
+done
+echo "moving tags: $tracks of 2 push jobs move theirs (deploy-stg.yml :beta, deploy-prod.yml :stable) to the record check's verified digest and read it back; retag lines: $retags, each a track step's own copy"
+[ "$tracks" -eq 2 ] || failed "moving tags: $tracks of 2 push jobs move theirs: each push job owes one track step"
 
 finished=1
 if [ "$fails" -gt 0 ]; then
