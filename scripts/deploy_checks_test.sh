@@ -697,7 +697,7 @@ fresh; edit "$W/wf/$STG" '      - uses: docker/setup-buildx-action@8d2750c68a424
 expect_red "n19 deploy-stg's setup-buildx by tag" 'uses docker/setup-buildx-action@v3, not pinned by commit'
 
 # n20 to n23 (m-11): each flag the record check must pass, removed in turn.
-fresh; edit "$W/wf/$STG" '.github/workflows/deploy-stg.yml@refs/heads/main"' '.github/workflows/deploy-stg.yml@$GITHUB_REF"'
+fresh; edit "$W/wf/$STG" 'identity="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/deploy-stg.yml@refs/heads/main"' 'identity="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/deploy-stg.yml@$GITHUB_REF"'
 expect_red "n20 deploy-stg's record identity at the run's own ref" "deploy-stg.yml (build record): job push: the record check does not read 'deploy-stg.yml@refs/heads/main'"
 fresh; edit "$W/wf/$PROD" '.github/workflows/deploy-prod.yml@refs/tags/$TAG"' '.github/workflows/deploy-prod.yml@$GITHUB_REF"'
 expect_red "n20b deploy-prod's record identity at the run's own ref" "deploy-prod.yml (build record): job push: the record check does not read 'deploy-prod.yml@refs/tags/\$TAG'"
@@ -707,7 +707,7 @@ fresh; edit "$W/wf/$PROD" ' --source-ref "refs/tags/$TAG" --source-digest' ' --s
 expect_red "n21b deploy-prod's record check without --source-ref" "deploy-prod.yml (build record): job push: the record check does not read '--source-ref \"refs/tags/\$TAG\"'"
 fresh; edit "$W/wf/$STG" " --source-digest \"\$GITHUB_SHA\" \\" " \\"
 expect_red "n22 deploy-stg's record check without --source-digest" "deploy-stg.yml (build record): job push: the record check does not read '--source-digest \"\$GITHUB_SHA\"'"
-fresh; edit "$W/wf/$STG" ' --deny-self-hosted-runners --limit 1000' ' --limit 1000'
+fresh; edit "$W/wf/$STG" ' --deny-self-hosted-runners --limit 1000 > "$RUNNER_TEMP/attest.out"' ' --limit 1000 > "$RUNNER_TEMP/attest.out"'
 expect_red "n23 deploy-stg's record check without --deny-self-hosted-runners" "deploy-stg.yml (build record): job push: the record check does not read '--deny-self-hosted-runners'"
 
 # n24. A token step's `if` that reads the guard and then widens it (`&& X` is allowed; `|| X` is not).
