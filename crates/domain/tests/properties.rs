@@ -6,7 +6,7 @@ use domain::cef_health::CefHealth;
 use domain::config::Thresholds;
 use domain::graphics::HideReason;
 use domain::health::{BeatState, ExitDetail, GraphicsStatus};
-use domain::input_link::LossReason;
+use domain::input_link::{BuildFacts, LossReason};
 use domain::ladder::Rung;
 use domain::lifecycle::{ExitReason, Lifecycle};
 use domain::output_link::Encoded;
@@ -24,8 +24,8 @@ const CASES: u32 = 512;
 const END_CASES: u32 = 2_048;
 
 fn steps() -> impl Strategy<Value = Vec<(Ms, u8)>> {
-    // dt 0..300 ms; kind 0..=18, ticks (0..=4) and camera frames (5..=9) dominant
-    prop::collection::vec((0u64..300, 0u8..=18), 1..600)
+    // dt 0..300 ms; kind 0..=19, ticks (0..=4) and camera frames (5..=9) dominant
+    prop::collection::vec((0u64..300, 0u8..=19), 1..600)
 }
 
 /// The harness's own facts, carried across a stream: the output's growing bytes-sent total.
@@ -77,6 +77,14 @@ fn event_for(kind: u8, s: &Supervisor, h: &mut Harness) -> Event {
         16 => Event::HeartbeatReply(Desired::Live),
         17 => Event::OutputError {
             gen: s.output_generation(),
+        },
+        // Owed 108: an input error shaped as Cloudflare's hold-end close (handshake, no media).
+        19 => Event::InputError {
+            gen: s.input_generation(),
+            facts: BuildFacts {
+                handshake_completed: true,
+                carried_media: false,
+            },
         },
         _ => Event::OutputError {
             gen: s.output_generation(),
@@ -141,7 +149,9 @@ fn programme_and_generation_properties_hold_on_random_streams() {
                     prop_assert_eq!(&d.next, &s, "an uncounted frame changed the supervisor");
                     uncounted_frames.set(uncounted_frames.get() + 1);
                 }
-                if let Event::InputLost { gen, .. } = ev {
+                // An input error is a loss or the hold-end rebuild's back-off (Owed 108): either way
+                // the link backs off, and the generation's frames stop counting.
+                if let Event::InputLost { gen, .. } | Event::InputError { gen, .. } = ev {
                     if Some(gen) == live && on_air(s.lifecycle()) {
                         live = None;
                     }
