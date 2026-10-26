@@ -443,6 +443,11 @@ seazn.club.compositor/
 - **Image handoff:** deploy only pushes the image. Moving `RELAY_IMAGE` in the web env is an explicit
   step, so a compositor push never silently changes what prod runs. (C16, amended 2026-10-25: that
   step is `scripts/promote.sh`, run by the owner on their own flyctl login, never a workflow.)
+  (C16, amended 2026-10-26, owner: "let's have beta tag when merge and stable tag in when git tag".
+  deploy-stg moves `seazn-relay-stg:beta`, and deploy-prod `seazn-relay-prod:stable`, to each build once
+  its build record verifies. RELAY_IMAGE is set once per env, by the owner. While it names the moving
+  tag, a merge (stg) or a release tag (prod) changes what NEW sessions run, with no further step. A pin
+  to a digest, set with `scripts/promote.sh`, is the explicit step that freezes an env or rolls it back.)
 - **Missing secret:** the job prints `::warning::` with the exact `gh secret set …` fix and does
   nothing, rather than failing (the `seazn.club.workflow` convention).
 

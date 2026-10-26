@@ -56,7 +56,10 @@ Also include:
   against the session id
 - the **rollback**: `scripts/promote.sh stg <previous ref>@sha256:<digest>`, run by the owner on their
   own flyctl login; promote prints that command as its `Rollback:` line (C16, amendment 2026-10-25:
-  promote.yml is removed)
+  promote.yml is removed). (Amended 2026-10-26, C16's moving tags.) While RELAY_IMAGE tracks `:beta`,
+  roll back either way: pin a previous build with that command (each deploy-stg summary prints its
+  build's pin; while pinned, `:beta` is not followed), or let the next merge move `:beta` on. Re-running
+  an older deploy-stg run moves `:beta` back to that build
 - **manual stop**: end the session in the organiser UI. **Never** `flyctl machine destroy` a live
   session's Machine, because the sweep would book an `r<n+1>`.
 
@@ -178,7 +181,11 @@ yet merged.
 
 - [ ] **Step 1: Preflight** (orchestrator, no owner needed):
   1. Stg web is on a commit containing R2001–R2006.
-  2. `RELAY_IMAGE` on `seazn-club-stg` equals the C16 promoted ref.
+  2. ~~`RELAY_IMAGE` on `seazn-club-stg` equals the C16 promoted ref.~~ (Amended 2026-10-26, C16's
+     moving tags.) `RELAY_IMAGE` tracks `:beta`, whose digest is `<x>`. Record `<x>` as the
+     `:beta` line of the latest deploy-stg run's summary, or as the `following:` line of
+     `scripts/promote.sh stg --track beta`, which is also how to check the owner's hand-set value.
+     If RELAY_IMAGE is pinned instead, record the pin, and that `:beta` is not followed.
   3. The stg fixture has a YouTube destination with a **private/unlisted** broadcast.
   4. The capture app build is the one in `seazn.club.capture` main.
 
@@ -209,7 +216,12 @@ yet merged.
   `v0.1.0` and run `scripts/promote.sh prod v0.1.0@sha256:<digest> --confirm-prod` (C16, amendment
   2026-10-25), and only after FLY_API_TOKEN_RELAY_PROD exists: the owner mints it after this task passes, if the
   owner decides a repository token is acceptable for prod (compositor `_INDEX.md`, C16 open item (f):
-  its reach includes every live prod session's stream key).
+  its reach includes every live prod session's stream key). (Amended 2026-10-26, C16's moving tags.)
+  `:stable` exists only after the first `v*` tag's deploy-prod run creates it, so prod's RELAY_IMAGE is
+  set to `registry.fly.io/seazn-relay-prod:stable` only after this task passes and that run has
+  completed. The owner sets it once (`scripts/promote.sh prod --track stable --confirm-prod` is the
+  verified way). seazn-club-prod showed all 49 secrets Staged on 2026-10-26, so any `secrets set` or
+  deploy there ships them all, and promote refuses until the owner resolves them.
 
 ## Acceptance
 
