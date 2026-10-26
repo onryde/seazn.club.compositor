@@ -1,10 +1,14 @@
 name: deploy-stg
-# C16 (docs/tasks/C16-deploy.md, amendment 2026-10-25): build the relay image at this commit and push it
-# to the stg relay app's registry as <RELAY_REGISTRY>/seazn-relay-stg:<sha>. A push changes nothing live:
-# a relay Machine takes an image only when web creates one, from web's RELAY_IMAGE, and RELAY_IMAGE
-# changes only through scripts/promote.sh, which the owner (or the coordinator, on the owner's explicit
-# go-ahead) runs on their own machine with their own flyctl login (decision log 2026-10-14: the bump is
-# explicit, never automatic; 2026-10-25: no GitHub environment, and no web-app token in GitHub).
+# C16 (docs/tasks/C16-deploy.md, amendments 2026-10-25 and 2026-10-26): build the relay image at this
+# commit, push it to the stg relay app's registry as <RELAY_REGISTRY>/seazn-relay-stg:<sha>, and, once
+# main's build record of it verifies, point the moving tag <RELAY_REGISTRY>/seazn-relay-stg:beta at that
+# same digest (owner, 2026-10-26: ":beta" on every merge, ":stable" on every release tag). A relay Machine
+# takes an image only when web creates one, from web's RELAY_IMAGE, which the owner sets once per env
+# (scripts/promote.sh is the verified way, run on their own machine with their own flyctl login; no
+# web-app token is in GitHub, decision log 2026-10-25). While RELAY_IMAGE tracks :beta, each merge here is
+# live for every NEW stg session, because Fly runs what :beta names when it creates the Machine; while it
+# is pinned to a digest (`scripts/promote.sh stg <sha>@sha256:<digest>`), :beta is not followed and a
+# merge changes nothing live.
 #
 # - The token guard: FLY_API_TOKEN_RELAY_STG unset is a warning and a skipped push, never a red. It is
 #   a REPOSITORY secret, minted `fly tokens create deploy -a seazn-relay-stg`, so it reaches that one
@@ -28,8 +32,14 @@ name: deploy-stg
 #   (amendment 2026-10-23), so every layer is built from source here.
 # - The target is relay and nothing else: never the image that carries the C14 hooks (amendment
 #   2026-10-24).
-# - A sha already in the registry is never pushed again: promote pins RELAY_IMAGE by digest, and a tag
-#   that never moves keeps a rollback's ref meaning what it meant.
+# - A sha already in the registry is never pushed again: a `:<sha>` tag never moves, so a pin's ref keeps
+#   meaning what it meant.
+# - The moving tag (decision log 2026-10-26): after the record check, `:beta` is pointed at the digest
+#   that check verified, by a manifest copy (one source, by digest, --prefer-index=false: buildx pushes
+#   that manifest's own bytes, so the digest is unchanged), then read back; a `:beta` that names anything
+#   else fails the job. It trades promote's digest check at session time for automation: CI moves the tag
+#   only after main's attestation verifies, but Fly runs whatever :beta names when a session's Machine is
+#   created, and any holder of the push token can move it too.
 # scripts/check-workflows.sh (check.yml) holds this file to all of the above.
 on:
   push: { branches: [main] }
@@ -216,11 +226,86 @@ jobs:
               --cert-identity "$identity" --source-ref refs/heads/main --source-digest "$GITHUB_SHA" \
               --signer-digest "$GITHUB_SHA" --deny-self-hosted-runners --limit 1000 > "$RUNNER_TEMP/attest.out" 2>&1; then
             echo "$ref@$DIGEST: attested by $identity for $GITHUB_SHA"
+            # The verified digest, written here and nowhere else: the moving tag's step reads only this.
+            echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           elif [ "$FOUND" = true ]; then
             echo "::error::$ref is in the registry ($DIGEST) but is not main's own build: no attestation from $identity for $GITHUB_SHA. A squat, or a push whose record never landed: nothing pushed, nothing to promote; the owner must resolve it (the next commit on main gets a tag of its own). $(tail -c 300 "$RUNNER_TEMP/attest.out")"
             exit 1
           else
             echo "::error::this run's push of $ref ($DIGEST) has no attestation that verifies, so scripts/promote.sh would refuse it: $(tail -c 300 "$RUNNER_TEMP/attest.out")"
+            exit 1
+          fi
+      # The moving tag (owner, 2026-10-26: ":beta" on every merge). Its DIGEST is the record check's own
+      # output, which that step writes only when main's attestation verifies: the push's own digest on the
+      # pushed path (the C-1 rule), the found tag's on the found path, and never a digest read by tag here.
+      # The copy is by digest with one source and --prefer-index=false, so buildx pushes that manifest's
+      # own bytes under :beta (buildx v0.38.1, util/imagetools/create.go: one source and no annotations
+      # returns the source's original bytes; with the default --prefer-index=true it wraps an image
+      # manifest in a new index, a new digest). No layer is built or pushed again. The read-back is the
+      # proof, every run: a :beta that names anything but DIGEST is a red.
+      - name: Move :beta to the verified build
+        id: track
+        if: steps.token.outputs.enabled == 'true'
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_RELAY_STG }}
+          DIGEST: ${{ steps.record.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The login leaves with this step (the PR #93 review's m-2): no later step, and no third-party
+          # action, inherits the token through docker's config.
+          trap 'docker logout "$RELAY_REGISTRY" > /dev/null 2>&1 || true' EXIT
+          if ! [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::no verified digest to move :beta to ('$DIGEST'): the record check outputs one only when main's attestation verifies. :beta not moved"
+            exit 1
+          fi
+          flyctl auth docker
+          moving="$RELAY_REGISTRY/$RELAY_APP:beta"
+          # The old :beta, for the summary. Only "not found" means none yet ("Already pushed?"'s rule).
+          if old=$(docker buildx imagetools inspect "$moving" --format '{{.Manifest.Digest}}' 2> "$RUNNER_TEMP/moving.err"); then
+            if ! [[ "$old" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::$moving resolved to no manifest digest: '$old'. :beta not moved"
+              exit 1
+            fi
+          elif grep -qF "$moving: not found" "$RUNNER_TEMP/moving.err"; then
+            old=none
+          else
+            echo "::error::the registry could not be read for $moving (only 'not found' means none yet): $(head -c 300 "$RUNNER_TEMP/moving.err"). :beta not moved"
+            exit 1
+          fi
+          # Never backwards (the PR #94 review's item 2): :beta moves only to main's tip. The concurrency group
+          # runs one merge's job at a time, so a newer merge's run comes after this one and moves it on; a re-run
+          # of an older merge skips, and the pin it prints is the way to run that build.
+          tip=$(git ls-remote origin refs/heads/main 2> "$RUNNER_TEMP/tip.err" | cut -f1) || tip=''
+          if ! [[ "$tip" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::main's tip could not be read (git ls-remote origin refs/heads/main gave '$tip': $(head -c 200 "$RUNNER_TEMP/tip.err")). :beta not moved"
+            exit 1
+          fi
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "::warning::$moving not moved: $GITHUB_SHA is not main's tip ($tip), and moving it would take :beta backwards. To run this build anyway, pin it: scripts/promote.sh stg $TAG@$DIGEST"
+            { echo "old=$old"; echo "skipped=$GITHUB_SHA is not main's tip ($tip)"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The old :beta must be main's own build (the PR #94 review's item 3). Anything else was pushed from
+          # outside main's deploy (any holder of the push token can move the tag) and was live for every new
+          # session whose RELAY_IMAGE tracks :beta. The move below still goes ahead, which restores main's
+          # build, and the step then fails, so the owner sees it.
+          who="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/deploy-stg.yml@refs/heads/main"
+          squat=no
+          if [ "$old" != none ] && ! gh attestation verify "oci://$RELAY_REGISTRY/$RELAY_APP@$old" --repo "$GITHUB_REPOSITORY" \
+              --cert-identity "$who" --source-ref refs/heads/main --deny-self-hosted-runners --limit 1000 > "$RUNNER_TEMP/old.out" 2>&1; then
+            squat=yes
+          fi
+          docker buildx version
+          docker buildx imagetools create --prefer-index=false --tag "$moving" "$RELAY_REGISTRY/$RELAY_APP@$DIGEST"
+          now=$(docker buildx imagetools inspect "$moving" --format '{{.Manifest.Digest}}')
+          if [ "$now" != "$DIGEST" ]; then
+            echo "::error::$moving names '$now' after the move, not the verified $DIGEST (main's build of $TAG; it named $old before). The copy changed the digest, or another push holding the token moved the tag: every new session on a web app whose RELAY_IMAGE tracks :beta takes '$now'. Pin it (scripts/promote.sh stg $TAG@$DIGEST); the owner must resolve the tag"
+            exit 1
+          fi
+          echo "$moving: $old -> $DIGEST (main's build of $TAG)"
+          { echo "old=$old"; echo "new=$now"; } >> "$GITHUB_OUTPUT"
+          if [ "$squat" = yes ]; then
+            echo "::error::$moving named $old before this move, and it is no main build: no attestation from $who verifies it. :beta was moved by something other than main's deploy, and every new session whose RELAY_IMAGE tracks :beta ran it until now. :beta names main's build $DIGEST again; the owner must check who moved it. $(tail -c 300 "$RUNNER_TEMP/old.out")"
             exit 1
           fi
       - name: Summary
@@ -229,18 +314,38 @@ jobs:
         env:
           DIGEST: ${{ steps.push.outputs.digest || steps.exists.outputs.digest }}
           FOUND: ${{ steps.exists.outputs.exists }}
+          OLD: ${{ steps.track.outputs.old }}
+          NEW: ${{ steps.track.outputs.new }}
+          SKIPPED: ${{ steps.track.outputs.skipped }}
         run: |
           ref="$RELAY_REGISTRY/$RELAY_APP:$TAG"
+          moving="$RELAY_REGISTRY/$RELAY_APP:beta"
+          # The track step reads :beta back; a summary that would name another digest is a red, not a claim. A move
+          # it skipped (an older build) names none.
+          if [ -z "$SKIPPED" ] && [ "$NEW" != "$DIGEST" ]; then
+            echo "::error::the track step reports $moving as '$NEW', not this build's $DIGEST: no summary"
+            exit 1
+          fi
           {
             echo "## Relay image, stg"
             echo
             if [ "$FOUND" = true ]; then
-              echo "Found in the registry, not built by this run: \`$ref\` (\`$DIGEST\`), attested earlier as main's build of $TAG. Nothing pushed, nothing live changed."
+              echo "Found in the registry, not built by this run: \`$ref\` (\`$DIGEST\`), attested earlier as main's build of $TAG. No image built or pushed."
             else
-              echo "Pushed and attested as main's build of $TAG: \`$ref\` (\`$DIGEST\`). Nothing live changed."
+              echo "Pushed and attested as main's build of $TAG: \`$ref\` (\`$DIGEST\`)."
             fi
             echo
-            echo "Promote it on the owner's go-ahead (stg's web app takes it for every new session; not run), from a checkout of main, logged in to flyctl as yourself:"
+            if [ -n "$SKIPPED" ]; then
+              echo "\`$moving\` not moved: $SKIPPED. It still names \`$OLD\`, so nothing live changed for a RELAY_IMAGE that tracks \`:beta\`."
+            elif [ "$OLD" = "$NEW" ]; then
+              echo "\`$moving\` already named this build: \`$NEW\` (unchanged)."
+            else
+              echo "\`$moving\` moved: \`$OLD\` -> \`$NEW\` (this build, after its record verified)."
+            fi
+            echo
+            [ -n "$SKIPPED" ] || echo "If seazn-club-stg's RELAY_IMAGE tracks \`:beta\` (set once per env by the owner; \`scripts/promote.sh stg --track beta\` is the verified way), every new stg session's Machine now runs this build, and running Machines keep theirs. If RELAY_IMAGE is pinned to a digest, nothing live changed: while pinned, \`:beta\` is not followed."
+            echo
+            echo "To pin this build instead (to freeze stg, or later to roll back to it), on the owner's go-ahead, from a checkout of main, logged in to flyctl as yourself:"
             echo
             echo '```'
             echo "scripts/promote.sh stg $TAG@$DIGEST"
