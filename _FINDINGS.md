@@ -2602,7 +2602,8 @@ policies × 5 heartbeat phases). Gaps 15, 25 and 40: one map each, per-trial med
 
 **Round 2 (21:05 to 22:07): does the hold follow `timeoutSeconds`, or a dead SRT peer?** Two
 questions from the coordinator. (1) Does the SRT-playback hold follow `recording.timeoutSeconds`, as R0
-section 4a's HLS hold does on RTMPS (`timeoutSeconds` + about 3 s; web's `holdWindowSeconds.srt` is null)?
+section 4a's HLS hold does on RTMPS (`timeoutSeconds` + about 3 s)? (Only the ingest capability's
+`holdWindowSeconds.srt` is null; web serves the phone 183 for SRT: finding 15.)
 (2) Is it Cloudflare waiting out a dead SRT peer, so that a clean close, with SRT's shutdown sent, ends it
 early?
 
@@ -2628,25 +2629,49 @@ early?
       (both statuses, ENDLIST, the media-sequence head). The URL is a public playback URL, since the
       input does not sign. It reached the Machine as an uploaded file and is never printed: 0 lines
       withheld, and no result line holds it.
-  - `sweep.py` prints the per-trial numbers below. The status entries are in `cloudflare-status.jsonl`
-    (`cfjoin.py`: 26 pairs).
+  - *Cooldowns.* A run's trials started a fixed time after the previous trial's end: 240 s in the clean
+    arm, and 40, 45 and 75 s at 10, 30 and 60. Those three are shorter than the HLS hold found later
+    (finding 15). So every trial after the first in those three runs, 8 of the 15, started while the previous
+    broadcast's HLS master still served 200: P1 connected 40.3 to 75.4 s after the previous publisher's
+    SIGKILL, after Cloudflare's disconnect read (+30.3). `sweep.py` calls these starts `held`. The other
+    7 are `fresh`: master 204 at P1's connect, 146.8 to 379.3 s after the previous publisher's end. Round
+    1's trials started 219 to 271 s after the previous publisher's end, past that hold at 180, so they
+    are fresh by inference (HLS was not polled then). The exception is the first probe trial
+    (`probes-prod` T1): 114 s after the last publisher of a smoke run with recording off, so its start
+    state is not known.
+  - `sweep.py` prints the per-trial numbers below; it is run on the results in the order they ran, so
+    each trial's start is timed from the publisher before it. The status entries are in
+    `cloudflare-status.jsonl` (`cfjoin.py`: 26 pairs).
 
 | Run (results) | UTC | Ingest, drop | `timeoutSeconds` | Trials | The close, per trial (errors on R0 and the attached readers) | HLS |
 |---|---|---|---|---|---|---|
 | `r2-smoke` | 21:07 | SRT, clean | 180 | 1, invalid | — | P2's media at +11.6 |
-| `r2-clean180` | 21:11 to 21:25 | SRT, clean | 180 | 3, gap 5.5 | +29.79 to +29.92; +29.99 to +30.03; +29.89 to +29.93 | P2's media at +11.4 to +11.8 |
-| F-032 `probes-prod` (the kill arm) | 18:07 to 18:21 | SRT, kill | 180 | 3, gap 5.5 | +30.93 to +31.01; +30.00 to +30.98; +30.01 to +31.01 | not polled |
-| `r2-t10` | 21:28 to 21:37 | SRT, kill | 10 | 3, gap 5.5; 1 with no P2 | +30.83 to +30.97; silent (finding 17); +30.01 to +31.01; no P2: +30.01 to +31.01 | P2's media at +11.0 to +12.6; no P2: master 204 at +42.3 |
-| `r2-t30` | 21:38 to 21:45 | SRT, kill | 30 | 3, gap 5.5 | +30.89 to +30.91; +30.01 to +30.98; +30.00 to +30.98 | P2's media at +10.5 to +11.4 |
-| `r2-t60` | 21:47 to 21:59 | SRT, kill | 60 | 3, gap 5.5; 1 with no P2 | +30.01 to +30.86; silent; +30.88 to +30.98; no P2: +30.01 to +30.94 | P2's media at +11.1 to +11.7; no P2: master 204 at +92.3 |
-| `r2-ctl-rtmps60` (the control) | 22:02 to 22:05 | RTMPS, kill | 60 | 1, no P2 | +29.99 to +30.00 | master 204 at +62.4 |
+| `r2-clean180` | 21:11 to 21:25 | SRT, clean | 180 | 3, gap 5.5; cooldown 240, all fresh | +29.79 to +29.92; +29.99 to +30.03; +29.89 to +29.93 | P2's media at +11.4 to +11.8 |
+| F-032 `probes-prod` (the kill arm) | 18:07 to 18:21 | SRT, kill | 180 | 3, gap 5.5; cooldown 240; T1 not known, T2 and T3 fresh | +30.93 to +31.01; +30.00 to +30.98; +30.01 to +31.01 | not polled |
+| `r2-t10` | 21:28 to 21:37 | SRT, kill | 10 | 3, gap 5.5; 1 with no P2; cooldown 40 | fresh: +30.83 to +30.97; held: +30.01, R0 missed it (finding 17); +30.01 to +31.01; no P2: +30.01 to +31.01 | P2's media at +11.0 to +12.6; no P2: master 204 at +42.3 |
+| `r2-t30` | 21:38 to 21:45 | SRT, kill | 30 | 3, gap 5.5; cooldown 45 | fresh: +30.89 to +30.91; held: +30.01 to +30.98; +30.00 to +30.98 | P2's media at +10.5 to +11.4 |
+| `r2-t60` | 21:47 to 21:59 | SRT, kill | 60 | 3, gap 5.5; 1 with no P2; cooldown 75 | fresh: +30.01 to +30.86; held: +30.00 to +30.89, R0 missed it; +30.88 to +30.98; no P2: +30.01 to +30.94 | P2's media at +11.1 to +11.7; no P2: master 204 at +92.3 |
+| `r2-ctl-rtmps60` (the control) | 22:02 to 22:05 | RTMPS, kill | 60 | 1, no P2; fresh | +29.99 to +30.00 | master 204 at +62.4 |
 
-13. **The SRT-playback hold does not follow `timeoutSeconds`.** At 10, 30 and 60 it ended at the drop +
-    30.0 to 31.0 (`census.py`: 26, 25 and 25 errors), as it does at 180 (F-032: +29.9 to +31.2). That
-    holds even at 10, where Cloudflare's own recording timeout runs out first. No `timeoutSeconds`
-    shortens it, so fix (a)'s gate and expected numbers stand at any setting. Replayed on the 12 round-2
-    maps with a P2 (`sim.py`), (a) gives a median of +34.4 (+34.3 to +34.6 on every map where no lucky
-    connect came first), against today's +40.2. That is F-032's range again.
+13. **The SRT-playback hold did not follow `timeoutSeconds` in any trial, but only one fresh broadcast
+    was measured at each of 10, 30 and 60.**
+    - All trials: at 10, 30 and 60 it ended at the drop + 30.0 to 31.0 (`census.py`: 27, 25 and 29
+      errors), as it does at 180 (F-032: +29.9 to +31.2).
+    - Fresh broadcasts alone (`sweep.py`'s `fresh`): +30.83 to +30.97 at 10, +30.89 to +30.91 at 30 and
+      +30.01 to +30.86 at 60, n=1 each. At 180, round 1's 9 probe trials and the clean arm's 3 (11 fresh,
+      1 not known: the method) gave +29.79 to +31.01. So "30 to 31 s at every setting" still holds on the
+      fresh trials alone, but on one trial per setting below 180. That is too few to give a spread at any
+      of those settings, or to conclude from alone. It does show that one fresh broadcast at 10 and one at
+      60 each held to +30 to +31, where a hold equal to `timeoutSeconds` would have ended near +10 and
+      +60, and one following it as HLS's does (finding 15) near +42 and +92.
+    - The other 8 (`held`: 3 at 10, 2 at 30, 3 at 60) started inside the previous broadcast's HLS hold
+      (the method's cooldowns). Their holds fell in the same range, +30.00 to +31.01, with R0 missing
+      the close in 2 (finding 17). They agree, but they began from a different state, so they do not add
+      to the fresh n.
+    - So no setting from 10 to 60 is seen to shorten the hold, and fix (a)'s gate and expected numbers
+      stand at those settings on this evidence. Replayed on the 12 round-2 maps with a P2 (`sim.py`), (a)
+      gives a median of +34.4 (+34.3 to +34.6 wherever no lucky connect came first, on every map but
+      `r2-t10` T2: finding 17), against today's +40.2. That is F-032's range again.
 14. **Nor is it a dead SRT peer.**
     - With a clean close, Cloudflare's status read the disconnect 0.28 s after the SIGTERM (n=4). Each is
       timed by its trial's end, which closes the same way: a read after each drop came only once P2's
@@ -2657,37 +2682,74 @@ early?
       RTMPS kill trials (F-032, where Cloudflare knew in 0.3 s) ended at +29.92 to +30.00 the same way.
     - The dead peer does cost 30 s, but elsewhere: in Cloudflare's status, and in HLS (finding 15).
 15. **What follows `timeoutSeconds` is HLS's hold, as R0 found. On SRT it starts only when Cloudflare
-    notices the drop.**
-    - With no new publisher over SRT, the HLS master turned 204 at the drop + 42.3 at 10, and + 92.3 at
-      60. Neither time was there an ENDLIST. That is Cloudflare's SRT disconnect (+30.3) +
-      `timeoutSeconds` + 2.0 s.
-    - The RTMPS control at 60 turned 204 at +62.4 (R0: 63.1 at 60), so the probe sees R0's behaviour.
-      Its SRT playback still ended at +29.99.
-    - So from these two points, web's `holdWindowSeconds.srt` is about `timeoutSeconds` + 32 s: about
-      212 s at 180. That matches the P5 session's ~213 s at 180 (one point each). That window is HLS's,
-      not the relay's.
-16. **HLS shows a new publisher about 19 s before SRT playback does.** With P2 at +5.5, the HLS head
-    moved again at +10.5 to +12.6 in all 12 trials with a P2, 4.7 to 6.8 s after P2's connect. SRT
-    playback held to +30 to +31. HLS is a second read path (finding 11), but its latency as a relay input
+    notices the drop. It is not a reconnect window.**
+    - With no new publisher over SRT, the HLS master turned 204 at the drop + 42.3 at 10 and + 92.3 at
+      60 (n=1 each), with no ENDLIST either time. That fits Cloudflare's SRT disconnect + `timeoutSeconds`
+      + 2.0 s, with the disconnect at +30.3: measured in the trial at 10 (+30.30), inferred at 60 (no
+      status read in that trial; every SRT SIGKILL read was 30.28 to 30.30).
+    - Both points are back-to-back trials (T4, a `held` start). The broadcast each timed was the trial's
+      own: its variant came up 8.4 and 8.6 s after P1's connect.
+    - The RTMPS control at 60 turned 204 at +62.4, with no ENDLIST. R0's 63.1 at 60 (section 4a) was an
+      ENDLIST on a clean cut, so the duration matches R0's and the signal does not. Its SRT playback
+      still ended at +29.99.
+    - So with nobody back, the master stays 200, frozen, for about `timeoutSeconds` + 32 s over SRT
+      (n=1 each). About 212 s at 180 is an extrapolation, which matches the P5 session's ~213 s at 180.
+    - A publisher that comes back inside that time does not continue the stream. All 8 that did (each
+      `held` trial's P1, 40.3 to 75.4 s after the previous SIGKILL, after Cloudflare's disconnect read)
+      got a new HLS stream: the held master went 204 2.0 to 3.0 s after their connect, and a new variant
+      came up 8.1 to 9.3 s after their connect. Each trial also made its own recording (16 recordings for round 2's
+      16 trials). A publisher back inside the SRT hold (P2 at +5.8, before the disconnect read) kept the
+      variant, 12 of 12. Returns between those two times (+6 to +40) were not sampled.
+    - So `timeoutSeconds` + 32 is how long HLS shows a dead broadcast as live, not a window inside which
+      a return is seamless. An HLS reader (finding 16's second read path) has to reload the master after
+      a republish: the stream it was reading ends 2 to 3 s after the new publisher arrives, and the new
+      one has a new variant URL. (The old variant's URL was not polled after its master went 204; the
+      poll follows the master.)
+    - For web, a recommendation for its owner, not a measured fact about web. Web serves the phone
+      `holdWindowSeconds.srt` = 183: `holdWindowFor` (`apps/web/src/server/usecases/capture-phone.ts`:83-92)
+      computes `INGEST_TIMEOUT_SECONDS` 180 + `HOLD_SLACK_SECONDS` 3 and never reads the ingest
+      capability's `srt: null` (`ingest-cf.ts`:137); `capture-get.test.ts`:402-409 pins that. The field
+      is described as how long the ingest holds a dropped publish before the broadcast ends, and design
+      C2 relies on it as the window in which a reconnect is invisible on air
+      (`2026-09-07-streaming-programme-design.md`:997-1006). Over SRT with a killed publisher, 183 is
+      neither measured window: a return continued the broadcast at +5.8 and did not at +40.3 or later;
+      HLS shows the broadcast for about `timeoutSeconds` + 32; and SRT playback, which the relay reads,
+      closes at +30 to +31 at every setting tried. If the field means a seamless return, the measured
+      bound is below +40.3 and not yet narrowed. If it means the HLS end, it is about `timeoutSeconds`
+      + 32. Which it should mean is web's call.
+16. **HLS shows a new publisher about 19 s before Cloudflare's SRT close.** With P2 at +5.5, the HLS
+    head moved again at +10.5 to +12.6 in all 12 trials with a P2, 4.7 to 6.8 s after P2's connect.
+    SRT playback held to +30 to +31; the first reader started at or after the close decoded at +32.4 to
+    +34.6 (9 of the 12; in 3 it got nothing), 20.6 to 24.0 s after HLS's move in the same trial. A lucky reader inside the
+    hold decoded as early as +8.5. HLS is a second read path (finding 11), but its latency as a relay input
     (LL-HLS, 2 s segments) is not measured.
-17. **A second shape for the hold's end: silent** (2 of 12 trials with a P2, both a trial 2: one at 10,
-    one at 60; 0 of F-032's 9 probe trials).
-    - No reader got the close error. R0 and the 5 to 6 attached probes went silent at +31.0: one buffered
-      frame, then nothing.
+17. **A second shape for the hold's end: R0 misses the close** (2 of 12 trials with a P2, both a
+    trial 2 and a `held` start: one at 10, one at 60; 0 of F-032's 9 probe trials).
+    - R0 got no error: one frame at +31.0, then nothing to the trial's end.
+    - Other readers did get the close. At 60, 4 of the 7 attached probes and 1 started inside the
+      spread, at +30.00 to +30.89; 3 attached stayed silent. At 10, 1 of the 8 attached at +30.01, and 7
+      silent; then 4 probes started later got the same error together at +39.42 (`census.py`'s `error`
+      misses).
     - Fresh readers were then mostly not served for about 10 s more. At 10, nothing until a reader
       started at +41.0 decoded at +44.3. At 60, one decode from +34.0, then nothing to the trial's end.
-    - In this shape (a) has no error to act on and falls back to today's schedule. The replay at 10 puts
-      every policy past the trial's end (+50).
+    - So (a) can still act in this shape, when the relay's build is one that gets an error. The +39.42
+      errors at 10 pass its 20 s gate too. In the replay at 60, a lucky in-window decode comes first,
+      today and with (a) (median +22.3). At 10 every policy's connects map to probes that got no error
+      and decoded nothing, so all run past the trial's end (+50).
+    - The cause is not known. Both came in `held` starts (2 of 8, against 0 of 7 fresh round-2 trials
+      and 0 of round 1's 9); n=2.
     - The build that was Running at the drop (R0) got the close error in 22 of the 24 probe trials
       across both rounds. Relay builds attached during a connect got it in 6 of 8. A relay that kept its
       stalled build open, gate shut, as it already keeps abandoned builds, would hear the close in about
       11 returns in 12, instead of 3 in 4. Not replayed; one for the fix's design.
 
-So, to the two questions. The SRT hold stays near 30 s at every `timeoutSeconds` from 10 to 180, so no
-setting buys fix (a) anything, and (a) stands as written. A clean close does not shorten it either. Phone
-ingest over RTMPS would not dodge it. In F-032's 3 RTMPS SIGKILL trials (P2 `connected` at +6.5 per
-Cloudflare), SRT playback held to +29.92 to +30.00, 7 of 69 fresh readers decoded inside the hold, and the
-first reader started at the close decoded at +33.3 (+34.5 over SRT). RTMPS removes the dead peer's 30 s
+So, to the two questions. The SRT hold ended near +30 to +31 in every trial at every `timeoutSeconds`
+from 10 to 180. Below 180 that rests on one fresh broadcast per setting, plus 8 trials that started
+inside the previous broadcast's HLS hold. On that evidence no setting buys fix (a) anything, and (a)
+stands as written. A clean close does not shorten it either. Phone ingest over RTMPS would not dodge
+it. In F-032's 3 RTMPS SIGKILL trials (P2 `connected` at +6.5 per Cloudflare), SRT playback held to
++29.92 to +30.00, 7 of 69 fresh readers decoded inside the hold, and the first reader started at the
+close decoded at +33.3 (+34.5 over SRT). RTMPS removes the dead peer's 30 s
 from Cloudflare's status and from HLS only.
 
 **Recommended fix.** Not built here: the dispatch was measurement only.
@@ -2739,8 +2801,9 @@ from Cloudflare's status and from HLS only.
   34.5 s on the six 5.5 s maps (up to +35.9 at gap 25, one map). In C17's shape (the phone back 5.7 s after its exit) that is 27.5 to 28.8 s, plus 1 s to
   `live`: 28.5 to 29.8 s, against the replica's 35.6 s for today (C17's stamps: 33.9 to 38.9). That
   holds only when the close reaches the link's build, which 6 of 8 attached relay builds did, so about 3
-  returns in 4. The rest fall back to today's schedule, as does the silent end (finding 17, 2 of 12
-  round-2 trials). It holds at any `timeoutSeconds` (finding 13).
+  returns in 4. The rest fall back to today's schedule, as does a trial where the close misses every
+  build the relay has open (finding 17: R0 missed it in 2 of 12 round-2 trials). It holds at 10, 30
+  and 60 as at 180, on one fresh trial each below 180 (finding 13).
 - *Side note.* "Un-abandon" (an abandoned build that delivers its first frame goes back on air) would
   have caught the one re-attached build at +32.7 (n=1).
 
@@ -2770,13 +2833,18 @@ from Cloudflare's status and from HLS only.
     trade.
 
 **Not measured.**
-- A second drop inside a running hold: each trial was a fresh broadcast after a 240 to 270 s cooldown.
+- A second drop inside a running SRT hold. Round 1's trials started 219 to 271 s after the previous
+  publisher's end (all but the first probe trial: the method). Round 2's 8 `held` trials started
+  inside the previous broadcast's HLS hold, but 10 to 45 s after Cloudflare's disconnect read, so after
+  its SRT hold.
+- The SRT hold at 10, 30 and 60 beyond one fresh broadcast each (finding 13), and a return between +6
+  and +40 s (finding 15).
 - An input idle for minutes: the only no-publisher window is gap 40's 9 s, so how Cloudflare treats
   readers then, and so (a)'s cost for a gone phone, is not measured beyond it.
 - A real network loss, as against SIGKILL.
 - Any input but the spike's Input A, and any region but lhr.
 - Cloudflare's RTMPS and WebRTC playback, and HLS as a relay input (its latency).
-- A clean close over RTMPS, and the silent end's cause (finding 17, n=2).
+- A clean close over RTMPS, and why R0 missed the close (finding 17, n=2).
 - The full relay, and CI: see the method.
 - The in-window hit rate under the relay's single-connect pattern: 16 % on 32 connects, too few to pin.
 
