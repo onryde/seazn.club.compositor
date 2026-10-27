@@ -156,9 +156,10 @@ fn main() {
                         now.duration_since(built_at).as_millis()
                     );
                 }
-                Event::InputLost { gen: g, reason } => {
+                Event::InputLost { gen: g, .. } | Event::InputError { gen: g, .. } => {
                     losses += 1;
-                    eprintln!("event t_ms={} InputLost gen={g} {reason:?}", ms(now));
+                    // Owed 108: a pipeline error comes as `InputError`, with the build's facts.
+                    eprintln!("event t_ms={} {e:?}", ms(now));
                     if g == gen {
                         gen += 1;
                         built_at = Instant::now();

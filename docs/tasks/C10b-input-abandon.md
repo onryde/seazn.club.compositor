@@ -59,6 +59,11 @@ premises table. In short:
 - **App, testkit:** `InputSource::abandon(gen)`, one driver arm; `Call::InputAbandon(gen)`.
 - **Adapters:** `GstInput::abandon(gen)` closes the current build's gate (video, audio, events) and
   sends nothing; the pipeline stays up, gated, until the next `rebuild` (for Owed 49's measurement).
+  *Amended 2026-10-27 (Owed 108 fix (a), F-032):* save the given-up build's first pipeline error,
+  which it still reports while it runs, as `Event::InputError { gen, facts }` with the build's
+  handshake and media flags: Cloudflare's hold-end close lands on such a build, and the domain's
+  input link reads it (`InputLink::on_error`). Its frames, audio, EOS and later errors stay shut out,
+  and the next `rebuild`, `stop` or the drop ends even that.
   A stale gen, a build already lost and a second call change nothing. `SampleClock`, `ruled`,
   `DOMAIN_LAG_ALLOWANCE_MS` and `give_up` are deleted; `GstInput::new` keeps `&Thresholds` for the
   SRT latency. The three G1 tests are re-pointed at the port call and now also prove the adapter

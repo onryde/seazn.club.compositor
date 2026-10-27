@@ -6,7 +6,7 @@ use domain::cef_health::CefHealth;
 use domain::config::{OutputProfile, Thresholds};
 use domain::graphics::HideReason;
 use domain::health::{BeatState, ExitDetail, ExitInfo, HealthReport, PhaseChannel};
-use domain::input_link::LossReason;
+use domain::input_link::{BuildFacts, LossReason};
 use domain::ladder::Rung;
 use domain::lifecycle::{ExitReason, Lifecycle};
 use domain::output_link::Encoded;
@@ -117,6 +117,8 @@ enum Kind {
     /// A frame of a generation not the current one (C10b): one already rebuilt past.
     InputFrameStale,
     InputLost,
+    /// An input error with the handshake and no media (Owed 108): Cloudflare's close, in shape.
+    InputError,
     OutputProgress,
     OutputError,
     OutputDrained,
@@ -141,7 +143,7 @@ enum Kind {
     CefRestart,
 }
 
-const KINDS: [Kind; 28] = [
+const KINDS: [Kind; 29] = [
     Kind::Tick,
     Kind::BootstrapOk,
     Kind::BootstrapFailed,
@@ -151,6 +153,7 @@ const KINDS: [Kind; 28] = [
     Kind::InputFrame,
     Kind::InputFrameStale,
     Kind::InputLost,
+    Kind::InputError,
     Kind::OutputProgress,
     Kind::OutputError,
     Kind::OutputDrained,
@@ -187,6 +190,7 @@ fn kind_of(e: &Event) -> Kind {
         // The stale kind is a frame too; `sample` checks it against this one.
         Event::InputFrame { .. } => Kind::InputFrame,
         Event::InputLost { .. } => Kind::InputLost,
+        Event::InputError { .. } => Kind::InputError,
         Event::OutputProgress { .. } => Kind::OutputProgress,
         Event::OutputError { .. } => Kind::OutputError,
         Event::OutputDrained => Kind::OutputDrained,
@@ -235,6 +239,13 @@ fn sample(kind: Kind, s: &Supervisor) -> Event {
         Kind::InputLost => Event::InputLost {
             gen: s.input_generation(),
             reason: LossReason::Error,
+        },
+        Kind::InputError => Event::InputError {
+            gen: s.input_generation(),
+            facts: BuildFacts {
+                handshake_completed: true,
+                carried_media: false,
+            },
         },
         Kind::OutputProgress => Event::OutputProgress {
             gen: s.output_generation(),

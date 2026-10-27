@@ -66,7 +66,7 @@ use crate::graphics::{Graphics, GraphicsAction, GraphicsState, HideReason};
 use crate::health::{
     BeatState, ExitDetail, ExitInfo, GraphicsStatus, HealthReport, LinkStatus, PhaseChannel,
 };
-use crate::input_link::{InputAction, InputLink, InputState, LossReason};
+use crate::input_link::{BuildFacts, InputAction, InputLink, InputState, LossReason};
 use crate::ladder::{Ladder, Rung};
 use crate::lifecycle::{ExitReason, Lifecycle};
 use crate::output_link::{Encoded, OutputLink, OutputState, SwapReason};
@@ -128,6 +128,14 @@ pub enum Event {
         gen: u64,
         reason: LossReason,
     },
+    /// An error on input generation `gen`'s pipeline, with what its SRT connection had shown (Owed
+    /// 108 fix (a), F-032): the current build's, or the first one of the last build the link gave up
+    /// while that build still runs. Running, it is a loss, as `InputLost` with `Error` is; between
+    /// builds the link reads Cloudflare's hold-end close in it (`InputLink::on_error`).
+    InputError {
+        gen: u64,
+        facts: BuildFacts,
+    },
     /// The current sink's bytes-sent total, counted from 0 for each sink (C09: rtmp2sink
     /// `out-bytes-total`). It replaces the brief's `OutputConnected` and `OutputAck`: F-005 found CF
     /// Input B sends no RTMP acknowledgements, and C04's `OutputLink` reads bytes sent (Owed 13).
@@ -185,8 +193,10 @@ pub enum Effect {
         gen: u64,
     },
     /// The domain gave input generation `gen` up by its own rule, the connect timeout or the stall
-    /// rule (C10b, Owed 50): the adapter shuts that generation out (`InputSource::abandon`). Pushed
-    /// once a generation, on the Running tick that decided it; a loss the adapter reported owes none.
+    /// rule (C10b, Owed 50): the adapter shuts that generation out (`InputSource::abandon`), save its
+    /// first pipeline error, which still comes as `Event::InputError` while the build runs (Owed 108).
+    /// Pushed once a generation, on the Running tick that decided it; a loss the adapter reported
+    /// owes none.
     AbandonInput {
         gen: u64,
     },
@@ -476,6 +486,12 @@ impl Supervisor {
         }
     }
 
+    /// An input error (Owed 108): the link reads it against the programme's last camera frame.
+    fn on_input_error(&mut self, now: Ms, gen: u64, facts: BuildFacts) {
+        let last = self.programme.last_frame_at();
+        self.input.on_error(now, gen, facts, last, &self.t);
+    }
+
     /// A frame counts only from the generation the link takes frames from (C10b).
     fn on_input_frame(&mut self, now: Ms, gen: u64) {
         if self.input.takes_frames_from(gen) {
@@ -525,6 +541,7 @@ impl Supervisor {
             Event::InputFrame { gen } => self.on_input_frame(now, gen),
             Event::InputConnected { gen } => self.input.on_connected(now, gen),
             Event::InputLost { gen, reason } => self.input.on_lost(now, gen, reason, &t),
+            Event::InputError { gen, facts } => self.on_input_error(now, gen, facts),
             Event::OutputProgress {
                 gen,
                 total_bytes,
@@ -588,6 +605,7 @@ impl Supervisor {
             Event::InputFrame { gen } => self.on_input_frame(now, gen),
             Event::InputConnected { gen } => self.input.on_connected(now, gen),
             Event::InputLost { gen, reason: r } => self.input.on_lost(now, gen, r, &t),
+            Event::InputError { gen, facts } => self.on_input_error(now, gen, facts),
             Event::OutputProgress {
                 gen,
                 total_bytes,
@@ -2370,6 +2388,7 @@ mod tests {
             input_connect_timeout_ms: 5_041,
             input_stall_after_ms: 5_051,
             input_srt_latency_ms: 1_181,
+            input_hold_end_after_ms: 20_021,
             kick_alert_count: 3,
             kick_window_ms: 300_061,
             output_backoff_base_ms: 541,
@@ -2414,6 +2433,7 @@ mod tests {
             th.input_backoff_cap_ms,
             th.input_connect_timeout_ms,
             th.input_stall_after_ms,
+            th.input_hold_end_after_ms,
             th.kick_window_ms,
             th.output_backoff_base_ms,
             th.output_backoff_cap_ms,
@@ -2437,7 +2457,7 @@ mod tests {
         let mut unique = ms.to_vec();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(unique.len(), 26, "setup: every Ms threshold distinct");
+        assert_eq!(unique.len(), 27, "setup: every Ms threshold distinct");
         let base = th.bootstrap_backoff_base_ms;
         assert!(
             2 * base < th.bootstrap_backoff_cap_ms && 4 * base > th.bootstrap_backoff_cap_ms,

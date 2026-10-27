@@ -21,7 +21,7 @@ use adapters::gst_programme::GstProgramme;
 use app::ports::{Inbound, InputSource, InputSpec, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::{Receiver, Sender};
 use domain::config::{OutputProfile, Thresholds};
-use domain::input_link::LossReason;
+use domain::input_link::{BuildFacts, LossReason};
 use domain::programme::FrameChoice;
 use domain::supervisor::Event;
 use gstreamer as gst;
@@ -343,11 +343,31 @@ fn frame_gens(events: &[Event]) -> Vec<u64> {
         .collect()
 }
 
+/// The losses, each pipeline error among them: Owed 108 reports a bus error as `InputError` with the
+/// build's facts, the open build's loss (the domain's, unless it reads Cloudflare's hold-end close
+/// in it), or the first error of the build given up. The tests that read the facts match the event.
 fn losses(events: &[Event]) -> Vec<(u64, LossReason)> {
     events
         .iter()
         .filter_map(|e| match e {
             Event::InputLost { gen, reason } => Some((*gen, *reason)),
+            Event::InputError { gen, .. } => Some((*gen, LossReason::Error)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A loss or a pipeline error (`losses`).
+fn is_loss(e: &Event) -> bool {
+    matches!(e, Event::InputLost { .. } | Event::InputError { .. })
+}
+
+/// The `InputError`s, with their facts (Owed 108).
+fn errors(events: &[Event]) -> Vec<(u64, BuildFacts)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::InputError { gen, facts } => Some((*gen, *facts)),
             _ => None,
         })
         .collect()
@@ -720,7 +740,7 @@ fn input_caps_change_does_not_reach_programme() {
             thread::sleep(Duration::from_millis(50));
         }
         l.stop();
-        events_until(&rx, LOSS_BUDGET, |e| matches!(e, Event::InputLost { .. }));
+        events_until(&rx, LOSS_BUDGET, is_loss);
     }
     eprintln!("camera frames checked: {checked}");
     assert_eq!(checked, 30);
@@ -741,12 +761,12 @@ fn listener_closing_reports_an_error_loss_with_the_right_generation() {
     connect(&mut input, &rx, 1, &spec(port));
     drop(l);
     let l2 = Listener::start(port, &cfg(640, 360));
-    let seen = events_until(&rx, LOSS_BUDGET, |e| matches!(e, Event::InputLost { .. }));
+    let seen = events_until(&rx, LOSS_BUDGET, is_loss);
     assert_eq!(losses(&seen), vec![(1, LossReason::Error)]);
     // A second generation on a new listener: its own loss carries its own number.
     connect(&mut input, &rx, 2, &spec(port));
     drop(l2);
-    let seen = events_until(&rx, LOSS_BUDGET, |e| matches!(e, Event::InputLost { .. }));
+    let seen = events_until(&rx, LOSS_BUDGET, is_loss);
     assert_eq!(losses(&seen), vec![(2, LossReason::Error)]);
     let after = events_for(&rx, Duration::from_secs(2));
     assert!(losses(&after).is_empty(), "one loss a generation: {after:?}");
@@ -837,9 +857,7 @@ fn srt_uri_encodes_and_never_appears_in_logs() {
         passphrase: "SECRETPASS&word=2345".to_owned(),
     };
     input.rebuild(1, &secret);
-    let seen = events_until(&rx, Duration::from_secs(8), |e| {
-        matches!(e, Event::InputLost { .. })
-    });
+    let seen = events_until(&rx, Duration::from_secs(8), is_loss);
     assert_eq!(losses(&seen), vec![(1, LossReason::Error)]);
     assert!(connects(&seen).is_empty());
     // Element errors that echo the values raw, percent-encoded, and inside the URI are scrubbed too.
@@ -856,10 +874,7 @@ fn srt_uri_encodes_and_never_appears_in_logs() {
         assert!(input.plant_error(text));
     }
     events_until(&rx, Duration::from_secs(8), |e| {
-        *e == Event::InputLost {
-            gen: 2,
-            reason: LossReason::Error,
-        }
+        matches!(e, Event::InputError { gen: 2, .. })
     });
     thread::sleep(Duration::from_millis(200));
     let debug = format!("{input:?}");
@@ -1003,7 +1018,7 @@ fn camera_loss_then_recovery() {
     connect(&mut input, &rx, 1, &spec(port));
     let before = camera_pts(&frames);
     l.stop();
-    let seen = events_until(&rx, LOSS_BUDGET, |e| matches!(e, Event::InputLost { .. }));
+    let seen = events_until(&rx, LOSS_BUDGET, is_loss);
     assert_eq!(losses(&seen), vec![(1, LossReason::Error)]);
     let quiet = events_for(&rx, Duration::from_millis(500));
     assert_eq!(frames_in(&quiet), 0, "no frame after the loss");
@@ -1038,9 +1053,7 @@ fn reconnecting_twice_builds_three_generations_and_leaks_none() {
         }));
         all.extend(events_for(&rx, Duration::from_millis(500)));
         l.stop();
-        all.extend(events_until(&rx, LOSS_BUDGET, |e| {
-            matches!(e, Event::InputLost { .. })
-        }));
+        all.extend(events_until(&rx, LOSS_BUDGET, is_loss));
     }
     all.extend(events_for(&rx, Duration::from_secs(1)));
     eprintln!(
@@ -1079,12 +1092,12 @@ fn a_source_that_never_answers_is_lost_as_an_error() {
     let (mut input, rx, frames, _lines) = input(&P720);
     let t0 = Instant::now();
     input.rebuild(1, &spec(free_port()));
-    let seen = events_until(&rx, Duration::from_secs(8), |e| {
-        matches!(e, Event::InputLost { .. })
-    });
+    let seen = events_until(&rx, Duration::from_secs(8), is_loss);
     let took = t0.elapsed();
     eprintln!("lost after {took:?}; events {seen:?}");
     assert_eq!(losses(&seen), vec![(1, LossReason::Error)]);
+    // Owed 108: a refused connect has no handshake and no byte.
+    assert_eq!(errors(&seen), vec![(1, BuildFacts::default())]);
     assert!(connects(&seen).is_empty() && frames_in(&seen) == 0);
     assert!(frames.camera().is_none());
 }
@@ -1125,7 +1138,7 @@ fn eos_and_error_are_told_apart_once_a_generation() {
             _ => input.plant_error("planted"),
         };
         assert!(planted);
-        let seen = events_until(&rx, LOSS_BUDGET, |e| matches!(e, Event::InputLost { .. }));
+        let seen = events_until(&rx, LOSS_BUDGET, is_loss);
         assert_eq!(losses(&seen), vec![(gen, first)]);
         let second = match first {
             LossReason::Eos => input.plant_error("after the eos"),
@@ -1152,7 +1165,7 @@ fn a_lost_generation_writes_nothing_more() {
     events_for(&rx, Duration::from_millis(300));
     let before = frames.audio_level();
     assert!(input.plant_error("planted"));
-    events_until(&rx, LOSS_BUDGET, |e| matches!(e, Event::InputLost { .. }));
+    events_until(&rx, LOSS_BUDGET, is_loss);
     let pts = camera_pts(&frames);
     let dropped = input.gate_dropped();
     let at_loss = frames.audio_level();
@@ -1310,14 +1323,17 @@ fn a_start_srt_refuses_is_lost_as_an_error() {
             ..spec(free_port())
         },
     );
-    let seen = events_until(&rx, Duration::from_secs(8), |e| {
-        matches!(e, Event::InputLost { .. })
-    });
+    let seen = events_until(&rx, Duration::from_secs(8), is_loss);
     let took = t0.elapsed();
     let more = events_for(&rx, Duration::from_millis(500));
     let lines = lines.lock().unwrap().clone();
     eprintln!("lost after {took:?}; lines {lines:?}");
     assert_eq!(losses(&seen), vec![(1, LossReason::Error)]);
+    assert_eq!(
+        errors(&seen),
+        vec![(1, BuildFacts::default())],
+        "no handshake (Owed 108)"
+    );
     assert!(more.is_empty(), "one loss: {more:?}");
     assert!(
         took < Duration::from_secs(2),
@@ -1416,8 +1432,13 @@ fn a_peer_close_is_an_error_even_when_the_log_is_slow() {
         let l = Listener::start(port, &cfg(640, 360));
         connect(&mut input, &rx, gen, &spec(port));
         drop(l);
-        let seen = events_until(&rx, LOSS_BUDGET, |e| matches!(e, Event::InputLost { .. }));
+        let seen = events_until(&rx, LOSS_BUDGET, is_loss);
         assert_eq!(losses(&seen), vec![(gen, LossReason::Error)], "close {gen}");
+        let streamed = BuildFacts {
+            handshake_completed: true,
+            carried_media: true,
+        };
+        assert_eq!(errors(&seen), vec![(gen, streamed)], "close {gen} (Owed 108)");
         closes += 1;
     }
     let after = events_for(&rx, Duration::from_secs(1));
@@ -1892,7 +1913,7 @@ fn abandon_after_a_reported_loss_changes_nothing() {
     let l = Listener::start(port, &cfg(640, 360));
     connect(&mut input, &rx, 1, &spec(port));
     drop(l);
-    let seen = events_until(&rx, LOSS_BUDGET, |e| matches!(e, Event::InputLost { .. }));
+    let seen = events_until(&rx, LOSS_BUDGET, is_loss);
     assert_eq!(losses(&seen), vec![(1, LossReason::Error)]);
     input.abandon(1);
     let after = events_for(&rx, Duration::from_millis(500));
@@ -1903,6 +1924,135 @@ fn abandon_after_a_reported_loss_changes_nothing() {
     assert!(after.is_empty(), "{after:?}");
     assert_eq!(input.abandoned(), 0);
     assert_eq!(lines_with(&lines, "gen=1: abandon: its gate was already shut"), 1);
+    finish(input);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Owed 108 (F-032): Cloudflare's hold-end close, and the facts each error carries
+
+/// Cloudflare's hold-end close, in shape: when the phone drops, Cloudflare holds its SRT broadcast
+/// about 30 s and then closes every attached reader with an error, most often on a build the domain
+/// has given up and not yet rebuilt past. Four builds, each attached to a local listener that then
+/// goes away: a silent one (the handshake completed and no byte came: the held broadcast) and a
+/// streaming one, each still open and each given up first (`abandon`). Each reports `InputError`
+/// once, for its own generation, with the handshake, and with media exactly when the listener sent
+/// some; a second error from the same build (planted) reports nothing.
+#[test]
+fn a_peer_close_reports_the_builds_facts_open_or_given_up() {
+    let _s = serial();
+    let (mut input, rx, _frames, lines) = input(&P720);
+    let mut checked = 0;
+    let mut gen = 0;
+    for streaming in [false, true] {
+        for given_up in [false, true] {
+            gen += 1;
+            let port = free_port();
+            let l = if streaming {
+                Listener::start(port, &cfg(640, 360))
+            } else {
+                Listener::silent(port)
+            };
+            if streaming {
+                connect(&mut input, &rx, gen, &spec(port));
+            } else {
+                rebuild_past_the_handshake(&mut input, gen, &spec(port));
+            }
+            // The build's thread reads the handshake on each pass of its bus: let it pass a few.
+            let before = events_for(&rx, Duration::from_millis(500));
+            assert!(losses(&before).is_empty(), "gen {gen}: {before:?}");
+            if given_up {
+                input.abandon(gen);
+                let _ = rx.try_iter().count();
+            }
+            drop(l);
+            let seen = events_until(&rx, LOSS_BUDGET, is_loss);
+            let want = BuildFacts {
+                handshake_completed: true,
+                carried_media: streaming,
+            };
+            eprintln!(
+                "gen {gen} (streaming {streaming}, given up {given_up}): {:?}",
+                errors(&seen)
+            );
+            assert_eq!(errors(&seen), vec![(gen, want)], "gen {gen}: {seen:?}");
+            assert_eq!(losses(&seen).len(), 1, "gen {gen}: one report: {seen:?}");
+            assert!(input.plant_error("a second error"));
+            let after = events_for(&rx, Duration::from_millis(500));
+            assert!(losses(&after).is_empty(), "gen {gen}: a second error: {after:?}");
+            checked += 1;
+        }
+    }
+    let after_abandon = lines_with(&lines, "an error after the abandon");
+    eprintln!("closes checked: {checked}; errors after an abandon logged: {after_abandon}");
+    assert_eq!(checked, 4);
+    assert_eq!(after_abandon, 2, "the two given-up builds");
+    assert_eq!(input.abandoned(), 2);
+    finish(input);
+}
+
+/// Owed 108's bound on the adapter's side: only the build last given up, and only while it runs. A
+/// given-up build the next `rebuild` retired reports nothing when its peer goes away, and neither
+/// does one given up and then stopped; the build between them, given up and still running, reports
+/// its own (the positive pair). Only that pair fails without this change (before it, a given-up build
+/// reported nothing at all). The retired and stopped halves pin today's behaviour, which the build's
+/// stop flag and teardown already give; no mutant of `Shared::shut`'s `given_up` clearing reaches
+/// them (its doc says why).
+#[test]
+fn a_retired_or_stopped_build_reports_no_error() {
+    let _s = serial();
+    let (mut input, rx, _frames, _lines) = input(&P720);
+    let ports = [free_port(), free_port(), free_port()];
+    let [l1, l2, l3] = ports.map(Listener::silent);
+    rebuild_past_the_handshake(&mut input, 1, &spec(ports[0]));
+    input.abandon(1);
+    rebuild_past_the_handshake(&mut input, 2, &spec(ports[1]));
+    let _ = events_for(&rx, Duration::from_millis(500));
+    drop(l1);
+    let retired = events_for(&rx, Duration::from_secs(1));
+    eprintln!("after the retired gen 1's peer went away: {retired:?}");
+    assert!(losses(&retired).is_empty(), "retired: {retired:?}");
+
+    input.abandon(2);
+    drop(l2);
+    let seen = events_until(&rx, LOSS_BUDGET, is_loss);
+    let held = BuildFacts {
+        handshake_completed: true,
+        carried_media: false,
+    };
+    assert_eq!(errors(&seen), vec![(2, held)], "given up, running: {seen:?}");
+
+    rebuild_past_the_handshake(&mut input, 3, &spec(ports[2]));
+    let _ = events_for(&rx, Duration::from_millis(500));
+    input.abandon(3);
+    input.stop();
+    drop(l3);
+    let stopped = events_for(&rx, Duration::from_secs(1));
+    eprintln!("after the stopped gen 3's peer went away: {stopped:?}");
+    assert!(losses(&stopped).is_empty(), "stopped: {stopped:?}");
+    assert_eq!(input.abandoned(), 3);
+    finish(input);
+}
+
+/// F-032's refused connect, a rotated passphrase: the listener's encryption refuses the caller's key
+/// in the handshake, so the error comes with no handshake and no byte, which is what keeps the
+/// domain's hold-end rule off a refusal.
+#[test]
+fn a_refused_passphrase_errors_with_no_handshake() {
+    let _s = serial();
+    let mut c = cfg(640, 360);
+    c.passphrase = Some("the-right-passphrase".to_owned());
+    let l = Listener::new(&c);
+    let (mut input, rx, _frames, _lines) = input(&P720);
+    let rotated = InputSpec {
+        passphrase: "a-rotated-passphrase".to_owned(),
+        ..spec(l.port)
+    };
+    let t0 = Instant::now();
+    input.rebuild(1, &rotated);
+    let seen = events_until(&rx, Duration::from_secs(8), is_loss);
+    eprintln!("refused after {:?}: {seen:?}", t0.elapsed());
+    assert_eq!(errors(&seen), vec![(1, BuildFacts::default())], "{seen:?}");
+    assert!(connects(&seen).is_empty() && frames_in(&seen) == 0);
     finish(input);
 }
 
@@ -2108,7 +2258,7 @@ fn one_generation_on_a_new_adapter(port: u16) -> usize {
     connect(&mut input, &rx, 1, &spec(port));
     let live = input_thread_ids().len();
     l.stop();
-    events_until(&rx, LOSS_BUDGET, |e| matches!(e, Event::InputLost { .. }));
+    events_until(&rx, LOSS_BUDGET, is_loss);
     finish(input);
     live
 }
@@ -2192,7 +2342,7 @@ fn the_generations_reuse_the_adapters_threads() {
         let l = Listener::start(port, &cfg(640, 360));
         connect(&mut input, &rx, gen, &spec(port));
         l.stop();
-        events_until(&rx, LOSS_BUDGET, |e| matches!(e, Event::InputLost { .. }));
+        events_until(&rx, LOSS_BUDGET, is_loss);
     }
     input.stop();
     finish(input);
@@ -2374,9 +2524,7 @@ fn a_malformed_url_is_a_loss_without_a_pipeline() {
             ..spec(9)
         };
         input.rebuild(gen, &s);
-        let seen = events_until(&rx, Duration::from_millis(200), |e| {
-            matches!(e, Event::InputLost { .. })
-        });
+        let seen = events_until(&rx, Duration::from_millis(200), is_loss);
         assert_eq!(losses(&seen), vec![(gen, LossReason::Error)]);
         checked += 1;
     }

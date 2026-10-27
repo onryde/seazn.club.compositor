@@ -7,7 +7,7 @@ use domain::config::{
     OutputProfile, Thresholds, OUTPUT_GAP_BUDGET_MS, OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS,
     TICK_WIDEST_MS,
 };
-use domain::input_link::{InputAction, InputLink, InputState, LossReason, KICK_HISTORY_CAP};
+use domain::input_link::{BuildFacts, InputAction, InputLink, InputState, LossReason, KICK_HISTORY_CAP};
 use domain::output_link::{Encoded, OutputLink, OutputState, SwapReason};
 use domain::time::Ms;
 
@@ -121,15 +121,19 @@ enum InputEvent {
     Tick,
     Connected,
     Lost(LossReason),
+    /// An input error shaped as Cloudflare's hold-end close (Owed 108: handshake, no media), a frame
+    /// stamp at 0, at an instant before `input_hold_end_after_ms` in every state: today's loss.
+    Error,
     Stall,
 }
 
-const INPUT_EVENTS: [InputEvent; 6] = [
+const INPUT_EVENTS: [InputEvent; 7] = [
     InputEvent::Tick,
     InputEvent::Connected,
     InputEvent::Lost(LossReason::Eos),
     InputEvent::Lost(LossReason::Error),
     InputEvent::Lost(LossReason::Stalled),
+    InputEvent::Error,
     InputEvent::Stall,
 ];
 
@@ -143,6 +147,15 @@ fn apply_input(l: &mut InputLink, e: InputEvent, now: Ms, gen: u64, t: &Threshol
         }
         InputEvent::Lost(r) => {
             l.on_lost(now, gen, r, t);
+            None
+        }
+        InputEvent::Error => {
+            assert!(now < t.input_hold_end_after_ms, "setup: before the gate");
+            let facts = BuildFacts {
+                handshake_completed: true,
+                carried_media: false,
+            };
+            l.on_error(now, gen, facts, Some(0), t);
             None
         }
         InputEvent::Stall => l.check_stall(now, None, t),
@@ -169,8 +182,9 @@ fn brief_input(from: Kind, e: InputEvent) -> (Kind, Asks, usize) {
         (K::Backoff, E::Tick) => (K::Connecting, A::Build, 0),
         (K::Connecting, E::Tick) => (K::Backoff, A::Abandon, 0), // the connect timed out
         (K::Connecting, E::Connected) => (K::Up, A::Nothing, 0),
-        (K::Connecting, E::Lost(_)) => (K::Backoff, A::Nothing, 0), // a failure, never a kick
+        (K::Connecting, E::Lost(_) | E::Error) => (K::Backoff, A::Nothing, 0), // never a kick
         (K::Up, E::Lost(r)) => (K::Backoff, A::Nothing, usize::from(r == LossReason::Eos)),
+        (K::Up, E::Error) => (K::Backoff, A::Nothing, 0),
         (K::Up, E::Stall) => (K::Backoff, A::Abandon, 0), // no frame for 5 s
         (k, _) => (k, A::Nothing, 0),                     // everything else changes nothing
     }
@@ -248,7 +262,7 @@ fn input_early_ticks_and_other_generations_change_nothing() {
         }
     }
     eprintln!("input no-ops checked: {checked}");
-    assert_eq!(checked, INPUT_KINDS.len() * (1 + 2 * 4));
+    assert_eq!(checked, INPUT_KINDS.len() * (1 + 2 * 5));
 }
 
 /// An output link in `kind` at sink generation 2 (1 torn down, 3 never built), one failure behind it

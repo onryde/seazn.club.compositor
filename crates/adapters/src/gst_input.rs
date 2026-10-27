@@ -16,10 +16,12 @@
 //! **Events**, each tagged with the generation of the pipeline that sent it: the first decoded video
 //! sample sends `InputConnected { gen }` (F-002: "connected" is the first decoded frame, never the
 //! handshake); every video sample replaces the frame store's camera slot and sends `InputFrame { gen }`; every
-//! audio sample goes into the frame store's 400 ms ring; a bus error sends `InputLost { gen, Error }`
-//! and the video branch's EOS `InputLost { gen, Eos }`, once a generation. `InputFrame` and
-//! `InputConnected` are tried, never waited for, so a full inbound channel can never hold the camera
-//! slot still: a dropped frame is counted, and `InputConnected` is tried again on the next sample.
+//! audio sample goes into the frame store's 400 ms ring; a bus error sends `InputError { gen, facts }`
+//! (Owed 108: the build's `BuildFacts`, below), a loss to the domain unless it reads Cloudflare's
+//! hold-end close in it, and the video branch's EOS `InputLost { gen, Eos }`, once a generation.
+//! `InputFrame` and `InputConnected` are tried, never waited for, so a full inbound channel can never
+//! hold the camera slot still: a dropped frame is counted, and `InputConnected` is tried again on the
+//! next sample.
 //!
 //! **Error or EOS is decided when the error is posted** (PR #30 review I1). On a peer close `srtsrc`
 //! posts an error and `basesrc` then pushes an EOS, which reaches the video appsink 1–7 ms later. The
@@ -44,8 +46,25 @@
 //! rules). The stall rule and the connect timeout are the domain's alone: it says it gave a
 //! generation up with `abandon(gen)`, and the gate closes for that build, video and audio alike, so a
 //! connection that starts delivering again before the rebuild a back-off later never puts the camera
-//! back on air. No event is sent (the domain decided it), and no rule of the domain's is read here:
+//! back on air. No loss is sent (the domain decided it), and no rule of the domain's is read here:
 //! however long a connection goes quiet, this adapter gives nothing up by itself.
+//!
+//! **Save its first error** (Owed 108, F-032; amends C10b and Owed 50). When the phone drops,
+//! Cloudflare holds its SRT broadcast about 30 s and then closes every attached reader with an error,
+//! and the build that error lands on is most often one the domain has given up and not yet rebuilt
+//! past. So the build last given up, while it still runs, reports its first pipeline error as
+//! `InputError` too: the domain reads the close in it (`InputLink::on_error`). Its frames, audio, EOS
+//! and later errors stay shut out, and the next `rebuild`, `stop` or the drop ends even that.
+//!
+//! **Build facts** (Owed 108). Each `InputError` carries what the build's SRT connection had shown:
+//! `handshake_completed`, polled on the build's thread every `BUS_WAIT_MS` until seen (`srtsrc`'s
+//! `stats` carry `rtt-ms` only once libsrt has connected the socket), and `carried_media`, set by a
+//! probe on the source's pad at its first buffer, decoded or not. A refused connect (a rotated
+//! passphrase, a deleted input) errors about 20 ms in with no handshake; Cloudflare's close finds one.
+//! The handshake is known only if a pass saw it before the error: once the socket is broken,
+//! `srt_bstats` refuses it, so the read at a socket error adds nothing, and a handshake completed in
+//! the last `BUS_WAIT_MS` before Cloudflare's close reads false. That fails safe: the domain keeps
+//! today's back-off for it.
 //!
 //! **Never blocks the caller.** Each build runs on one thread, which starts it, reads its bus and
 //! then tears it down: `srtsrc` resolves its host inside `set_state(PAUSED)`, and a hanging resolver
@@ -80,7 +99,7 @@ use std::time::Instant;
 use app::ports::{redacted_origin, Inbound, InputSource, InputSpec};
 use crossbeam_channel::Sender;
 use domain::config::Thresholds;
-use domain::input_link::LossReason;
+use domain::input_link::{BuildFacts, LossReason};
 use domain::supervisor::Event;
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -135,6 +154,9 @@ fn stderr_log() -> LogFn {
 struct Shared {
     /// The build whose samples and events may pass; `None` while no generation is live.
     gate: Mutex<Option<u64>>,
+    /// The build the domain last gave up (`abandon`) while it still runs: its first pipeline error is
+    /// still reported (Owed 108). Locked after `gate`, never before it.
+    given_up: Mutex<Option<u64>>,
     tx: Sender<Inbound>,
     frames: FrameStore,
     log: LogFn,
@@ -179,6 +201,63 @@ impl Shared {
         Some(self.frames.clear_audio())
     }
 
+    /// The domain gave `build` up (C10b): closes the gate as `close` does and, under the same lock,
+    /// marks the build given up, so its first pipeline error is still reported (Owed 108). An error
+    /// posted between the two can therefore not fall through: `error_of` takes both locks in the same
+    /// order. `Some(bytes flushed)` when this call closed it.
+    fn give_up(&self, build: u64) -> Option<usize> {
+        let mut open = locked(&self.gate);
+        if *open != Some(build) {
+            return None;
+        }
+        *open = None;
+        *locked(&self.given_up) = Some(build);
+        Some(self.frames.clear_audio())
+    }
+
+    /// No build passes and none is given up: the gate for a retire (`rebuild`, `stop`, the drop).
+    /// Clearing `given_up` here is belt and braces, and no test can kill it: a retired build's thread
+    /// sees `stop` and drops any error it pops, and the teardown follows, so a mark left behind
+    /// reports nothing; the next `give_up` overwrites it (the PR #98 review's m4).
+    fn shut(&self) {
+        let mut open = locked(&self.gate);
+        *open = None;
+        *locked(&self.given_up) = None;
+    }
+
+    /// What a pipeline error of `build` is, decided once, on the posting thread: the open build's
+    /// loss (the gate closes and its audio is flushed, as `close` does), or the first error of the
+    /// build the domain gave up while it still runs (Owed 108). A retired build's error, and any
+    /// later one, is nothing.
+    fn error_of(&self, build: u64) -> Option<ErrorOf> {
+        let mut open = locked(&self.gate);
+        if *open == Some(build) {
+            *open = None;
+            self.frames.clear_audio();
+            return Some(ErrorOf::Loss);
+        }
+        let mut given_up = locked(&self.given_up);
+        if *given_up == Some(build) {
+            *given_up = None;
+            return Some(ErrorOf::GivenUp);
+        }
+        None
+    }
+
+    /// `InputError { gen, facts }` for an error `error_of` decided (Owed 108). It waits for room, as
+    /// `report` does.
+    fn report_error(&self, gen: u64, of: ErrorOf, facts: BuildFacts) {
+        let what = match of {
+            ErrorOf::Loss => "lost (Error)",
+            ErrorOf::GivenUp => "an error after the abandon",
+        };
+        self.log(&format!(
+            "gen={gen}: {what}; handshake={} media={}",
+            facts.handshake_completed, facts.carried_media
+        ));
+        let _ = self.tx.send(Inbound::Event(Event::InputError { gen, facts }));
+    }
+
     /// `InputLost { gen, reason }` for a loss already decided. It waits for room: this runs on the
     /// pipeline's own threads, never the driver's.
     fn report(&self, gen: u64, reason: LossReason) {
@@ -192,6 +271,48 @@ impl Shared {
             self.report(gen, reason);
         }
     }
+}
+
+/// What a pipeline error is to this adapter, decided on the posting thread (Owed 108).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorOf {
+    /// The open build's: its loss.
+    Loss,
+    /// The first of the build the domain last gave up, while it still runs.
+    GivenUp,
+}
+
+/// What a build's SRT connection has shown so far (Owed 108). Each flag only ever turns true.
+#[derive(Debug, Default)]
+struct Seen {
+    /// libsrt has connected the socket (`srt_connected`), polled on the build's thread.
+    handshake: AtomicBool,
+    /// A buffer has left `srtsrc` (its pad's probe).
+    media: AtomicBool,
+}
+
+impl Seen {
+    fn facts(&self) -> BuildFacts {
+        BuildFacts {
+            handshake_completed: self.handshake.load(Ordering::SeqCst),
+            carried_media: self.media.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Polls `src`'s handshake until it is seen; after that it reads nothing.
+    fn poll_handshake(&self, src: Option<&gst::Element>) {
+        if !self.handshake.load(Ordering::SeqCst) && src.is_some_and(srt_connected) {
+            self.handshake.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The caller's SRT handshake has completed: `srt_bstats` answers only once libsrt has set the
+/// socket's `m_bConnected` (libsrt 1.5.3, `CUDT::bstats`), and `srtsrc`'s `stats` carry `rtt-ms`
+/// only when it answered (the reading PR #83's test hold used first; `tests/input.rs`).
+fn srt_connected(src: &gst::Element) -> bool {
+    src.property::<Option<gst::Structure>>("stats")
+        .is_some_and(|s| s.has_field("rtt-ms"))
 }
 
 /// The live `InputSource` (C10).
@@ -221,9 +342,12 @@ struct Live {
     pipeline: gst::Pipeline,
     /// Ends the build's thread: it then tears the pipeline down.
     stop: Arc<AtomicBool>,
-    /// Set by the bus's sync handler when an error decided this build's loss; the build's thread
-    /// sends the event.
-    errored: Arc<AtomicBool>,
+    /// Set by the bus's sync handler when an error is one this adapter reports (`Shared::error_of`):
+    /// the build's loss, or the first error after its abandon (Owed 108). The build's thread sends
+    /// the event.
+    errored: Arc<Mutex<Option<ErrorOf>>>,
+    /// The build's handshake and first byte (Owed 108), carried on its `InputError`.
+    seen: Arc<Seen>,
     /// The build's thread is running (false: it could not be spawned, and the pipeline never started).
     running: bool,
 }
@@ -237,6 +361,7 @@ impl GstInput {
         let input = Self {
             shared: Arc::new(Shared {
                 gate: Mutex::new(None),
+                given_up: Mutex::new(None),
                 tx,
                 frames,
                 log: stderr_log(),
@@ -465,7 +590,7 @@ impl GstInput {
 
     /// Closes the gate and tells the current build's thread to tear its pipeline down. Returns at once.
     fn retire_current(&mut self) {
-        *locked(&self.shared.gate) = None;
+        self.shared.shut();
         if let Some(live) = self.current.take() {
             if live.running {
                 // Counted before the flag is set: the build's thread counts down once it sees it.
@@ -483,6 +608,19 @@ impl GstInput {
         src.set_property("uri", Self::srt_uri(spec, self.latency_ms));
         // The domain owns reconnection (AGENTS.md §4): a lost peer is reported, never retried here.
         src.set_property("auto-reconnect", false);
+        // Owed 108: the build's first byte out of the source, decoded or not.
+        let seen = Arc::new(Seen::default());
+        let media = Arc::clone(&seen);
+        src.static_pad("src")
+            .ok_or("srtsrc has no src pad")?
+            .add_probe(
+                gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+                move |_, _| {
+                    media.media.store(true, Ordering::SeqCst);
+                    gst::PadProbeReturn::Remove
+                },
+            )
+            .ok_or("the source's byte probe was refused")?;
         let demux = make("tsdemux", "demux")?;
 
         let vqueue = leaky_queue("vqueue", VIDEO_QUEUE_NS)?;
@@ -560,7 +698,7 @@ impl GstInput {
         let abandoned_at = Arc::new(Mutex::new(None));
         self.wire_video(&vsink, build, gen, Arc::clone(&abandoned_at));
         self.wire_audio(&asink, build);
-        let errored = Arc::new(AtomicBool::new(false));
+        let errored = Arc::new(Mutex::new(None));
         self.sync_handler(&pipeline, build, &errored)?;
         Ok(Live {
             gen,
@@ -569,6 +707,7 @@ impl GstInput {
             pipeline,
             stop: Arc::new(AtomicBool::new(false)),
             errored,
+            seen,
             running: false,
         })
     }
@@ -688,12 +827,13 @@ impl GstInput {
     }
 
     /// Runs on the thread that posts each message, before it is queued: an error decides its build's
-    /// loss there and then (I1), ahead of the EOS `basesrc` pushes after it. Nothing slow runs here.
+    /// loss there and then (I1), ahead of the EOS `basesrc` pushes after it, or is the first error of
+    /// the build given up (Owed 108). Nothing slow runs here.
     fn sync_handler(
         &self,
         pipeline: &gst::Pipeline,
         build: u64,
-        errored: &Arc<AtomicBool>,
+        errored: &Arc<Mutex<Option<ErrorOf>>>,
     ) -> Result<(), String> {
         let bus = pipeline.bus().ok_or("input pipeline has no bus")?;
         let shared = Arc::clone(&self.shared);
@@ -701,8 +841,8 @@ impl GstInput {
         bus.set_sync_handler(move |_, msg| {
             match msg.view() {
                 gst::MessageView::Error(_) => {
-                    if shared.close(build).is_some() {
-                        errored.store(true, Ordering::SeqCst);
+                    if let Some(of) = shared.error_of(build) {
+                        *locked(&errored) = Some(of);
                     }
                 }
                 gst::MessageView::StreamStatus(st) => use_the_input_pool(st),
@@ -727,7 +867,8 @@ impl GstInput {
         let pipeline = live.pipeline.clone();
         let stop = Arc::clone(&live.stop);
         let errored = Arc::clone(&live.errored);
-        let started = BUILDS.run(move || run_build(&shared, &pipeline, &bus, &stop, &errored, gen));
+        let seen = Arc::clone(&live.seen);
+        let started = BUILDS.run(move || run_build(&shared, &pipeline, &bus, &stop, &errored, &seen, gen));
         match started {
             Ok(()) => live.running = true,
             Err(_) => self.lost_unstarted(gen, "no thread"),
@@ -753,18 +894,22 @@ impl GstInput {
 ///    the first read waits for PLAYING. A build retired by then never goes PLAYING, so a stopped
 ///    build never reaches the camera. A refused start is lost through
 ///    the error its element posts on the bus (measured: "Could not open resource" 20 ms in), the one
-///    road to `InputLost`, with the domain's connect timeout behind it.
+///    road to its loss, reported as `InputError` with no handshake (Owed 108), with the domain's
+///    connect timeout behind it.
 /// 2. The bus, until the build is retired: every error and warning text is logged after the
-///    scrubber, and the error that decided the build's loss (the sync handler) is reported.
+///    scrubber, and the error the sync handler kept (the build's loss, or the first after its
+///    abandon) is reported with the build's facts. The handshake is polled on each pass until seen.
 /// 3. The teardown, `set_state(NULL)`, counted in `teardowns_in_flight` until it returns.
 fn run_build(
     shared: &Arc<Shared>,
     pipeline: &gst::Pipeline,
     bus: &gst::Bus,
     stop: &AtomicBool,
-    errored: &AtomicBool,
+    errored: &Mutex<Option<ErrorOf>>,
+    seen: &Seen,
     gen: u64,
 ) {
+    let src = pipeline.by_name("src");
     match pipeline.set_state(gst::State::Paused) {
         Err(e) => shared.log(&format!("gen={gen}: did not start: {e}")),
         Ok(_) if stop.load(Ordering::SeqCst) => {}
@@ -775,6 +920,7 @@ fn run_build(
         }
     }
     while !stop.load(Ordering::SeqCst) {
+        seen.poll_handshake(src.as_ref());
         let Some(msg) = bus.timed_pop_filtered(
             gst::ClockTime::from_mseconds(BUS_WAIT_MS),
             &[gst::MessageType::Error, gst::MessageType::Warning],
@@ -791,8 +937,13 @@ fn run_build(
                     e.error(),
                     e.debug().as_deref().unwrap_or("")
                 ));
-                if errored.swap(false, Ordering::SeqCst) {
-                    shared.report(gen, LossReason::Error);
+                let kept = locked(errored).take();
+                if let Some(of) = kept {
+                    // Only a downstream element's error leaves the socket up, so only it can read a
+                    // handshake the last pass missed here; a socket error reads nothing new (the
+                    // module doc's "Build facts").
+                    seen.poll_handshake(src.as_ref());
+                    shared.report_error(gen, of, seen.facts());
                 }
             }
             gst::MessageView::Warning(w) => shared.log(&format!(
@@ -869,23 +1020,24 @@ impl InputSource for GstInput {
 
     /// The domain has given `gen` up (C10b): the gate closes for its build, video and audio alike,
     /// before this returns, and the build's audio still in the ring is flushed with it (m1), so none
-    /// of it goes on air; no event is sent (the domain decided it). The pipeline stays up, gated,
+    /// of it goes on air; no loss is sent (the domain decided it). The pipeline stays up, gated,
     /// until the next `rebuild` tears it down, and its first video sample after this is logged
-    /// (Owed 49). A `gen` that is not the current build's, a build this adapter already reported
-    /// lost, and a second call change nothing.
+    /// (Owed 49). Its first pipeline error until then is still reported, as `InputError` (Owed 108,
+    /// F-032: Cloudflare's hold-end close). A `gen` that is not the current build's, a build this
+    /// adapter already reported lost, and a second call change nothing.
     fn abandon(&mut self, gen: u64) {
         let Some(live) = self.current.as_ref().filter(|l| l.gen == gen) else {
             self.shared
                 .log(&format!("gen={gen}: abandon ignored: not the current build"));
             return;
         };
-        match self.shared.close(live.build) {
+        match self.shared.give_up(live.build) {
             Some(flushed) => {
                 *locked(&live.abandoned_at) = Some(Instant::now());
                 self.shared.abandoned.fetch_add(1, Ordering::SeqCst);
                 self.shared.log(&format!(
                     "gen={gen}: abandoned by the domain; {flushed} B of its audio flushed; nothing \
-                     more of it reaches the programme"
+                     more of it reaches the programme, save its first error (Owed 108)"
                 ));
             }
             None => self

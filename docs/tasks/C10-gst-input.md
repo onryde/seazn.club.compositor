@@ -154,6 +154,28 @@ while what it owns is hung (or stands in for hung) and the drop returns within 5
 - **`InputFrame { gen }`**: every frame carries its build's generation (the events table's
   `InputFrame` row), and the domain ignores one it does not take frames from.
 
+## Amendment 2026-10-27 (Owed 108 fix (a), F-032: Cloudflare's hold-end close)
+
+- **A bus error now sends `InputError { gen, facts }`**, not `InputLost { gen, Error }` (the events
+  table's `Bus Error` row): the open build's loss, as before, or the first error of the build the
+  domain last gave up while it still runs. `facts` is `BuildFacts { handshake_completed,
+  carried_media }`: the handshake polled on the build's thread every `BUS_WAIT_MS` until seen
+  (`srtsrc`'s `stats` carry `rtt-ms` only once libsrt has connected the socket), and the first buffer
+  out of `srtsrc` (a pad probe). `InputLost { gen, Error }` stays for a build that never ran (no bus,
+  no thread, a malformed URL, a build that could not be made); EOS is unchanged.
+- **The handshake is known only if a 50 ms pass saw it before the error.** A broken socket refuses
+  `srt_bstats`, so the read at a socket error adds nothing; a handshake completed in the last pass
+  before Cloudflare's close reads false and keeps today's back-off (fails safe; the PR #98 review's
+  m5).
+- **`abandon(gen)` sends no loss, save that first error** (it amends the 2026-10-20 amendment's
+  "sends no event"): Cloudflare's close lands on a given-up build, so without it the domain's
+  hold-end rule would be inert. The next `rebuild`, `stop` or the drop ends it.
+- Tests: `a_peer_close_reports_the_builds_facts_open_or_given_up` (silent and streaming listeners,
+  open and given up), `a_retired_or_stopped_build_reports_no_error`,
+  `a_refused_passphrase_errors_with_no_handshake`, and the facts asserted in
+  `a_source_that_never_answers_is_lost_as_an_error`, `a_start_srt_refuses_is_lost_as_an_error` and
+  `a_peer_close_is_an_error_even_when_the_log_is_slow`.
+
 ## Do not touch
 
 `gst_programme.rs`/`gst_output.rs` (report problems, don't change them), and other domain files.
