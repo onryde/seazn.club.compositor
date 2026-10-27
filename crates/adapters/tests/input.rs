@@ -600,6 +600,57 @@ fn the_harness_lets_a_start_go_only_past_its_handshake() {
     assert_eq!(verdicts, 3);
 }
 
+/// The generations of the `InputMedia` events (Owed 108 fix (b)).
+fn media(events: &[Event]) -> Vec<u64> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::InputMedia { gen } => Some(*gen),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Owed 108 fix (b): each build's first byte out of the source is one `InputMedia { gen }`, sent
+/// before its first decoded frame (`InputConnected`) and never again for that build. A build whose
+/// peer completes the handshake and sends no byte sends none (its pair). A build given up before its
+/// first byte sends none either: the gate, which `a_late_connect_is_dropped_and_a_fresh_generation_connects`
+/// pins, since it sees no event at all from such a build.
+#[test]
+fn each_builds_first_byte_is_one_input_media() {
+    let _s = serial();
+    let (mut input, rx, _frames, _lines) = input(&P720);
+    let streams = [Listener::new(&cfg(640, 360)), Listener::new(&cfg(640, 360))];
+    let mut checked = 0;
+    for (gen, l) in (1..).zip(&streams) {
+        let deadline = rebuild_past_the_handshake(&mut input, gen, &spec(l.port));
+        let seen = events_until(&rx, left(deadline), |e| *e == Event::InputConnected { gen });
+        let more = events_for(&rx, Duration::from_millis(500));
+        eprintln!(
+            "gen {gen}: media {:?} until connected, {:?} after",
+            media(&seen),
+            media(&more)
+        );
+        assert_eq!(media(&seen), vec![gen], "gen {gen}: {seen:?}");
+        let at = |want: &Event| seen.iter().position(|e| e == want);
+        assert!(
+            at(&Event::InputMedia { gen }) < at(&Event::InputConnected { gen }),
+            "gen {gen}: the byte before the frame: {seen:?}"
+        );
+        assert!(media(&more).is_empty(), "gen {gen}: once a build: {more:?}");
+        assert!(losses(&more).is_empty(), "gen {gen}: {more:?}");
+        checked += 1;
+    }
+    let port = free_port();
+    let _silent = Listener::silent(port);
+    rebuild_past_the_handshake(&mut input, 3, &spec(port));
+    let quiet = events_for(&rx, Duration::from_secs(1));
+    eprintln!("a silent peer: {quiet:?}; builds checked: {checked}");
+    assert!(media(&quiet).is_empty(), "no byte, no media: {quiet:?}");
+    assert_eq!(checked, 2);
+    finish(input);
+}
+
 /// Nothing listened at the caller's first handshake request, so its handshake rode libsrt's resend,
 /// which libsrt 1.5.3 sends every 250 ms with no answer (`queue.cpp`:1085-1089): its listener accepts
 /// no earlier than this after the rebuild. A listener already up answers the first request instead

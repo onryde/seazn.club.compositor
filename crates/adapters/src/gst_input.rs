@@ -19,9 +19,11 @@
 //! audio sample goes into the frame store's 400 ms ring; a bus error sends `InputError { gen, facts }`
 //! (Owed 108: the build's `BuildFacts`, below), a loss to the domain unless it reads Cloudflare's
 //! hold-end close in it, and the video branch's EOS `InputLost { gen, Eos }`, once a generation.
-//! `InputFrame` and `InputConnected` are tried, never waited for, so a full inbound channel can never
-//! hold the camera slot still: a dropped frame is counted, and `InputConnected` is tried again on the
-//! next sample.
+//! The build's first byte out of `srtsrc`, decoded or not, sends `InputMedia { gen }` (Owed 108 fix
+//! (b): the domain keeps a connect that carries bytes when web reports the phone live again).
+//! `InputFrame`, `InputConnected` and `InputMedia` are tried, never waited for, so a full inbound
+//! channel can never hold the camera slot still: a dropped frame is counted, and `InputConnected` and
+//! `InputMedia` are tried again on the next sample and the next buffer.
 //!
 //! **Error or EOS is decided when the error is posted** (PR #30 review I1). On a peer close `srtsrc`
 //! posts an error and `basesrc` then pushes an EOS, which reaches the video appsink 1–7 ms later. The
@@ -608,15 +610,27 @@ impl GstInput {
         src.set_property("uri", Self::srt_uri(spec, self.latency_ms));
         // The domain owns reconnection (AGENTS.md §4): a lost peer is reported, never retried here.
         src.set_property("auto-reconnect", false);
-        // Owed 108: the build's first byte out of the source, decoded or not.
+        // Owed 108: the build's first byte out of the source, decoded or not. While the build's gate
+        // is open it is also `InputMedia { gen }` (fix (b)), tried under the gate's lock as a frame is;
+        // the probe stays until one is delivered or the gate has shut.
         let seen = Arc::new(Seen::default());
         let media = Arc::clone(&seen);
+        let shared = Arc::clone(&self.shared);
         src.static_pad("src")
             .ok_or("srtsrc has no src pad")?
             .add_probe(
                 gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
                 move |_, _| {
                     media.media.store(true, Ordering::SeqCst);
+                    let open = locked(&shared.gate);
+                    if *open == Some(build)
+                        && shared
+                            .tx
+                            .try_send(Inbound::Event(Event::InputMedia { gen }))
+                            .is_err()
+                    {
+                        return gst::PadProbeReturn::Ok;
+                    }
                     gst::PadProbeReturn::Remove
                 },
             )
