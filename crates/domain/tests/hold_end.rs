@@ -103,21 +103,32 @@ impl Run {
     /// The drop, the close at `close` with `facts`, then `after`, through `until`. Returns the
     /// instant the close was sent.
     fn outage(&mut self, close: Ms, facts: BuildFacts, after: After, until: Ms) -> Ms {
-        let mut sent = None;
+        self.drive(LAST, &[(close, facts)], after, until)[0]
+    }
+
+    /// Gen 1 on air until `last`, then each of `errors` on the current generation at the first tick
+    /// at or after its instant, then `after` with the last one's facts, through `until`. Returns the
+    /// instants the errors were sent.
+    fn drive(&mut self, last: Ms, errors: &[(Ms, BuildFacts)], after: After, until: Ms) -> Vec<Ms> {
+        let mut sent = Vec::new();
         let mut errored = 0;
         while self.now <= until {
             let gen = self.s.input_generation();
-            if gen == 1 && self.now > 0 && self.now <= LAST {
+            if gen == 1 && self.now > 0 && self.now <= last {
                 self.send(Event::InputConnected { gen: 1 });
                 self.send(Event::InputFrame { gen: 1 });
             }
-            if sent.is_none() && self.now >= close {
-                self.send(Event::InputError { gen, facts });
-                sent = Some(self.now);
-                errored = gen;
+            if let Some(&(at, facts)) = errors.get(sent.len()) {
+                if self.now >= at {
+                    self.send(Event::InputError { gen, facts });
+                    sent.push(self.now);
+                    errored = gen;
+                }
             }
-            if let (Some(_), After::Errors, Some(&(at, g))) = (sent, after, self.builds.last()) {
+            let done = sent.len() == errors.len();
+            if let (true, After::Errors, Some(&(at, g))) = (done, after, self.builds.last()) {
                 if g > errored && self.now >= at + 100 {
+                    let facts = errors.last().expect("setup: an error").1;
                     self.send(Event::InputError { gen: g, facts });
                     errored = g;
                 }
@@ -125,7 +136,8 @@ impl Run {
             self.send(Event::Tick);
             self.now += self.step;
         }
-        sent.expect("setup: the close was sent")
+        assert_eq!(sent.len(), errors.len(), "setup: every error was sent");
+        sent
     }
 
     /// The builds at or after `from`.
@@ -292,6 +304,67 @@ fn a_refused_connect_and_a_session_never_on_camera_keep_todays_back_off() {
     }
     eprintln!("cases checked: {checked}");
     assert_eq!(checked, 3 * STEPS.len());
+}
+
+/// The gate runs from the camera's LAST frame (`Programme::last_frame_at`, which the supervisor hands
+/// the link), not from the boot or the first frame: here the camera was on air three gates before the
+/// drop, so either wrong anchor would put every error past the gate. F-032's errors before the close
+/// keep today's builds: the one at a new publisher's arrival, about 4 s after the last frame (on the
+/// build still Running), and one on the fresh build being connected, inside the gate. Neither spends
+/// the shot, so Cloudflare's close 29 s after the last frame still rebuilds a base wait later.
+#[test]
+fn the_gate_runs_from_the_last_frame_of_a_long_shot() {
+    let th = t();
+    let gate = th.input_hold_end_after_ms;
+    let last = 3 * gate;
+    let arrival = last + 4_000;
+    assert!(
+        arrival < last + th.input_stall_after_ms,
+        "setup: the arrival's error is on the build still Running"
+    );
+    // A base wait after the arrival's loss, the fresh build connects for a connect timeout.
+    let connecting = arrival + th.input_backoff_base_ms + th.input_connect_timeout_ms / 2;
+    let close = last + 29_000;
+    assert!(
+        connecting < last + gate && close >= last + gate && arrival > gate,
+        "setup: the early errors inside the gate, the close past it, all past one from boot"
+    );
+    let mut checked = 0;
+    for step in STEPS {
+        let until = close + th.input_backoff_cap_ms + th.input_connect_timeout_ms;
+        let (mut with, mut today) = (Run::booted(step), Run::booted(step));
+        let errors = |early| [(arrival, early), (connecting, early), (close, HELD)];
+        let sent = with.drive(last, &errors(HELD), After::TimesOut, until);
+        assert_eq!(today.drive(last, &errors(REFUSED), After::TimesOut, until), sent);
+        let before = |r: &Run| -> Vec<(Ms, u64)> {
+            r.builds.iter().copied().filter(|&(at, _)| at < sent[2]).collect()
+        };
+        assert!(
+            with.builds
+                .iter()
+                .any(|&(at, g)| at > sent[0] && at < sent[1] && g == 2),
+            "step {step}: setup: gen 2 is being connected at the second error: {:?}",
+            with.builds
+        );
+        assert_eq!(
+            before(&with),
+            before(&today),
+            "step {step}: the early errors are today's"
+        );
+        let gen_at_close = before(&with).len() as u64;
+        let want = first_tick(sent[2] + th.input_backoff_base_ms, step);
+        for (r, name) in [(&with, "handshaken early"), (&today, "refused early")] {
+            assert_eq!(
+                r.builds.iter().find(|&&(at, _)| at >= sent[2]),
+                Some(&(want, gen_at_close + 1)),
+                "step {step}, {name}: the close still rebuilds a base wait later: {:?}",
+                r.builds
+            );
+        }
+        checked += 1;
+    }
+    eprintln!("long-shot tick grids checked: {checked}");
+    assert_eq!(checked, STEPS.len());
 }
 
 /// The hold routes the error to the link (it ticks no link, so it builds nothing), and a second

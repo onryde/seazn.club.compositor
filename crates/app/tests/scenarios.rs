@@ -2203,6 +2203,75 @@ fn cloudflares_close_rebuilds_a_base_wait_later_through_the_driver() {
     assert_eq!(next.len(), 2, "pairs checked: {}", next.len());
 }
 
+/// Owed 108's gate runs from the camera's last frame through the real driver, not from the session
+/// or the first frame: the camera was on air three gates before the drop. F-032's errors before the
+/// close, at a new publisher's arrival 4 s after the last frame (the build still Running) and on the
+/// fresh build being connected, both inside the gate, keep today's builds whether they handshook or
+/// not; neither spends the shot, so the close 29 s after the last frame rebuilds a base wait later.
+#[test]
+fn the_gate_runs_from_the_last_frame_through_the_driver() {
+    let t = th();
+    let step = OutputProfile::P720.frame_period_ms().round() as u64;
+    let gate = t.input_hold_end_after_ms;
+    let held = BuildFacts {
+        handshake_completed: true,
+        carried_media: false,
+    };
+    let builds = |sim: &Sim| sim.log.count(|c| matches!(c, Call::InputRebuild(..))) as u64;
+    let mut runs = Vec::new();
+    for early in [held, BuildFacts::default()] {
+        let mut sim = Sim::new(t.clone(), session_720p());
+        let stop = SESSION_AT + 3 * gate;
+        let mut events = vec![(SESSION_AT + 1, ev(Event::InputConnected { gen: 1 }))];
+        events.extend(every(SESSION_AT + 1, stop, step, || frame(1)));
+        let last = events.last().expect("frames").0;
+        let arrival = last + 4_000;
+        let connecting = arrival + t.input_backoff_base_ms + t.input_connect_timeout_ms / 2;
+        let close = last + 29_000;
+        assert!(arrival < last + t.input_stall_after_ms && arrival - SESSION_AT > gate);
+        assert!(
+            connecting < last + gate && close >= last + gate,
+            "setup: the gate's two sides"
+        );
+        sim.drive(arrival, events);
+        assert_eq!(builds(&sim), 1, "setup: gen 1 on air at the arrival");
+        sim.drive(
+            arrival + 1,
+            vec![(arrival, ev(Event::InputError { gen: 1, facts: early }))],
+        );
+        sim.drive(connecting, vec![]);
+        assert_eq!(builds(&sim), 2, "setup: gen 2 is being connected");
+        let e = Event::InputError { gen: 2, facts: early };
+        sim.drive(connecting + 1, vec![(connecting, ev(e))]);
+        sim.drive(close, vec![]);
+        let gen = builds(&sim);
+        let before = sim.times_of(|c| matches!(c, Call::InputRebuild(..)));
+        sim.drive(
+            close + 1,
+            vec![(close, ev(Event::InputError { gen, facts: held }))],
+        );
+        let limit = close + t.input_connect_timeout_ms + t.input_backoff_cap_ms + 1_000;
+        let built = sim.tick_until(limit, rebuilt(gen + 1));
+        let want = sim.first_tick_at_or_after(close + t.input_backoff_base_ms);
+        eprintln!(
+            "long shot, early errors {early:?}: last frame {last}, builds {before:?}, the close on \
+             gen {gen} at {close}, gen {} built at {built} (the base wait's tick {want})",
+            gen + 1
+        );
+        assert_eq!(
+            built, want,
+            "{early:?}: the close still rebuilds a base wait later"
+        );
+        runs.push(before);
+    }
+    assert_eq!(
+        runs[0], runs[1],
+        "the early errors are today's, handshaken or not"
+    );
+    eprintln!("long-shot runs checked: {}", runs.len());
+    assert_eq!(runs.len(), 2);
+}
+
 /// The hold ticks no link: an input whose connect would time out on the tick after the end request
 /// is not abandoned through the hold. Its pair without the request is, on that tick.
 #[test]
