@@ -44,7 +44,7 @@
   "web_cookies_inert": ["seazn_org", "seazn_signed_in"],
   "scan_min_chars": 16,
   "harness_guest": {"test": {"cpus": 4, "memory_mb": 8192}, "real": {"cpus": 8, "memory_mb": 16384}},
-  "compositor_guest": {"performance-4x": {"cpus": 4, "memory_mb": 8192}, "performance-8x": {"cpus": 8, "memory_mb": 16384}},
+  "compositor_guest": {"performance-4x": {"cpus": 4, "memory_mb": 8192}, "performance-6x": {"cpus": 6, "memory_mb": 12288}, "performance-8x": {"cpus": 8, "memory_mb": 16384}},
   "legs": {
     "A": {"output": "720p", "template": "bar", "sport": "cricket"},
     "B": {"output": "720p", "template": "bug", "sport": "badminton"},
