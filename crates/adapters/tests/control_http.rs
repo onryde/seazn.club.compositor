@@ -6,8 +6,12 @@
 //! The fake is a raw `TcpListener`, not `tiny_http`: the error paths need a reply cut mid-body, a
 //! connection closed with no reply and a server that never answers, and `tiny_http` answers a dropped
 //! request with a 500.
-use adapters::control_http::{heartbeat_wire, parse_session, HttpControlPlane, PlaneConfigError};
-use app::ports::{ControlPlane, FetchError, HeartbeatError, Measured, FINAL_BEAT_TIMEOUT_MS};
+use adapters::control_http::{
+    heartbeat_wire, parse_reply, parse_session, HttpControlPlane, PlaneConfigError,
+};
+use app::ports::{
+    ControlPlane, FetchError, HeartbeatError, Measured, Reply as BeatReply, FINAL_BEAT_TIMEOUT_MS,
+};
 use domain::config::Thresholds;
 use domain::health::{BeatState, ExitDetail, ExitInfo, HealthReport};
 use domain::lifecycle::ExitReason;
@@ -37,6 +41,10 @@ fn fixture_text(name: &str) -> String {
 }
 fn fixture(name: &str) -> Value {
     serde_json::from_str(&fixture_text(name)).unwrap()
+}
+/// A reply with no phone-live counter, as web sends it before the session's phone was ever live.
+fn bare(desired: Desired) -> Result<BeatReply, HeartbeatError> {
+    Ok(BeatReply::from(desired))
 }
 /// The house envelope of a 200 (contract description; F-006): the fixtures are its `data`.
 fn ok(data: Value) -> String {
@@ -403,11 +411,33 @@ fn heartbeat_posts_to_heartbeat_path_and_reads_desired_state() {
         ..Measured::default()
     };
     let mut checked = 0;
-    for (reply, want) in [
-        ("reply-ending.json", Desired::Ending),
-        ("reply-live.json", Desired::Live),
-    ] {
-        let fake = serve(vec![Reply::Status(200, ok(fixture(reply)))]);
+    // Every reply vector (fixtures README, "Names"): `desiredState` is read as the fixture spells it,
+    // and its `phoneLiveEdge` (Owed 108 fix (b)) as the integer it carries, or as none when it carries
+    // none, a null, or a value the contract refuses (an `invalid-` vector): the beat still counts.
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/fixtures/relay-job.v1");
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("reply-"))
+        .collect();
+    names.sort();
+    for reply in &names {
+        let data = fixture(reply);
+        let desired = match data["desiredState"].as_str() {
+            Some("live") => Desired::Live,
+            Some("ending") => Desired::Ending,
+            other => panic!("{reply}: desiredState {other:?}"),
+        };
+        let edge = if reply.contains("-invalid-") {
+            None
+        } else {
+            data["phoneLiveEdge"].as_u64()
+        };
+        let want = BeatReply {
+            desired,
+            phone_live_edge: edge,
+        };
+        let fake = serve(vec![Reply::Status(200, ok(data))]);
         let h = periodic();
         assert_eq!(plane(&fake.url).heartbeat(&h, &m), Ok(want), "{reply}");
         let seen = fake.next();
@@ -427,7 +457,56 @@ fn heartbeat_posts_to_heartbeat_path_and_reads_desired_state() {
         assert!(errs.is_empty(), "web would refuse {posted}: {errs:?}");
         checked += 1;
     }
-    assert_eq!(checked, 2);
+    let edges = names
+        .iter()
+        .filter(|n| fixture(n)["phoneLiveEdge"].is_u64())
+        .count();
+    eprintln!("reply fixtures checked: {checked}, with a counter: {edges}");
+    assert!(checked >= 7 && edges >= 2, "anti-vacuity: {names:?}");
+}
+
+/// Owed 108 fix (b): `phoneLiveEdge` is read tolerantly. The contract admits an integer of at least 0
+/// (a number with no fraction, `5.0` included: JSON Schema's integer) or null; absent, null, a
+/// negative, a string, a fraction or a boolean reads as no counter, and the reply still reads its
+/// `desiredState`. A reply that is not a `heartbeatReply` stays refused whatever counter it carries.
+#[test]
+fn the_reply_reads_its_phone_live_counter_tolerantly() {
+    let cases: [(Option<Value>, Option<u64>); 9] = [
+        (None, None),
+        (Some(json!(null)), None),
+        (Some(json!(0)), Some(0)),
+        (Some(json!(5)), Some(5)),
+        (Some(json!(5.0)), Some(5)),
+        (Some(json!(-1)), None),
+        (Some(json!("3")), None),
+        (Some(json!(1.5)), None),
+        (Some(json!(true)), None),
+    ];
+    let mut checked = 0;
+    for (word, desired) in [("live", Desired::Live), ("ending", Desired::Ending)] {
+        for (edge, want) in &cases {
+            let mut data = json!({ "desiredState": word });
+            if let Some(e) = edge {
+                data["phoneLiveEdge"] = e.clone();
+            }
+            let got = parse_reply(&data);
+            let want = BeatReply {
+                desired,
+                phone_live_edge: *want,
+            };
+            assert_eq!(got, Some(want), "{data}");
+            checked += 1;
+        }
+    }
+    for data in [
+        json!({ "desiredState": "stop", "phoneLiveEdge": 3 }),
+        json!({ "phoneLiveEdge": 3 }),
+    ] {
+        assert_eq!(parse_reply(&data), None, "{data}");
+        checked += 1;
+    }
+    eprintln!("replies parsed: {checked}");
+    assert_eq!(checked, 2 * cases.len() + 2);
 }
 
 /// Wave gate 1 review I5 (Owed 29): only a 410 is `Gone`; a 401, a 404 and a 5xx stay transport
@@ -510,7 +589,7 @@ fn the_final_beat_under_a_410_is_gone() {
     assert!(matches!(got, Err(HeartbeatError::Transport(_))), "{got:?}");
     let fake = serve(vec![Reply::Status(200, ok(fixture("reply-ending.json")))]);
     let got = plane(&fake.url).heartbeat(&final_beat(ExitReason::Ended), &Measured::default());
-    assert_eq!(got, Ok(Desired::Ending));
+    assert_eq!(got, bare(Desired::Ending));
     eprintln!("final beats under a 410 checked: {checked}");
     assert_eq!(checked, 7, "the six of C06 and C11b's restart");
 }
@@ -906,7 +985,7 @@ fn the_sessions_credentials_are_scrubbed_by_value_from_the_final_beat_and_errors
         };
         assert_eq!(
             p.heartbeat(&beat, &Measured::default()),
-            Ok(Desired::Live),
+            bare(Desired::Live),
             "{form}"
         );
         let posted: Value = serde_json::from_str(&fake.next().body).unwrap();
@@ -968,7 +1047,7 @@ fn the_final_lane_scrubs_what_the_plane_learns_after_it_was_made() {
         };
         assert_eq!(
             lane.heartbeat(&beat, &Measured::default()),
-            Ok(Desired::Live),
+            bare(Desired::Live),
             "{value}"
         );
         let seen = fake.next();
@@ -1031,7 +1110,10 @@ fn every_call_opens_a_fresh_connection() {
     let mut p = plane(&url);
     let mut seen = Vec::new();
     for _ in 0..3 {
-        assert_eq!(p.heartbeat(&periodic(), &Measured::default()), Ok(Desired::Live));
+        assert_eq!(
+            p.heartbeat(&periodic(), &Measured::default()),
+            bare(Desired::Live)
+        );
         seen.push(conns.recv_timeout(SEEN_WAIT).expect("the fake saw the beat"));
     }
     assert_eq!(seen, vec![0, 1, 2], "one connection per call");

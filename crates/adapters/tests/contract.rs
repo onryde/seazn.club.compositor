@@ -1,6 +1,6 @@
 //! The vendored contract is the arbiter: our wire output must validate against it, and its fixtures
 //! must decode into our types. Expected values come from the vendored files, never from our code.
-use adapters::control_http::{heartbeat_wire, parse_session, programme_phase_wire};
+use adapters::control_http::{heartbeat_wire, parse_reply, parse_session, programme_phase_wire};
 use app::ports::{FetchError, Measured};
 use domain::cef_health::CefHealth;
 use domain::config::{OutputProfile, Thresholds};
@@ -831,6 +831,86 @@ fn every_session_fixture_gets_the_verdict_its_name_declares() {
         counts.get("refused").copied().unwrap_or(0) >= 4,
         "anti-vacuity: {counts:?}"
     );
+}
+
+/// The reply vectors' verdicts (Owed 108 fix (b)): the contract admits every plain `reply-` vector
+/// and refuses every `reply-invalid-` one, and the parser reads each one's `desiredState`, with the
+/// `phoneLiveEdge` the vector carries when the contract admits it, and none when it refuses it (a bad
+/// counter never costs the beat).
+#[test]
+fn every_reply_fixture_gets_the_verdict_its_name_declares() {
+    let v = schema_def("heartbeatReply");
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for e in std::fs::read_dir(fixtures_dir()).unwrap() {
+        let name = e.unwrap().file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix("reply-") else {
+            continue;
+        };
+        let data = fixture(&name);
+        let got = parse_reply(&data).unwrap_or_else(|| panic!("{name}: not read"));
+        assert_eq!(
+            Some(match got.desired {
+                Desired::Live => "live",
+                Desired::Ending => "ending",
+            }),
+            data["desiredState"].as_str(),
+            "{name}"
+        );
+        let verdict = if rest.starts_with("invalid-") {
+            assert!(
+                !violations(&v, &data).is_empty(),
+                "{name}: the contract admits it"
+            );
+            assert_eq!(got.phone_live_edge, None, "{name}");
+            "refused"
+        } else {
+            assert_eq!(violations(&v, &data), Vec::<String>::new(), "{name}");
+            assert_eq!(got.phone_live_edge, data["phoneLiveEdge"].as_u64(), "{name}");
+            if got.phone_live_edge.is_some() {
+                *counts.entry("with a counter").or_default() += 1;
+            }
+            "admitted"
+        };
+        *counts.entry(verdict).or_default() += 1;
+    }
+    eprintln!("reply fixtures checked: {counts:?}");
+    for (verdict, floor) in [("admitted", 5), ("refused", 2), ("with a counter", 2)] {
+        assert!(
+            counts.get(verdict).copied().unwrap_or(0) >= floor,
+            "anti-vacuity: {verdict}: {counts:?}"
+        );
+    }
+}
+
+/// The counter's bounds are the contract's (`heartbeatReply.phoneLiveEdge`'s integer branch): its
+/// `minimum` and `maximum` read as themselves, and one past either reads as no counter, as does a
+/// number past the maximum written with a fraction of zero.
+#[test]
+fn the_phone_live_counter_is_read_within_the_contracts_bounds() {
+    let branches = contract()["$defs"]["heartbeatReply"]["properties"]["phoneLiveEdge"]["anyOf"].clone();
+    let int = branches
+        .as_array()
+        .and_then(|a| a.iter().find(|b| b["type"] == "integer"))
+        .expect("an integer branch")
+        .clone();
+    let (min, max) = (int["minimum"].as_u64().unwrap(), int["maximum"].as_u64().unwrap());
+    let v = schema_def("heartbeatReply");
+    let mut checked = 0;
+    for (edge, want) in [
+        (json!(min), Some(min)),
+        (json!(max), Some(max)),
+        (json!(max + 1), None),
+        (json!(max as f64 * 2.0), None),
+        (json!(min as i64 - 1), None),
+    ] {
+        let data = json!({ "desiredState": "live", "phoneLiveEdge": edge });
+        assert_eq!(violations(&v, &data).is_empty(), want.is_some(), "{data}");
+        let got = parse_reply(&data).expect("the reply is read");
+        assert_eq!(got.phone_live_edge, want, "{data}");
+        checked += 1;
+    }
+    eprintln!("bounds checked: {checked}");
+    assert_eq!(checked, 5);
 }
 
 #[test]

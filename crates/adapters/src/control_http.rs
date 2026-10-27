@@ -7,8 +7,10 @@
 //!   `Refused`; a 200 that is JSON but not a composed session's envelope → `Refused(WrongMode)`;
 //!   anything else (a 5xx, any other status, a redirect, a body that did not arrive as JSON, a network
 //!   error, a timeout) → `Transient`, which the domain retries on its back-off.
-//! - the POST: 200 with a heartbeat reply → `Ok(Desired)`; **410 → `Gone`, on every beat, the final
-//!   one included**; everything else → `Transport`.
+//! - the POST: 200 with a heartbeat reply → `Ok(Reply)`, its `desiredState` and, when it carries a
+//!   value the contract admits, its `phoneLiveEdge` (Owed 108 fix (b); any other value reads as no
+//!   counter, never as a failed beat); **410 → `Gone`, on every beat, the final one included**;
+//!   everything else → `Transport`.
 //!
 //! **Secrets** (AGENTS.md §7). The job token goes into the `Authorization` header and nowhere else:
 //! never into a URL, an error or `Debug`. No error carries a response body (the session's body holds
@@ -20,7 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use app::ports::{
-    redacted_origin, ControlPlane, FetchError, HeartbeatError, InputSpec, Measured, SessionConfig,
+    redacted_origin, ControlPlane, FetchError, HeartbeatError, InputSpec, Measured, Reply, SessionConfig,
     TargetSpec, FINAL_BEAT_TIMEOUT_MS,
 };
 use domain::config::OutputProfile;
@@ -322,6 +324,38 @@ pub fn parse_session(v: &Value) -> Result<SessionConfig, FetchError> {
 }
 
 /// What a 200's body held.
+/// A heartbeat reply's `data` (the contract's `heartbeatReply`), or `None` when its `desiredState` is
+/// not one of the contract's words. Its `phoneLiveEdge` (Owed 108 fix (b)) is read tolerantly: only
+/// a value the contract admits is a counter, and anything else (absent, null, a negative, a string,
+/// a fraction) reads as none, so a bad counter never costs the beat.
+pub fn parse_reply(data: &Value) -> Option<Reply> {
+    let desired = match data.get("desiredState").and_then(Value::as_str) {
+        Some("live") => Desired::Live,
+        Some("ending") => Desired::Ending,
+        _ => return None,
+    };
+    Some(Reply {
+        desired,
+        phone_live_edge: data.get("phoneLiveEdge").and_then(live_edge),
+    })
+}
+
+/// The contract's integer in [0, 2^53 − 1]: JSON Schema's integer is a number whose fraction is
+/// zero, so `5.0` reads as 5, as web's validator would admit it.
+fn live_edge(v: &Value) -> Option<u64> {
+    let n = match v.as_u64() {
+        Some(n) => n,
+        None => {
+            let f = v.as_f64()?;
+            if f.fract() != 0.0 || !(0.0..=JSON_MAX_SAFE_INTEGER as f64).contains(&f) {
+                return None;
+            }
+            f as u64
+        }
+    };
+    (n <= JSON_MAX_SAFE_INTEGER).then_some(n)
+}
+
 enum Body {
     /// The `data` of the house envelope `{ "ok": true, "data": … }` (F-006).
     Data(Value),
@@ -548,7 +582,7 @@ impl ControlPlane for HttpControlPlane {
         Ok(session)
     }
 
-    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Desired, HeartbeatError> {
+    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Reply, HeartbeatError> {
         let mut req = self
             .agent
             .post(&self.heartbeat_url)
@@ -566,15 +600,11 @@ impl ControlPlane for HttpControlPlane {
             410 => return Err(HeartbeatError::Gone),
             other => return Err(self.transport(&format!("heartbeat refused: status {other}"))),
         }
-        let desired = match body_of(&body) {
-            Body::Data(d) => match d.get("desiredState").and_then(Value::as_str) {
-                Some("live") => Some(Desired::Live),
-                Some("ending") => Some(Desired::Ending),
-                _ => None,
-            },
+        let reply = match body_of(&body) {
+            Body::Data(d) => parse_reply(&d),
             Body::NotEnvelope | Body::NotJson => None,
         };
-        desired.ok_or_else(|| self.transport("heartbeat reply: not a heartbeatReply"))
+        reply.ok_or_else(|| self.transport("heartbeat reply: not a heartbeatReply"))
     }
 }
 

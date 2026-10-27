@@ -1,19 +1,20 @@
 //! `run()` (C08) on a wall clock: the real driver, the real control worker and a scripted plane. The
 //! final beat is posted before `run()` returns, on a full channel and on a fatal error, and the flush
 //! is bounded by `FINAL_BEAT_TIMEOUT_MS` (Owed 28). Every wait is bounded and FAILS rather than hang.
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use app::control_worker::spawn;
 use app::driver::Driver;
-use app::ports::{HeartbeatError, Inbound, Measured, SessionConfig, FINAL_BEAT_TIMEOUT_MS};
+use app::ports::{HeartbeatError, Inbound, Measured, Reply, SessionConfig, FINAL_BEAT_TIMEOUT_MS};
 use app::run::run;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use domain::cef_health::CefHealth;
 use domain::config::Thresholds;
 use domain::health::{ExitDetail, HealthReport};
+use domain::input_link::LossReason;
 use domain::lifecycle::ExitReason;
 use domain::supervisor::{Desired, Event, SignalKind};
 use testkit::fakes::{
@@ -466,4 +467,83 @@ fn the_final_beat_is_posted_with_the_inbound_channel_kept_full() {
         "posted before run() returned"
     );
     assert!(!rig.log.lines().contains(&unconfirmed()), "{:?}", rig.log.lines());
+}
+
+/// How long after `from` the driver first rebuilt input generation `gen`, polled; fails after `within`.
+fn rebuilt_after(log: &Log, gen: u64, from: Instant, within: Duration) -> Duration {
+    let built = |log: &Log| log.count(|c| matches!(c, Call::InputRebuild(g, _) if *g == gen)) > 0;
+    while !built(log) {
+        assert!(
+            from.elapsed() < within,
+            "input gen {gen} not rebuilt within {within:?}"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    from.elapsed()
+}
+
+/// Owed 108 fix (b) on the wall clock, the seam whole: the scripted plane answers every periodic
+/// beat with web's phone-live counter, the real control worker posts it, and the real driver hands it
+/// to the input link. Gen 1 is lost while connecting; a counter raised after its first value was
+/// read rebuilds gen 2 sooner than the base back-off, the least any back-off waits. Its pairs wait at
+/// least the base back-off out: a reply with no counter (today's) and a counter that never moves.
+#[test]
+fn a_raised_phone_live_counter_in_a_reply_rebuilds_the_camera_sooner() {
+    let base = Duration::from_millis(Thresholds::default().input_backoff_base_ms);
+    let mut checked = 0;
+    for (carried, raised) in [(false, false), (true, false), (true, true)] {
+        let counter = Arc::new(AtomicU64::new(0));
+        let read = Arc::clone(&counter);
+        let session = SessionConfig {
+            heartbeat_interval_ms: 50,
+            ..session_720p()
+        };
+        let (plane, plane_log) = ScriptedPlane::new(session);
+        let plane = plane.replies(move |_| {
+            let phone_live_edge = carried.then(|| read.load(Ordering::SeqCst));
+            let reply = Reply {
+                desired: Desired::Live,
+                phone_live_edge,
+            };
+            (Duration::ZERO, Ok(reply))
+        });
+        let rig = launch(plane, plane_log, None);
+        rebuilt_after(&rig.log, 1, rig.started, Duration::from_secs(5));
+        let answered = |c: &[PlaneCall]| count(c, |c| matches!(c, PlaneCall::Beat(h, _) if h.exit.is_none()));
+        assert!(
+            rig.plane.wait_for(Duration::from_secs(5), |c| answered(c) >= 2),
+            "setup: the first counter was read"
+        );
+        let lost = Instant::now();
+        send(
+            &rig,
+            Event::InputLost {
+                gen: 1,
+                reason: LossReason::Error,
+            },
+        );
+        if raised {
+            counter.store(1, Ordering::SeqCst);
+        }
+        let after = rebuilt_after(&rig.log, 2, lost, Duration::from_secs(15));
+        eprintln!("counter carried {carried}, raised {raised}: gen 2 built {after:?} after the loss");
+        if raised {
+            assert!(after < base, "the raised counter rebuilds sooner: {after:?}");
+        } else {
+            assert!(after >= base, "no edge: today's back-off, {after:?}");
+        }
+        send(
+            &rig,
+            Event::Fatal {
+                detail: Some(ExitDetail::new("x")),
+            },
+        );
+        assert_eq!(
+            finished(&rig, Duration::from_secs(5)).code,
+            ExitReason::Fatal.code()
+        );
+        checked += 1;
+    }
+    eprintln!("replies checked: {checked}");
+    assert_eq!(checked, 3);
 }

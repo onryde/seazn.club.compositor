@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use adapters::redact::Scrubber;
 use app::ports::{
-    ControlPlane, FetchError, GraphicsRenderer, HeartbeatError, LogSink, Measured, ProgrammeOutput,
+    ControlPlane, FetchError, GraphicsRenderer, HeartbeatError, LogSink, Measured, ProgrammeOutput, Reply,
     SessionConfig, TargetSpec,
 };
 use domain::cef_health::CefHealth;
@@ -27,7 +27,6 @@ use domain::config::OutputProfile;
 use domain::health::HealthReport;
 use domain::ladder::Rung;
 use domain::programme::FrameChoice;
-use domain::supervisor::Desired;
 use time::OffsetDateTime;
 
 use crate::clock::Clock;
@@ -279,7 +278,7 @@ impl ControlPlane for LoggedPlane {
         r
     }
 
-    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Desired, HeartbeatError> {
+    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Reply, HeartbeatError> {
         let r = self.inner.heartbeat(report, measured);
         if report.exit.is_some() {
             match &r {
