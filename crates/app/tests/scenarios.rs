@@ -7,7 +7,7 @@ use app::driver::Driver;
 use app::ports::{ControlRequest, Inbound, Measured, MemorySplit, Metrics, ProcStatus, SessionConfig};
 use domain::config::{OutputProfile, Thresholds, OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS};
 use domain::health::{ExitDetail, GraphicsStatus, HealthReport, LinkStatus};
-use domain::input_link::LossReason;
+use domain::input_link::{BuildFacts, LossReason};
 use domain::ladder::Rung;
 use domain::lifecycle::ExitReason;
 use domain::output_link::Encoded;
@@ -2156,6 +2156,51 @@ fn a_reported_loss_is_never_abandoned_through_the_driver() {
     }
     eprintln!("reported losses checked: {checked}");
     assert_eq!(checked, 3);
+}
+
+/// Owed 108 (F-032), through the real driver: Cloudflare's hold-end close, an error on the build
+/// the domain gave up (the handshake completed, no byte), 29 s after the last frame, rebuilds on the
+/// first tick at or after a base back-off from it, and the driver abandons nothing for it (the
+/// adapter decided it). Its pair, the same error with no handshake (a refused connect), keeps
+/// today's back-off: a later build.
+#[test]
+fn cloudflares_close_rebuilds_a_base_wait_later_through_the_driver() {
+    let t = th();
+    let step = OutputProfile::P720.frame_period_ms().round() as u64;
+    let mut next = Vec::new();
+    for handshake in [true, false] {
+        let mut sim = Sim::new(t.clone(), session_720p());
+        let stop = SESSION_AT + 1_900;
+        let mut events = vec![(SESSION_AT + 1, ev(Event::InputConnected { gen: 1 }))];
+        events.extend(every(SESSION_AT + 1, stop, step, || frame(1)));
+        let last = events.last().expect("frames").0;
+        let close = last + 29_000;
+        sim.drive(close, events);
+        let gen = sim.log.count(|c| matches!(c, Call::InputRebuild(..))) as u64;
+        let abandoned_before = abandons(&sim.log).len();
+        assert!(gen > 1, "setup: rebuilt through the outage");
+        let facts = BuildFacts {
+            handshake_completed: handshake,
+            carried_media: false,
+        };
+        sim.drive(close + 1, vec![(close, ev(Event::InputError { gen, facts }))]);
+        let limit = close + t.input_connect_timeout_ms + t.input_backoff_cap_ms + 1_000;
+        let built = sim.tick_until(limit, rebuilt(gen + 1));
+        let want = sim.first_tick_at_or_after(close + t.input_backoff_base_ms);
+        eprintln!(
+            "close (handshake {handshake}) on gen {gen} at {close}: gen {} built at {built}; the \
+             base wait ends on the tick at {want}",
+            gen + 1
+        );
+        if handshake {
+            assert_eq!(built, want, "the close rebuilds a base wait later");
+            assert_eq!(abandons(&sim.log).len(), abandoned_before, "no abandon for it");
+        } else {
+            assert!(built > want, "a refused connect waits today's back-off out");
+        }
+        next.push(built);
+    }
+    assert_eq!(next.len(), 2, "pairs checked: {}", next.len());
 }
 
 /// The hold ticks no link: an input whose connect would time out on the tick after the end request
