@@ -95,12 +95,12 @@ permissions: { contents: read }
 concurrency:
   # One soak at a time: the cleanup destroys every Machine in the app, and a second run's would be
   # among them.
-  group: soak
+  group: soak-spike-medium6x
   cancel-in-progress: false
 defaults:
   run: { shell: bash }
 env:
-  FLY_APP: seazn-relay-soak
+  FLY_APP: seazn-relay-spike
   FLY_REGION: lhr
   # flyctl, pinned with its release checksum (superfly/flyctl v0.4.116, flyctl_0.4.116_checksums.txt).
   FLYCTL_VERSION: 0.4.116
@@ -125,7 +125,7 @@ jobs:
       - name: The Fly token
         id: gate
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SPIKE }}
         run: |
           if [ -z "$FLY_API_TOKEN" ]; then
             echo "::warning::FLY_API_TOKEN_SOAK unset — soak skipped"
@@ -454,7 +454,7 @@ jobs:
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - name: Push to Fly's registry
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SPIKE }}
         run: |
           flyctl auth docker
           harness="harness $SOAK_IMAGE"
@@ -515,7 +515,7 @@ jobs:
       - name: Launch the Machines
         id: launch
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SPIKE }}
         run: |
           umask 077
           s=harness/soak/soak.json
@@ -636,7 +636,7 @@ jobs:
       - name: Watch the run
         id: watch
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SPIKE }}
           HID: ${{ steps.launch.outputs.harness }}
           CID: ${{ steps.launch.outputs.compositor }}
         run: |
@@ -678,7 +678,7 @@ jobs:
       - name: Fetch the outputs
         if: always() && steps.launch.outputs.harness != ''
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SPIKE }}
           HID: ${{ steps.launch.outputs.harness }}
         run: |
           OUT="$RUNNER_TEMP/out"
@@ -711,7 +711,7 @@ jobs:
         env:
           # Scanned for too: a cost leg's leg.sh runs flyctl with it beside files that are kept
           # (cost-leg.log, cost-samples.err). Never in argv: a mode-600 pattern file (printf is a builtin).
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SPIKE }}
         run: |
           OUT="$RUNNER_TEMP/out"
           n="$(find "$OUT" -type f | wc -l)"
@@ -811,7 +811,7 @@ jobs:
         id: destroy
         if: always()
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SOAK }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_SPIKE }}
         run: |
           [ ! -f "$RUNNER_TEMP/stream.pid" ] || kill -- "-$(cat "$RUNNER_TEMP/stream.pid")" 2> /dev/null || true
           [ ! -f "$RUNNER_TEMP/leg.pid" ] || kill -- "-$(cat "$RUNNER_TEMP/leg.pid")" 2> /dev/null || true
