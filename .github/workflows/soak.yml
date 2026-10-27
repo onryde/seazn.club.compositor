@@ -95,12 +95,12 @@ permissions: { contents: read }
 concurrency:
   # One soak at a time: the cleanup destroys every Machine in the app, and a second run's would be
   # among them.
-  group: soak
+  group: soak-spike-6x
   cancel-in-progress: false
 defaults:
   run: { shell: bash }
 env:
-  FLY_APP: seazn-relay-soak
+  FLY_APP: seazn-relay-spike
   FLY_REGION: lhr
   # flyctl, pinned with its release checksum (superfly/flyctl v0.4.116, flyctl_0.4.116_checksums.txt).
   FLYCTL_VERSION: 0.4.116
