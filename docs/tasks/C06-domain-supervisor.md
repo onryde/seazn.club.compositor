@@ -1352,6 +1352,18 @@ C11b (PR #34; `docs/tasks/C11b-cef-health.md`, "As built") adds to this aggregat
   clears the input's live flag on `InputLost` and `InputError` alike; `Thresholds`' `distinct()`
   gains `input_hold_end_after_ms`.
 
+## Amendment 2026-10-27 (Owed 108 fix (b), F-032: `Event::PhoneLiveEdge`, `Event::InputMedia`)
+
+- **`Event::PhoneLiveEdge { count }`**: web's phone-live edge counter, posted by C08 after a periodic
+  reply that carries one. **`Event::InputMedia { gen }`**: C10's report of a build's first byte.
+  The Running and Holding arms hand them to `InputLink::on_phone_live_edge` and `on_media` (C04's
+  amendment of this date); Draining and Booting ignore them. The hold ticks no link, so a nudge
+  latched in it acts on nothing.
+- **The tick** runs the stall check, then `check_nudge`, then `on_tick`: a nudge's `Abandon` comes
+  before the rebuild it makes due.
+- Tests: the matrix's two kinds (31 kinds, 217 pairs); the properties' kinds 20 and 21 (a current
+  generation's media, a rising counter).
+
 ## Do not touch
 
 Earlier modules' public APIs. A change needed there is a deviation: report it, don't make it silently.

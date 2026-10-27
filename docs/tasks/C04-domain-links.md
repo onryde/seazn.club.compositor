@@ -716,6 +716,27 @@ won once, by about 1 ms. rtmp2 counts bytes only when a whole message is written
   the drop, 4 more tick grids); `tests/links.rs`'s input column gains `InputEvent::Error` (21 pairs,
   33 no-ops).
 
+## Amendment 2026-10-27 (Owed 108 fix (b), F-032: the phone is live again)
+
+- **`InputLink::on_phone_live_edge(count)`**: web's phone-live edge counter from a heartbeat reply.
+  The first value the link sees is a baseline (a boot and an in-place restart act on nothing); each
+  later increase latches ONE nudge, however far the value rose; a lower value latches nothing and
+  becomes the value the next one is read against.
+- **`InputLink::on_media(gen)`**: the current generation's first byte out of its source. Every build
+  clears it.
+- **`InputLink::check_nudge(now, t)`**, on each tick before `on_tick`, and `back_off` at the link's
+  next failure: the latched nudge makes the build due now with the attempt count reset (the state of a
+  first failure), never later than a build already due. In Backoff the tick builds it. Connecting
+  with no byte yet, the connect is given up (`Abandon`) and rebuilt now, once an outage (re-armed
+  when a generation reaches Running, armed from the start). Running, or a connect carrying bytes, or
+  the outage's discard spent, it stays latched and acts at the stall, the loss or the connect timeout.
+  The nudge clears when it acts or when a generation reaches Running. A nudge and fix (a)'s close in
+  one outage build once.
+- **No 1 s wait.** The nudge builds now, as F-032's replay's `nudge` policy does; fix (a)'s close
+  keeps its base wait.
+- Tests: `tests/phone_live.rs` (4 tick grids, 12 cases, waits from `backoff::delay`);
+  `tests/links.rs`'s input column gains `InputEvent::Media` (24 pairs, 39 no-ops).
+
 ## Do not touch
 
 `config.rs` values, `programme.rs`. (Amended 2026-10-19: Owed 38's ruling adds

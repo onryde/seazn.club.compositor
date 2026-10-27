@@ -705,6 +705,12 @@ The implementer's choices, inside the brief. None is an owner ruling; each mediu
   `Event::InputError { gen, facts }` while the build runs (Cloudflare's hold-end close). The driver
   forwards it as any event. Scenarios: `cloudflares_close_rebuilds_a_base_wait_later_through_the_driver`,
   and `the_gate_runs_from_the_last_frame_through_the_driver` (the gate's anchor, the PR #98 review's I1).
+- *Amended 2026-10-27 (Owed 108 fix (b), F-032):* a periodic heartbeat's reply that carries web's
+  phone-live counter posts `Event::HeartbeatReply(desired)` and then `Event::PhoneLiveEdge { count }`,
+  every time (the domain tells an edge from a repeat); a final beat's reply posts its reply alone.
+  `ScriptedPlane::replies` answers a whole `Reply`. Tests:
+  `a_periodic_reply_with_a_phone_live_counter_posts_the_edge_after_it` and, on the wall clock through
+  the real worker and driver, `a_raised_phone_live_counter_in_a_reply_rebuilds_the_camera_sooner`.
 
 ## Amendment 2026-10-24 (Owed 86: the honest beat)
 
