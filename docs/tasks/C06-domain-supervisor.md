@@ -1341,6 +1341,17 @@ C11b (PR #34; `docs/tasks/C11b-cef-health.md`, "As built") adds to this aggregat
   properties: an abandon names the last build once, on a tick, and P5 forbids it after Final, and the
   oracle models which generation's frames count (an uncounted frame leaves the supervisor as it was).
 
+## Amendment 2026-10-27 (Owed 108 fix (a), F-032: `Event::InputError`)
+
+- **`Event::InputError { gen, facts: BuildFacts }`**: the adapter's report of a pipeline error, the
+  current build's or the first one of the last build given up (C10's amendment of this date). The
+  Running and Holding arms hand it to `InputLink::on_error` with the programme's last frame (C04's
+  amendment of this date); `InputLost { gen, reason }` stays for EOS and a build that never ran.
+  No `Effect::AbandonInput` follows it: the adapter decided it.
+- Tests: the matrix's `InputError` kind (29 kinds, 203 pairs); the properties' kind 19, whose oracle
+  clears the input's live flag on `InputLost` and `InputError` alike; `Thresholds`' `distinct()`
+  gains `input_hold_end_after_ms`.
+
 ## Do not touch
 
 Earlier modules' public APIs. A change needed there is a deviation: report it, don't make it silently.

@@ -697,6 +697,23 @@ won once, by about 1 ms. rtmp2 counts bytes only when a whole message is written
   Connected. (Amended 2026-10-25: while the encoders starve; with both delivering, Owed 94's backstop
   swaps it.)
 
+## Amendment 2026-10-27 (Owed 108 fix (a), F-032: Cloudflare's hold-end close)
+
+- **`InputLink::on_error(now, gen, facts, last_frame_at, t)`**: an error on the current build, or the
+  first one on the last build the link gave up while it still runs. `facts` is `BuildFacts {
+  handshake_completed, carried_media }`, read by the adapter off the build itself.
+- **The rule.** Between builds (Connecting or Backoff), an error on a build whose handshake completed
+  and that never carried media, at least `Thresholds::input_hold_end_after_ms` (20 000) after the last
+  frame, is Cloudflare's hold-end close: the link backs off a base wait with the attempt count reset,
+  and never later than a build already due. Bound: once an outage (`hold_end_armed`, spent by the
+  rebuild), re-armed only when a generation reaches Running, disarmed until the link's first Running.
+  Any other error is `on_lost(Error)`, unchanged: a loss while Running or Connecting, nothing in
+  Backoff.
+- Tests: the inline ones under "Owed 108 fix (a)" (each guard has a case where only it decides);
+  `tests/hold_end.rs` (4 tick grids, 12 cases; a phone that never returns costs a constant 1 to 2
+  extra connects when connects time out and 2 to 3 when they error, over 3 362 horizons, derived from
+  `backoff::delay`); `tests/links.rs`'s input column gains `InputEvent::Error` (21 pairs, 33 no-ops).
+
 ## Do not touch
 
 `config.rs` values, `programme.rs`. (Amended 2026-10-19: Owed 38's ruling adds
