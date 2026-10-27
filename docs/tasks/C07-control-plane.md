@@ -560,7 +560,9 @@ superseded by the minimum's mutants.
   JSON Schema's integer) is a counter; absent, null, a negative, a string, a fraction or a boolean
   reads as none, and the beat still counts. A reply with no `desiredState` word stays a transport
   error, whatever counter it carries.
-- The contract is re-vendored at web `694f7abc6` (seazn.club PR #1040), sha256 `284756740ddb…`.
+- The contract is re-vendored at web ~~`694f7abc6`~~ `228a3b7057`, #1040's merge on web main (amended
+  2026-10-27: the bytes are unchanged, so only `VENDORED.json`'s commit moved) (seazn.club PR #1040),
+  sha256 `284756740ddb…`.
 - Tests: `the_reply_reads_its_phone_live_counter_tolerantly`, every reply fixture through the HTTP
   fake (`heartbeat_posts_to_heartbeat_path_and_reads_desired_state`), and in `tests/contract.rs`
   `every_reply_fixture_gets_the_verdict_its_name_declares` and

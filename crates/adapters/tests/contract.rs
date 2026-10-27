@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 
 /// `docs/_INDEX.md` Owed 24: web's own pin of `docs/contracts/relay-job.v1.json`, copied from
 /// `seazn.club` `apps/web/src/server/api-v1/__tests__/relay-contract.test.ts` (`SHA256`, at
-/// 694f7abc6 on `feat/relay-phone-live-edge`, web PR #1040: the reply's `phoneLiveEdge`, Owed 108
-/// fix (b); before it dec7b95d9, the `restart` exit word, Owed 66). A contract bump moves web's
+/// 228a3b7057 on web main, web PR #1040's merge: the reply's `phoneLiveEdge`, Owed 108 fix (b), the
+/// same bytes as its branch's 694f7abc6; before it dec7b95d9, the `restart` exit word, Owed 66). A contract bump moves web's
 /// constant and this one together; a vendored file that hashes otherwise drifted from the contract
 /// web enforces.
 const WEB_PINNED_CONTRACT_SHA256: &str = "284756740ddb7ecf984d5858b19cacb98b3677100e6a69f34bbea4d0c91f97e3";
