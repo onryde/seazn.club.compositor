@@ -24,13 +24,15 @@ const CASES: u32 = 512;
 const END_CASES: u32 = 2_048;
 
 fn steps() -> impl Strategy<Value = Vec<(Ms, u8)>> {
-    // dt 0..300 ms; kind 0..=19, ticks (0..=4) and camera frames (5..=9) dominant
-    prop::collection::vec((0u64..300, 0u8..=19), 1..600)
+    // dt 0..300 ms; kind 0..=21, ticks (0..=4) and camera frames (5..=9) dominant
+    prop::collection::vec((0u64..300, 0u8..=21), 1..600)
 }
 
-/// The harness's own facts, carried across a stream: the output's growing bytes-sent total.
+/// The harness's own facts, carried across a stream: the output's growing bytes-sent total, and web's
+/// phone-live edge counter (Owed 108 fix (b)), one higher at each reply that carries it.
 struct Harness {
     sent: u64,
+    edges: u64,
 }
 
 fn event_for(kind: u8, s: &Supervisor, h: &mut Harness) -> Event {
@@ -86,6 +88,15 @@ fn event_for(kind: u8, s: &Supervisor, h: &mut Harness) -> Event {
                 carried_media: false,
             },
         },
+        // Owed 108 fix (b): the current build's first byte, and web's phone-live counter rising by
+        // one at each draw (the first a baseline), so a stream nudges a link in every state.
+        20 => Event::InputMedia {
+            gen: s.input_generation(),
+        },
+        21 => {
+            h.edges += 1;
+            Event::PhoneLiveEdge { count: h.edges }
+        }
         _ => Event::OutputError {
             gen: s.output_generation(),
         },
@@ -126,7 +137,7 @@ fn programme_and_generation_properties_hold_on_random_streams() {
         .run(&steps(), |steps| {
             checked.set(checked.get() + 1);
             let mut s = booted(&t, Ms::MAX / 2);
-            let mut h = Harness { sent: 0 };
+            let mut h = Harness { sent: 0, edges: 0 };
             let mut now: Ms = 0;
             let mut frames: Vec<Ms> = Vec::new();
             let mut last_rebuild = 0u64;

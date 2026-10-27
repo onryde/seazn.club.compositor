@@ -34,6 +34,24 @@
 //!   back is not left waiting out the 8 or 10 s step. Bound: once an outage, re-armed only when a
 //!   generation reaches Running, and disarmed until the link's first Running. Any other error is
 //!   today's `on_lost(Error)`: a loss while Running or Connecting, nothing in Backoff.
+//! - **The phone is live again (Owed 108 fix (b), F-032).** Web counts each time the session's phone
+//!   comes back live after an outage (`phoneLiveEdge`, in a heartbeat's reply: the only way web can
+//!   reach the relay) and the supervisor hands each value read to `on_phone_live_edge`. The first value
+//!   the link sees is a baseline, never an edge, so a boot and an in-place restart act on nothing; each
+//!   later increase latches ONE nudge, however much the value rose. The nudge acts on the next tick
+//!   (`check_nudge`) or at the link's next failure (`back_off`), and either way the build is due at
+//!   once with the attempt count reset, as after a first failure, never later than a build already
+//!   due:
+//!   - **Backoff:** the build is due now.
+//!   - **Running:** nothing. A camera still delivering is never torn down (a web outage raises every
+//!     live session's counter at once); the nudge stays latched and acts at the stall or the loss.
+//!   - **Connecting with no media yet** (`on_media`: no byte has left the build's source): the connect
+//!     is given up (`Abandon`) and built again now, once an outage (re-armed when a generation reaches
+//!     Running): a reader attached to Cloudflare's held broadcast gets no bytes. A connect already
+//!     carrying bytes, or one after the outage's discard, is kept, and the nudge acts at its connect
+//!     timeout or its loss.
+//!
+//!   The nudge is cleared when it acts, or when a generation reaches Running.
 use crate::backoff::delay;
 use crate::config::Thresholds;
 use crate::time::{elapsed, Ms};
@@ -92,6 +110,17 @@ pub struct InputLink {
     /// The hold-end rebuild's one shot an outage (Owed 108): set when a generation reaches Running,
     /// spent by the rebuild. False until the link's first Running.
     hold_end_armed: bool,
+    /// Web's phone-live edge counter as last read (Owed 108 fix (b)): `None` until a reply carries
+    /// one, so the first value is a baseline.
+    phone_live_edge: Option<u64>,
+    /// A nudge latched by an increase of that counter and not acted on yet.
+    nudged: bool,
+    /// The nudge's one discard of a connect an outage: spent by the discard, re-armed when a
+    /// generation reaches Running. Armed from the start: web's counter says the phone is back whether
+    /// or not this process has had a camera yet (an in-place restart has not).
+    discard_armed: bool,
+    /// The current generation's first byte has left its source (`on_media`). False at each build.
+    media: bool,
 }
 
 impl Default for InputLink {
@@ -108,6 +137,10 @@ impl InputLink {
             generation: 0,
             kicks: Window::new(KICK_HISTORY_CAP),
             hold_end_armed: false,
+            phone_live_edge: None,
+            nudged: false,
+            discard_armed: true,
+            media: false,
         }
     }
 
@@ -136,6 +169,57 @@ impl InputLink {
         if gen == self.generation && matches!(self.state, InputState::Connecting { .. }) {
             self.state = InputState::Running { since: now };
             self.hold_end_armed = true;
+            // Owed 108 fix (b): the camera is back, so a nudge not yet acted on has nothing left to
+            // do, and the next outage gets its own discard.
+            self.nudged = false;
+            self.discard_armed = true;
+        }
+    }
+
+    /// The current generation's first byte out of its source (Owed 108 fix (b)), decoded or not: a
+    /// nudge then keeps the connect instead of discarding it. Another generation's changes nothing.
+    /// One that comes after the link gave its generation up needs no guard: the flag is read only
+    /// while Connecting, and every build clears it.
+    pub fn on_media(&mut self, gen: u64) {
+        if gen == self.generation {
+            self.media = true;
+        }
+    }
+
+    /// Web's phone-live edge counter from a heartbeat reply (Owed 108 fix (b)). The first value is a
+    /// baseline; a value above the last one read latches one nudge (`check_nudge`). A value at or
+    /// below it latches nothing: web's counter never goes down, so a lower one is not an edge, and
+    /// it becomes the value the next one is read against.
+    pub fn on_phone_live_edge(&mut self, count: u64) {
+        if self.phone_live_edge.is_some_and(|seen| count > seen) {
+            self.nudged = true;
+        }
+        self.phone_live_edge = Some(count);
+    }
+
+    /// The latched nudge, on a tick (Owed 108 fix (b)), before `on_tick`: in Backoff the build is due
+    /// now, its count reset, so the tick builds it; Connecting with no media and the outage's discard
+    /// armed, the connect is given up (`Abandon`) and its rebuild is due now. Running, or a connect
+    /// with media, or the discard spent, it stays latched for `back_off`: the stall, the loss or the
+    /// connect timeout.
+    pub fn check_nudge(&mut self, now: Ms, t: &Thresholds) -> Option<InputAction> {
+        if !self.nudged {
+            return None;
+        }
+        match self.state {
+            // Due now, so never later than the build it replaces: one due sooner is due by now too,
+            // and this tick's `on_tick` builds either.
+            InputState::Backoff { .. } => {
+                self.back_off(now, 0, t);
+                None
+            }
+            InputState::Connecting { .. } if !self.media && self.discard_armed => {
+                self.discard_armed = false;
+                let gen = self.generation;
+                self.back_off(now, 0, t);
+                Some(InputAction::Abandon { gen })
+            }
+            InputState::Connecting { .. } | InputState::Running { .. } => None,
         }
     }
 
@@ -226,6 +310,7 @@ impl InputLink {
             InputState::Backoff { attempt, until } if now >= until => {
                 self.generation += 1;
                 self.state = InputState::Connecting { attempt, since: now };
+                self.media = false;
                 Some(InputAction::Rebuild { gen: self.generation })
             }
             InputState::Connecting { attempt, since }
@@ -248,9 +333,17 @@ impl InputLink {
     }
 
     /// Failure number `failed_before + 1` waits `delay(failed_before)`. Both additions saturate: the
-    /// clock is a u64 (time.rs), and "retried forever" has no last attempt.
+    /// clock is a u64 (time.rs), and "retried forever" has no last attempt. A latched nudge (Owed 108
+    /// fix (b)) acts here and is spent: the count starts again as after a first failure, and the build
+    /// is due now.
     fn back_off(&mut self, now: Ms, failed_before: u32, t: &Thresholds) {
-        let wait = delay(failed_before, t.input_backoff_base_ms, t.input_backoff_cap_ms);
+        let (failed_before, wait) = if self.nudged {
+            self.nudged = false;
+            (0, 0)
+        } else {
+            let wait = delay(failed_before, t.input_backoff_base_ms, t.input_backoff_cap_ms);
+            (failed_before, wait)
+        };
         self.state = InputState::Backoff {
             attempt: failed_before.saturating_add(1),
             until: now.saturating_add(wait),

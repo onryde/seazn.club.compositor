@@ -124,16 +124,20 @@ enum InputEvent {
     /// An input error shaped as Cloudflare's hold-end close (Owed 108: handshake, no media), a frame
     /// stamp at 0, at an instant before `input_hold_end_after_ms` in every state: today's loss.
     Error,
+    /// The build's first byte (Owed 108 fix (b)): it moves no state and asks for nothing, and only the
+    /// current generation's counts (the no-op sweep below holds it to that).
+    Media,
     Stall,
 }
 
-const INPUT_EVENTS: [InputEvent; 7] = [
+const INPUT_EVENTS: [InputEvent; 8] = [
     InputEvent::Tick,
     InputEvent::Connected,
     InputEvent::Lost(LossReason::Eos),
     InputEvent::Lost(LossReason::Error),
     InputEvent::Lost(LossReason::Stalled),
     InputEvent::Error,
+    InputEvent::Media,
     InputEvent::Stall,
 ];
 
@@ -156,6 +160,10 @@ fn apply_input(l: &mut InputLink, e: InputEvent, now: Ms, gen: u64, t: &Threshol
                 carried_media: false,
             };
             l.on_error(now, gen, facts, Some(0), t);
+            None
+        }
+        InputEvent::Media => {
+            l.on_media(gen);
             None
         }
         InputEvent::Stall => l.check_stall(now, None, t),
@@ -262,7 +270,7 @@ fn input_early_ticks_and_other_generations_change_nothing() {
         }
     }
     eprintln!("input no-ops checked: {checked}");
-    assert_eq!(checked, INPUT_KINDS.len() * (1 + 2 * 5));
+    assert_eq!(checked, INPUT_KINDS.len() * (1 + 2 * 6));
 }
 
 /// An output link in `kind` at sink generation 2 (1 torn down, 3 never built), one failure behind it

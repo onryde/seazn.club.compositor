@@ -136,6 +136,18 @@ pub enum Event {
         gen: u64,
         facts: BuildFacts,
     },
+    /// The first byte out of input generation `gen`'s source, decoded or not (Owed 108 fix (b); C10
+    /// sends it once a build): a phone-live nudge keeps a connect that has had one
+    /// (`InputLink::on_media`).
+    InputMedia {
+        gen: u64,
+    },
+    /// Web's phone-live edge counter, read from a heartbeat's reply that carries one (`phoneLiveEdge`,
+    /// Owed 108 fix (b); C08 sends it after that reply's `HeartbeatReply`). The input link reads the
+    /// first value as a baseline and each increase as one nudge (`InputLink::on_phone_live_edge`).
+    PhoneLiveEdge {
+        count: u64,
+    },
     /// The current sink's bytes-sent total, counted from 0 for each sink (C09: rtmp2sink
     /// `out-bytes-total`). It replaces the brief's `OutputConnected` and `OutputAck`: F-005 found CF
     /// Input B sends no RTMP acknowledgements, and C04's `OutputLink` reads bytes sent (Owed 13).
@@ -192,11 +204,11 @@ pub enum Effect {
     RebuildInput {
         gen: u64,
     },
-    /// The domain gave input generation `gen` up by its own rule, the connect timeout or the stall
-    /// rule (C10b, Owed 50): the adapter shuts that generation out (`InputSource::abandon`), save its
-    /// first pipeline error, which still comes as `Event::InputError` while the build runs (Owed 108).
-    /// Pushed once a generation, on the Running tick that decided it; a loss the adapter reported
-    /// owes none.
+    /// The domain gave input generation `gen` up by its own rule, the connect timeout, the stall rule
+    /// or a phone-live nudge's discard of a connect with no media (C10b, Owed 50, Owed 108 fix (b)):
+    /// the adapter shuts that generation out (`InputSource::abandon`), save its first pipeline error,
+    /// which still comes as `Event::InputError` while the build runs (Owed 108). Pushed once a
+    /// generation, on the Running tick that decided it; a loss the adapter reported owes none.
     AbandonInput {
         gen: u64,
     },
@@ -508,10 +520,13 @@ impl Supervisor {
                     self.start_hold(now, ExitReason::Deadline);
                     return self.holding(Event::Tick, now, now, ExitReason::Deadline, fx);
                 }
-                // A stall gives the generation up before the tick that may rebuild it (C10b).
+                // A stall gives the generation up before the tick that may rebuild it (C10b), and so
+                // does a phone-live nudge's discard (Owed 108 fix (b)): either way the rebuild a nudge
+                // makes due now comes on this same tick.
                 let stall = self.input.check_stall(now, self.programme.last_frame_at(), &t);
+                let nudge = self.input.check_nudge(now, &t);
                 let tick = self.input.on_tick(now, &t);
-                fx.extend(stall.into_iter().chain(tick).map(input_effect));
+                fx.extend(stall.into_iter().chain(nudge).chain(tick).map(input_effect));
                 if self.output.on_tick(now, &t) {
                     fx.push(Effect::SwapSink {
                         gen: self.output.generation(),
@@ -542,6 +557,8 @@ impl Supervisor {
             Event::InputConnected { gen } => self.input.on_connected(now, gen),
             Event::InputLost { gen, reason } => self.input.on_lost(now, gen, reason, &t),
             Event::InputError { gen, facts } => self.on_input_error(now, gen, facts),
+            Event::InputMedia { gen } => self.input.on_media(gen),
+            Event::PhoneLiveEdge { count } => self.input.on_phone_live_edge(count),
             Event::OutputProgress {
                 gen,
                 total_bytes,
@@ -606,6 +623,9 @@ impl Supervisor {
             Event::InputConnected { gen } => self.input.on_connected(now, gen),
             Event::InputLost { gen, reason: r } => self.input.on_lost(now, gen, r, &t),
             Event::InputError { gen, facts } => self.on_input_error(now, gen, facts),
+            Event::InputMedia { gen } => self.input.on_media(gen),
+            // The hold ticks no link (C06), so a nudge latched here acts on nothing.
+            Event::PhoneLiveEdge { count } => self.input.on_phone_live_edge(count),
             Event::OutputProgress {
                 gen,
                 total_bytes,
