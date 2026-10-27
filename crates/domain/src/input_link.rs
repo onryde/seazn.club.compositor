@@ -97,6 +97,22 @@ pub enum InputAction {
     Abandon { gen: u64 },
 }
 
+/// What the driver's log reads of the phone-live nudge (Owed 108 fix (b), the PR #99 review's m1): a
+/// copy of the link's own fields, taken before and after each decision. No rule reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NudgeView {
+    pub state: InputState,
+    pub generation: u64,
+    /// Web's counter as last read; `None` until a reply carried one.
+    pub counter: Option<u64>,
+    /// A nudge is latched and has not acted yet.
+    pub latched: bool,
+    /// The outage's one discard of a connect with no byte is not spent yet.
+    pub discard_armed: bool,
+    /// The current generation's first byte has left its source.
+    pub media: bool,
+}
+
 /// Kick history bound: the window never holds more than this many stamps (AGENTS.md §4, nothing
 /// unbounded). C04 brief default. It must exceed `kick_alert_count`, or a kick storm could never read
 /// as more than the alert count (pinned by `the_kick_history_bound_leaves_room_for_the_alert`).
@@ -151,6 +167,18 @@ impl InputLink {
     /// The number of builds so far, and the generation an adapter event must carry to count.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// The phone-live nudge's fields as they stand, for the log (`NudgeView`).
+    pub fn nudge_view(&self) -> NudgeView {
+        NudgeView {
+            state: self.state,
+            generation: self.generation,
+            counter: self.phone_live_edge,
+            latched: self.nudged,
+            discard_armed: self.discard_armed,
+            media: self.media,
+        }
     }
 
     /// Whether a frame of generation `gen` counts (C10b): it is the current generation, and the link

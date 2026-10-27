@@ -52,6 +52,19 @@
 //!   zygote_gone=<gen|-> leaked_teardowns=<n> gpu_process_deaths=<n>`). Never after `Exit`. A reload
 //!   (Owed 96; owner ruling 2026-10-25 "A") writes `cef reload gen=<g> reason=gpu_process_death
 //!   deaths=<n>` before the port's restart: `g` the generation it builds, `n` the process's count.
+//! - **Web's phone-live counter** (Owed 108 fix (b); the PR #99 review's m1, so a live run can time
+//!   the reply and the nudge from the relay's own lines). Read off the input link before and after
+//!   each decision (`Supervisor::input_nudge`), never decided here: `phone live edge from=<old> to=<new>
+//!   nudge=<n>` when the counter the link holds changes (`from=-`: the process's first value, a
+//!   baseline), where `n` is what the link's nudge is after it: `latched` (this value latched one),
+//!   `already` (one was waiting) or `none`. A repeat changes nothing and writes nothing, however many
+//!   replies carry it. A latched nudge then writes one of: `phone live nudge rebuild gen=<g>
+//!   discarded=<d>` just before the rebuild it made due (`d` the connect it gave up, or `-`); `phone
+//!   live nudge held gen=<g> input=<backoff|connecting|running> media=<bool> discard=<armed|spent>`
+//!   once, when the first tick after the latch leaves it waiting (the link's facts at that tick), and
+//!   then the rebuild line when it acts; or `phone live nudge cleared gen=<g>` when generation `g`
+//!   reaches Running before it acts. Each line is once a change or once a latch, so none repeats on a
+//!   beat. Integers and words only.
 //! - **After `Exit`** nothing reaches a port from `step` or `tick_due`. `run()`'s flush follows, and
 //!   logs `final beat not confirmed within 2000 ms` when it times out.
 use std::time::Duration;
@@ -60,6 +73,7 @@ use domain::cef_health::CefHealth;
 use domain::config::Thresholds;
 use domain::graphics::HideReason;
 use domain::health::ExitDetail;
+use domain::input_link::{InputState, NudgeView};
 use domain::lifecycle::{ExitReason, Lifecycle};
 use domain::output_link::SwapReason;
 use domain::programme::ProgrammePhase;
@@ -101,6 +115,13 @@ impl Grid {
     fn first_not_due(&self, now: u64) -> u64 {
         now.saturating_sub(self.origin).saturating_mul(self.rate) / 1_000 + 1
     }
+}
+
+/// A phone-live nudge the link spent, whose build is still to come (Owed 108 fix (b)): the next
+/// `RebuildInput` is its build. `discarded` is the connect it gave up, if it gave one up.
+#[derive(Debug, Clone, Copy)]
+struct SpentNudge {
+    discarded: Option<u64>,
 }
 
 /// A counter's log line: the total last logged, and when.
@@ -154,6 +175,10 @@ pub struct Driver {
     input_gen: Option<u64>,
     /// When the last memory split line was written.
     memory_at: Option<u64>,
+    /// A spent phone-live nudge whose rebuild line is still to write.
+    nudge_spent: Option<SpentNudge>,
+    /// A nudge latched since the last tick: the next tick says whether it waits.
+    nudge_unchecked: bool,
     exited: bool,
 }
 
@@ -179,6 +204,8 @@ impl Driver {
             cef: CefHealth::default(),
             input_gen: None,
             memory_at: None,
+            nudge_spent: None,
+            nudge_unchecked: false,
             exited: false,
         }
     }
@@ -222,6 +249,7 @@ impl Driver {
             if let Some(code) = self.apply(d, now) {
                 return Some(code);
             }
+            self.nudge_held();
             if let Some(choice) = frame {
                 self.ports.programme.push(index, choice);
             }
@@ -312,7 +340,9 @@ impl Driver {
     }
 
     fn apply(&mut self, d: Decision, now: u64) -> Option<i32> {
+        let before = self.supervisor.input_nudge();
         self.supervisor = d.next;
+        self.phone_live(before, self.supervisor.input_nudge());
         let phase = self.supervisor.programme_phase();
         if phase != self.phase {
             self.phase = phase;
@@ -345,6 +375,12 @@ impl Driver {
                     return self.no_session(now);
                 };
                 self.input_gen = Some(gen);
+                if let Some(spent) = self.nudge_spent.take() {
+                    let discarded = spent.discarded.map_or_else(|| "-".to_owned(), |g| g.to_string());
+                    p.log.info(&format!(
+                        "phone live nudge rebuild gen={gen} discarded={discarded}"
+                    ));
+                }
                 p.input.rebuild(gen, &cfg.input);
             }
             // The domain gave the generation up (C10b): the adapter shuts it out. No session needed.
@@ -464,6 +500,57 @@ impl Driver {
         None
     }
 
+    /// The phone-live lines one decision owes (the module doc), from the link's nudge before and after
+    /// it. The rebuild line waits for its `RebuildInput`.
+    fn phone_live(&mut self, before: NudgeView, after: NudgeView) {
+        if let (true, Some(to)) = (after.counter != before.counter, after.counter) {
+            let from = before.counter.map_or_else(|| "-".to_owned(), |n| n.to_string());
+            let nudge = match (before.latched, after.latched) {
+                (_, false) => "none",
+                (false, true) => "latched",
+                (true, true) => "already",
+            };
+            self.ports
+                .log
+                .info(&format!("phone live edge from={from} to={to} nudge={nudge}"));
+        }
+        match (before.latched, after.latched) {
+            (false, true) => self.nudge_unchecked = true,
+            // A nudge spent or cleared before the next tick leaves the flag set: `nudge_held` reads the
+            // link's own latch, so that tick writes nothing (the PR #100 review's m1: one guard, not two).
+            (true, false) => {
+                if matches!(after.state, InputState::Running { .. }) {
+                    let line = format!("phone live nudge cleared gen={}", after.generation);
+                    self.ports.log.info(&line);
+                } else {
+                    let discarded =
+                        (before.discard_armed && !after.discard_armed).then_some(before.generation);
+                    self.nudge_spent = Some(SpentNudge { discarded });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// After a tick: a nudge latched since the last tick that this tick left waiting writes its
+    /// `held` line, once a latch.
+    fn nudge_held(&mut self) {
+        if !std::mem::take(&mut self.nudge_unchecked) {
+            return;
+        }
+        let v = self.supervisor.input_nudge();
+        if v.latched {
+            let line = format!(
+                "phone live nudge held gen={} input={} media={} discard={}",
+                v.generation,
+                input_word(v.state),
+                v.media,
+                if v.discard_armed { "armed" } else { "spent" }
+            );
+            self.ports.log.info(&line);
+        }
+    }
+
     /// A wiring effect with no session to wire from (an inbound `BootstrapOk`): a fatal error.
     fn no_session(&mut self, now: u64) -> Option<i32> {
         let detail = Some(ExitDetail::new(NO_SESSION));
@@ -520,6 +607,14 @@ fn swap_name(r: SwapReason) -> &'static str {
         SwapReason::Error => "error",
         SwapReason::ConnectTimeout => "connect_timeout",
         SwapReason::EgressStalled => "egress_stalled",
+    }
+}
+
+fn input_word(s: InputState) -> &'static str {
+    match s {
+        InputState::Backoff { .. } => "backoff",
+        InputState::Connecting { .. } => "connecting",
+        InputState::Running { .. } => "running",
     }
 }
 
