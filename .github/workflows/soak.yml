@@ -80,7 +80,7 @@ on:
       guest:
         description: "The compositor Machine's guest (soak.json compositor_guest; production's is performance-4x)"
         type: choice
-        options: [performance-4x, performance-8x]
+        options: [performance-4x, performance-6x, performance-8x]
         default: performance-4x
       schedule:
         description: "soak (dropouts and disconnects, schedule.jq's soak_plan), dropouts (the memory experiment: camera dropouts every 125 s, no disconnect) or none (its control: nothing in the drive)"
