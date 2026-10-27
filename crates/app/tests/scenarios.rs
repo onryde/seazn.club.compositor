@@ -2536,3 +2536,256 @@ fn a_driver_stalled_past_the_backstop_reads_its_queued_readings_before_it_ticks(
     );
     assert_eq!(after.last().map(|h| h.output), Some(LinkStatus::Connected));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Owed 108 fix (b), the PR #99 review's m1: the phone-live lines
+// ---------------------------------------------------------------------------------------------
+
+fn edge(count: u64) -> Inbound {
+    ev(Event::PhoneLiveEdge { count })
+}
+
+fn phone_lines(log: &Log) -> Vec<String> {
+    lines_starting(log, "phone live ")
+}
+
+/// `count` every 50 ms from `from` while before `to`: web's counter as each periodic reply carries it
+/// (C08 posts an `Event::PhoneLiveEdge` for every reply that carries one, a repeat included).
+fn replies(from: u64, to: u64, count: u64) -> Vec<(u64, Inbound)> {
+    every(from, to, 50, move || edge(count))
+}
+
+/// The call right after the line `text`: the line is written just before it.
+fn call_after_line(log: &Log, text: &str) -> Call {
+    let calls = log.calls();
+    let i = calls
+        .iter()
+        .position(|c| *c == Call::Log(text.to_owned()))
+        .unwrap_or_else(|| panic!("no line {text:?}"));
+    calls.get(i + 1).cloned().expect("a call after the line")
+}
+
+/// The m1 lines, through the real driver: web's counter is logged once a change with its old and new
+/// value and what the link's nudge is after it (the first value, `from=-`, latches none; a rise
+/// latches one; a rise or a fall while one waits finds it `already` there), never on a repeat however
+/// many replies carry it; a nudge latched while the camera runs is held, said once, and acts at the
+/// stall, where its rebuild's line comes just before the rebuild.
+#[test]
+fn the_phone_live_counter_is_logged_once_a_change_and_never_on_a_repeat() {
+    let t = th();
+    let mut sim = Sim::new(t.clone(), session_720p());
+    let step = OutputProfile::P720.frame_period_ms().round() as u64;
+    let stop = SESSION_AT + 3_000;
+    let mut events = vec![(SESSION_AT + 1, ev(Event::InputConnected { gen: 1 }))];
+    events.extend(every(SESSION_AT + 1, stop, step, || frame(1)));
+    let last = events.last().expect("frames").0;
+    let mut sent = replies(SESSION_AT + 10, SESSION_AT + 800, 0);
+    sent.extend(replies(SESSION_AT + 800, SESSION_AT + 1_500, 2));
+    sent.extend(replies(SESSION_AT + 1_500, SESSION_AT + 2_000, 5));
+    sent.extend(replies(SESSION_AT + 2_000, stop, 1));
+    let edges = sent.len();
+    events.extend(sent);
+    sim.drive(stop, events);
+    let r2 = sim.tick_until(stop + t.input_stall_after_ms + t.input_backoff_cap_ms, rebuilt(2));
+    let lines = phone_lines(&sim.log);
+    eprintln!("edges sent {edges}, 4 values; lines {}: {lines:?}", lines.len());
+    assert!(edges > 4 * 2, "setup: every value repeated");
+    assert_eq!(
+        lines,
+        [
+            "phone live edge from=- to=0 nudge=none",
+            "phone live edge from=0 to=2 nudge=latched",
+            "phone live nudge held gen=1 input=running media=false discard=armed",
+            "phone live edge from=2 to=5 nudge=already",
+            "phone live edge from=5 to=1 nudge=already",
+            "phone live nudge rebuild gen=2 discarded=-",
+        ]
+    );
+    // The held nudge acts at the stall: gen 2 is built on the stall's own tick, no back-off waited.
+    assert_eq!(r2, sim.first_tick_at_or_after(last + t.input_stall_after_ms));
+    assert!(matches!(
+        call_after_line(&sim.log, "phone live nudge rebuild gen=2 discarded=-"),
+        Call::InputRebuild(2, _)
+    ));
+}
+
+/// A nudge in Backoff, through the real driver: its line comes just before the rebuild it makes due,
+/// once, on the first tick after the reply that raised the counter, a base back-off sooner.
+#[test]
+fn a_nudge_in_backoff_logs_its_rebuild_once_just_before_it() {
+    let t = th();
+    let mut sim = Sim::new(t.clone(), session_720p());
+    let step = OutputProfile::P720.frame_period_ms().round() as u64;
+    let lose = SESSION_AT + 1_000;
+    let mut events = vec![(SESSION_AT + 1, ev(Event::InputConnected { gen: 1 }))];
+    events.extend(every(SESSION_AT + 1, lose, step, || frame(1)));
+    events.extend(replies(SESSION_AT + 10, lose + 100, 0));
+    events.push((
+        lose,
+        ev(Event::InputLost {
+            gen: 1,
+            reason: LossReason::Error,
+        }),
+    ));
+    events.extend(replies(lose + 100, lose + 600, 1));
+    sim.drive(lose + 600, events);
+    let lines = phone_lines(&sim.log);
+    eprintln!("lines {}: {lines:?}", lines.len());
+    assert_eq!(
+        lines,
+        [
+            "phone live edge from=- to=0 nudge=none",
+            "phone live edge from=0 to=1 nudge=latched",
+            "phone live nudge rebuild gen=2 discarded=-",
+        ]
+    );
+    // An event at a tick's instant arrives after that tick (`Sim::drive`), so the nudge acts on the
+    // first tick past it.
+    assert_eq!(
+        sim.times_of(rebuilt(2)),
+        vec![sim.first_tick_at_or_after(lose + 100 + 1)]
+    );
+    assert!(
+        100 < t.input_backoff_base_ms,
+        "setup: the edge lands inside today's back-off"
+    );
+    assert!(matches!(
+        call_after_line(&sim.log, "phone live nudge rebuild gen=2 discarded=-"),
+        Call::InputRebuild(2, _)
+    ));
+}
+
+/// A nudge on a connect with no byte yet, through the real driver, over two outages: the first
+/// discards it, and its line names the discarded generation between that abandon and the rebuild; a
+/// second edge in the same outage finds the discard spent, is held (said once), and acts at the
+/// connect's timeout; the next outage, after a Running, gets its own discard and its own line.
+#[test]
+fn a_nudge_on_a_connect_with_no_byte_logs_the_discard_once_an_outage() {
+    let t = th();
+    let mut sim = Sim::new(t.clone(), session_720p());
+    let step = OutputProfile::P720.frame_period_ms().round() as u64;
+    let lose = SESSION_AT + 1_000;
+    let mut events = vec![(SESSION_AT + 1, ev(Event::InputConnected { gen: 1 }))];
+    events.extend(every(SESSION_AT + 1, lose, step, || frame(1)));
+    events.extend(replies(SESSION_AT + 10, lose, 0));
+    events.push((
+        lose,
+        ev(Event::InputLost {
+            gen: 1,
+            reason: LossReason::Error,
+        }),
+    ));
+    sim.drive(lose + 1, events);
+    let limit = lose + t.input_connect_timeout_ms + t.input_backoff_cap_ms;
+    let r2 = sim.tick_until(limit, rebuilt(2));
+    // Outage 1, edge 1: gen 2 has no byte, so it is discarded and gen 3 built at once.
+    sim.drive(r2 + 101, vec![(r2 + 100, edge(1))]);
+    let r3 = sim.tick_until(r2 + 1_000, rebuilt(3));
+    assert_eq!(r3, sim.first_tick_at_or_after(r2 + 100 + 1));
+    let calls = sim.calls();
+    let i = calls
+        .iter()
+        .position(|c| *c == Call::Log("phone live nudge rebuild gen=3 discarded=2".to_owned()))
+        .expect("the discard's line");
+    assert_eq!(calls.get(i - 1), Some(&Call::InputAbandon(2)));
+    assert!(matches!(calls.get(i + 1), Some(Call::InputRebuild(3, _))));
+    // Outage 1, edge 2: the discard is spent, so the nudge waits for gen 3's connect timeout.
+    sim.drive(r3 + 101, replies(r3 + 100, r3 + 101, 2));
+    let r4 = sim.tick_until(r3 + t.input_connect_timeout_ms + 1_000, rebuilt(4));
+    assert_eq!(
+        sim.times_of(abandoned(3)),
+        vec![sim.first_tick_at_or_after(r3 + t.input_connect_timeout_ms)]
+    );
+    // Gen 4 runs (the discard re-arms), then outage 2: gen 5 has no byte and edge 3 discards it.
+    let lose2 = r4 + 1_000;
+    let mut events = vec![(r4 + 1, ev(Event::InputConnected { gen: 4 }))];
+    events.extend(every(r4 + 1, lose2, step, || frame(4)));
+    events.push((
+        lose2,
+        ev(Event::InputLost {
+            gen: 4,
+            reason: LossReason::Error,
+        }),
+    ));
+    sim.drive(lose2 + 1, events);
+    let r5 = sim.tick_until(lose2 + t.input_backoff_cap_ms, rebuilt(5));
+    sim.drive(r5 + 101, vec![(r5 + 100, edge(3))]);
+    sim.tick_until(r5 + 1_000, rebuilt(6));
+    let lines = phone_lines(&sim.log);
+    eprintln!(
+        "builds 2..6 at {r2} {r3} {r4} {r5}; lines {}: {lines:?}",
+        lines.len()
+    );
+    assert_eq!(
+        lines,
+        [
+            "phone live edge from=- to=0 nudge=none",
+            "phone live edge from=0 to=1 nudge=latched",
+            "phone live nudge rebuild gen=3 discarded=2",
+            "phone live edge from=1 to=2 nudge=latched",
+            "phone live nudge held gen=3 input=connecting media=false discard=spent",
+            "phone live nudge rebuild gen=4 discarded=-",
+            "phone live edge from=2 to=3 nudge=latched",
+            "phone live nudge rebuild gen=6 discarded=5",
+        ]
+    );
+}
+
+/// A nudge on a connect already carrying bytes, through the real driver: it is held (said once, with
+/// the byte), and when that connect reaches Running the nudge is cleared, said once, and never acts:
+/// no rebuild line, and no build past it. A later fall in the counter, nothing waiting, says
+/// `nudge=none`.
+#[test]
+fn a_nudge_held_on_a_connect_with_bytes_is_cleared_when_it_runs() {
+    let t = th();
+    let mut sim = Sim::new(t.clone(), session_720p());
+    let step = OutputProfile::P720.frame_period_ms().round() as u64;
+    let lose = SESSION_AT + 1_000;
+    let mut events = vec![(SESSION_AT + 1, ev(Event::InputConnected { gen: 1 }))];
+    events.extend(every(SESSION_AT + 1, lose, step, || frame(1)));
+    events.extend(replies(SESSION_AT + 10, lose, 0));
+    events.push((
+        lose,
+        ev(Event::InputLost {
+            gen: 1,
+            reason: LossReason::Error,
+        }),
+    ));
+    sim.drive(lose + 1, events);
+    let r2 = sim.tick_until(lose + t.input_backoff_cap_ms, rebuilt(2));
+    let mut events = vec![(r2 + 10, ev(Event::InputMedia { gen: 2 }))];
+    events.extend(replies(r2 + 100, r2 + 400, 1));
+    events.push((r2 + 500, ev(Event::InputConnected { gen: 2 })));
+    let end = r2 + 2 * t.input_connect_timeout_ms;
+    events.extend(every(r2 + 500, end, step, || frame(2)));
+    events.extend(replies(r2 + 400, end - 1_000, 1));
+    // A fall with nothing waiting: the counter changes, and the link latches nothing.
+    events.extend(replies(end - 1_000, end, 0));
+    sim.drive(end, events);
+    let lines = phone_lines(&sim.log);
+    eprintln!("lines {}: {lines:?}", lines.len());
+    assert_eq!(
+        lines,
+        [
+            "phone live edge from=- to=0 nudge=none",
+            "phone live edge from=0 to=1 nudge=latched",
+            "phone live nudge held gen=2 input=connecting media=true discard=armed",
+            "phone live nudge cleared gen=2",
+            "phone live edge from=1 to=0 nudge=none",
+        ]
+    );
+    assert_eq!(sim.log.count(|c| matches!(c, Call::InputRebuild(..))), 2);
+}
+
+/// The empty case: replies that never carry a counter write no phone-live line through an outage and
+/// its rebuilds, and neither does the domain's own back-off.
+#[test]
+fn no_counter_in_any_reply_writes_no_phone_live_line() {
+    let t = th();
+    let mut sim = Sim::new(t.clone(), session_720p());
+    let r = sim.tick_until(SESSION_AT + 3 * t.input_connect_timeout_ms, rebuilt(3));
+    let builds = sim.log.count(|c| matches!(c, Call::InputRebuild(..)));
+    eprintln!("builds {builds} by {r}");
+    assert_eq!(builds, 3, "setup: two connect timeouts");
+    assert_eq!(phone_lines(&sim.log), Vec::<String>::new());
+}

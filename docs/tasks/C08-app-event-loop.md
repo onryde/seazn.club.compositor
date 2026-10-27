@@ -388,6 +388,16 @@ The app layer turns domain `Effect`s into port calls and turns adapter callbacks
   `the_real_output_fps_is_logged_each_beat_and_starvation_raises_then_clears_the_alarm` and
   `a_beat_before_any_session_writes_no_output_fps_line` pass, and the nominal fps in the line or on the
   wire, the alarm dropped, and the finite filter removed each go red.
+- (Amended 2026-10-27, Owed 108 fix (b), the PR #99 review's m1) Web's phone-live counter and each
+  nudge reach the log, once a change or once a latch, never on a repeated value (the amendment of
+  this date). `tests/scenarios.rs`: `the_phone_live_counter_is_logged_once_a_change_and_never_on_a_repeat`,
+  `a_nudge_in_backoff_logs_its_rebuild_once_just_before_it`,
+  `a_nudge_on_a_connect_with_no_byte_logs_the_discard_once_an_outage`,
+  `a_nudge_held_on_a_connect_with_bytes_is_cleared_when_it_runs` and
+  `no_counter_in_any_reply_writes_no_phone_live_line` pass, and `run.rs`'s
+  `a_raised_phone_live_counter_in_a_reply_rebuilds_the_camera_sooner` pins the lines through the real
+  worker (one line for a counter repeated in 17 replies). Three mutants went red: the change guard
+  made `true` (a line every reply), the held line on every tick, and the rebuild line never written.
 
 ## Amendment 2026-10-15 (overlay templates spec)
 
@@ -711,6 +721,24 @@ The implementer's choices, inside the brief. None is an owner ruling; each mediu
   `ScriptedPlane::replies` answers a whole `Reply`. Tests:
   `a_periodic_reply_with_a_phone_live_counter_posts_the_edge_after_it` and, on the wall clock through
   the real worker and driver, `a_raised_phone_live_counter_in_a_reply_rebuilds_the_camera_sooner`.
+
+## Amendment 2026-10-27 (the PR #99 review's m1: the phone-live lines)
+
+Owed 108's live verification times the reconnect from the relay's own lines, and nothing logged the
+counter or the nudge. The driver now reads the input link's nudge before and after each decision
+(`Supervisor::input_nudge`, a copy of the link's fields, `domain::input_link::NudgeView`; an addition
+to the domain's API, read by no rule) and writes, at `info` through `Ports.log`:
+- `phone live edge from=<old|-> to=<new> nudge=<latched|already|none>` when the counter the link holds
+  changes; `from=-` is the process's first value (a baseline), and `nudge` is what the link's nudge is
+  after it, as observed, never inferred. A repeated value writes nothing.
+- Then, for a latched nudge, one of: `phone live nudge rebuild gen=<g> discarded=<d|->` just before the
+  `RebuildInput` the nudge made due (`d` the connect it gave up); `phone live nudge held gen=<g>
+  input=<backoff|connecting|running> media=<bool> discard=<armed|spent>` once, when the first tick after
+  the latch leaves it waiting, with the link's facts at that tick (it acts later at the stall, the loss
+  or the connect's timeout, and writes the rebuild line then); or `phone live nudge cleared gen=<g>`
+  when generation `g` reaches Running first.
+- Integers and words only; no line carries a credential. The rule itself (`input_link.rs`,
+  `supervisor.rs`) is unchanged.
 
 ## Amendment 2026-10-24 (Owed 86: the honest beat)
 

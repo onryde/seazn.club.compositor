@@ -542,6 +542,30 @@ fn a_raised_phone_live_counter_in_a_reply_rebuilds_the_camera_sooner() {
             finished(&rig, Duration::from_secs(5)).code,
             ExitReason::Fatal.code()
         );
+        // The PR #99 review's m1: the log says what the counter did, once a change, however many
+        // replies carried the same value; a reply with no counter says nothing.
+        let replies = answered(&rig.plane.calls());
+        let lines: Vec<String> = rig
+            .log
+            .lines()
+            .into_iter()
+            .filter(|l| l.starts_with("phone live "))
+            .collect();
+        eprintln!("periodic replies {replies}, phone-live lines {lines:?}");
+        // The counter that never moves waits out the base back-off, so its value is repeated in many
+        // replies: the witness that a repeat writes nothing. The raised one rebuilds within a beat.
+        let floor = if carried && !raised { 10 } else { 2 };
+        assert!(replies >= floor, "setup: {replies} replies, under {floor}");
+        let want: &[&str] = match (carried, raised) {
+            (false, _) => &[],
+            (true, false) => &["phone live edge from=- to=0 nudge=none"],
+            (true, true) => &[
+                "phone live edge from=- to=0 nudge=none",
+                "phone live edge from=0 to=1 nudge=latched",
+                "phone live nudge rebuild gen=2 discarded=-",
+            ],
+        };
+        assert_eq!(lines, want, "counter carried {carried}, raised {raised}");
         checked += 1;
     }
     eprintln!("replies checked: {checked}");

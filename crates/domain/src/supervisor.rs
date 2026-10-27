@@ -66,7 +66,7 @@ use crate::graphics::{Graphics, GraphicsAction, GraphicsState, HideReason};
 use crate::health::{
     BeatState, ExitDetail, ExitInfo, GraphicsStatus, HealthReport, LinkStatus, PhaseChannel,
 };
-use crate::input_link::{BuildFacts, InputAction, InputLink, InputState, LossReason};
+use crate::input_link::{BuildFacts, InputAction, InputLink, InputState, LossReason, NudgeView};
 use crate::ladder::{Ladder, Rung};
 use crate::lifecycle::{ExitReason, Lifecycle};
 use crate::output_link::{Encoded, OutputLink, OutputState, SwapReason};
@@ -317,6 +317,12 @@ impl Supervisor {
 
     pub fn input_generation(&self) -> u64 {
         self.input.generation()
+    }
+
+    /// The input link's phone-live nudge as it stands (Owed 108 fix (b)): read by the driver's log
+    /// only.
+    pub fn input_nudge(&self) -> NudgeView {
+        self.input.nudge_view()
     }
 
     pub fn output_generation(&self) -> u64 {
