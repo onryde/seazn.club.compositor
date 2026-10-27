@@ -77,8 +77,8 @@ if [ -n "$SOAK_LEG" ] && [ "$SOAK_SCHEDULE" != soak ]; then
   exit 64
 fi
 # The session fake-control hands out (a vendored relay-job fixture: the output profile), and the
-# overlay's sport and template. The soak: 720p, bar on cricket.
-SESSION_SRC="$SOAK/session-composed-720p.json"
+# overlay's sport and template. The soak: 1080p (spike/x264-faster-soak1080), bar on cricket.
+SESSION_SRC="$SOAK/session-composed-1080p.json"
 LEG_SPORT=cricket
 LEG_TEMPLATE=bar
 if [ -n "$SOAK_LEG" ]; then
