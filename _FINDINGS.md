@@ -3012,7 +3012,7 @@ the same on 4x and 6x; 6x is what keeps it inside the size rule with every peak 
 8192 MB) to 6 CPU 12288 MB. `medium` and `slow` buy no visible quality at 6 Mbps; bitrate and
 B-frames are the levers that would, and neither is measured here.
 
-**Owner ruling (2026-10-27, this session, after these numbers): 1080p `medium` on performance-6x**, over the recommendation above (decision log, `docs/_INDEX.md`). Not yet measured for it: a 3 h soak of 1080p `medium` on 6x.
+**Owner ruling (2026-10-27, this session, after these numbers): 1080p `medium` on performance-6x**, over the recommendation above (decision log, `docs/_INDEX.md`). Not yet measured for it: a 3 h soak of 1080p `medium` on 6x. Amended the same day: the size rule moves to 75 % of cores; against 4.5 of 6, `medium` on 6x is within on every leg (p95 at most 3.683, peak second 4.261).
 
 **For the owner** (a product change, not made here): (a) the preset `veryfast` → `faster`
 (`gst_programme.rs:61`) at either output; (b) the web default `RELAY_OUTPUT_PROFILE` → 1080p
