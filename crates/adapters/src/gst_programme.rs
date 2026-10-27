@@ -58,7 +58,7 @@ const APPSRC_TICKS: u64 = 3;
 const AAC_BITRATE: i32 = 128_000;
 /// The x264 settings C00 measured real time with margin (F-005): `veryfast`, `zerolatency`, a 2 s
 /// keyframe interval, no B-frames (F-004), a 1 000 ms VBV and CBR with filler (POC values).
-const X264_SPEED_PRESET: &str = "veryfast";
+const X264_SPEED_PRESET: &str = "fast";
 const X264_TUNE: &str = "zerolatency";
 const X264_VBV_MS: u32 = 1_000;
 const X264_OPTIONS: &str = "nal-hrd=cbr:filler=1";
