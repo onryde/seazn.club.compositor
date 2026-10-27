@@ -703,7 +703,8 @@ The implementer's choices, inside the brief. None is an owner ruling; each mediu
 - *Amended 2026-10-27 (Owed 108 fix (a), F-032):* "nothing more of that generation passes" now
   has one exception, the given-up build's first pipeline error, which the adapter reports as
   `Event::InputError { gen, facts }` while the build runs (Cloudflare's hold-end close). The driver
-  forwards it as any event. Scenario: `cloudflares_close_rebuilds_a_base_wait_later_through_the_driver`.
+  forwards it as any event. Scenarios: `cloudflares_close_rebuilds_a_base_wait_later_through_the_driver`,
+  and `the_gate_runs_from_the_last_frame_through_the_driver` (the gate's anchor, the PR #98 review's I1).
 
 ## Amendment 2026-10-24 (Owed 86: the honest beat)
 

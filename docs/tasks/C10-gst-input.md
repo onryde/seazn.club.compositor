@@ -163,6 +163,10 @@ while what it owns is hung (or stands in for hung) and the drop returns within 5
   (`srtsrc`'s `stats` carry `rtt-ms` only once libsrt has connected the socket), and the first buffer
   out of `srtsrc` (a pad probe). `InputLost { gen, Error }` stays for a build that never ran (no bus,
   no thread, a malformed URL, a build that could not be made); EOS is unchanged.
+- **The handshake is known only if a 50 ms pass saw it before the error.** A broken socket refuses
+  `srt_bstats`, so the read at a socket error adds nothing; a handshake completed in the last pass
+  before Cloudflare's close reads false and keeps today's back-off (fails safe; the PR #98 review's
+  m5).
 - **`abandon(gen)` sends no loss, save that first error** (it amends the 2026-10-20 amendment's
   "sends no event"): Cloudflare's close lands on a given-up build, so without it the domain's
   hold-end rule would be inert. The next `rebuild`, `stop` or the drop ends it.

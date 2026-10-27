@@ -1993,7 +1993,10 @@ fn a_peer_close_reports_the_builds_facts_open_or_given_up() {
 /// Owed 108's bound on the adapter's side: only the build last given up, and only while it runs. A
 /// given-up build the next `rebuild` retired reports nothing when its peer goes away, and neither
 /// does one given up and then stopped; the build between them, given up and still running, reports
-/// its own (the positive pair).
+/// its own (the positive pair). Only that pair fails without this change (before it, a given-up build
+/// reported nothing at all). The retired and stopped halves pin today's behaviour, which the build's
+/// stop flag and teardown already give; no mutant of `Shared::shut`'s `given_up` clearing reaches
+/// them (its doc says why).
 #[test]
 fn a_retired_or_stopped_build_reports_no_error() {
     let _s = serial();

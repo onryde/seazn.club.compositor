@@ -32,7 +32,7 @@ pub struct Thresholds {
     /// in-chain camera→overlay delay of 3 083–3 105 ms that includes it, so the overlay delay's
     /// default (F-002, ADR 0006) moves with this value.
     pub input_srt_latency_ms: Ms,
-    /// F-032 (Owed 108 fix (a); the coordinator's dispatch of 2026-10-26 relays the owner's approval):
+    /// F-032's recommended fix (a) (Owed 108, `_FINDINGS.md`; the dispatch of 2026-10-26):
     /// Cloudflare's SRT playback holds a dropped publisher's broadcast about 30 s, then closes every
     /// attached reader with an error. An input error at least this long after the last frame, on a
     /// build whose handshake completed and that carried no media, is read as that close: the link

@@ -712,7 +712,9 @@ won once, by about 1 ms. rtmp2 counts bytes only when a whole message is written
 - Tests: the inline ones under "Owed 108 fix (a)" (each guard has a case where only it decides);
   `tests/hold_end.rs` (4 tick grids, 12 cases; a phone that never returns costs a constant 1 to 2
   extra connects when connects time out and 2 to 3 when they error, over 3 362 horizons, derived from
-  `backoff::delay`); `tests/links.rs`'s input column gains `InputEvent::Error` (21 pairs, 33 no-ops).
+  `backoff::delay`; and the gate's anchor, the last frame, with the camera on air three gates before
+  the drop, 4 more tick grids); `tests/links.rs`'s input column gains `InputEvent::Error` (21 pairs,
+  33 no-ops).
 
 ## Do not touch
 

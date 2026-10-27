@@ -61,6 +61,10 @@
 //! `stats` carry `rtt-ms` only once libsrt has connected the socket), and `carried_media`, set by a
 //! probe on the source's pad at its first buffer, decoded or not. A refused connect (a rotated
 //! passphrase, a deleted input) errors about 20 ms in with no handshake; Cloudflare's close finds one.
+//! The handshake is known only if a pass saw it before the error: once the socket is broken,
+//! `srt_bstats` refuses it, so the read at a socket error adds nothing, and a handshake completed in
+//! the last `BUS_WAIT_MS` before Cloudflare's close reads false. That fails safe: the domain keeps
+//! today's back-off for it.
 //!
 //! **Never blocks the caller.** Each build runs on one thread, which starts it, reads its bus and
 //! then tears it down: `srtsrc` resolves its host inside `set_state(PAUSED)`, and a hanging resolver
@@ -212,6 +216,9 @@ impl Shared {
     }
 
     /// No build passes and none is given up: the gate for a retire (`rebuild`, `stop`, the drop).
+    /// Clearing `given_up` here is belt and braces, and no test can kill it: a retired build's thread
+    /// sees `stop` and drops any error it pops, and the teardown follows, so a mark left behind
+    /// reports nothing; the next `give_up` overwrites it (the PR #98 review's m4).
     fn shut(&self) {
         let mut open = locked(&self.gate);
         *open = None;
@@ -932,6 +939,9 @@ fn run_build(
                 ));
                 let kept = locked(errored).take();
                 if let Some(of) = kept {
+                    // Only a downstream element's error leaves the socket up, so only it can read a
+                    // handshake the last pass missed here; a socket error reads nothing new (the
+                    // module doc's "Build facts").
                     seen.poll_handshake(src.as_ref());
                     shared.report_error(gen, of, seen.facts());
                 }
