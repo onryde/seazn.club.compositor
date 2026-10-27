@@ -1,8 +1,8 @@
 {
   "source": "onryde/seazn.club",
-  "commit": "dec7b95d902f7767b3a6bca991ef08ae366e43ec",
+  "commit": "694f7abc667b60e5f744d5d4df7ceaa023b9ec33",
   "files": {
-    "fixtures/relay-job.v1/README.md": "9dd7097b93a1bfd3a67775136acfcc04393cccdb2475bc182b3b8fa5bcf3096d",
+    "fixtures/relay-job.v1/README.md": "614debb1e5ff25a65d2dbe4ef8f017bbadf36028a9dd309bbca60d1063380b1c",
     "fixtures/relay-job.v1/heartbeat-final-fatal.json": "7cd633faeae7fa27cdaca24c2423bd8334f80d8bddafbc84aeb67f6221d8305e",
     "fixtures/relay-job.v1/heartbeat-final-hold.json": "904dbedaa116b4f2cedc3197d41cdb1964627132abe93595b24486062e42af1f",
     "fixtures/relay-job.v1/heartbeat-final-restart.json": "e919b31569bcca8532d2e155a55862d579a314bf15fd17df85399e80787198a1",
@@ -16,6 +16,11 @@
     "fixtures/relay-job.v1/phase-reply-final.json": "526080bd90124f875585dd9bab516471675dad32f05da668269ba40781b64f5d",
     "fixtures/relay-job.v1/phase-reply-invalid-unknown-field.json": "76ef4e1d057b49552981f161bbb4cab57009ddf5d06baf4a649978031fbd8c37",
     "fixtures/relay-job.v1/reply-ending.json": "b3a2113140fc3de6dc7be8f1b9bfca73ca2c4a5ddda7740dede9ee6c64e71bab",
+    "fixtures/relay-job.v1/reply-invalid-live-edge-fractional.json": "9434d71b4dac3d933d2ea2db154d3455bbefe3680cb28a869607d9b3b3f8aed6",
+    "fixtures/relay-job.v1/reply-invalid-live-edge-negative.json": "d62cb736ccedd797274032e4d67ede1cab634dc9cd02d5b1f9d21ab90f4f07e5",
+    "fixtures/relay-job.v1/reply-live-edge-null.json": "1c7b9eb7cd8028c6850e025c97f33027aff94fad996e13639fc2153187d5438a",
+    "fixtures/relay-job.v1/reply-live-edge-zero.json": "e494179ded43fc1da29de04b6803af6c757db7d4e22269115d91b52d2bd6b884",
+    "fixtures/relay-job.v1/reply-live-edge.json": "09000234584f4f6938e31a55ce71d6a359725f1ec6f0635eda8047b84026f7c2",
     "fixtures/relay-job.v1/reply-live.json": "33e6a5d85d4ac298ee9ba35b5a591afc60bece74802d00323072fd988d4e1ad2",
     "fixtures/relay-job.v1/session-composed-1080p.json": "5ca468b1edb8f3d096c39d822ced0cad4f1ca58e94255a25e93201df864174c0",
     "fixtures/relay-job.v1/session-composed-720p.json": "ef851c570f04fbde6c2302e2870baa0dbb703fdec5b6f677225423d0a8be1585",
@@ -23,6 +28,6 @@
     "fixtures/relay-job.v1/session-passthrough.json": "6e26aaaec3701ee50f08efb3044c1fd7192efd130e188c839ac7bbfb016d9f27",
     "fixtures/relay-job.v1/session-refused-delay-absent.json": "175099704a276cbecaf60f0381b100edda842487627203542f79342815267e15",
     "fixtures/relay-job.v1/session-refused-delay-mismatch.json": "3f45d9bba1866f4ef9060bcbcc21e9e5e901380089236616cf983fc052422c0f",
-    "relay-job.v1.json": "e656867729c9a0a05476ab85501dc61255db6a8826d75c74c195c34ff7f06a23"
+    "relay-job.v1.json": "284756740ddb7ecf984d5858b19cacb98b3677100e6a69f34bbea4d0c91f97e3"
   }
 }
