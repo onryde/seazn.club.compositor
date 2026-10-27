@@ -3,7 +3,7 @@
 
     python3 -I harness/soak/cost/fixture.py <dir> [mutation...]
 
-One green leg on performance-4x (the size rule's max: 2.0 cores), a 600 s drive from S: a sample a
+One green leg on performance-4x (the size rule's max: 3.0 cores), a 600 s drive from S: a sample a
 second (585 in the window from +15 s), 565 of them at 1.0 core and 20 at 1.9 (the p95, by nearest
 rank, is the 556th value: 1.0); beats every 5 s, all full and graphics ready (a beat every 5 s seldom
 sees the reload, so no beat says it happened); no drop; one kill 2 s after the midpoint, and the
@@ -36,7 +36,7 @@ def w(name, rows):
 
 
 hot = 40 if "cpu-over" in muts or "cpu-at-max" in muts else 20
-hot_v = 2.1 if "cpu-over" in muts else (2.0 if "cpu-at-max" in muts else 1.9)
+hot_v = 3.1 if "cpu-over" in muts else (3.0 if "cpu-at-max" in muts else 1.9)
 samples = []
 for i, t in enumerate(range(S + 16_000, E + 1, 1000)):
     if "few-samples" in muts and i % 5 == 0:

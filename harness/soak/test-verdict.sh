@@ -326,14 +326,15 @@ case_ projection-104 real pass '' '' 'def a: 954; def b: 104; '"$PROJ"
 measured "104 MB/h from 954 MB projects 954 + 104 * cap / 60 MB, the beats outside the drive unread" "$WORK/case-projection-104.out" 1.projection \
   ".slope_mb_per_h == 104 and .intercept_mb == 954 and .projected_mb == 954 + 104 * \$soak.memory_projection.session_cap_min / 60
    and .beats_fitted == $(fitted "$WORK/case-projection-104.json") and $PROJ_BUDGET"
-# Steep: 600 MB/h from 1500 MB projects over the budget, while check 1 still passes (part 1's median
-# about 1550 MB, part 3's about 1750: 12.9 %), so only the projection reds.
+# Steep: 1000 MB/h from 1500 MB projects 6500 MB at the cap, over the budget (performance-6x's half
+# is 6144 MB), while check 1 still passes (part 1's median about 1583 MB, part 3's about 1916: 21.1 %),
+# so only the projection reds.
 STEEP_REASON="$("$JQ" -r --argjson prod "$MEM_PROD" '.memory_projection as $p
-  | "reaches \(1500 + 600 * $p.session_cap_min / 60) MB at the session cap of \($p.session_cap_min) min, over the budget of \($prod * $p.memory_budget_fraction) MB"' \
+  | "reaches \(1500 + 1000 * $p.session_cap_min / 60) MB at the session cap of \($p.session_cap_min) min, over the budget of \($prod * $p.memory_budget_fraction) MB"' \
   "$HERE/soak.json")"
-case_ projection-steep real fail '1.projection' "1.projection:$STEEP_REASON" 'def a: 1500; def b: 600; '"$PROJ"
-measured "a steep run: 600 MB/h from 1500 MB, its projection over the budget" "$WORK/case-projection-steep.out" 1.projection \
-  '.slope_mb_per_h == 600 and .intercept_mb == 1500 and .projected_mb == 1500 + 600 * $soak.memory_projection.session_cap_min / 60
+case_ projection-steep real fail '1.projection' "1.projection:$STEEP_REASON" 'def a: 1500; def b: 1000; '"$PROJ"
+measured "a steep run: 1000 MB/h from 1500 MB, its projection over the budget" "$WORK/case-projection-steep.out" 1.projection \
+  '.slope_mb_per_h == 1000 and .intercept_mb == 1500 and .projected_mb == 1500 + 1000 * $soak.memory_projection.session_cap_min / 60
    and .projected_mb > .budget_mb and '"$PROJ_BUDGET"
 # The budget's edge (PR #88 review m1): the projection is judged as it is reported, to 0.1 MB, and
 # the gate is `>`. 500 MB/h from the budget less 500 * cap / 60, plus d: 0.1 under the budget and
@@ -354,7 +355,7 @@ measured "0.1 MB over the budget" "$WORK/case-projection-over-budget.out" 1.proj
   '(.projected_mb * 10 | round) == (.budget_mb * 10 + 1)'
 # The guest (the coordinator's decision, 2026-10-25): a soak on a bigger guest budgets the production
 # guest's memory, never its own. performance-8x's 16384 MB still budgets production's fraction, so
-# the steep run still reds. A smaller Machine than production's (none is in compositor_guest; the
+# the steep run still reds. A smaller Machine than production's (performance-4x since 2026-10-27; the
 # smaller side of the rule) budgets its own: a flat run at three quarters of production's budget
 # reds on half production's memory.
 MEM_8X="$("$JQ" -er '.compositor_guest["performance-8x"].memory_mb' "$HERE/soak.json")"
@@ -363,7 +364,7 @@ checks=$((checks + 1))
 if [ "$MEM_8X" -gt "$MEM_PROD" ]; then echo "PASS the 8x guest is bigger than production's ($MEM_8X > $MEM_PROD MB)"
 else fail "the 8x guest's $MEM_8X MB is not bigger than production's $MEM_PROD MB: the next cases prove nothing"; fi
 MEM="$MEM_8X"
-case_ projection-steep-8x real fail '1.projection' "1.projection:$STEEP_REASON" 'def a: 1500; def b: 600; '"$PROJ"
+case_ projection-steep-8x real fail '1.projection' "1.projection:$STEEP_REASON" 'def a: 1500; def b: 1000; '"$PROJ"
 measured "an 8x run (C_MEM $MEM_8X) still budgets production's memory" "$WORK/case-projection-steep-8x.out" 1.projection \
   '.machine_memory_mb == $mem and $mem > $prod and .budget_mb == $prod * $soak.memory_projection.memory_budget_fraction
    and .projected_mb > .budget_mb and '"$PROJ_BUDGET"

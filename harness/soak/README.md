@@ -1,7 +1,7 @@
 # The soak (C15)
 
 The 3 h soak from `docs/tasks/C15-soak.md` and spec §9.5. The real relay image runs on the
-production guest (performance, 4 CPU, 8192 MB) as one Fly Machine, beside a harness Machine, in the
+production guest (performance, 6 CPU, 12288 MB) as one Fly Machine, beside a harness Machine, in the
 dedicated app `seazn-relay-soak` (org seazn-club, region `lhr`). One workflow job,
 `.github/workflows/soak.yml`, drives it end to end.
 
@@ -329,7 +329,7 @@ by its sha256, and the leak gate uploads the job's own copy on page=real only wh
 
 **Harness Machine size, page=real: performance-8x, 16384 MB** (soak.json `harness_guest.real`).
 page=test stays at performance-4x, 8192 MB. The compositor Machine is alone on the production guest
-(performance-4x, 8192 MB) either way.
+(performance-6x, 12288 MB) either way.
 
 **Verified locally (2026-10-24)** against a standalone build of `7dcb3c42e2`, with no `.env.local`:
 
@@ -382,7 +382,7 @@ unless its kill can land inside the verdict's window (`cost_kill_late_max_s`, 10
 |---|---|
 | `run` | One start and one end; the drive at least `leg_min_drive_min`. |
 | `samples` | From +`cost_sample_from_s` (15 s) to the end, at least `cost_samples_min_ratio` of a sample a second, each reading the guest's CPU count (so a leg on the wrong size fails). |
-| `cpu` | The Machine's CPU p95 (nearest rank) at most `cost_cpu_p95_max_share` (50 %) of the guest's cores. |
+| `cpu` | The Machine's CPU p95 (nearest rank) at most `cost_cpu_p95_max_share` (75 %: owner ruling 2026-10-27, F-033 (PR #102); it was Owed 20's 50 %) of the guest's cores. |
 | `rung` | Every beat's rung is `full`, the reload included. |
 | `drops` | The final `droppedFrames` is 0. |
 | `moments` | At least `cost_moments_min_per_min` (1) moment a minute over the drive (a mean; see finding 15), by the page's own feed. A feed that answered for none of the events fails. |
@@ -407,7 +407,7 @@ production guest, then the heavier one. So: `A:snow,A:noise,C:snow,C:noise` firs
 heavier pattern and D on 1080p's. If B or D measures above A or C, the brief's sport hypothesis
 failed and a football leg is owed before a size is chosen; that leg cannot run as built (no
 football driver, and `momentsOf` has no football rule), so it would fail closed on its moments,
-never pass. A leg over the size rule on performance-4x reruns with `-f guest=performance-8x`.
+never pass. A leg over the size rule on performance-6x reruns with `-f guest=performance-8x`.
 GitHub keeps one pending run per concurrency group (`soak`): a dispatch queued behind a running
 one replaces any run already pending, silently. Dispatch the next only after the previous has
 started. A running run is never cancelled (`cancel-in-progress: false`).

@@ -512,14 +512,14 @@ expect "verdict green: one renderer before the kill and one after (no held page 
 expect "verdict green: the tree, the renderer, the busiest thread, the encoder" "$W/green.json" \
   '.[0].row | .cats_avg.renderer == 0.05 and .top_thread == {name: "x264enc:src", p95: 0.4, max: 0.4}
    and .encoder_speed == {median: 1, min: 1} and .dropped_final == 0'
-expect "verdict green: Owed 93, two held pages at the live renderer's cost: 1.0 + 2 x 0.05 within 2.0" "$W/green.json" \
-  '.[0].owed93 == {renderer_avg: 0.05, p95_plus_two_held: 1.1, size_rule_max: 2, within: true}'
+expect "verdict green: Owed 93, two held pages at the live renderer's cost: 1.0 + 2 x 0.05 within 3.0" "$W/green.json" \
+  '.[0].owed93 == {renderer_avg: 0.05, p95_plus_two_held: 1.1, size_rule_max: 3, within: true}'
 grep -qF "line(s) of cost-samples.jsonl not a JSON object: dropped" "$W/green.txt" \
   && pass "verdict green: the lines that are not JSON objects are dropped and counted" || fail "verdict green: dropped lines" "$(head -n 3 "$W/green.txt")"
 legdir "$W/legs/at-max" cpu-at-max
 "$V" --dir "$W/legs/at-max" --leg A --camera snow --guest performance-4x >"$W/at-max.json" 2>/dev/null \
-  && expect "verdict: a p95 of exactly 2.0 cores passes (at most 50 %)" "$W/at-max.json" '.[0].row.machine.p95 == 2 and .[0].status == "pass"' \
-  || fail "verdict: a p95 of exactly 2.0" "$(jq -c '.checks[] | select(.status == "fail")' "$W/at-max.json")"
+  && expect "verdict: a p95 of exactly 3.0 cores passes (at most 75 %)" "$W/at-max.json" '.[0].row.machine.p95 == 3 and .[0].status == "pass"' \
+  || fail "verdict: a p95 of exactly 3.0" "$(jq -c '.checks[] | select(.status == "fail")' "$W/at-max.json")"
 "$V" --dir "$W/legs/green" --leg A --camera snow --guest performance-8x >"$W/8x.json" 2>/dev/null && rc=0 || rc=$?
 expect "verdict: the same samples judged as performance-8x fail on the CPU count (4 read, 8 asked)" "$W/8x.json" \
   '.[0] | .status == "fail" and [.checks[] | select(.status == "fail") | .id] == ["samples"]'
@@ -547,7 +547,7 @@ red_among() {
     fail "verdict red: $1" "exit $rc, $(jq -c '[.checks[] | select(.status == "fail") | {id, reason}]' "$W/$2.json" 2>/dev/null)"
   fi
 }
-red "a p95 over 2.0 cores" cpu-over cpu "p95 2.1 cores, over 2"
+red "a p95 over 3.0 cores" cpu-over cpu "p95 3.1 cores, over 3"
 red "a stepped beat" stepped rung "1 beat(s) off full (overlay_half_rate"
 red "pre-encoder drops" drops drops "droppedFrames reached 3"
 red "fewer than one moment a minute" few-moments moments "9 moments in 10 min"
