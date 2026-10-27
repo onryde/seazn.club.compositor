@@ -516,8 +516,9 @@ impl Driver {
         }
         match (before.latched, after.latched) {
             (false, true) => self.nudge_unchecked = true,
+            // A nudge spent or cleared before the next tick leaves the flag set: `nudge_held` reads the
+            // link's own latch, so that tick writes nothing (the PR #100 review's m1: one guard, not two).
             (true, false) => {
-                self.nudge_unchecked = false;
                 if matches!(after.state, InputState::Running { .. }) {
                     let line = format!("phone live nudge cleared gen={}", after.generation);
                     self.ports.log.info(&line);
