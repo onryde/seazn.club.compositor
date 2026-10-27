@@ -1,7 +1,9 @@
 # Relay log shipper (docs/_INDEX.md Owed 106; owner, 2026-10-26: Fly's log shipper to
-# Cloudflare R2, kept 30 days). Ships the relay apps' logs only — SUBJECT filters the
-# org's log stream to seazn-relay-stg — to R2 under seazn-relay-stg/<date>/, one JSON
-# line per log line, each carrying fly.app.instance (the session's Machine id).
+# Cloudflare R2, kept 30 days). Ships the relay apps' logs only, one process group per relay
+# app: each group's SUBJECT filters the org's log stream to that app (the shipper takes one
+# subject, and a NATS wildcard cannot match part of an app name without also taking the web
+# apps' logs). Objects land under <app>/<date>/ (seazn-relay-stg/..., seazn-relay-prod/...),
+# one JSON line per log line, each carrying fly.app.instance (the session's Machine id).
 #
 # Secrets (synced by the owner through Doppler, never here): FLY_ACCESS_TOKEN (a read-only
 # org token), AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (an R2 token scoped to the bucket).
@@ -16,9 +18,11 @@ primary_region = "lhr"
 
 [processes]
   app = "bash -c 'export ACCESS_TOKEN=\"$FLY_ACCESS_TOKEN\"; exec bash start-fly-log-transporter.sh'"
+  prod = "bash -c 'export ACCESS_TOKEN=\"$FLY_ACCESS_TOKEN\" SUBJECT=\"logs.seazn-relay-prod.>\"; exec bash start-fly-log-transporter.sh'"
 
 [env]
   ORG = "seazn-club"
+  # The `app` group's subject (stg); the `prod` group overrides it in its command.
   SUBJECT = "logs.seazn-relay-stg.>"
   AWS_BUCKET = "seazn-relay-logs"
   AWS_REGION = "auto"
