@@ -176,6 +176,17 @@ while what it owns is hung (or stands in for hung) and the drop returns within 5
   `a_source_that_never_answers_is_lost_as_an_error`, `a_start_srt_refuses_is_lost_as_an_error` and
   `a_peer_close_is_an_error_even_when_the_log_is_slow`.
 
+## Amendment 2026-10-27 (Owed 108 fix (b), F-032: `InputMedia`)
+
+- **A build's first byte out of `srtsrc` sends `InputMedia { gen }`**, from the pad probe that sets
+  `carried_media`, under the build's open gate as frames are sent. It is tried, never waited for, and
+  the probe stays until one is delivered or the gate has shut, so a build given up before its first
+  byte sends none. The domain keeps a connect that carries bytes when web reports the phone live
+  again; `carried_media` alone reaches it only inside an `InputError`, after the build failed.
+- Tests: `each_builds_first_byte_is_one_input_media` (once a build, before its `InputConnected`; a
+  silent peer sends none); `a_late_connect_is_dropped_and_a_fresh_generation_connects` pins the gate
+  (no event from a build given up before its first byte).
+
 ## Do not touch
 
 `gst_programme.rs`/`gst_output.rs` (report problems, don't change them), and other domain files.

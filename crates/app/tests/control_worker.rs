@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use app::control_worker::{spawn, ControlHandle};
-use app::ports::{ControlQueue, ControlRequest, FetchError, HeartbeatError, Inbound, Measured};
+use app::ports::{ControlQueue, ControlRequest, FetchError, HeartbeatError, Inbound, Measured, Reply};
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError};
 use domain::health::{BeatState, ExitDetail, ExitInfo, GraphicsStatus, HealthReport, LinkStatus};
 use domain::ladder::Rung;
@@ -184,6 +184,85 @@ fn heartbeat_reply_and_failure_arrive_as_events() {
     }
     eprintln!("results checked: {checked}");
     assert_eq!(checked, 10);
+}
+
+/// Owed 108 fix (b): a periodic reply carrying web's phone-live counter posts its `HeartbeatReply`
+/// and then `PhoneLiveEdge` with the counter as read, a repeat included (the domain, not the worker,
+/// tells an edge from a repeat). The empty cases: a reply with no counter, a failed beat, and a final
+/// beat's reply (nothing is rebuilt once the process is ending) post the one event they posted before.
+/// A fetch requested after the expected messages proves nothing else came first on the worker's lane;
+/// the final lane is read for a while instead.
+#[test]
+fn a_periodic_reply_with_a_phone_live_counter_posts_the_edge_after_it() {
+    let edge = |desired, count| Reply {
+        desired,
+        phone_live_edge: Some(count),
+    };
+    let script: Vec<(bool, Result<Reply, HeartbeatError>, Vec<Event>)> = vec![
+        (
+            false,
+            Ok(edge(Desired::Live, 0)),
+            vec![
+                Event::HeartbeatReply(Desired::Live),
+                Event::PhoneLiveEdge { count: 0 },
+            ],
+        ),
+        (
+            false,
+            Ok(edge(Desired::Ending, 7)),
+            vec![
+                Event::HeartbeatReply(Desired::Ending),
+                Event::PhoneLiveEdge { count: 7 },
+            ],
+        ),
+        (
+            false,
+            Ok(Desired::Live.into()),
+            vec![Event::HeartbeatReply(Desired::Live)],
+        ),
+        (
+            false,
+            Err(HeartbeatError::Transport("HTTP 503".into())),
+            vec![Event::HeartbeatFailed],
+        ),
+        (
+            true,
+            Ok(edge(Desired::Ending, 7)),
+            vec![Event::HeartbeatReply(Desired::Ending)],
+        ),
+    ];
+    let mut checked = 0;
+    for (is_final, result, want) in script {
+        let (tx, rx) = unbounded();
+        let (plane, _log) = ScriptedPlane::new(session_720p());
+        let plane = plane.replies(move |_| (Duration::ZERO, result.clone()));
+        let mut h = spawn(Box::new(plane), tx);
+        let report = if is_final {
+            final_beat(1, ExitReason::Ended)
+        } else {
+            periodic(1)
+        };
+        h.request(beat(report));
+        let got: Vec<Inbound> = want.iter().map(|_| recv(&rx)).collect();
+        let want: Vec<Inbound> = want.into_iter().map(Inbound::Event).collect();
+        assert_eq!(got, want, "final={is_final}");
+        if is_final {
+            assert!(
+                rx.recv_timeout(SLOW).is_err(),
+                "the final lane posted after its reply"
+            );
+        } else {
+            h.request(ControlRequest::FetchSession);
+            assert_eq!(
+                recv(&rx),
+                Inbound::Session(session_720p()),
+                "nothing between the reply's messages and the next fetch"
+            );
+        }
+        checked += 1;
+    }
+    eprintln!("replies checked: {checked}");
+    assert_eq!(checked, 5);
 }
 
 /// The periodic slot holds one beat behind the one in flight; a newer beat replaces it (drop-oldest,

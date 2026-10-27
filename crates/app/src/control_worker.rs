@@ -16,7 +16,9 @@
 //!
 //! The fetch and the periodic beats share the thread `control`, the fetch first. Every result is
 //! posted to the loop as an `Inbound` message, mapped below; no result's text is kept or logged (C07
-//! has already redacted it, and the domain needs only its kind). A final beat is acknowledged, for
+//! has already redacted it, and the domain needs only its kind). A periodic beat's reply that carries
+//! web's phone-live edge counter posts `Event::PhoneLiveEdge` right after its `HeartbeatReply` (Owed
+//! 108 fix (b)); a final beat's does not, since nothing is rebuilt once the process is ending. A final beat is acknowledged, for
 //! `flush`, as soon as its call returns, and its lane takes the next final beat while a result waits
 //! for room in the inbound channel, so neither a full channel nor a stalled periodic beat holds up
 //! the exit (review round 1, items 1 and 2).
@@ -28,10 +30,11 @@ use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Select, Sender, TryRecvError};
 use domain::health::{ExitDetail, HealthReport};
-use domain::supervisor::{Desired, Event, HeartbeatRefusal};
+use domain::supervisor::{Event, HeartbeatRefusal};
 
 use crate::ports::{
-    ControlPlane, ControlQueue, ControlRequest, FetchError, HeartbeatError, Inbound, Measured, SessionConfig,
+    ControlPlane, ControlQueue, ControlRequest, FetchError, HeartbeatError, Inbound, Measured, Reply,
+    SessionConfig,
 };
 
 /// The final-beat slot: the drain's beat, then a fatal error's during the drain.
@@ -247,13 +250,19 @@ struct Worker {
 impl Worker {
     fn run(mut self) {
         while let Some(job) = self.next() {
-            let msg = match job {
-                Job::Fetch => fetched(self.cp.fetch_session()),
-                Job::Periodic((h, m)) => replied(self.cp.heartbeat(&h, &m)),
+            let (msg, edge) = match job {
+                Job::Fetch => (fetched(self.cp.fetch_session()), None),
+                Job::Periodic((h, m)) => {
+                    let r = self.cp.heartbeat(&h, &m);
+                    let edge = live_edge(&r);
+                    (replied(r), edge)
+                }
             };
             // A full channel holds this thread alone: the final lane posts on its own. The loop may
             // have gone (it returned): the send then fails, and is ignored.
-            let _ = self.tx.send(msg);
+            for msg in std::iter::once(msg).chain(edge) {
+                let _ = self.tx.send(msg);
+            }
         }
     }
 
@@ -297,10 +306,18 @@ fn fetched(r: Result<SessionConfig, FetchError>) -> Inbound {
 }
 
 /// Every heartbeat's result, the final beat's included (Owed 29: C07 returns `Gone` for every 410).
-fn replied(r: Result<Desired, HeartbeatError>) -> Inbound {
+fn replied(r: Result<Reply, HeartbeatError>) -> Inbound {
     Inbound::Event(match r {
-        Ok(d) => Event::HeartbeatReply(d),
+        Ok(reply) => Event::HeartbeatReply(reply.desired),
         Err(HeartbeatError::Gone) => Event::HeartbeatRefused(HeartbeatRefusal::Gone),
         Err(HeartbeatError::Transport(_)) => Event::HeartbeatFailed,
     })
+}
+
+/// A periodic reply's phone-live edge counter, when it carries one (Owed 108 fix (b)), for the
+/// domain's input link: posted after the reply's own event, every time, since the domain reads a
+/// repeat as no edge.
+fn live_edge(r: &Result<Reply, HeartbeatError>) -> Option<Inbound> {
+    let count = r.as_ref().ok()?.phone_live_edge?;
+    Some(Inbound::Event(Event::PhoneLiveEdge { count }))
 }

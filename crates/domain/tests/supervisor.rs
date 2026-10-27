@@ -119,6 +119,10 @@ enum Kind {
     InputLost,
     /// An input error with the handshake and no media (Owed 108): Cloudflare's close, in shape.
     InputError,
+    /// The first byte of the current input build (Owed 108 fix (b)).
+    InputMedia,
+    /// Web's phone-live edge counter from a reply (Owed 108 fix (b)): the first value, a baseline.
+    PhoneLiveEdge,
     OutputProgress,
     OutputError,
     OutputDrained,
@@ -143,7 +147,7 @@ enum Kind {
     CefRestart,
 }
 
-const KINDS: [Kind; 29] = [
+const KINDS: [Kind; 31] = [
     Kind::Tick,
     Kind::BootstrapOk,
     Kind::BootstrapFailed,
@@ -154,6 +158,8 @@ const KINDS: [Kind; 29] = [
     Kind::InputFrameStale,
     Kind::InputLost,
     Kind::InputError,
+    Kind::InputMedia,
+    Kind::PhoneLiveEdge,
     Kind::OutputProgress,
     Kind::OutputError,
     Kind::OutputDrained,
@@ -191,6 +197,8 @@ fn kind_of(e: &Event) -> Kind {
         Event::InputFrame { .. } => Kind::InputFrame,
         Event::InputLost { .. } => Kind::InputLost,
         Event::InputError { .. } => Kind::InputError,
+        Event::InputMedia { .. } => Kind::InputMedia,
+        Event::PhoneLiveEdge { .. } => Kind::PhoneLiveEdge,
         Event::OutputProgress { .. } => Kind::OutputProgress,
         Event::OutputError { .. } => Kind::OutputError,
         Event::OutputDrained => Kind::OutputDrained,
@@ -247,6 +255,10 @@ fn sample(kind: Kind, s: &Supervisor) -> Event {
                 carried_media: false,
             },
         },
+        Kind::InputMedia => Event::InputMedia {
+            gen: s.input_generation(),
+        },
+        Kind::PhoneLiveEdge => Event::PhoneLiveEdge { count: 2 },
         Kind::OutputProgress => Event::OutputProgress {
             gen: s.output_generation(),
             total_bytes: 1_000,

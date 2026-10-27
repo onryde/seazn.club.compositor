@@ -164,6 +164,27 @@ pub enum FetchError {
     Transient(String),
 }
 
+/// A heartbeat's 200, the contract's `heartbeatReply`: what web wants (`desiredState`) and, once the
+/// session's phone has been live, web's phone-live edge counter (`phoneLiveEdge`, Owed 108 fix (b)):
+/// `None` when the reply carries none, or a value the contract does not admit (the beat still counts).
+/// C08 hands `desired` to the domain as `Event::HeartbeatReply` and a present counter as
+/// `Event::PhoneLiveEdge` after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reply {
+    pub desired: Desired,
+    pub phone_live_edge: Option<u64>,
+}
+
+/// A reply with no phone-live counter: a session with no phone, or none live yet (web omits the key).
+impl From<Desired> for Reply {
+    fn from(desired: Desired) -> Self {
+        Self {
+            desired,
+            phone_live_edge: None,
+        }
+    }
+}
+
 /// A heartbeat's outcome when it is not a reply (amended 2026-10-18, wave gate 1 review I5;
 /// `docs/_INDEX.md` Owed 29). Only a 410 is `Gone`, on every beat, the final one included: web has
 /// ended the session (C08 maps it to `HeartbeatRefused(HeartbeatRefusal::Gone)`). Everything else,
@@ -291,7 +312,7 @@ pub trait ControlPlane: Send {
     fn fetch_session(&mut self) -> Result<SessionConfig, FetchError>;
     /// A report whose `exit` is `Some` is the final beat: one attempt, bounded by
     /// `FINAL_BEAT_TIMEOUT_MS`. Its result is classified exactly like any other beat's.
-    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Desired, HeartbeatError>;
+    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Reply, HeartbeatError>;
     /// A second instance for the final-beat lane (C08 review round 1, the coordinator's ruling), which
     /// the control worker runs on its own thread: its own connection, so a call in flight on this
     /// instance never holds a final beat up; and every credential this instance knows or LATER learns

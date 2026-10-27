@@ -552,6 +552,20 @@ wrong variant; the minimum at 1 and at 9, `<=`, counted in bytes, and off), 7/7 
 earlier mutants on the plane and on `redact` re-ran 43/43 red. R17 (the empty value learned) is
 superseded by the minimum's mutants.
 
+## Amendment 2026-10-27 (Owed 108 fix (b): the reply's `phoneLiveEdge`)
+
+- **`ControlPlane::heartbeat` returns `Result<Reply, HeartbeatError>`**, `Reply { desired,
+  phone_live_edge }` (`app::ports`). `control_http::parse_reply` reads `desiredState` as before and
+  `phoneLiveEdge` tolerantly: only an integer the contract admits (in [0, 2^53 − 1], `5.0` included,
+  JSON Schema's integer) is a counter; absent, null, a negative, a string, a fraction or a boolean
+  reads as none, and the beat still counts. A reply with no `desiredState` word stays a transport
+  error, whatever counter it carries.
+- The contract is re-vendored at web `694f7abc6` (seazn.club PR #1040), sha256 `284756740ddb…`.
+- Tests: `the_reply_reads_its_phone_live_counter_tolerantly`, every reply fixture through the HTTP
+  fake (`heartbeat_posts_to_heartbeat_path_and_reads_desired_state`), and in `tests/contract.rs`
+  `every_reply_fixture_gets_the_verdict_its_name_declares` and
+  `the_phone_live_counter_is_read_within_the_contracts_bounds` (bounds read off the contract).
+
 ## Do not touch
 
 `contracts/` by hand (only the script writes it), and the domain crate.

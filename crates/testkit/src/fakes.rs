@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use app::ports::{
     redacted_origin, ControlPlane, ControlQueue, ControlRequest, FetchError, GraphicsRenderer,
     HeartbeatError, Inbound, InputSource, InputSpec, LogSink, Measured, Metrics, PhasePublisher, Ports,
-    ProgrammeOutput, SessionConfig, TargetSpec,
+    ProgrammeOutput, Reply, SessionConfig, TargetSpec,
 };
 use domain::cef_health::CefHealth;
 use domain::config::OutputProfile;
@@ -365,20 +365,21 @@ impl PlaneLog {
     }
 }
 
-type Reply = Box<dyn FnMut(&HealthReport) -> (Duration, Result<Desired, HeartbeatError>) + Send>;
+type Answer = Box<dyn FnMut(&HealthReport) -> (Duration, Result<Reply, HeartbeatError>) + Send>;
 
 /// A scripted plane's script, shared with its final-lane instance.
 struct Script {
     session: SessionConfig,
     fetches: VecDeque<Result<SessionConfig, FetchError>>,
     fetch_delay: Duration,
-    reply: Reply,
+    reply: Answer,
 }
 
 /// A `ControlPlane` for the control worker's tests and the binary's fake mode (C12: "a scripted
 /// control plane that serves `session_720p()` and replies `live`"). Fetches answer from `fetches` in
-/// order, then `Ok(session)` for ever. Each heartbeat calls `reply`, which says how long the call
-/// takes and what it returns; the default answers `Live` at once. Its `final_lane` shares the script
+/// order, then `Ok(session)` for ever. Each heartbeat calls `reply` (or `replies`), which says how
+/// long the call takes and what it returns; the default answers `Live` at once, with no phone-live
+/// counter. Its `final_lane` shares the script
 /// and the record, and runs its calls apart: no lock is held while a call takes its time.
 pub struct ScriptedPlane {
     script: Arc<Mutex<Script>>,
@@ -402,7 +403,7 @@ impl ScriptedPlane {
             session,
             fetches: VecDeque::new(),
             fetch_delay: Duration::ZERO,
-            reply: Box::new(|_| (Duration::ZERO, Ok(Desired::Live))),
+            reply: Box::new(|_| (Duration::ZERO, Ok(Desired::Live.into()))),
         };
         let plane = Self {
             script: Arc::new(Mutex::new(script)),
@@ -422,9 +423,21 @@ impl ScriptedPlane {
         self
     }
 
+    /// Each heartbeat answers `desiredState` alone: the reply carries no phone-live counter.
     pub fn reply(
         self,
-        f: impl FnMut(&HealthReport) -> (Duration, Result<Desired, HeartbeatError>) + Send + 'static,
+        mut f: impl FnMut(&HealthReport) -> (Duration, Result<Desired, HeartbeatError>) + Send + 'static,
+    ) -> Self {
+        self.replies(move |h| {
+            let (delay, r) = f(h);
+            (delay, r.map(Reply::from))
+        })
+    }
+
+    /// Each heartbeat answers a whole reply, its phone-live counter included (Owed 108 fix (b)).
+    pub fn replies(
+        self,
+        f: impl FnMut(&HealthReport) -> (Duration, Result<Reply, HeartbeatError>) + Send + 'static,
     ) -> Self {
         locked(&self.script).reply = Box::new(f);
         self
@@ -445,7 +458,7 @@ impl ControlPlane for ScriptedPlane {
         r
     }
 
-    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Desired, HeartbeatError> {
+    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Reply, HeartbeatError> {
         self.log.push(PlaneCall::BeatStarted(report.clone()));
         let (delay, result) = (locked(&self.script).reply)(report);
         thread::sleep(delay);

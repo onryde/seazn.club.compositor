@@ -65,4 +65,10 @@ stored beat, never a `null` and never a `0`.
   `phaseChannel: "loopback"`. `heartbeat-invalid-phase-channel` is a one-field edit of it, refused on
   `phaseChannel` alone. `phase-reply-final` is the loopback reply in `final`;
   `phase-reply-invalid-unknown-field` adds a key the strict reply does not declare.
+- `reply-live-edge` is a reply carrying the phone-live edge counter (Owed 108 fix b): the phone has been lost and come
+  back twice in this session. A Machine acts once per INCREASE of the value it has seen. `reply-live-edge-zero` is the
+  counter at its first appearance: the phone's first-ever live, which is no edge, so a present 0 is a counter and is not
+  "absent". `reply-live-edge-null` is the unknown spelled out; web omits the key instead (`reply-live` is that reply),
+  and a reader treats null and absent alike. `reply-invalid-live-edge-negative` and `reply-invalid-live-edge-fractional`
+  are not counts.
 - Every id, key, passphrase and token here is a placeholder, never a real credential.
