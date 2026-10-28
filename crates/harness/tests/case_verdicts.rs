@@ -3240,6 +3240,54 @@ fn cpu_starved_reds_a_wire_beat_the_log_never_printed() {
     assert_eq!(a["disagree"], 0, "{tag}: {a}");
 }
 
+// `wire_only` searches every log line, not only the judged ones: CI's wire beat lands about 1 ms
+// after its log line, so a beat can straddle the span's start, its log line just before stress plus
+// one beat (not judged) and its wire beat at it (judged). That wire beat has its log line and is no
+// red. The sim's beats sit on the beat grid, so the first judged beat's two writers both move: the
+// log line to stress + hb - 1, the wire beat to stress + hb.
+#[test]
+fn cpu_starved_pairs_a_wire_beat_with_a_log_line_before_the_span() {
+    let tag = "cpu-wire-straddles";
+    let mut w = cpu_starved(true, false, Felt::Honest);
+    let hb = w.ms("heartbeat_interval_ms");
+    let start = w.marks.iter().find(|m| m.0 == "stress").map(|m| m.1).unwrap() + hb;
+    let first = w
+        .log
+        .iter()
+        .find(|(t, m)| m.starts_with(BEAT_LINE) && *t >= start)
+        .map(|l| l.0)
+        .unwrap();
+    let mut moved = 0;
+    for (t, m) in &mut w.log {
+        if *t == first && m.starts_with(BEAT_LINE) {
+            *t = start - 1;
+            moved += 1;
+        }
+    }
+    for (t, x) in &mut w.beats {
+        if *t == first && x["fps"].is_number() {
+            *t = start;
+            moved += 1;
+        }
+    }
+    assert_eq!(moved, 2, "{tag}: the first judged beat's log line and wire beat");
+    let v = judge(&w, "cpu-starved", "", tag);
+    assert_pass(&v, tag);
+    let m = &v.json["measures"];
+    let a = &m["wire_agrees_with_log"];
+    eprintln!(
+        "{tag}: wire_only {}, {} logged, {} on the wire",
+        a["wire_only"], a["checked"], m["wire_below_floor"]["checked"]
+    );
+    assert_eq!(a["wire_only"], 0, "{tag}: {a}");
+    // The straddling beat is judged on the wire and not in the log.
+    assert_eq!(
+        m["wire_below_floor"]["checked"].as_u64(),
+        a["checked"].as_u64().map(|n| n + 1),
+        "{tag}: {m}"
+    );
+}
+
 // The ladder's logic is unchanged (the owner's ruling, no ladder change; the coordinator, medium,
 // 2026-10-25, on the PR #77 review's I3): a step its own trigger justifies passes, a step without
 // the overruns its rule needs is a red, and C05's rungs and bottom still hold.
