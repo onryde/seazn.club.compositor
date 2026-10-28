@@ -131,8 +131,10 @@ STARVED='less(mark_at("stress_done"); mark_at("stress")) as $w
 #   stress_done] (a beat reads the frames since the beat before it, so the first beat after `stress`
 #   straddles it; a judged beat is starved for its whole window). `reason` says why none is. The
 #   wire's are its beats received in the same span (about 1 ms after the log's line, in CI).
+# - `wire_half_step`: half the wire's 0.1 step, named once ($wire_half): `tolerance` and
+#   wire_below_floor (and `wire_above`, its count) both read it.
 # - `pairs`: each judged log beat with the wire beat received within half a beat of it. The two agree
-#   within `tolerance`, half the wire's 0.1 plus half the log's 0.01 (the wire's rounding is pinned
+#   within `tolerance`, the wire's half-step plus half the log's 0.01 (the wire's rounding is pinned
 #   by case_verdicts.rs `the_wire_fps_is_the_reading_to_one_decimal`).
 # - the run's first raise, from `stress`, against the window's span (`window_ms`);
 # - the first clear after that raise, from `stress_done`, against `bound_ms`, realtime_after's window
@@ -147,7 +149,7 @@ STARVED='less(mark_at("stress_done"); mark_at("stress")) as $w
 HONEST='mark_at("stress") as $s | mark_at("stress_done") as $e
   | $t.heartbeat_interval_ms as $hb
   | ($t.budget_ladder_realtime_ms + $t.heartbeat_interval_ms) as $bound
-  | (0.05 + 0.005) as $tol | (beats // []) as $series
+  | 0.05 as $wire_half | ($wire_half + 0.005) as $tol | (beats // []) as $series
   | .log.output_fps as $all | ($all // []) as $b
   | (if $s == null or $e == null then [] else [$b[] | select(.at_ms >= $s + $hb and .at_ms <= $e)] end) as $in
   | (if $s == null or $e == null then [] else [$series[] | select(.received_ms >= $s + $hb and .received_ms <= $e) | .body.fps | numbers] end) as $wire
@@ -162,7 +164,8 @@ HONEST='mark_at("stress") as $s | mark_at("stress_done") as $e
        elif ($in | length) == 0 then "no beat inside the starvation window" else null end),
      parsed: ($b | length), checked: ($in | length), fps: ($in | map(.fps)),
      above: ($in | map(select(.fps >= $t.output_fps_floor)) | length),
-     wire: $wire, wire_above: ($wire | map(select(. >= $t.output_fps_floor)) | length),
+     wire: $wire, wire_half_step: $wire_half,
+     wire_above: ($wire | map(select(. >= $t.output_fps_floor + $wire_half)) | length),
      pairs: $pairs, tolerance: $tol, missing: ($pairs | map(select(.wire == null)) | length),
      disagree: ($pairs | map(select(.wire != null and ((.wire - .log) | abs) > $tol)) | length),
      floor: $t.output_fps_floor, recovered: $t.output_fps_recovered,
@@ -235,11 +238,18 @@ case_verdict() {
   require alarm_raised "$HONEST | .raise_from_stress_ms >= 0 and .raise_from_stress_ms <= .window_ms" \
     "$HONEST | {raises, raise_fps, raise_from_stress_ms, window_ms}"
   # (b) The beat reads the starvation: every judged beat under the floor, in the log and on the wire,
-  # and the two writers agree on each judged beat.
+  # and the two writers agree on each judged beat. The wire is read to its own rounding: its `fps` is
+  # the reading to one decimal, so a wire value w stands for a reading in [w - 0.05, w + 0.05), and
+  # it reads the starvation when w < floor + `wire_half_step`. Against the bare floor it went red on
+  # a beat the log shows starved (chaos run 40613627384, PR #103's head: logged 28.46, sent 28.5, the
+  # floor itself). Nothing is given up: a reading in [floor, floor + wire_half_step) sends the floor
+  # too, and the log's check (two decimals, the bare floor) reds that beat, while
+  # wire_agrees_with_log holds the wire to the log's reading. A wire a whole step over the floor
+  # still reds.
   require beats_below_floor "$HONEST | .fps | length >= 1 and all(. < \$t.output_fps_floor)" \
     "$HONEST | {checked, above, floor, fps}"
-  require wire_below_floor "$HONEST | .wire | length >= 1 and all(. < \$t.output_fps_floor)" \
-    "$HONEST | {checked: (.wire | length), above: .wire_above, floor, fps: .wire}"
+  require wire_below_floor "$HONEST | .wire_half_step as \$h | .wire | length >= 1 and all(. < \$t.output_fps_floor + \$h)" \
+    "$HONEST | {checked: (.wire | length), above: .wire_above, floor, half_step: .wire_half_step, fps: .wire}"
   require wire_agrees_with_log "$HONEST | .checked >= 1 and .missing == 0 and .disagree == 0" \
     "$HONEST | {checked, tolerance, missing, disagree, pairs}"
   # (c) The alarm clears once the quota is lifted, within realtime_after's window. Of the beats
