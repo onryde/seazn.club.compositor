@@ -17,6 +17,16 @@ gh workflow run soak.yml --ref <branch> -f sha=<40-hex head> -f page=real -f min
 
 `-f guest=performance-8x` puts the compositor Machine on the next size (a soak or a leg).
 
+**The soak's output is 1080p30** (`soak.json` `soak_output`, spelled as a leg's `output`). That is
+production's output since the owner's ruling of 2026-10-27 (ADR 0005's amendment, F-033; web PR
+#1052 serves 1080p when `RELAY_OUTPUT_PROFILE` is unset or blank), so the soak runs what a match
+runs. The first 3 h soak at 1080p, x264 `medium` on performance-6x, passed 15 of 15 checks (run
+40585028513, from a spike branch). `driver.sh` serves the vendored
+`session-composed-<soak_output>.json` (the image carries the 720p and 1080p ones) with bar on
+cricket, and the camera at its size. It refuses (64) a `soak_output` that is empty, absent or names
+no fixture: there is no default output. The cost legs keep their own (`legs`), and the chaos suite
+stays at 720p (the PR #52 review's m11).
+
 ## The pieces
 
 | File | What it is |
@@ -24,13 +34,13 @@ gh workflow run soak.yml --ref <branch> -f sha=<40-hex head> -f page=real -f min
 | `Dockerfile` | The harness Machine's image. The C13 harness image (fake-camera, fake-control, checker) plus MediaMTX (compose.yml's digest), iptables and the driver, under `tini -s`. |
 | `mediamtx.yml` | `harness/mediamtx.yml` on one Machine. SRT `cam` in, RTMP `live/dest` out. Both are recorded: `live/dest` under `/out/rec` (which the checker reads) and `cam` under `/out/camrec` (the sampler's reference). |
 | `driver.sh` | The harness Machine's main process. See its header and "The run" below. |
-| `soak.json` | The soak's own numbers: schedule, waits, ratios and the workflow's margins. The domain's numbers stay in `harness/thresholds.json`. |
+| `soak.json` | The soak's own numbers: schedule, waits, ratios and the workflow's margins, and its output (`soak_output`, above). The domain's numbers stay in `harness/thresholds.json`. |
 | `schedule.jq` | `soak_plan($soak; $drive_s)`: the dropout and disconnect times for a drive. It refuses a plan that cannot hold every action kind. `schedule_plan` picks it, the memory experiment's `dropout_plan`, or `none` (its control) by name. |
 | `verdict.jq`, `verdict.sh` | The verdict over one run's files. `soak.yml` and `test-verdict.sh` call the same command. |
 | `sampler.py` | Check (d): once a minute, compares the programme with the camera-only recording over the camera's still bands (see "The overlay sampler"). |
 | `flylog.py` | Turns the platform's log stream into the `docker logs --timestamps` shape that logfacts reads, plus `logscan.json` for check (b). |
 | `test-verdict.sh` | Runs the verdict on `fixtures/green` (a 30-min miniature; `green-dropouts` and `green-none` are the same run on the experiment's schedules) and on one jq patch per red. Each case asserts its status, its exact failing ids, its reason and the check list. |
-| `test-driver.sh` | Runs the driver under stubs on a 1-minute compressed schedule. It also covers the error path, which holds `/out` until the hard stop, the secrets scan's jars, and cost legs B and C. |
+| `test-driver.sh` | Runs the driver under stubs on a 1-minute compressed schedule. It also covers the error path, which holds `/out` until the hard stop, the secrets scan's jars, cost legs B and C, and `soak_output`: the soak's 1080p session and camera, and its refusals. |
 | `test-sampler.sh` | Runs `sampler.py` on synthetic recordings made with ffmpeg: a moving square and a noise strip, with an overlay bar that goes off air for one minute, a disconnect, and a missing segment. It also covers an all-noise camera and a run with no start. |
 | `test-workflow.sh` | Checks `soak.yml`'s shape: the gate and the plan step, run for real; `--restart no`; the job token; the `always()` destroy; the page source's job. It also runs `flylog.py` on a recorded-shape stream. |
 | `web.Dockerfile` | page=real's harness image: the soak image plus a standalone seazn.club build, node, and Postgres 16 with the migrated database restored at build time. See "The page source". |
@@ -54,7 +64,9 @@ gh workflow run soak.yml --ref <branch> -f sha=<40-hex head> -f page=real -f min
 
 After the checker, the driver runs `sampler.py` on the run's recordings. For each minute it picks
 one instant clear of every dropout and disconnect, and decodes three frames: the programme at that
-instant, the camera, and the camera `control_gap_s` later. Each frame is cut into bands of 40 rows.
+instant, the camera, and the camera `control_gap_s` later. Each frame is scaled to 1280×720 (the
+sampler's own size, whatever the output: 1080p's frames are scaled down) and cut into bands of 40
+rows.
 
 - **A band is stable** when the two camera frames agree in it. On `ball`, that is every band except
   the ball's and the strip's. On a stable band, the camera's frame is the reference whatever the

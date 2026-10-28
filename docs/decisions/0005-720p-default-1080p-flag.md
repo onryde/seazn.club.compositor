@@ -29,5 +29,6 @@ would use about 3 of the 4 cores at steady state.
 - The "Why" above is superseded: F-033 measured 1080p `medium` on 6 CPUs at p95 2.85 to 3.68 cores
   on the worst-case cost legs (peak 4.26), within 75 %, and a 3 h soak (run 40585028513) passed
   15 of 15 checks.
-- Still open: the C15 soak's own session is 720p (`harness/soak/driver.sh`); the 1080p soak ran
-  from a spike branch. The chaos legs stay 720p (the PR #52 review's m11).
+- The C15 soak runs at 1080p: `harness/soak/soak.json`'s `soak_output`, which `driver.sh` serves
+  as the session (the 1080p soak above ran from a spike branch). The chaos legs stay 720p (the
+  PR #52 review's m11).

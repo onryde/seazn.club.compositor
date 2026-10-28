@@ -77,8 +77,9 @@ if [ -n "$SOAK_LEG" ] && [ "$SOAK_SCHEDULE" != soak ]; then
   exit 64
 fi
 # The session fake-control hands out (a vendored relay-job fixture: the output profile), and the
-# overlay's sport and template. The soak: 720p, bar on cricket.
-SESSION_SRC="$SOAK/session-composed-720p.json"
+# overlay's sport and template. The soak: soak.json's soak_output (production's output, 1080p since
+# ADR 0005's 2026-10-27 amendment), bar on cricket; it has no default, so an empty or absent one is
+# refused. A cost leg: its own (soak.json's legs), and it never reads soak_output.
 LEG_SPORT=cricket
 LEG_TEMPLATE=bar
 if [ -n "$SOAK_LEG" ]; then
@@ -89,6 +90,11 @@ if [ -n "$SOAK_LEG" ]; then
   LEG_SPORT="$(jq -r .sport <<<"$leg_spec")"
   LEG_TEMPLATE="$(jq -r .template <<<"$leg_spec")"
   [ -f "$SESSION_SRC" ] || { log "FAIL leg $SOAK_LEG: no session fixture $SESSION_SRC"; exit 64; }
+else
+  soak_output="$(jq -r '.soak_output // empty' "$SOAK/soak.json")"
+  [ -n "$soak_output" ] || { log "FAIL soak.json has no soak_output (the soak's output, spelled as a leg's: 720p, 1080p)"; exit 64; }
+  SESSION_SRC="$SOAK/session-composed-$soak_output.json"
+  [ -f "$SESSION_SRC" ] || { log "FAIL soak_output '$soak_output': no session fixture $SESSION_SRC"; exit 64; }
 fi
 case "$SOAK_PAGE" in
   test) ;;

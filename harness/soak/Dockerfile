@@ -21,8 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends iptables jq pro
     && command -v iptables-nft >/dev/null && command -v ip6tables-nft >/dev/null
 COPY --from=mediamtx /mediamtx /usr/local/bin/mediamtx
 # What fake-control serves and rewrites: the C14 test page and its score timeline (the plumbing
-# page; the production page is an overlayUrl, driver.sh), and the vendored composed sessions (the
-# cost legs' 1080p one too).
+# page; the production page is an overlayUrl, driver.sh), and the vendored composed sessions: the
+# soak's (soak.json's soak_output, 1080p) and the cost legs' (720p and 1080p).
 COPY harness/pages /soak/pages
 COPY contracts/fixtures/relay-job.v1/session-composed-720p.json /soak/session-composed-720p.json
 COPY contracts/fixtures/relay-job.v1/session-composed-1080p.json /soak/session-composed-1080p.json

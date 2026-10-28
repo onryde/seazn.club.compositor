@@ -6,8 +6,11 @@
 # exists. What it proves: the driver's own sequence (live, every scheduled action with its wall
 # time and witness, the end request, the log hand-off, the checker, the secrets scan, done), and
 # that the actions it writes are the plan verdict.jq judges against. The media is soak.yml's run.
-# Runs 3 and 4 (in parallel) take page=real with a stub page source (web/up.sh) and a stub score
-# driver: the session fake-control serves carries the page's URL and token and stays out of /out,
+# Run 1 also serves soak.json's soak_output, the soak's output (1080p: production's output since the
+# owner's ruling of 2026-10-27, ADR 0005's amendment), as the session, unchanged, with the camera at
+# its size; run 3 serves it on page=real. Runs 3 and 4 (in parallel) take page=real with a stub
+# page source (web/up.sh) and a stub score driver: the session fake-control serves carries the
+# page's URL and token and stays out of /out,
 # the deliveries are written, and the secrets scan covers the page source's credentials (run 4
 # plants the page token in /out, and must read as a leak). Run 5 (in parallel too) hangs the checker:
 # the driver stops it at the hard stop's reserve, skips the sampler, and still exits by the hard
@@ -27,7 +30,10 @@
 # leg's names leg). Runs 14 and 15 refuse an unknown schedule and the dropouts schedule on a leg.
 # Run 16 (page=test, in parallel) takes SOAK_SCHEDULE=none (the experiment's control): the start
 # names it, and no dropout, disconnect, camera pause or firewall rule happens in the whole drive.
-# Run 17 refuses the none schedule on a leg.
+# Run 17 refuses the none schedule on a leg. Runs 18, 19 and 20 refuse a soak_output with no session
+# fixture, an empty one and an absent one (64, by name, before any action). Run 21 is leg C with
+# soak_output absent: a leg serves its own output, never reads soak_output, and reaches the next
+# refusal (no page source); leg B serving 720p beside a 1080p soak_output (run 9) is the same rule.
 #
 #   HARNESS_BASH=<bash 5> harness/soak/test-driver.sh     (driver.sh needs bash 5: mapfile, EPOCHREALTIME)
 #
@@ -365,6 +371,13 @@ check "status done" '.[0].phase == "done"' "$W/out/status.json"
 check "fake-control on every address, the private name in the session's origins" \
   '.[0] | test("--listen \\[::\\]:7000") and test("--input-origin srt://m0.vm.soak-test.internal:8890") and test("--overlay-origin http://m0.vm.soak-test.internal:7000")' \
   <(grep '^fake-control ' "$STATE/calls" | jq -R .)
+# The soak's session: soak.json's soak_output, 1080p (production's output, ADR 0005's 2026-10-27
+# amendment), the vendored fixture served unchanged on page=test, and the camera at its size.
+checkx "the soak serves the 1080p fixture, unchanged (soak.json soak_output)" \
+  '.[0] == $want[0] and .[0].output.width == 1920 and .[0].output.height == 1080' \
+  --slurpfile want "$ROOT/contracts/fixtures/relay-job.v1/session-composed-1080p.json" "$W/out/session.json"
+check "the soak's camera at 1920x1080, ball" '.[0] | test("--size 1920x1080 --pattern ball( |$)")' \
+  <(grep '^fake-camera ' "$STATE/calls" | jq -R .)
 
 # Run 2, the error path: fake-control never answers. The driver writes done (not ok, with its exit)
 # and status error, then holds /out until the hard stop (soak.yml fetches on phase error), and exits
@@ -402,10 +415,12 @@ check "real: the page source ran without the run's credentials in its environmen
 check "real: fake-control serves the session under the web state, the page's origin as the overlay's" \
   ".[0] | test(\"--fixture $W/web3/session.json \") and test(\"--overlay-origin http://m0.vm.soak-test.internal:3000 \")" \
   <(grep '^fake-control ' "$W/state3/calls" | jq -R .)
-check "real: the session carries the page's URL, its token as pageToken, the seeded fixture" \
+checkx "real: the session carries the page's URL, its token as pageToken, the seeded fixture, soak_output's (1080p) output and delay" \
   "(.[0]) as \$s | (\$s.overlayUrl == \"$(tr -d '\n' <"$W/web3/overlay-url")\")
      and (\$s.overlayUrl | contains(\"st=\" + \$s.pageToken + \"&\")) and (\$s.pageToken | length > 40)
-     and \$s.fixtureId == \"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\" and \$s.overlayDelayMs == 3100" "$W/web3/session.json"
+     and \$s.fixtureId == \"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\"
+     and \$s.output == \$want[0].output and \$s.output.height == 1080 and \$s.overlayDelayMs == \$want[0].overlayDelayMs" \
+  --slurpfile want "$ROOT/contracts/fixtures/relay-job.v1/session-composed-1080p.json" "$W/web3/session.json"
 checked=$((checked + 1))
 if [ ! -e "$R/session.json" ] && ! grep -rqF "st=" "$R" 2>/dev/null; then echo "PASS real: no session or signed URL in /out"; else
   echo "FAIL real: the session or a signed URL is in /out"; failures=$((failures + 1)); fi
@@ -615,6 +630,43 @@ if [ "$(cat "$W/rc14")" -eq 64 ] && grep -q "FAIL SOAK_SCHEDULE must be soak, dr
   echo "PASS schedules: an unknown schedule, and the dropouts and none schedules on a leg, are refused (64), by name, before any action"
 else
   echo "FAIL schedules: the refusals"; tail -n 3 "$W/driver14.out" "$W/driver15.out" "$W/driver17.out"; failures=$((failures + 1)); fi
+# Runs 18 to 21: soak.json's soak_output, each on its own copy of the driver's files with soak.json
+# changed. 18: an output with no session fixture; 19: empty; 20: absent (both 64, by name, before
+# any action: there is no default output). 21: leg C with soak_output absent, on page=real with no
+# page source: a leg never reads soak_output, so it passes the session's choice and is refused at
+# the page source instead.
+for case in '18|.soak_output = "4k"' '19|.soak_output = ""' '20|del(.soak_output)' '21|del(.soak_output)'; do
+  n="${case%%|*}"
+  mkdir -p "$W/soak$n"
+  cp "$W/soak/driver.sh" "$W/soak/schedule.jq" "$W/soak/session-composed-720p.json" "$W/soak/session-composed-1080p.json" "$W/soak$n/"
+  jq "${case#*|}" "$W/soak/soak.json" >"$W/soak$n/soak.json"
+done
+for case in "18 test -" "19 test -" "20 test -" "21 real C"; do
+  set -- $case
+  leg="$3"
+  [ "$leg" != - ] || leg=""
+  rc=0
+  env -i PATH="$PATH_STUB" HOME="$W" STATE="$W/state$1" SOAK_ROOT="$W/soak$1" SOAK_OUT="$W/out$1" SOAK_WEB_STATE="$W/web$1" \
+    SESSION_ID="11111111-2222-4333-8444-5555555555$1" JOB_TOKEN="$JOB_TOKEN" SOAK_DRIVE_MIN=1 SOAK_DEADLINE_MS=1 \
+    SOAK_HARD_STOP_MS=1 SOAK_PAGE="$2" SOAK_LEG="$leg" FLY_MACHINE_ID=m0 FLY_APP_NAME=soak-test \
+    "$BASH5" "$W/soak$1/driver.sh" >"$W/driver$1.out" 2>&1 || rc=$?
+  echo "$rc" >"$W/rc$1"
+done
+for case in "18|FAIL soak_output '4k': no session fixture $W/soak18/session-composed-4k.json" \
+  "19|FAIL soak.json has no soak_output" "20|FAIL soak.json has no soak_output"; do
+  n="${case%%|*}"
+  checked=$((checked + 1))
+  if [ "$(cat "$W/rc$n")" -eq 64 ] && grep -qF "${case#*|}" "$W/driver$n.out" && [ ! -s "$W/out$n/actions.jsonl" ]; then
+    echo "PASS soak_output run $n ($(jq -c '.soak_output' "$W/soak$n/soak.json")): refused (64), by name, before any action"
+  else
+    echo "FAIL soak_output run $n: exit $(cat "$W/rc$n"), want 64 and \"${case#*|}\""; tail -n 3 "$W/driver$n.out"; failures=$((failures + 1)); fi
+done
+checked=$((checked + 1))
+if [ "$(cat "$W/rc21")" -eq 64 ] && grep -qF "FAIL SOAK_PAGE=real needs the page source" "$W/driver21.out" \
+  && ! grep -q soak_output "$W/driver21.out"; then
+  echo "PASS soak_output run 21: leg C with soak_output absent passes the session's choice (refused later, at the page source)"
+else
+  echo "FAIL soak_output run 21: exit $(cat "$W/rc21")"; tail -n 3 "$W/driver21.out"; failures=$((failures + 1)); fi
 
 checked=$((checked + 1))
 if printf '%s\n' "$JOB_TOKEN" | grep -rqF -f - "$W/out" "$W/out2" "$W/out3" "$W/out4" "$W/out5" "$W/out6" "$W/driver.out" "$W/driver2.out" \
@@ -622,7 +674,7 @@ if printf '%s\n' "$JOB_TOKEN" | grep -rqF -f - "$W/out" "$W/out2" "$W/out3" "$W/
   "$W/state4/calls" "$W/state5/calls" "$W/state6/calls" "$W/state7/calls" "$W/out8" "$W/out9" "$W/out10" "$W/driver8.out" \
   "$W/driver9.out" "$W/driver10.out" "$W/driver11.out" "$W/driver12.out" "$W/state8/calls" "$W/state9/calls" "$W/state10/calls" \
   "$W/out13" "$W/driver13.out" "$W/state13/calls" "$W/driver14.out" "$W/driver15.out" "$W/out16" "$W/driver16.out" \
-  "$W/state16/calls" "$W/driver17.out"; then
+  "$W/state16/calls" "$W/driver17.out" "$W/driver18.out" "$W/driver19.out" "$W/driver20.out" "$W/driver21.out"; then
   echo "FAIL the job token reached a file"
   failures=$((failures + 1))
 else
