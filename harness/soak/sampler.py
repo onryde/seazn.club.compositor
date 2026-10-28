@@ -6,7 +6,8 @@ the camera as published (`cam`), both as fMP4 segments named by their wall-clock
 (`%Y-%m-%d_%H-%M-%S-%f`, UTC). For each minute k of the drive it takes one instant T in that minute,
 clear of every scheduled dropout and disconnect (a paused camera or a dropped destination has no
 honest frame), and decodes three frames: the programme at T, the camera at T, and the camera
-`control_gap_s` later. The frame is cut into bands of `sample_band_rows` rows.
+`control_gap_s` later. A T with no frame to read (no segment, or past its segment's last frame)
+moves on to the minute's next clear offset. The frame is cut into bands of `sample_band_rows` rows.
 
 - A band is STABLE when the two camera frames agree in it (mean absolute difference at most
   `stable_band_max`): the camera's picture does not move there, so the camera at T is that band's
@@ -237,23 +238,27 @@ def main(argv):
     rows = []
     for k in range(minutes):
         base = start_ms + k * every
-        t = next((base + o * 1000 for o in soak["sample_offsets_s"]
-                  if not any(lo <= base + o * 1000 <= hi for lo, hi in windows)), None)
-        row = {"minute": k, "at_ms": t if t is not None else base}
-        if t is None:
-            row.update(differs=False, error="every sample instant falls in a scheduled action")
-        else:
+        clear = [base + o * 1000 for o in soak["sample_offsets_s"]
+                 if not any(lo <= base + o * 1000 <= hi for lo, hi in windows)]
+        row = {"minute": k, "at_ms": base, "differs": False,
+               "error": "every sample instant falls in a scheduled action"}
+        # An instant with no frame to read (no segment, or past its segment's last frame: soak
+        # 40702117071) moves on to the minute's next clear instant, as one in a scheduled action
+        # does. The last instant's error stands when none has a frame.
+        for t in clear:
+            row = {"minute": k, "at_ms": t}
             lp, lc = locate(prog, t, max_len, a.ffprobe), locate(cam, t, max_len, a.ffprobe)
             lc2 = locate(cam, t + soak["control_gap_s"] * 1000, max_len, a.ffprobe)
             if lp is None or lc is None or lc2 is None:
                 row.update(differs=False, error="no " + ("programme" if lp is None else "camera") + " segment at the instant")
-            else:
-                fp, fc, fc2 = frame(a.ffmpeg, *lp), frame(a.ffmpeg, *lc), frame(a.ffmpeg, *lc2)
-                if fp is None or fc is None or fc2 is None:
-                    row.update(differs=False, error="a frame did not decode")
-                else:
-                    row.update(judge(fp, fc, fc2, soak))
-                    row.update(programme=os.path.basename(lp[0]), camera=os.path.basename(lc[0]))
+                continue
+            fp, fc, fc2 = frame(a.ffmpeg, *lp), frame(a.ffmpeg, *lc), frame(a.ffmpeg, *lc2)
+            if fp is None or fc is None or fc2 is None:
+                row.update(differs=False, error="a frame did not decode")
+                continue
+            row.update(judge(fp, fc, fc2, soak))
+            row.update(programme=os.path.basename(lp[0]), camera=os.path.basename(lc[0]))
+            break
         rows.append(row)
     with open(a.out, "w", encoding="utf-8") as f:
         for r in rows:

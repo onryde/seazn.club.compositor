@@ -94,6 +94,25 @@ python3 -I "$HERE/sampler.py" --programme "$W/prog" --camera "$W/cam" --actions 
   --out "$W/x.jsonl" >/dev/null 2>&1 || rc=$?
 [ "$rc" -eq 1 ] && pass "no start action: refused" || fail "no start action" "exit $rc"
 
+# An instant past its segment's last frame (soak 40702117071, minutes 0 and 2: the instant 2-3 ms
+# before the next segment's start, after the earlier one's last frame): the programme's first
+# segment cut to 8 s and named 10 ms late, so minute 1's first instant (8 s) is 7.99 s into a segment
+# whose last frame is at 7.967 s and which ends at 8 s. ffmpeg decodes nothing there. The minute is
+# sampled at its second offset (10 s, in the next segment), as an instant in a scheduled action is.
+mkdir -p "$W/edge"
+cp "$W/prog/"*.mp4 "$W/edge/"
+ffmpeg -v error -nostdin -i "$W/prog/2026-10-24_12-00-00-000000.mp4" -t 8 -c:v libx264 -preset ultrafast -g 30 \
+  -pix_fmt yuv420p "$W/edge/2026-10-24_12-00-00-010000.mp4"
+rm "$W/edge/2026-10-24_12-00-00-000000.mp4"
+rc=0
+python3 -I "$HERE/sampler.py" --programme "$W/edge" --camera "$W/cam" --actions "$W/actions.jsonl" --soak "$W/soak.json" \
+  --out "$W/edge.jsonl" >/dev/null 2>&1 || rc=$?
+jq -e -s ".[1] | .differs and (has(\"error\") | not) and .at_ms == $((t0 + 10000))" "$W/edge.jsonl" >/dev/null 2>&1 \
+  && pass "an instant past its segment's last frame: the minute sampled at its next offset, on air" \
+  || fail "the segment's tail" "exit $rc; $(jq -c -s '.[1]' "$W/edge.jsonl" 2>/dev/null)"
+jq -e -s '.[5].error | test("no programme segment")' "$W/edge.jsonl" >/dev/null 2>&1 \
+  && pass "every instant of a minute without a frame: still an error" || fail "minute 5 with the fallback" "$(jq -c -s '.[5]' "$W/edge.jsonl" 2>/dev/null)"
+
 # The cost legs' stills (--stills/--still-at): a JPEG at each instant, at the programme's own size,
 # taken at that instant (the bar shows at 5 s and is gone at 15 s: its region's mean luma says so),
 # and a missed one where there is no segment (30-40 s).

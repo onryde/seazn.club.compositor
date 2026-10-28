@@ -68,7 +68,10 @@ The cost legs keep their own (`legs`), and the chaos suite stays at 720p (the PR
 
 After the checker, the driver runs `sampler.py` on the run's recordings. For each minute it picks
 one instant clear of every dropout and disconnect, and decodes three frames: the programme at that
-instant, the camera, and the camera `control_gap_s` later. Each frame is scaled to 1280×720 (the
+instant, the camera, and the camera `control_gap_s` later. An instant with no frame to read (no
+segment, or past its segment's last frame, a few ms before the next one starts: soak 40702117071's
+minutes 0 and 2) moves on to the minute's next clear `sample_offsets_s` instant; the minute is an
+error only when none has a frame. Each frame is scaled to 1280×720 (the
 sampler's own size, whatever the output: 1080p's frames are scaled down) and cut into bands of 40
 rows.
 
