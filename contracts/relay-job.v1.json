@@ -113,7 +113,7 @@
           "additionalProperties": false
         },
         "output": {
-          "description": "Composed only: the programme encode. 720p30 (1280×720, 30 fps, 4000 kbps) by default, 1080p30 (1920×1080, 30 fps, 6000 kbps) when flagged (compositor ADR 0005). A compositor refuses any other profile.",
+          "description": "Composed only: the programme encode. 1080p30 (1920×1080, 30 fps, 6000 kbps) by default (owner ruling 2026-10-27, compositor F-033), 720p30 (1280×720, 30 fps, 4000 kbps) when set explicitly (compositor ADR 0005). A compositor refuses any other profile.",
           "type": "object",
           "properties": {
             "width": {

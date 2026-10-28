@@ -1,6 +1,6 @@
 {
   "source": "onryde/seazn.club",
-  "commit": "228a3b705700111d0bb78c2f1b0e3dc3b64b43f9",
+  "commit": "4a9e18095804e8416a95684efedea326eea16a81",
   "files": {
     "fixtures/relay-job.v1/README.md": "614debb1e5ff25a65d2dbe4ef8f017bbadf36028a9dd309bbca60d1063380b1c",
     "fixtures/relay-job.v1/heartbeat-final-fatal.json": "7cd633faeae7fa27cdaca24c2423bd8334f80d8bddafbc84aeb67f6221d8305e",
@@ -28,6 +28,6 @@
     "fixtures/relay-job.v1/session-passthrough.json": "6e26aaaec3701ee50f08efb3044c1fd7192efd130e188c839ac7bbfb016d9f27",
     "fixtures/relay-job.v1/session-refused-delay-absent.json": "175099704a276cbecaf60f0381b100edda842487627203542f79342815267e15",
     "fixtures/relay-job.v1/session-refused-delay-mismatch.json": "3f45d9bba1866f4ef9060bcbcc21e9e5e901380089236616cf983fc052422c0f",
-    "relay-job.v1.json": "284756740ddb7ecf984d5858b19cacb98b3677100e6a69f34bbea4d0c91f97e3"
+    "relay-job.v1.json": "90a21541970c566d71a0634503708643c7c1c8de1d36730b6ca907f396d321fe"
   }
 }
