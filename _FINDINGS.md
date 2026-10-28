@@ -3033,7 +3033,7 @@ encoder-only, offline); the CPU on each Fly host type (only Zen 2 was identified
 
 **Teardown.** `seazn-relay-spike`: the sweep Machine destroyed by hand, the 6x soak's by its
 workflow; 0 Machines after. `seazn-relay-soak`: every run's "Destroy every Machine" step; 0 Machines after run 40533512886. `FLY_API_TOKEN_SPIKE` (a 24 h deploy
-token for `seazn-relay-spike`, made for the 6x soak) is to be deleted from the repo's secrets (`gh secret delete FLY_API_TOKEN_SPIKE`; owner action, open; the token itself expires 2026-10-28 14:07 UTC).
+token for `seazn-relay-spike`, made for the 6x soak) is to be deleted from the repo's secrets (`gh secret delete FLY_API_TOKEN_SPIKE`; owner action, open; the token itself expires 2026-10-28 14:07 UTC). *Closed 2026-10-28: the owner deleted it; `gh secret list` no longer shows it.*
 No stg, prod or product crate changed; the spike branches are `spike/x264-*`, never merged.
 
 ---
