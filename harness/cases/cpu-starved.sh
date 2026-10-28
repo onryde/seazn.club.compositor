@@ -131,11 +131,14 @@ STARVED='less(mark_at("stress_done"); mark_at("stress")) as $w
 #   stress_done] (a beat reads the frames since the beat before it, so the first beat after `stress`
 #   straddles it; a judged beat is starved for its whole window). `reason` says why none is. The
 #   wire's are its beats received in the same span (about 1 ms after the log's line, in CI).
-# - `wire_half_step`: half the wire's 0.1 step, named once ($wire_half): `tolerance` and
-#   wire_below_floor (and `wire_above`, its count) both read it.
+# - `wire_half_step`: half the wire's 0.1 step ($wire_half), beside half the log's 0.01 ($log_half),
+#   each named once: `tolerance` is their sum, and wire_below_floor (and `wire_above`, its count)
+#   reads the wire's.
 # - `pairs`: each judged log beat with the wire beat received within half a beat of it. The two agree
-#   within `tolerance`, the wire's half-step plus half the log's 0.01 (the wire's rounding is pinned
-#   by case_verdicts.rs `the_wire_fps_is_the_reading_to_one_decimal`).
+#   within `tolerance` (the wire's rounding is pinned by case_verdicts.rs
+#   `the_wire_fps_is_the_reading_to_one_decimal`). `missing` counts a judged log beat with no wire
+#   beat, and `wire_only` the reverse: a judged wire beat with no log line (judged or not) within half
+#   a beat of it, so the wire cannot carry a beat the log never printed.
 # - the run's first raise, from `stress`, against the window's span (`window_ms`);
 # - the first clear after that raise, from `stress_done`, against `bound_ms`, realtime_after's window
 #   (BUDGET_LADDER_REALTIME_MS, spec §6's "Real time within 10 s", plus one beat); and `after`, the
@@ -145,17 +148,21 @@ STARVED='less(mark_at("stress_done"); mark_at("stress")) as $w
 # The product compares the raw rate and the log prints two decimals, so a reading in [28.495, 28.5)
 # raises the alarm and reads 28.50 here, `above` (the review's m3). It is rare, not impossible: the
 # window is 0.005 wide, but chaos run 40613627384's judged beats reached 28.46 (not the 17 to 21 fps
-# this comment once assumed), so a red there names the log's print, not the product. A report with no `output_fps` (a checker older than the honest beat) reads no beat,
-# never one.
+# this comment once assumed), so a red there names the log's print, not the product. A report with
+# no `output_fps` (a checker older than the honest beat) reads no beat, never one.
 HONEST='mark_at("stress") as $s | mark_at("stress_done") as $e
   | $t.heartbeat_interval_ms as $hb
   | ($t.budget_ladder_realtime_ms + $t.heartbeat_interval_ms) as $bound
-  | 0.05 as $wire_half | ($wire_half + 0.005) as $tol | (beats // []) as $series
+  | 0.05 as $wire_half | 0.005 as $log_half | ($wire_half + $log_half) as $tol | (beats // []) as $series
   | .log.output_fps as $all | ($all // []) as $b
   | (if $s == null or $e == null then [] else [$b[] | select(.at_ms >= $s + $hb and .at_ms <= $e)] end) as $in
-  | (if $s == null or $e == null then [] else [$series[] | select(.received_ms >= $s + $hb and .received_ms <= $e) | .body.fps | numbers] end) as $wire
+  | (if $s == null or $e == null then [] else [$series[] | select(.received_ms >= $s + $hb and .received_ms <= $e)
+      | select(.body.fps | type == "number")] end) as $wire_beats
+  | ($wire_beats | map(.body.fps)) as $wire
   | [$in[] | . as $l | {log: $l.fps,
       wire: ([$series[] | select(.received_ms > $l.at_ms - $hb / 2 and .received_ms <= $l.at_ms + $hb / 2) | .body.fps | numbers] | first)}] as $pairs
+  | [$wire_beats[] | .received_ms as $w
+      | select([$b[] | select(.at_ms >= $w - $hb / 2 and .at_ms < $w + $hb / 2)] | length == 0)] as $wire_only
   | ((.log.starvation_raised // []) | first) as $r
   | (if $r == null then null else [(.log.starvation_cleared // [])[] | select(.at_ms > $r.at_ms)] | first end) as $c
   | (if $e == null then [] else [$b[] | select(.at_ms >= $e + $hb and .at_ms < $e + $bound)] end) as $after
@@ -168,6 +175,7 @@ HONEST='mark_at("stress") as $s | mark_at("stress_done") as $e
      wire: $wire, wire_half_step: $wire_half,
      wire_above: ($wire | map(select(. >= $t.output_fps_floor + $wire_half)) | length),
      pairs: $pairs, tolerance: $tol, missing: ($pairs | map(select(.wire == null)) | length),
+     wire_only: ($wire_only | length),
      disagree: ($pairs | map(select(.wire != null and ((.wire - .log) | abs) > $tol)) | length),
      floor: $t.output_fps_floor, recovered: $t.output_fps_recovered,
      raises: ((.log.starvation_raised // []) | length), raise_fps: ($r.fps // null),
@@ -245,14 +253,14 @@ case_verdict() {
   # a beat the log shows starved (chaos run 40613627384, PR #103's head: logged 28.46, sent 28.5, the
   # floor itself). Nothing is given up: a reading in [floor, floor + wire_half_step) sends the floor
   # too, and the log's check (two decimals, the bare floor) reds that beat, while
-  # wire_agrees_with_log holds the wire to the log's reading. A wire a whole step over the floor
-  # still reds.
+  # wire_agrees_with_log holds every judged wire beat to a log line (`wire_only`) and to its reading
+  # (`disagree`). A wire a whole step over the floor still reds.
   require beats_below_floor "$HONEST | .fps | length >= 1 and all(. < \$t.output_fps_floor)" \
     "$HONEST | {checked, above, floor, fps}"
   require wire_below_floor "$HONEST | .wire_half_step as \$h | .wire | length >= 1 and all(. < \$t.output_fps_floor + \$h)" \
     "$HONEST | {checked: (.wire | length), above: .wire_above, floor, half_step: .wire_half_step, fps: .wire}"
-  require wire_agrees_with_log "$HONEST | .checked >= 1 and .missing == 0 and .disagree == 0" \
-    "$HONEST | {checked, tolerance, missing, disagree, pairs}"
+  require wire_agrees_with_log "$HONEST | .checked >= 1 and .missing == 0 and .wire_only == 0 and .disagree == 0" \
+    "$HONEST | {checked, tolerance, missing, wire_only, disagree, pairs}"
   # (c) The alarm clears once the quota is lifted, within realtime_after's window. Of the beats
   # whose window lies after the quota in that window, none reads under the floor (the product
   # re-raises only there, so a healthy window a few frames short is no red) and at least one reads

@@ -2475,6 +2475,10 @@ enum Shape {
     /// One judged beat just over the floor whose wire reads a whole step over it
     /// (WIRE_OVER_FLOOR_FPS): a beat that did not read the starvation, on both writers.
     WireOverFloor,
+    /// One judged beat reading the floor itself (thresholds.json's output_fps_floor: logged 28.50,
+    /// sent 28.5): a beat that did not read the starvation, which the wire, read to its half-step,
+    /// cannot tell from 28.46, and the log reds.
+    ReadsTheFloor,
 }
 
 /// The rate CI's case 6 read while the 0.75 quota held (run 40143263604: 17.6 to 20.27 fps over its 7
@@ -2590,7 +2594,7 @@ fn cpu_starved_shaped(done: bool, rung_back: bool, felt: Felt, alarm: AlarmIs, s
     // lies after the quota.
     let at = match shape {
         Shape::Quota => None,
-        Shape::OneFull | Shape::WireAtFloor | Shape::WireOverFloor => {
+        Shape::OneFull | Shape::WireAtFloor | Shape::WireOverFloor | Shape::ReadsTheFloor => {
             readings.iter().filter(|r| r.0 >= a + hb && r.0 <= b).nth(2)
         }
         Shape::StartupDip => readings.get(1),
@@ -2602,6 +2606,7 @@ fn cpu_starved_shaped(done: bool, rung_back: bool, felt: Felt, alarm: AlarmIs, s
             Shape::OneFull => rate,
             Shape::WireAtFloor => WIRE_AT_FLOOR_FPS,
             Shape::WireOverFloor => WIRE_OVER_FLOOR_FPS,
+            Shape::ReadsTheFloor => floor,
             Shape::StartupDip => floor - 1.0,
             Shape::SagsAfter => floor - 0.1,
             Shape::HealthyDip => recovered - 0.1,
@@ -3171,6 +3176,68 @@ fn cpu_starved_reds_a_wire_a_step_over_the_floor() {
             .contains(&json!(sent)),
         "{tag}: {m}"
     );
+}
+
+// The band the wire gives up: a reading at the floor itself sends the floor, which the wire's
+// half-step reads as under it. The log's check (two decimals, the bare floor) reds that beat, and it
+// is the verdict's only red: the writers agree.
+#[test]
+fn cpu_starved_reds_a_beat_at_the_floor_on_the_log_alone() {
+    let tag = "cpu-reads-the-floor";
+    let w = cpu_starved_shaped(true, false, Felt::Honest, AlarmIs::Declared, Shape::ReadsTheFloor);
+    let floor = level(&w, "output_fps_floor");
+    assert_eq!(
+        fps_wire(floor),
+        floor,
+        "the premise: the wire sends the floor as itself"
+    );
+    assert_sim_alarm_is_the_products(&w);
+    let v = judge(&w, "cpu-starved", "", tag);
+    assert_fails(&v, "beats_below_floor", tag);
+    assert_eq!(
+        failed_checks(&v),
+        vec![json!("beats_below_floor")],
+        "{tag}: the log's check is the only red (wire_below_floor and wire_agrees_with_log pass)"
+    );
+    let m = &v.json["measures"];
+    eprintln!(
+        "{tag}: logged {}, sent {}",
+        m["beats_below_floor"]["fps"], m["wire_below_floor"]["fps"]
+    );
+    assert_eq!(m["beats_below_floor"]["above"], 1, "{tag}: {m}");
+    assert_eq!(m["wire_below_floor"]["above"], 0, "{tag}: {m}");
+    for check in ["beats_below_floor", "wire_below_floor"] {
+        assert!(
+            m[check]["fps"].as_array().unwrap().contains(&json!(floor)),
+            "{tag}: the floor is not among {check}'s beats: {m}"
+        );
+    }
+}
+
+// The pairing the other way: a judged wire beat with no log line within half a beat of it. A reading
+// at the floor whose log line is lost leaves the wire's 28.5 alone, under the wire's half-step, so
+// only wire_agrees_with_log (`wire_only`) can red it.
+#[test]
+fn cpu_starved_reds_a_wire_beat_the_log_never_printed() {
+    let tag = "cpu-wire-only";
+    let mut w = cpu_starved_shaped(true, false, Felt::Honest, AlarmIs::Declared, Shape::ReadsTheFloor);
+    let floor = level(&w, "output_fps_floor");
+    let line = format!("{BEAT_LINE}{floor:.2} ");
+    let before = w.log.len();
+    w.log.retain(|(_, m)| !m.starts_with(&line));
+    assert_eq!(before - w.log.len(), 1, "{tag}: the floor's beat is one log line");
+    let v = judge(&w, "cpu-starved", "", tag);
+    assert_fails(&v, "wire_agrees_with_log", tag);
+    assert_eq!(
+        failed_checks(&v),
+        vec![json!("wire_agrees_with_log")],
+        "{tag}: the wire-only beat is that check's red alone"
+    );
+    let a = &v.json["measures"]["wire_agrees_with_log"];
+    eprintln!("{tag}: wire_only {}, missing {}", a["wire_only"], a["missing"]);
+    assert_eq!(a["wire_only"], 1, "{tag}: {a}");
+    assert_eq!(a["missing"], 0, "{tag}: {a}");
+    assert_eq!(a["disagree"], 0, "{tag}: {a}");
 }
 
 // The ladder's logic is unchanged (the owner's ruling, no ladder change; the coordinator, medium,
