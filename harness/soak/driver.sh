@@ -96,6 +96,14 @@ else
   SESSION_SRC="$SOAK/session-composed-$soak_output.json"
   [ -f "$SESSION_SRC" ] || { log "FAIL soak_output '$soak_output': no session fixture $SESSION_SRC"; exit 64; }
 fi
+# The served session's frame rate is the one thresholds.json's frame_period_ms was dumped from: the
+# verdict's dropped-frame budget reads that period (verdict.jq), and nothing else ties the two. The
+# same division as the domain's frame_period_ms (1_000.0 / fps, config.rs), so they agree exactly
+# or not at all. A session or thresholds file that cannot be read is refused the same way.
+jq -e --slurpfile t "$SOAK/thresholds.json" '1000 / .output.fps == $t[0].frame_period_ms' "$SESSION_SRC" >/dev/null 2>&1 || {
+  log "FAIL the session's frame rate is not thresholds.json's: $(basename "$SESSION_SRC") fps $(jq -r .output.fps "$SESSION_SRC" 2>&1), frame_period_ms $(jq -r .frame_period_ms "$SOAK/thresholds.json" 2>&1)"
+  exit 64
+}
 case "$SOAK_PAGE" in
   test) ;;
   real) [ -x "$SOAK/web/up.sh" ] || { log "FAIL SOAK_PAGE=real needs the page source ($SOAK/web/up.sh: the web image)"; exit 64; } ;;

@@ -25,7 +25,7 @@ what they would in production.
 
 | What | When |
 |---|---|
-| Duration | 3 h at 720p30 |
+| Duration | 3 h at ~~720p30~~ 1080p30 (amended 2026-10-28: ADR 0005's 2026-10-27 amendment makes 1080p30 production's output; `harness/soak/soak.json` `soak_output`) |
 | Scripted match | every 20 min: fake-control replays `score.json` from the start, so the overlay index restarts at 0 |
 | Camera dropout | every 5 min: `POST camera /pause`, then `/resume` 10 s later |
 | Dest disconnect | once per hour, at minute 30: `iptables -I INPUT -p tcp --dport 1935 -j DROP` for 30 s, then `-D` |

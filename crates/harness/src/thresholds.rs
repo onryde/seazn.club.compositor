@@ -185,7 +185,9 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     put("heartbeat_interval_ms", json!(heartbeat_interval_ms));
     put("bootstrap_backoff_base_ms", json!(bootstrap_backoff_base_ms));
     put("bootstrap_backoff_cap_ms", json!(bootstrap_backoff_cap_ms));
-    // The domain's named consts, and the harness session's frame period (720p30, the fixture's).
+    // The domain's named consts, and the harness sessions' frame period: P720's, the 30 fps both
+    // profiles share (the chaos fixture is 720p30, the soak's 1080p30). soak/driver.sh refuses a
+    // served session whose fps differs, since the soak verdict's dropped-frame budget reads it.
     put("encoder_speed_realtime_min", json!(ENCODER_SPEED_REALTIME_MIN));
     put("output_gap_budget_ms", json!(OUTPUT_GAP_BUDGET_MS));
     // rtmp2sink's `timeout`, which C09 sets: the only detector of a destination stall (Owed 87).
