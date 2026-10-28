@@ -512,14 +512,29 @@ expect "verdict green: one renderer before the kill and one after (no held page 
 expect "verdict green: the tree, the renderer, the busiest thread, the encoder" "$W/green.json" \
   '.[0].row | .cats_avg.renderer == 0.05 and .top_thread == {name: "x264enc:src", p95: 0.4, max: 0.4}
    and .encoder_speed == {median: 1, min: 1} and .dropped_final == 0'
-expect "verdict green: Owed 93, two held pages at the live renderer's cost: 1.0 + 2 x 0.05 within 2.0" "$W/green.json" \
-  '.[0].owed93 == {renderer_avg: 0.05, p95_plus_two_held: 1.1, size_rule_max: 2, within: true}'
+expect "verdict green: Owed 93, two held pages at the live renderer's cost: 1.0 + 2 x 0.05 within 3.0" "$W/green.json" \
+  '.[0].owed93 == {renderer_avg: 0.05, p95_plus_two_held: 1.1, size_rule_max: 3, within: true}'
 grep -qF "line(s) of cost-samples.jsonl not a JSON object: dropped" "$W/green.txt" \
   && pass "verdict green: the lines that are not JSON objects are dropped and counted" || fail "verdict green: dropped lines" "$(head -n 3 "$W/green.txt")"
 legdir "$W/legs/at-max" cpu-at-max
 "$V" --dir "$W/legs/at-max" --leg A --camera snow --guest performance-4x >"$W/at-max.json" 2>/dev/null \
-  && expect "verdict: a p95 of exactly 2.0 cores passes (at most 50 %)" "$W/at-max.json" '.[0].row.machine.p95 == 2 and .[0].status == "pass"' \
-  || fail "verdict: a p95 of exactly 2.0" "$(jq -c '.checks[] | select(.status == "fail")' "$W/at-max.json")"
+  && expect "verdict: a p95 of exactly 3.0 cores passes (at most 75 %)" "$W/at-max.json" '.[0].row.machine.p95 == 3 and .[0].status == "pass"' \
+  || fail "verdict: a p95 of exactly 3.0" "$(jq -c '.checks[] | select(.status == "fail")' "$W/at-max.json")"
+# The same rule on 6 CPUs (owner ruling 2026-10-27: 0.75 x 6 = 4.5 cores): exactly 4.5 passes, 4.6
+# fails the cpu check alone, and the check names the share and the cores.
+legdir "$W/legs/six-at-max" cpu6-at-max
+"$V" --dir "$W/legs/six-at-max" --leg A --camera snow --guest performance-6x >"$W/six-at-max.json" 2>/dev/null \
+  && expect "verdict: on performance-6x a p95 of exactly 4.5 cores passes, the check read as 75 % of 6 cores (4.5)" "$W/six-at-max.json" \
+    '.[0] | .cpus == 6 and .row.machine.p95 == 4.5 and .status == "pass"
+     and ([.checks[] | select(.id == "cpu") | .name] == ["Machine CPU p95 at most 75 % of 6 cores (4.5)"])' \
+  || fail "verdict: a p95 of exactly 4.5 on performance-6x" "$(jq -c '[.checks[] | select(.status == "fail") | {id, reason}]' "$W/six-at-max.json" 2>/dev/null)"
+legdir "$W/legs/six-over" cpu6-over
+rc=0
+"$V" --dir "$W/legs/six-over" --leg A --camera snow --guest performance-6x >"$W/six-over.json" 2>/dev/null || rc=$?
+[ "$rc" -eq 1 ] && expect "verdict red: on performance-6x a p95 of 4.6 cores fails the cpu check alone (over 4.5)" "$W/six-over.json" \
+    '.[0] | .status == "fail" and [.checks[] | select(.status == "fail") | .id] == ["cpu"]
+     and ((.checks[] | select(.id == "cpu") | .reason) | contains("p95 4.6 cores, over 4.5"))' \
+  || fail "verdict red: 4.6 on performance-6x" "exit $rc, $(jq -c '[.checks[] | select(.status == "fail") | {id, reason}]' "$W/six-over.json" 2>/dev/null)"
 "$V" --dir "$W/legs/green" --leg A --camera snow --guest performance-8x >"$W/8x.json" 2>/dev/null && rc=0 || rc=$?
 expect "verdict: the same samples judged as performance-8x fail on the CPU count (4 read, 8 asked)" "$W/8x.json" \
   '.[0] | .status == "fail" and [.checks[] | select(.status == "fail") | .id] == ["samples"]'
@@ -547,7 +562,7 @@ red_among() {
     fail "verdict red: $1" "exit $rc, $(jq -c '[.checks[] | select(.status == "fail") | {id, reason}]' "$W/$2.json" 2>/dev/null)"
   fi
 }
-red "a p95 over 2.0 cores" cpu-over cpu "p95 2.1 cores, over 2"
+red "a p95 over 3.0 cores" cpu-over cpu "p95 3.1 cores, over 3"
 red "a stepped beat" stepped rung "1 beat(s) off full (overlay_half_rate"
 red "pre-encoder drops" drops drops "droppedFrames reached 3"
 red "fewer than one moment a minute" few-moments moments "9 moments in 10 min"

@@ -49,11 +49,11 @@
 # The programme clock (the window's recorded frame rate against BUDGET_FPS_MEAN_MIN, the recording's
 # PTS gaps, the scheduled changes shown) is MEASURED in this case, not judged: the owner, 2026-10-25,
 # "A" (relayed by the coordinator; docs/_INDEX.md Owed 86). The quota starves the CPU below what
-# performance-4x is sized for, with the ladder and lite mode ruled out, so nothing in the product
-# holds spec §9.4's "clock holds" here; the viewer's quality on real CPU is gated by the soak and by
-# C15's cost legs. The three values and their sample counts are printed, and a clock read on nothing
-# is a red (`clock_measured`). Every other case keeps its clock checks. The encoder is back
-# at realtime within BUDGET_LADDER_REALTIME_MS of the end; the score stays on air (no overlay-less
+# the production guest is sized for, with the ladder and lite mode ruled out, so nothing in the
+# product holds spec §9.4's "clock holds" here; the viewer's quality on real CPU is gated by the
+# soak and by C15's cost legs. The three values and their sample counts are printed, and a clock
+# read on nothing is a red (`clock_measured`). Every other case keeps its clock checks. The encoder
+# is back at realtime within BUDGET_LADDER_REALTIME_MS of the end; the score stays on air (no overlay-less
 # frame); every rung is full or overlay_half_rate and never back to full after a step (C05). The last
 # beat's rung is printed. 720p only, as every chaos leg: the harness session is the 720p fixture (a
 # 1080p leg is owed with a 1080p fixture; the PR #52 review's m11).
@@ -255,10 +255,10 @@ case_verdict() {
   # its bottom below.
   require ladder_justified "$LADDER | .justified" "$LADDER"
   # The programme clock under the induced starvation: MEASURED here, never gated (the owner,
-  # 2026-10-25, "A", relayed by the coordinator). The case starves the CPU below what performance-4x
-  # is sized for, with the ladder and lite mode ruled out, so spec §9.4's "clock holds" is not this
-  # case's gate: the viewer's quality on real CPU is gated by the soak (overlay on air 25/25) and by
-  # C15's cost legs (the size rule; the owner's 2026-10-18 rule, "measure, and raise the CPU size").
+  # 2026-10-25, "A", relayed by the coordinator). The case starves the CPU below what the production
+  # guest is sized for, with the ladder and lite mode ruled out, so spec §9.4's "clock holds" is not
+  # this case's gate: the viewer's quality on real CPU is gated by the soak (overlay on air 25/25) and
+  # by C15's cost legs (the size rule; the owner's 2026-10-18 rule, "measure, and raise the CPU size").
   # Every other case keeps its own clock checks. The three are shown here and, through CASE_KEY, in
   # run-chaos.sh's table; each carries its sample count, and a clock read on nothing (no window, no
   # recording, no scheduled change) is `clock_measured`'s red.

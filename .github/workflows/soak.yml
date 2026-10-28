@@ -1,6 +1,6 @@
 name: soak
 # The run list reads what the run can prove: a page=test run is PLUMBING ONLY, never a soak pass.
-run-name: ${{ inputs.legs != '' && format('cost legs {0} on {1}, {2} min{3}', inputs.legs, inputs.guest, inputs.minutes, inputs.malloc_arena_max != '' && format(', MALLOC_ARENA_MAX={0}', inputs.malloc_arena_max) || '') || format('soak page={0} {1} min{2}{3}{4}{5}', inputs.page, inputs.minutes, inputs.page == 'test' && ' (PLUMBING ONLY)' || '', inputs.guest != 'performance-4x' && format(' on {0}', inputs.guest) || '', inputs.schedule == 'dropouts' && ', dropouts only' || inputs.schedule == 'none' && ', no dropouts (the control)' || '', inputs.malloc_arena_max != '' && format(', MALLOC_ARENA_MAX={0}', inputs.malloc_arena_max) || '') }}
+run-name: ${{ inputs.legs != '' && format('cost legs {0} on {1}, {2} min{3}', inputs.legs, inputs.guest, inputs.minutes, inputs.malloc_arena_max != '' && format(', MALLOC_ARENA_MAX={0}', inputs.malloc_arena_max) || '') || format('soak page={0} {1} min{2}{3}{4}{5}', inputs.page, inputs.minutes, inputs.page == 'test' && ' (PLUMBING ONLY)' || '', inputs.guest != 'performance-6x' && format(' on {0}', inputs.guest) || '', inputs.schedule == 'dropouts' && ', dropouts only' || inputs.schedule == 'none' && ', no dropouts (the control)' || '', inputs.malloc_arena_max != '' && format(', MALLOC_ARENA_MAX={0}', inputs.malloc_arena_max) || '') }}
 # The soak (C15, docs/tasks/C15-soak.md, spec 9.5): the real relay image on the production guest, as
 # one Fly Machine, against a harness Machine beside it (harness/soak: MediaMTX, fake-camera,
 # fake-control, the checker and driver.sh), in the dedicated app seazn-relay-soak. This job drives
@@ -78,10 +78,10 @@ on:
         required: false
         default: ""
       guest:
-        description: "The compositor Machine's guest (soak.json compositor_guest; production's is performance-4x)"
+        description: "The compositor Machine's guest (soak.json compositor_guest; production's is performance-6x)"
         type: choice
-        options: [performance-4x, performance-8x]
-        default: performance-4x
+        options: [performance-4x, performance-6x, performance-8x]
+        default: performance-6x
       schedule:
         description: "soak (dropouts and disconnects, schedule.jq's soak_plan), dropouts (the memory experiment: camera dropouts every 125 s, no disconnect) or none (its control: nothing in the drive)"
         type: choice

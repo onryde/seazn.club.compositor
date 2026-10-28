@@ -130,12 +130,12 @@ grep -qF 'guest: {cpu_kind: "performance", cpus: ($ENV.C_CPUS | tonumber), memor
   && grep -qF 'run_machine "$name_c" "registry.fly.io/$FLY_APP:relay-$SHA" "$RUNNER_TEMP/compositor.machine.json" "$C_CPUS" "$C_MEM"' <<<"$launch" \
   && grep -qF 'COMPOSITOR_DRIVERS: "live"' <<<"$launch" \
   && pass "the compositor: performance, the plan's CPUs and memory in its config and its run line, live drivers" || fail "the compositor's guest"
-check "the compositor's guest: the input, production's performance-4x by default, through the plan to the soak job" \
-  '((.on // .["true"]).workflow_dispatch.inputs.guest | .default == "performance-4x" and .options == ["performance-4x", "performance-8x"])
+check "the compositor's guest: the input, production's performance-6x by default, through the plan to the soak job" \
+  '((.on // .["true"]).workflow_dispatch.inputs.guest | .default == "performance-6x" and .options == ["performance-4x", "performance-6x", "performance-8x"])
    and .jobs.soak.env.C_CPUS == "${{ needs.plan.outputs.c_cpus }}" and .jobs.soak.env.C_MEM == "${{ needs.plan.outputs.c_mem }}"
    and .jobs.plan.outputs.c_cpus == "${{ steps.runs.outputs.c_cpus }}" and .jobs.soak.env.GUEST == "${{ inputs.guest }}"'
-jq -e '.compositor_guest == {"performance-4x": {cpus: 4, memory_mb: 8192}, "performance-8x": {cpus: 8, memory_mb: 16384}}' "$HERE/soak.json" >/dev/null \
-  && pass "soak.json: performance-4x is 4 CPUs, 8192 MB (R1's RUNNER_DEFAULT_GUEST), performance-8x 8 and 16384" || fail "soak.json's compositor_guest"
+jq -e '.compositor_guest == {"performance-4x": {cpus: 4, memory_mb: 8192}, "performance-6x": {cpus: 6, memory_mb: 12288}, "performance-8x": {cpus: 8, memory_mb: 16384}}' "$HERE/soak.json" >/dev/null \
+  && pass "soak.json's compositor_guest: performance-4x 4 CPUs, 8192 MB; performance-6x 6, 12288; performance-8x 8, 16384" || fail "soak.json's compositor_guest"
 # Check 1.projection budgets the production guest's memory at most: soak.json names it, and it is
 # the workflow's default guest and one of compositor_guest's.
 pg="$(jq -r '.memory_projection.production_guest' "$HERE/soak.json")"
@@ -241,7 +241,7 @@ check "run-name: the page and the minutes, PLUMBING ONLY on page=test; the cost 
    and contains("format('"'"'cost legs {0} on {1}, {2} min{3}'"'"', inputs.legs, inputs.guest, inputs.minutes, inputs.malloc_arena_max != '"'"''"'"' && format('"'"', MALLOC_ARENA_MAX={0}'"'"', inputs.malloc_arena_max)")
    and ([scan("inputs.malloc_arena_max != '"'"''"'"' && format\\('"'"', MALLOC_ARENA_MAX=\\{0\\}'"'"', inputs.malloc_arena_max\\)")] | length == 2)
    and (contains("gst_tracers") | not)
-   and contains("inputs.guest != '"'"'performance-4x'"'"' && format('"'"' on {0}'"'"', inputs.guest)")'
+   and contains("inputs.guest != '"'"'performance-6x'"'"' && format('"'"' on {0}'"'"', inputs.guest)")'
 grep -qF '# PLUMBING ONLY — NOT A SOAK PASS' <<<"$verdict" && pass "the step summary heads a plumbing run PLUMBING ONLY" || fail "the summary heading"
 check "the page source's artifact: one name per run, replaced by a re-run (no run_attempt)" \
   '[.jobs.web.steps[], .jobs.images.steps[] | select((.uses // "") | test("actions/(up|down)load-artifact")) | .with]
@@ -318,9 +318,9 @@ runs() { # <legs> <camera> <page> <guest> [schedule, default soak]: the runs ste
     bash -eo pipefail -c "$runs_step" >"$W/runs.err" 2>&1)
 }
 out() { sed -n "s/^$1=//p" "$W/runs.out"; }
-runs "" ball test performance-4x && [ "$(out mode)" = soak ] && [ "$(out runs)" = '[{"leg":"","camera":"ball"}]' ] \
-  && [ "$(out c_cpus)" = 4 ] && [ "$(out c_mem)" = 8192 ] \
-  && pass "runs: no legs is the soak, one run, on performance-4x" || fail "runs: the soak" "$(cat "$W/runs.out")"
+runs "" ball test performance-6x && [ "$(out mode)" = soak ] && [ "$(out runs)" = '[{"leg":"","camera":"ball"}]' ] \
+  && [ "$(out c_cpus)" = 6 ] && [ "$(out c_mem)" = 12288 ] \
+  && pass "runs: no legs is the soak, one run, on performance-6x (6 CPUs, 12288 MB)" || fail "runs: the soak" "$(cat "$W/runs.out")"
 runs "A:snow,A:noise" ball real performance-4x && [ "$(out mode)" = legs ] \
   && [ "$(out runs)" = '[{"leg":"A","camera":"snow"},{"leg":"A","camera":"noise"}]' ] \
   && pass "runs: A:snow,A:noise is two runs of leg A, a camera each" || fail "runs: A:snow,A:noise" "$(cat "$W/runs.out")"
