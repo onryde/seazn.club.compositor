@@ -61,7 +61,7 @@ const AAC_BITRATE: i32 = 128_000;
 /// `slow` within 0.8. Every 1080p `medium` cost leg ran real time with 0 drops (4 CPUs: D:noise;
 /// 6 CPUs: C:noise, D:noise, D:snow; C:snow's beats unfetched). Only the one-host sweep, on raw
 /// per-pixel noise, fell behind (48.3 to 50.4 s for 45 s of frames), its cause not settled. It drives
-/// 720p too. Open: no 3 h soak of 1080p `medium` on 6 CPUs yet. The rest are the settings C00
+/// 720p too. A 3 h soak of 1080p `medium` on 6 CPUs passed (F-033). The rest are the settings C00
 /// measured real time (F-005): `zerolatency`, a 2 s keyframe interval, no B-frames (F-004), a
 /// 1 000 ms VBV and CBR with filler (POC values).
 const X264_SPEED_PRESET: &str = "medium";
