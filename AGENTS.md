@@ -42,7 +42,8 @@ Everything in spec §12 is **R4, and is refused, not half-built**: page moments 
 rules and proof-of-play, console additions, the warm pool and hot standby, and the pilot. A "small
 start" on any of them is a scope breach. Raise it; don't build it.
 
-Output is 720p30 by default with a 1080p30 flag (ADR 0005). CEF always renders the page at 1920×1080.
+Output is 1080p30 by default with a 720p30 flag (ADR 0005, amended 2026-10-27; F-033). CEF always renders
+the page at 1920×1080.
 
 ## 3. Layering — enforced, not documented
 
