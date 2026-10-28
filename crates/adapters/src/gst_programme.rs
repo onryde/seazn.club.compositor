@@ -56,13 +56,14 @@ const APPSRC_TICKS: u64 = 3;
 /// AAC-LC at 128 kbps (F-004: the verified fix encodes the input's audio at AAC-LC 128 kbps, 48 kHz,
 /// stereo).
 const AAC_BITRATE: i32 = 128_000;
-/// x264's preset (owner ruling 2026-10-27 on F-033: 1080p `medium` on 6 CPUs). F-033: `fast` and
-/// `medium` score within 0.5 VMAF of `faster`, `slow` within 0.8; at 1080p on noise `medium` fell
-/// behind real time on one 4-CPU host (50.4 s for 45 s of frames), inferred to be x264's thread split;
-/// on 6 CPUs its legs ran real time with 0 drops (one leg's beats unfetched), within the 75 % size
-/// rule. It drives 720p too. Open: no 3 h soak of 1080p `medium` on 6 CPUs yet. The rest are the
-/// settings C00 measured real time (F-005): `zerolatency`, a 2 s keyframe interval, no B-frames
-/// (F-004), a 1 000 ms VBV and CBR with filler (POC values).
+/// x264's preset (owner ruling 2026-10-27 on F-033: 1080p `medium` on 6 CPUs, which keeps every 1080p
+/// leg within the 75 % size rule). F-033: `fast` and `medium` score within 0.5 VMAF of `faster`,
+/// `slow` within 0.8. Every 1080p `medium` cost leg ran real time with 0 drops (4 CPUs: D:noise;
+/// 6 CPUs: C:noise, D:noise, D:snow; C:snow's beats unfetched). Only the one-host sweep, on raw
+/// per-pixel noise, fell behind (48.3 to 50.4 s for 45 s of frames), its cause not settled. It drives
+/// 720p too. Open: no 3 h soak of 1080p `medium` on 6 CPUs yet. The rest are the settings C00
+/// measured real time (F-005): `zerolatency`, a 2 s keyframe interval, no B-frames (F-004), a
+/// 1 000 ms VBV and CBR with filler (POC values).
 const X264_SPEED_PRESET: &str = "medium";
 const X264_TUNE: &str = "zerolatency";
 const X264_VBV_MS: u32 = 1_000;
