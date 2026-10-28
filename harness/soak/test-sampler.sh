@@ -75,7 +75,7 @@ s '.[5].error | test("no programme segment")' && pass "minute 5: no programme se
 rc=0
 python3 -I "$HERE/sampler.py" --programme "$W/prog" --camera "$W/noise" --actions "$W/actions.jsonl" --soak "$W/soak.json" \
   --out "$W/noise.jsonl" >/dev/null 2>&1 || rc=$?
-jq -e -s '(map(.differs) | any | not) and ([.[0,1,2,3,4] | .error | test("no stable band")] | all)' "$W/noise.jsonl" >/dev/null 2>&1 \
+jq -e -s ".[0].at_ms == $((t0 + 2000)) and (map(.differs) | any | not) and ([.[0,1,2,3,4] | .error | test(\"no stable band\")] | all)" "$W/noise.jsonl" >/dev/null 2>&1 \
   && pass "a noise camera: no stable band, never on air" || fail "the noise camera" "exit $rc; $(jq -c -s 'map({differs, error})' "$W/noise.jsonl" 2>/dev/null)"
 
 s '[.[0,1,3,4] | .median_diff < 2] | all' && pass "on air: the floor (median_diff) stays under 2 where only the bar differs" \
@@ -84,7 +84,7 @@ s '[.[0,1,3,4] | .median_diff < 2] | all' && pass "on air: the floor (median_dif
 rc=0
 python3 -I "$HERE/sampler.py" --programme "$W/shift" --camera "$W/cam" --actions "$W/actions.jsonl" --soak "$W/soak.json" \
   --out "$W/shift.jsonl" >/dev/null 2>&1 || rc=$?
-jq -e -s '(map(.differs) | any | not) and ([.[0,1,2,3,4] | .median_diff >= 4 and (.error | test("level shift"))] | all)' "$W/shift.jsonl" >/dev/null 2>&1 \
+jq -e -s ".[0].at_ms == $((t0 + 2000)) and (map(.differs) | any | not) and ([.[0,1,2,3,4] | .median_diff >= 4 and (.error | test(\"level shift\"))] | all)" "$W/shift.jsonl" >/dev/null 2>&1 \
   && pass "a level-shifted programme with no overlay: never on air, a level-shift error" \
   || fail "the level shift" "exit $rc; $(jq -c -s 'map({differs, region_diff, median_diff, error})' "$W/shift.jsonl" 2>/dev/null)"
 
@@ -110,8 +110,33 @@ python3 -I "$HERE/sampler.py" --programme "$W/edge" --camera "$W/cam" --actions 
 jq -e -s ".[1] | .differs and (has(\"error\") | not) and .at_ms == $((t0 + 10000))" "$W/edge.jsonl" >/dev/null 2>&1 \
   && pass "an instant past its segment's last frame: the minute sampled at its next offset, on air" \
   || fail "the segment's tail" "exit $rc; $(jq -c -s '.[1]' "$W/edge.jsonl" 2>/dev/null)"
-jq -e -s '.[5].error | test("no programme segment")' "$W/edge.jsonl" >/dev/null 2>&1 \
-  && pass "every instant of a minute without a frame: still an error" || fail "minute 5 with the fallback" "$(jq -c -s '.[5]' "$W/edge.jsonl" 2>/dev/null)"
+jq -e -s ".[5] | (.error | test(\"no programme segment\")) and .at_ms == $((t0 + 34000))" "$W/edge.jsonl" >/dev/null 2>&1 \
+  && pass "every instant of a minute without a frame: the last instant's error stands" \
+  || fail "minute 5 with the fallback" "$(jq -c -s '.[5]' "$W/edge.jsonl" 2>/dev/null)"
+# The same edge with one offset (2 s): minute 1's only instant is 8 s, and its error is the decode
+# path's (not the no-segment path's), so the fallback above was taken from a decode failure.
+jq '. + {sample_offsets_s: [2]}' "$W/soak.json" >"$W/soak-one.json"
+rc=0
+python3 -I "$HERE/sampler.py" --programme "$W/edge" --camera "$W/cam" --actions "$W/actions.jsonl" --soak "$W/soak-one.json" \
+  --out "$W/edge-one.jsonl" >/dev/null 2>&1 || rc=$?
+jq -e -s ".[1] | .differs == false and .error == \"a frame did not decode\" and .at_ms == $((t0 + 8000))" "$W/edge-one.jsonl" >/dev/null 2>&1 \
+  && pass "the edge's first instant fails on the decode, not on a missing segment" \
+  || fail "the edge's failure path" "exit $rc; $(jq -c -s '.[1]' "$W/edge-one.jsonl" 2>/dev/null)"
+
+# A judged off-air sample is never retried: offsets 5 and 7 s put minute 2's instants at 17 s (the bar
+# gone, 12-18 s) and 19 s (the bar back). The minute is read at 17 s, off air, with no error; a retry
+# until on air would read 19 s.
+jq '. + {sample_offsets_s: [5, 7]}' "$W/soak.json" >"$W/soak-57.json"
+grep '"start"' "$W/actions.jsonl" >"$W/startonly.jsonl"
+rc=0
+python3 -I "$HERE/sampler.py" --programme "$W/prog" --camera "$W/cam" --actions "$W/startonly.jsonl" --soak "$W/soak-57.json" \
+  --out "$W/offair.jsonl" >/dev/null 2>&1 || rc=$?
+jq -e -s ".[2] | .differs == false and (has(\"error\") | not) and .at_ms == $((t0 + 17000))" "$W/offair.jsonl" >/dev/null 2>&1 \
+  && pass "an off-air sample is the minute's: not retried at the next instant" \
+  || fail "the off-air minute" "exit $rc; $(jq -c -s '.[2]' "$W/offair.jsonl" 2>/dev/null)"
+jq -e -s ".[3] | .differs and .at_ms == $((t0 + 23000))" "$W/offair.jsonl" >/dev/null 2>&1 \
+  && pass "the same offsets read on air where the bar is (minute 3, 23 s): the off-air read is the bar's" \
+  || fail "the on-air control" "$(jq -c -s '.[3]' "$W/offair.jsonl" 2>/dev/null)"
 
 # The cost legs' stills (--stills/--still-at): a JPEG at each instant, at the programme's own size,
 # taken at that instant (the bar shows at 5 s and is gone at 15 s: its region's mean luma says so),

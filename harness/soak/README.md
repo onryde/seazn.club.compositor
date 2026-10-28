@@ -45,7 +45,7 @@ The cost legs keep their own (`legs`), and the chaos suite stays at 720p (the PR
 | `flylog.py` | Turns the platform's log stream into the `docker logs --timestamps` shape that logfacts reads, plus `logscan.json` for check (b). |
 | `test-verdict.sh` | Runs the verdict on `fixtures/green` (a 30-min miniature; `green-dropouts` and `green-none` are the same run on the experiment's schedules) and on one jq patch per red. Each case asserts its status, its exact failing ids, its reason and the check list. |
 | `test-driver.sh` | Runs the driver under stubs on a 1-minute compressed schedule. It also covers the error path, which holds `/out` until the hard stop, the secrets scan's jars, cost legs B and C, and `soak_output`: the soak's 1080p session and camera, and its refusals, and the frame-rate refusal against `thresholds.json`. |
-| `test-sampler.sh` | Runs `sampler.py` on synthetic recordings made with ffmpeg: a moving square and a noise strip, with an overlay bar that goes off air for one minute, a disconnect, and a missing segment. It also covers an all-noise camera and a run with no start. |
+| `test-sampler.sh` | Runs `sampler.py` on synthetic recordings made with ffmpeg: a moving square and a noise strip, with an overlay bar that goes off air for one minute, a disconnect, and a missing segment. It also covers an all-noise camera, a run with no start, an instant past its segment's last frame (the minute moves to its next instant), and an off-air sample that is never retried. |
 | `test-workflow.sh` | Checks `soak.yml`'s shape: the gate and the plan step, run for real; `--restart no`; the job token; the `always()` destroy; the page source's job. It also runs `flylog.py` on a recorded-shape stream. |
 | `web.Dockerfile` | page=real's harness image: the soak image plus a standalone seazn.club build, node, and Postgres 16 with the migrated database restored at build time. See "The page source". |
 | `web/up.sh` | page=real's page source on the Machine: Postgres, the web server, the seed, the stream session, the signed URL, a pre-flight. |
@@ -70,8 +70,9 @@ After the checker, the driver runs `sampler.py` on the run's recordings. For eac
 one instant clear of every dropout and disconnect, and decodes three frames: the programme at that
 instant, the camera, and the camera `control_gap_s` later. An instant with no frame to read (no
 segment, or past its segment's last frame, a few ms before the next one starts: soak 40702117071's
-minutes 0 and 2) moves on to the minute's next clear `sample_offsets_s` instant; the minute is an
-error only when none has a frame. Each frame is scaled to 1280×720 (the
+minutes 0 and 2) moves on to the minute's next clear `sample_offsets_s` instant; when none has a
+frame, the last one's frame-reading error stands. A judged sample (on air, off air, or one of the
+errors below) is never retried for another instant. Each frame is scaled to 1280×720 (the
 sampler's own size, whatever the output: 1080p's frames are scaled down) and cut into bands of 40
 rows.
 

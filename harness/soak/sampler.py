@@ -244,7 +244,8 @@ def main(argv):
                "error": "every sample instant falls in a scheduled action"}
         # An instant with no frame to read (no segment, or past its segment's last frame: soak
         # 40702117071) moves on to the minute's next clear instant, as one in a scheduled action
-        # does. The last instant's error stands when none has a frame.
+        # does; the last instant's error stands when none has a frame. A judged sample (on air, off
+        # air, no stable band, a level shift) is the minute's: it is never retried for another.
         for t in clear:
             row = {"minute": k, "at_ms": t}
             lp, lc = locate(prog, t, max_len, a.ffprobe), locate(cam, t, max_len, a.ffprobe)
