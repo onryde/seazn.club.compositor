@@ -378,16 +378,18 @@ check "the cost-table job: after every leg (not after a cancel), on the legs onl
    and .if == "${{ !cancelled() && needs.plan.outputs.enabled == '"'"'true'"'"' && needs.plan.outputs.mode == '"'"'legs'"'"' }}"
    and ([.steps[] | select((.uses // "") | startswith("actions/download-artifact")) | .with.pattern] == ["soak-${{ github.run_id }}-*"])
    and ([.steps[] | .run // empty] | join("\n") | contains("harness/soak/cost/table.sh \"${f[@]}\""))'
-# Every leg's session reaches the harness image (driver.sh reads /soak/session-composed-<output>.json).
-outputs="$(jq -r '[.legs[] | .output] | unique[]' "$HERE/soak.json")"
+# Every leg's session and the soak's (soak_output) reach the harness image (driver.sh reads
+# /soak/session-composed-<output>.json), so an unshipped output fails here, not on the Machine. An
+# absent soak_output reads as null, which no fixture is named after.
+outputs="$(jq -r '[.legs[].output, .soak_output] | unique[]' "$HERE/soak.json")"
 n_out=0 missing=""
 for o in $outputs; do
   n_out=$((n_out + 1))
   grep -qxF "COPY contracts/fixtures/relay-job.v1/session-composed-$o.json /soak/session-composed-$o.json" "$HERE/Dockerfile" \
     && [ -f "$ROOT/contracts/fixtures/relay-job.v1/session-composed-$o.json" ] || missing="$missing $o"
 done
-[ "$n_out" -ge 2 ] && [ -z "$missing" ] && pass "the image: every leg's session fixture copied ($n_out outputs: $(echo $outputs))" \
-  || fail "the image: the legs' session fixtures" "checked $n_out, missing:$missing"
+[ "$n_out" -ge 2 ] && [ -z "$missing" ] && pass "the image: every leg's and the soak's session fixture copied ($n_out outputs: $(echo $outputs))" \
+  || fail "the image: the legs' and the soak's session fixtures" "checked $n_out, missing:$missing"
 # The cost table's step, run for real: each leg:camera's latest attempt, and a red naming a run with
 # no verdict.
 table_step="$(step cost-table "The cost table")"

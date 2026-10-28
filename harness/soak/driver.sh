@@ -77,8 +77,9 @@ if [ -n "$SOAK_LEG" ] && [ "$SOAK_SCHEDULE" != soak ]; then
   exit 64
 fi
 # The session fake-control hands out (a vendored relay-job fixture: the output profile), and the
-# overlay's sport and template. The soak: 720p, bar on cricket.
-SESSION_SRC="$SOAK/session-composed-720p.json"
+# overlay's sport and template. The soak: soak.json's soak_output (production's output, 1080p since
+# ADR 0005's 2026-10-27 amendment), bar on cricket; it has no default, so an empty or absent one is
+# refused. A cost leg: its own (soak.json's legs), and it never reads soak_output.
 LEG_SPORT=cricket
 LEG_TEMPLATE=bar
 if [ -n "$SOAK_LEG" ]; then
@@ -89,7 +90,20 @@ if [ -n "$SOAK_LEG" ]; then
   LEG_SPORT="$(jq -r .sport <<<"$leg_spec")"
   LEG_TEMPLATE="$(jq -r .template <<<"$leg_spec")"
   [ -f "$SESSION_SRC" ] || { log "FAIL leg $SOAK_LEG: no session fixture $SESSION_SRC"; exit 64; }
+else
+  soak_output="$(jq -r '.soak_output // empty' "$SOAK/soak.json")"
+  [ -n "$soak_output" ] || { log "FAIL soak.json has no soak_output (the soak's output, spelled as a leg's: 720p, 1080p)"; exit 64; }
+  SESSION_SRC="$SOAK/session-composed-$soak_output.json"
+  [ -f "$SESSION_SRC" ] || { log "FAIL soak_output '$soak_output': no session fixture $SESSION_SRC"; exit 64; }
 fi
+# The served session's frame rate is the one thresholds.json's frame_period_ms was dumped from: the
+# verdict's dropped-frame budget reads that period (verdict.jq), and nothing else ties the two. The
+# same division as the domain's frame_period_ms (1_000.0 / fps, config.rs), so they agree exactly
+# or not at all. A session or thresholds file that cannot be read is refused the same way.
+jq -e --slurpfile t "$SOAK/thresholds.json" '1000 / .output.fps == $t[0].frame_period_ms' "$SESSION_SRC" >/dev/null 2>&1 || {
+  log "FAIL the session's frame rate is not thresholds.json's: $(basename "$SESSION_SRC") fps $(jq -r .output.fps "$SESSION_SRC" 2>&1), frame_period_ms $(jq -r .frame_period_ms "$SOAK/thresholds.json" 2>&1)"
+  exit 64
+}
 case "$SOAK_PAGE" in
   test) ;;
   real) [ -x "$SOAK/web/up.sh" ] || { log "FAIL SOAK_PAGE=real needs the page source ($SOAK/web/up.sh: the web image)"; exit 64; } ;;
