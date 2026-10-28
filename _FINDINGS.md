@@ -2889,7 +2889,7 @@ which means an image rebuild.
 
 ---
 
-## F-033: x264 `faster` at 1080p: +5 to +9 VMAF over today's 720p `veryfast`, real time on performance-4x at 47 to 69 % p95; `fast` and `medium` buy nothing and fall behind real time at 1080p (soak runs 40490810263 to 40533512886, 2026-10-27)
+## F-033: x264 `faster` at 1080p: +5 to +9 VMAF over today's 720p `veryfast`, real time on performance-4x at 47 to 69 % p95; `fast`, `medium` and `slow` buy at most 0.8 (soak runs 40490810263 to 40563632370, 2026-10-27)
 
 **Question** (owner, 2026-10-27, via session r2: "measure it slowers encoder and 1080p by default").
 For {720p, 1080p} × x264 `speed-preset` {`veryfast`, `faster`, `fast`, `medium`}, keeping
@@ -2922,7 +2922,7 @@ CPU above 50 % of cores ⇒ the next size.
   40533512886). `driver.sh`'s soak session moved to `session-composed-1080p.json` on the spike
   branch; camera `noise`.
 
-**Quality** (VMAF mean (5th percentile); bytes within 1 % across presets, so the bitrate is equal):
+**Quality** (VMAF mean (5th percentile); bytes within 1.4 % across presets, so the bitrate is equal):
 
 | | touchdown_pass | rush_field_cuts |
 |---|---|---|
@@ -2939,17 +2939,18 @@ each output's own size, `veryfast` → `faster` gains +1.8 to +3.4 VMAF; `fast` 
 SSIM lower on both clips).
 
 **CPU, one host** (Zen 2: `cpu family 23`, `model 49`; Fly reports the model name as "AMD EPYC").
-Encoder cores, the source subtracted, the mean of two rounds (the rounds agree within 0.06):
+Encoder cores, the source subtracted, the mean of two rounds (the rounds agree within 0.09):
 
 | | 1080p noise | 1080p ball | 720p noise | 720p ball |
 |---|---|---|---|---|
 | `veryfast` | 1.03 | 0.40 | 0.48 | 0.18 |
 | `faster` | 1.52 (×1.47) | 0.55 (×1.37) | 0.72 (×1.50) | 0.25 (×1.40) |
-| `fast` | 1.79 (×1.74), **50.4 s for 45 s of frames** | 0.55 (×1.38) | 0.89 (×1.84) | 0.26 (×1.44) |
-| `medium` | 1.79 (×1.74), **50.4 s for 45 s of frames** | 0.63 (×1.57) | 0.91 (×1.89) | 0.28 (×1.56) |
+| `fast` | 1.79 (×1.74), **48.3 to 50.4 s for 45 s of frames** | 0.55 (×1.38) | 0.89 (×1.84) | 0.26 (×1.44) |
+| `medium` | 1.79 (×1.74), **48.3 to 50.4 s for 45 s of frames** | 0.63 (×1.57) | 0.91 (×1.89) | 0.28 (×1.56) |
 
-**CPU, the cost legs** (Machine cores p95 / max; every leg: encoder speed median 1, worst beat
-0.967 or 1, output 30 fps, final `droppedFrames` 0, every beat `full`):
+**CPU, the cost legs** (Machine cores p95 / max; every leg but 6x `medium` C:snow: encoder speed median 1, worst beat
+0.967 or 1, output 30 fps, final `droppedFrames` 0, every beat `full`; that leg's beats and log were
+not fetched, see finding 4):
 
 | Preset, guest | 720p A:snow | 1080p legs |
 |---|---|---|
@@ -2984,9 +2985,14 @@ reference)". The sampler needs still bands in the camera (`sampler.py:8-24`), an
 **Findings.**
 1. **`faster` is the preset.** It carries nearly all of the quality that slower presets reach
    (+1.8 to +3.4 VMAF at each size), for ×1.37 to ×1.50 the encoder's CPU. `fast` and `medium` add
-   at most 0.5 VMAF, cost ×1.38 to ×1.89, and at 1080p on noise they **fell behind real time on a
-   Zen 2 4x** (50.4 s for 45 s of frames), plateauing at 1.79 encoder cores: a limit of x264's
-   thread split under `zerolatency` rather than of the Machine's 4 cores (inferred).
+   at most 0.5 VMAF (`slow` 0.8) and cost ×1.38 to ×1.89. **In the one-host sweep only**, on raw
+   per-pixel `videotestsrc` noise at 1080p, `fast` and `medium` fell behind real time on a Zen 2 4x
+   (48.3 to 50.4 s for 45 s of frames) at about 1.79 encoder cores. **Every 1080p `medium` cost leg
+   ran real time** (4x D:noise; 6x C:noise, D:noise, D:snow: encoder speed median 1, 30 fps, 0
+   drops), on a camera that reaches the encoder decoded from a 4 Mbps stream, an easier picture than
+   raw noise. Why the sweep stalled is not settled: 6x `medium` D:noise read 2.847 against 4x's
+   2.268, so the encoder does use more cores when it has them, though host variance (about 0.4)
+   covers most of that gap.
 2. **The cost legs' host is not fixed, and it moves the reading by about 0.4 core.** `veryfast`
    D:noise read 1.924 on 2026-10-25 and 1.503 on 2026-10-27; `fast` read below `veryfast` across
    runs, which one host cannot do (the one-host table orders them strictly). A leg does not record
@@ -2994,21 +3000,21 @@ reference)". The sampler needs still bands in the camera (`sampler.py:8-24`), an
    masked). Cross-run comparisons of presets are read from the one-host table, and a leg's absolute
    reading holds for its own host.
 3. **1080p `faster` on performance-4x is real time but over the size rule.** Five legs read p95
-   1.87 to 2.76 of 4 (47 % to 69 %), max 2.99 to 3.12; three of five fail the 50 % rule, and Owed
-   93's held-page sum is over on three. No leg dropped a frame or stepped down. The one-host delta
+   1.87 to 2.76 of 4 (47 % to 69 %), max 2.12 to 3.12; three of five fail the 50 % rule, and Owed
+   93's held-page sum is over on four. No leg dropped a frame or stepped down. The one-host delta
    (+0.49 core at 1080p noise) on `veryfast`'s 1.924 predicts 2.41, against the 2.478 measured.
 4. **1080p `faster` on performance-6x is within the rule** (p95 31 % and 45 %; Owed 93 within) and
    held a 3 h soak clean, its peak second at most 3.31 cores. 720p `faster` on 4x is within the rule
    (p95 1.794, 45 %). **1080p `medium` on 6x is not:** p95 47 % to 61 %, two of four legs over,
    and D:snow's peak second 4.26 cores; every leg real time with no drop (C:snow's beats were not
    fetched: the harness's log fetch read a 503 from Fly's API, so its rung and drops are
-   unwitnessed; its CPU samples are complete, 586 of 586).
+   unwitnessed, and so is its reload; its CPU samples are complete, 586 of 586).
 5. **Cost** (Fly's pricing page, Ashburn: performance CPUs at $33 a CPU-month with 2 GB, linear;
    lhr's multiplier not checked): 4x $0.54, 6x $0.81, 8x $1.08 a 3 h match.
 
 **Recommendation (this spike's, not a ruling):** 1080p `faster` on performance-6x. The picture is
 the same on 4x and 6x; 6x is what keeps it inside the size rule with every peak under 4 cores, for
-+$0.27 a 3 h match. It also moves web's runner guest (`RUNNER_DEFAULT_GUEST`, `config.ts:39`, 4 CPU
++$0.27 a 3 h match. It also moves web's runner guest (`RUNNER_DEFAULT_GUEST`, `config.ts:54` at `seazn.club` `df9d847e83`, 4 CPU
 8192 MB) to 6 CPU 12288 MB. `medium` and `slow` buy no visible quality at 6 Mbps; bitrate and
 B-frames are the levers that would, and neither is measured here.
 
@@ -3016,7 +3022,7 @@ B-frames are the levers that would, and neither is measured here.
 
 **For the owner** (a product change, not made here): (a) the preset `veryfast` → `faster`
 (`gst_programme.rs:61`) at either output; (b) the web default `RELAY_OUTPUT_PROFILE` → 1080p
-(`seazn.club` `apps/web/src/server/relay/config.ts:241-245`) on performance-4x needs the size rule
+(`seazn.club` `apps/web/src/server/relay/config.ts:268-277` at `df9d847e83`) on performance-4x needs the size rule
 moved, or performance-6x (+$0.27 a 3 h match). The owner's ruling relayed by session r2, "a, but wait
 for soak test", is option (a)+(b) on 4x, conditional on the 4x soak.
 
@@ -3027,7 +3033,7 @@ encoder-only, offline); the CPU on each Fly host type (only Zen 2 was identified
 
 **Teardown.** `seazn-relay-spike`: the sweep Machine destroyed by hand, the 6x soak's by its
 workflow; 0 Machines after. `seazn-relay-soak`: every run's "Destroy every Machine" step; 0 Machines after run 40533512886. `FLY_API_TOKEN_SPIKE` (a 24 h deploy
-token for `seazn-relay-spike`, made for the 6x soak) is to be deleted from the repo's secrets.
+token for `seazn-relay-spike`, made for the 6x soak) is to be deleted from the repo's secrets (`gh secret delete FLY_API_TOKEN_SPIKE`; owner action, open; the token itself expires 2026-10-28 14:07 UTC).
 No stg, prod or product crate changed; the spike branches are `spike/x264-*`, never merged.
 
 ---
