@@ -143,8 +143,9 @@ STARVED='less(mark_at("stress_done"); mark_at("stress")) as $w
 #   stress_done + bound_ms): past the catch-up, whose burst the first beat after the quota carries
 #   (CI: 83.67 fps; the PR #77 review's m1).
 # The product compares the raw rate and the log prints two decimals, so a reading in [28.495, 28.5)
-# raises the alarm and reads 28.50 here, `above` (the review's m3): at the starved 17 to 21 fps it
-# never arises. A report with no `output_fps` (a checker older than the honest beat) reads no beat,
+# raises the alarm and reads 28.50 here, `above` (the review's m3). It is rare, not impossible: the
+# window is 0.005 wide, but chaos run 40613627384's judged beats reached 28.46 (not the 17 to 21 fps
+# this comment once assumed), so a red there names the log's print, not the product. A report with no `output_fps` (a checker older than the honest beat) reads no beat,
 # never one.
 HONEST='mark_at("stress") as $s | mark_at("stress_done") as $e
   | $t.heartbeat_interval_ms as $hb
