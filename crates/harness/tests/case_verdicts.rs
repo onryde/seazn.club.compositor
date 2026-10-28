@@ -2469,11 +2469,27 @@ enum Shape {
     /// The rate back after the quota, then one healthy beat a few frames short (0.1 under the
     /// recovered level, over the floor) inside realtime_after's window: no re-raise, a pass.
     HealthyDip,
+    /// One judged beat just under the floor whose wire, to one decimal, reads the floor itself
+    /// (WIRE_AT_FLOOR_FPS): a starved beat both writers report truly.
+    WireAtFloor,
+    /// One judged beat just over the floor whose wire reads a whole step over it
+    /// (WIRE_OVER_FLOOR_FPS): a beat that did not read the starvation, on both writers.
+    WireOverFloor,
+    /// One judged beat reading the floor itself (thresholds.json's output_fps_floor: logged 28.50,
+    /// sent 28.5): a beat that did not read the starvation, which the wire, read to its half-step,
+    /// cannot tell from 28.46, and the log reds.
+    ReadsTheFloor,
 }
 
 /// The rate CI's case 6 read while the 0.75 quota held (run 40143263604: 17.6 to 20.27 fps over its 7
 /// judged beats). Sim physics only: no verdict reads it.
 const STARVED_FPS: f64 = 20.0;
+
+/// The judged beat CI's chaos run 40613627384 read on PR #103's head: logged 28.46, under the floor,
+/// and sent as 28.5 on the wire, the floor itself. Sim input only: the verdict reads the floor.
+const WIRE_AT_FLOOR_FPS: f64 = 28.46;
+/// A reading just over the floor, sent a whole wire step over it (28.6). Sim input only.
+const WIRE_OVER_FLOOR_FPS: f64 = 28.56;
 
 /// The honest beat's three lines (app/src/driver.rs; logfacts pins their formats).
 const BEAT_LINE: &str = "output fps beat=";
@@ -2578,7 +2594,9 @@ fn cpu_starved_shaped(done: bool, rung_back: bool, felt: Felt, alarm: AlarmIs, s
     // lies after the quota.
     let at = match shape {
         Shape::Quota => None,
-        Shape::OneFull => readings.iter().filter(|r| r.0 >= a + hb && r.0 <= b).nth(2),
+        Shape::OneFull | Shape::WireAtFloor | Shape::WireOverFloor | Shape::ReadsTheFloor => {
+            readings.iter().filter(|r| r.0 >= a + hb && r.0 <= b).nth(2)
+        }
         Shape::StartupDip => readings.get(1),
         Shape::SagsAfter | Shape::HealthyDip => readings.iter().filter(|r| r.0 >= b + hb).nth(1),
     }
@@ -2586,6 +2604,9 @@ fn cpu_starved_shaped(done: bool, rung_back: bool, felt: Felt, alarm: AlarmIs, s
     if let Some(at) = at {
         let fps = match shape {
             Shape::OneFull => rate,
+            Shape::WireAtFloor => WIRE_AT_FLOOR_FPS,
+            Shape::WireOverFloor => WIRE_OVER_FLOOR_FPS,
+            Shape::ReadsTheFloor => floor,
             Shape::StartupDip => floor - 1.0,
             Shape::SagsAfter => floor - 0.1,
             Shape::HealthyDip => recovered - 0.1,
@@ -3083,6 +3104,188 @@ fn cpu_starved_reds_when_the_beat_lies_on_either_writer_or_is_missing() {
     }
     eprintln!("cpu-starved beat reds checked: {checked}");
     assert_eq!(checked, 11);
+}
+
+// The wire's `fps` is the reading to one decimal, so the verdict reads a wire value w as a reading in
+// [w - 0.05, w + 0.05): under the floor when w < floor + half the wire's step. CI's chaos run
+// 40613627384 (PR #103's head) logged 28.46 and sent 28.5, the floor itself, and wire_below_floor
+// went red on a beat the log shows starved. Each writer is judged on its own and both pass.
+#[test]
+fn cpu_starved_reads_a_wire_at_the_floor_to_its_rounding() {
+    let tag = "cpu-wire-at-floor";
+    let w = cpu_starved_shaped(true, false, Felt::Honest, AlarmIs::Declared, Shape::WireAtFloor);
+    let floor = level(&w, "output_fps_floor");
+    assert!(
+        WIRE_AT_FLOOR_FPS < floor && fps_wire(WIRE_AT_FLOOR_FPS) == floor,
+        "the premise: a reading under the floor that the wire sends as the floor"
+    );
+    assert_sim_alarm_is_the_products(&w);
+    let v = judge(&w, "cpu-starved", "", tag);
+    assert_pass(&v, tag);
+    let m = &v.json["measures"];
+    let read = |check: &str| -> Vec<f64> {
+        m[check]["fps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_f64)
+            .collect()
+    };
+    let (log, wire) = (read("beats_below_floor"), read("wire_below_floor"));
+    eprintln!(
+        "{tag}: judged {} logged {log:?}, {} on the wire {wire:?}",
+        log.len(),
+        wire.len()
+    );
+    assert!(log.contains(&WIRE_AT_FLOOR_FPS), "{tag}: {m}");
+    assert!(
+        wire.contains(&floor),
+        "{tag}: the floor is not among the wire's beats: {m}"
+    );
+    assert_eq!(m["wire_below_floor"]["above"], 0, "{tag}: {m}");
+}
+
+// A wire a whole step over the floor stands for a reading at or over it: still a red on the wire,
+// as on the log, with the two writers agreeing.
+#[test]
+fn cpu_starved_reds_a_wire_a_step_over_the_floor() {
+    let tag = "cpu-wire-over-floor";
+    let w = cpu_starved_shaped(true, false, Felt::Honest, AlarmIs::Declared, Shape::WireOverFloor);
+    let floor = level(&w, "output_fps_floor");
+    let sent = fps_wire(WIRE_OVER_FLOOR_FPS);
+    assert!(
+        WIRE_OVER_FLOOR_FPS > floor && sent > floor,
+        "the premise: a reading over the floor that the wire sends over it"
+    );
+    let v = judge(&w, "cpu-starved", "", tag);
+    for check in ["wire_below_floor", "beats_below_floor"] {
+        assert_fails(&v, check, tag);
+    }
+    let failed = failed_checks(&v);
+    assert!(
+        !failed.contains(&json!("wire_agrees_with_log")),
+        "{tag}: {failed:?}"
+    );
+    let m = &v.json["measures"];
+    eprintln!("{tag}: the wire's beats {}", m["wire_below_floor"]["fps"]);
+    assert_eq!(m["wire_below_floor"]["above"], 1, "{tag}: {m}");
+    assert!(
+        m["wire_below_floor"]["fps"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(sent)),
+        "{tag}: {m}"
+    );
+}
+
+// The band the wire gives up: a reading at the floor itself sends the floor, which the wire's
+// half-step reads as under it. The log's check (two decimals, the bare floor) reds that beat, and it
+// is the verdict's only red: the writers agree.
+#[test]
+fn cpu_starved_reds_a_beat_at_the_floor_on_the_log_alone() {
+    let tag = "cpu-reads-the-floor";
+    let w = cpu_starved_shaped(true, false, Felt::Honest, AlarmIs::Declared, Shape::ReadsTheFloor);
+    let floor = level(&w, "output_fps_floor");
+    assert_eq!(
+        fps_wire(floor),
+        floor,
+        "the premise: the wire sends the floor as itself"
+    );
+    assert_sim_alarm_is_the_products(&w);
+    let v = judge(&w, "cpu-starved", "", tag);
+    assert_fails(&v, "beats_below_floor", tag);
+    assert_eq!(
+        failed_checks(&v),
+        vec![json!("beats_below_floor")],
+        "{tag}: the log's check is the only red (wire_below_floor and wire_agrees_with_log pass)"
+    );
+    let m = &v.json["measures"];
+    eprintln!(
+        "{tag}: logged {}, sent {}",
+        m["beats_below_floor"]["fps"], m["wire_below_floor"]["fps"]
+    );
+    assert_eq!(m["beats_below_floor"]["above"], 1, "{tag}: {m}");
+    assert_eq!(m["wire_below_floor"]["above"], 0, "{tag}: {m}");
+    for check in ["beats_below_floor", "wire_below_floor"] {
+        assert!(
+            m[check]["fps"].as_array().unwrap().contains(&json!(floor)),
+            "{tag}: the floor is not among {check}'s beats: {m}"
+        );
+    }
+}
+
+// The pairing the other way: a judged wire beat with no log line within half a beat of it. A reading
+// at the floor whose log line is lost leaves the wire's 28.5 alone, under the wire's half-step, so
+// only wire_agrees_with_log (`wire_only`) can red it.
+#[test]
+fn cpu_starved_reds_a_wire_beat_the_log_never_printed() {
+    let tag = "cpu-wire-only";
+    let mut w = cpu_starved_shaped(true, false, Felt::Honest, AlarmIs::Declared, Shape::ReadsTheFloor);
+    let floor = level(&w, "output_fps_floor");
+    let line = format!("{BEAT_LINE}{floor:.2} ");
+    let before = w.log.len();
+    w.log.retain(|(_, m)| !m.starts_with(&line));
+    assert_eq!(before - w.log.len(), 1, "{tag}: the floor's beat is one log line");
+    let v = judge(&w, "cpu-starved", "", tag);
+    assert_fails(&v, "wire_agrees_with_log", tag);
+    assert_eq!(
+        failed_checks(&v),
+        vec![json!("wire_agrees_with_log")],
+        "{tag}: the wire-only beat is that check's red alone"
+    );
+    let a = &v.json["measures"]["wire_agrees_with_log"];
+    eprintln!("{tag}: wire_only {}, missing {}", a["wire_only"], a["missing"]);
+    assert_eq!(a["wire_only"], 1, "{tag}: {a}");
+    assert_eq!(a["missing"], 0, "{tag}: {a}");
+    assert_eq!(a["disagree"], 0, "{tag}: {a}");
+}
+
+// `wire_only` searches every log line, not only the judged ones: CI's wire beat lands about 1 ms
+// after its log line, so a beat can straddle the span's start, its log line just before stress plus
+// one beat (not judged) and its wire beat at it (judged). That wire beat has its log line and is no
+// red. The sim's beats sit on the beat grid, so the first judged beat's two writers both move: the
+// log line to stress + hb - 1, the wire beat to stress + hb.
+#[test]
+fn cpu_starved_pairs_a_wire_beat_with_a_log_line_before_the_span() {
+    let tag = "cpu-wire-straddles";
+    let mut w = cpu_starved(true, false, Felt::Honest);
+    let hb = w.ms("heartbeat_interval_ms");
+    let start = w.marks.iter().find(|m| m.0 == "stress").map(|m| m.1).unwrap() + hb;
+    let first = w
+        .log
+        .iter()
+        .find(|(t, m)| m.starts_with(BEAT_LINE) && *t >= start)
+        .map(|l| l.0)
+        .unwrap();
+    let mut moved = 0;
+    for (t, m) in &mut w.log {
+        if *t == first && m.starts_with(BEAT_LINE) {
+            *t = start - 1;
+            moved += 1;
+        }
+    }
+    for (t, x) in &mut w.beats {
+        if *t == first && x["fps"].is_number() {
+            *t = start;
+            moved += 1;
+        }
+    }
+    assert_eq!(moved, 2, "{tag}: the first judged beat's log line and wire beat");
+    let v = judge(&w, "cpu-starved", "", tag);
+    assert_pass(&v, tag);
+    let m = &v.json["measures"];
+    let a = &m["wire_agrees_with_log"];
+    eprintln!(
+        "{tag}: wire_only {}, {} logged, {} on the wire",
+        a["wire_only"], a["checked"], m["wire_below_floor"]["checked"]
+    );
+    assert_eq!(a["wire_only"], 0, "{tag}: {a}");
+    // The straddling beat is judged on the wire and not in the log.
+    assert_eq!(
+        m["wire_below_floor"]["checked"].as_u64(),
+        a["checked"].as_u64().map(|n| n + 1),
+        "{tag}: {m}"
+    );
 }
 
 // The ladder's logic is unchanged (the owner's ruling, no ladder change; the coordinator, medium,
