@@ -3037,3 +3037,51 @@ token for `seazn-relay-spike`, made for the 6x soak) is to be deleted from the r
 No stg, prod or product crate changed; the spike branches are `spike/x264-*`, never merged.
 
 ---
+
+---
+
+## F-034: 1080p `medium` does not fit performance-4x: both snow cost legs over the 75 % rule, and C:snow drops frames and steps the ladder (soak.yml run 40658933660, 2026-10-28)
+
+The owner asked, after F-033's 6x ruling, why 4 CPUs would not do when the 1080p `medium` soak
+peaked at 1.79 cores. That soak's camera is `ball` (a still picture, the cheapest encode); the cost
+legs' `snow` is the worst case, and F-033 had `medium` on 4x for one leg only (D:noise, p95 2.268).
+This run measures the two snow legs F-033 had only on 6x.
+
+**Method.** `soak.yml` dispatched on `main` at `07dd6ff` (x264 `medium` since PR #103), `page=real`
+(web `7dcb3c42e2`, the workflow's default, as F-033's 6x legs), `legs=C:snow,D:snow`,
+`guest=performance-4x`, 15 min, `seazn-relay-soak` at lhr. The same legs and page as F-033's 6x
+`medium` run (40563632370); a different host each leg, so the ±0.4 core host spread F-033 found
+applies.
+
+| 1080p `medium`, performance-4x | C 1080p bar on cricket, snow | D 1080p bug on badminton, snow |
+|---|---|---|
+| Machine cores avg / p95 / max (of 4) | 3.34 / **3.414** / 3.515 (p95 85.35 %) | 2.838 / **3.074** / 3.212 (p95 76.85 %) |
+| Owed 93: p95 + two held pages vs the rule (3.0) | 3.478 (over) | 3.113 (over) |
+| Encoder speed, median / worst beat | 1 / 0.933 | 1 / 0.967 |
+| Output fps, median beat | **25.8** | 30 |
+| Final droppedFrames | **2544** | 0 |
+| Rungs (beats) | full 4, **overlay_half_rate 121** | full 125 |
+| Machine memory used, max MB | 839 | 802 |
+| Samples / expected | 585 / 585 | 586 / 586 |
+| Size rule verdict | **FAIL**: cpu, rung, drops | **FAIL**: cpu |
+
+Against 6x (F-033, run 40563632370): C:snow p95 3.465 / max 3.775, D:snow 3.683 / 4.261 of 6, each
+real time, 30 fps, 0 drops, the full rung.
+
+**Findings.**
+
+1. **1080p `medium` on performance-4x fails the size rule on both worst-case legs**, and C:snow
+   fails on the picture too: the beat fps fell to a 25.8 median, 2544 frames dropped in 15 min, and
+   the ladder stepped to `overlay_half_rate` within the first beats and held there (in production a
+   step is the sizing alarm, Owed 20). D:snow played clean but at p95 77 %, with no headroom for the
+   page's later work (sponsors, images, animation; R4).
+2. **The owner's ruling (F-033: 1080p `medium` on performance-6x) stands on measurement**, no longer
+   on extrapolation: the same legs on 6 CPUs held real time with 0 drops.
+3. **The `ball` soak is not a sizing number.** Its 1.48 / 1.79 cores is a still picture's cost; the
+   size is read from the snow and noise legs.
+
+**Not measured here.** One run per leg (host spread ±0.4 core, F-033); C:noise and D:noise on 4x at
+`medium` beyond F-033's one D:noise leg; a real phone picture.
+
+**Teardown.** The run's own "Destroy every Machine" step; 0 Machines in `seazn-relay-soak` after
+(`flyctl machines list`). No stg, prod or product file changed.
