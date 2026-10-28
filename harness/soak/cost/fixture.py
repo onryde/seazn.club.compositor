@@ -9,10 +9,11 @@ rank, is the 556th value: 1.0); beats every 5 s, all full and graphics ready (a 
 sees the reload, so no beat says it happened); no drop; one kill 2 s after the midpoint, and the
 compositor's own log of it (flylog.py's shape, the compositor's `ts=`): `cef crashed gen=1` 0.4 s
 after the kill, `graphics restart gen=2`, `cef ready gen=2` 4 s after it; a boundary every 6 s,
-each one moment (100 in 10 minutes); eight stills of eight asked.
+each one moment (100 in 10 minutes); eight stills of eight asked. cpu6-at-max and cpu6-over are the
+same leg on 6 CPUs (performance-6x), its 40 hottest samples at 4.5 and 4.6 cores.
 
 Each mutation changes one thing:
-  cpu-over, cpu-at-max, few-samples, ncpu                 the samples
+  cpu-over, cpu-at-max, cpu6-over, cpu6-at-max, few-samples, ncpu   the samples
   stepped, drops, no-rung-field, no-dropped-field         the beats
   no-start, two-starts, no-end, short-drive               the actions
   no-kill, no-renderer, two-kills, kill-late, kill-early-80ms, kill-rc, kill-no-rc   leg.sh's kill lines
@@ -35,14 +36,17 @@ def w(name, rows):
             f.write((r if isinstance(r, str) else json.dumps(r)) + "\n")
 
 
-hot = 40 if "cpu-over" in muts or "cpu-at-max" in muts else 20
-hot_v = 3.1 if "cpu-over" in muts else (3.0 if "cpu-at-max" in muts else 1.9)
+six = "cpu6-over" in muts or "cpu6-at-max" in muts
+hot = 40 if "cpu-over" in muts or "cpu-at-max" in muts or six else 20
+hot_at = {"cpu-over": 3.1, "cpu-at-max": 3.0, "cpu6-over": 4.6, "cpu6-at-max": 4.5}
+hot_v = next((v for m, v in hot_at.items() if m in muts), 1.9)
+ncpu = 8 if "ncpu" in muts else 6 if six else 4
 samples = []
 for i, t in enumerate(range(S + 16_000, E + 1, 1000)):
     if "few-samples" in muts and i % 5 == 0:
         continue
     v = hot_v if i >= 585 - hot else 1.0
-    samples.append({"t_ms": t, "dt_ms": 1000, "ncpu": 8 if "ncpu" in muts else 4, "machine": v, "tree": v - 0.1,
+    samples.append({"t_ms": t, "dt_ms": 1000, "ncpu": ncpu, "machine": v, "tree": v - 0.1,
                     "cats": {"compositor": 0.7, "renderer": 0.05, "gpu": 0.04, "utility": 0.0, "zygote": 0.0,
                              "cef_other": 0.0, "xvfb": 0.01, "self": 0.01, "other": 0.02},
                     "renderers": [{"pid": 41 if t < K else 43, "client": 7 if t < K else 8, "cores": 0.05}],

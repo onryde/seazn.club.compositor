@@ -135,7 +135,7 @@ check "the compositor's guest: the input, production's performance-6x by default
    and .jobs.soak.env.C_CPUS == "${{ needs.plan.outputs.c_cpus }}" and .jobs.soak.env.C_MEM == "${{ needs.plan.outputs.c_mem }}"
    and .jobs.plan.outputs.c_cpus == "${{ steps.runs.outputs.c_cpus }}" and .jobs.soak.env.GUEST == "${{ inputs.guest }}"'
 jq -e '.compositor_guest == {"performance-4x": {cpus: 4, memory_mb: 8192}, "performance-6x": {cpus: 6, memory_mb: 12288}, "performance-8x": {cpus: 8, memory_mb: 16384}}' "$HERE/soak.json" >/dev/null \
-  && pass "soak.json: performance-4x is 4 CPUs, 8192 MB, performance-6x 6 and 12288 (R1's RUNNER_DEFAULT_GUEST, owner ruling 2026-10-27), performance-8x 8 and 16384" || fail "soak.json's compositor_guest"
+  && pass "soak.json's compositor_guest: performance-4x 4 CPUs, 8192 MB; performance-6x 6, 12288; performance-8x 8, 16384" || fail "soak.json's compositor_guest"
 # Check 1.projection budgets the production guest's memory at most: soak.json names it, and it is
 # the workflow's default guest and one of compositor_guest's.
 pg="$(jq -r '.memory_projection.production_guest' "$HERE/soak.json")"

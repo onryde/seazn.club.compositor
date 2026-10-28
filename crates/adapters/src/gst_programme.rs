@@ -56,12 +56,13 @@ const APPSRC_TICKS: u64 = 3;
 /// AAC-LC at 128 kbps (F-004: the verified fix encodes the input's audio at AAC-LC 128 kbps, 48 kHz,
 /// stereo).
 const AAC_BITRATE: i32 = 128_000;
-/// x264's preset (F-033, PR #102; owner ruling 2026-10-27: 1080p `medium` on performance-6x).
-/// `fast`, `medium` and `slow` score within 0.8 VMAF of `faster` at the same bitrate; `medium` fell
-/// behind real time at 1080p on one 4x host (50.4 s for 45 s of frames), and on 6x every 1080p leg
-/// is inside the 75 % size rule (p95 at most 3.683 of 6 cores). The rest are the settings C00
-/// measured real time (F-005): `zerolatency`, a 2 s keyframe interval, no B-frames (F-004), a
-/// 1 000 ms VBV and CBR with filler (POC values).
+/// x264's preset (owner ruling 2026-10-27 on F-033: 1080p `medium` on 6 CPUs). F-033: `fast` and
+/// `medium` score within 0.5 VMAF of `faster`, `slow` within 0.8; at 1080p on noise `medium` fell
+/// behind real time on one 4-CPU host (50.4 s for 45 s of frames), inferred to be x264's thread split;
+/// on 6 CPUs its legs ran real time with 0 drops (one leg's beats unfetched), within the 75 % size
+/// rule. It drives 720p too. Open: no 3 h soak of 1080p `medium` on 6 CPUs yet. The rest are the
+/// settings C00 measured real time (F-005): `zerolatency`, a 2 s keyframe interval, no B-frames
+/// (F-004), a 1 000 ms VBV and CBR with filler (POC values).
 const X264_SPEED_PRESET: &str = "medium";
 const X264_TUNE: &str = "zerolatency";
 const X264_VBV_MS: u32 = 1_000;

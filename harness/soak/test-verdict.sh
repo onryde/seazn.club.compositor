@@ -285,9 +285,10 @@ measured "0.1 point over the bound" "$WORK/case-memory-drift.out" 1 \
 # still 22.7 %), arm 1's on 500 MB (its medians are not in this repo). The reason (PR #88 review
 # m3): these are whole-verdict cases, and in a 30-minute fixture a part-3 step fits about 6 times
 # the real run's slope (the step comes 20 minutes in, not 2 hours). On the real 994 MB the soak's
-# step projects 3932 MB, 4 % under check 1.projection's budget, so a change to the cap or the
-# fraction would red a case named for check 1; halved it projects about 1966 MB (the real run fits
-# 108.4 MB/h from 945.9 MB: 1487.8 MB). The bound's own cases project about 3100 MB.
+# step projects 3932 MB, 36 % under check 1.projection's 6144 MB budget (4 % under the 4096 MB it
+# was before 2026-10-27), so a smaller guest, cap or fraction could red a case named for check 1;
+# halved it projects about 1966 MB (the real run fits 108.4 MB/h from 945.9 MB: 1487.8 MB). The
+# bound's own cases project about 3100 MB.
 case_ drift-soak-40139563554 real pass '' '' 'def m1: 497; def m3($max): 610; '"$DRIFT"
 measured "the 3 h soak's 22.7 % passes (its medians halved)" "$WORK/case-drift-soak-40139563554.out" 1 \
   '.hour1_median_mb == 497 and .hour3_median_mb == 610 and .drift_pct == 22.7'
@@ -355,9 +356,10 @@ measured "0.1 MB over the budget" "$WORK/case-projection-over-budget.out" 1.proj
   '(.projected_mb * 10 | round) == (.budget_mb * 10 + 1)'
 # The guest (the coordinator's decision, 2026-10-25): a soak on a bigger guest budgets the production
 # guest's memory, never its own. performance-8x's 16384 MB still budgets production's fraction, so
-# the steep run still reds. A smaller Machine than production's (performance-4x since 2026-10-27; the
-# smaller side of the rule) budgets its own: a flat run at three quarters of production's budget
-# reds on half production's memory.
+# the steep run still reds. A smaller Machine than production's (performance-4x's, from soak.json;
+# the smaller side of the rule) budgets its own: a flat run at three quarters of production's budget
+# reds on performance-4x's memory.
+MEM_4X="$("$JQ" -er '.compositor_guest["performance-4x"].memory_mb' "$HERE/soak.json")"
 MEM_8X="$("$JQ" -er '.compositor_guest["performance-8x"].memory_mb' "$HERE/soak.json")"
 cases=$((cases + 1))
 checks=$((checks + 1))
@@ -368,12 +370,16 @@ case_ projection-steep-8x real fail '1.projection' "1.projection:$STEEP_REASON" 
 measured "an 8x run (C_MEM $MEM_8X) still budgets production's memory" "$WORK/case-projection-steep-8x.out" 1.projection \
   '.machine_memory_mb == $mem and $mem > $prod and .budget_mb == $prod * $soak.memory_projection.memory_budget_fraction
    and .projected_mb > .budget_mb and '"$PROJ_BUDGET"
-MEM=$((MEM_PROD / 2))
+cases=$((cases + 1))
+checks=$((checks + 1))
+if [ "$MEM_4X" -lt "$MEM_PROD" ]; then echo "PASS the 4x guest is smaller than production's ($MEM_4X < $MEM_PROD MB)"
+else fail "the 4x guest's $MEM_4X MB is not smaller than production's $MEM_PROD MB: the next case proves nothing"; fi
+MEM="$MEM_4X"
 case_ projection-small-guest real fail '1.projection' \
   "1.projection:over the budget of $("$JQ" -r --argjson m "$MEM" '$m * .memory_projection.memory_budget_fraction' "$HERE/soak.json") MB" \
   '$soak[0] as $k | ($k.compositor_guest[$k.memory_projection.production_guest].memory_mb * $k.memory_projection.memory_budget_fraction * 0.75) as $level
    | def a: $level; def b: 0; '"$PROJ"
-measured "a Machine smaller than production's budgets its own memory" "$WORK/case-projection-small-guest.out" 1.projection \
+measured "a Machine smaller than production's (performance-4x, C_MEM $MEM_4X) budgets its own memory" "$WORK/case-projection-small-guest.out" 1.projection \
   '.machine_memory_mb == $mem and $mem < $prod and .budget_mb == $mem * $soak.memory_projection.memory_budget_fraction
    and .projected_mb < $prod * $soak.memory_projection.memory_budget_fraction and '"$PROJ_BUDGET"
 MEM="$MEM_PROD"
