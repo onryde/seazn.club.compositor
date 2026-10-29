@@ -3085,3 +3085,50 @@ real time, 30 fps, 0 drops, the full rung.
 
 **Teardown.** The run's own "Destroy every Machine" step; 0 Machines in `seazn-relay-soak` after
 (`flyctl machines list`). No stg, prod or product file changed.
+
+## F-035: 1080p `medium` on performance-6x holds the worst-case picture for a full 5 h session; the 3 h `ball` soak's only red was the overlay sampler (soak.yml runs 40702117071 and 40747878608, 2026-10-28/29)
+
+After the build of F-033's ruling (PRs #103 to #105), two soaks of 1080p x264 `medium` on
+performance-6x from `main` at `1de5f5b`, `page=real` (web `7dcb3c42e2`), `schedule=soak`,
+`seazn-relay-soak` at lhr: the 3 h soak of record on `ball`, and, at the owner's ask ("are we doing
+snow right?"), the worst-case picture for `session_cap_min` (300, a livestream's 5 h) on `snow`. The
+soak had only ever run on `ball`; `snow` had run 15 min per cost leg (F-033, F-034).
+
+| 1080p `medium`, performance-6x | 3 h, `ball` (40702117071) | 5 h, `snow` (40747878608) |
+|---|---|---|
+| Verdict | 14/15: 5d red (2 of 180 minutes) | 14/15: 5d red (300 of 300), by design |
+| Dropped frames (budget) | 0 (324) | 0 (540) |
+| Rung beats / stepped | 2165 / 0 | 3604 / 0 |
+| Compositor tree cores, median / p95 / max (of 6) | - / 1.23 / 2.06 | 2.98 / **3.10** / **3.86** |
+| Encoder speed, worst beat | 1.0 | 0.967 (12 of 3604 beats, no drop) |
+| Memory hour 1 / last part median MB (drift) | 1063 / 1129 (6.2 %) | 1084 / 1187 (9.5 %) |
+| Memory projection to 300 min (budget 6144 MB) | 1220.5 MB (36.5 MB/h) | 1221.3 MB (33.7 MB/h) |
+| Camera dropouts / dest disconnects | 36/36, 3/3 | 60/60, 3/3 |
+| Score deliveries ok | 360 | 600 |
+| Machines after | 0 | 0 |
+
+Cores here are the heartbeat's `cpuPct` (the compositor's process tree over the CPUs it may use,
+`crates/adapters/src/metrics_proc.rs`) × 6, not the cost legs' Machine-wide `/proc` reading, so they
+are not the F-033/F-034 columns' measure; both sit well inside the 75 % rule (4.5 cores).
+
+**Findings.**
+
+1. **6x holds the worst-case picture for a whole session.** Five hours of `snow` at 1080p `medium`:
+   0 dropped frames, the full rung throughout, the encoder at real time on all but 12 beats (0.967:
+   one frame short of 30 in a beat, recovered, never under the 28.5 fps floor), and memory projected
+   to 1221 MB at the session cap. The ruling (F-033) now stands on 5 h of load, not 15 min.
+2. **The 3 h `ball` soak's red was the sampler, not the overlay.** Minutes 0 and 2 read `a frame did
+   not decode`: each instant fell 2-3 ms before the next programme segment's start, after the earlier
+   segment's last frame, where `ffmpeg -ss` decodes nothing. They were the only 2 of 180 instants
+   within 5 s of a boundary; the other 178 minutes were on air (region_diff 47-55). PR #106
+   (`3f3792d`) moves such an instant to the minute's next clear offset and never retries a judged
+   sample. Run 40585028513 (the 15/15 before it) used the same sampler and missed the edge by phase.
+3. **5d cannot judge `snow`.** All 300 minutes read `no stable band`, as the sampler's design says
+   (no still band, no reference), and none read off air. A `snow` soak is a load test: its pass is
+   the other 14 checks.
+
+**Not measured here.** A `noise` soak; a real phone picture over hours; one host per run (±0.4 core,
+F-033). The 3 h `ball` soak on `3f3792d` (with PR #106) is run 40846498346, in flight at this entry.
+
+**Teardown.** Each run's own "Destroy every Machine" step; 0 Machines in `seazn-relay-soak` after
+each (`flyctl machines list`). No stg, prod or product file changed.
