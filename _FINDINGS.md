@@ -3129,6 +3129,9 @@ are not the F-033/F-034 columns' measure; both sit well inside the 75 % rule (4.
 
 **Not measured here.** A `noise` soak; a real phone picture over hours; one host per run (±0.4 core,
 F-033). The 3 h `ball` soak on `3f3792d` (with PR #106) is run 40846498346, in flight at this entry.
+*Closed 2026-10-29: run 40846498346 (`ball`, 3 h, `3f3792d`) passed **15/15**: 5d 180 of 180
+minutes on air, 0 dropped frames, 0 steps, memory 1070 / 1142 MB (6.7 %), projected 1242.2 MB; 0
+Machines after. It is the soak of record for 1080p `medium` on performance-6x.*
 
 **Teardown.** Each run's own "Destroy every Machine" step; 0 Machines in `seazn-relay-soak` after
 each (`flyctl machines list`). No stg, prod or product file changed.
