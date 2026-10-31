@@ -7025,6 +7025,24 @@ fn sponsor_airings(edit: impl Fn(&mut World, i64, i64)) -> World {
     w
 }
 
+/// The card's `kind` line, wherever its beat is, changed by `f`.
+fn card_line(w: &mut World, kind: &str, f: impl Fn(&mut Value)) {
+    let mut found = 0;
+    for (_, body) in &mut w.beats {
+        if let Some(lines) = body.get_mut("airings").and_then(Value::as_array_mut) {
+            for l in lines.iter_mut().filter(|l| l["kind"] == kind) {
+                f(l);
+                found += 1;
+            }
+        }
+    }
+    assert_eq!(found, 1, "the card's {kind} line");
+}
+
+/// Each of the case's 10 judged checks reds on a world that breaks it: a resent start, a missing end,
+/// a dropped count, airings off, an unarmed card, an armed one never served, a cut-short end, an end
+/// stamped before its start, a foreign line, a non-zero exit, a restart, and a stopped beat for
+/// another reason.
 #[test]
 fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_go_wrong() {
     assert_pass(
@@ -7048,7 +7066,7 @@ fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_
         next["airingsDropped"] = json!(0);
     });
     let mut checked = 0;
-    let reds: [(&str, World, &str); 5] = [
+    let reds: [(&str, World, &str); 12] = [
         ("sa-resent", resent, "start_relayed_once"),
         (
             "sa-no-end",
@@ -7089,6 +7107,58 @@ fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_
             }),
             "armed",
         ),
+        // Armed, but the page never polled it: fake-control never served the card.
+        (
+            "sa-unserved",
+            sponsor_airings(|w, _, _| w.control_state["page_sponsor_served_ms"] = Value::Null),
+            "sponsor_served",
+        ),
+        // The end says the card was cut short: not the page's own end.
+        (
+            "sa-cut-short",
+            sponsor_airings(|w, _, _| card_line(w, "end", |l| l["cutShort"] = json!(true))),
+            "end_relayed_once",
+        ),
+        // The end is stamped before the start.
+        (
+            "sa-end-first",
+            sponsor_airings(|w, start, _| {
+                card_line(w, "end", |l| l["at"] = json!(stamps(start - 1_000).1));
+            }),
+            "end_after_start",
+        ),
+        // A line the page never logged rides beside the card's start.
+        (
+            "sa-foreign",
+            sponsor_airings(|w, _, _| {
+                let (_, body) = w
+                    .beats
+                    .iter_mut()
+                    .find(|(_, b)| b.get("airings").is_some())
+                    .unwrap();
+                body["airings"].as_array_mut().unwrap().push(json!({"kind": "end",
+                    "momentId": "another-moment", "at": "2026-10-24T12:00:09.000Z", "cutShort": true}));
+            }),
+            "only_the_card",
+        ),
+        // The run did not end as asked: a non-zero exit, a restart, a stopped beat for another reason.
+        (
+            "sa-exit-1",
+            sponsor_airings(|w, _, _| w.run_patch = Some(|r| r["compositor"]["exit_code"] = json!(1))),
+            "compositor_exit",
+        ),
+        (
+            "sa-restarted",
+            sponsor_airings(|w, _, _| w.run_patch = Some(|r| r["compositor"]["restarts"] = json!(1))),
+            "no_restarts",
+        ),
+        (
+            "sa-fatal",
+            sponsor_airings(|w, _, _| {
+                w.run_patch = Some(|r| r["last_beat"]["exitReason"] = json!("fatal"));
+            }),
+            "ended_beat",
+        ),
     ];
     for (tag, w, check) in &reds {
         assert_fails(&judge(w, "sponsor-airings", "", tag), check, tag);
@@ -7096,4 +7166,9 @@ fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_
     }
     eprintln!("sponsor-airings reds checked: {checked}");
     assert_eq!(checked, reds.len());
+    // Every judged check (the 11 declared, less the one measure) has a red world here.
+    let mut named: Vec<&str> = reds.iter().map(|r| r.2).collect();
+    named.sort_unstable();
+    named.dedup();
+    assert_eq!(named.len(), 10, "{named:?}");
 }

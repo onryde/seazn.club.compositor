@@ -101,7 +101,7 @@ use std::time::{Duration, Instant};
 use app::airings::Airings;
 use app::ports::{redacted_origin, CefPoll, CefPss, GraphicsRenderer, Inbound};
 use crossbeam_channel::Sender;
-use domain::airings::{utc_instant_ms, AiringLine, LineRefusal};
+use domain::airings::{utc_instant_ms, AiringLine, LineRefusal, AIRING_BUFFER_CAP};
 use domain::health::PhaseChannel;
 use domain::supervisor::Event;
 use gstreamer as gst;
@@ -1530,24 +1530,33 @@ struct Gate {
     #[cfg(feature = "test-hooks")]
     withheld: BTreeSet<u64>,
     /// The current build's sponsor starts held for the beat and not ended yet, by moment id (SC1 fix
-    /// round 1): its retirement ends each one (`end_open_airings`). Only the current build's lines are
-    /// held, so these are always its.
+    /// round 1): its crash or its retirement, whichever comes first, ends each one
+    /// (`end_open_airings`). Only the current build's lines are held, so these are always its. At most
+    /// `AIRING_BUFFER_CAP`, the oldest leaving first (SC1 polish m-c).
     open_airings: Vec<String>,
 }
 
 impl Gate {
-    /// Holds `line` of `build` for the beat when `build` is the current build, keeping its open starts.
-    /// Under the gate's lock, with the retirement that ends them (`end_open_airings`), so no start can
-    /// be held after its build's retirement ended the others. `None` when `build` is retired, else
-    /// whether it was held (false: airings off).
+    /// Holds `line` of `build` for the beat when `build` is the current build and has not crashed,
+    /// keeping its open starts. Under the gate's lock, with the crash and the retirement that end them
+    /// (`end_open_airings`), so no start can be held after its build's crash or retirement ended the
+    /// others. `None` when `build` is retired or crashed, else whether it was held (false: airings
+    /// off).
     fn hold_airing(&mut self, airings: &Airings, build: u64, line: &AiringLine) -> Option<bool> {
-        if self.current.is_none_or(|(b, _)| b != build) {
+        if self.current.is_none_or(|(b, _)| b != build) || self.crashed.contains(&build) {
             return None;
         }
         let held = airings.push(line.clone());
         if held {
             match line {
-                AiringLine::Start(s) => self.open_airings.push(s.moment_id().to_owned()),
+                AiringLine::Start(s) => {
+                    self.open_airings.push(s.moment_id().to_owned());
+                    // Bounded (AGENTS.md §4) at the buffer's own cap: more open starts than it
+                    // holds lines could not all ride a beat anyway. The oldest leaves first.
+                    if self.open_airings.len() > AIRING_BUFFER_CAP {
+                        self.open_airings.remove(0);
+                    }
+                }
                 AiringLine::End(e) => {
                     if let Some(i) = self.open_airings.iter().position(|m| m == e.moment_id()) {
                         self.open_airings.remove(i);
@@ -1788,9 +1797,17 @@ impl Shared {
 
     /// Decides `build` crashed, once: its gate closes for good. True for the first decision.
     fn decide_crash(&self, build: u64) -> bool {
+        let at = utc_instant_ms(wall_ms());
         let mut g = locked(&self.gate);
         if !g.crashed.insert(build) {
             return false;
+        }
+        // SC1 polish m-b: the current build's cards left the programme at its crash, not at the
+        // restart's retirement a back-off later, so its open starts end now, cut short, under the lock
+        // `hold_airing` takes. Nothing is logged here (this runs in GStreamer's log callback); the
+        // ends ride the next beat, beside the crash's own log line.
+        if g.current.is_some_and(|(b, _)| b == build) {
+            g.end_open_airings(&self.airings, &at);
         }
         if g.open == Some(build) {
             g.open = None;
@@ -5531,5 +5548,82 @@ mod tests {
         let mut g = unit_adapter(Arc::clone(&shared));
         g.stop();
         assert_eq!(shared.airings.held(), 0);
+    }
+
+    /// SC1 polish m-c (AGENTS.md §4): the open starts are bounded at the airings buffer's cap, the
+    /// oldest leaving first. At the cap every start is open; one past it, the first is not, so the
+    /// retirement ends the newest `AIRING_BUFFER_CAP` and never the first.
+    #[test]
+    fn the_open_starts_are_bounded_at_the_buffers_cap_dropping_the_oldest() {
+        let mut checked = 0;
+        for n in [AIRING_BUFFER_CAP, AIRING_BUFFER_CAP + 1] {
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            let airings = Airings::on();
+            let shared = unit_shared_with(tx, ProcTree::live(), Arc::default(), u64::MAX, airings.clone());
+            let mut g = locked(&shared.gate);
+            g.current = Some((6, 6));
+            for i in 0..n {
+                assert_eq!(
+                    g.hold_airing(&airings, 6, &sponsor_start(&format!("m{i}"))),
+                    Some(true)
+                );
+            }
+            let want: Vec<String> = (n - AIRING_BUFFER_CAP..n).map(|i| format!("m{i}")).collect();
+            assert_eq!(g.open_airings, want, "{n} starts");
+            let ended: Vec<String> = g
+                .end_open_airings(&airings, "2026-10-31T12:00:09.000Z")
+                .iter()
+                .map(|l| l.moment_id().to_owned())
+                .collect();
+            assert_eq!(ended, want, "{n} starts: the retirement ends the open ones");
+            assert!(g.open_airings.is_empty());
+            checked += 1;
+        }
+        eprintln!("open-start caps checked: {checked}");
+        assert_eq!(checked, 2);
+    }
+
+    /// SC1 polish m-b: a crash ends the current build's cards on air at the crash instant, cut short,
+    /// not at the restart's retirement a back-off later. A line the crashed build logs after its crash
+    /// is not held, and the retirement then ends nothing more. A crash of a build that is not current
+    /// ends nothing.
+    #[test]
+    fn a_crash_ends_the_cards_on_air_at_the_crash_not_at_the_restart() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let airings = Airings::on();
+        let shared = unit_shared_with(tx, ProcTree::live(), Arc::default(), u64::MAX, airings.clone());
+        shared.retired.store(true, Ordering::SeqCst);
+        locked(&shared.gate).current = Some((7, 7));
+        shared.push(page_note(7, PageSignal::Sponsor(Ok(sponsor_start("on-air")))));
+        dispatch(&shared);
+        assert!(shared.decide_crash(3), "an older build's crash");
+        assert_eq!(
+            locked(&shared.gate).open_airings,
+            vec!["on-air".to_owned()],
+            "an older build's crash ends none of the current build's cards"
+        );
+        let before = utc_instant_ms(wall_ms());
+        assert!(shared.decide_crash(7));
+        let after = utc_instant_ms(wall_ms());
+        shared.push(page_note(7, PageSignal::Sponsor(Ok(sponsor_start("late")))));
+        dispatch(&shared);
+        std::thread::sleep(Duration::from_millis(20));
+        let restart = utc_instant_ms(wall_ms());
+        assert!(after < restart, "{after} < {restart}");
+        let mut g = unit_adapter(Arc::clone(&shared));
+        g.stop();
+        let batch = airings.for_beat();
+        let lines = batch.lines();
+        assert_eq!(lines.len(), 2, "the start and its crash end only: {lines:?}");
+        assert_eq!(lines[0], sponsor_start("on-air"));
+        let AiringLine::End(end) = &lines[1] else {
+            panic!("a synthesised end: {lines:?}");
+        };
+        assert_eq!((end.moment_id(), end.cut_short()), ("on-air", true));
+        assert!(
+            before.as_str() <= end.at() && end.at() <= after.as_str(),
+            "stamped at the crash: {before} <= {} <= {after} (the restart came at {restart})",
+            end.at()
+        );
     }
 }
