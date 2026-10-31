@@ -227,6 +227,46 @@ pub const fn output_egress_flat_ms(backoff_base_ms: Ms, connect_timeout_ms: Ms) 
 /// deaths under it.
 pub const CHROMIUM_GPU_DEATHS_ABORT: usize = 6;
 
+/// R4 sponsors on stream, the frame grab (spec 2026-10-27 §3.6.3: "1.5 s after a `start` line, grab one
+/// programme frame"; task SC2: `FRAME_GRAB_DELAY_MS = 1_500`): from a sponsor start held for the beat to
+/// the grab of its frame, so the card is on screen in it. Consts, not `Thresholds` fields: the
+/// supervisor decides nothing on them (`crate::frame_grab` does).
+pub const FRAME_GRAB_DELAY_MS: Ms = 1_500;
+
+/// Spec §3.6.3, "≤ 1 per 20 s" (task SC2: `FRAME_GRAB_MIN_GAP_MS = 20_000`; the SC2 dispatch: "across ALL
+/// airings"): the least time between two grabs, whatever their airings. A start whose grab would come
+/// sooner after the last grab gets none.
+pub const FRAME_GRAB_MIN_GAP_MS: Ms = 20_000;
+
+/// Spec §3.6.3, "JPEG 640×360 q≈75" (task SC2: "a JPEG at 640×360, q 75"): the grabbed frame's width and
+/// height, a 16:9 frame like both programme profiles.
+pub const FRAME_GRAB_SIZE: (u32, u32) = (640, 360);
+
+/// Spec §3.6.3 and task SC2, as above: the JPEG's quality (jpegenc's `quality`, 0 to 100).
+pub const FRAME_GRAB_JPEG_QUALITY: u32 = 75;
+
+/// Web's frame endpoint (task S9: "body `image/jpeg` ≤ 256 KiB"): a larger frame would be refused
+/// (413), so it is never sent.
+pub const FRAME_UPLOAD_MAX_BYTES: usize = 256 * 1024;
+
+/// The SC2 dispatch (2026-10-31): "a 5xx or transport error may retry at most once": an upload is tried
+/// at most twice. A 4xx is not retried, and a 410 stops every later upload.
+pub const FRAME_UPLOAD_ATTEMPTS: u32 = 2;
+
+/// Each upload attempt's bound, connect to last byte (the implementer's choice): the heartbeat's own,
+/// `Thresholds::heartbeat_interval_ms` (5 s, spec §5.3), so a frame never holds a connection longer
+/// than a beat does.
+pub const FRAME_UPLOAD_TIMEOUT_MS: Ms = 5_000;
+
+/// How long a grab waits for the programme's next frame once it has asked for one (the implementer's
+/// choice): 30 frame periods at the 30 fps of both profiles. A programme that makes no frame in that
+/// time (drained, stalled) gives none.
+pub const FRAME_GRAB_WAIT_MS: Ms = 1_000;
+
+/// How long a grab waits for its JPEG once it has the frame (the implementer's choice): one 640×360
+/// encode takes milliseconds, so this only bounds a stuck encoder.
+pub const FRAME_ENCODE_WAIT_MS: Ms = 2_000;
+
 impl Default for Thresholds {
     fn default() -> Self {
         let (output_backoff_base_ms, output_connect_timeout_ms) = (500, 5_000);
@@ -718,5 +758,46 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, BOTH_MODES.len());
+    }
+
+    // R4 task SC2, each frame-grab number against its source: the spec's §3.6.3 line ("1.5 s after a
+    // `start` line … JPEG 640×360 q≈75 … ≤ 1 per 20 s"), the SC2 brief's constants, web's S9 bound
+    // ("≤ 256 KiB") and the dispatch's one retry.
+    #[test]
+    fn the_frame_grab_numbers_match_the_spec_and_s9() {
+        assert_eq!(
+            FRAME_GRAB_DELAY_MS, 1_500,
+            "spec §3.6.3: 1.5 s after a start line"
+        );
+        assert_eq!(FRAME_GRAB_MIN_GAP_MS, 20_000, "spec §3.6.3: at most 1 per 20 s");
+        assert_eq!(FRAME_GRAB_SIZE, (640, 360), "spec §3.6.3: 640×360");
+        assert_eq!(FRAME_GRAB_JPEG_QUALITY, 75, "spec §3.6.3: q≈75; SC2: q 75");
+        assert_eq!(FRAME_UPLOAD_MAX_BYTES, 262_144, "S9: at most 256 KiB");
+        assert_eq!(FRAME_UPLOAD_ATTEMPTS, 2, "the dispatch: one retry at most");
+        let t = Thresholds::default();
+        assert_eq!(
+            FRAME_UPLOAD_TIMEOUT_MS, t.heartbeat_interval_ms,
+            "a beat's own bound"
+        );
+        // Both profiles are 16:9, so the grab scales without borders.
+        let mut checked = 0;
+        for p in BOTH_MODES {
+            assert_eq!(p.width * FRAME_GRAB_SIZE.1, p.height * FRAME_GRAB_SIZE.0, "{p:?}");
+            checked += 1;
+        }
+        assert_eq!(checked, BOTH_MODES.len());
+    }
+
+    // A grab's whole run (the frame, the encode, every upload attempt at its bound) ends before the next
+    // grab can be due, `FRAME_GRAB_MIN_GAP_MS` after it: so no grab waits behind another's upload and
+    // lands late, showing a later picture than its card's (ureq 2's DNS is unbounded, Owed 28: the one
+    // part no bound here covers).
+    #[test]
+    fn a_grabs_whole_run_ends_before_the_next_can_be_due() {
+        let run = FRAME_GRAB_WAIT_MS
+            + FRAME_ENCODE_WAIT_MS
+            + u64::from(FRAME_UPLOAD_ATTEMPTS) * FRAME_UPLOAD_TIMEOUT_MS;
+        assert_eq!(run, 13_000);
+        assert!(run < FRAME_GRAB_MIN_GAP_MS, "{run} ms");
     }
 }

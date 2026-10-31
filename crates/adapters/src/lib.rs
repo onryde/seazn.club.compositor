@@ -2,6 +2,7 @@
 pub mod cef_graphics;
 pub mod control_http;
 pub mod frame_store;
+pub mod frame_tap;
 pub mod gst_input;
 pub mod gst_output;
 pub mod gst_programme;

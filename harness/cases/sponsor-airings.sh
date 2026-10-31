@@ -10,7 +10,9 @@
 #
 # The verdict: the card's start and its end each reach a beat exactly once (a 2xx clears what a beat
 # carried, so a line is never sent twice), in order, nothing else rides, nothing is dropped, and the
-# run ends as smoke's does. Anti-vacuity: the arming mark and fake-control's served stamp. Not a
+# run ends as smoke's does. R4 SC2: the card is on air 3 s, so its frame is grabbed 1.5 s in, from the
+# live programme's tap and the image's jpegenc, and fake-control's S9 route receives it once: a whole
+# JPEG within web's 256 KiB (S9; `FRAME_UPLOAD_MAX_BYTES`), under the card's moment. Anti-vacuity: the arming mark and fake-control's served stamp. Not a
 # chaos case (case_verdicts.rs's NOT_CHAOS): harness.yml runs it on every pull request, beside smoke.
 
 CASE_LIVE_S=30
@@ -30,7 +32,7 @@ AIRED='[.heartbeats.series[] | .received_ms as $r | (.body.airings // [])[] | . 
   | [$card[] | select(.kind == "start")] as $starts
   | [$card[] | select(.kind == "end")] as $ends'
 
-CASE_CHECKS=11
+CASE_CHECKS=12
 case_verdict() {
   require armed '$case.armed[0].value.page_sponsor_armed == true' '$case.armed'
   require_run sponsor_served '.control_state.page_sponsor_served_ms != null' \
@@ -47,6 +49,9 @@ case_verdict() {
     | ($c | length) >= 1 and all($c[]; .body.airingsDropped == 0)
     and ([.heartbeats.series[] | select((.body.airingsDropped // 0) > 0)] | length) == 0' \
     '[.heartbeats.series[] | .body.airingsDropped // empty]'
+  require_run frame_posted '.control_state.frames_posted == 1 and (.control_state.frames[0]
+    | .moment_segment == "harness-sponsor-1" and .jpeg == true and .bytes > 0 and .bytes <= 262144)' \
+    '.control_state.frames'
   measure airings_relayed "$AIRED"' | $aired | length'
   # The run ended as asked: one clean exit (0), no restart, and the stopped beat says why.
   require_run compositor_exit '.compositor.status == "exited" and .compositor.exit_code == 0'

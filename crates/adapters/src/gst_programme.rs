@@ -44,6 +44,7 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 
 use crate::frame_store::{FrameStore, AUDIO_CHANNELS, AUDIO_FRAME_BYTES, AUDIO_RATE, AUDIO_RING_BYTES};
+use crate::frame_tap::{GstFrameTap, TapProbe};
 use crate::gst_output::{self, EncodedRing, Entry, LogFn, OutputGen, Shared, OUTPUT_SINK_TIMEOUT_S};
 use crate::redact::Scrubber;
 use crate::slate::Slate;
@@ -126,6 +127,8 @@ pub struct GstProgramme {
     push_errors: u64,
     half_rate: bool,
     running: Option<Running>,
+    /// R4 task SC2: the frame tap's probe, installed at `start()` when `frame_tap` was asked for first.
+    tap: Option<Arc<TapProbe>>,
     /// Test hook (`refuse_key_requests`): keyframe requests still to refuse.
     #[cfg(feature = "test-hooks")]
     key_refusals: Arc<AtomicU32>,
@@ -182,6 +185,7 @@ impl GstProgramme {
             push_errors: 0,
             half_rate: false,
             running: None,
+            tap: None,
             #[cfg(feature = "test-hooks")]
             key_refusals: Arc::new(AtomicU32::new(0)),
             #[cfg(feature = "test-hooks")]
@@ -194,6 +198,18 @@ impl GstProgramme {
     pub fn with_log(mut self, log: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
         self.shared.log = log;
         self
+    }
+
+    /// R4 task SC2: the programme's frame tap (`crate::frame_tap`), for the frame worker. Asked for
+    /// before `start()` (the probe goes in as the pipeline is built, which is never rebuilt), once:
+    /// `None` after `start()` or for a second ask. Never asked for, no probe exists.
+    pub fn frame_tap(&mut self) -> Option<GstFrameTap> {
+        if self.running.is_some() || self.tap.is_some() {
+            return None;
+        }
+        let (tap, probe) = GstFrameTap::new(self.shared.clone());
+        self.tap = Some(probe);
+        Some(tap)
     }
 
     /// Programme pipelines built so far: 1 once started, and never more (the pipeline is never
@@ -624,6 +640,20 @@ impl GstProgramme {
         .map_err(|e| format!("programme audio chain: {e}"))?;
         link_layer(base.upcast_ref(), &mixer, 0, None)?;
         link_layer(overlay.upcast_ref(), &mixer, 1, Some((w, h)))?;
+
+        // R4 task SC2: the frame tap, only when asked for. The probe never waits (`TapProbe`).
+        if let Some(probe) = &self.tap {
+            let pad = enc_caps
+                .static_pad("src")
+                .ok_or("programme: the encoder caps have no src pad")?;
+            let probe = Arc::clone(probe);
+            pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+                if let Some(buffer) = info.buffer() {
+                    probe.on_buffer(pad, buffer);
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
 
         // The drop before the encoder (C09 brief): every overrun is one EncoderOverrun.
         let tx = self.shared.tx.clone();

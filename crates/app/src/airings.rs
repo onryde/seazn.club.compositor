@@ -9,27 +9,42 @@
 //! **Off unless the binary turns it on** (`Airings::on`, from the Machine's `RELAY_AIRINGS`). Web's
 //! heartbeat is strict: a beat carrying `airings` before web declares the key is a 400, and the whole
 //! beat is lost. Off, a push holds nothing and every snapshot is empty, so no beat carries the keys.
+//!
+//! **Each line held is the frame grabs' cue** (R4 task SC2, `with_frames`): a push hands the line to
+//! the frame plan once it is held, so only a line the heartbeat forwards can plan or cancel a grab.
+//! Off, nothing is held, so nothing is planned either.
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use domain::airings::{AiringBatch, AiringBuffer, AiringLine};
 
+use crate::frame_grab::FrameGrabs;
+
 fn locked(m: &Mutex<AiringBuffer>) -> MutexGuard<'_, AiringBuffer> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A handle on the one buffer: clones share it. `Default` is off.
+/// A handle on the one buffer: clones share it, and the frame plan it cues. `Default` is off.
 #[derive(Clone, Default)]
-pub struct Airings(Option<Arc<Mutex<AiringBuffer>>>);
+pub struct Airings {
+    buffer: Option<Arc<Mutex<AiringBuffer>>>,
+    frames: FrameGrabs,
+}
 
 // Counts only: a line's ids are not printed.
 impl fmt::Debug for Airings {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
+        match &self.buffer {
             None => f.write_str("Airings(off)"),
             Some(b) => {
                 let b = locked(b);
-                write!(f, "Airings(on, held {}, dropped {})", b.len(), b.dropped())
+                write!(
+                    f,
+                    "Airings(on, held {}, dropped {}, {:?})",
+                    b.len(),
+                    b.dropped(),
+                    self.frames
+                )
             }
         }
     }
@@ -38,37 +53,52 @@ impl fmt::Debug for Airings {
 impl Airings {
     /// Holds nothing and sends nothing (the default).
     pub fn off() -> Self {
-        Self(None)
+        Self::default()
     }
 
-    /// A new, empty buffer.
+    /// A new, empty buffer, cueing no frame grab.
     pub fn on() -> Self {
-        Self(Some(Arc::default()))
+        Self {
+            buffer: Some(Arc::default()),
+            frames: FrameGrabs::off(),
+        }
+    }
+
+    /// The same buffer, each line it holds from now on cueing `frames` (R4 task SC2).
+    pub fn with_frames(self, frames: FrameGrabs) -> Self {
+        Self { frames, ..self }
+    }
+
+    /// The frame plan the held lines cue (off unless `with_frames` set one).
+    pub fn frames(&self) -> &FrameGrabs {
+        &self.frames
     }
 
     pub fn is_on(&self) -> bool {
-        self.0.is_some()
+        self.buffer.is_some()
     }
 
-    /// Holds `line` for the next beat: true, or false when off (nothing is held).
+    /// Holds `line` for the next beat and cues the frame plan with it: true, or false when off
+    /// (nothing is held, and nothing cued).
     pub fn push(&self, line: AiringLine) -> bool {
-        let Some(b) = &self.0 else {
+        let Some(b) = &self.buffer else {
             return false;
         };
+        self.frames.observe(&line);
         locked(b).push(line);
         true
     }
 
     /// The next beat's lines: every one held, oldest first (empty when off).
     pub fn for_beat(&self) -> AiringBatch {
-        self.0
+        self.buffer
             .as_ref()
             .map_or_else(AiringBatch::default, |b| locked(b).take_for_beat())
     }
 
     /// The beat that carried `batch` was answered with a 2xx: its lines leave.
     pub fn ack_2xx(&self, batch: &AiringBatch) {
-        if let Some(b) = &self.0 {
+        if let Some(b) = &self.buffer {
             locked(b).ack_2xx(batch);
         }
     }
@@ -76,11 +106,11 @@ impl Airings {
     /// Web refused the beat that carried `batch` (`HeartbeatError::Refused`): its lines leave, counted
     /// dropped. The number that left (0 when off).
     pub fn drop_refused(&self, batch: &AiringBatch) -> usize {
-        self.0.as_ref().map_or(0, |b| locked(b).drop_refused(batch))
+        self.buffer.as_ref().map_or(0, |b| locked(b).drop_refused(batch))
     }
 
     /// Lines held now (0 when off).
     pub fn held(&self) -> usize {
-        self.0.as_ref().map_or(0, |b| locked(b).len())
+        self.buffer.as_ref().map_or(0, |b| locked(b).len())
     }
 }

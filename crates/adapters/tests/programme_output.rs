@@ -3135,3 +3135,167 @@ fn the_gate_reads_gstreamer_1_24() {
     );
     assert_eq!(checked, 2);
 }
+
+// ---------------------------------------------------------------------------------------------
+// R4 task SC2: the frame tap (spec 2026-10-27 §3.6.3). The size, the quality and the byte bound are
+// `domain::config`'s, pinned there to the spec and to S9.
+
+use adapters::frame_tap::GstFrameTap;
+use app::ports::FrameTap;
+use domain::config::{FRAME_GRAB_SIZE, FRAME_GRAB_WAIT_MS, FRAME_UPLOAD_MAX_BYTES};
+
+/// A 720p programme with a frame tap, asked for before `start()` as the binary asks for it.
+fn programme_with_tap() -> (GstProgramme, GstFrameTap, Receiver<Inbound>, FrameStore) {
+    gst::init().expect("gstreamer");
+    let frames = FrameStore::default();
+    let (tx, rx) = crossbeam_channel::bounded(8_192);
+    let mut p = GstProgramme::new(frames.clone(), tx).with_log(Arc::new(|_: &str| {}));
+    let tap = p.frame_tap().expect("a tap before start");
+    p.start(&P720).expect("start");
+    (p, tap, rx, frames)
+}
+
+/// A JPEG decoded by GStreamer's own `jpegdec`, to RGB: its size and a pixel reader. The colour
+/// checks are the loose `is_*` classes, so the JPEG's full-range decode does not matter.
+struct Jpeg {
+    w: u32,
+    h: u32,
+    stride: usize,
+    rgb: Vec<u8>,
+}
+
+impl Jpeg {
+    fn decode(bytes: &[u8]) -> Jpeg {
+        let pipeline = gst::parse::launch(
+            "appsrc name=src caps=image/jpeg ! jpegdec ! videoconvert ! video/x-raw,format=RGB ! \
+             appsink name=out sync=false",
+        )
+        .expect("jpeg pipeline")
+        .downcast::<gst::Pipeline>()
+        .expect("pipeline");
+        let src = pipeline
+            .by_name("src")
+            .expect("src")
+            .downcast::<gst_app::AppSrc>()
+            .expect("appsrc");
+        let out = pipeline
+            .by_name("out")
+            .expect("out")
+            .downcast::<gst_app::AppSink>()
+            .expect("appsink");
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        src.push_buffer(gst::Buffer::from_slice(bytes.to_vec()))
+            .expect("push");
+        src.end_of_stream().expect("eos");
+        let sample = out
+            .try_pull_sample(gst::ClockTime::from_seconds(5))
+            .expect("the JPEG decodes");
+        let info = gst_video::VideoInfo::from_caps(sample.caps().expect("caps")).expect("info");
+        let frame =
+            gst_video::VideoFrame::from_buffer_readable(sample.buffer_owned().expect("buffer"), &info)
+                .expect("frame");
+        let j = Jpeg {
+            w: info.width(),
+            h: info.height(),
+            stride: frame.plane_stride()[0] as usize,
+            rgb: frame.plane_data(0).expect("plane").to_vec(),
+        };
+        pipeline.set_state(gst::State::Null).expect("null");
+        j
+    }
+
+    fn at(&self, x: u32, y: u32) -> Rgb {
+        let o = y as usize * self.stride + x as usize * 3;
+        [self.rgb[o], self.rgb[o + 1], self.rgb[o + 2]]
+    }
+}
+
+/// The SOF0 marker's height and width, read from the JPEG's own header (ITU T.81 B.2.2).
+fn sof0_size(jpeg: &[u8]) -> Option<(u32, u32)> {
+    let at = jpeg.windows(2).position(|w| w == [0xFF, 0xC0])?;
+    let h = u32::from(u16::from_be_bytes([jpeg[at + 5], jpeg[at + 6]]));
+    let w = u32::from(u16::from_be_bytes([jpeg[at + 7], jpeg[at + 8]]));
+    Some((w, h))
+}
+
+/// One grab on another thread while the programme runs at pace: a 640 × 360 JPEG of the composed
+/// frame (the green camera with the overlay's blue corner on top), within web's bound, and the
+/// programme lost no frame to it.
+#[test]
+fn the_frame_tap_grabs_the_composed_programme_as_a_640x360_jpeg() {
+    let _s = serial();
+    let dir = Tmp::new("tap");
+    let (mut p, mut tap, rx, frames) = programme_with_tap();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    frames.set_camera(solid(gst_video::VideoFormat::Bgra, 1_280, 720, [0, 255, 0, 255]));
+    frames.set_overlay(overlay_blue_corner());
+    pace(&mut p, 0..10, FrameChoice::Emit);
+    let grab = thread::spawn(move || {
+        let got = tap.grab();
+        (got, tap)
+    });
+    pace(&mut p, 10..40, FrameChoice::Emit);
+    let (got, mut tap) = grab.join().expect("the grab thread");
+    let jpeg = got.expect("a frame");
+    assert_eq!(&jpeg[..3], &[0xFF, 0xD8, 0xFF], "SOI");
+    assert_eq!(&jpeg[jpeg.len() - 2..], &[0xFF, 0xD9], "EOI");
+    assert!(jpeg.len() <= FRAME_UPLOAD_MAX_BYTES, "{} bytes", jpeg.len());
+    assert_eq!(sof0_size(&jpeg), Some(FRAME_GRAB_SIZE), "the header's size");
+    let pic = Jpeg::decode(&jpeg);
+    assert_eq!((pic.w, pic.h), FRAME_GRAB_SIZE);
+    assert!(
+        is_green(pic.at(pic.w / 2, pic.h / 2)),
+        "{:?}",
+        pic.at(pic.w / 2, pic.h / 2)
+    );
+    // The overlay's 100 × 100 of 1920 × 1080 is 33 × 33 at 640 × 360.
+    assert!(is_blue(pic.at(12, 12)), "{:?}", pic.at(12, 12));
+    // A second grab, with the encoder kept: another frame.
+    let again = thread::spawn(move || tap.grab());
+    pace(&mut p, 40..70, FrameChoice::Emit);
+    let second = again.join().expect("the second grab").expect("a second frame");
+    assert_eq!(sof0_size(&second), Some(FRAME_GRAB_SIZE));
+    drain_and_wait(&mut p, &rx);
+    let d = decode(&dir.file("a.flv"));
+    assert_eq!(d.frames.len(), 70, "the programme kept every frame");
+}
+
+/// A grab with no programme frame coming (nothing pushed) fails within its bound, and the next
+/// frame the programme makes after it is not held by the tap: the programme runs on untouched.
+#[test]
+fn a_grab_with_no_programme_frame_fails_within_its_bound() {
+    let _s = serial();
+    let dir = Tmp::new("tap-none");
+    let (mut p, mut tap, rx, _frames) = programme_with_tap();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    let began = Instant::now();
+    let got = tap.grab();
+    let took = began.elapsed();
+    assert_eq!(
+        got,
+        Err(format!("no programme frame within {FRAME_GRAB_WAIT_MS} ms"))
+    );
+    assert!(took >= Duration::from_millis(FRAME_GRAB_WAIT_MS), "{took:?}");
+    assert!(
+        took < Duration::from_millis(FRAME_GRAB_WAIT_MS + 1_000),
+        "{took:?}"
+    );
+    pace(&mut p, 0..30, FrameChoice::Slate(SlateKind::Waiting));
+    drain_and_wait(&mut p, &rx);
+    assert_eq!(decode(&dir.file("a.flv")).frames.len(), 30);
+    drop(tap);
+}
+
+/// The tap is asked for before `start()` (its probe goes in as the pipeline is built, never
+/// rebuilt), and once.
+#[test]
+fn the_frame_tap_is_refused_after_start_and_a_second_time() {
+    let _s = serial();
+    gst::init().expect("gstreamer");
+    let (tx, _rx) = crossbeam_channel::bounded(64);
+    let mut p = GstProgramme::new(FrameStore::default(), tx);
+    assert!(p.frame_tap().is_some());
+    assert!(p.frame_tap().is_none(), "a second tap");
+    let (mut q, _rx2, _f, _l) = programme();
+    assert!(q.frame_tap().is_none(), "after start");
+}

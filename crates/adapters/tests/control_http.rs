@@ -7,10 +7,12 @@
 //! connection closed with no reply and a server that never answers, and `tiny_http` answers a dropped
 //! request with a 500.
 use adapters::control_http::{
-    heartbeat_wire, heartbeat_wire_with, parse_reply, parse_session, HttpControlPlane, PlaneConfigError,
+    heartbeat_wire, heartbeat_wire_with, parse_reply, parse_session, path_segment, HttpControlPlane,
+    PlaneConfigError,
 };
 use app::ports::{
-    ControlPlane, FetchError, HeartbeatError, Measured, Reply as BeatReply, FINAL_BEAT_TIMEOUT_MS,
+    ControlPlane, FetchError, FrameUpload, FrameUploadError, HeartbeatError, Measured, Reply as BeatReply,
+    FINAL_BEAT_TIMEOUT_MS,
 };
 use domain::airings::{AiringBatch, AiringBuffer, AiringLine, AiringSource, AiringStyle};
 use domain::config::Thresholds;
@@ -75,6 +77,8 @@ struct Seen {
     path: String,
     headers: Vec<(String, String)>,
     body: String,
+    /// The body's bytes as sent (a JPEG is not UTF-8).
+    raw: Vec<u8>,
 }
 
 impl Seen {
@@ -143,12 +147,15 @@ fn read_request(s: &mut TcpStream) -> Option<Seen> {
         path,
         headers,
         body: String::from_utf8_lossy(&body).into_owned(),
+        raw: body,
     })
 }
 
 fn reason(code: u16) -> &'static str {
     match code {
         200 => "OK",
+        201 => "Created",
+        204 => "No Content",
         301 => "Moved Permanently",
         302 => "Found",
         303 => "See Other",
@@ -1188,4 +1195,171 @@ fn the_posted_beat_carries_its_airings() {
     }
     eprintln!("posted beats checked: {checked}");
     assert_eq!(checked, 6);
+}
+
+// ---- R4 task SC2: the frame upload (web's S9 endpoint) ----
+
+/// A JPEG's markers around bytes that are not UTF-8, so a body read as text would not match.
+const JPEG: &[u8] = &[
+    0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x80, 0xFE, 0x00, 0xC3, 0x28, 0xFF, 0xD9,
+];
+
+/// S9's request: a POST of the JPEG, raw, to the session's airing path with the moment id as one
+/// percent-encoded segment, the job token as the bearer (as the heartbeat sends it) and
+/// `Content-Type: image/jpeg`. The expected path is written out by hand from S9's route.
+#[test]
+fn a_frame_posts_the_jpeg_to_its_airings_path_with_the_bearer() {
+    let fake = serve(vec![Reply::Status(204, String::new())]);
+    let mut up = plane(&fake.url).frame_upload();
+    assert_eq!(up.post_frame("12:sponsor.over_end", JPEG), Ok(()));
+    let seen = fake.next();
+    assert_eq!(seen.method, "POST");
+    assert_eq!(
+        seen.path,
+        format!("/api/internal/relay/sessions/{SID}/airings/12%3Asponsor.over_end/frame")
+    );
+    assert_eq!(
+        seen.header("authorization"),
+        Some(format!("Bearer {TOKEN}").as_str())
+    );
+    assert_eq!(seen.header("content-type"), Some("image/jpeg"));
+    assert_eq!(
+        seen.header("content-length"),
+        Some(JPEG.len().to_string().as_str())
+    );
+    assert_eq!(seen.raw, JPEG);
+    let dbg = format!("{up:?}");
+    assert_no_token("the uploader's Debug", &dbg);
+    assert!(dbg.contains("****"), "{dbg}");
+}
+
+/// The segment encoding, by hand from RFC 3986: unreserved bytes stay, every other byte is `%XX`
+/// (upper-case), a multi-byte character byte by byte.
+#[test]
+fn a_moment_id_is_percent_encoded_as_one_segment() {
+    let table = [
+        ("AZaz09-._~", "AZaz09-._~"),
+        ("12:sponsor.over_end", "12%3Asponsor.over_end"),
+        ("scene:4c1d:179344818", "scene%3A4c1d%3A179344818"),
+        ("a/b", "a%2Fb"),
+        ("a?b#c", "a%3Fb%23c"),
+        ("50%", "50%25"),
+        ("a b", "a%20b"),
+        ("é", "%C3%A9"),
+        ("...", "..."),
+    ];
+    for (id, want) in table {
+        assert_eq!(path_segment(id), want, "{id:?}");
+    }
+    eprintln!("segments checked: {}", table.len());
+    assert_eq!(table.len(), 9);
+}
+
+/// The status table (the SC2 dispatch's policy reads it): any 2xx stored; 410 gone; a 5xx failed
+/// (retryable), its text free of the token; every other status, the 4xx and a redirect (never
+/// followed: one request each), refused with its code.
+#[test]
+fn the_frame_statuses_map_to_stored_gone_refused_and_failed() {
+    let table: [(u16, Result<(), FrameUploadError>); 17] = [
+        (200, Ok(())),
+        (201, Ok(())),
+        (204, Ok(())),
+        (410, Err(FrameUploadError::Gone)),
+        (400, Err(FrameUploadError::Refused(400))),
+        (401, Err(FrameUploadError::Refused(401))),
+        (403, Err(FrameUploadError::Refused(403))),
+        (404, Err(FrameUploadError::Refused(404))),
+        (413, Err(FrameUploadError::Refused(413))),
+        (415, Err(FrameUploadError::Refused(415))),
+        (422, Err(FrameUploadError::Refused(422))),
+        (429, Err(FrameUploadError::Refused(429))),
+        (302, Err(FrameUploadError::Refused(302))),
+        (307, Err(FrameUploadError::Refused(307))),
+        (
+            500,
+            Err(FrameUploadError::Failed("frame refused: status 500".to_owned())),
+        ),
+        (
+            502,
+            Err(FrameUploadError::Failed("frame refused: status 502".to_owned())),
+        ),
+        (
+            503,
+            Err(FrameUploadError::Failed("frame refused: status 503".to_owned())),
+        ),
+    ];
+    for (code, want) in &table {
+        let reply = if (300..400).contains(code) {
+            Reply::Redirect(*code, format!("{}/elsewhere", unbound_url()))
+        } else {
+            Reply::Status(*code, String::new())
+        };
+        let fake = serve(vec![reply, Reply::Status(204, String::new())]);
+        let got = plane(&fake.url).frame_upload().post_frame("m", JPEG);
+        assert_eq!(&got, want, "{code}");
+        assert_no_token(&format!("{code}"), &format!("{got:?}"));
+        fake.next();
+        assert!(
+            fake.none_within(Duration::from_millis(200)),
+            "{code}: a second request"
+        );
+    }
+    eprintln!("frame statuses checked: {}", table.len());
+    assert_eq!(table.len(), 17);
+}
+
+/// No answer: a refused connection, a close with no reply and a hung server are each `Failed`, the
+/// hung one within the upload's bound (`FRAME_UPLOAD_TIMEOUT_MS`), and no text carries the token.
+#[test]
+fn a_frame_with_no_answer_fails_within_its_bound_and_never_carries_the_token() {
+    use domain::config::FRAME_UPLOAD_TIMEOUT_MS;
+    let mut checked = 0;
+    let refused = plane(&unbound_url()).frame_upload().post_frame("m", JPEG);
+    let closed = {
+        let fake = serve(vec![Reply::Close]);
+        plane(&fake.url).frame_upload().post_frame("m", JPEG)
+    };
+    let fake = serve(vec![Reply::Hang(Duration::from_millis(
+        FRAME_UPLOAD_TIMEOUT_MS + 3_000,
+    ))]);
+    let began = Instant::now();
+    let hung = plane(&fake.url).frame_upload().post_frame("m", JPEG);
+    let took = began.elapsed();
+    assert!(
+        took < Duration::from_millis(FRAME_UPLOAD_TIMEOUT_MS + 1_500),
+        "the hung upload took {took:?}"
+    );
+    for (what, got) in [("refused", refused), ("closed", closed), ("hung", hung)] {
+        match &got {
+            Err(FrameUploadError::Failed(text)) => {
+                assert!(text.starts_with("frame transport: "), "{what}: {text}");
+                assert_no_token(what, text);
+            }
+            other => panic!("{what}: {other:?}"),
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 3);
+}
+
+/// The uploader's own guard: a moment id that cannot be one path segment (`""`, `.`, `..`, which a URL
+/// parser resolves away) is refused, and nothing is sent.
+#[test]
+fn a_moment_id_that_is_not_a_segment_is_never_sent() {
+    let fake = serve(vec![Reply::Status(204, String::new())]);
+    let mut up = plane(&fake.url).frame_upload();
+    let mut checked = 0;
+    for id in ["", ".", ".."] {
+        assert_eq!(
+            up.post_frame(id, JPEG),
+            Err(FrameUploadError::Unaddressable),
+            "{id:?}"
+        );
+        checked += 1;
+    }
+    assert!(
+        fake.none_within(Duration::from_millis(300)),
+        "a request reached web"
+    );
+    assert_eq!(checked, 3);
 }

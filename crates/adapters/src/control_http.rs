@@ -22,11 +22,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use app::ports::{
-    redacted_origin, ControlPlane, FetchError, HeartbeatError, InputSpec, Measured, Reply, SessionConfig,
-    TargetSpec, FINAL_BEAT_TIMEOUT_MS,
+    redacted_origin, ControlPlane, FetchError, FrameUpload, FrameUploadError, HeartbeatError, InputSpec,
+    Measured, Reply, SessionConfig, TargetSpec, FINAL_BEAT_TIMEOUT_MS,
 };
 use domain::airings::{AiringBatch, AiringLine};
-use domain::config::OutputProfile;
+use domain::config::{OutputProfile, FRAME_UPLOAD_TIMEOUT_MS};
+use domain::frame_grab::is_path_segment;
 use domain::health::{BeatState, ExitDetail, GraphicsStatus, HealthReport, LinkStatus, PhaseChannel};
 use domain::ladder::Rung;
 use domain::lifecycle::ExitReason;
@@ -582,6 +583,90 @@ impl HttpControlPlane {
 
     fn bearer(&self) -> String {
         format!("Bearer {}", self.token)
+    }
+
+    /// R4 task SC2: the uploader for web's frame endpoint (S9), sharing this plane's token and
+    /// scrubber (what a fetch learned is masked in its errors too) with an agent of its own, bounded by
+    /// `FRAME_UPLOAD_TIMEOUT_MS` and built as `agent` builds every agent here: an upload never waits on
+    /// a beat's connection, nor a beat on an upload's.
+    pub fn frame_upload(&self) -> HttpFrameUpload {
+        HttpFrameUpload {
+            agent: agent(FRAME_UPLOAD_TIMEOUT_MS),
+            session_url: self.session_url.clone(),
+            token: self.token.clone(),
+            scrubber: Arc::clone(&self.scrubber),
+        }
+    }
+}
+
+/// `text` as one URL path segment: every byte but RFC 3986's unreserved (`A-Z a-z 0-9 - . _ ~`)
+/// percent-encoded, upper-case hex, so `:` and `/` in a moment id (`12:sponsor.over_end`) cannot end
+/// the segment, and web reads the id back by decoding it (S9's `[momentId]`). The dot-segments are
+/// refused before this (`domain::frame_grab::is_path_segment`): no encoding keeps them in place, since
+/// a URL parser resolves `%2e` as `.` (WHATWG URL).
+pub fn path_segment(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for b in text.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// R4 task SC2: one POST of a frame to web's frame endpoint (task S9:
+/// `POST /api/internal/relay/sessions/{sid}/airings/{momentId}/frame`, the JPEG as the body,
+/// `Content-Type: image/jpeg`, the job token as the bearer, as the heartbeat sends it). A 2xx is
+/// stored (S9 answers 204), a 410 is the session gone, a 5xx or no answer failed, and any other status
+/// (a 4xx: another session's token is a 404, a refused body a 413 or 415) refused. Every error text is
+/// scrubbed of the token.
+pub struct HttpFrameUpload {
+    agent: ureq::Agent,
+    session_url: String,
+    token: String,
+    scrubber: Arc<Mutex<Scrubber>>,
+}
+
+impl fmt::Debug for HttpFrameUpload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpFrameUpload")
+            .field("origin", &redacted_origin(&self.session_url))
+            .field("token", &"****")
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpFrameUpload {
+    /// Where `moment_id`'s frame goes.
+    pub fn frame_url(&self, moment_id: &str) -> String {
+        format!("{}/airings/{}/frame", self.session_url, path_segment(moment_id))
+    }
+
+    fn failed(&self, text: &str) -> FrameUploadError {
+        FrameUploadError::Failed(locked(&self.scrubber).scrub(text))
+    }
+}
+
+impl FrameUpload for HttpFrameUpload {
+    fn post_frame(&mut self, moment_id: &str, jpeg: &[u8]) -> Result<(), FrameUploadError> {
+        if !is_path_segment(moment_id) {
+            return Err(FrameUploadError::Unaddressable);
+        }
+        let sent = self
+            .agent
+            .post(&self.frame_url(moment_id))
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .set("Content-Type", "image/jpeg")
+            .send_bytes(jpeg);
+        let (code, _) = exchange(sent).map_err(|e| self.failed(&format!("frame transport: {e}")))?;
+        match code {
+            200..=299 => Ok(()),
+            410 => Err(FrameUploadError::Gone),
+            500..=599 => Err(self.failed(&format!("frame refused: status {code}"))),
+            other => Err(FrameUploadError::Refused(other)),
+        }
     }
 }
 

@@ -162,6 +162,10 @@ impl LogSink for DriverLog {
     fn info(&mut self, line: &str) {
         self.0.info(line);
     }
+
+    fn warn(&mut self, line: &str) {
+        self.0.warn(line);
+    }
 }
 
 /// Logs the programme's lifecycle and delegates every call.

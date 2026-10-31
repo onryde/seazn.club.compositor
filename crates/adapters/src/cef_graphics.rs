@@ -5626,4 +5626,94 @@ mod tests {
             end.at()
         );
     }
+    // ---- R4 task SC2: the frame grab is cued by the lines held, and only by them ----
+
+    /// The airings with a frame plan on a fixed clock: a start held plans its grab at 1 500 ms.
+    use domain::config::FRAME_GRAB_DELAY_MS;
+
+    fn airings_with_frames() -> Airings {
+        Airings::on().with_frames(app::frame_grab::FrameGrabs::on(Arc::new(|| 0)))
+    }
+
+    /// The controller's ruling: a grab only for a start SC1 holds for the beat. A start of a retired
+    /// build, one of a crashed build, and a refused line plan none; the current page's start plans one.
+    #[test]
+    fn only_a_start_held_for_the_beat_plans_a_frame_grab() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let airings = airings_with_frames();
+        let shared = unit_shared_with(tx, ProcTree::live(), Arc::default(), u64::MAX, airings.clone());
+        shared.retired.store(true, Ordering::SeqCst);
+        locked(&shared.gate).current = Some((8, 8));
+        assert!(shared.decide_crash(9), "a build that is not current");
+        shared.push(page_note(7, PageSignal::Sponsor(Ok(sponsor_start("retired")))));
+        shared.push(Note::Page {
+            build: 8,
+            gen: 8,
+            signal: PageSignal::Sponsor(Err(LineRefusal::KeySet)),
+            text: "seazn:sponsor:start {}".to_owned(),
+        });
+        dispatch(&shared);
+        assert_eq!(
+            airings.frames().next_due(),
+            None,
+            "a retired build's start, a refused line"
+        );
+        assert!(shared.decide_crash(8));
+        shared.push(page_note(8, PageSignal::Sponsor(Ok(sponsor_start("crashed")))));
+        dispatch(&shared);
+        assert_eq!(airings.frames().next_due(), None, "a crashed build's start");
+        assert_eq!(airings.held(), 0);
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let airings = airings_with_frames();
+        let shared = unit_shared_with(tx, ProcTree::live(), Arc::default(), u64::MAX, airings.clone());
+        shared.retired.store(true, Ordering::SeqCst);
+        locked(&shared.gate).current = Some((8, 8));
+        shared.push(page_note(8, PageSignal::Sponsor(Ok(sponsor_start("current")))));
+        dispatch(&shared);
+        assert_eq!(
+            airings.frames().next_due(),
+            Some(FRAME_GRAB_DELAY_MS),
+            "the current page's"
+        );
+        assert_eq!(
+            airings.frames().take_due(FRAME_GRAB_DELAY_MS).as_deref(),
+            Some("current")
+        );
+    }
+
+    /// A retirement inside the delay, and a crash: the end SC1 writes for the card on air cancels its
+    /// grab, so nothing is grabbed for it.
+    #[test]
+    fn a_retirement_or_a_crash_inside_the_delay_cancels_the_grab() {
+        let mut checked = 0;
+        for crash in [false, true] {
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            let airings = airings_with_frames();
+            let shared = unit_shared_with(tx, ProcTree::live(), Arc::default(), u64::MAX, airings.clone());
+            shared.retired.store(true, Ordering::SeqCst);
+            locked(&shared.gate).current = Some((10, 10));
+            shared.push(page_note(10, PageSignal::Sponsor(Ok(sponsor_start("on-air")))));
+            dispatch(&shared);
+            assert_eq!(
+                airings.frames().next_due(),
+                Some(FRAME_GRAB_DELAY_MS),
+                "crash {crash}"
+            );
+            if crash {
+                assert!(shared.decide_crash(10));
+            } else {
+                unit_adapter(Arc::clone(&shared)).stop();
+            }
+            assert_eq!(airings.frames().next_due(), None, "crash {crash}");
+            assert_eq!(airings.frames().take_due(u64::MAX), None, "crash {crash}");
+            assert_eq!(
+                airings.held(),
+                2,
+                "crash {crash}: the start and its end ride the beat"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 2);
+    }
 }

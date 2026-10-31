@@ -6996,7 +6996,8 @@ fn stays_on_air_reds_a_page_that_leaves_after_coming_back_in_every_leg_with_a_ba
 
 /// R4 SC1 fix round 1 (I3 c): the sponsor-airings case's run. The page logs its card's start 600 ms
 /// after fake-control serves the arming and its end 3 s later; the next beat after each carries it
-/// (with `airingsDropped: 0`), once. `edit` changes the world before it is judged.
+/// (with `airingsDropped: 0`), once. R4 SC2: fake-control received the card's frame 1.5 s after the
+/// start, once, a whole JPEG. `edit` changes the world before it is judged.
 fn sponsor_airings(edit: impl Fn(&mut World, i64, i64)) -> World {
     let mut w = World::new(30);
     let armed = w.at(5.0);
@@ -7004,6 +7005,9 @@ fn sponsor_airings(edit: impl Fn(&mut World, i64, i64)) -> World {
     w.control_state["page_sponsor_armed"] = json!(false);
     w.control_state["page_sponsor_served_ms"] = json!(armed + 400);
     let (start, end) = (armed + 1_000, armed + 4_000);
+    w.control_state["frames_posted"] = json!(1);
+    w.control_state["frames"] = json!([{"moment_segment": "harness-sponsor-1", "bytes": 21_734,
+        "jpeg": true, "received_ms": start + 1_520}]);
     let start_line = json!({"kind": "start", "momentId": "harness-sponsor-1",
         "cardId": "0b8c2a3e-1f4d-4c6b-9a7e-5d2f8e1c3b4a", "style": "lower_third",
         "source": "rotation", "breakKind": null, "at": stamps(start).1});
@@ -7039,10 +7043,10 @@ fn card_line(w: &mut World, kind: &str, f: impl Fn(&mut Value)) {
     assert_eq!(found, 1, "the card's {kind} line");
 }
 
-/// Each of the case's 10 judged checks reds on a world that breaks it: a resent start, a missing end,
+/// Each of the case's 11 judged checks reds on a world that breaks it: a resent start, a missing end,
 /// a dropped count, airings off, an unarmed card, an armed one never served, a cut-short end, an end
-/// stamped before its start, a foreign line, a non-zero exit, a restart, and a stopped beat for
-/// another reason.
+/// stamped before its start, a foreign line, a non-zero exit, a restart, a stopped beat for another
+/// reason, and (R4 SC2) no frame, two frames, a cut JPEG, another moment's and one past web's bound.
 #[test]
 fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_go_wrong() {
     assert_pass(
@@ -7066,7 +7070,8 @@ fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_
         next["airingsDropped"] = json!(0);
     });
     let mut checked = 0;
-    let reds: [(&str, World, &str); 12] = [
+    let frame = |edit: fn(&mut Value)| sponsor_airings(move |w, _, _| edit(&mut w.control_state));
+    let reds: [(&str, World, &str); 17] = [
         ("sa-resent", resent, "start_relayed_once"),
         (
             "sa-no-end",
@@ -7159,6 +7164,36 @@ fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_
             }),
             "ended_beat",
         ),
+        // R4 SC2: the frame never came, came twice, came cut, came for another moment, or came
+        // larger than web takes.
+        (
+            "sa-no-frame",
+            frame(|c| {
+                c["frames_posted"] = json!(0);
+                c["frames"] = json!([]);
+            }),
+            "frame_posted",
+        ),
+        (
+            "sa-two-frames",
+            frame(|c| c["frames_posted"] = json!(2)),
+            "frame_posted",
+        ),
+        (
+            "sa-cut-frame",
+            frame(|c| c["frames"][0]["jpeg"] = json!(false)),
+            "frame_posted",
+        ),
+        (
+            "sa-other-frame",
+            frame(|c| c["frames"][0]["moment_segment"] = json!("another-moment")),
+            "frame_posted",
+        ),
+        (
+            "sa-big-frame",
+            frame(|c| c["frames"][0]["bytes"] = json!(262_145)),
+            "frame_posted",
+        ),
     ];
     for (tag, w, check) in &reds {
         assert_fails(&judge(w, "sponsor-airings", "", tag), check, tag);
@@ -7166,9 +7201,9 @@ fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_
     }
     eprintln!("sponsor-airings reds checked: {checked}");
     assert_eq!(checked, reds.len());
-    // Every judged check (the 11 declared, less the one measure) has a red world here.
+    // Every judged check (the 12 declared, less the one measure) has a red world here.
     let mut named: Vec<&str> = reds.iter().map(|r| r.2).collect();
     named.sort_unstable();
     named.dedup();
-    assert_eq!(named.len(), 10, "{named:?}");
+    assert_eq!(named.len(), 11, "{named:?}");
 }

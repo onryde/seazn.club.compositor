@@ -20,7 +20,7 @@ use compositor::clock::Clock;
 use compositor::env::Drivers;
 use compositor::logged::{rfc3339_ms, LoggedPlane, LoggedProgramme, Logger};
 use compositor::wiring::{
-    assemble, cef_fps, sponsor_airings, LazyInput, PageOrigin, Parts, ProfileSlot, ProfileTap,
+    assemble, cef_fps, sponsor_airings, sponsor_frames, LazyInput, PageOrigin, Parts, ProfileSlot, ProfileTap,
 };
 use crossbeam_channel::{bounded, Receiver, Sender};
 use domain::airings::{AiringBuffer, AiringLine};
@@ -735,6 +735,71 @@ fn the_sponsor_airings_follow_relay_airings_and_say_so() {
             if on { "on" } else { "off" }
         );
         assert_eq!(buf.messages(), vec![want], "{value:?}");
+        checked += 1;
+    }
+    assert_eq!(checked, 3);
+}
+
+/// R4 task SC2: the frame grabs ride the airings' gate (the controller's ruling: one `RELAY_AIRINGS` for
+/// both), on the process clock, and the start says which. On, a held start plans a grab
+/// `FRAME_GRAB_DELAY_MS` after the clock's now; off, nothing is planned.
+#[test]
+fn the_sponsor_frames_follow_relay_airings_and_say_so() {
+    use domain::config::FRAME_GRAB_DELAY_MS;
+    let mut checked = 0;
+    for (value, on) in [(None, false), (Some("0"), false), (Some("1"), true)] {
+        let mut m = std::collections::BTreeMap::from([
+            (
+                compositor::env::SESSION_ID,
+                "3f8a2c1e-7b4d-4e9a-9c2f-5d6e7f8a9b0c".to_owned(),
+            ),
+            (compositor::env::JOB_TOKEN, TOKEN.to_owned()),
+            (compositor::env::APP_URL, "https://stg.seazn.club".to_owned()),
+            (
+                compositor::env::RELAY_DEADLINE_AT,
+                "2026-10-14T18:30:00.000Z".to_owned(),
+            ),
+            (compositor::env::COMPOSITOR_DRIVERS, "live".to_owned()),
+        ]);
+        if let Some(v) = value {
+            m.insert(compositor::env::RELAY_AIRINGS, v.to_owned());
+        }
+        let env = compositor::env::parse(|k| m.get(k).cloned(), true).expect("a valid env");
+        let (log, buf) = logger();
+        let clock = Arc::new(Clock::system());
+        let airings = sponsor_airings(&env, &log).with_frames(sponsor_frames(&env, &clock, &log));
+        assert_eq!(airings.frames().is_on(), on, "{value:?}");
+        let said = if on { "on" } else { "off" };
+        assert_eq!(
+            buf.messages(),
+            vec![
+                format!("sponsor airings on the heartbeat: {said}"),
+                format!("sponsor frames: {said}"),
+            ],
+            "{value:?}"
+        );
+        let before = clock.now_ms();
+        let start = AiringLine::start(
+            "1:sponsor.set_break".to_owned(),
+            "card-1".to_owned(),
+            domain::airings::AiringStyle::LowerThird,
+            domain::airings::AiringSource::Rotation,
+            None,
+            "2026-10-31T12:00:00.000Z".to_owned(),
+        )
+        .expect("bounds");
+        airings.push(start);
+        let after = clock.now_ms();
+        match airings.frames().next_due() {
+            Some(due) => {
+                assert!(on, "{value:?}: planned while off");
+                assert!(
+                    (before + FRAME_GRAB_DELAY_MS..=after + FRAME_GRAB_DELAY_MS).contains(&due),
+                    "{value:?}: due {due}, now {before}..{after}"
+                );
+            }
+            None => assert!(!on, "{value:?}: nothing planned while on"),
+        }
         checked += 1;
     }
     assert_eq!(checked, 3);

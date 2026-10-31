@@ -2,5 +2,6 @@
 pub mod airings;
 pub mod control_worker;
 pub mod driver;
+pub mod frame_grab;
 pub mod ports;
 pub mod run;

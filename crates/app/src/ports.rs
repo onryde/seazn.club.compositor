@@ -413,6 +413,44 @@ pub trait PhasePublisher: Send {
 /// driver never logs either (C07 confirm pass; Owed 32).
 pub trait LogSink: Send {
     fn info(&mut self, line: &str);
+    /// A line a person should act on (R4 task SC2's frame worker: a frame dropped, said once). The
+    /// default writes it as `info`; C12's sink writes `level=warn`.
+    fn warn(&mut self, line: &str) {
+        self.info(line);
+    }
+}
+
+/// R4 task SC2 (spec 2026-10-27 §3.6.3): one programme frame, as the sponsor airing's proof. Only the
+/// frame worker's thread calls it, never the loop, and the programme never waits on it: the live tap
+/// (C09's programme) hands a frame over without blocking its streaming thread, and the copy and the
+/// encode happen on the caller's thread. It returns the next frame the programme composes after the
+/// call, as a JPEG at `FRAME_GRAB_SIZE` and `FRAME_GRAB_JPEG_QUALITY`, or why there is none; it waits
+/// at most `FRAME_GRAB_WAIT_MS` for the frame and `FRAME_ENCODE_WAIT_MS` for the JPEG. The text never
+/// carries a credential.
+pub trait FrameTap: Send {
+    fn grab(&mut self) -> Result<Vec<u8>, String>;
+}
+
+/// An upload attempt's failure (R4 task SC2, web's S9 frame endpoint), classified for
+/// `domain::frame_grab::after_upload`. The text is already redacted, and never carries the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameUploadError {
+    /// A 410: the session is gone.
+    Gone,
+    /// Any other status that is not a 2xx, 5xx or 410 (a 4xx, a redirect): web will not take this frame.
+    Refused(u16),
+    /// A 5xx, a network error or a timeout.
+    Failed(String),
+    /// The moment id cannot be one path segment of the URL (`domain::frame_grab::is_path_segment`):
+    /// nothing was sent. The plan never schedules such a grab; this is the uploader's own guard.
+    Unaddressable,
+}
+
+/// R4 task SC2: web's frame endpoint (task S9: `POST /api/internal/relay/sessions/{sid}/airings/
+/// {momentId}/frame`, `image/jpeg`, the session's job token as the bearer, answered 204). One attempt
+/// per call, bounded by `FRAME_UPLOAD_TIMEOUT_MS`; the frame worker decides any retry.
+pub trait FrameUpload: Send {
+    fn post_frame(&mut self, moment_id: &str, jpeg: &[u8]) -> Result<(), FrameUploadError>;
 }
 
 /// What the loop asks of the control worker. A `Heartbeat` whose report carries an `exit` is a final

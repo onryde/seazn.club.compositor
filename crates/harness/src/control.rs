@@ -18,6 +18,10 @@
 //! - R4 SC1: `POST /control/page-sponsor` arms the page's sponsor card once (409 after), served to
 //!   the first poll after it the same way (`{"sponsor":true}` once): the page then logs one sponsor
 //!   start and, a few seconds later, its end (harness/cases/sponsor-airings.sh).
+//! - R4 SC2: `POST /api/internal/relay/sessions/{sid}/airings/{momentId}/frame` (web's S9 frame
+//!   endpoint, the same bearer and session checks): answers 204 and records the frame's moment
+//!   segment (as sent, percent-encoded), its size, whether it is a whole JPEG (SOI and EOI) and when,
+//!   for `GET /control/state`'s `frames` (the first `FRAMES_KEPT`; `frames_posted` counts them all).
 //! - `GET /score.json`: the events that have happened by now (a live score feed reveals an event
 //!   when it happens; none before the start), or 503 while the feed is down. The page polls it
 //!   every second.
@@ -37,8 +41,11 @@ use crate::thresholds::{BUDGET_SCORE_STALE_AFTER_MS, HARNESS_PAGE_POLL_MS};
 
 /// The relay routes' prefix (R1, `seazn.club`'s internal relay API).
 pub const SESSIONS: &str = "/api/internal/relay/sessions/";
-/// The largest heartbeat body read (a beat is a few hundred bytes).
-pub const MAX_BODY: u64 = 64 * 1024;
+/// The largest body read: a sponsor frame at web's own bound (R4 SC2, `FRAME_UPLOAD_MAX_BYTES`, S9's
+/// 256 KiB), so a frame is never cut; a beat is a few hundred bytes.
+pub const MAX_BODY: u64 = domain::config::FRAME_UPLOAD_MAX_BYTES as u64;
+/// R4 SC2: the sponsor frames kept for `GET /control/state` (AGENTS.md §4: bounded; the count goes on).
+pub const FRAMES_KEPT: usize = 8;
 
 /// Where the rewrite points the session: each origin is `scheme://host:port`.
 #[derive(Clone, PartialEq, Eq)]
@@ -240,6 +247,9 @@ struct State {
     /// first `/page-control.json` poll after it, once.
     page_sponsor_armed: bool,
     page_sponsor_served_ms: Option<i64>,
+    /// R4 SC2: the sponsor frames posted (all of them), and the first `FRAMES_KEPT`.
+    frames_posted: u64,
+    frames: Vec<Value>,
 }
 
 /// fake-control's routes and state.
@@ -308,6 +318,8 @@ impl Fake {
                 page_hang_served_ms: None,
                 page_sponsor_armed: false,
                 page_sponsor_served_ms: None,
+                frames_posted: 0,
+                frames: Vec::new(),
             }),
         })
     }
@@ -341,6 +353,26 @@ impl Fake {
         if sid != self.session_id {
             self.state().other_session += 1;
             return Answer::json(404, &json!({"ok": false, "code": "NOT_FOUND"}));
+        }
+        let frame = tail
+            .strip_prefix("airings/")
+            .and_then(|r| r.strip_suffix("/frame"))
+            .filter(|seg| !seg.is_empty() && !seg.contains('/'));
+        if let (Some(segment), "POST") = (frame, method) {
+            let jpeg = body.starts_with(&[0xFF, 0xD8, 0xFF]) && body.ends_with(&[0xFF, 0xD9]);
+            let mut st = self.state();
+            st.frames_posted += 1;
+            if st.frames.len() < FRAMES_KEPT {
+                st.frames.push(
+                    json!({"moment_segment": segment, "bytes": body.len(), "jpeg": jpeg,
+                                      "received_ms": now_ms}),
+                );
+            }
+            return Answer {
+                status: 204,
+                content_type: "application/json",
+                body: Vec::new(),
+            };
         }
         match (method, tail) {
             ("GET", "") => {
@@ -428,7 +460,8 @@ impl Fake {
                             "page_hang_armed": st.page_hang_armed,
                             "page_hang_served_ms": st.page_hang_served_ms,
                             "page_sponsor_armed": st.page_sponsor_armed,
-                            "page_sponsor_served_ms": st.page_sponsor_served_ms}),
+                            "page_sponsor_served_ms": st.page_sponsor_served_ms,
+                            "frames_posted": st.frames_posted, "frames": st.frames}),
                 )
             }
             ("POST", "/control/page-hang") => {
@@ -740,6 +773,65 @@ mod tests {
         let v: Value = serde_json::from_slice(&a.body).unwrap();
         assert_eq!((a.status, v["ok"].as_bool()), (200, Some(true)));
         assert_eq!(v["data"]["sessionId"], "sid-1");
+    }
+
+    /// R4 SC2: web's frame endpoint (S9), behind the relay routes' own checks: answered 204, each
+    /// frame recorded with its moment segment as sent, its size and whether it is a whole JPEG; the
+    /// state keeps the first `FRAMES_KEPT` and counts every one. A path that is not one frame segment
+    /// is still a 404, and a GET of a frame path is too.
+    #[test]
+    fn frames_are_answered_204_and_recorded_for_the_state() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let f = fake(Arc::clone(&out));
+        let state = || -> Value {
+            serde_json::from_slice(&f.handle("GET", "/control/state", None, b"", 0).body).unwrap()
+        };
+        assert_eq!(
+            (
+                state()["frames_posted"].as_u64(),
+                state()["frames"].as_array().map(Vec::len)
+            ),
+            (Some(0), Some(0))
+        );
+        let path = format!("{SESSIONS}sid-1/airings/1%3Asponsor.set_break/frame");
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0xFF, 0xD9];
+        assert_eq!(f.handle("POST", &path, None, &jpeg, 5).status, 401);
+        let other = format!("{SESSIONS}sid-2/airings/m/frame");
+        assert_eq!(f.handle("POST", &other, Some("Bearer tok"), &jpeg, 5).status, 404);
+        for bad in [
+            "airings//frame",
+            "airings/a/b/frame",
+            "airings/m/frames",
+            "airings/m",
+        ] {
+            let p = format!("{SESSIONS}sid-1/{bad}");
+            assert_eq!(
+                f.handle("POST", &p, Some("Bearer tok"), &jpeg, 5).status,
+                404,
+                "{bad}"
+            );
+        }
+        assert_eq!(f.handle("GET", &path, Some("Bearer tok"), b"", 5).status, 404);
+        let a = f.handle("POST", &path, Some("Bearer tok"), &jpeg, 6);
+        assert_eq!((a.status, a.body.len()), (204, 0));
+        let cut = f.handle("POST", &path, Some("Bearer tok"), &jpeg[..4], 7);
+        assert_eq!(cut.status, 204);
+        let v = state();
+        assert_eq!(v["frames_posted"], 2);
+        assert_eq!(
+            v["frames"],
+            json!([
+                {"moment_segment": "1%3Asponsor.set_break", "bytes": 7, "jpeg": true, "received_ms": 6},
+                {"moment_segment": "1%3Asponsor.set_break", "bytes": 4, "jpeg": false, "received_ms": 7},
+            ])
+        );
+        for n in 0..FRAMES_KEPT + 3 {
+            f.handle("POST", &path, Some("Bearer tok"), &jpeg, 10 + n as i64);
+        }
+        let v = state();
+        assert_eq!(v["frames_posted"].as_u64(), Some(2 + FRAMES_KEPT as u64 + 3));
+        assert_eq!(v["frames"].as_array().map(Vec::len), Some(FRAMES_KEPT), "bounded");
+        assert!(out.lock().unwrap().is_empty(), "a frame is not a beat");
     }
 
     #[test]
