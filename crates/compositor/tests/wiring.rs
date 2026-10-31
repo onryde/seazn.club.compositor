@@ -650,6 +650,60 @@ fn logged_plane_passes_the_airings_on_on_both_lanes() {
     assert_eq!(carried, vec![(false, batch.clone()), (true, batch)]);
 }
 
+/// SC1 fix round 1, I2: web refusing a beat that carried sponsor airings (a 400 or a 422) is said once
+/// a process, as a WARN, whichever lane it happens on and however often: the worker drops those lines
+/// and counts them, and the log says why the count rose. A refused beat with no line says nothing.
+#[test]
+fn a_refused_beat_carrying_airings_warns_once() {
+    let (log, buf) = logger();
+    let (plane, _) = ScriptedPlane::new(session_720p());
+    let plane = plane.reply(|_| (Duration::ZERO, Err(HeartbeatError::Refused(400))));
+    let mut lp = LoggedPlane::new(Box::new(plane), log);
+    let mut lane = lp.final_lane();
+    let mut buffer = AiringBuffer::default();
+    for n in 0..2 {
+        buffer.push(
+            AiringLine::end(
+                format!("{n}:sponsor.set_break"),
+                "2026-10-31T12:00:08Z".to_owned(),
+                false,
+            )
+            .expect("within web's bounds"),
+        );
+    }
+    let batch = buffer.take_for_beat();
+    let periodic = Supervisor::new(Thresholds::default())
+        .decide(Event::Tick, 0)
+        .next
+        .health(0);
+    let bare = AiringBuffer::default().take_for_beat();
+    assert!(lp.heartbeat_with(&periodic, &Measured::default(), &bare).is_err());
+    assert!(
+        buf.messages().is_empty(),
+        "no line, nothing to say: {:?}",
+        buf.messages()
+    );
+    for _ in 0..3 {
+        assert!(lp
+            .heartbeat_with(&periodic, &Measured::default(), &batch)
+            .is_err());
+    }
+    assert!(lane
+        .heartbeat_with(&final_report(ExitReason::Ended), &Measured::default(), &batch)
+        .is_err());
+    let lines = buf.messages();
+    let warned: Vec<&String> = lines.iter().filter(|l| l.contains("sponsor airings")).collect();
+    assert_eq!(
+        warned,
+        vec!["web refused a beat carrying 2 sponsor airings (status 400): they are dropped and counted in airingsDropped (said once)"],
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"final beat failed: web refused it (status 400)".to_owned()),
+        "{lines:?}"
+    );
+}
+
 /// R4 task SC1: the binary's airings follow `RELAY_AIRINGS` (off unless `1`), and its start says
 /// which, so a run's log shows whether its beats can carry them.
 #[test]

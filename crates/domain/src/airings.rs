@@ -228,6 +228,32 @@ pub fn is_utc_instant(s: &str) -> bool {
     fraction.is_empty() || fraction.strip_prefix(b".").is_some_and(all_digits)
 }
 
+/// `epoch_ms` as the instant `is_utc_instant` takes, `Date.toISOString()`'s form
+/// (`YYYY-MM-DDTHH:MM:SS.mmmZ`), for a line the compositor writes itself (a retired page's end).
+pub fn utc_instant_ms(epoch_ms: u64) -> String {
+    let (days, in_day) = (epoch_ms / 86_400_000, epoch_ms % 86_400_000);
+    let (year, month, day) = civil(days);
+    let (h, mi, sec, ms) = (
+        in_day / 3_600_000,
+        in_day / 60_000 % 60,
+        in_day / 1_000 % 60,
+        in_day % 1_000,
+    );
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{mi:02}:{sec:02}.{ms:03}Z")
+}
+
+/// The Gregorian date `days` after 1970-01-01 (Howard Hinnant's `civil_from_days`, for days ≥ 0).
+fn civil(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let (era, doe) = (z / 146_097, z % 146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + u64::from(month <= 2), month, day)
+}
+
 fn all_digits(b: &[u8]) -> bool {
     !b.is_empty() && b.iter().all(u8::is_ascii_digit)
 }
@@ -249,7 +275,8 @@ fn days_in(year: u32, month: u32) -> u32 {
 }
 
 /// What one beat carries: every line held when it was taken, oldest first, and the buffer's dropped
-/// total then. Empty when nothing is held: the beat then carries no `airings` key.
+/// total then. Empty when nothing is held: the beat then carries no `airings` key, and no
+/// `airingsDropped` either unless something was ever dropped (`carries_nothing`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AiringBatch {
     lines: Vec<AiringLine>,
@@ -265,9 +292,14 @@ impl AiringBatch {
     pub fn is_empty(&self) -> bool {
         self.lines.is_empty()
     }
-    /// The buffer's dropped total when the batch was taken (the beat's `airingsDropped`).
+    /// The buffer's dropped total when the batch was taken (the beat's `airingsDropped`): a total for
+    /// the process, and an upper bound (`AiringBuffer::dropped`).
     pub fn dropped(&self) -> u32 {
         self.dropped
+    }
+    /// No line and nothing ever dropped: the beat carries neither key.
+    pub fn carries_nothing(&self) -> bool {
+        self.is_empty() && self.dropped == 0
     }
 }
 
@@ -310,13 +342,32 @@ impl AiringBuffer {
         }
     }
 
+    /// Web refused the beat that carried `batch` (a 400 or a 422: the same body is refused again, and a
+    /// strict heartbeat that keeps being refused loses the session). Its lines still held leave and
+    /// are counted dropped, and every line pushed after it was taken stays. The number that left.
+    pub fn drop_refused(&mut self, batch: &AiringBatch) -> usize {
+        let Some(through) = batch.through else {
+            return 0;
+        };
+        let mut left = 0;
+        while self.held.front().is_some_and(|(seq, _)| *seq <= through) {
+            self.held.pop_front();
+            left += 1;
+        }
+        let counted = u32::try_from(left).unwrap_or(u32::MAX);
+        self.dropped = self.dropped.saturating_add(counted);
+        left
+    }
+
     pub fn len(&self) -> usize {
         self.held.len()
     }
     pub fn is_empty(&self) -> bool {
         self.held.is_empty()
     }
-    /// Lines dropped past the cap, over the process.
+    /// Lines dropped, over the process: past the cap, or carried by a beat web refused. An upper
+    /// bound: a line dropped past the cap while a beat in flight carries it is counted even when that
+    /// beat lands.
     pub fn dropped(&self) -> u32 {
         self.dropped
     }
@@ -417,6 +468,60 @@ mod tests {
         // A late 2xx of an older beat removes nothing it did not carry.
         b.ack_2xx(&carried);
         assert_eq!(ids(&b.take_for_beat()), want(2, 2));
+    }
+
+    /// Fix round 1, I2: a beat web refused (400/422) would be refused again, so what it carried leaves,
+    /// counted; a line pushed after its snapshot stays. A second call, and an empty batch, change
+    /// nothing.
+    #[test]
+    fn a_refused_beat_drops_and_counts_what_it_carried_and_keeps_later_lines() {
+        let mut b = AiringBuffer::default();
+        assert_eq!(
+            b.drop_refused(&b.take_for_beat()),
+            0,
+            "an empty batch drops nothing"
+        );
+        assert_eq!((b.len(), b.dropped()), (0, 0));
+        b.push(start(1));
+        b.push(start(2));
+        let carried = b.take_for_beat();
+        b.push(start(3));
+        assert_eq!(b.drop_refused(&carried), 2);
+        assert_eq!(b.dropped(), 2);
+        let next = b.take_for_beat();
+        assert_eq!(
+            (ids(&next), next.dropped()),
+            (want(3, 3), 2),
+            "line 3 stays; 2 counted"
+        );
+        assert_eq!(b.drop_refused(&carried), 0, "a second call drops nothing more");
+        assert_eq!((b.len(), b.dropped()), (1, 2));
+
+        // Past the cap first: two dropped by the cap, then the refused beat's 62 still held.
+        let mut b = AiringBuffer::default();
+        for n in 1..=AIRING_BUFFER_CAP as u64 {
+            b.push(start(n));
+        }
+        let carried = b.take_for_beat();
+        b.push(start(65));
+        b.push(start(66));
+        assert_eq!(b.dropped(), 2);
+        assert_eq!(b.drop_refused(&carried), 62);
+        assert_eq!((ids(&b.take_for_beat()), b.dropped()), (want(65, 66), 64));
+    }
+
+    /// m2: a beat carries `airingsDropped` whenever the total is above 0, lines or none.
+    #[test]
+    fn a_batch_carries_nothing_only_with_no_line_and_nothing_dropped() {
+        let mut b = AiringBuffer::default();
+        assert!(b.take_for_beat().carries_nothing());
+        b.push(start(1));
+        assert!(!b.take_for_beat().carries_nothing());
+        let carried = b.take_for_beat();
+        b.drop_refused(&carried);
+        let after = b.take_for_beat();
+        assert!(after.is_empty() && after.dropped() == 1);
+        assert!(!after.carries_nothing(), "no line, but a dropped total to report");
     }
 
     #[test]

@@ -1,7 +1,8 @@
 name: harness
 # The harness (C13): build the relay image and the harness image from docker/Dockerfile, run one
-# case of harness/run-case.sh against them (the smoke case on a pull request), and upload out/ once
-# run-case.sh's secrets scan says it is clean.
+# case of harness/run-case.sh against them, and upload out/ once run-case.sh's secrets scan says it
+# is clean. A pull request runs two legs, the smoke case and R4 SC1's sponsor-airings case (the
+# sponsor lines a real CEF page logs reach a beat); a dispatch runs the one case it names.
 # This is the only place the compose stack runs (owner ruling 2026-10-23: no local Docker). The
 # builds read image.yml's caches (GHCR when warm, else GitHub's) and write neither.
 # Dispatchable, so a throwaway mutant branch can run a case too.
@@ -32,6 +33,11 @@ jobs:
   harness:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    strategy:
+      # Each leg's verdict is its own: one red leg does not cancel the other.
+      fail-fast: false
+      matrix:
+        case: ${{ fromJSON(github.event_name == 'pull_request' && '["smoke","sponsor-airings"]' || format('["{0}"]', inputs.case || 'smoke')) }}
     # Read only: this workflow never writes a cache or the registry.
     permissions: { contents: read, packages: read }
     defaults:
@@ -40,7 +46,7 @@ jobs:
     env:
       RELAY_IMAGE: seazn-relay:${{ github.sha }}
       HARNESS_IMAGE: seazn-harness:${{ github.sha }}
-      CASE: ${{ inputs.case || 'smoke' }}
+      CASE: ${{ matrix.case }}
     steps:
       - uses: actions/checkout@v4
       - name: The case name

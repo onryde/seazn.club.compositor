@@ -15,6 +15,7 @@
 //! - `Logger::log_sink`: the driver's own lines (`app::ports::LogSink`), in both driver modes.
 use std::fmt;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use adapters::redact::Scrubber;
@@ -252,10 +253,13 @@ impl GraphicsRenderer for LoggedGraphics {
     }
 }
 
-/// Teaches the log each fetched session's credentials, and logs a final beat that failed.
+/// Teaches the log each fetched session's credentials, logs a final beat that failed, and says once a
+/// process (on either lane) that web refused a beat carrying sponsor airings (SC1 fix round 1, I2).
 pub struct LoggedPlane {
     inner: Box<dyn ControlPlane>,
     log: Logger,
+    /// The refusal has been said (shared with the final lane).
+    refusal_said: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for LoggedPlane {
@@ -266,7 +270,11 @@ impl fmt::Debug for LoggedPlane {
 
 impl LoggedPlane {
     pub fn new(inner: Box<dyn ControlPlane>, log: Logger) -> Self {
-        Self { inner, log }
+        Self {
+            inner,
+            log,
+            refusal_said: Arc::default(),
+        }
     }
 }
 
@@ -286,6 +294,15 @@ impl ControlPlane for LoggedPlane {
         airings: &AiringBatch,
     ) -> Result<Reply, HeartbeatError> {
         let r = self.inner.heartbeat_with(report, measured, airings);
+        if let Err(HeartbeatError::Refused(code)) = &r {
+            if !airings.is_empty() && !self.refusal_said.swap(true, Ordering::SeqCst) {
+                self.log.warn(&format!(
+                    "web refused a beat carrying {} sponsor airings (status {code}): they are dropped and \
+                     counted in airingsDropped (said once)",
+                    airings.lines().len()
+                ));
+            }
+        }
         if report.exit.is_some() {
             match &r {
                 Ok(_) => {}
@@ -293,6 +310,9 @@ impl ControlPlane for LoggedPlane {
                     .log
                     .warn("final beat failed: web answered 410 (session gone)"),
                 Err(HeartbeatError::Transport(text)) => self.log.warn(&format!("final beat failed: {text}")),
+                Err(HeartbeatError::Refused(code)) => self
+                    .log
+                    .warn(&format!("final beat failed: web refused it (status {code})")),
             }
         }
         r
@@ -302,6 +322,7 @@ impl ControlPlane for LoggedPlane {
         Box::new(Self {
             inner: self.inner.final_lane(),
             log: self.log.clone(),
+            refusal_said: Arc::clone(&self.refusal_said),
         })
     }
 }

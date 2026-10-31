@@ -22,6 +22,11 @@ pub const COMPOSITOR_FAKE_START_FAIL: &str = "COMPOSITOR_FAKE_START_FAIL";
 /// Fake mode only: `1` makes the fake graphics report a dead CEF zygote (generation 1) from the start,
 /// which the domain acts on at the first Running tick: the in-place restart, exit 75 (C11b).
 pub const COMPOSITOR_FAKE_ZYGOTE_GONE: &str = "COMPOSITOR_FAKE_ZYGOTE_GONE";
+/// Fake mode only (SC1 fix round 1, I3): `1` holds one sponsor line (`wiring::FAKE_SPONSOR_MOMENT`) in
+/// the run's airings at the start, as a live page's would be, so a smoke run with `RELAY_AIRINGS=1`
+/// and `COMPOSITOR_FAKE_CONTROL=http` can read it in a POST. Off (the default), and with the airings
+/// off, nothing is held.
+pub const COMPOSITOR_FAKE_SPONSOR_LINE: &str = "COMPOSITOR_FAKE_SPONSOR_LINE";
 
 /// R4 task SC1 (spec 2026-10-27 §3.6.2): `1` puts the sponsor airings the overlay page logs on the
 /// heartbeat (`airings`, `airingsDropped`). Off unless set: web's heartbeat is strict, so a beat
@@ -78,6 +83,7 @@ pub struct FakeKnobs {
     pub control_http: bool,
     pub start_fail: Option<String>,
     pub zygote_gone: bool,
+    pub sponsor_line: bool,
 }
 
 /// Owed 94: how the planted sink stall stalls (`COMPOSITOR_TEST_HOLD_SINK_AFTER_MS`,
@@ -197,6 +203,11 @@ pub fn parse(get: impl Fn(&str) -> Option<String>, release: bool) -> Result<Env,
                 None | Some("") | Some("0") => false,
                 Some("1") => true,
                 Some(_) => return Err(EnvError::Invalid(COMPOSITOR_FAKE_ZYGOTE_GONE)),
+            },
+            sponsor_line: match get(COMPOSITOR_FAKE_SPONSOR_LINE).as_deref() {
+                None | Some("") | Some("0") => false,
+                Some("1") => true,
+                Some(_) => return Err(EnvError::Invalid(COMPOSITOR_FAKE_SPONSOR_LINE)),
             },
         },
     };

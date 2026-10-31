@@ -5,8 +5,8 @@
 //! each instant's verdict was read off zod's own `z.string().datetime()` by running it (the SC1
 //! report pastes that run). None is computed by the code under test.
 use domain::airings::{
-    is_utc_instant, AiringLine, AiringSource, AiringStyle, LineRefusal, AIRING_BREAK_KIND_MAX_UNITS,
-    AIRING_ID_MAX_UNITS,
+    is_utc_instant, utc_instant_ms, AiringLine, AiringSource, AiringStyle, LineRefusal,
+    AIRING_BREAK_KIND_MAX_UNITS, AIRING_ID_MAX_UNITS,
 };
 
 const AT: &str = "2026-10-31T12:00:00.000Z";
@@ -205,4 +205,46 @@ fn a_start_and_an_end_keep_their_values() {
         (e.moment_id(), e.at(), e.cut_short()),
         ("4:sponsor.set_break", AT, true)
     );
+}
+
+/// Fix round 1 (the retire ruling): the instant the compositor writes for a retired page's end. Each
+/// expected string is Python's `datetime` for that epoch millisecond (the SC1 fix-round report pastes
+/// the run), not the formatter's: leap days, a century that is not a leap year, the last millisecond
+/// of a day and of the year 9999.
+const FORMATTED: &[(u64, &str)] = &[
+    (0, "1970-01-01T00:00:00.000Z"),
+    (1_000, "1970-01-01T00:00:01.000Z"),
+    (86_399_999, "1970-01-01T23:59:59.999Z"),
+    (951_782_400_000, "2000-02-29T00:00:00.000Z"),
+    (951_868_799_999, "2000-02-29T23:59:59.999Z"),
+    (1_709_164_800_000, "2024-02-29T00:00:00.000Z"),
+    (1_792_002_600_000, "2026-10-14T18:30:00.000Z"),
+    (1_793_448_123_456, "2026-10-31T12:02:03.456Z"),
+    (4_107_542_399_999, "2100-02-28T23:59:59.999Z"),
+    (4_107_542_400_000, "2100-03-01T00:00:00.000Z"),
+    (253_402_300_799_999, "9999-12-31T23:59:59.999Z"),
+];
+
+#[test]
+fn a_written_instant_is_dates_iso_form_and_web_takes_it() {
+    let mut checked = 0;
+    for (ms, want) in FORMATTED {
+        let got = utc_instant_ms(*ms);
+        assert_eq!(&got, want, "{ms}");
+        assert!(is_utc_instant(&got), "{got}");
+        checked += 1;
+    }
+    // Every day's noon from 1970 to 2100: each one web takes, and each one later than the last.
+    let day = 86_400_000u64;
+    let mut last = String::new();
+    let mut days = 0;
+    for d in 0..(4_107_542_400_000 / day) {
+        let got = utc_instant_ms(d * day + day / 2);
+        assert!(is_utc_instant(&got) && got > last, "{got} after {last}");
+        last = got;
+        days += 1;
+    }
+    eprintln!("instants written: {checked} pinned, {days} days swept");
+    assert_eq!(checked, FORMATTED.len());
+    assert_eq!(days, 47_541);
 }

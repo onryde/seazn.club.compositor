@@ -325,7 +325,7 @@ pub enum PlaneCall {
     BeatStarted(HealthReport),
     Beat(HealthReport, Measured),
     /// The sponsor airings a beat carried (R4 task SC1), recorded just before that beat's `Beat`, in
-    /// one step with it; absent when the beat carried none.
+    /// one step with it; absent when the beat carried neither key (no line, nothing dropped).
     Airings(AiringBatch),
 }
 
@@ -374,7 +374,7 @@ impl PlaneLog {
     /// other lane cannot land between the two.
     fn push_beat(&self, beat: PlaneCall, airings: &AiringBatch) {
         let mut calls = locked(&self.0);
-        if !airings.is_empty() {
+        if !airings.carries_nothing() {
             calls.push(PlaneCall::Airings(airings.clone()));
         }
         calls.push(beat);

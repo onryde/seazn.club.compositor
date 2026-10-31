@@ -101,7 +101,7 @@ use std::time::{Duration, Instant};
 use app::airings::Airings;
 use app::ports::{redacted_origin, CefPoll, CefPss, GraphicsRenderer, Inbound};
 use crossbeam_channel::Sender;
-use domain::airings::{AiringLine, LineRefusal};
+use domain::airings::{utc_instant_ms, AiringLine, LineRefusal};
 use domain::health::PhaseChannel;
 use domain::supervisor::Event;
 use gstreamer as gst;
@@ -1529,6 +1529,48 @@ struct Gate {
     /// Test hook (Owed 99): builds whose samples never reach the slot, latched or written.
     #[cfg(feature = "test-hooks")]
     withheld: BTreeSet<u64>,
+    /// The current build's sponsor starts held for the beat and not ended yet, by moment id (SC1 fix
+    /// round 1): its retirement ends each one (`end_open_airings`). Only the current build's lines are
+    /// held, so these are always its.
+    open_airings: Vec<String>,
+}
+
+impl Gate {
+    /// Holds `line` of `build` for the beat when `build` is the current build, keeping its open starts.
+    /// Under the gate's lock, with the retirement that ends them (`end_open_airings`), so no start can
+    /// be held after its build's retirement ended the others. `None` when `build` is retired, else
+    /// whether it was held (false: airings off).
+    fn hold_airing(&mut self, airings: &Airings, build: u64, line: &AiringLine) -> Option<bool> {
+        if self.current.is_none_or(|(b, _)| b != build) {
+            return None;
+        }
+        let held = airings.push(line.clone());
+        if held {
+            match line {
+                AiringLine::Start(s) => self.open_airings.push(s.moment_id().to_owned()),
+                AiringLine::End(e) => {
+                    if let Some(i) = self.open_airings.iter().position(|m| m == e.moment_id()) {
+                        self.open_airings.remove(i);
+                    }
+                }
+            }
+        }
+        Some(held)
+    }
+
+    /// The retiring build's open starts end now, cut short, at `at` (the retire ruling: the card left
+    /// the programme then), held for the beat like any line. The ends held, for the log.
+    fn end_open_airings(&mut self, airings: &Airings, at: &str) -> Vec<AiringLine> {
+        let mut ended = Vec::new();
+        for moment in std::mem::take(&mut self.open_airings) {
+            if let Ok(end) = AiringLine::end(moment, at.to_owned(), true) {
+                if airings.push(end.clone()) {
+                    ended.push(end);
+                }
+            }
+        }
+        ended
+    }
 }
 
 /// A build's newest sample from before its ready, and the counts its write at the ready joins.
@@ -1681,8 +1723,8 @@ struct Shared {
     tree: ProcTree,
     /// The process's CEF watch (`cef_watch`).
     watch: Arc<Mutex<CefWatch>>,
-    /// Where the current page's sponsor lines go for the heartbeat (`with_airings`; off by default).
-    airings: Mutex<Airings>,
+    /// Where the current page's sponsor lines go for the heartbeat (`new`'s; `Airings::off` holds none).
+    airings: Airings,
     #[cfg(feature = "test-hooks")]
     teardown_hold: Mutex<bool>,
     #[cfg(feature = "test-hooks")]
@@ -1925,9 +1967,12 @@ pub struct CefGraphics {
 }
 
 impl CefGraphics {
-    /// `fps` is the programme's (`max-video-framerate`); `rss_cap_mb` is `Thresholds::cef_rss_cap_mb`.
-    /// It loads cefsrc's plugin and installs the process's log handler, so build it before the loop.
-    pub fn new(frames: FrameStore, tx: Sender<Inbound>, fps: u32, rss_cap_mb: u64) -> Self {
+    /// `fps` is the programme's (`max-video-framerate`); `rss_cap_mb` is `Thresholds::cef_rss_cap_mb`;
+    /// `airings` is where the current page's sponsor lines go for the heartbeat (R4 task SC1), the
+    /// control worker's own handle: required, so a composition root cannot leave it out (fix round 1,
+    /// I3). It loads cefsrc's plugin and installs the process's log handler, so build it before the
+    /// loop.
+    pub fn new(frames: FrameStore, tx: Sender<Inbound>, fps: u32, rss_cap_mb: u64, airings: Airings) -> Self {
         static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
         let inst = NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed);
         let lease = profile_lease();
@@ -1951,7 +1996,7 @@ impl CefGraphics {
             memory: CefMemory::default(),
             tree: ProcTree::live(),
             watch: cef_watch(),
-            airings: Mutex::new(Airings::off()),
+            airings,
             #[cfg(feature = "test-hooks")]
             teardown_hold: Mutex::new(false),
             #[cfg(feature = "test-hooks")]
@@ -2034,13 +2079,6 @@ impl CefGraphics {
     /// of stderr, from the next line on. C12 wires its log sink here.
     pub fn with_log(self, log: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
         *locked(&self.shared.log) = log;
-        self
-    }
-
-    /// Holds each sponsor line the current page logs in `airings`, for the heartbeat (R4 task SC1),
-    /// from the next line on. Off (the default), a line is logged and held nowhere.
-    pub fn with_airings(self, airings: Airings) -> Self {
-        *locked(&self.shared.airings) = airings;
         self
     }
 
@@ -2225,14 +2263,25 @@ impl CefGraphics {
     /// Closes the gate and tells the current build's thread to tear its pipeline down, with the
     /// reaper's watch behind it. Returns at once.
     fn retire_current(&mut self) {
-        let latched = {
+        let at = utc_instant_ms(wall_ms());
+        let (latched, retired, ended) = {
             let mut g = locked(&self.shared.gate);
             g.open = None;
-            g.current = None;
-            g.latched.take()
+            let retired = g.current.take();
+            // Under the lock the dispatcher holds a line under: no start of this build is held after.
+            let ended = g.end_open_airings(&self.shared.airings, &at);
+            (g.latched.take(), retired, ended)
         };
         // Its sample is let go after the lock.
         drop(latched);
+        if let Some((_, gen)) = retired {
+            for end in &ended {
+                self.shared.log(&format!(
+                    "gen={gen}: {}: retired, ended at {at}",
+                    airing_said(end)
+                ));
+            }
+        }
         if let Some(live) = self.current.take() {
             if live.running {
                 // Counted before the flag is set: the build's thread counts down once it sees it.
@@ -2579,13 +2628,11 @@ fn dispatch(shared: &Shared) {
                     shared.log(&format!("gen={gen}: `{text}` from a retired page; not relayed"));
                 }
                 PageSignal::Sponsor(Ok(line)) => {
-                    let current = shared.is_current(build);
-                    let fate = if !current {
-                        "from a retired page; not relayed"
-                    } else if locked(&shared.airings).push(line.clone()) {
-                        "held for the beat"
-                    } else {
-                        "not held (airings off)"
+                    let held = locked(&shared.gate).hold_airing(&shared.airings, build, line);
+                    let fate = match held {
+                        None => "from a retired page; not relayed",
+                        Some(true) => "held for the beat",
+                        Some(false) => "not held (airings off)",
                     };
                     shared.log(&format!("gen={gen}: {}: {fate}", airing_said(line)));
                 }
@@ -2636,6 +2683,13 @@ fn dispatch(shared: &Shared) {
             storms.clear();
         }
     }
+}
+
+/// The wall clock, epoch milliseconds (a retired page's synthesised sponsor end; 0 before the epoch).
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// A read sponsor line, for the log: its kind, moment and card (no timestamp: the log line has one).
@@ -4160,8 +4214,15 @@ mod tests {
             fake_tree(&cef),
             Arc::clone(&watch),
             1,
+            Airings::off(),
         ));
-        let b = unit_adapter(unit_shared_with(tx, fake_tree(&cef), Arc::clone(&watch), 2));
+        let b = unit_adapter(unit_shared_with(
+            tx,
+            fake_tree(&cef),
+            Arc::clone(&watch),
+            2,
+            Airings::off(),
+        ));
         let (sa, sb) = (Arc::clone(&a.shared), Arc::clone(&b.shared));
         let at = |t: u64| {
             let mut c = locked(&cef);
@@ -4605,7 +4666,7 @@ mod tests {
     /// An adapter's shared state with no CEF behind it: `tree` is what its watch lists, and the watch
     /// is its own (not the process's).
     fn unit_shared(tx: Sender<Inbound>, tree: ProcTree) -> Arc<Shared> {
-        unit_shared_with(tx, tree, Arc::default(), u64::MAX)
+        unit_shared_with(tx, tree, Arc::default(), u64::MAX, Airings::off())
     }
 
     /// `unit_shared` over `watch` (two adapters in one process share the process's), as `inst`.
@@ -4614,6 +4675,7 @@ mod tests {
         tree: ProcTree,
         watch: Arc<Mutex<CefWatch>>,
         inst: u64,
+        airings: Airings,
     ) -> Arc<Shared> {
         Arc::new(Shared {
             inst,
@@ -4635,7 +4697,7 @@ mod tests {
             memory: CefMemory::default(),
             tree,
             watch,
-            airings: Mutex::new(Airings::off()),
+            airings,
             #[cfg(feature = "test-hooks")]
             teardown_hold: Mutex::new(false),
             #[cfg(feature = "test-hooks")]
@@ -5331,10 +5393,9 @@ mod tests {
             lines
         };
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let shared = unit_shared(tx, ProcTree::live());
-        let lines = capture(&shared);
         let airings = Airings::on();
-        *locked(&shared.airings) = airings.clone();
+        let shared = unit_shared_with(tx, ProcTree::live(), Arc::default(), u64::MAX, airings.clone());
+        let lines = capture(&shared);
         // The dispatcher returns once its queue is empty.
         shared.retired.store(true, Ordering::SeqCst);
         locked(&shared.gate).current = Some((2, 2));
@@ -5397,6 +5458,78 @@ mod tests {
                     .to_owned()
             ]
         );
-        assert_eq!(locked(&off.airings).held(), 0);
+        assert_eq!(off.airings.held(), 0);
+    }
+
+    /// The retire ruling (SC1 fix round 1): a retired page's sponsor start with no end ends at its
+    /// retirement, cut short, stamped with that instant (the card left the programme then); the next
+    /// beat carries the start and that end. A start that ended gets no second end, a start held after
+    /// the retirement cannot be (its build is not current), and a second retirement ends nothing more.
+    #[test]
+    fn a_retired_pages_open_start_ends_cut_short_at_its_retirement() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let airings = Airings::on();
+        let shared = unit_shared_with(tx, ProcTree::live(), Arc::default(), u64::MAX, airings.clone());
+        let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        *locked(&shared.log) = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |l: &str| locked(&lines).push(l.to_owned()))
+        };
+        shared.retired.store(true, Ordering::SeqCst);
+        locked(&shared.gate).current = Some((4, 4));
+        shared.push(page_note(4, PageSignal::Sponsor(Ok(sponsor_start("open")))));
+        shared.push(page_note(4, PageSignal::Sponsor(Ok(sponsor_start("closed")))));
+        shared.push(page_note(4, PageSignal::Sponsor(Ok(sponsor_end("closed")))));
+        dispatch(&shared);
+        let mut g = unit_adapter(Arc::clone(&shared));
+        let before = utc_instant_ms(wall_ms());
+        g.stop();
+        let after = utc_instant_ms(wall_ms());
+        let batch = airings.for_beat();
+        let lines_held = batch.lines();
+        assert_eq!(lines_held.len(), 4, "{lines_held:?}");
+        assert_eq!(
+            &lines_held[..3],
+            &[
+                sponsor_start("open"),
+                sponsor_start("closed"),
+                sponsor_end("closed")
+            ]
+        );
+        let AiringLine::End(end) = &lines_held[3] else {
+            panic!("a synthesised end: {lines_held:?}");
+        };
+        assert_eq!((end.moment_id(), end.cut_short()), ("open", true));
+        assert!(
+            before.as_str() <= end.at() && end.at() <= after.as_str(),
+            "{before} <= {} <= {after}",
+            end.at()
+        );
+        let said = locked(&lines).clone();
+        assert_eq!(
+            said.iter().filter(|l| l.contains("retired, ended at")).count(),
+            1,
+            "{said:?}"
+        );
+        // A line of the retired build after it: not held, and no further end.
+        shared.push(page_note(4, PageSignal::Sponsor(Ok(sponsor_start("late")))));
+        dispatch(&shared);
+        g.stop();
+        assert_eq!(airings.for_beat().lines().len(), 4, "nothing more");
+    }
+
+    /// Off: no start is held, so a retirement ends nothing.
+    #[test]
+    fn off_a_retirement_ends_nothing() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let shared = unit_shared(tx, ProcTree::live());
+        shared.retired.store(true, Ordering::SeqCst);
+        locked(&shared.gate).current = Some((5, 5));
+        shared.push(page_note(5, PageSignal::Sponsor(Ok(sponsor_start("a")))));
+        dispatch(&shared);
+        assert!(locked(&shared.gate).open_airings.is_empty());
+        let mut g = unit_adapter(Arc::clone(&shared));
+        g.stop();
+        assert_eq!(shared.airings.held(), 0);
     }
 }

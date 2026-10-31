@@ -40,6 +40,7 @@ use app::ports::{
     Ports, ProgrammeOutput, TargetSpec,
 };
 use crossbeam_channel::{bounded, Receiver, Sender};
+use domain::airings::{AiringLine, AiringSource, AiringStyle};
 use domain::cef_health::CefHealth;
 use domain::config::{OutputProfile, Thresholds};
 use domain::ladder::Rung;
@@ -448,9 +449,14 @@ fn live_media(
 ) -> Media {
     let frames = FrameStore::default();
     // First (Owed 53): its `new` installs the process's GStreamer log handler.
-    let graphics = CefGraphics::new(frames.clone(), tx.clone(), cef_fps(), t.cef_rss_cap_mb)
-        .with_log(log.adapter_sink())
-        .with_airings(airings.clone());
+    let graphics = CefGraphics::new(
+        frames.clone(),
+        tx.clone(),
+        cef_fps(),
+        t.cef_rss_cap_mb,
+        airings.clone(),
+    )
+    .with_log(log.adapter_sink());
     arm_test_hooks(&graphics, hooks);
     let cef = graphics.memory();
     let mut programme = GstProgramme::new(frames.clone(), tx.clone()).with_log(log.adapter_sink());
@@ -508,7 +514,30 @@ fn arm_programme_hooks(programme: &mut GstProgramme, hooks: &TestHooks) {
 #[cfg(not(feature = "test-hooks"))]
 fn arm_programme_hooks(_: &mut GstProgramme, _: &TestHooks) {}
 
-fn fake_media(env: &Env) -> Media {
+/// The moment id of the one sponsor line `COMPOSITOR_FAKE_SPONSOR_LINE` holds (fake mode).
+pub const FAKE_SPONSOR_MOMENT: &str = "1:sponsor.set_break";
+
+/// That line: a rotation start, as a live page logs one.
+fn fake_sponsor_line() -> Option<AiringLine> {
+    AiringLine::start(
+        FAKE_SPONSOR_MOMENT.to_owned(),
+        "0b8c2a3e-1f4d-4c6b-9a7e-5d2f8e1c3b4a".to_owned(),
+        AiringStyle::LowerThird,
+        AiringSource::Rotation,
+        Some("set_break".to_owned()),
+        "2026-10-31T12:00:00.000Z".to_owned(),
+    )
+    .ok()
+}
+
+/// The fake mode's media, over `airings`, the control worker's own handle (SC1 fix round 1, I3: the
+/// fake sponsor line goes where a live page's would).
+fn fake_media(env: &Env, airings: &Airings) -> Media {
+    if env.fake.sponsor_line {
+        if let Some(line) = fake_sponsor_line() {
+            airings.push(line);
+        }
+    }
     let calls = Log::default();
     let knob = CefKnob::default();
     if env.fake.zygote_gone {
@@ -560,7 +589,7 @@ pub fn run(env: &Env, clock: &Arc<Clock>, log: &Logger, signals: Signals) -> i32
     let airings = sponsor_airings(env, log);
     let media = match env.drivers {
         Drivers::Live => live_media(&t, &tx, log, &env.hooks, &airings),
-        Drivers::Fake => fake_media(env),
+        Drivers::Fake => fake_media(env, &airings),
     };
     let control = control_worker::spawn_with_airings(
         Box::new(LoggedPlane::new(plane, log.clone())),

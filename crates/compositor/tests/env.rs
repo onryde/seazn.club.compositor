@@ -132,6 +132,7 @@ fn fake_knobs_parse_in_fake_mode_only() {
     m.insert(env::COMPOSITOR_FAKE_CONTROL, "http".to_owned());
     m.insert(env::COMPOSITOR_FAKE_START_FAIL, "boom".to_owned());
     m.insert(env::COMPOSITOR_FAKE_ZYGOTE_GONE, "1".to_owned());
+    m.insert(env::COMPOSITOR_FAKE_SPONSOR_LINE, "1".to_owned());
     let live = parse(&m, true).unwrap();
     assert_eq!(live.fake, env::FakeKnobs::default(), "a live run ignores them");
     m.insert(env::COMPOSITOR_DRIVERS, "fake".to_owned());
@@ -139,9 +140,16 @@ fn fake_knobs_parse_in_fake_mode_only() {
     assert!(fake.control_http);
     assert_eq!(fake.start_fail.as_deref(), Some("boom"));
     assert!(fake.zygote_gone);
+    assert!(fake.sponsor_line);
+    for (key, off) in [("0", false), ("", false)] {
+        let mut b = m.clone();
+        b.insert(env::COMPOSITOR_FAKE_SPONSOR_LINE, key.to_owned());
+        assert_eq!(parse(&b, true).unwrap().fake.sponsor_line, off, "{key:?}");
+    }
     for (key, bad) in [
         (env::COMPOSITOR_FAKE_CONTROL, "https"),
         (env::COMPOSITOR_FAKE_ZYGOTE_GONE, "yes"),
+        (env::COMPOSITOR_FAKE_SPONSOR_LINE, "yes"),
     ] {
         let mut b = m.clone();
         b.insert(key, bad.to_owned());

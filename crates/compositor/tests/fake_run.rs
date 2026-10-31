@@ -15,6 +15,7 @@ use adapters::control_http::parse_session;
 use adapters::phase_http::{origin_of, RELAY_PHASE_LONG_POLL_MAX_MS, RELAY_PHASE_PATH, RELAY_PHASE_PORT};
 use compositor::env;
 use compositor::logged::rfc3339_ms;
+use compositor::wiring::FAKE_SPONSOR_MOMENT;
 use domain::config::Thresholds;
 use serde_json::{json, Value};
 use testkit::fakes::session_720p;
@@ -655,6 +656,72 @@ fn a_410_on_a_beat_exits_zero_within_a_second_and_posts_nothing_after() {
         posts.iter().all(|p| p.at <= first.answered),
         "a POST after the 410"
     );
+}
+
+/// SC1 fix round 1, I3: the binary's own wiring carries sponsor airings. `COMPOSITOR_FAKE_SPONSOR_LINE`
+/// holds one line in the handle the media were given; with `RELAY_AIRINGS=1` a POST to the real HTTP
+/// plane carries it, so the worker posts from that same handle (not `spawn`'s off one, nor a second
+/// buffer). Without the key, no POST carries either airings key; with it and no knob, none either
+/// (nothing is held that no page logged).
+fn sponsor_run(airings: bool, knob: bool) -> (Vec<Post>, String) {
+    let fc = FakeControl::serve(fixture("session-composed-720p.json"), Arc::new(|_, _| live()));
+    let mut vars = fc.env(deadline_in(3_000));
+    if knob {
+        vars.push((env::COMPOSITOR_FAKE_SPONSOR_LINE, "1".to_owned()));
+    }
+    if airings {
+        vars.push((env::RELAY_AIRINGS, "1".to_owned()));
+    }
+    let mut run = Run::spawn(&vars);
+    let (code, _) = run.wait_exit(Duration::from_secs(30));
+    assert_eq!(code, Some(0), "{}", run.stderr());
+    assert_no_secret(&run);
+    (fc.posts(), run.stderr())
+}
+
+#[test]
+fn with_relay_airings_a_posted_beat_carries_the_sponsor_line() {
+    let _s = serial();
+    let (posts, e) = sponsor_run(true, true);
+    assert!(e.contains("msg=sponsor airings on the heartbeat: on"), "{e}");
+    let carrying: Vec<&Post> = posts.iter().filter(|p| p.body.get("airings").is_some()).collect();
+    assert!(!carrying.is_empty(), "no POST carried the line: {posts:?}");
+    for p in &carrying {
+        let items = p.body["airings"].as_array().expect("an array");
+        assert_eq!(items.len(), 1, "{}", p.body);
+        assert_eq!(items[0]["kind"], "start", "{}", p.body);
+        assert_eq!(items[0]["momentId"], FAKE_SPONSOR_MOMENT, "{}", p.body);
+        assert_eq!(p.body["airingsDropped"], 0, "{}", p.body);
+    }
+    // The first 2xx cleared it: the final beat, posted last, carries none.
+    let last = posts.last().expect("a final beat");
+    assert_eq!(last.body["state"], "stopped", "{}", last.body);
+    assert!(last.body.get("airings").is_none(), "{}", last.body);
+    eprintln!("posts: {}, carrying the line: {}", posts.len(), carrying.len());
+}
+
+#[test]
+fn without_relay_airings_or_a_line_no_posted_beat_carries_either_key() {
+    let _s = serial();
+    let mut checked = 0;
+    for (airings, knob, said) in [(false, true, "off"), (true, false, "on")] {
+        let (posts, e) = sponsor_run(airings, knob);
+        assert!(
+            e.contains(&format!("msg=sponsor airings on the heartbeat: {said}")),
+            "{e}"
+        );
+        assert!(posts.len() >= 2, "a periodic and a final beat: {posts:?}");
+        for p in &posts {
+            assert!(
+                p.body.get("airings").is_none() && p.body.get("airingsDropped").is_none(),
+                "{}",
+                p.body
+            );
+            checked += 1;
+        }
+    }
+    eprintln!("posts without airings: {checked}");
+    assert!(checked >= 4);
 }
 
 /// C11b: a dead CEF zygote restarts the process in place: exit 75, the last POST the vendored

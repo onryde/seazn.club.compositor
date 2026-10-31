@@ -202,10 +202,13 @@ fn wire(report: &HealthReport, measured: &Measured, airings: &AiringBatch, scrub
     if let Some(n) = measured.mem_mb {
         put("memMb", int(n));
     }
-    // R4 task SC1: the sponsor airings, only when the beat carries some (off, it never does), with the
-    // buffer's dropped total beside them, 0 included (a measured zero).
+    // R4 task SC1: the sponsor airings, only when the beat carries some (off, it never does). The
+    // buffer's dropped total rides beside them, 0 included (a measured zero), and alone on a beat with
+    // no line once it is above 0 (fix round 1, m2): a total for the process, and an upper bound.
     if !airings.is_empty() {
         put("airings", airings.lines().iter().map(airing_wire).collect());
+    }
+    if !airings.carries_nothing() {
         put("airingsDropped", airings.dropped().into());
     }
     // The exit keys ride only a `stopped` beat (the contract's if/then; web answers 400 otherwise).
@@ -644,6 +647,8 @@ impl ControlPlane for HttpControlPlane {
         match code {
             200 => {}
             410 => return Err(HeartbeatError::Gone),
+            // Web refused the body: sent again, it is refused again (fix round 1, I2).
+            400 | 422 => return Err(HeartbeatError::Refused(code)),
             other => return Err(self.transport(&format!("heartbeat refused: status {other}"))),
         }
         let reply = match body_of(&body) {

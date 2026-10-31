@@ -27,6 +27,7 @@ use adapters::cef_graphics::{
 };
 use adapters::frame_store::FrameStore;
 use adapters::gst_programme::GstProgramme;
+use app::airings::Airings;
 use app::ports::{GraphicsRenderer, Inbound, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::Receiver;
 use domain::cef_health::CefHealth;
@@ -98,14 +99,16 @@ fn rig_with(frames: FrameStore, cap_mb: u64) -> Rig {
     let sink = Arc::clone(&lines);
     // A child test process prints the adapter's lines too: they join the stderr its parent reads.
     let echo = std::env::var_os("C11_CHILD").is_some();
-    let g = CefGraphics::new(frames.clone(), tx, 30, cap_mb).with_log(Arc::new(move |l: &str| {
-        if echo {
-            eprintln!("adapter: {l}");
-        }
-        sink.lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(l.to_owned());
-    }));
+    let g = CefGraphics::new(frames.clone(), tx, 30, cap_mb, Airings::off()).with_log(Arc::new(
+        move |l: &str| {
+            if echo {
+                eprintln!("adapter: {l}");
+            }
+            sink.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(l.to_owned());
+        },
+    ));
     Rig { g, rx, frames, lines }
 }
 

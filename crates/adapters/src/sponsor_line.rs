@@ -75,8 +75,15 @@ fn object(body: &str, keys: &[&str]) -> Result<Map<String, Value>, LineRefusal> 
     Ok(o)
 }
 
+/// `key`'s value. Never an index: serde_json's `Map` index panics on a missing key, and this runs
+/// inside GStreamer's log callback on CEF's UI thread, where a panic aborts the process (fix round 1,
+/// I1). A missing key is the key set's refusal, whatever `object` let through.
+fn field<'a>(o: &'a Map<String, Value>, key: &str) -> Result<&'a Value, LineRefusal> {
+    o.get(key).ok_or(LineRefusal::KeySet)
+}
+
 fn text(o: &Map<String, Value>, key: &'static str) -> Result<String, LineRefusal> {
-    o[key]
+    field(o, key)?
         .as_str()
         .map(str::to_owned)
         .ok_or(LineRefusal::WrongType(key))
@@ -84,7 +91,7 @@ fn text(o: &Map<String, Value>, key: &'static str) -> Result<String, LineRefusal
 
 /// A declared word of `table`, or the refusal naming `key`.
 fn word<T: Copy>(o: &Map<String, Value>, key: &'static str, table: &[(T, &str)]) -> Result<T, LineRefusal> {
-    let w = o[key].as_str().ok_or(LineRefusal::WrongType(key))?;
+    let w = field(o, key)?.as_str().ok_or(LineRefusal::WrongType(key))?;
     table
         .iter()
         .find(|(_, t)| *t == w)
@@ -97,7 +104,7 @@ fn start(o: &Map<String, Value>) -> Result<AiringLine, LineRefusal> {
     let card_id = text(o, "cardId")?;
     let style = word(o, "style", &STYLE_WORDS)?;
     let source = word(o, "source", &SOURCE_WORDS)?;
-    let break_kind = match &o["breakKind"] {
+    let break_kind = match field(o, "breakKind")? {
         Value::Null => None,
         Value::String(k) => Some(k.clone()),
         _ => return Err(LineRefusal::WrongType("breakKind")),
@@ -109,7 +116,7 @@ fn start(o: &Map<String, Value>) -> Result<AiringLine, LineRefusal> {
 fn end(o: &Map<String, Value>) -> Result<AiringLine, LineRefusal> {
     let moment_id = text(o, "momentId")?;
     let at = text(o, "at")?;
-    let cut_short = o["cutShort"]
+    let cut_short = field(o, "cutShort")?
         .as_bool()
         .ok_or(LineRefusal::WrongType("cutShort"))?;
     AiringLine::end(moment_id, at, cut_short)

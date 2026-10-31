@@ -73,6 +73,12 @@ impl Airings {
         }
     }
 
+    /// Web refused the beat that carried `batch` (`HeartbeatError::Refused`): its lines leave, counted
+    /// dropped. The number that left (0 when off).
+    pub fn drop_refused(&self, batch: &AiringBatch) -> usize {
+        self.0.as_ref().map_or(0, |b| locked(b).drop_refused(batch))
+    }
+
     /// Lines held now (0 when off).
     pub fn held(&self) -> usize {
         self.0.as_ref().map_or(0, |b| locked(b).len())

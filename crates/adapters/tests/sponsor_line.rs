@@ -44,6 +44,12 @@ fn without(mut body: Value, key: &str) -> Value {
     body
 }
 
+/// `body` with `from` renamed `to`: the same number of keys, one of them not the spec's.
+fn renamed(body: Value, from: &str, to: &str) -> Value {
+    let v = body[from].clone();
+    with(without(body, from), to, v)
+}
+
 /// Spec §3.6.1's key sets, as web's producer writes them.
 #[test]
 fn the_key_sets_are_the_specs() {
@@ -326,4 +332,45 @@ fn each_style_and_source_has_one_word_and_reads_back() {
     );
     eprintln!("style and source pairs read back: {checked}");
     assert_eq!(checked, 6);
+}
+
+/// Fix round 1, I1: a body with the right NUMBER of keys and one wrong key is refused as `KeySet`, never
+/// read: the reader runs inside GStreamer's log callback on CEF's UI thread, where a panic aborts the
+/// process. Every key of both kinds renamed in turn, and one case where an earlier value is also of
+/// the wrong type: the key set is checked before any value, so it is still `KeySet` (what the
+/// membership check, and nothing else, decides).
+#[test]
+fn a_same_count_wrong_key_is_refused_as_the_key_set_never_read() {
+    let mut cases: Vec<(String, LineRefusal)> = Vec::new();
+    for k in START_KEYS {
+        cases.push((start_line(&renamed(start_body(), k, "time")), LineRefusal::KeySet));
+    }
+    for k in END_KEYS {
+        cases.push((end_line(&renamed(end_body(), k, "cut")), LineRefusal::KeySet));
+    }
+    cases.push((
+        start_line(&renamed(with(start_body(), "momentId", json!(5)), "at", "time")),
+        LineRefusal::KeySet,
+    ));
+    cases.push((
+        end_line(&renamed(
+            with(end_body(), "momentId", Value::Null),
+            "cutShort",
+            "cut_short",
+        )),
+        LineRefusal::KeySet,
+    ));
+    let mut checked = 0;
+    for (line, want) in &cases {
+        let body: Value = serde_json::from_str(line.split_once(' ').unwrap().1).unwrap();
+        let keys = body.as_object().unwrap().len();
+        assert!(
+            keys == START_KEYS.len() || keys == END_KEYS.len(),
+            "same count: {line}"
+        );
+        assert_eq!(parse_sponsor_line(line), Some(Err(*want)), "{line}");
+        checked += 1;
+    }
+    eprintln!("same-count wrong key sets checked: {checked}");
+    assert_eq!(checked, START_KEYS.len() + END_KEYS.len() + 2);
 }

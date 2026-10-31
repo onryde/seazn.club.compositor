@@ -6587,10 +6587,14 @@ fn the_blank_page_sweep_reds_a_false_reload_and_an_unpainted_page_on_both_paths(
     assert_eq!(checked, 6);
 }
 
-/// The case files that are not chaos cases, each run by hand from harness.yml: C13's smoke case
-/// (the harness's own end-to-end run) and Owed 81's two probe controls (F-029). The same list is in
-/// chaos_table.rs.
-const NOT_CHAOS: [&str; 3] = ["smoke", "owed81-noaudio", "owed81-align1"];
+/// The case files that are not chaos cases, each run from harness.yml: C13's smoke case (the
+/// harness's own end-to-end run), Owed 81's two probe controls (F-029), and R4 SC1's sponsor-airings
+/// case. The same list is in chaos_table.rs.
+const NOT_CHAOS: [&str; 4] = ["smoke", "owed81-noaudio", "owed81-align1", "sponsor-airings"];
+
+/// The NOT_CHAOS cases that are runs of their own, not one of smoke's controls (harness.yml runs both
+/// on every pull request).
+const NOT_CHAOS_RUNS: [&str; 2] = ["smoke", "sponsor-airings"];
 
 /// Every case file in harness/cases has a test here: a new case cannot ship unjudged.
 #[test]
@@ -6676,7 +6680,7 @@ fn every_not_chaos_control_drives_what_smoke_drives() {
         }
     };
     let mut checked = 0;
-    for case in NOT_CHAOS.iter().filter(|c| **c != "smoke") {
+    for case in NOT_CHAOS.iter().filter(|c| !NOT_CHAOS_RUNS.contains(c)) {
         let mut want: Vec<String> = smoke.lines().map(str::to_owned).collect();
         want.push(allowed(case).to_owned());
         let got: Vec<String> = drive(case).lines().map(str::to_owned).collect();
@@ -6684,7 +6688,8 @@ fn every_not_chaos_control_drives_what_smoke_drives() {
         checked += 1;
     }
     eprintln!("not-chaos controls checked against smoke's drive and stack: {checked}");
-    assert_eq!(checked, NOT_CHAOS.len() - 1);
+    assert_eq!(checked, NOT_CHAOS.len() - NOT_CHAOS_RUNS.len());
+    assert_eq!(checked, 2, "Owed 81's two controls");
 }
 
 /// Each `$t.<key>` a verdict filter reads (lib.jq, every case file, run-case.sh) and each
@@ -6987,4 +6992,108 @@ fn stays_on_air_reds_a_page_that_leaves_after_coming_back_in_every_leg_with_a_ba
         json!(0),
         "sty-empty"
     );
+}
+
+/// R4 SC1 fix round 1 (I3 c): the sponsor-airings case's run. The page logs its card's start 600 ms
+/// after fake-control serves the arming and its end 3 s later; the next beat after each carries it
+/// (with `airingsDropped: 0`), once. `edit` changes the world before it is judged.
+fn sponsor_airings(edit: impl Fn(&mut World, i64, i64)) -> World {
+    let mut w = World::new(30);
+    let armed = w.at(5.0);
+    w.mark("armed", armed, json!({"page_sponsor_armed": true}));
+    w.control_state["page_sponsor_armed"] = json!(false);
+    w.control_state["page_sponsor_served_ms"] = json!(armed + 400);
+    let (start, end) = (armed + 1_000, armed + 4_000);
+    let start_line = json!({"kind": "start", "momentId": "harness-sponsor-1",
+        "cardId": "0b8c2a3e-1f4d-4c6b-9a7e-5d2f8e1c3b4a", "style": "lower_third",
+        "source": "rotation", "breakKind": null, "at": stamps(start).1});
+    let end_line = json!({"kind": "end", "momentId": "harness-sponsor-1", "at": stamps(end).1,
+        "cutShort": false});
+    for (at, line) in [(start, start_line), (end, end_line)] {
+        let (_, body) = w
+            .beats
+            .iter_mut()
+            .find(|(b, body)| *b > at && body["state"] == "playing")
+            .expect("a beat after the line");
+        match body["airings"].as_array_mut() {
+            Some(lines) => lines.push(line),
+            None => body["airings"] = json!([line]),
+        }
+        body["airingsDropped"] = json!(0);
+    }
+    edit(&mut w, start, end);
+    w
+}
+
+#[test]
+fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_go_wrong() {
+    assert_pass(
+        &judge(&sponsor_airings(|_, _, _| {}), "sponsor-airings", "", "sa-good"),
+        "sa-good",
+    );
+    // A line on two beats: the 2xx did not clear it.
+    let resent = sponsor_airings(|w, start, _| {
+        let first = w
+            .beats
+            .iter()
+            .find(|(b, _)| *b > start)
+            .map(|(_, body)| body["airings"].clone())
+            .unwrap();
+        let (_, next) = w
+            .beats
+            .iter_mut()
+            .find(|(b, body)| *b > start && body.get("airings").is_none() && body["state"] == "playing")
+            .unwrap();
+        next["airings"] = first;
+        next["airingsDropped"] = json!(0);
+    });
+    let mut checked = 0;
+    let reds: [(&str, World, &str); 5] = [
+        ("sa-resent", resent, "start_relayed_once"),
+        (
+            "sa-no-end",
+            sponsor_airings(|w, _, end| {
+                w.beats_in(end, i64::MAX, |b| {
+                    if let Some(o) = b.as_object_mut() {
+                        o.remove("airings");
+                        o.remove("airingsDropped");
+                    }
+                });
+            }),
+            "end_relayed_once",
+        ),
+        (
+            "sa-dropped",
+            sponsor_airings(|w, _, end| {
+                w.beats_in(end + 6_000, i64::MAX, |b| b["airingsDropped"] = json!(1))
+            }),
+            "none_dropped",
+        ),
+        (
+            "sa-off",
+            sponsor_airings(|w, _, _| {
+                w.beats_in(i64::MIN, i64::MAX, |b| {
+                    if let Some(o) = b.as_object_mut() {
+                        o.remove("airings");
+                        o.remove("airingsDropped");
+                    }
+                });
+            }),
+            "start_relayed_once",
+        ),
+        (
+            "sa-unarmed",
+            sponsor_airings(|w, _, _| {
+                w.marks.clear();
+                w.control_state["page_sponsor_served_ms"] = Value::Null;
+            }),
+            "armed",
+        ),
+    ];
+    for (tag, w, check) in &reds {
+        assert_fails(&judge(w, "sponsor-airings", "", tag), check, tag);
+        checked += 1;
+    }
+    eprintln!("sponsor-airings reds checked: {checked}");
+    assert_eq!(checked, reds.len());
 }

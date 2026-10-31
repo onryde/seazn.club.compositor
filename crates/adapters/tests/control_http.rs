@@ -510,32 +510,33 @@ fn the_reply_reads_its_phone_live_counter_tolerantly() {
     assert_eq!(checked, 2 * cases.len() + 2);
 }
 
-/// Wave gate 1 review I5 (Owed 29): only a 410 is `Gone`; a 401, a 404 and a 5xx stay transport
-/// errors, and none of their texts carries the token.
+/// Wave gate 1 review I5 (Owed 29): only a 410 is `Gone`; a 401, a 404, a 429 and a 5xx stay
+/// transport errors, and none of their texts carries the token. SC1 fix round 1 (I2): a 400 and a 422
+/// (web refused the body) are `Refused`, with their status.
 #[test]
-fn heartbeat_410_is_gone_and_other_refusals_are_transport() {
+fn heartbeat_410_is_gone_400_and_422_are_refused_and_other_refusals_are_transport() {
     let table = [
-        (410, true),
-        (401, false),
-        (404, false),
-        (503, false),
-        (500, false),
-        (400, false),
+        (410, Some(HeartbeatError::Gone)),
+        (400, Some(HeartbeatError::Refused(400))),
+        (422, Some(HeartbeatError::Refused(422))),
+        (401, None),
+        (404, None),
+        (429, None),
+        (503, None),
+        (500, None),
     ];
-    for (code, gone) in table {
-        let fake = serve(vec![Reply::Status(code, refused("X"))]);
+    for (code, want) in &table {
+        let fake = serve(vec![Reply::Status(*code, refused("X"))]);
         let got = plane(&fake.url).heartbeat(&periodic(), &Measured::default());
-        if gone {
-            assert_eq!(got, Err(HeartbeatError::Gone), "{code}");
-        } else {
-            match &got {
-                Err(HeartbeatError::Transport(text)) => assert_no_token(&format!("{code}"), text),
-                other => panic!("{code}: {other:?}"),
-            }
+        match (want, &got) {
+            (Some(w), Err(e)) => assert_eq!(e, w, "{code}"),
+            (None, Err(HeartbeatError::Transport(text))) => assert_no_token(&format!("{code}"), text),
+            (_, other) => panic!("{code}: {other:?}"),
         }
         assert_no_token(&format!("{code} debug"), &format!("{got:?}"));
     }
     eprintln!("heartbeat statuses checked: {}", table.len());
+    assert_eq!(table.len(), 8);
 }
 
 /// The word each reason posts: the contract's `exitReason` description, word for word ("ended,

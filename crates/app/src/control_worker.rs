@@ -309,9 +309,11 @@ impl Worker {
 
 /// One beat, periodic or final, with the sponsor airings held when it is posted (R4 task SC1; spec
 /// 2026-10-27 §3.6.2). The final beat is a beat like any other here, so it carries every line still
-/// held: that is its flush. Only a reply (C07's 200 with a heartbeat reply, the contract's 2xx) clears
-/// what this beat carried; any other outcome keeps it for the next beat, and a line pushed while the
-/// call was in flight stays either way (`AiringBuffer::ack_2xx`).
+/// held: that is its flush. A reply (C07's 200 with a heartbeat reply, the contract's 2xx) clears what
+/// this beat carried. Web refusing its body (`Refused`: a 400 or a 422) drops what it carried, counted
+/// in `airingsDropped`: the same body would be refused on every beat until web called the session
+/// lost (fix round 1, I2). Any other outcome (a 5xx, a transport error, a 410) keeps it for the next
+/// beat. A line pushed while the call was in flight stays whatever the outcome.
 fn post_beat(
     cp: &mut dyn ControlPlane,
     airings: &Airings,
@@ -320,8 +322,12 @@ fn post_beat(
 ) -> Result<Reply, HeartbeatError> {
     let batch = airings.for_beat();
     let r = cp.heartbeat_with(h, m, &batch);
-    if r.is_ok() {
-        airings.ack_2xx(&batch);
+    match &r {
+        Ok(_) => airings.ack_2xx(&batch),
+        Err(HeartbeatError::Refused(_)) => {
+            airings.drop_refused(&batch);
+        }
+        Err(HeartbeatError::Transport(_) | HeartbeatError::Gone) => {}
     }
     r
 }
@@ -339,7 +345,7 @@ fn replied(r: Result<Reply, HeartbeatError>) -> Inbound {
     Inbound::Event(match r {
         Ok(reply) => Event::HeartbeatReply(reply.desired),
         Err(HeartbeatError::Gone) => Event::HeartbeatRefused(HeartbeatRefusal::Gone),
-        Err(HeartbeatError::Transport(_)) => Event::HeartbeatFailed,
+        Err(HeartbeatError::Transport(_) | HeartbeatError::Refused(_)) => Event::HeartbeatFailed,
     })
 }
 

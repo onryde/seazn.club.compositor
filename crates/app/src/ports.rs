@@ -188,13 +188,19 @@ impl From<Desired> for Reply {
 
 /// A heartbeat's outcome when it is not a reply (amended 2026-10-18, wave gate 1 review I5;
 /// `docs/_INDEX.md` Owed 29). Only a 410 is `Gone`, on every beat, the final one included: web has
-/// ended the session (C08 maps it to `HeartbeatRefused(HeartbeatRefusal::Gone)`). Everything else,
-/// a 401, a 404, a 5xx, a reply that is not one, a network error or a timeout, is `Transport`
+/// ended the session (C08 maps it to `HeartbeatRefused(HeartbeatRefusal::Gone)`). A 400 or a 422 is
+/// `Refused`. Everything else, a 401, a 404, a 5xx, a reply that is not one, a network error or a
+/// timeout, is `Transport`
 /// (C08 maps it to `HeartbeatFailed`). The text is already redacted, and never carries the token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeartbeatError {
     Gone,
     Transport(String),
+    /// Web refused the beat's body: a 400 or a 422, its status kept (SC1 fix round 1, I2). The same
+    /// body is refused again, so the control worker drops the sponsor airings it carried (counted in
+    /// `airingsDropped`) instead of resending them until web calls the session lost. C08 maps it to
+    /// `HeartbeatFailed`, like `Transport`.
+    Refused(u16),
 }
 
 /// Values measured by adapters (absent ⇒ None ⇒ omitted on the wire, never sent as 0).

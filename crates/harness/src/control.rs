@@ -15,6 +15,9 @@
 //! - C14: `POST /control/page-hang` arms the page's hang once (409 after), and
 //!   `GET /page-control.json` serves it to the first poll after (`{"hang":true}` once), with the
 //!   page's stale rule (`stale_after_ms`, `poll_ms`: the budgets, `thresholds`).
+//! - R4 SC1: `POST /control/page-sponsor` arms the page's sponsor card once (409 after), served to
+//!   the first poll after it the same way (`{"sponsor":true}` once): the page then logs one sponsor
+//!   start and, a few seconds later, its end (harness/cases/sponsor-airings.sh).
 //! - `GET /score.json`: the events that have happened by now (a live score feed reveals an event
 //!   when it happens; none before the start), or 503 while the feed is down. The page polls it
 //!   every second.
@@ -233,6 +236,10 @@ struct State {
     /// `/page-control.json` poll after it, once.
     page_hang_armed: bool,
     page_hang_served_ms: Option<i64>,
+    /// R4 SC1: the page's sponsor card, armed by `POST /control/page-sponsor` and served to the
+    /// first `/page-control.json` poll after it, once.
+    page_sponsor_armed: bool,
+    page_sponsor_served_ms: Option<i64>,
 }
 
 /// fake-control's routes and state.
@@ -299,6 +306,8 @@ impl Fake {
                 score_refused: 0,
                 page_hang_armed: false,
                 page_hang_served_ms: None,
+                page_sponsor_armed: false,
+                page_sponsor_served_ms: None,
             }),
         })
     }
@@ -417,7 +426,9 @@ impl Fake {
                             "other_session_requests": st.other_session,
                             "unauthorized_requests": st.unauthorized, "score_refused": st.score_refused,
                             "page_hang_armed": st.page_hang_armed,
-                            "page_hang_served_ms": st.page_hang_served_ms}),
+                            "page_hang_served_ms": st.page_hang_served_ms,
+                            "page_sponsor_armed": st.page_sponsor_armed,
+                            "page_sponsor_served_ms": st.page_sponsor_served_ms}),
                 )
             }
             ("POST", "/control/page-hang") => {
@@ -428,6 +439,14 @@ impl Fake {
                 st.page_hang_armed = true;
                 Answer::json(200, &json!({"page_hang_armed": true}))
             }
+            ("POST", "/control/page-sponsor") => {
+                let mut st = self.state();
+                if st.page_sponsor_armed || st.page_sponsor_served_ms.is_some() {
+                    return Answer::json(409, &json!({"ok": false, "code": "ALREADY_ARMED"}));
+                }
+                st.page_sponsor_armed = true;
+                Answer::json(200, &json!({"page_sponsor_armed": true}))
+            }
             // The page's own controls (C14): the hang, once, and its stale rule's numbers, which are
             // the budgets' (spec §6, page side), never a literal in the page.
             ("GET", "/page-control.json") => {
@@ -436,9 +455,14 @@ impl Fake {
                 if hang {
                     st.page_hang_served_ms = Some(now_ms);
                 }
+                let sponsor = std::mem::take(&mut st.page_sponsor_armed);
+                if sponsor {
+                    st.page_sponsor_served_ms = Some(now_ms);
+                }
                 Answer::json(
                     200,
-                    &json!({"hang": hang, "stale_after_ms": BUDGET_SCORE_STALE_AFTER_MS,
+                    &json!({"hang": hang, "sponsor": sponsor,
+                            "stale_after_ms": BUDGET_SCORE_STALE_AFTER_MS,
                             "poll_ms": HARNESS_PAGE_POLL_MS}),
                 )
             }
@@ -930,6 +954,55 @@ mod tests {
             "one hang per run"
         );
         assert_eq!(poll(60)["hang"], false);
+    }
+
+    /// R4 SC1 fix round 1 (I3 c): the sponsor card, armed by `POST /control/page-sponsor` and served
+    /// to one `/page-control.json` poll, once, as the hang is: unarmed, no poll carries it; a second
+    /// arming is refused; and the hang and the card arm apart.
+    #[test]
+    fn the_page_sponsor_card_is_armed_once_and_served_to_one_poll() {
+        let f = fake(Arc::new(Mutex::new(Vec::new())));
+        let poll = |now: i64| -> Value {
+            let a = f.handle("GET", "/page-control.json", None, b"", now);
+            assert_eq!(a.status, 200);
+            serde_json::from_slice(&a.body).unwrap()
+        };
+        let state = || -> Value {
+            serde_json::from_slice(&f.handle("GET", "/control/state", None, b"", 0).body).unwrap()
+        };
+        assert_eq!(poll(10)["sponsor"], false, "unarmed");
+        assert_eq!(
+            (
+                state()["page_sponsor_armed"].clone(),
+                state()["page_sponsor_served_ms"].clone()
+            ),
+            (json!(false), Value::Null)
+        );
+        assert_eq!(
+            f.handle("POST", "/control/page-sponsor", None, b"", 20).status,
+            200
+        );
+        assert_eq!(state()["page_sponsor_armed"], true);
+        let served = poll(30);
+        assert_eq!(
+            (served["sponsor"].clone(), served["hang"].clone()),
+            (json!(true), json!(false))
+        );
+        assert_eq!(poll(40)["sponsor"], false, "one-shot");
+        assert_eq!(
+            (
+                state()["page_sponsor_armed"].clone(),
+                state()["page_sponsor_served_ms"].as_i64()
+            ),
+            (json!(false), Some(30))
+        );
+        assert_eq!(
+            f.handle("POST", "/control/page-sponsor", None, b"", 50).status,
+            409,
+            "one card per run"
+        );
+        assert_eq!(poll(60)["sponsor"], false);
+        assert_eq!(state()["page_hang_armed"], false, "the card never arms the hang");
     }
 
     #[test]

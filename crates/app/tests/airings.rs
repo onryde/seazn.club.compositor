@@ -85,6 +85,14 @@ fn carried(log: &PlaneLog) -> Vec<(u32, bool, Vec<String>)> {
         .collect()
 }
 
+/// What each completed beat carried, as `carried`, with the beat's dropped total.
+fn carried_dropped(log: &PlaneLog) -> Vec<(u32, Vec<String>, u32)> {
+    log.beat_airings()
+        .into_iter()
+        .map(|(h, b)| (h.heartbeat_failures, ids(&b), b.dropped()))
+        .collect()
+}
+
 fn recv(rx: &Receiver<Inbound>) -> Inbound {
     rx.recv_timeout(WAIT).expect("no message from the worker")
 }
@@ -140,14 +148,14 @@ fn a_beat_answered_5xx_keeps_the_items_and_a_2xx_clears_them() {
     assert_eq!(airings.held(), 0);
 }
 
-/// Every outcome that is not a reply keeps the lines: a 5xx, a 4xx, a reply that is none (all C07's
-/// `Transport`), and a 410.
+/// Every outcome that is neither a reply nor web refusing the body keeps the lines: a 5xx, a 401, a
+/// 404, a 429, a reply that is none (all C07's `Transport`), and a 410.
 #[test]
 fn every_outcome_but_a_reply_keeps_the_items() {
     let failures = [
         status(500),
         status(503),
-        status(400),
+        status(429),
         status(401),
         status(404),
         HeartbeatError::Gone,
@@ -162,7 +170,7 @@ fn every_outcome_but_a_reply_keeps_the_items() {
         h.request(beat(periodic(1)));
         let want_event = match e {
             HeartbeatError::Gone => Event::HeartbeatRefused(HeartbeatRefusal::Gone),
-            HeartbeatError::Transport(_) => Event::HeartbeatFailed,
+            HeartbeatError::Transport(_) | HeartbeatError::Refused(_) => Event::HeartbeatFailed,
         };
         assert_eq!(recv(&rx), Inbound::Event(want_event), "{e:?}");
         assert_eq!(airings.held(), 1, "{e:?} keeps it");
@@ -272,4 +280,88 @@ fn off_no_beat_carries_any_airing() {
     }
     eprintln!("beats checked carrying none: {checked}");
     assert_eq!(checked, 4);
+}
+
+/// Fix round 1, I2: web refusing a beat's body (a 400 or a 422) would refuse it again on every beat
+/// until it calls the session lost, so the lines that beat carried leave, counted in `airingsDropped`
+/// (the next beat says so, lines or none), and the domain still sees a failed beat. A 503 between
+/// them keeps its lines. The final beat drops the same way.
+#[test]
+fn a_beat_web_refuses_drops_its_lines_counted_and_a_5xx_keeps_them() {
+    let (tx, rx) = unbounded();
+    let (plane, log) = scripted(
+        vec![
+            (1, HeartbeatError::Refused(400)),
+            (3, HeartbeatError::Refused(422)),
+            (4, status(503)),
+            (8, HeartbeatError::Refused(400)),
+        ],
+        Duration::ZERO,
+    );
+    let airings = Airings::on();
+    let mut h = spawn_with_airings(Box::new(plane), tx, airings.clone());
+    airings.push(line(1));
+    airings.push(line(2));
+    h.request(beat(periodic(1)));
+    assert_eq!(
+        recv(&rx),
+        Inbound::Event(Event::HeartbeatFailed),
+        "a refusal is a failed beat"
+    );
+    assert_eq!(airings.held(), 0, "the refused beat's lines left");
+    h.request(beat(periodic(2)));
+    assert_eq!(recv(&rx), Inbound::Event(Event::HeartbeatReply(Desired::Live)));
+    airings.push(line(3));
+    h.request(beat(periodic(3)));
+    assert_eq!(recv(&rx), Inbound::Event(Event::HeartbeatFailed));
+    airings.push(line(4));
+    h.request(beat(periodic(4)));
+    assert_eq!(recv(&rx), Inbound::Event(Event::HeartbeatFailed));
+    assert_eq!(airings.held(), 1, "the 503 kept line 4");
+    h.request(beat(periodic(5)));
+    assert_eq!(recv(&rx), Inbound::Event(Event::HeartbeatReply(Desired::Live)));
+    airings.push(line(5));
+    h.request(beat(final_beat(8)));
+    assert!(h.flush(WAIT));
+    assert_eq!(
+        carried_dropped(&log),
+        vec![
+            (1, want(&[1, 2]), 0),
+            (2, vec![], 2),
+            (3, want(&[3]), 2),
+            (4, want(&[4]), 3),
+            (5, want(&[4]), 3),
+            (8, want(&[5]), 3),
+        ],
+        "each refusal's lines left and were counted; the 503's were resent"
+    );
+    assert_eq!(airings.held(), 0, "the refused final beat's line left too");
+    assert_eq!(airings.for_beat().dropped(), 4);
+}
+
+/// A refusal of a beat that carried no line drops nothing (a second refusal, after the first's lines
+/// left, included).
+#[test]
+fn a_refused_beat_with_no_lines_drops_nothing() {
+    let (tx, rx) = unbounded();
+    let (plane, log) = scripted(
+        vec![
+            (1, HeartbeatError::Refused(400)),
+            (2, HeartbeatError::Refused(400)),
+        ],
+        Duration::ZERO,
+    );
+    let airings = Airings::on();
+    let mut h = spawn_with_airings(Box::new(plane), tx, airings.clone());
+    h.request(beat(periodic(1)));
+    assert_eq!(recv(&rx), Inbound::Event(Event::HeartbeatFailed));
+    airings.push(line(1));
+    h.request(beat(periodic(2)));
+    assert_eq!(recv(&rx), Inbound::Event(Event::HeartbeatFailed));
+    h.request(beat(periodic(3)));
+    assert_eq!(recv(&rx), Inbound::Event(Event::HeartbeatReply(Desired::Live)));
+    assert_eq!(
+        carried_dropped(&log),
+        vec![(1, vec![], 0), (2, want(&[1]), 0), (3, vec![], 1)]
+    );
 }

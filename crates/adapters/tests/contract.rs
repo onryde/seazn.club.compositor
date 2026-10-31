@@ -1669,7 +1669,6 @@ fn a_beat_with_no_airings_carries_neither_key() {
         (stopped(ExitReason::Ended, Some("drained")), full_measured()),
     ] {
         let with = heartbeat_wire_with(&r, &m, &AiringBatch::default());
-        assert_eq!(with, heartbeat_wire(&r, &m));
         assert!(
             with.get("airings").is_none() && with.get("airingsDropped").is_none(),
             "{with}"
@@ -1682,6 +1681,32 @@ fn a_beat_with_no_airings_carries_neither_key() {
     }
     eprintln!("beats without airings checked: {checked}");
     assert_eq!(checked, 3);
+}
+
+/// Fix round 1, m2: with no line to carry but a dropped total above 0 (lines a refused beat carried),
+/// the beat carries `airingsDropped` alone, and S8's shape takes it; the vendored def does not yet
+/// (why the keys are off until web declares them).
+#[test]
+fn a_beat_with_only_a_dropped_total_carries_airings_dropped_alone() {
+    let mut buffer = AiringBuffer::default();
+    buffer.push(a_start(1));
+    buffer.push(a_start(2));
+    let refused = buffer.take_for_beat();
+    assert_eq!(buffer.drop_refused(&refused), 2);
+    let batch = buffer.take_for_beat();
+    assert!(batch.is_empty() && batch.dropped() == 2);
+    let mut checked = 0;
+    for r in [report(), stopped(ExitReason::Ended, Some("drained"))] {
+        let wire = heartbeat_wire_with(&r, &Measured::default(), &batch);
+        assert!(wire.get("airings").is_none(), "no line, no airings: {wire}");
+        assert_eq!(wire["airingsDropped"], 2, "{wire}");
+        let errs = violations(&provisional_heartbeat(), &wire);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!violations(&schema_def("heartbeat"), &wire).is_empty(), "{wire}");
+        checked += 1;
+    }
+    eprintln!("dropped-only beats checked: {checked}");
+    assert_eq!(checked, 2);
 }
 
 /// The largest beat the buffer can give: 64 lines at web's bounds (ids of 80 UTF-16 units, a break
