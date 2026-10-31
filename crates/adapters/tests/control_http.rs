@@ -7,11 +7,12 @@
 //! connection closed with no reply and a server that never answers, and `tiny_http` answers a dropped
 //! request with a 500.
 use adapters::control_http::{
-    heartbeat_wire, parse_reply, parse_session, HttpControlPlane, PlaneConfigError,
+    heartbeat_wire, heartbeat_wire_with, parse_reply, parse_session, HttpControlPlane, PlaneConfigError,
 };
 use app::ports::{
     ControlPlane, FetchError, HeartbeatError, Measured, Reply as BeatReply, FINAL_BEAT_TIMEOUT_MS,
 };
+use domain::airings::{AiringBatch, AiringBuffer, AiringLine, AiringSource, AiringStyle};
 use domain::config::Thresholds;
 use domain::health::{BeatState, ExitDetail, ExitInfo, HealthReport};
 use domain::lifecycle::ExitReason;
@@ -1117,4 +1118,73 @@ fn every_call_opens_a_fresh_connection() {
         seen.push(conns.recv_timeout(SEEN_WAIT).expect("the fake saw the beat"));
     }
     assert_eq!(seen, vec![0, 1, 2], "one connection per call");
+}
+
+/// R4 task SC1, the seam: the POST web receives carries the beat's airings exactly as the wire writes
+/// them, on a beat answered 200 and on one answered 503 alike, the final beat's included; a beat with
+/// none carries neither key.
+#[test]
+fn the_posted_beat_carries_its_airings() {
+    let mut buffer = AiringBuffer::default();
+    buffer.push(
+        AiringLine::start(
+            "3:sponsor.set_break".to_owned(),
+            "card-1".to_owned(),
+            AiringStyle::Banner,
+            AiringSource::Scene,
+            None,
+            "2026-10-31T12:00:00.000Z".to_owned(),
+        )
+        .unwrap(),
+    );
+    buffer.push(
+        AiringLine::end(
+            "3:sponsor.set_break".to_owned(),
+            "2026-10-31T12:00:09Z".to_owned(),
+            true,
+        )
+        .unwrap(),
+    );
+    let batch = buffer.take_for_beat();
+    let final_beat = HealthReport {
+        state: BeatState::Stopped,
+        exit: Some(ExitInfo {
+            reason: ExitReason::Ended,
+            detail: None,
+        }),
+        ..periodic()
+    };
+    let mut checked = 0;
+    for (h, status, body) in [
+        (periodic(), 200, ok(fixture("reply-live.json"))),
+        (periodic(), 503, refused("UNAVAILABLE")),
+        (final_beat, 200, ok(fixture("reply-ending.json"))),
+    ] {
+        for carried in [&batch, &AiringBatch::default()] {
+            let fake = serve(vec![Reply::Status(status, body.clone())]);
+            let r = plane(&fake.url).heartbeat_with(&h, &Measured::default(), carried);
+            assert_eq!(r.is_ok(), status == 200, "{status}: {r:?}");
+            let posted: Value = serde_json::from_str(&fake.next().body).expect("the body is JSON");
+            assert_eq!(posted, heartbeat_wire_with(&h, &Measured::default(), carried));
+            if carried.is_empty() {
+                assert!(
+                    posted.get("airings").is_none() && posted.get("airingsDropped").is_none(),
+                    "{posted}"
+                );
+                assert_eq!(posted, heartbeat_wire(&h, &Measured::default()));
+            } else {
+                assert_eq!(posted["airings"].as_array().map(Vec::len), Some(2), "{posted}");
+                assert_eq!(
+                    posted["airings"][0]["breakKind"],
+                    Value::Null,
+                    "a scene start: {posted}"
+                );
+                assert_eq!(posted["airings"][1]["cutShort"], true, "{posted}");
+                assert_eq!(posted["airingsDropped"], 0, "{posted}");
+            }
+            checked += 1;
+        }
+    }
+    eprintln!("posted beats checked: {checked}");
+    assert_eq!(checked, 6);
 }

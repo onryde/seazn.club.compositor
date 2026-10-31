@@ -98,8 +98,10 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use app::airings::Airings;
 use app::ports::{redacted_origin, CefPoll, CefPss, GraphicsRenderer, Inbound};
 use crossbeam_channel::Sender;
+use domain::airings::{AiringLine, LineRefusal};
 use domain::health::PhaseChannel;
 use domain::supervisor::Event;
 use gstreamer as gst;
@@ -110,6 +112,7 @@ use crate::frame_store::FrameStore;
 use crate::gst_output::LogFn;
 use crate::gst_programme::OVERLAY_SIZE;
 use crate::redact::Scrubber;
+use crate::sponsor_line::{parse_sponsor_line, source_word};
 
 /// F-001: a js-signal page's `set_state(NULL)` did not return within 10 s. A retired build whose
 /// teardown has not returned after this long has its renderer processes killed (amendment
@@ -217,13 +220,16 @@ pub(crate) enum PageSignal {
     Alive,
     ScoreStale(bool),
     Channel(PhaseChannel),
+    /// A `seazn:sponsor:start|end` proof-of-play line (R4 task SC1; `sponsor_line`), read or refused.
+    Sponsor(Result<AiringLine, LineRefusal>),
     /// A `seazn:` line that is none of the above: logged at WARN, mapped to nothing.
     Unknown,
     /// Not ours (the page's own console output).
     Other,
 }
 
-/// The exact lines F-001 and R2005 fixed. Nothing is trimmed or lowercased.
+/// The exact lines F-001 and R2005 fixed, and R4's sponsor lines (`sponsor_line`, a signal and a
+/// bounded JSON body). Nothing is trimmed or lowercased.
 pub(crate) fn page_signal(message: &str) -> PageSignal {
     match message {
         "seazn:ready" => PageSignal::Ready,
@@ -232,7 +238,9 @@ pub(crate) fn page_signal(message: &str) -> PageSignal {
         "seazn:score-stale=false" => PageSignal::ScoreStale(false),
         "seazn:phase-channel=loopback" => PageSignal::Channel(PhaseChannel::Loopback),
         "seazn:phase-channel=web" => PageSignal::Channel(PhaseChannel::Web),
-        m if m.starts_with("seazn:") => PageSignal::Unknown,
+        m if m.starts_with("seazn:") => {
+            parse_sponsor_line(m).map_or(PageSignal::Unknown, PageSignal::Sponsor)
+        }
         _ => PageSignal::Other,
     }
 }
@@ -1419,8 +1427,10 @@ enum Note {
 }
 
 impl Note {
-    /// Which notes a full queue gives up first (PR #32 review m6): `Some(0)` only logs, `Some(1)`
-    /// is a signal the page repeats or the domain outlives (a beat, a stale or channel value), and
+    /// Which notes a full queue gives up first (PR #32 review m6): `Some(0)` only logs (a refused
+    /// sponsor line too), `Some(1)` is a signal the page repeats or the domain outlives (a beat, a
+    /// stale or channel value) or a read sponsor line (R4 task SC1: not repeated, but one a line, so
+    /// not kept past the cap), and
     /// `None` is never dropped: a decided crash (its gate is already shut, so a lost note would
     /// freeze the overlay unannounced), a ready (at most one queued per build, below) and a first
     /// frame (at most one a build; lost, the domain would count a painted page blank and reload it).
@@ -1433,7 +1443,11 @@ impl Note {
                 ..
             } => None,
             Note::Page {
-                signal: PageSignal::Alive | PageSignal::ScoreStale(_) | PageSignal::Channel(_),
+                signal:
+                    PageSignal::Alive
+                    | PageSignal::ScoreStale(_)
+                    | PageSignal::Channel(_)
+                    | PageSignal::Sponsor(Ok(_)),
                 ..
             } => Some(1),
             Note::Page { .. } | Note::RendererGone { .. } | Note::Element { .. } | Note::Forward(_) => {
@@ -1667,6 +1681,8 @@ struct Shared {
     tree: ProcTree,
     /// The process's CEF watch (`cef_watch`).
     watch: Arc<Mutex<CefWatch>>,
+    /// Where the current page's sponsor lines go for the heartbeat (`with_airings`; off by default).
+    airings: Mutex<Airings>,
     #[cfg(feature = "test-hooks")]
     teardown_hold: Mutex<bool>,
     #[cfg(feature = "test-hooks")]
@@ -1935,6 +1951,7 @@ impl CefGraphics {
             memory: CefMemory::default(),
             tree: ProcTree::live(),
             watch: cef_watch(),
+            airings: Mutex::new(Airings::off()),
             #[cfg(feature = "test-hooks")]
             teardown_hold: Mutex::new(false),
             #[cfg(feature = "test-hooks")]
@@ -2017,6 +2034,13 @@ impl CefGraphics {
     /// of stderr, from the next line on. C12 wires its log sink here.
     pub fn with_log(self, log: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
         *locked(&self.shared.log) = log;
+        self
+    }
+
+    /// Holds each sponsor line the current page logs in `airings`, for the heartbeat (R4 task SC1),
+    /// from the next line on. Off (the default), a line is logged and held nowhere.
+    pub fn with_airings(self, airings: Airings) -> Self {
+        *locked(&self.shared.airings) = airings;
         self
     }
 
@@ -2554,6 +2578,27 @@ fn dispatch(shared: &Shared) {
                 PageSignal::ScoreStale(_) | PageSignal::Channel(_) => {
                     shared.log(&format!("gen={gen}: `{text}` from a retired page; not relayed"));
                 }
+                PageSignal::Sponsor(Ok(line)) => {
+                    let current = shared.is_current(build);
+                    let fate = if !current {
+                        "from a retired page; not relayed"
+                    } else if locked(&shared.airings).push(line.clone()) {
+                        "held for the beat"
+                    } else {
+                        "not held (airings off)"
+                    };
+                    shared.log(&format!("gen={gen}: {}: {fate}", airing_said(line)));
+                }
+                PageSignal::Sponsor(Err(why)) => {
+                    let n = page_lines.entry(build).or_insert(0);
+                    *n += 1;
+                    if *n <= PAGE_LINES_PER_BUILD {
+                        shared.log(&format!(
+                            "gen={gen}: WARN: sponsor line refused ({why:?}): {}",
+                            clip(&text)
+                        ));
+                    }
+                }
                 PageSignal::Unknown | PageSignal::Other => {
                     let n = page_lines.entry(build).or_insert(0);
                     *n += 1;
@@ -2590,6 +2635,19 @@ fn dispatch(shared: &Shared) {
         if storms.len() > 64 {
             storms.clear();
         }
+    }
+}
+
+/// A read sponsor line, for the log: its kind, moment and card (no timestamp: the log line has one).
+fn airing_said(line: &AiringLine) -> String {
+    match line {
+        AiringLine::Start(s) => format!(
+            "sponsor start moment={} card={} source={}",
+            s.moment_id(),
+            s.card_id(),
+            source_word(s.source())
+        ),
+        AiringLine::End(e) => format!("sponsor end moment={} cut_short={}", e.moment_id(), e.cut_short()),
     }
 }
 
@@ -2768,6 +2826,7 @@ impl fmt::Debug for CefGraphics {
 mod tests {
     use super::*;
     use app::ports::KindPss;
+    use domain::airings::{AiringSource, AiringStyle};
 
     #[test]
     fn page_signals_match_exactly() {
@@ -4576,6 +4635,7 @@ mod tests {
             memory: CefMemory::default(),
             tree,
             watch,
+            airings: Mutex::new(Airings::off()),
             #[cfg(feature = "test-hooks")]
             teardown_hold: Mutex::new(false),
             #[cfg(feature = "test-hooks")]
@@ -5163,5 +5223,180 @@ mod tests {
                       Pss:               48210 kB\nPss_Anon:          30000 kB\n";
         assert_eq!(pss_kb(rollup), Some(48_210));
         assert_eq!(pss_kb("Rss: 1 kB\n"), None);
+    }
+
+    // ---- R4 task SC1: the page's sponsor lines ----
+
+    fn sponsor_start(moment: &str) -> AiringLine {
+        AiringLine::start(
+            moment.to_owned(),
+            "card-1".to_owned(),
+            AiringStyle::LowerThird,
+            AiringSource::Rotation,
+            Some("set_break".to_owned()),
+            "2026-10-31T12:00:00.000Z".to_owned(),
+        )
+        .expect("within web's bounds")
+    }
+
+    fn sponsor_end(moment: &str) -> AiringLine {
+        AiringLine::end(moment.to_owned(), "2026-10-31T12:00:08.000Z".to_owned(), false)
+            .expect("within web's bounds")
+    }
+
+    /// A sponsor line is its own signal, read or refused; a near miss stays `Unknown`. Each expected
+    /// line is built by hand from web's `sponsorLine` shape (S7), not by the reader.
+    #[test]
+    fn sponsor_lines_are_a_signal_of_their_own() {
+        let start = r#"seazn:sponsor:start {"momentId":"1:sponsor.set_break","cardId":"card-1","style":"lower_third","source":"rotation","breakKind":"set_break","at":"2026-10-31T12:00:00.000Z"}"#;
+        let end = r#"seazn:sponsor:end {"momentId":"1:sponsor.set_break","at":"2026-10-31T12:00:08.000Z","cutShort":false}"#;
+        let cases: Vec<(&str, PageSignal)> = vec![
+            (
+                start,
+                PageSignal::Sponsor(Ok(sponsor_start("1:sponsor.set_break"))),
+            ),
+            (end, PageSignal::Sponsor(Ok(sponsor_end("1:sponsor.set_break")))),
+            (
+                "seazn:sponsor:start {",
+                PageSignal::Sponsor(Err(LineRefusal::NotJson)),
+            ),
+            (
+                r#"seazn:sponsor:end {"momentId":"m","at":"2026-10-31T12:00:08Z"}"#,
+                PageSignal::Sponsor(Err(LineRefusal::KeySet)),
+            ),
+            // Near misses: a seazn: line, no sponsor line.
+            ("seazn:sponsor:start", PageSignal::Unknown),
+            ("seazn:sponsor:start{}", PageSignal::Unknown),
+            ("seazn:sponsor:middle {}", PageSignal::Unknown),
+            // Not ours at all.
+            (" seazn:sponsor:start {}", PageSignal::Other),
+        ];
+        for (line, want) in &cases {
+            assert_eq!(&page_signal(line), want, "{line:?}");
+        }
+        eprintln!("sponsor page lines checked: {}", cases.len());
+        assert_eq!(cases.len(), 8);
+    }
+
+    /// A full queue gives up a read sponsor line only after every log-only note (it is not repeated:
+    /// lost, its airing is never reported), and a refused one as a log line.
+    #[test]
+    fn a_full_note_queue_keeps_a_read_sponsor_line_over_a_log_line() {
+        let log = |n: u64| Note::Element {
+            gen: 1,
+            text: format!("line {n}"),
+        };
+        let is_sponsor = |n: &Note| {
+            matches!(
+                n,
+                Note::Page {
+                    signal: PageSignal::Sponsor(_),
+                    ..
+                }
+            )
+        };
+        let mut q = NoteQueue::default();
+        for n in 0..NOTE_QUEUE_CAP as u64 {
+            q.push(log(n));
+        }
+        q.push(page_note(1, PageSignal::Sponsor(Ok(sponsor_start("a")))));
+        assert_eq!(q.q.len(), NOTE_QUEUE_CAP);
+        assert_eq!(
+            q.q.iter().filter(|n| is_sponsor(n)).count(),
+            1,
+            "a log line made room"
+        );
+        // A queue of beats: a refused line is dropped outright, a read one takes a beat's place.
+        let mut q = NoteQueue::default();
+        for _ in 0..NOTE_QUEUE_CAP {
+            q.push(page_note(2, PageSignal::Alive));
+        }
+        q.push(page_note(2, PageSignal::Sponsor(Err(LineRefusal::NotJson))));
+        assert_eq!((q.dropped, q.q.iter().filter(|n| is_sponsor(n)).count()), (1, 0));
+        q.push(page_note(2, PageSignal::Sponsor(Ok(sponsor_end("a")))));
+        assert_eq!((q.dropped, q.q.iter().filter(|n| is_sponsor(n)).count()), (2, 1));
+    }
+
+    /// The dispatcher holds the current page's read lines for the beat, in order, and nothing else:
+    /// a retired page's line is logged, not relayed; a refused line is a WARN, capped a build like any
+    /// other page line; and off, a read line is logged and held nowhere.
+    #[test]
+    fn only_the_current_pages_read_sponsor_lines_are_held_for_the_beat() {
+        let capture = |shared: &Shared| {
+            let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+            *locked(&shared.log) = {
+                let lines = Arc::clone(&lines);
+                Arc::new(move |l: &str| locked(&lines).push(l.to_owned()))
+            };
+            lines
+        };
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let shared = unit_shared(tx, ProcTree::live());
+        let lines = capture(&shared);
+        let airings = Airings::on();
+        *locked(&shared.airings) = airings.clone();
+        // The dispatcher returns once its queue is empty.
+        shared.retired.store(true, Ordering::SeqCst);
+        locked(&shared.gate).current = Some((2, 2));
+        shared.push(page_note(2, PageSignal::Sponsor(Ok(sponsor_start("a")))));
+        shared.push(page_note(1, PageSignal::Sponsor(Ok(sponsor_start("b")))));
+        shared.push(page_note(2, PageSignal::Sponsor(Ok(sponsor_end("a")))));
+        let refused = PAGE_LINES_PER_BUILD as usize + 5;
+        for _ in 0..refused {
+            shared.push(Note::Page {
+                build: 2,
+                gen: 2,
+                signal: PageSignal::Sponsor(Err(LineRefusal::KeySet)),
+                text: "seazn:sponsor:start {}".to_owned(),
+            });
+        }
+        dispatch(&shared);
+        let batch = airings.for_beat();
+        assert_eq!(
+            batch.lines(),
+            &[sponsor_start("a"), sponsor_end("a")],
+            "the current page's, in order"
+        );
+        let lines = locked(&lines).clone();
+        let has = |want: &str| lines.iter().filter(|l| *l == want).count();
+        assert_eq!(
+            has("gen=2: sponsor start moment=a card=card-1 source=rotation: held for the beat"),
+            1,
+            "{lines:?}"
+        );
+        assert_eq!(
+            has("gen=2: sponsor end moment=a cut_short=false: held for the beat"),
+            1,
+            "{lines:?}"
+        );
+        assert_eq!(
+            has(
+                "gen=1: sponsor start moment=b card=card-1 source=rotation: from a retired page; not relayed"
+            ),
+            1,
+            "{lines:?}"
+        );
+        assert_eq!(
+            has("gen=2: WARN: sponsor line refused (KeySet): seazn:sponsor:start {}"),
+            PAGE_LINES_PER_BUILD as usize,
+            "capped: {lines:?}"
+        );
+
+        // Off: logged, held nowhere.
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let off = unit_shared(tx, ProcTree::live());
+        let lines = capture(&off);
+        off.retired.store(true, Ordering::SeqCst);
+        locked(&off.gate).current = Some((3, 3));
+        off.push(page_note(3, PageSignal::Sponsor(Ok(sponsor_start("c")))));
+        dispatch(&off);
+        assert_eq!(
+            *locked(&lines),
+            vec![
+                "gen=3: sponsor start moment=c card=card-1 source=rotation: not held (airings off)"
+                    .to_owned()
+            ]
+        );
+        assert_eq!(locked(&off.airings).held(), 0);
     }
 }

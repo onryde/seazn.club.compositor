@@ -10,6 +10,7 @@ pub mod metrics_proc;
 pub mod phase_http;
 pub mod redact;
 pub mod slate;
+pub mod sponsor_line;
 pub mod stats;
 
 /// AGENTS.md §7: every URL or error text that may be logged goes through this.

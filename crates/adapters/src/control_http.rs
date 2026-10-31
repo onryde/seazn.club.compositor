@@ -25,6 +25,7 @@ use app::ports::{
     redacted_origin, ControlPlane, FetchError, HeartbeatError, InputSpec, Measured, Reply, SessionConfig,
     TargetSpec, FINAL_BEAT_TIMEOUT_MS,
 };
+use domain::airings::{AiringBatch, AiringLine};
 use domain::config::OutputProfile;
 use domain::health::{BeatState, ExitDetail, GraphicsStatus, HealthReport, LinkStatus, PhaseChannel};
 use domain::ladder::Rung;
@@ -34,6 +35,7 @@ use domain::supervisor::{Desired, Refusal};
 use serde_json::{Map, Value};
 
 use crate::redact::Scrubber;
+use crate::sponsor_line::{source_word, style_word};
 
 /// The contract's `maximum` on every integer it declares (2^53 − 1, the largest integer a JSON
 /// number carries exactly; `relay-job.v1.json`). A counter is written at most at it: a larger value
@@ -144,12 +146,17 @@ fn fps_wire(x: Option<f64>) -> Option<Value> {
 /// each `Measured` field until an adapter measures it, and `exitReason` / `exitDetail` on every beat
 /// but a `Stopped` one with an exit.
 pub fn heartbeat_wire(report: &HealthReport, measured: &Measured) -> Value {
-    wire(report, measured, &Scrubber::default())
+    heartbeat_wire_with(report, measured, &AiringBatch::default())
+}
+
+/// `heartbeat_wire`, carrying `airings` (R4 task SC1).
+pub fn heartbeat_wire_with(report: &HealthReport, measured: &Measured, airings: &AiringBatch) -> Value {
+    wire(report, measured, airings, &Scrubber::default())
 }
 
 /// `heartbeat_wire`, with `exitDetail` scrubbed of the values `scrubber` knows before it is
 /// redacted and capped (the cap comes last, so it never leaves a part of a value behind).
-fn wire(report: &HealthReport, measured: &Measured, scrubber: &Scrubber) -> Value {
+fn wire(report: &HealthReport, measured: &Measured, airings: &AiringBatch, scrubber: &Scrubber) -> Value {
     let mut m = Map::new();
     let mut put = |k: &str, v: Value| {
         m.insert(k.to_owned(), v);
@@ -195,6 +202,12 @@ fn wire(report: &HealthReport, measured: &Measured, scrubber: &Scrubber) -> Valu
     if let Some(n) = measured.mem_mb {
         put("memMb", int(n));
     }
+    // R4 task SC1: the sponsor airings, only when the beat carries some (off, it never does), with the
+    // buffer's dropped total beside them, 0 included (a measured zero).
+    if !airings.is_empty() {
+        put("airings", airings.lines().iter().map(airing_wire).collect());
+        put("airingsDropped", airings.dropped().into());
+    }
     // The exit keys ride only a `stopped` beat (the contract's if/then; web answers 400 otherwise).
     if let (BeatState::Stopped, Some(exit)) = (report.state, &report.exit) {
         put("exitReason", exit_reason_wire(exit.reason).into());
@@ -205,6 +218,34 @@ fn wire(report: &HealthReport, measured: &Measured, scrubber: &Scrubber) -> Valu
             .collect();
         if !detail.is_empty() {
             put("exitDetail", detail.into());
+        }
+    }
+    Value::Object(m)
+}
+
+/// One airing as web's S8 reads it (`RelayAiring`, a union tagged by `kind`, strict): the page's
+/// keys, `kind` first, `breakKind` null for a scene. The ids are sent as the page logged them (no
+/// scrubber: web upserts on the moment id, and the page's ids hold no credential).
+fn airing_wire(line: &AiringLine) -> Value {
+    let mut m = Map::new();
+    match line {
+        AiringLine::Start(s) => {
+            m.insert("kind".to_owned(), "start".into());
+            m.insert("momentId".to_owned(), s.moment_id().into());
+            m.insert("cardId".to_owned(), s.card_id().into());
+            m.insert("style".to_owned(), style_word(s.style()).into());
+            m.insert("source".to_owned(), source_word(s.source()).into());
+            m.insert(
+                "breakKind".to_owned(),
+                s.break_kind().map_or(Value::Null, Value::from),
+            );
+            m.insert("at".to_owned(), s.at().into());
+        }
+        AiringLine::End(e) => {
+            m.insert("kind".to_owned(), "end".into());
+            m.insert("momentId".to_owned(), e.moment_id().into());
+            m.insert("at".to_owned(), e.at().into());
+            m.insert("cutShort".to_owned(), e.cut_short().into());
         }
     }
     Value::Object(m)
@@ -582,7 +623,12 @@ impl ControlPlane for HttpControlPlane {
         Ok(session)
     }
 
-    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Reply, HeartbeatError> {
+    fn heartbeat_with(
+        &mut self,
+        report: &HealthReport,
+        measured: &Measured,
+        airings: &AiringBatch,
+    ) -> Result<Reply, HeartbeatError> {
         let mut req = self
             .agent
             .post(&self.heartbeat_url)
@@ -591,7 +637,7 @@ impl ControlPlane for HttpControlPlane {
             // The final beat: one attempt, never delaying `Exit` past its bound (Owed 28).
             req = req.timeout(Duration::from_millis(self.timeout_ms.min(FINAL_BEAT_TIMEOUT_MS)));
         }
-        let body = wire(report, measured, &locked(&self.scrubber));
+        let body = wire(report, measured, airings, &locked(&self.scrubber));
         let sent = req.send_json(body);
         let (code, body) =
             exchange(sent).map_err(|e| self.transport(&format!("heartbeat transport: {e}")))?;

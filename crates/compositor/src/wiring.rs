@@ -32,6 +32,7 @@ use adapters::gst_programme::GstProgramme;
 use adapters::metrics_proc::ProcMetrics;
 use adapters::phase_http::{origin_of, AllowedOrigin, PhaseHttp, RELAY_PHASE_PORT};
 use adapters::stats::Stats;
+use app::airings::Airings;
 use app::control_worker;
 use app::driver::Driver;
 use app::ports::{
@@ -438,11 +439,18 @@ struct Media {
     cef: Option<CefMemory>,
 }
 
-fn live_media(t: &Thresholds, tx: &Sender<Inbound>, log: &Logger, hooks: &TestHooks) -> Media {
+fn live_media(
+    t: &Thresholds,
+    tx: &Sender<Inbound>,
+    log: &Logger,
+    hooks: &TestHooks,
+    airings: &Airings,
+) -> Media {
     let frames = FrameStore::default();
     // First (Owed 53): its `new` installs the process's GStreamer log handler.
     let graphics = CefGraphics::new(frames.clone(), tx.clone(), cef_fps(), t.cef_rss_cap_mb)
-        .with_log(log.adapter_sink());
+        .with_log(log.adapter_sink())
+        .with_airings(airings.clone());
     arm_test_hooks(&graphics, hooks);
     let cef = graphics.memory();
     let mut programme = GstProgramme::new(frames.clone(), tx.clone()).with_log(log.adapter_sink());
@@ -521,6 +529,21 @@ fn fake_media(env: &Env) -> Media {
     }
 }
 
+/// The sponsor airings' buffer `env` asks for (R4 task SC1; `RELAY_AIRINGS`), and the info line that
+/// says which: on, the live page's sponsor lines ride every beat; off, none does.
+pub fn sponsor_airings(env: &Env, log: &Logger) -> Airings {
+    let airings = if env.airings {
+        Airings::on()
+    } else {
+        Airings::off()
+    };
+    log.info(&format!(
+        "sponsor airings on the heartbeat: {}",
+        if airings.is_on() { "on" } else { "off" }
+    ));
+    airings
+}
+
 /// Builds every port for `env`'s mode and runs the loop; the process's exit code.
 pub fn run(env: &Env, clock: &Arc<Clock>, log: &Logger, signals: Signals) -> i32 {
     let t = Thresholds::default();
@@ -534,11 +557,16 @@ pub fn run(env: &Env, clock: &Arc<Clock>, log: &Logger, signals: Signals) -> i32
         Err(code) => return code,
     };
     let (phase, origin) = phase_endpoint(env, log);
+    let airings = sponsor_airings(env, log);
     let media = match env.drivers {
-        Drivers::Live => live_media(&t, &tx, log, &env.hooks),
+        Drivers::Live => live_media(&t, &tx, log, &env.hooks, &airings),
         Drivers::Fake => fake_media(env),
     };
-    let control = control_worker::spawn(Box::new(LoggedPlane::new(plane, log.clone())), tx.clone());
+    let control = control_worker::spawn_with_airings(
+        Box::new(LoggedPlane::new(plane, log.clone())),
+        tx.clone(),
+        airings,
+    );
     let metrics = match media.cef {
         Some(cef) => ProcMetrics::new(media.stats).with_cef(move || cef.read()),
         None => ProcMetrics::new(media.stats),

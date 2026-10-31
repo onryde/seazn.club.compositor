@@ -19,8 +19,11 @@ use app::ports::{
 use compositor::clock::Clock;
 use compositor::env::Drivers;
 use compositor::logged::{rfc3339_ms, LoggedPlane, LoggedProgramme, Logger};
-use compositor::wiring::{assemble, cef_fps, LazyInput, PageOrigin, Parts, ProfileSlot, ProfileTap};
+use compositor::wiring::{
+    assemble, cef_fps, sponsor_airings, LazyInput, PageOrigin, Parts, ProfileSlot, ProfileTap,
+};
 use crossbeam_channel::{bounded, Receiver, Sender};
+use domain::airings::{AiringBuffer, AiringLine};
 use domain::cef_health::CefHealth;
 use domain::config::{OutputProfile, Thresholds};
 use domain::health::{BeatState, ExitInfo, HealthReport};
@@ -611,6 +614,76 @@ fn final_report(reason: ExitReason) -> HealthReport {
         exit: Some(ExitInfo { reason, detail: None }),
         ..s.health(0)
     }
+}
+
+/// R4 task SC1: the decorator passes each beat's sponsor airings on, on both lanes. One that dropped
+/// them would post every beat bare while the worker cleared the buffer on its 2xx: every airing lost.
+#[test]
+fn logged_plane_passes_the_airings_on_on_both_lanes() {
+    let (log, _buf) = logger();
+    let (plane, calls) = ScriptedPlane::new(session_720p());
+    let mut lp = LoggedPlane::new(Box::new(plane), log);
+    let mut lane = lp.final_lane();
+    let mut buffer = AiringBuffer::default();
+    buffer.push(
+        AiringLine::end(
+            "1:sponsor.set_break".to_owned(),
+            "2026-10-31T12:00:08Z".to_owned(),
+            false,
+        )
+        .expect("within web's bounds"),
+    );
+    let batch = buffer.take_for_beat();
+    let periodic = Supervisor::new(Thresholds::default())
+        .decide(Event::Tick, 0)
+        .next
+        .health(0);
+    assert!(lp.heartbeat_with(&periodic, &Measured::default(), &batch).is_ok());
+    assert!(lane
+        .heartbeat_with(&final_report(ExitReason::Ended), &Measured::default(), &batch)
+        .is_ok());
+    let carried: Vec<_> = calls
+        .beat_airings()
+        .into_iter()
+        .map(|(h, b)| (h.exit.is_some(), b))
+        .collect();
+    assert_eq!(carried, vec![(false, batch.clone()), (true, batch)]);
+}
+
+/// R4 task SC1: the binary's airings follow `RELAY_AIRINGS` (off unless `1`), and its start says
+/// which, so a run's log shows whether its beats can carry them.
+#[test]
+fn the_sponsor_airings_follow_relay_airings_and_say_so() {
+    let mut checked = 0;
+    for (value, on) in [(None, false), (Some("0"), false), (Some("1"), true)] {
+        let mut m = std::collections::BTreeMap::from([
+            (
+                compositor::env::SESSION_ID,
+                "3f8a2c1e-7b4d-4e9a-9c2f-5d6e7f8a9b0c".to_owned(),
+            ),
+            (compositor::env::JOB_TOKEN, TOKEN.to_owned()),
+            (compositor::env::APP_URL, "https://stg.seazn.club".to_owned()),
+            (
+                compositor::env::RELAY_DEADLINE_AT,
+                "2026-10-14T18:30:00.000Z".to_owned(),
+            ),
+            (compositor::env::COMPOSITOR_DRIVERS, "live".to_owned()),
+        ]);
+        if let Some(v) = value {
+            m.insert(compositor::env::RELAY_AIRINGS, v.to_owned());
+        }
+        let env = compositor::env::parse(|k| m.get(k).cloned(), true).expect("a valid env");
+        let (log, buf) = logger();
+        let airings = sponsor_airings(&env, &log);
+        assert_eq!(airings.is_on(), on, "{value:?}");
+        let want = format!(
+            "sponsor airings on the heartbeat: {}",
+            if on { "on" } else { "off" }
+        );
+        assert_eq!(buf.messages(), vec![want], "{value:?}");
+        checked += 1;
+    }
+    assert_eq!(checked, 3);
 }
 
 /// A final beat whose call failed is logged with its text, scrubbed of the token and of the fetched

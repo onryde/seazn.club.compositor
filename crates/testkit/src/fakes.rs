@@ -13,6 +13,7 @@ use app::ports::{
     HeartbeatError, Inbound, InputSource, InputSpec, LogSink, Measured, Metrics, PhasePublisher, Ports,
     ProgrammeOutput, Reply, SessionConfig, TargetSpec,
 };
+use domain::airings::AiringBatch;
 use domain::cef_health::CefHealth;
 use domain::config::OutputProfile;
 use domain::health::HealthReport;
@@ -323,6 +324,9 @@ pub enum PlaneCall {
     Fetched,
     BeatStarted(HealthReport),
     Beat(HealthReport, Measured),
+    /// The sponsor airings a beat carried (R4 task SC1), recorded just before that beat's `Beat`, in
+    /// one step with it; absent when the beat carried none.
+    Airings(AiringBatch),
 }
 
 /// The scripted plane's record, readable from the test while the worker owns the plane.
@@ -345,8 +349,35 @@ impl PlaneLog {
             .collect()
     }
 
+    /// Every completed heartbeat's report and the airings it carried (empty when it carried none), in
+    /// order.
+    pub fn beat_airings(&self) -> Vec<(HealthReport, AiringBatch)> {
+        let calls = locked(&self.0);
+        let mut out = Vec::new();
+        for (i, c) in calls.iter().enumerate() {
+            if let PlaneCall::Beat(h, _) = c {
+                let carried = match i.checked_sub(1).map(|j| &calls[j]) {
+                    Some(PlaneCall::Airings(b)) => b.clone(),
+                    _ => AiringBatch::default(),
+                };
+                out.push((h.clone(), carried));
+            }
+        }
+        out
+    }
+
     fn push(&self, c: PlaneCall) {
         locked(&self.0).push(c);
+    }
+
+    /// A completed beat, with the airings it carried when it carried any, in one step: a beat of the
+    /// other lane cannot land between the two.
+    fn push_beat(&self, beat: PlaneCall, airings: &AiringBatch) {
+        let mut calls = locked(&self.0);
+        if !airings.is_empty() {
+            calls.push(PlaneCall::Airings(airings.clone()));
+        }
+        calls.push(beat);
     }
 
     /// Waits until `pred` holds over the calls, polling every 2 ms, for at most `timeout`. A bounded
@@ -458,11 +489,17 @@ impl ControlPlane for ScriptedPlane {
         r
     }
 
-    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Reply, HeartbeatError> {
+    fn heartbeat_with(
+        &mut self,
+        report: &HealthReport,
+        measured: &Measured,
+        airings: &AiringBatch,
+    ) -> Result<Reply, HeartbeatError> {
         self.log.push(PlaneCall::BeatStarted(report.clone()));
         let (delay, result) = (locked(&self.script).reply)(report);
         thread::sleep(delay);
-        self.log.push(PlaneCall::Beat(report.clone(), measured.clone()));
+        self.log
+            .push_beat(PlaneCall::Beat(report.clone(), measured.clone()), airings);
         result
     }
 

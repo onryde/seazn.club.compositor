@@ -22,6 +22,7 @@ use app::ports::{
     ControlPlane, FetchError, GraphicsRenderer, HeartbeatError, LogSink, Measured, ProgrammeOutput, Reply,
     SessionConfig, TargetSpec,
 };
+use domain::airings::AiringBatch;
 use domain::cef_health::CefHealth;
 use domain::config::OutputProfile;
 use domain::health::HealthReport;
@@ -278,8 +279,13 @@ impl ControlPlane for LoggedPlane {
         r
     }
 
-    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Reply, HeartbeatError> {
-        let r = self.inner.heartbeat(report, measured);
+    fn heartbeat_with(
+        &mut self,
+        report: &HealthReport,
+        measured: &Measured,
+        airings: &AiringBatch,
+    ) -> Result<Reply, HeartbeatError> {
+        let r = self.inner.heartbeat_with(report, measured, airings);
         if report.exit.is_some() {
             match &r {
                 Ok(_) => {}

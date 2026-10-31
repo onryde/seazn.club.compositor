@@ -1,6 +1,6 @@
 //! The Machine's environment (C12): the four values R1's runner driver sets (`SESSION_ID`,
-//! `JOB_TOKEN`, `APP_URL`, `RELAY_DEADLINE_AT`), the driver mode, and the fake mode's
-//! knobs. `parse` is pure: the binary hands it `std::env`, a test a table. An `EnvError` (exit 78,
+//! `JOB_TOKEN`, `APP_URL`, `RELAY_DEADLINE_AT`), the driver mode, the fake mode's knobs, and
+//! `RELAY_AIRINGS` (R4, optional: absent, the run is what it was before it). `parse` is pure: the binary hands it `std::env`, a test a table. An `EnvError` (exit 78,
 //! EX_CONFIG) names the key it is about and never a value: the job token is one of them (AGENTS.md §7;
 //! C07 review, Owed 32: the token comes from env, never argv).
 use std::fmt;
@@ -22,6 +22,14 @@ pub const COMPOSITOR_FAKE_START_FAIL: &str = "COMPOSITOR_FAKE_START_FAIL";
 /// Fake mode only: `1` makes the fake graphics report a dead CEF zygote (generation 1) from the start,
 /// which the domain acts on at the first Running tick: the in-place restart, exit 75 (C11b).
 pub const COMPOSITOR_FAKE_ZYGOTE_GONE: &str = "COMPOSITOR_FAKE_ZYGOTE_GONE";
+
+/// R4 task SC1 (spec 2026-10-27 §3.6.2): `1` puts the sponsor airings the overlay page logs on the
+/// heartbeat (`airings`, `airingsDropped`). Off unless set: web's heartbeat is strict, so a beat
+/// carrying them before web's S8 declares the keys is a 400 and the whole beat is lost. Web's runner
+/// sets it with the deploy that accepts them, so the switch moves with the schema. Unset, empty or `0`
+/// is off; anything else is refused (78). Read in both modes. A host that passes only R1's four keys
+/// (ADR 0007, item 2) runs with it off.
+pub const RELAY_AIRINGS: &str = "RELAY_AIRINGS";
 
 /// Owed 82, a `test-hooks` build only (C14 case 16; owner option A, 2026-10-24): a count, `N`. The
 /// live graphics adapter's next `N` retired CEF teardowns never return (`hold_next_teardowns`), so
@@ -109,6 +117,8 @@ pub struct Env {
     pub drivers: Drivers,
     pub fake: FakeKnobs,
     pub hooks: TestHooks,
+    /// `RELAY_AIRINGS`: the beats carry the sponsor airings (R4 task SC1).
+    pub airings: bool,
 }
 
 // The token prints as `****` (AGENTS.md §7); a fake start-failure text may carry a planted credential.
@@ -120,6 +130,7 @@ impl fmt::Debug for Env {
             .field("app_origin", &self.app_origin)
             .field("deadline_ms", &self.deadline_ms)
             .field("drivers", &self.drivers)
+            .field("airings", &self.airings)
             .finish_non_exhaustive()
     }
 }
@@ -189,6 +200,11 @@ pub fn parse(get: impl Fn(&str) -> Option<String>, release: bool) -> Result<Env,
             },
         },
     };
+    let airings = match get(RELAY_AIRINGS).as_deref() {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(_) => return Err(EnvError::Invalid(RELAY_AIRINGS)),
+    };
     Ok(Env {
         session_id,
         job_token,
@@ -198,6 +214,7 @@ pub fn parse(get: impl Fn(&str) -> Option<String>, release: bool) -> Result<Env,
         drivers,
         fake,
         hooks: test_hooks(&get)?,
+        airings,
     })
 }
 

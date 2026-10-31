@@ -149,6 +149,41 @@ fn fake_knobs_parse_in_fake_mode_only() {
     }
 }
 
+/// R4 task SC1: `RELAY_AIRINGS` turns the sponsor airings on, in either mode. Unset (every host that
+/// passes only R1's four keys, ADR 0007), empty or `0` leaves them off; `1` turns them on; anything
+/// else is refused (78), so a typo never silently leaves them off.
+#[test]
+fn relay_airings_is_off_unless_set_to_1() {
+    let mut checked = 0;
+    for drivers in ["live", "fake"] {
+        let mut m = base();
+        m.insert(env::COMPOSITOR_DRIVERS, drivers.to_owned());
+        assert!(!parse(&m, true).unwrap().airings, "{drivers}: unset is off");
+        checked += 1;
+        for (value, want) in [("", Some(false)), ("0", Some(false)), ("1", Some(true))] {
+            m.insert(env::RELAY_AIRINGS, value.to_owned());
+            assert_eq!(
+                parse(&m, true).ok().map(|e| e.airings),
+                want,
+                "{drivers}: {value:?}"
+            );
+            checked += 1;
+        }
+        for bad in ["true", "on", "yes", "2", " 1", "1 ", "01"] {
+            m.insert(env::RELAY_AIRINGS, bad.to_owned());
+            assert_eq!(
+                parse(&m, true).err(),
+                Some(EnvError::Invalid(env::RELAY_AIRINGS)),
+                "{drivers}: {bad:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(env::RELAY_AIRINGS, "RELAY_AIRINGS");
+    eprintln!("RELAY_AIRINGS values checked: {checked}");
+    assert_eq!(checked, 22);
+}
+
 /// `Env`'s `Debug` never prints the token.
 #[test]
 fn env_debug_hides_the_token() {

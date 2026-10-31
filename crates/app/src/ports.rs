@@ -10,6 +10,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use domain::airings::AiringBatch;
 use domain::cef_health::CefHealth;
 use domain::config::OutputProfile;
 use domain::health::HealthReport;
@@ -311,8 +312,20 @@ pub struct MemorySplit {
 pub trait ControlPlane: Send {
     fn fetch_session(&mut self) -> Result<SessionConfig, FetchError>;
     /// A report whose `exit` is `Some` is the final beat: one attempt, bounded by
-    /// `FINAL_BEAT_TIMEOUT_MS`. Its result is classified exactly like any other beat's.
-    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Reply, HeartbeatError>;
+    /// `FINAL_BEAT_TIMEOUT_MS`. Its result is classified exactly like any other beat's. `airings` is
+    /// the sponsor airings this beat carries (R4 task SC1; empty: the beat carries none, and no
+    /// `airings` key). Required of every plane, so a decorator cannot drop them by forgetting to pass
+    /// them on: the control worker calls this one alone.
+    fn heartbeat_with(
+        &mut self,
+        report: &HealthReport,
+        measured: &Measured,
+        airings: &AiringBatch,
+    ) -> Result<Reply, HeartbeatError>;
+    /// A beat that carries no airings.
+    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Reply, HeartbeatError> {
+        self.heartbeat_with(report, measured, &AiringBatch::default())
+    }
     /// A second instance for the final-beat lane (C08 review round 1, the coordinator's ruling), which
     /// the control worker runs on its own thread: its own connection, so a call in flight on this
     /// instance never holds a final beat up; and every credential this instance knows or LATER learns

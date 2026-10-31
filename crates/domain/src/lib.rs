@@ -4,6 +4,7 @@
 // The domain never writes to stderr; adapters and app own it (C12 logs there). Pinned by tests/purity.rs.
 #![forbid(clippy::print_stderr)]
 
+pub mod airings;
 pub mod backoff;
 pub mod cef_health;
 pub mod config;

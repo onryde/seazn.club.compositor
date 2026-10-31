@@ -32,6 +32,7 @@ use crossbeam_channel::{bounded, Receiver, Select, Sender, TryRecvError};
 use domain::health::{ExitDetail, HealthReport};
 use domain::supervisor::{Event, HeartbeatRefusal};
 
+use crate::airings::Airings;
 use crate::ports::{
     ControlPlane, ControlQueue, ControlRequest, FetchError, HeartbeatError, Inbound, Measured, Reply,
     SessionConfig,
@@ -137,8 +138,13 @@ impl ControlQueue for ControlHandle {
 }
 
 /// Starts the worker's two threads: `control` over `cp`, and `control-final` over
-/// `cp.final_lane()`. Their results go to `tx`.
+/// `cp.final_lane()`. Their results go to `tx`. No beat carries sponsor airings.
 pub fn spawn(cp: Box<dyn ControlPlane>, tx: Sender<Inbound>) -> ControlHandle {
+    spawn_with_airings(cp, tx, Airings::off())
+}
+
+/// `spawn`, with every beat carrying the sponsor airings `airings` holds (R4 task SC1; `post_beat`).
+pub fn spawn_with_airings(cp: Box<dyn ControlPlane>, tx: Sender<Inbound>, airings: Airings) -> ControlHandle {
     let (finals, finals_rx) = bounded(FINAL_SLOT);
     let (fetch, fetch_rx) = bounded(1);
     let (periodic, periodic_rx) = bounded(1);
@@ -148,12 +154,14 @@ pub fn spawn(cp: Box<dyn ControlPlane>, tx: Sender<Inbound>) -> ControlHandle {
         tx: tx.clone(),
         finals: finals_rx,
         posted: Arc::clone(&posted),
+        airings: airings.clone(),
     };
     let worker = Worker {
         cp,
         tx: tx.clone(),
         fetch: fetch_rx,
         periodic: periodic_rx.clone(),
+        airings,
     };
     for started in [
         thread::Builder::new()
@@ -190,6 +198,7 @@ struct FinalLane {
     tx: Sender<Inbound>,
     cp: Box<dyn ControlPlane>,
     posted: Arc<Posted>,
+    airings: Airings,
 }
 
 impl FinalLane {
@@ -227,7 +236,7 @@ impl FinalLane {
 
     /// Posts one final beat, acknowledges it for `flush`, and queues its result.
     fn post(&mut self, (h, m): Beat, unposted: &mut VecDeque<Inbound>) {
-        let r = self.cp.heartbeat(&h, &m);
+        let r = post_beat(&mut *self.cp, &self.airings, &h, &m);
         *locked(&self.posted.count) += 1;
         self.posted.cv.notify_all();
         unposted.push_back(replied(r));
@@ -245,6 +254,7 @@ struct Worker {
     tx: Sender<Inbound>,
     fetch: Receiver<()>,
     periodic: Receiver<Beat>,
+    airings: Airings,
 }
 
 impl Worker {
@@ -253,7 +263,7 @@ impl Worker {
             let (msg, edge) = match job {
                 Job::Fetch => (fetched(self.cp.fetch_session()), None),
                 Job::Periodic((h, m)) => {
-                    let r = self.cp.heartbeat(&h, &m);
+                    let r = post_beat(&mut *self.cp, &self.airings, &h, &m);
                     let edge = live_edge(&r);
                     (replied(r), edge)
                 }
@@ -295,6 +305,25 @@ impl Worker {
             sel.ready();
         }
     }
+}
+
+/// One beat, periodic or final, with the sponsor airings held when it is posted (R4 task SC1; spec
+/// 2026-10-27 §3.6.2). The final beat is a beat like any other here, so it carries every line still
+/// held: that is its flush. Only a reply (C07's 200 with a heartbeat reply, the contract's 2xx) clears
+/// what this beat carried; any other outcome keeps it for the next beat, and a line pushed while the
+/// call was in flight stays either way (`AiringBuffer::ack_2xx`).
+fn post_beat(
+    cp: &mut dyn ControlPlane,
+    airings: &Airings,
+    h: &HealthReport,
+    m: &Measured,
+) -> Result<Reply, HeartbeatError> {
+    let batch = airings.for_beat();
+    let r = cp.heartbeat_with(h, m, &batch);
+    if r.is_ok() {
+        airings.ack_2xx(&batch);
+    }
+    r
 }
 
 fn fetched(r: Result<SessionConfig, FetchError>) -> Inbound {
