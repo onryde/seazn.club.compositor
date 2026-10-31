@@ -3144,19 +3144,20 @@ use adapters::frame_tap::GstFrameTap;
 use app::ports::FrameTap;
 use domain::config::{FRAME_GRAB_SIZE, FRAME_GRAB_WAIT_MS, FRAME_UPLOAD_MAX_BYTES};
 
-/// A 720p programme with a frame tap, asked for before `start()` as the binary asks for it.
-fn programme_with_tap() -> (GstProgramme, GstFrameTap, Receiver<Inbound>, FrameStore) {
+/// A programme in `profile` with a frame tap, asked for before `start()` as the binary asks for it.
+fn programme_with_tap(profile: &OutputProfile) -> (GstProgramme, GstFrameTap, Receiver<Inbound>, FrameStore) {
     gst::init().expect("gstreamer");
     let frames = FrameStore::default();
     let (tx, rx) = crossbeam_channel::bounded(8_192);
     let mut p = GstProgramme::new(frames.clone(), tx).with_log(Arc::new(|_: &str| {}));
     let tap = p.frame_tap().expect("a tap before start");
-    p.start(&P720).expect("start");
+    p.start(profile).expect("start");
     (p, tap, rx, frames)
 }
 
-/// A JPEG decoded by GStreamer's own `jpegdec`, to RGB: its size and a pixel reader. The colour
-/// checks are the loose `is_*` classes, so the JPEG's full-range decode does not matter.
+/// A JPEG decoded by GStreamer's own `jpegdec`, to RGB: its size and a pixel reader. `jpegdec` reads
+/// every YCbCr JPEG as JFIF's full-range BT.601 (ITU-T T.871 §7), as every decoder does, so a black
+/// that decodes to 16 is a limited-range frame encoded as-is.
 struct Jpeg {
     w: u32,
     h: u32,
@@ -3218,46 +3219,61 @@ fn sof0_size(jpeg: &[u8]) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
-/// One grab on another thread while the programme runs at pace: a 640 × 360 JPEG of the composed
-/// frame (the green camera with the overlay's blue corner on top), within web's bound, and the
-/// programme lost no frame to it.
+/// One grab on another thread while the programme runs at pace, in both modes (1080p is the
+/// production default, AGENTS.md §2): a 640 × 360 JPEG of the composed frame (the green camera, its
+/// black bottom-left corner, and the overlay's blue corner on top), within web's bound, with JFIF's
+/// black, and the programme lost no frame to it.
 #[test]
 fn the_frame_tap_grabs_the_composed_programme_as_a_640x360_jpeg() {
     let _s = serial();
-    let dir = Tmp::new("tap");
-    let (mut p, mut tap, rx, frames) = programme_with_tap();
-    p.swap_sink(1, &file_target(&dir.file("a.flv")));
-    frames.set_camera(solid(gst_video::VideoFormat::Bgra, 1_280, 720, [0, 255, 0, 255]));
-    frames.set_overlay(overlay_blue_corner());
-    pace(&mut p, 0..10, FrameChoice::Emit);
-    let grab = thread::spawn(move || {
-        let got = tap.grab();
-        (got, tap)
-    });
-    pace(&mut p, 10..40, FrameChoice::Emit);
-    let (got, mut tap) = grab.join().expect("the grab thread");
-    let jpeg = got.expect("a frame");
-    assert_eq!(&jpeg[..3], &[0xFF, 0xD8, 0xFF], "SOI");
-    assert_eq!(&jpeg[jpeg.len() - 2..], &[0xFF, 0xD9], "EOI");
-    assert!(jpeg.len() <= FRAME_UPLOAD_MAX_BYTES, "{} bytes", jpeg.len());
-    assert_eq!(sof0_size(&jpeg), Some(FRAME_GRAB_SIZE), "the header's size");
-    let pic = Jpeg::decode(&jpeg);
-    assert_eq!((pic.w, pic.h), FRAME_GRAB_SIZE);
-    assert!(
-        is_green(pic.at(pic.w / 2, pic.h / 2)),
-        "{:?}",
-        pic.at(pic.w / 2, pic.h / 2)
-    );
-    // The overlay's 100 × 100 of 1920 × 1080 is 33 × 33 at 640 × 360.
-    assert!(is_blue(pic.at(12, 12)), "{:?}", pic.at(12, 12));
-    // A second grab, with the encoder kept: another frame.
-    let again = thread::spawn(move || tap.grab());
-    pace(&mut p, 40..70, FrameChoice::Emit);
-    let second = again.join().expect("the second grab").expect("a second frame");
-    assert_eq!(sof0_size(&second), Some(FRAME_GRAB_SIZE));
-    drain_and_wait(&mut p, &rx);
-    let d = decode(&dir.file("a.flv"));
-    assert_eq!(d.frames.len(), 70, "the programme kept every frame");
+    let mut modes = 0;
+    for profile in [OutputProfile::P720, OutputProfile::P1080] {
+        let (w, h) = (profile.width, profile.height);
+        let dir = Tmp::new(&format!("tap-{h}"));
+        let (mut p, mut tap, rx, frames) = programme_with_tap(&profile);
+        p.swap_sink(1, &file_target(&dir.file("a.flv")));
+        // Green, with black in the left quarter of the bottom half.
+        frames.set_camera(picture(gst_video::VideoFormat::Bgra, w, h, move |x, y| {
+            if x < w / 4 && y >= h / 2 {
+                [0, 0, 0, 255]
+            } else {
+                [0, 255, 0, 255]
+            }
+        }));
+        frames.set_overlay(overlay_blue_corner());
+        pace(&mut p, 0..10, FrameChoice::Emit);
+        let grab = thread::spawn(move || {
+            let got = tap.grab();
+            (got, tap)
+        });
+        pace(&mut p, 10..40, FrameChoice::Emit);
+        let (got, mut tap) = grab.join().expect("the grab thread");
+        let jpeg = got.expect("a frame");
+        assert_eq!(&jpeg[..3], &[0xFF, 0xD8, 0xFF], "{h}p: SOI");
+        assert_eq!(&jpeg[jpeg.len() - 2..], &[0xFF, 0xD9], "{h}p: EOI");
+        assert!(jpeg.len() <= FRAME_UPLOAD_MAX_BYTES, "{h}p: {} bytes", jpeg.len());
+        assert_eq!(sof0_size(&jpeg), Some(FRAME_GRAB_SIZE), "{h}p: the header's size");
+        let pic = Jpeg::decode(&jpeg);
+        assert_eq!((pic.w, pic.h), FRAME_GRAB_SIZE);
+        let centre = pic.at(pic.w / 2, pic.h / 2);
+        assert!(is_green(centre), "{h}p: {centre:?}");
+        // The overlay's 100 × 100 of 1920 × 1080 is 33 × 33 at 640 × 360.
+        assert!(is_blue(pic.at(12, 12)), "{h}p: {:?}", pic.at(12, 12));
+        // m6 (SC2 polish): black decodes to 0 in JFIF's full range; a limited-range frame encoded
+        // as-is decodes it to 16 (BT.709's foot room), so the bound sits halfway.
+        let black = pic.at(pic.w / 8, pic.h * 3 / 4);
+        assert!(black.iter().all(|&c| c <= 8), "{h}p: black reads {black:?}");
+        // A second grab, with the encoder kept: another frame.
+        let again = thread::spawn(move || tap.grab());
+        pace(&mut p, 40..70, FrameChoice::Emit);
+        let second = again.join().expect("the second grab").expect("a second frame");
+        assert_eq!(sof0_size(&second), Some(FRAME_GRAB_SIZE));
+        drain_and_wait(&mut p, &rx);
+        let d = decode(&dir.file("a.flv"));
+        assert_eq!(d.frames.len(), 70, "{h}p: the programme kept every frame");
+        modes += 1;
+    }
+    assert_eq!(modes, 2);
 }
 
 /// A grab with no programme frame coming (nothing pushed) fails within its bound, and the next
@@ -3266,7 +3282,8 @@ fn the_frame_tap_grabs_the_composed_programme_as_a_640x360_jpeg() {
 fn a_grab_with_no_programme_frame_fails_within_its_bound() {
     let _s = serial();
     let dir = Tmp::new("tap-none");
-    let (mut p, mut tap, rx, _frames) = programme_with_tap();
+    // 720p only: the wait for a frame does not depend on the mode.
+    let (mut p, mut tap, rx, _frames) = programme_with_tap(&P720);
     p.swap_sink(1, &file_target(&dir.file("a.flv")));
     let began = Instant::now();
     let got = tap.grab();

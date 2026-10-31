@@ -12,8 +12,9 @@
 # carried, so a line is never sent twice), in order, nothing else rides, nothing is dropped, and the
 # run ends as smoke's does. R4 SC2: the card is on air 3 s, so its frame is grabbed 1.5 s in, from the
 # live programme's tap and the image's jpegenc, and fake-control's S9 route receives it once: a whole
-# JPEG within web's 256 KiB (S9; `FRAME_UPLOAD_MAX_BYTES`), under the card's moment. Anti-vacuity: the arming mark and fake-control's served stamp. Not a
-# chaos case (case_verdicts.rs's NOT_CHAOS): harness.yml runs it on every pull request, beside smoke.
+# JPEG within web's 256 KiB (S9; `FRAME_UPLOAD_MAX_BYTES`), under the card's moment, while the card is
+# on air. Anti-vacuity: the arming mark and fake-control's served stamp. Not a chaos case
+# (case_verdicts.rs's NOT_CHAOS): harness.yml runs it on every pull request, beside smoke.
 
 CASE_LIVE_S=30
 CASE_KEY=airings_relayed
@@ -49,9 +50,16 @@ case_verdict() {
     | ($c | length) >= 1 and all($c[]; .body.airingsDropped == 0)
     and ([.heartbeats.series[] | select((.body.airingsDropped // 0) > 0)] | length) == 0' \
     '[.heartbeats.series[] | .body.airingsDropped // empty]'
-  require_run frame_posted '.control_state.frames_posted == 1 and (.control_state.frames[0]
-    | .moment_segment == "harness-sponsor-1" and .jpeg == true and .bytes > 0 and .bytes <= 262144)' \
-    '.control_state.frames'
+  # The frame came while the card was on air: no sooner than 1.5 s after the page stamped its start
+  # (`FRAME_GRAB_DELAY_MS`; the compositor hears of the start after the page stamps it, and the page
+  # and fake-control read one host clock), and no later than the page stamped its end. A beat's
+  # receipt bounds neither: the start's beat can come after the frame.
+  require frame_posted "$AIRED"' | def ms: (.[0:19] + "Z" | fromdateiso8601) * 1000 + (.[20:23] | tonumber);
+    $run.control_state as $c | ($starts | length) == 1 and ($ends | length) == 1
+    and $c.frames_posted == 1 and ($c.frames[0]
+    | .moment_segment == "harness-sponsor-1" and .jpeg == true and .bytes > 0 and .bytes <= 262144
+    and .received_ms >= ($starts[0].at | ms) + 1500 and .received_ms <= ($ends[0].at | ms))' \
+    '$run.control_state.frames'
   measure airings_relayed "$AIRED"' | $aired | length'
   # The run ended as asked: one clean exit (0), no restart, and the stopped beat says why.
   require_run compositor_exit '.compositor.status == "exited" and .compositor.exit_code == 0'

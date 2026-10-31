@@ -10,10 +10,17 @@
 //!   one (a `bounded(1)` channel: AGENTS.md §4). A full slot drops it.
 //! - **The copy and the encode are the caller's** (the frame worker's thread): the frame is deep-copied
 //!   at once, releasing the programme's buffer, then encoded by a pipeline of the tap's own
-//!   (`appsrc → videoscale → videoconvert → 640×360 → jpegenc → appsink`), on a bus nobody else reads:
-//!   an encoder error is this grab's error, never the programme's (whose bus errors are fatal). An
-//!   encoder that failed or timed out is torn down on a reaper thread and built afresh at the next grab.
+//!   (`appsrc → videoscale → videoconvert → 640×360 full-range I420 → jpegenc → appsink`), on a bus
+//!   nobody else reads: an encoder error is this grab's error, never the programme's (whose bus errors
+//!   are fatal). Each grab empties that bus, so nothing piles up on it. An encoder that failed or
+//!   timed out is torn down on a reaper thread and built afresh at the next grab.
+//! - **Full range** (SC2 polish): the programme is BT.709 limited range, and a JPEG is JFIF's full-range
+//!   BT.601 YCbCr (ITU-T T.871 §7), which every decoder assumes. So the encoder's caps ask
+//!   `videoconvert` for `JFIF_COLORIMETRY`; encoded as-is, the proof's blacks would decode at 16.
 //! - **Bounded waits**: `FRAME_GRAB_WAIT_MS` for the frame, `FRAME_ENCODE_WAIT_MS` for its JPEG.
+//! - **No frame left behind**: a grab that times out after the probe took its arm takes the frame the
+//!   probe is handing over (within `FRAME_GRAB_WAIT_MS` again) and drops it, so no programme buffer
+//!   waits in the slot until the next grab, 20 s later.
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -27,6 +34,11 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
 use crate::gst_output::{self, Shared};
+
+/// JFIF's YCbCr as GStreamer's colorimetry string (`range:matrix:transfer:primaries`): range 1
+/// (`0_255`), matrix 4 (BT.601), transfer and primaries 0 (unknown). ITU-T T.871 §7 defines JPEG's
+/// YCbCr as full-range BT.601, and `jpegdec` reads every YCbCr JPEG as exactly this.
+const JFIF_COLORIMETRY: &str = "1:4:0:0";
 
 /// The programme's side of the tap: the probe's state.
 pub(crate) struct TapProbe {
@@ -84,6 +96,8 @@ impl Encoder {
         size.set_property(
             "caps",
             gst::Caps::builder("video/x-raw")
+                .field("format", "I420")
+                .field("colorimetry", JFIF_COLORIMETRY)
                 .field("width", FRAME_GRAB_SIZE.0 as i32)
                 .field("height", FRAME_GRAB_SIZE.1 as i32)
                 .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
@@ -135,6 +149,15 @@ impl Encoder {
                 gst::MessageView::Error(e) => Some(format!("frame tap: the encoder failed: {}", e.error())),
                 _ => None,
             })
+    }
+
+    /// Drops every message on the encoder's bus. Nobody watches that bus, so each grab empties it
+    /// (AGENTS.md §4): it holds at most one grab's messages. The encoder is idle between grabs, so
+    /// the loop ends.
+    fn drain_bus(&self) {
+        if let Some(bus) = self.pipeline.bus() {
+            while bus.pop().is_some() {}
+        }
     }
 }
 
@@ -223,7 +246,9 @@ impl GstFrameTap {
                 .bus_error()
                 .unwrap_or_else(|| format!("frame tap: the encoder refused the frame: {flow:?}"))),
         };
-        if jpeg.is_err() {
+        if jpeg.is_ok() {
+            enc.drain_bus();
+        } else {
             self.retire_encoder();
         }
         jpeg
@@ -241,7 +266,14 @@ impl FrameTap for GstFrameTap {
         {
             Ok(sample) => sample,
             Err(_) => {
-                self.probe.armed.store(false, Ordering::SeqCst);
+                // Still armed: disarmed here, and no frame can come. Already disarmed: the probe took
+                // the arm, and its frame is on its way (a `try_send`, which never waits). It is taken
+                // and dropped, so no programme buffer waits in the slot for the next grab.
+                if !self.probe.armed.swap(false, Ordering::SeqCst) {
+                    let _ = self
+                        .frames
+                        .recv_timeout(Duration::from_millis(FRAME_GRAB_WAIT_MS));
+                }
                 return Err(format!("no programme frame within {FRAME_GRAB_WAIT_MS} ms"));
             }
         };
@@ -265,5 +297,124 @@ impl Drop for GstFrameTap {
     fn drop(&mut self) {
         self.probe.armed.store(false, Ordering::SeqCst);
         self.retire_encoder();
+    }
+}
+
+/// CI-only (GStreamer): the tap without a running programme. A thread stands in for the probe, taking
+/// the arm and handing a frame over as `TapProbe::on_buffer` does.
+#[cfg(test)]
+mod tests {
+    use std::thread;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::frame_store::FrameStore;
+    use crate::gst_programme::GstProgramme;
+
+    /// A tap from a programme that never starts: its probe is never installed, so only the stand-in
+    /// below reaches it.
+    fn tap() -> GstFrameTap {
+        gst::init().expect("gstreamer");
+        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let mut p = GstProgramme::new(FrameStore::default(), tx).with_log(Arc::new(|_: &str| {}));
+        p.frame_tap().expect("a tap before start")
+    }
+
+    /// A 720p programme frame as the probe sees one: I420, BT.709 limited range (black).
+    fn programme_frame() -> gst::Sample {
+        let info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::I420, 1_280, 720)
+            .build()
+            .expect("info");
+        let mut buffer = gst::Buffer::with_size(info.size()).expect("buffer");
+        {
+            let b = buffer.get_mut().expect("writable");
+            let mut m = b.map_writable().expect("map");
+            let luma = info.stride()[0] as usize * 720;
+            m.as_mut_slice()[..luma].fill(16);
+            m.as_mut_slice()[luma..].fill(128);
+        }
+        gst::Sample::builder()
+            .buffer(&buffer)
+            .caps(&info.to_caps().expect("caps"))
+            .build()
+    }
+
+    /// The probe's part: waits (bounded) for the arm, takes it, waits `late`, then hands `frame`
+    /// over. True when the slot took it.
+    fn probe_hands_over(tap: &GstFrameTap, late: Duration, frame: gst::Sample) -> thread::JoinHandle<bool> {
+        let probe = Arc::clone(&tap.probe);
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !probe.armed.swap(false, Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "the grab never armed the probe");
+                thread::sleep(Duration::from_millis(1));
+            }
+            thread::sleep(late);
+            probe.slot.try_send(frame).is_ok()
+        })
+    }
+
+    /// m2 (SC2 polish): the probe took the arm, but its frame lands after the wait ran out. The grab
+    /// fails as one with no frame, and takes that frame, so the slot holds nothing.
+    #[test]
+    fn a_frame_handed_over_after_the_wait_is_taken_and_never_left_in_the_slot() {
+        let mut tap = tap();
+        let late = probe_hands_over(
+            &tap,
+            Duration::from_millis(FRAME_GRAB_WAIT_MS + 200),
+            programme_frame(),
+        );
+        assert_eq!(
+            tap.grab(),
+            Err(format!("no programme frame within {FRAME_GRAB_WAIT_MS} ms"))
+        );
+        assert!(
+            late.join().expect("the probe's thread"),
+            "the frame was handed over"
+        );
+        assert!(tap.frames.is_empty(), "a programme frame waits in the slot");
+        assert!(!tap.probe.armed.load(Ordering::SeqCst), "still armed");
+    }
+
+    /// m3 (SC2 polish): each grab leaves the encoder's bus empty: what building it posted, and a
+    /// message planted between two grabs.
+    #[test]
+    fn each_grab_leaves_the_encoders_bus_empty() {
+        let mut tap = tap();
+        let mut checked = 0;
+        for planted in [false, true] {
+            if planted {
+                let bus = tap
+                    .encoder
+                    .as_ref()
+                    .expect("the encoder is kept")
+                    .pipeline
+                    .bus()
+                    .expect("bus");
+                bus.post(gst::message::Application::new(gst::Structure::new_empty(
+                    "sc2-planted",
+                )))
+                .expect("posted");
+                assert!(bus.peek().is_some(), "the planted message is on the bus");
+            }
+            let hand = probe_hands_over(&tap, Duration::ZERO, programme_frame());
+            let jpeg = tap.grab().expect("a JPEG");
+            assert!(hand.join().expect("the probe's thread"));
+            assert_eq!(&jpeg[..2], &[0xFF, 0xD8], "SOI");
+            let bus = tap
+                .encoder
+                .as_ref()
+                .expect("the encoder is kept")
+                .pipeline
+                .bus()
+                .expect("bus");
+            assert!(
+                bus.peek().is_none(),
+                "grab {checked}: the bus holds {:?}",
+                bus.peek()
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 2);
     }
 }

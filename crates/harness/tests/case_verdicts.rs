@@ -7046,13 +7046,26 @@ fn card_line(w: &mut World, kind: &str, f: impl Fn(&mut Value)) {
 /// Each of the case's 11 judged checks reds on a world that breaks it: a resent start, a missing end,
 /// a dropped count, airings off, an unarmed card, an armed one never served, a cut-short end, an end
 /// stamped before its start, a foreign line, a non-zero exit, a restart, a stopped beat for another
-/// reason, and (R4 SC2) no frame, two frames, a cut JPEG, another moment's and one past web's bound.
+/// reason, and (R4 SC2) no frame, two frames, a cut JPEG, another moment's, one past web's bound, and
+/// one that came before the 1.5 s delay or after the card's end.
 #[test]
 fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_go_wrong() {
     assert_pass(
         &judge(&sponsor_airings(|_, _, _| {}), "sponsor-airings", "", "sa-good"),
         "sa-good",
     );
+    // SC2 polish (m8): the frame's receipt, moved; on either edge of the card's air time it passes.
+    let at = |edit: fn(i64, i64) -> i64| {
+        sponsor_airings(move |w, start, end| {
+            w.control_state["frames"][0]["received_ms"] = json!(edit(start, end));
+        })
+    };
+    for (tag, w) in [
+        ("sa-frame-at-delay", at(|start, _| start + 1_500)),
+        ("sa-frame-at-end", at(|_, end| end)),
+    ] {
+        assert_pass(&judge(&w, "sponsor-airings", "", tag), tag);
+    }
     // A line on two beats: the 2xx did not clear it.
     let resent = sponsor_airings(|w, start, _| {
         let first = w
@@ -7071,7 +7084,7 @@ fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_
     });
     let mut checked = 0;
     let frame = |edit: fn(&mut Value)| sponsor_airings(move |w, _, _| edit(&mut w.control_state));
-    let reds: [(&str, World, &str); 17] = [
+    let reds: [(&str, World, &str); 19] = [
         ("sa-resent", resent, "start_relayed_once"),
         (
             "sa-no-end",
@@ -7194,6 +7207,10 @@ fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_
             frame(|c| c["frames"][0]["bytes"] = json!(262_145)),
             "frame_posted",
         ),
+        // SC2 polish (m8): a frame 1 ms inside the delay (`FRAME_GRAB_DELAY_MS`), or 1 ms after the
+        // card's end.
+        ("sa-early-frame", at(|start, _| start + 1_499), "frame_posted"),
+        ("sa-late-frame", at(|_, end| end + 1), "frame_posted"),
     ];
     for (tag, w, check) in &reds {
         assert_fails(&judge(w, "sponsor-airings", "", tag), check, tag);
