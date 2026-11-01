@@ -40,6 +40,20 @@ On Fly that is `stop_config: { signal: "SIGTERM", timeout: "20s" }` plus an expl
 request. F-008 measured both: the explicit signal wins, and a stop that names none gets `stop_config`'s. The table
 above is left as accepted on 2026-10-15. See `docs/_INDEX.md`, Decision log, 2026-10-16.
 
+**Amended in part (2026-11-01, R4 sponsors on stream, tasks SC1 and SC2).** Item 2's "Nothing else is read" no
+longer holds. The host may also pass one optional key, `RELAY_AIRINGS`, which turns on R4's sponsor airings on the
+heartbeat and their proof frames. Its values:
+- absent, empty or `0`: off. The run is the four-key run above, unchanged.
+- `1`: on.
+- anything else: refused at bootstrap with exit 78, which item 5's note already covers.
+
+It is read from env, like the other four (`crates/compositor/src/env.rs`). A host driver that never sets it runs the
+compositor as before.
+
+Web's runner driver passes the key only when web's own `RELAY_AIRINGS` is exactly `"1"`
+(`apps/web/src/server/relay/runner-fly.ts`, R4 PR A). Otherwise the key is absent. A sibling driver for another host
+owes the same pass-through. The table above is left as accepted. See `docs/_INDEX.md`, Decision log, 2026-11-01.
+
 Equivalents for item 5: Fly `restart: on-failure, max_retries: 2`; Docker
 `--restart on-failure:2`; Kubernetes Job `backoffLimit: 2` + `restartPolicy: OnFailure`; Nomad
 `restart { attempts = 2 }`; Cloud Run jobs `maxRetries: 2`.

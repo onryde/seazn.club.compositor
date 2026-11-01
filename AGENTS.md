@@ -42,6 +42,17 @@ Everything in spec §12 is **R4, and is refused, not half-built**: page moments 
 rules and proof-of-play, console additions, the warm pool and hot standby, and the pilot. A "small
 start" on any of them is a scope breach. Raise it; don't build it.
 
+**R4 has started for one item (2026-11-01): sponsors on stream, proof of play only.** The design of
+record is `seazn.club` `docs/superpowers/specs/2026-10-27-sponsors-on-stream-design.md` (§3.6). It
+puts two compositor tasks in scope:
+- SC1 forwards the overlay page's sponsor airings (`seazn:sponsor:start` and `seazn:sponsor:end`) on
+  the heartbeat.
+- SC2 grabs one programme frame per airing and posts it to web.
+
+Both are off unless the host passes `RELAY_AIRINGS=1` (ADR 0007, amended 2026-11-01). Sponsor rules
+stay web's. The page decides what airs and when, and the compositor only relays what the page logs.
+The rest of §12 is still refused.
+
 Output is 1080p30 by default with a 720p30 flag (ADR 0005, amended 2026-10-27; F-033). CEF always renders
 the page at 1920×1080.
 
