@@ -1567,8 +1567,10 @@ impl Gate {
         Some(held)
     }
 
-    /// The retiring build's open starts end now, cut short, at `at` (the retire ruling: the card left
-    /// the programme then), held for the beat like any line. The ends held, for the log.
+    /// The current build's open starts end at `at`, cut short, held for the beat like any line. The
+    /// two callers are its retirement (`retire_current`, the retire ruling: the card left the programme
+    /// then) and its crash (`decide_crash`, SC1 polish m-b: at the crash instant). Returns the ends
+    /// that were held, for the log. With the airings off, none is held and the list is empty.
     fn end_open_airings(&mut self, airings: &Airings, at: &str) -> Vec<AiringLine> {
         let mut ended = Vec::new();
         for moment in std::mem::take(&mut self.open_airings) {
@@ -2647,7 +2649,7 @@ fn dispatch(shared: &Shared) {
                 PageSignal::Sponsor(Ok(line)) => {
                     let held = locked(&shared.gate).hold_airing(&shared.airings, build, line);
                     let fate = match held {
-                        None => "from a retired page; not relayed",
+                        None => "from a retired or crashed page; not relayed",
                         Some(true) => "held for the beat",
                         Some(false) => "not held (airings off)",
                     };
@@ -5397,8 +5399,9 @@ mod tests {
     }
 
     /// The dispatcher holds the current page's read lines for the beat, in order, and nothing else:
-    /// a retired page's line is logged, not relayed; a refused line is a WARN, capped a build like any
-    /// other page line; and off, a read line is logged and held nowhere.
+    /// a retired page's line, or the current build's once it crashed, is logged, not relayed; a refused
+    /// line is a WARN, capped a build like any other page line; and off, a read line is logged and held
+    /// nowhere.
     #[test]
     fn only_the_current_pages_read_sponsor_lines_are_held_for_the_beat() {
         let capture = |shared: &Shared| {
@@ -5449,7 +5452,7 @@ mod tests {
         );
         assert_eq!(
             has(
-                "gen=1: sponsor start moment=b card=card-1 source=rotation: from a retired page; not relayed"
+                "gen=1: sponsor start moment=b card=card-1 source=rotation: from a retired or crashed page; not relayed"
             ),
             1,
             "{lines:?}"
@@ -5459,6 +5462,30 @@ mod tests {
             PAGE_LINES_PER_BUILD as usize,
             "capped: {lines:?}"
         );
+
+        // The final review's SC1 #2: the current build, once it crashed, is refused as a retired page
+        // is, and its line says it can be either.
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let held = Airings::on();
+        let after = unit_shared_with(tx, ProcTree::live(), Arc::default(), u64::MAX, held.clone());
+        let lines = capture(&after);
+        after.retired.store(true, Ordering::SeqCst);
+        {
+            let mut g = locked(&after.gate);
+            g.current = Some((4, 4));
+            g.crashed.insert(4);
+        }
+        after.push(page_note(4, PageSignal::Sponsor(Ok(sponsor_start("d")))));
+        dispatch(&after);
+        assert_eq!(
+            *locked(&lines),
+            vec![
+                "gen=4: sponsor start moment=d card=card-1 source=rotation: from a retired or crashed page; \
+                 not relayed"
+                    .to_owned()
+            ]
+        );
+        assert_eq!(held.held(), 0, "nothing held after the crash");
 
         // Off: logged, held nowhere.
         let (tx, _rx) = crossbeam_channel::unbounded();
