@@ -71,4 +71,15 @@ stored beat, never a `null` and never a `0`.
   "absent". `reply-live-edge-null` is the unknown spelled out; web omits the key instead (`reply-live` is that reply),
   and a reader treats null and absent alike. `reply-invalid-live-edge-negative` and `reply-invalid-live-edge-fractional`
   are not counts.
+- `heartbeat-airings` carries R4's proof of play (sponsors on stream spec 2026-10-27 §3.6): the overlay page's
+  `seazn:sponsor:start` and `seazn:sponsor:end` console lines, each tagged by the compositor with `kind` from the
+  line's name. It holds a break card (`12:sponsor.over_end`, a lower third the rotation chose) and a scene carousel
+  showing (`scene:reconnecting:<10-second bucket>`, a banner with `breakKind: null`), each with its end, and the
+  scene's end is cut short. Every `at` is UTC `Z`, as the page writes it. `heartbeat-invalid-airing-unknown-key`
+  adds `sponsorName` to the first item. The page never writes that key, and because both the item and the beat are
+  strict, that one key refuses the whole beat. Validate each line before buffering it.
+- `heartbeat-full` also carries `airingsDropped: 3` without `airings`. The compositor sends the count on every
+  beat once it is above 0: it is a total for the process, an upper bound, and it starts again from 0 when the
+  process restarts. The server keeps it with the beat. It never keeps `airings` there: it records the list as
+  sponsor airings and strips it from the stored beat.
 - Every id, key, passphrase and token here is a placeholder, never a real credential.

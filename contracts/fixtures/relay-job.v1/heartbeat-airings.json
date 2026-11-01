@@ -1,0 +1,37 @@
+{
+  "state": "playing",
+  "programmePhase": "live",
+  "airings": [
+    {
+      "kind": "start",
+      "momentId": "12:sponsor.over_end",
+      "cardId": "3f6c2a1e-8b4d-4e7a-9c5b-2d1e0f9a8b7c",
+      "style": "lower_third",
+      "source": "rotation",
+      "breakKind": "over_end",
+      "at": "2026-10-31T14:02:11.250Z"
+    },
+    {
+      "kind": "end",
+      "momentId": "12:sponsor.over_end",
+      "at": "2026-10-31T14:02:19.270Z",
+      "cutShort": false
+    },
+    {
+      "kind": "start",
+      "momentId": "scene:reconnecting:179345534",
+      "cardId": "7a9e4b2c-1d3f-4a5b-8c6d-0e1f2a3b4c5d",
+      "style": "banner",
+      "source": "scene",
+      "breakKind": null,
+      "at": "2026-10-31T14:02:20.000Z"
+    },
+    {
+      "kind": "end",
+      "momentId": "scene:reconnecting:179345534",
+      "at": "2026-10-31T14:02:26.410Z",
+      "cutShort": true
+    }
+  ],
+  "airingsDropped": 0
+}

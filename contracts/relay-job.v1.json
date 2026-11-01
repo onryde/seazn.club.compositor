@@ -174,7 +174,7 @@
       "additionalProperties": false
     },
     "heartbeat": {
-      "description": "POST /api/internal/relay/sessions/{sid}/heartbeat with `Authorization: Bearer <job token>`, every heartbeatIntervalMs (compositor spec 2026-10-14 §5.3): the Machine's report, and the control channel. The body is bare (no envelope). Strict: an unknown key is a 400, never dropped. Every field but `state` is optional. Omitted when not measured, never sent as 0: a present 0 is a measured zero. null is admitted and stored as sent, but a compositor omits a field rather than sending null. The server keeps the whole latest body and every beat as a sample. The 200 is `{ \"ok\": true, \"data\": <heartbeatReply> }`; 400 a body this schema refuses; 401 a refused token; 404 an unknown session; 410 SESSION_ENDED.",
+      "description": "POST /api/internal/relay/sessions/{sid}/heartbeat with `Authorization: Bearer <job token>`, every heartbeatIntervalMs (compositor spec 2026-10-14 §5.3): the Machine's report, and the control channel. The body is bare (no envelope). Strict: an unknown key is a 400, never dropped. Every field but `state` is optional. Omitted when not measured, never sent as 0: a present 0 is a measured zero. null is admitted and stored as sent, but a compositor omits a field rather than sending null. The server keeps the whole latest body and every beat as a sample, except `airings`, which it records as proof of play instead. The 200 is `{ \"ok\": true, \"data\": <heartbeatReply> }`; 400 a body this schema refuses; 401 a refused token; 404 an unknown session; 410 SESSION_ENDED.",
       "type": "object",
       "properties": {
         "state": {
@@ -475,6 +475,132 @@
             {
               "type": "string",
               "maxLength": 100
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "airings": {
+          "description": "R4 sponsors on stream (sponsors on stream spec 2026-10-27 §3.6): the overlay page's proof-of-play items, oldest first. The compositor reads each `seazn:sponsor:start` or `seazn:sponsor:end` console line (JSON of at most 512 bytes, with exactly the keys below except `kind`), sets `kind` from the line's name, and buffers at most 64 items: an overflow drops the OLDEST and counts it in airingsDropped. An item is cleared when a beat that carried it is answered 2xx. A 400 or 422 reply drops what that beat carried, counted in airingsDropped (the beat will never be admitted as it is). Every other reply keeps it for the next beat: a 5xx, a transport error, a 410, and a 401, 403, 404 or 429. The final beat flushes the rest. Validate each item against this shape before buffering it: the beat is strict, so one item this schema refuses makes the whole beat a 400. The server records each item as proof of play, one airing per session and momentId. A repeated start keeps the FIRST row and a repeated end changes nothing, so sending an item again after a lost reply is safe. An item whose `at` is more than 10 minutes from the server's clock is refused and counted, and the beat is still answered. The list is not kept with the beat: the stored latest beat and its samples carry every other field, never this one. Omitted when there is nothing to send.",
+          "anyOf": [
+            {
+              "maxItems": 64,
+              "type": "array",
+              "items": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "description": "`start` (a `seazn:sponsor:start` line: the card went on air) or `end` (a `seazn:sponsor:end` line: it left the screen).",
+                        "type": "string",
+                        "const": "start"
+                      },
+                      "momentId": {
+                        "description": "The showing's id, as the page logged it: `<seq>:sponsor.<breakKind>` for a break's card, `scene:<sceneId>:<10-second bucket>` for a scene carousel showing. An end names its start's id.",
+                        "type": "string",
+                        "maxLength": 80
+                      },
+                      "cardId": {
+                        "description": "The card on air. The server takes a break card's sponsor from its own assignment for the moment, and a scene card's sponsor from this id.",
+                        "type": "string",
+                        "maxLength": 80
+                      },
+                      "style": {
+                        "description": "lower_third or banner.",
+                        "type": "string",
+                        "enum": [
+                          "lower_third",
+                          "banner"
+                        ]
+                      },
+                      "source": {
+                        "description": "`rotation` for a break's card (the server reads whether the rotation or the operator chose it from its own assignment), `scene` for a scene carousel showing. `operator` is admitted and read like `rotation`.",
+                        "type": "string",
+                        "enum": [
+                          "rotation",
+                          "scene",
+                          "operator"
+                        ]
+                      },
+                      "breakKind": {
+                        "description": "The natural break the card filled, as the sport declares it (for example over_end). null for a scene carousel showing.",
+                        "anyOf": [
+                          {
+                            "type": "string",
+                            "maxLength": 40
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "at": {
+                        "description": "When the page logged the line, in UTC, as JavaScript's `Date.toISOString()` writes it (ending `Z`, never an offset). Pass it through unchanged.",
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "momentId",
+                      "cardId",
+                      "style",
+                      "source",
+                      "breakKind",
+                      "at"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "description": "`start` (a `seazn:sponsor:start` line: the card went on air) or `end` (a `seazn:sponsor:end` line: it left the screen).",
+                        "type": "string",
+                        "const": "end"
+                      },
+                      "momentId": {
+                        "description": "The showing's id, as the page logged it: `<seq>:sponsor.<breakKind>` for a break's card, `scene:<sceneId>:<10-second bucket>` for a scene carousel showing. An end names its start's id.",
+                        "type": "string",
+                        "maxLength": 80
+                      },
+                      "at": {
+                        "description": "When the page logged the line, in UTC, as JavaScript's `Date.toISOString()` writes it (ending `Z`, never an offset). Pass it through unchanged.",
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+                      },
+                      "cutShort": {
+                        "description": "true when the card left before its hold ran out (a score moment cut it, or the operator skipped it).",
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "momentId",
+                      "at",
+                      "cutShort"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "airingsDropped": {
+          "description": "How many proof-of-play items the compositor has dropped since its process started: the OLDEST items its 64-item buffer overflowed, plus the items a beat carried when that beat was answered 400 or 422. Every other reply (a 2xx clears the items; a 5xx, a transport error, a 410, a 401, 403, 404 or 429 keeps them) drops nothing. A total for the process and an upper bound, which starts again from 0 when the process restarts. Sent on every beat once above 0, with or without airings. A present 0 is a measured zero. The server logs the first beat of a session that reports one.",
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
             },
             {
               "type": "null"
