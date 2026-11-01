@@ -7043,17 +7043,16 @@ fn card_line(w: &mut World, kind: &str, f: impl Fn(&mut Value)) {
     assert_eq!(found, 1, "the card's {kind} line");
 }
 
-/// Each of the case's 11 judged checks reds on a world that breaks it: a resent start, a missing end,
+/// Each judged check the case declares reds on a world that breaks it: a resent start, a missing end,
 /// a dropped count, airings off, an unarmed card, an armed one never served, a cut-short end, an end
-/// stamped before its start, a foreign line, a non-zero exit, a restart, a stopped beat for another
-/// reason, and (R4 SC2) no frame, two frames, a cut JPEG, another moment's, one past web's bound, and
-/// one that came before the 1.5 s delay or after the card's end.
+/// stamped before its start or received on an earlier beat, a foreign line, a non-zero exit or a
+/// compositor still running, a restart, a stopped beat for another reason or a last beat not stopped,
+/// and (R4 SC2) no frame, two frames, a cut JPEG, another moment's, one past web's bound, and one that
+/// came before the 1.5 s delay or after the card's end.
 #[test]
 fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_go_wrong() {
-    assert_pass(
-        &judge(&sponsor_airings(|_, _, _| {}), "sponsor-airings", "", "sa-good"),
-        "sa-good",
-    );
+    let good = judge(&sponsor_airings(|_, _, _| {}), "sponsor-airings", "", "sa-good");
+    assert_pass(&good, "sa-good");
     // SC2 polish (m8): the frame's receipt, moved; on either edge of the card's air time it passes.
     let at = |edit: fn(i64, i64) -> i64| {
         sponsor_airings(move |w, start, end| {
@@ -7084,7 +7083,7 @@ fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_
     });
     let mut checked = 0;
     let frame = |edit: fn(&mut Value)| sponsor_airings(move |w, _, _| edit(&mut w.control_state));
-    let reds: [(&str, World, &str); 19] = [
+    let reds: [(&str, World, &str); 22] = [
         ("sa-resent", resent, "start_relayed_once"),
         (
             "sa-no-end",
@@ -7145,6 +7144,37 @@ fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_
             }),
             "end_after_start",
         ),
+        // The final review's SC1 #5: the end's stamps are in order, but its beat came before the
+        // start's (the end moved to the last beat at or before the start).
+        (
+            "sa-end-beat-first",
+            sponsor_airings(|w, start, end| {
+                let line = {
+                    let (_, body) = w
+                        .beats
+                        .iter_mut()
+                        .find(|(b, body)| *b > end && body["state"] == "playing")
+                        .unwrap();
+                    let line = body["airings"].as_array_mut().unwrap().pop().unwrap();
+                    if body["airings"].as_array().is_some_and(Vec::is_empty) {
+                        let o = body.as_object_mut().unwrap();
+                        o.remove("airings");
+                        o.remove("airingsDropped");
+                    }
+                    line
+                };
+                assert_eq!(line["kind"], "end", "the end's beat carries the end last");
+                let (_, earlier) = w
+                    .beats
+                    .iter_mut()
+                    .rev()
+                    .find(|(b, body)| *b <= start && body["state"] == "playing")
+                    .unwrap();
+                earlier["airings"] = json!([line]);
+                earlier["airingsDropped"] = json!(0);
+            }),
+            "end_after_start",
+        ),
         // A line the page never logged rides beside the card's start.
         (
             "sa-foreign",
@@ -7165,6 +7195,12 @@ fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_
             sponsor_airings(|w, _, _| w.run_patch = Some(|r| r["compositor"]["exit_code"] = json!(1))),
             "compositor_exit",
         ),
+        // SC1 #5: the exit code reads 0, but the compositor never exited.
+        (
+            "sa-still-running",
+            sponsor_airings(|w, _, _| w.run_patch = Some(|r| r["compositor"]["status"] = json!("running"))),
+            "compositor_exit",
+        ),
         (
             "sa-restarted",
             sponsor_airings(|w, _, _| w.run_patch = Some(|r| r["compositor"]["restarts"] = json!(1))),
@@ -7174,6 +7210,14 @@ fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_
             "sa-fatal",
             sponsor_airings(|w, _, _| {
                 w.run_patch = Some(|r| r["last_beat"]["exitReason"] = json!("fatal"));
+            }),
+            "ended_beat",
+        ),
+        // SC1 #5: the last beat says "ended", but it is not a stopped beat.
+        (
+            "sa-not-stopped",
+            sponsor_airings(|w, _, _| {
+                w.run_patch = Some(|r| r["last_beat"]["state"] = json!("playing"));
             }),
             "ended_beat",
         ),
@@ -7218,9 +7262,21 @@ fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_
     }
     eprintln!("sponsor-airings reds checked: {checked}");
     assert_eq!(checked, reds.len());
-    // Every judged check (the 12 declared, less the one measure) has a red world here.
+    // Every judged check the case declares has a red world here (the final review's SC1 #4): the
+    // checks are read off the good run's PASS lines, one per `require` and `require_run` (its measure
+    // prints MEASURE), so a check added to the case reds this until it has a red of its own.
+    let mut judged: Vec<&str> = good
+        .lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("PASS "))
+        .filter_map(|l| l.split([':', ' ']).next())
+        .collect();
+    judged.sort_unstable();
+    judged.dedup();
     let mut named: Vec<&str> = reds.iter().map(|r| r.2).collect();
     named.sort_unstable();
     named.dedup();
-    assert_eq!(named.len(), 11, "{named:?}");
+    eprintln!("sponsor-airings judged checks, each with a red: {}", judged.len());
+    assert!(!judged.is_empty(), "the good run printed no PASS line");
+    assert_eq!(named, judged, "the reds' checks are the case's judged checks");
 }
