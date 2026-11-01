@@ -31,9 +31,12 @@ pub const COMPOSITOR_FAKE_SPONSOR_LINE: &str = "COMPOSITOR_FAKE_SPONSOR_LINE";
 /// R4 task SC1 (spec 2026-10-27 §3.6.2): `1` puts the sponsor airings the overlay page logs on the
 /// heartbeat (`airings`, `airingsDropped`). Off unless set: web's heartbeat is strict, so a beat
 /// carrying them before web's S8 declares the keys is a 400 and the whole beat is lost. Web's runner
-/// sets it with the deploy that accepts them, so the switch moves with the schema. Unset, empty or `0`
-/// is off; anything else is refused (78). Read in both modes. A host that passes only R1's four keys
-/// (ADR 0007, item 2) runs with it off.
+/// copies it into each composed Machine's env only when web's own `RELAY_AIRINGS` is exactly `1`, and
+/// an operator sets that by hand (a secret on the web app) only after R4 PR A is deployed, the
+/// `sponsor-frames` bucket exists and the compositor carrying PR C is deployed (web's README, "Deploy
+/// step, sponsors on stream"; PR C final review, m4). Unset, empty or `0` is off; anything else is
+/// refused (78). Read in both modes. A host that passes only R1's four keys (ADR 0007, item 2) runs
+/// with it off.
 pub const RELAY_AIRINGS: &str = "RELAY_AIRINGS";
 
 /// Owed 82, a `test-hooks` build only (C14 case 16; owner option A, 2026-10-24): a count, `N`. The

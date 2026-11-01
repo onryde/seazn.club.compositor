@@ -47,7 +47,10 @@ record is `seazn.club` `docs/superpowers/specs/2026-10-27-sponsors-on-stream-des
 puts two compositor tasks in scope:
 - SC1 forwards the overlay page's sponsor airings (`seazn:sponsor:start` and `seazn:sponsor:end`) on
   the heartbeat.
-- SC2 grabs one programme frame per airing and posts it to web.
+- SC2 grabs at most one programme frame per airing, 1.5 s after its start and at most one every 20 s
+  across all airings, and posts it to web. A card that ends within the 1.5 s gets none. Its CPU cost
+  is measured on stg before `RELAY_AIRINGS=1` on prod, since stg runs only main's image (the
+  controller's ruling, 2026-11-01).
 
 Both are off unless the host passes `RELAY_AIRINGS=1` (ADR 0007, amended 2026-11-01). Sponsor rules
 stay web's. The page decides what airs and when, and the compositor only relays what the page logs.

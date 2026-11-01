@@ -443,7 +443,13 @@ fn the_worker_thread_runs_the_due_grab_and_a_410_ends_it() {
     now.store(1_000 + 2 * DELAY + GAP, Ordering::SeqCst);
     airings.push(end("other", false));
     assert!(uploads.wait_for(2, WAIT), "the second grab was posted");
-    assert!(grabs.is_stopped());
+    // The fake records the call before it answers, so the stop lands just after: wait for it,
+    // bounded (PR C fix round: this read raced the worker and flaked).
+    let deadline = std::time::Instant::now() + WAIT;
+    while !grabs.is_stopped() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(grabs.is_stopped(), "the 410 stopped the plan");
     now.store(1_000 + 10 * GAP, Ordering::SeqCst);
     airings.push(start("c"));
     std::thread::sleep(Duration::from_millis(50));

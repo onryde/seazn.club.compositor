@@ -506,8 +506,10 @@ fn live_media(
 
 /// R4 task SC2: the programme's frame tap when the frame grabs are on, asked for before `start()`,
 /// which installs its probe (the programme is never rebuilt). Off, nothing is asked, so the programme
-/// has no probe at all. Public for its witness (the final review's SC2 m7: `wiring.rs`'s
-/// `the_programme_is_tapped_only_when_the_frame_grabs_are_on`), which needs no GStreamer.
+/// has no probe at all. Public for a test of this decision alone (SC2 m7: `tests/wiring.rs`'s
+/// `the_programme_is_tapped_only_when_the_frame_grabs_are_on`, no GStreamer). That test does not see
+/// `live_media` call it: what kills a live media that never taps (W6) is the harness case
+/// sponsor-airings' `frame_posted` check, on CI (PR C final review, m1).
 pub fn programme_tap(programme: &mut GstProgramme, grabs: &FrameGrabs) -> Option<Box<dyn FrameTap>> {
     if grabs.is_on() {
         programme.frame_tap().map(|t| Box::new(t) as Box<dyn FrameTap>)
