@@ -2943,8 +2943,14 @@ fn a_second_start_inside_20_s_grabs_nothing() {
 }
 
 /// The live worker's thread, its upload hung and then failing (5xx) on both attempts, for two airings:
-/// the programme pushes every frame while it hangs, the airings handle takes lines and gives beats
-/// (neither waits on the upload), and the failure is one line for the process.
+/// the airings handle takes lines and gives beats while the upload hangs, and the failure is one line
+/// for the process.
+///
+/// The witness that nothing waits on the upload is `prompt`. The airings handle takes the plan's lock
+/// on every push, so a lock held across the upload makes it miss its 2 s bound on another thread. The
+/// frame count while the upload hangs (`made >= 299`) is NOT a witness (the final review's SC2 m4):
+/// the sim's ticks run on this thread and never reach the plan or the worker, so they pass whatever
+/// the worker does. It is kept to show the programme keeps its cadence beside a hung upload.
 #[test]
 fn a_failing_upload_logs_once_and_never_stalls_the_pipeline() {
     let mut sim = Sim::new(th(), session_720p());
@@ -3009,7 +3015,8 @@ fn a_failing_upload_logs_once_and_never_stalls_the_pipeline() {
                 uploads.wait_for(2 * k + attempt, Duration::from_secs(3)),
                 "{moment}: attempt {attempt}"
             );
-            // The upload hangs: ten seconds of programme, and the handle, carry on.
+            // The upload hangs: ten seconds of programme (cadence only, not the witness: see the doc
+            // above), and the handle carries on.
             let before = pushes(&sim.log).len();
             let from = sim.now;
             drive(&mut sim, from + 10_000);
