@@ -620,8 +620,10 @@ pub fn path_segment(text: &str) -> String {
 /// `POST /api/internal/relay/sessions/{sid}/airings/{momentId}/frame`, the JPEG as the body,
 /// `Content-Type: image/jpeg`, the job token as the bearer, as the heartbeat sends it). A 2xx is
 /// stored (S9 answers 204), a 410 is the session gone, a 5xx or no answer failed, and any other status
-/// (a 4xx: another session's token is a 404, a refused body a 413 or 415) refused. Every error text is
-/// scrubbed of the token.
+/// refused. S9's 4xx are a token it refuses, another session's included, 401 (the heartbeat's own); an
+/// unknown session 404; a moment id outside web's grammar 400; a body past its bound 413; and one that
+/// is not a JPEG 415. Every error text is scrubbed of what the plane knows (the token and the
+/// session's credentials).
 pub struct HttpFrameUpload {
     agent: ureq::Agent,
     session_url: String,

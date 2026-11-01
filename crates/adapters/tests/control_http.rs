@@ -1342,6 +1342,29 @@ fn a_frame_with_no_answer_fails_within_its_bound_and_never_carries_the_token() {
     assert_eq!(checked, 3);
 }
 
+/// The final review's SC2 m5: the uploader shares the plane's scrubber, so what a fetch taught the
+/// plane is masked in a frame's error text too, for an uploader made before the fetch, as the binary
+/// makes it. APP_URL carries a planted stream key in its path, so ureq's own error text names it, and
+/// the session names that key, so the fetch teaches it.
+#[test]
+fn a_frame_error_is_scrubbed_of_what_the_plane_learned_after_the_uploader_was_made() {
+    const KEY: &str = "PLANTED-SK-FRAME-1";
+    let mut session = fixture("session-composed-720p.json");
+    session["target"]["streamKey"] = json!(KEY);
+    let fake = serve(vec![Reply::Status(200, ok(session)), Reply::Close]);
+    let mut p = plane(&format!("{}/{KEY}", fake.url));
+    let mut up = p.frame_upload();
+    assert!(p.fetch_session().is_ok());
+    fake.next();
+    let text = match up.post_frame("m", JPEG) {
+        Err(FrameUploadError::Failed(t)) => t,
+        other => panic!("a closed connection: {other:?}"),
+    };
+    assert!(text.starts_with("frame transport: "), "{text}");
+    assert!(!text.contains("PLANTED"), "{text}");
+    assert!(text.contains("****"), "the URL was in the error, masked: {text}");
+}
+
 /// The uploader's own guard: a moment id that cannot be one path segment (`""`, `.`, `..`, which a URL
 /// parser resolves away) is refused, and nothing is sent.
 #[test]
