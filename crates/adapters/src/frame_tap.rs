@@ -320,16 +320,16 @@ mod tests {
         p.frame_tap().expect("a tap before start")
     }
 
-    /// A 720p programme frame as the probe sees one: I420, BT.709 limited range (black).
-    fn programme_frame() -> gst::Sample {
-        let info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::I420, 1_280, 720)
+    /// A `width`×`height` programme frame as the probe sees one: I420, BT.709 limited range (black).
+    fn programme_frame(width: u32, height: u32) -> gst::Sample {
+        let info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::I420, width, height)
             .build()
             .expect("info");
         let mut buffer = gst::Buffer::with_size(info.size()).expect("buffer");
         {
             let b = buffer.get_mut().expect("writable");
             let mut m = b.map_writable().expect("map");
-            let luma = info.stride()[0] as usize * 720;
+            let luma = info.stride()[0] as usize * height as usize;
             m.as_mut_slice()[..luma].fill(16);
             m.as_mut_slice()[luma..].fill(128);
         }
@@ -362,7 +362,7 @@ mod tests {
         let late = probe_hands_over(
             &tap,
             Duration::from_millis(FRAME_GRAB_WAIT_MS + 200),
-            programme_frame(),
+            programme_frame(1_280, 720),
         );
         assert_eq!(
             tap.grab(),
@@ -397,7 +397,7 @@ mod tests {
                 .expect("posted");
                 assert!(bus.peek().is_some(), "the planted message is on the bus");
             }
-            let hand = probe_hands_over(&tap, Duration::ZERO, programme_frame());
+            let hand = probe_hands_over(&tap, Duration::ZERO, programme_frame(1_280, 720));
             let jpeg = tap.grab().expect("a JPEG");
             assert!(hand.join().expect("the probe's thread"));
             assert_eq!(&jpeg[..2], &[0xFF, 0xD8], "SOI");
@@ -416,5 +416,45 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, 2);
+    }
+
+    /// The final review's SC2 m9: the encoder is rebuilt for new caps and kept for the same ones. The
+    /// programme's caps never change (C09 never rebuilds), so this guard is a "cannot happen" made
+    /// reachable here: a 720p frame, then two 1080p ones, each a JPEG. The caps change gets an encoder
+    /// built for the new caps, and the repeat keeps that same encoder.
+    #[test]
+    fn a_frame_with_other_caps_gets_an_encoder_of_its_own() {
+        let mut tap = tap();
+        let mut before: Option<gst::Pipeline> = None;
+        let mut checked = 0;
+        for (k, (w, h)) in [(1_280, 720), (1_920, 1_080), (1_920, 1_080)]
+            .into_iter()
+            .enumerate()
+        {
+            let frame = programme_frame(w, h);
+            let caps = frame.caps().expect("caps").to_owned();
+            let hand = probe_hands_over(&tap, Duration::ZERO, frame);
+            let jpeg = tap.grab().unwrap_or_else(|e| panic!("{w}x{h}: {e}"));
+            assert!(hand.join().expect("the probe's thread"));
+            assert_eq!(&jpeg[..2], &[0xFF, 0xD8], "{w}x{h}: SOI");
+            let enc = tap.encoder.as_ref().expect("the encoder is kept");
+            assert_eq!(enc.caps, caps, "{w}x{h}: the encoder's caps");
+            match k {
+                1 => assert_ne!(
+                    before.as_ref(),
+                    Some(&enc.pipeline),
+                    "the caps change: a new encoder"
+                ),
+                2 => assert_eq!(
+                    before.as_ref(),
+                    Some(&enc.pipeline),
+                    "the same caps: the same encoder"
+                ),
+                _ => {}
+            }
+            before = Some(enc.pipeline.clone());
+            checked += 1;
+        }
+        assert_eq!(checked, 3);
     }
 }
