@@ -49,24 +49,35 @@ pub struct FrameGrabPlan {
     stopped: bool,
 }
 
+/// One refusal of a start: the plan, the start's moment id and its grab's due instant in, the
+/// verdict out when it refuses.
+type StartRule = fn(&FrameGrabPlan, &str, Ms) -> Option<StartVerdict>;
+
+/// A start's refusals, asked in this order (the SC2 dispatch). The first that refuses gives the
+/// verdict, and a start that none refuses is scheduled. A table (AGENTS.md §4; the final review's SC2
+/// m10), so the order lives in one place, which `tests/frame_grab.rs` sweeps over every reachable
+/// combination.
+const START_REFUSALS: [StartRule; 4] = [
+    |plan, _, _| plan.stopped.then_some(StartVerdict::Stopped),
+    |_, moment_id, _| (!is_path_segment(moment_id)).then_some(StartVerdict::NotASegment),
+    |plan, _, _| plan.waiting.is_some().then_some(StartVerdict::AnotherWaits),
+    |plan, _, due_at| {
+        let gap_ends_at = plan.last_taken_at?.saturating_add(FRAME_GRAB_MIN_GAP_MS);
+        (due_at < gap_ends_at).then_some(StartVerdict::TooSoon { gap_ends_at })
+    },
+];
+
 impl FrameGrabPlan {
-    /// A sponsor start held for the beat at `now`.
+    /// A sponsor start held for the beat at `now`: refused by the first of `START_REFUSALS` that
+    /// refuses it, else its grab waits, due `FRAME_GRAB_DELAY_MS` later. A refused start changes
+    /// nothing.
     pub fn on_start(&mut self, moment_id: &str, now: Ms) -> StartVerdict {
-        if self.stopped {
-            return StartVerdict::Stopped;
-        }
-        if !is_path_segment(moment_id) {
-            return StartVerdict::NotASegment;
-        }
-        if self.waiting.is_some() {
-            return StartVerdict::AnotherWaits;
-        }
         let due_at = now.saturating_add(FRAME_GRAB_DELAY_MS);
-        if let Some(last) = self.last_taken_at {
-            let gap_ends_at = last.saturating_add(FRAME_GRAB_MIN_GAP_MS);
-            if due_at < gap_ends_at {
-                return StartVerdict::TooSoon { gap_ends_at };
-            }
+        if let Some(refused) = START_REFUSALS
+            .iter()
+            .find_map(|refuses| refuses(self, moment_id, due_at))
+        {
+            return refused;
         }
         self.waiting = Some((moment_id.to_owned(), due_at));
         StartVerdict::Scheduled { due_at }

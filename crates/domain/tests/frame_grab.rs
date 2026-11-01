@@ -306,3 +306,69 @@ fn over_a_sweep_no_two_grabs_are_closer_than_the_gap() {
     assert!(ended >= 1, "no end ever cancelled a grab");
     assert!(starts > scheduled.len() + ended, "no start was ever refused");
 }
+
+/// The final review's SC2 m10: a start's refusals have one order, the SC2 dispatch's (a stopped plan,
+/// then a moment id that cannot be a path segment, then another grab waiting, then the gap), and the
+/// first that holds is the verdict. Swept over every combination the plan's API can reach. A stopped
+/// plan has no waiting grab (`stop` drops it), so 12 of the 16. Each refusal leaves the plan as it
+/// was; a start none refuses waits, due `DELAY` later. The expected verdict is read off this order,
+/// written here, never off the plan's table.
+#[test]
+fn a_starts_refusals_apply_in_the_dispatchs_order_in_every_combination() {
+    const NOW: Ms = 1_000_000;
+    let mut checked = 0;
+    for stopped in [false, true] {
+        for bad_segment in [false, true] {
+            for waits in [false, true] {
+                for too_soon in [false, true] {
+                    if stopped && waits {
+                        continue;
+                    }
+                    let mut p = FrameGrabPlan::default();
+                    if too_soon {
+                        // A grab taken at NOW: its gap runs to NOW + GAP, past this start's due instant.
+                        assert!(matches!(
+                            p.on_start("taken", NOW - DELAY),
+                            StartVerdict::Scheduled { .. }
+                        ));
+                        assert_eq!(p.take_due(NOW).as_deref(), Some("taken"));
+                    }
+                    if waits {
+                        // Scheduled clear of the gap, so it waits whether or not the gap runs.
+                        let at = NOW + GAP;
+                        assert!(matches!(p.on_start("waits", at), StartVerdict::Scheduled { .. }));
+                    }
+                    if stopped {
+                        p.stop();
+                    }
+                    let moment = if bad_segment { ".." } else { "12:sponsor.over_end" };
+                    let want = if stopped {
+                        StartVerdict::Stopped
+                    } else if bad_segment {
+                        StartVerdict::NotASegment
+                    } else if waits {
+                        StartVerdict::AnotherWaits
+                    } else if too_soon {
+                        StartVerdict::TooSoon {
+                            gap_ends_at: NOW + GAP,
+                        }
+                    } else {
+                        StartVerdict::Scheduled { due_at: NOW + DELAY }
+                    };
+                    let before = p.clone();
+                    let got = p.on_start(moment, NOW);
+                    let case = (stopped, bad_segment, waits, too_soon);
+                    assert_eq!(got, want, "{case:?}");
+                    if matches!(want, StartVerdict::Scheduled { .. }) {
+                        assert_eq!(p.next_due(), Some(NOW + DELAY), "{case:?}");
+                    } else {
+                        assert_eq!(p, before, "{case:?}: a refused start changed the plan");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+    }
+    eprintln!("start combinations checked: {checked}");
+    assert_eq!(checked, 12);
+}
