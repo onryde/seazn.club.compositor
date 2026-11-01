@@ -8,10 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adapters::control_http::DECLARED_PROFILES;
+use adapters::frame_store::FrameStore;
+use adapters::gst_programme::GstProgramme;
 use adapters::metrics_proc::ProcMetrics;
 use adapters::phase_http::{origin_of, AllowedOrigin, PhaseHttp};
 use adapters::stats::Stats;
 use app::driver::Driver;
+use app::frame_grab::FrameGrabs;
 use app::ports::{
     CefPoll, CefPss, ControlPlane, ControlRequest, GraphicsRenderer, HeartbeatError, Inbound, InputSource,
     KindPss, Measured, ProgrammeOutput,
@@ -20,7 +23,8 @@ use compositor::clock::Clock;
 use compositor::env::Drivers;
 use compositor::logged::{rfc3339_ms, LoggedPlane, LoggedProgramme, Logger};
 use compositor::wiring::{
-    assemble, cef_fps, sponsor_airings, sponsor_frames, LazyInput, PageOrigin, Parts, ProfileSlot, ProfileTap,
+    assemble, cef_fps, programme_tap, sponsor_airings, sponsor_frames, LazyInput, PageOrigin, Parts,
+    ProfileSlot, ProfileTap,
 };
 use crossbeam_channel::{bounded, Receiver, Sender};
 use domain::airings::{AiringBuffer, AiringLine};
@@ -1217,4 +1221,31 @@ fn the_memory_split_reaches_the_log_through_the_real_sampler() {
     } else {
         assert!(lines.is_empty(), "no /proc, no split: {lines:?}");
     }
+}
+
+/// R4 task SC2 (the final review's m7: a witness off CI's harness for W6, "the live media never taps").
+/// On, the tap is asked of the programme before it starts, so the programme holds its probe and a
+/// second ask gets none. Off, nothing is asked, so the programme holds no probe and a later ask would
+/// still get one. No GStreamer runs: neither the programme nor the tap is started.
+#[test]
+fn the_programme_is_tapped_only_when_the_frame_grabs_are_on() {
+    let mut checked = 0;
+    for on in [true, false] {
+        let grabs = if on {
+            FrameGrabs::on(Arc::new(|| 0))
+        } else {
+            FrameGrabs::off()
+        };
+        let (tx, _rx): (Sender<Inbound>, Receiver<Inbound>) = bounded(4);
+        let mut programme = GstProgramme::new(FrameStore::default(), tx);
+        let tap = programme_tap(&mut programme, &grabs);
+        assert_eq!(tap.is_some(), on, "on={on}: the tap");
+        assert_eq!(
+            programme.frame_tap().is_none(),
+            on,
+            "on={on}: whether the programme already holds a probe"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 2);
 }

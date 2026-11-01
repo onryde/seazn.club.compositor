@@ -484,12 +484,7 @@ fn live_media(
     let cef = graphics.memory();
     let mut programme = GstProgramme::new(frames.clone(), tx.clone()).with_log(log.adapter_sink());
     arm_programme_hooks(&mut programme, hooks);
-    // Before `start()`, which installs it: the programme is never rebuilt.
-    let tap = if airings.frames().is_on() {
-        programme.frame_tap().map(|t| Box::new(t) as Box<dyn FrameTap>)
-    } else {
-        None
-    };
+    let tap = programme_tap(&mut programme, airings.frames());
     let stats = programme.stats();
     let slot = ProfileSlot::default();
     let (input_tx, input_log, input_t) = (tx.clone(), log.clone(), t.clone());
@@ -506,6 +501,18 @@ fn live_media(
         stats,
         cef: Some(cef),
         tap,
+    }
+}
+
+/// R4 task SC2: the programme's frame tap when the frame grabs are on, asked for before `start()`,
+/// which installs its probe (the programme is never rebuilt). Off, nothing is asked, so the programme
+/// has no probe at all. Public for its witness (the final review's SC2 m7: `wiring.rs`'s
+/// `the_programme_is_tapped_only_when_the_frame_grabs_are_on`), which needs no GStreamer.
+pub fn programme_tap(programme: &mut GstProgramme, grabs: &FrameGrabs) -> Option<Box<dyn FrameTap>> {
+    if grabs.is_on() {
+        programme.frame_tap().map(|t| Box::new(t) as Box<dyn FrameTap>)
+    } else {
+        None
     }
 }
 
