@@ -312,8 +312,11 @@ impl Worker {
 /// held: that is its flush. A reply (C07's 200 with a heartbeat reply, the contract's 2xx) clears what
 /// this beat carried. Web refusing its body (`Refused`: a 400 or a 422) drops what it carried, counted
 /// in `airingsDropped`: the same body would be refused on every beat until web called the session
-/// lost (fix round 1, I2). Any other outcome (a 5xx, a transport error, a 410) keeps it for the next
-/// beat. A line pushed while the call was in flight stays whatever the outcome.
+/// lost (fix round 1, I2). A refused beat whose one airings key was `airingsDropped` turns the airings
+/// off for the process, so no later beat carries either key (PR C final review, I1: a web rolled back
+/// past the keys refuses every beat that carries them). Any other outcome (a 5xx, a transport error, a
+/// 410) keeps it for the next beat. A line pushed while the call was in flight stays whatever the
+/// outcome.
 fn post_beat(
     cp: &mut dyn ControlPlane,
     airings: &Airings,

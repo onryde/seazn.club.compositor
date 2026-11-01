@@ -205,7 +205,9 @@ fn wire(report: &HealthReport, measured: &Measured, airings: &AiringBatch, scrub
     }
     // R4 task SC1: the sponsor airings, only when the beat carries some (off, it never does). The
     // buffer's dropped total rides beside them, 0 included (a measured zero), and alone on a beat with
-    // no line once it is above 0 (fix round 1, m2): a total for the process, and an upper bound.
+    // no line once it is above 0 (fix round 1, m2): a total for the process, and an upper bound. Web
+    // refusing a beat that carried it alone shuts the buffer, and no later beat carries either key (PR
+    // C final review, I1; `AiringBuffer::drop_refused`).
     if !airings.is_empty() {
         put("airings", airings.lines().iter().map(airing_wire).collect());
     }

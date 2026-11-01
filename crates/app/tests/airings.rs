@@ -365,3 +365,52 @@ fn a_refused_beat_with_no_lines_drops_nothing() {
         vec![(1, vec![], 0), (2, want(&[1]), 0), (3, vec![], 1)]
     );
 }
+
+/// PR C final review, I1, through the real worker: a web that does not know the airings keys (rolled
+/// back past R4 PR A) refuses the beat carrying lines, which drops them, counted, and then the beat
+/// carrying only that count. That second refusal turns the airings off for the process: the next
+/// beat, and every one after it, carries neither key, a line pushed later is not held, and the final
+/// beat carries nothing either. Owner's standing ruling: a slip must never kill a live stream.
+#[test]
+fn a_refused_count_alone_turns_the_airings_off_for_the_process() {
+    let (tx, rx) = unbounded();
+    let (plane, log) = scripted(
+        vec![
+            (1, HeartbeatError::Refused(400)),
+            (2, HeartbeatError::Refused(400)),
+        ],
+        Duration::ZERO,
+    );
+    let airings = Airings::on();
+    let mut h = spawn_with_airings(Box::new(plane), tx, airings.clone());
+    assert!(airings.push(line(1)) && airings.push(line(2)));
+    h.request(beat(periodic(1)));
+    assert_eq!(recv(&rx), Inbound::Event(Event::HeartbeatFailed));
+    h.request(beat(periodic(2)));
+    assert_eq!(recv(&rx), Inbound::Event(Event::HeartbeatFailed));
+    // Off from here: nothing is held, and the beats after land.
+    assert!(!airings.push(line(3)), "a line after the shut is not held");
+    assert_eq!(airings.held(), 0);
+    for mark in 3..=4 {
+        h.request(beat(periodic(mark)));
+        assert_eq!(recv(&rx), Inbound::Event(Event::HeartbeatReply(Desired::Live)));
+    }
+    h.request(beat(final_beat(9)));
+    assert!(h.flush(WAIT));
+    let beats = log.beat_airings();
+    assert_eq!(
+        carried_dropped(&log),
+        vec![
+            (1, want(&[1, 2]), 0),
+            (2, vec![], 2),
+            (3, vec![], 0),
+            (4, vec![], 0),
+            (9, vec![], 0)
+        ],
+        "the count's refusal is the last beat to carry either key"
+    );
+    let after: Vec<&AiringBatch> = beats.iter().skip(2).map(|(_, b)| b).collect();
+    assert!(after.iter().all(|b| b.carries_nothing()), "{after:?}");
+    eprintln!("beats after the shut carrying neither key: {}", after.len());
+    assert_eq!(after.len(), 3);
+}

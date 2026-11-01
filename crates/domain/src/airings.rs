@@ -18,6 +18,14 @@
 //! - **The final beat flushes**: it is a beat like any other, so it carries every line still held, and
 //!   none is left behind for a beat that will never come. Its 2xx clears them as any beat's does; a
 //!   second final beat (the drain's, then a fatal error's) sends again what the first did not land.
+//! - **A refused count turns the buffer off for the process** (PR C final review, I1). Once anything
+//!   was dropped, `airingsDropped` rides every beat, lines or none. A web that does not know the key
+//!   (one rolled back past R4 PR A, its heartbeat strict) refuses each of those beats, and the session
+//!   is lost in about 15 s. So web refusing a beat whose only airings key was the count
+//!   (`carries_only_the_count`) shuts the buffer: it drops what it holds, holds nothing more, and
+//!   every later batch carries neither key. Owner's standing ruling: a slip must never kill a live
+//!   stream. A beat refused for another reason shuts it too, which costs the proof of play and never
+//!   the stream.
 use std::collections::VecDeque;
 
 /// Spec 2026-10-27 §3.6.2, "buffers ≤ 64"; web's `airings` is `.max(64)` (S8's `RelayHeartbeat`), so a
@@ -301,6 +309,11 @@ impl AiringBatch {
     pub fn carries_nothing(&self) -> bool {
         self.is_empty() && self.dropped == 0
     }
+    /// No line, but a dropped total: the beat's one airings key is `airingsDropped`. Web refusing such
+    /// a beat shuts the buffer (`AiringBuffer::drop_refused`, the final review's I1).
+    pub fn carries_only_the_count(&self) -> bool {
+        self.is_empty() && self.dropped > 0
+    }
 }
 
 /// The lines not yet acknowledged, each with its sequence number, at most `AIRING_BUFFER_CAP`.
@@ -309,21 +322,45 @@ pub struct AiringBuffer {
     held: VecDeque<(u64, AiringLine)>,
     next: u64,
     dropped: u32,
+    /// Web refused a beat carrying only the count (the final review's I1): off for the process.
+    shut: bool,
 }
 
 impl AiringBuffer {
-    /// Holds `line`; past the cap, the oldest line is dropped and counted.
-    pub fn push(&mut self, line: AiringLine) {
+    /// Holds `line`; past the cap, the oldest line is dropped and counted. Whether it was held: false
+    /// once the buffer is shut (`drop_refused`).
+    pub fn push(&mut self, line: AiringLine) -> bool {
+        if self.shut {
+            return false;
+        }
         if self.held.len() >= AIRING_BUFFER_CAP {
             self.held.pop_front();
             self.dropped = self.dropped.saturating_add(1);
         }
         self.held.push_back((self.next, line));
         self.next += 1;
+        true
     }
 
-    /// The next beat's lines: a snapshot, nothing removed.
+    /// Counts `n` lines lost before they reached the buffer (the graphics adapter's note queue, full:
+    /// the final review's m5), as a line dropped past the cap is counted. Nothing once shut.
+    pub fn count_lost(&mut self, n: u32) {
+        if !self.shut {
+            self.dropped = self.dropped.saturating_add(n);
+        }
+    }
+
+    /// Web refused a beat carrying only the count, so no beat carries either key again.
+    pub fn is_shut(&self) -> bool {
+        self.shut
+    }
+
+    /// The next beat's lines: a snapshot, nothing removed. Once shut, empty and with no count, so the
+    /// beat carries neither key.
     pub fn take_for_beat(&self) -> AiringBatch {
+        if self.shut {
+            return AiringBatch::default();
+        }
         AiringBatch {
             lines: self.held.iter().map(|(_, l)| l.clone()).collect(),
             through: self.held.back().map(|(seq, _)| *seq),
@@ -345,7 +382,15 @@ impl AiringBuffer {
     /// Web refused the beat that carried `batch` (a 400 or a 422: the same body is refused again, and a
     /// strict heartbeat that keeps being refused loses the session). Its lines still held leave and
     /// are counted dropped, and every line pushed after it was taken stays. The number that left.
+    ///
+    /// A refused batch that carried only the count shuts the buffer for the process (the final
+    /// review's I1): what it holds leaves, uncounted, and none of it is sent. 0 left.
     pub fn drop_refused(&mut self, batch: &AiringBatch) -> usize {
+        if batch.carries_only_the_count() {
+            self.shut = true;
+            self.held.clear();
+            return 0;
+        }
         let Some(through) = batch.through else {
             return 0;
         };
@@ -365,9 +410,10 @@ impl AiringBuffer {
     pub fn is_empty(&self) -> bool {
         self.held.is_empty()
     }
-    /// Lines dropped, over the process: past the cap, or carried by a beat web refused. An upper
-    /// bound: a line dropped past the cap while a beat in flight carries it is counted even when that
-    /// beat lands.
+    /// Lines dropped, over the process: past the cap, carried by a beat web refused, or lost before
+    /// the buffer (`count_lost`). An upper bound: a line dropped past the cap while a beat in flight
+    /// carries it is counted even when that beat lands, and a lost line may be one the dispatcher would
+    /// have refused (a retired page's).
     pub fn dropped(&self) -> u32 {
         self.dropped
     }
@@ -522,6 +568,52 @@ mod tests {
         let after = b.take_for_beat();
         assert!(after.is_empty() && after.dropped() == 1);
         assert!(!after.carries_nothing(), "no line, but a dropped total to report");
+    }
+
+    /// The final review's I1: a refused beat that carried only the count shuts the buffer. What it held
+    /// leaves, every later batch carries neither key, nothing more is held or counted, and a second
+    /// refusal or a 2xx changes nothing. A refused batch with a line, or with nothing at all, does not
+    /// shut it.
+    #[test]
+    fn a_refused_count_alone_shuts_the_buffer_for_good() {
+        let mut b = AiringBuffer::default();
+        assert_eq!(b.drop_refused(&b.take_for_beat()), 0);
+        assert!(!b.is_shut(), "a refused beat with neither key");
+        assert!(b.push(start(1)));
+        assert_eq!(b.drop_refused(&b.take_for_beat()), 1);
+        assert!(!b.is_shut(), "a refused beat with a line");
+        assert!(b.push(start(2)), "held after a refused line");
+        let count_only = AiringBatch {
+            dropped: 1,
+            ..AiringBatch::default()
+        };
+        assert!(count_only.carries_only_the_count());
+        assert_eq!(b.drop_refused(&count_only), 0, "nothing counted");
+        assert!(b.is_shut());
+        assert!(b.is_empty(), "line 2 left with the shut");
+        let after = b.take_for_beat();
+        assert!(after.carries_nothing(), "{after:?}");
+        assert!(!b.push(start(3)), "nothing held once shut");
+        b.count_lost(5);
+        b.ack_2xx(&after);
+        assert_eq!(b.drop_refused(&after), 0);
+        assert!(b.is_shut() && b.is_empty() && b.take_for_beat().carries_nothing());
+        assert_eq!(b.dropped(), 1, "the total stops where it was, and is never sent");
+    }
+
+    /// The final review's m5: lines lost before the buffer are counted with the rest.
+    #[test]
+    fn lines_lost_before_the_buffer_are_counted_in_the_total() {
+        let mut b = AiringBuffer::default();
+        b.count_lost(2);
+        let batch = b.take_for_beat();
+        assert!(
+            batch.carries_only_the_count() && batch.dropped() == 2,
+            "{batch:?}"
+        );
+        b.push(start(1));
+        b.count_lost(1);
+        assert_eq!(b.take_for_beat().dropped(), 3);
     }
 
     #[test]

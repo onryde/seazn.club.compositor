@@ -1466,6 +1466,17 @@ impl Note {
             _ => None,
         }
     }
+
+    /// A sponsor line the page logged and the reader took: one the beat would carry.
+    fn is_read_sponsor_line(&self) -> bool {
+        matches!(
+            self,
+            Note::Page {
+                signal: PageSignal::Sponsor(Ok(_)),
+                ..
+            }
+        )
+    }
 }
 
 /// The dispatcher's queue: `NOTE_QUEUE_CAP` notes, where a full queue drops a log-only note first,
@@ -1479,13 +1490,17 @@ pub(crate) struct NoteQueue {
 }
 
 impl NoteQueue {
-    fn push(&mut self, note: Note) {
+    /// Queues `note`, dropping one past the cap by the policy above. Whether the note dropped (the
+    /// newcomer or a queued one) was a read sponsor line, which the caller counts in `airingsDropped`
+    /// (PR C final review, m5).
+    fn push(&mut self, note: Note) -> bool {
         if let Some(b) = note.ready_of() {
             if self.q.iter().any(|n| n.ready_of() == Some(b)) {
                 self.dropped += 1;
-                return;
+                return false;
             }
         }
+        let mut lost_line = false;
         if self.q.len() >= NOTE_QUEUE_CAP {
             let incoming = note.rank();
             let victim = (0..=1u8)
@@ -1493,19 +1508,20 @@ impl NoteQueue {
                 .find_map(|r| self.q.iter().position(|n| n.rank() == Some(r)));
             match victim {
                 Some(i) => {
-                    self.q.remove(i);
+                    lost_line = self.q.remove(i).is_some_and(|n| n.is_read_sponsor_line());
                     self.dropped += 1;
                 }
                 // Nothing as cheap as the newcomer: it is the one dropped.
                 None if incoming.is_some() => {
                     self.dropped += 1;
-                    return;
+                    return note.is_read_sponsor_line();
                 }
                 // Only crashes and readies queued, and this is one too: kept, past the cap.
                 None => {}
             }
         }
         self.q.push_back(note);
+        lost_line
     }
 
     fn pop(&mut self) -> Option<Note> {
@@ -1765,10 +1781,15 @@ impl Shared {
         sink(&clean);
     }
 
-    /// Queues a note for the dispatcher; never waits (`NoteQueue`'s policy when full).
+    /// Queues a note for the dispatcher; never waits (`NoteQueue`'s policy when full). A read sponsor
+    /// line the full queue dropped is counted in `airingsDropped` (PR C final review, m5), after the
+    /// queue's lock is let go.
     fn push(&self, note: Note) {
-        locked(&self.notes).push(note);
+        let lost_line = locked(&self.notes).push(note);
         self.notes_cv.notify_one();
+        if lost_line {
+            self.airings.count_lost(1);
+        }
     }
 
     /// The reaper's wait before its kill.
@@ -5396,6 +5417,46 @@ mod tests {
         assert_eq!((q.dropped, q.q.iter().filter(|n| is_sponsor(n)).count()), (1, 0));
         q.push(page_note(2, PageSignal::Sponsor(Ok(sponsor_end("a")))));
         assert_eq!((q.dropped, q.q.iter().filter(|n| is_sponsor(n)).count()), (2, 1));
+    }
+
+    /// The final review's m5: a read sponsor line the full note queue drops is counted in
+    /// `airingsDropped`, and no other note is. A queue of beats, then a read line (a beat makes room),
+    /// then a queue's worth more: the beats go first, then the oldest lines. The count expected is the
+    /// lines pushed less the lines still queued, read off the queue, not the counter. Refused lines and
+    /// beats dropped count nothing; off, nothing is counted.
+    #[test]
+    fn a_read_sponsor_line_the_full_queue_drops_is_counted_in_airings_dropped() {
+        let read = |n: &Note| n.is_read_sponsor_line();
+        let mut checked = 0;
+        for on in [true, false] {
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            let airings = if on { Airings::on() } else { Airings::off() };
+            let s = unit_shared_with(tx, ProcTree::live(), Arc::default(), u64::MAX, airings.clone());
+            for _ in 0..NOTE_QUEUE_CAP {
+                s.push(page_note(1, PageSignal::Alive));
+            }
+            s.push(page_note(1, PageSignal::Sponsor(Err(LineRefusal::NotJson))));
+            assert_eq!(
+                airings.for_beat().dropped(),
+                0,
+                "on={on}: a refused line is no airing"
+            );
+            let pushed = NOTE_QUEUE_CAP + 3;
+            for n in 0..pushed {
+                s.push(page_note(
+                    1,
+                    PageSignal::Sponsor(Ok(sponsor_start(&n.to_string()))),
+                ));
+            }
+            let queued = locked(&s.notes).q.iter().filter(|n| read(n)).count();
+            assert_eq!(queued, NOTE_QUEUE_CAP, "on={on}: the beats made room first");
+            let want = if on { (pushed - queued) as u32 } else { 0 };
+            assert_eq!(want > 0, on, "a case where the count differs from 0");
+            assert_eq!(airings.for_beat().dropped(), want, "on={on}");
+            checked += 1;
+        }
+        eprintln!("note-queue loss cases checked: {checked}");
+        assert_eq!(checked, 2);
     }
 
     /// The dispatcher holds the current page's read lines for the beat, in order, and nothing else:

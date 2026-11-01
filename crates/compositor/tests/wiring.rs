@@ -708,6 +708,63 @@ fn a_refused_beat_carrying_airings_warns_once() {
     );
 }
 
+/// PR C final review, I1: web refusing a beat that carried only `airingsDropped` turns the airings off
+/// for the process, and the log says so once, as a WARN, whichever lane and however often. A refused
+/// beat carrying lines, or nothing, never says it.
+#[test]
+fn a_refused_count_alone_warns_once_that_the_airings_are_off() {
+    let (log, buf) = logger();
+    let (plane, _) = ScriptedPlane::new(session_720p());
+    let plane = plane.reply(|_| (Duration::ZERO, Err(HeartbeatError::Refused(400))));
+    let mut lp = LoggedPlane::new(Box::new(plane), log);
+    let mut lane = lp.final_lane();
+    let mut buffer = AiringBuffer::default();
+    buffer.push(
+        AiringLine::end(
+            "1:sponsor.set_break".to_owned(),
+            "2026-10-31T12:00:08Z".to_owned(),
+            false,
+        )
+        .expect("within web's bounds"),
+    );
+    let lines = buffer.take_for_beat();
+    let periodic = Supervisor::new(Thresholds::default())
+        .decide(Event::Tick, 0)
+        .next
+        .health(0);
+    let bare = AiringBuffer::default().take_for_beat();
+    assert!(lp.heartbeat_with(&periodic, &Measured::default(), &bare).is_err());
+    assert!(lp
+        .heartbeat_with(&periodic, &Measured::default(), &lines)
+        .is_err());
+    let off = |buf: &Vec<String>| {
+        buf.iter()
+            .filter(|l| l.contains("sponsor airings are off"))
+            .count()
+    };
+    assert_eq!(off(&buf.messages()), 0, "lines or nothing: {:?}", buf.messages());
+    buffer.drop_refused(&lines);
+    let count = buffer.take_for_beat();
+    assert!(count.carries_only_the_count());
+    for _ in 0..3 {
+        assert!(lp
+            .heartbeat_with(&periodic, &Measured::default(), &count)
+            .is_err());
+    }
+    assert!(lane
+        .heartbeat_with(&final_report(ExitReason::Ended), &Measured::default(), &count)
+        .is_err());
+    let said: Vec<String> = buf
+        .messages()
+        .into_iter()
+        .filter(|l| l.contains("sponsor airings are off"))
+        .collect();
+    assert_eq!(
+        said,
+        vec!["web refused a beat carrying only airingsDropped (status 400): sponsor airings are off for the rest of this process, and no beat carries either key (said once)"],
+    );
+}
+
 /// R4 task SC1: the binary's airings follow `RELAY_AIRINGS` (off unless `1`), and its start says
 /// which, so a run's log shows whether its beats can carry them.
 #[test]
@@ -1223,10 +1280,12 @@ fn the_memory_split_reaches_the_log_through_the_real_sampler() {
     }
 }
 
-/// R4 task SC2 (the final review's m7: a witness off CI's harness for W6, "the live media never taps").
-/// On, the tap is asked of the programme before it starts, so the programme holds its probe and a
-/// second ask gets none. Off, nothing is asked, so the programme holds no probe and a later ask would
-/// still get one. No GStreamer runs: neither the programme nor the tap is started.
+/// R4 task SC2 (SC2 m7): `programme_tap`'s decision alone. On, the tap is asked of the programme
+/// before it starts, so the programme holds its probe and a second ask gets none. Off, nothing is
+/// asked, so the programme holds no probe and a later ask would still get one. No GStreamer runs:
+/// neither the programme nor the tap is started. Not a witness of W6 ("the live media never taps"):
+/// it never sees `live_media` call the helper. The harness case sponsor-airings' `frame_posted` check
+/// is that witness, on CI (PR C final review, m1).
 #[test]
 fn the_programme_is_tapped_only_when_the_frame_grabs_are_on() {
     let mut checked = 0;

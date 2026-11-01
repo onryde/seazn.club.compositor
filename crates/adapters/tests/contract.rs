@@ -1827,6 +1827,61 @@ fn a_beat_with_only_a_dropped_total_carries_airings_dropped_alone() {
     assert_eq!(checked, 2);
 }
 
+/// PR C final review, I1: web main before R4 PR A, strict and without the airings keys (the vendored
+/// heartbeat def with `airings` and `airingsDropped` taken out), refuses a beat carrying the count
+/// alone, so every such beat would be lost. Web refusing that beat shuts the buffer, and the next beat,
+/// periodic or final, carries neither key: the pre-R4 def takes it, and so does the vendored one.
+#[test]
+fn after_a_refused_count_the_next_beat_is_one_web_without_the_keys_takes() {
+    let doc = contract();
+    let mut defs = doc["$defs"].clone();
+    let props = defs["heartbeat"]["properties"]
+        .as_object_mut()
+        .expect("the heartbeat's properties");
+    for key in ["airings", "airingsDropped"] {
+        assert!(props.remove(key).is_some(), "the vendored def declares {key}");
+    }
+    assert_eq!(
+        defs["heartbeat"]["additionalProperties"], false,
+        "web's heartbeat is strict"
+    );
+    let pre_r4 = jsonschema::validator_for(
+        &json!({ "$schema": doc["$schema"], "$defs": defs, "$ref": "#/$defs/heartbeat" }),
+    )
+    .expect("schema compiles");
+    let mut buffer = AiringBuffer::default();
+    buffer.push(a_start(1));
+    let lines = buffer.take_for_beat();
+    assert_eq!(buffer.drop_refused(&lines), 1);
+    let count = buffer.take_for_beat();
+    assert!(count.carries_only_the_count());
+    let mut checked = 0;
+    for r in [report(), stopped(ExitReason::Ended, Some("drained"))] {
+        let refused = heartbeat_wire_with(&r, &Measured::default(), &count);
+        assert!(
+            !violations(&pre_r4, &refused).is_empty(),
+            "pre-R4 web refuses the count: {refused}"
+        );
+        checked += 1;
+    }
+    assert_eq!(buffer.drop_refused(&count), 0);
+    assert!(buffer.is_shut());
+    assert!(!buffer.push(a_start(2)), "nothing held once shut");
+    for r in [report(), stopped(ExitReason::Ended, Some("drained"))] {
+        let wire = heartbeat_wire_with(&r, &Measured::default(), &buffer.take_for_beat());
+        assert!(
+            wire.get("airings").is_none() && wire.get("airingsDropped").is_none(),
+            "{wire}"
+        );
+        let errs = violations(&pre_r4, &wire);
+        assert!(errs.is_empty(), "pre-R4 web takes it: {errs:?}");
+        assert!(violations(&schema_def("heartbeat"), &wire).is_empty(), "{wire}");
+        checked += 1;
+    }
+    eprintln!("beats checked against web without the keys: {checked}");
+    assert_eq!(checked, 4);
+}
+
 /// The largest beat the buffer can give: 64 lines at web's bounds (ids of 80 UTF-16 units, a break
 /// kind of 40), every style and source, both kinds, and the largest dropped count, on a periodic and a
 /// final beat. Each validates against the vendored def.

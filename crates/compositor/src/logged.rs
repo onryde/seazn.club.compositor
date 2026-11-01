@@ -258,12 +258,16 @@ impl GraphicsRenderer for LoggedGraphics {
 }
 
 /// Teaches the log each fetched session's credentials, logs a final beat that failed, and says once a
-/// process (on either lane) that web refused a beat carrying sponsor airings (SC1 fix round 1, I2).
+/// process (on either lane) that web refused a beat carrying sponsor airings (SC1 fix round 1, I2),
+/// and once that it refused one carrying only their dropped count, which turns them off (PR C final
+/// review, I1).
 pub struct LoggedPlane {
     inner: Box<dyn ControlPlane>,
     log: Logger,
     /// The refusal has been said (shared with the final lane).
     refusal_said: Arc<AtomicBool>,
+    /// The count's refusal, and the airings off, has been said (shared with the final lane).
+    shut_said: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for LoggedPlane {
@@ -278,6 +282,7 @@ impl LoggedPlane {
             inner,
             log,
             refusal_said: Arc::default(),
+            shut_said: Arc::default(),
         }
     }
 }
@@ -306,6 +311,12 @@ impl ControlPlane for LoggedPlane {
                     airings.lines().len()
                 ));
             }
+            if airings.carries_only_the_count() && !self.shut_said.swap(true, Ordering::SeqCst) {
+                self.log.warn(&format!(
+                    "web refused a beat carrying only airingsDropped (status {code}): sponsor airings are \
+                     off for the rest of this process, and no beat carries either key (said once)"
+                ));
+            }
         }
         if report.exit.is_some() {
             match &r {
@@ -327,6 +338,7 @@ impl ControlPlane for LoggedPlane {
             inner: self.inner.final_lane(),
             log: self.log.clone(),
             refusal_said: Arc::clone(&self.refusal_said),
+            shut_said: Arc::clone(&self.shut_said),
         })
     }
 }
