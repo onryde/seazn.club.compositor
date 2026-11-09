@@ -8,10 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adapters::control_http::DECLARED_PROFILES;
+use adapters::frame_store::FrameStore;
+use adapters::gst_programme::GstProgramme;
 use adapters::metrics_proc::ProcMetrics;
 use adapters::phase_http::{origin_of, AllowedOrigin, PhaseHttp};
 use adapters::stats::Stats;
 use app::driver::Driver;
+use app::frame_grab::FrameGrabs;
 use app::ports::{
     CefPoll, CefPss, ControlPlane, ControlRequest, GraphicsRenderer, HeartbeatError, Inbound, InputSource,
     KindPss, Measured, ProgrammeOutput,
@@ -19,8 +22,12 @@ use app::ports::{
 use compositor::clock::Clock;
 use compositor::env::Drivers;
 use compositor::logged::{rfc3339_ms, LoggedPlane, LoggedProgramme, Logger};
-use compositor::wiring::{assemble, cef_fps, LazyInput, PageOrigin, Parts, ProfileSlot, ProfileTap};
+use compositor::wiring::{
+    assemble, cef_fps, programme_tap, sponsor_airings, sponsor_frames, LazyInput, PageOrigin, Parts,
+    ProfileSlot, ProfileTap,
+};
 use crossbeam_channel::{bounded, Receiver, Sender};
+use domain::airings::{AiringBuffer, AiringLine};
 use domain::cef_health::CefHealth;
 use domain::config::{OutputProfile, Thresholds};
 use domain::health::{BeatState, ExitInfo, HealthReport};
@@ -613,6 +620,252 @@ fn final_report(reason: ExitReason) -> HealthReport {
     }
 }
 
+/// R4 task SC1: the decorator passes each beat's sponsor airings on, on both lanes. One that dropped
+/// them would post every beat bare while the worker cleared the buffer on its 2xx: every airing lost.
+#[test]
+fn logged_plane_passes_the_airings_on_on_both_lanes() {
+    let (log, _buf) = logger();
+    let (plane, calls) = ScriptedPlane::new(session_720p());
+    let mut lp = LoggedPlane::new(Box::new(plane), log);
+    let mut lane = lp.final_lane();
+    let mut buffer = AiringBuffer::default();
+    buffer.push(
+        AiringLine::end(
+            "1:sponsor.set_break".to_owned(),
+            "2026-10-31T12:00:08Z".to_owned(),
+            false,
+        )
+        .expect("within web's bounds"),
+    );
+    let batch = buffer.take_for_beat();
+    let periodic = Supervisor::new(Thresholds::default())
+        .decide(Event::Tick, 0)
+        .next
+        .health(0);
+    assert!(lp.heartbeat_with(&periodic, &Measured::default(), &batch).is_ok());
+    assert!(lane
+        .heartbeat_with(&final_report(ExitReason::Ended), &Measured::default(), &batch)
+        .is_ok());
+    let carried: Vec<_> = calls
+        .beat_airings()
+        .into_iter()
+        .map(|(h, b)| (h.exit.is_some(), b))
+        .collect();
+    assert_eq!(carried, vec![(false, batch.clone()), (true, batch)]);
+}
+
+/// SC1 fix round 1, I2: web refusing a beat that carried sponsor airings (a 400 or a 422) is said once
+/// a process, as a WARN, whichever lane it happens on and however often: the worker drops those lines
+/// and counts them, and the log says why the count rose. A refused beat with no line says nothing.
+#[test]
+fn a_refused_beat_carrying_airings_warns_once() {
+    let (log, buf) = logger();
+    let (plane, _) = ScriptedPlane::new(session_720p());
+    let plane = plane.reply(|_| (Duration::ZERO, Err(HeartbeatError::Refused(400))));
+    let mut lp = LoggedPlane::new(Box::new(plane), log);
+    let mut lane = lp.final_lane();
+    let mut buffer = AiringBuffer::default();
+    for n in 0..2 {
+        buffer.push(
+            AiringLine::end(
+                format!("{n}:sponsor.set_break"),
+                "2026-10-31T12:00:08Z".to_owned(),
+                false,
+            )
+            .expect("within web's bounds"),
+        );
+    }
+    let batch = buffer.take_for_beat();
+    let periodic = Supervisor::new(Thresholds::default())
+        .decide(Event::Tick, 0)
+        .next
+        .health(0);
+    let bare = AiringBuffer::default().take_for_beat();
+    assert!(lp.heartbeat_with(&periodic, &Measured::default(), &bare).is_err());
+    assert!(
+        buf.messages().is_empty(),
+        "no line, nothing to say: {:?}",
+        buf.messages()
+    );
+    for _ in 0..3 {
+        assert!(lp
+            .heartbeat_with(&periodic, &Measured::default(), &batch)
+            .is_err());
+    }
+    assert!(lane
+        .heartbeat_with(&final_report(ExitReason::Ended), &Measured::default(), &batch)
+        .is_err());
+    let lines = buf.messages();
+    let warned: Vec<&String> = lines.iter().filter(|l| l.contains("sponsor airings")).collect();
+    assert_eq!(
+        warned,
+        vec!["web refused a beat carrying 2 sponsor airings (status 400): they are dropped and counted in airingsDropped (said once)"],
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"final beat failed: web refused it (status 400)".to_owned()),
+        "{lines:?}"
+    );
+}
+
+/// PR C final review, I1: web refusing a beat that carried only `airingsDropped` turns the airings off
+/// for the process, and the log says so once, as a WARN, whichever lane and however often. A refused
+/// beat carrying lines, or nothing, never says it.
+#[test]
+fn a_refused_count_alone_warns_once_that_the_airings_are_off() {
+    let (log, buf) = logger();
+    let (plane, _) = ScriptedPlane::new(session_720p());
+    let plane = plane.reply(|_| (Duration::ZERO, Err(HeartbeatError::Refused(400))));
+    let mut lp = LoggedPlane::new(Box::new(plane), log);
+    let mut lane = lp.final_lane();
+    let mut buffer = AiringBuffer::default();
+    buffer.push(
+        AiringLine::end(
+            "1:sponsor.set_break".to_owned(),
+            "2026-10-31T12:00:08Z".to_owned(),
+            false,
+        )
+        .expect("within web's bounds"),
+    );
+    let lines = buffer.take_for_beat();
+    let periodic = Supervisor::new(Thresholds::default())
+        .decide(Event::Tick, 0)
+        .next
+        .health(0);
+    let bare = AiringBuffer::default().take_for_beat();
+    assert!(lp.heartbeat_with(&periodic, &Measured::default(), &bare).is_err());
+    assert!(lp
+        .heartbeat_with(&periodic, &Measured::default(), &lines)
+        .is_err());
+    let off = |buf: &Vec<String>| {
+        buf.iter()
+            .filter(|l| l.contains("sponsor airings are off"))
+            .count()
+    };
+    assert_eq!(off(&buf.messages()), 0, "lines or nothing: {:?}", buf.messages());
+    buffer.drop_refused(&lines);
+    let count = buffer.take_for_beat();
+    assert!(count.carries_only_the_count());
+    for _ in 0..3 {
+        assert!(lp
+            .heartbeat_with(&periodic, &Measured::default(), &count)
+            .is_err());
+    }
+    assert!(lane
+        .heartbeat_with(&final_report(ExitReason::Ended), &Measured::default(), &count)
+        .is_err());
+    let said: Vec<String> = buf
+        .messages()
+        .into_iter()
+        .filter(|l| l.contains("sponsor airings are off"))
+        .collect();
+    assert_eq!(
+        said,
+        vec!["web refused a beat carrying only airingsDropped (status 400): sponsor airings are off for the rest of this process, and no beat carries either key (said once)"],
+    );
+}
+
+/// R4 task SC1: the binary's airings follow `RELAY_AIRINGS` (off unless `1`), and its start says
+/// which, so a run's log shows whether its beats can carry them.
+#[test]
+fn the_sponsor_airings_follow_relay_airings_and_say_so() {
+    let mut checked = 0;
+    for (value, on) in [(None, false), (Some("0"), false), (Some("1"), true)] {
+        let mut m = std::collections::BTreeMap::from([
+            (
+                compositor::env::SESSION_ID,
+                "3f8a2c1e-7b4d-4e9a-9c2f-5d6e7f8a9b0c".to_owned(),
+            ),
+            (compositor::env::JOB_TOKEN, TOKEN.to_owned()),
+            (compositor::env::APP_URL, "https://stg.seazn.club".to_owned()),
+            (
+                compositor::env::RELAY_DEADLINE_AT,
+                "2026-10-14T18:30:00.000Z".to_owned(),
+            ),
+            (compositor::env::COMPOSITOR_DRIVERS, "live".to_owned()),
+        ]);
+        if let Some(v) = value {
+            m.insert(compositor::env::RELAY_AIRINGS, v.to_owned());
+        }
+        let env = compositor::env::parse(|k| m.get(k).cloned(), true).expect("a valid env");
+        let (log, buf) = logger();
+        let airings = sponsor_airings(&env, &log);
+        assert_eq!(airings.is_on(), on, "{value:?}");
+        let want = format!(
+            "sponsor airings on the heartbeat: {}",
+            if on { "on" } else { "off" }
+        );
+        assert_eq!(buf.messages(), vec![want], "{value:?}");
+        checked += 1;
+    }
+    assert_eq!(checked, 3);
+}
+
+/// R4 task SC2: the frame grabs ride the airings' gate (the controller's ruling: one `RELAY_AIRINGS` for
+/// both), on the process clock, and the start says which. On, a held start plans a grab
+/// `FRAME_GRAB_DELAY_MS` after the clock's now; off, nothing is planned.
+#[test]
+fn the_sponsor_frames_follow_relay_airings_and_say_so() {
+    use domain::config::FRAME_GRAB_DELAY_MS;
+    let mut checked = 0;
+    for (value, on) in [(None, false), (Some("0"), false), (Some("1"), true)] {
+        let mut m = std::collections::BTreeMap::from([
+            (
+                compositor::env::SESSION_ID,
+                "3f8a2c1e-7b4d-4e9a-9c2f-5d6e7f8a9b0c".to_owned(),
+            ),
+            (compositor::env::JOB_TOKEN, TOKEN.to_owned()),
+            (compositor::env::APP_URL, "https://stg.seazn.club".to_owned()),
+            (
+                compositor::env::RELAY_DEADLINE_AT,
+                "2026-10-14T18:30:00.000Z".to_owned(),
+            ),
+            (compositor::env::COMPOSITOR_DRIVERS, "live".to_owned()),
+        ]);
+        if let Some(v) = value {
+            m.insert(compositor::env::RELAY_AIRINGS, v.to_owned());
+        }
+        let env = compositor::env::parse(|k| m.get(k).cloned(), true).expect("a valid env");
+        let (log, buf) = logger();
+        let clock = Arc::new(Clock::system());
+        let airings = sponsor_airings(&env, &log).with_frames(sponsor_frames(&env, &clock, &log));
+        assert_eq!(airings.frames().is_on(), on, "{value:?}");
+        let said = if on { "on" } else { "off" };
+        assert_eq!(
+            buf.messages(),
+            vec![
+                format!("sponsor airings on the heartbeat: {said}"),
+                format!("sponsor frames: {said}"),
+            ],
+            "{value:?}"
+        );
+        let before = clock.now_ms();
+        let start = AiringLine::start(
+            "1:sponsor.set_break".to_owned(),
+            "card-1".to_owned(),
+            domain::airings::AiringStyle::LowerThird,
+            domain::airings::AiringSource::Rotation,
+            None,
+            "2026-10-31T12:00:00.000Z".to_owned(),
+        )
+        .expect("bounds");
+        airings.push(start);
+        let after = clock.now_ms();
+        match airings.frames().next_due() {
+            Some(due) => {
+                assert!(on, "{value:?}: planned while off");
+                assert!(
+                    (before + FRAME_GRAB_DELAY_MS..=after + FRAME_GRAB_DELAY_MS).contains(&due),
+                    "{value:?}: due {due}, now {before}..{after}"
+                );
+            }
+            None => assert!(!on, "{value:?}: nothing planned while on"),
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 3);
+}
+
 /// A final beat whose call failed is logged with its text, scrubbed of the token and of the fetched
 /// session's credentials, on the final lane the worker posts it on (C08 review round 1); a periodic
 /// beat's failure is not logged here (the domain counts it).
@@ -1025,4 +1278,33 @@ fn the_memory_split_reaches_the_log_through_the_real_sampler() {
     } else {
         assert!(lines.is_empty(), "no /proc, no split: {lines:?}");
     }
+}
+
+/// R4 task SC2 (SC2 m7): `programme_tap`'s decision alone. On, the tap is asked of the programme
+/// before it starts, so the programme holds its probe and a second ask gets none. Off, nothing is
+/// asked, so the programme holds no probe and a later ask would still get one. No GStreamer runs:
+/// neither the programme nor the tap is started. Not a witness of W6 ("the live media never taps"):
+/// it never sees `live_media` call the helper. The harness case sponsor-airings' `frame_posted` check
+/// is that witness, on CI (PR C final review, m1).
+#[test]
+fn the_programme_is_tapped_only_when_the_frame_grabs_are_on() {
+    let mut checked = 0;
+    for on in [true, false] {
+        let grabs = if on {
+            FrameGrabs::on(Arc::new(|| 0))
+        } else {
+            FrameGrabs::off()
+        };
+        let (tx, _rx): (Sender<Inbound>, Receiver<Inbound>) = bounded(4);
+        let mut programme = GstProgramme::new(FrameStore::default(), tx);
+        let tap = programme_tap(&mut programme, &grabs);
+        assert_eq!(tap.is_some(), on, "on={on}: the tap");
+        assert_eq!(
+            programme.frame_tap().is_none(),
+            on,
+            "on={on}: whether the programme already holds a probe"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 2);
 }

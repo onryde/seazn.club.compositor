@@ -1,7 +1,14 @@
 //! The vendored contract is the arbiter: our wire output must validate against it, and its fixtures
 //! must decode into our types. Expected values come from the vendored files, never from our code.
-use adapters::control_http::{heartbeat_wire, parse_reply, parse_session, programme_phase_wire};
+use adapters::control_http::{
+    heartbeat_wire, heartbeat_wire_with, parse_reply, parse_session, programme_phase_wire,
+};
+use adapters::sponsor_line::{parse_sponsor_line, END_KEYS, SOURCE_WORDS, START_KEYS, STYLE_WORDS};
 use app::ports::{FetchError, Measured};
+use domain::airings::{
+    is_utc_instant, AiringBatch, AiringBuffer, AiringLine, AiringSource, AiringStyle, LineRefusal,
+    AIRING_BREAK_KIND_MAX_UNITS, AIRING_BUFFER_CAP, AIRING_ID_MAX_UNITS,
+};
 use domain::cef_health::CefHealth;
 use domain::config::{OutputProfile, Thresholds};
 use domain::health::{
@@ -19,12 +26,13 @@ use std::path::{Path, PathBuf};
 
 /// `docs/_INDEX.md` Owed 24: web's own pin of `docs/contracts/relay-job.v1.json`, copied from
 /// `seazn.club` `apps/web/src/server/api-v1/__tests__/relay-contract.test.ts` (`SHA256`, at
-/// 4a9e180958 on web main, web PR #1052's merge: `output`'s description only, 1080p30 the default
-/// (owner ruling 2026-10-27, F-033); before it 228a3b7057, web PR #1040's merge, the reply's
-/// `phoneLiveEdge`, Owed 108 fix (b); before that dec7b95d9, the `restart` exit word, Owed 66). A
-/// contract bump moves web's constant and this one together; a vendored file that hashes otherwise
-/// drifted from the contract web enforces.
-const WEB_PINNED_CONTRACT_SHA256: &str = "90a21541970c566d71a0634503708643c7c1c8de1d36730b6ca907f396d321fe";
+/// fef4751faf on web's `feat/r4-sponsors`, R4 PR A, not merged yet: the heartbeat's `airings` and
+/// `airingsDropped`, S8; before it 4a9e180958 on web main, web PR #1052's merge: `output`'s
+/// description only, 1080p30 the default (owner ruling 2026-10-27, F-033); before that 228a3b7057,
+/// web PR #1040's merge, the reply's `phoneLiveEdge`, Owed 108 fix (b); before that dec7b95d9, the
+/// `restart` exit word, Owed 66). A contract bump moves web's constant and this one together; a
+/// vendored file that hashes otherwise drifted from the contract web enforces.
+const WEB_PINNED_CONTRACT_SHA256: &str = "54ba1d77b29b8881d29beb6dd8bf6671503602e7cbcc26de71d264abc36ddcac";
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts")
@@ -1515,4 +1523,576 @@ fn the_restart_beat_is_the_vendored_restart_fixture() {
     assert!(violations(&v, &wire).is_empty(), "{wire}");
     eprintln!("restart fixture keys checked: {checked}");
     assert_eq!(checked, 3);
+}
+
+// ---- R4 task SC1: the sponsor airings, on the vendored contract (S8, web fef4751faf) ----
+//
+// Web's S8 declares `airings` and `airingsDropped` on the heartbeat (`RelayAiring`, P6), and its
+// fixtures carry them: `heartbeat-airings.json` (a break card and a scene carousel showing, each with
+// its end, the scene's cut short), `heartbeat-invalid-airing-unknown-key.json` (one key the page never
+// writes, which refuses the whole beat) and `heartbeat-full.json` (`airingsDropped` alone). These tests
+// read that def and those fixtures; the provisional schema and fixture SC1 built before S8 was vendored
+// are gone. The vendored commit is on web's R4 PR A branch, not web main: a later contract change
+// there is re-vendored before this merges.
+
+/// The vendored heartbeat's `airings` array (its `anyOf`'s array branch).
+fn airings_def() -> Value {
+    contract()["$defs"]["heartbeat"]["properties"]["airings"]["anyOf"]
+        .as_array()
+        .and_then(|a| a.iter().find(|b| b["type"] == "array"))
+        .cloned()
+        .expect("airings: an array branch")
+}
+
+/// The vendored item whose `kind` is `kind`, from the array's `oneOf`.
+fn airing_item(kind: &str) -> Value {
+    airings_def()["items"]["oneOf"]
+        .as_array()
+        .expect("items: a oneOf")
+        .iter()
+        .find(|i| i["properties"]["kind"]["const"] == kind)
+        .cloned()
+        .unwrap_or_else(|| panic!("no {kind} item"))
+}
+
+/// The page's line for one wire item: the item without `kind`, after its signal (web's `sponsorLine`).
+fn page_line(item: &Value) -> String {
+    let mut body = item.as_object().expect("an item").clone();
+    let kind = body.remove("kind").expect("a kind");
+    format!("seazn:sponsor:{} {}", kind.as_str().unwrap(), Value::Object(body))
+}
+
+fn a_start(n: usize) -> AiringLine {
+    AiringLine::start(
+        format!("{n}:sponsor.set_break"),
+        "card".to_owned(),
+        AiringStyle::LowerThird,
+        AiringSource::Rotation,
+        Some("set_break".to_owned()),
+        "2026-10-31T12:00:00.000Z".to_owned(),
+    )
+    .unwrap()
+}
+
+/// What the vendored def declares is what the reader reads and the beat writes: both keys optional
+/// on a strict beat; at most `AIRING_BUFFER_CAP` items; each item's keys, less the `kind` the
+/// compositor tags, exactly the reader's; the domain's length bounds; and the two word tables.
+#[test]
+fn the_vendored_airings_are_the_readers_shape() {
+    let hb = &contract()["$defs"]["heartbeat"];
+    assert_eq!(
+        hb["additionalProperties"], false,
+        "the beat refuses an unknown key"
+    );
+    let required = hb["required"].as_array().expect("required");
+    assert!(
+        !required.iter().any(|k| k == "airings" || k == "airingsDropped"),
+        "both keys are optional: a beat with neither is the one the compositor sends with the airings off"
+    );
+    assert_eq!(airings_def()["maxItems"].as_u64(), Some(AIRING_BUFFER_CAP as u64));
+    let (start, end) = (airing_item("start"), airing_item("end"));
+    let mut checked = 0;
+    for (item, keys) in [(&start, &START_KEYS[..]), (&end, &END_KEYS[..])] {
+        assert_eq!(item["additionalProperties"], false, "a strict item");
+        let names = |v: &Value| -> Vec<String> {
+            let mut n: Vec<String> = match v {
+                Value::Array(a) => a.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+                Value::Object(o) => o.keys().cloned().collect(),
+                _ => panic!("{v}"),
+            };
+            n.retain(|k| k != "kind");
+            n.sort();
+            n
+        };
+        let mut want: Vec<String> = keys.iter().map(|k| (*k).to_owned()).collect();
+        want.sort();
+        assert_eq!(names(&item["required"]), want, "required");
+        assert_eq!(names(&item["properties"]), want, "properties");
+        checked += 1;
+    }
+    for (item, key) in [(&start, "momentId"), (&start, "cardId"), (&end, "momentId")] {
+        assert_eq!(
+            item["properties"][key]["maxLength"].as_u64(),
+            Some(AIRING_ID_MAX_UNITS as u64),
+            "{key}"
+        );
+        checked += 1;
+    }
+    let break_kind = start["properties"]["breakKind"]["anyOf"]
+        .as_array()
+        .expect("breakKind: a string or null");
+    assert!(break_kind.iter().any(|b| b["type"] == "null"));
+    assert_eq!(
+        break_kind
+            .iter()
+            .find(|b| b["type"] == "string")
+            .and_then(|b| b["maxLength"].as_u64()),
+        Some(AIRING_BREAK_KIND_MAX_UNITS as u64)
+    );
+    checked += 1;
+    let words = |table: &[&str]| {
+        let mut w: Vec<String> = table.iter().map(|w| (*w).to_owned()).collect();
+        w.sort();
+        w
+    };
+    for (key, table) in [
+        ("style", words(&STYLE_WORDS.map(|(_, w)| w))),
+        ("source", words(&SOURCE_WORDS.map(|(_, w)| w))),
+    ] {
+        let mut declared: Vec<String> = start["properties"][key]["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{key}: an enum"))
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        declared.sort();
+        assert_eq!(declared, table, "{key}");
+        checked += 1;
+    }
+    assert!(
+        hb["properties"]["airingsDropped"]["anyOf"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|b| b["type"] == "integer" && b["minimum"] == 0)),
+        "airingsDropped: an integer from 0"
+    );
+    checked += 1;
+    eprintln!("airings declarations checked against the reader: {checked}");
+    // 2 key sets, 3 id bounds, the break kind, 2 word tables, the dropped count.
+    assert_eq!(checked, 9);
+}
+
+/// Every vendored heartbeat fixture gets the verdict its name declares from the vendored def: an
+/// `invalid-` one is refused, every other one taken, the airings pair among them.
+#[test]
+fn every_heartbeat_fixture_gets_the_verdict_its_name_declares() {
+    let v = schema_def("heartbeat");
+    let (mut taken, mut refused) = (Vec::new(), Vec::new());
+    for e in std::fs::read_dir(fixtures_dir()).unwrap() {
+        let name = e.unwrap().file_name().into_string().unwrap();
+        let Some(rest) = name.strip_prefix("heartbeat-") else {
+            continue;
+        };
+        let errs = violations(&v, &fixture(&name));
+        if rest.starts_with("invalid-") {
+            assert!(!errs.is_empty(), "{name} was taken");
+            refused.push(name);
+        } else {
+            assert!(errs.is_empty(), "{name}: {errs:?}");
+            taken.push(name);
+        }
+    }
+    eprintln!(
+        "heartbeat fixtures judged: {} taken, {} refused",
+        taken.len(),
+        refused.len()
+    );
+    for want in ["heartbeat-airings.json", "heartbeat-full.json"] {
+        assert!(taken.iter().any(|n| n == want), "{want} is not among {taken:?}");
+    }
+    assert!(
+        refused
+            .iter()
+            .any(|n| n == "heartbeat-invalid-airing-unknown-key.json"),
+        "{refused:?}"
+    );
+    assert!(
+        taken.len() >= 7 && refused.len() >= 5,
+        "anti-vacuity: {taken:?} {refused:?}"
+    );
+}
+
+/// The vendored fixture's airings, written by the page as lines, read by the reader, held by the
+/// buffer and written on a beat: every key of the fixture is the beat's (its `airingsDropped: 0` is
+/// the measured zero that rides with lines), and the beat validates.
+#[test]
+fn the_vendored_heartbeat_airings_fixture_round_trips() {
+    let want = fixture("heartbeat-airings.json");
+    let items = want["airings"].as_array().expect("airings");
+    assert_eq!(
+        items.len(),
+        4,
+        "a break card and a scene showing, each with its end"
+    );
+    let mut buffer = AiringBuffer::default();
+    for item in items {
+        let line = page_line(item);
+        let read = parse_sponsor_line(&line).unwrap_or_else(|| panic!("not a sponsor line: {line}"));
+        buffer.push(read.unwrap_or_else(|e| panic!("{line}: refused {e:?}")));
+    }
+    let report = HealthReport {
+        state: BeatState::Playing,
+        programme_phase: ProgrammePhase::Live,
+        ..report()
+    };
+    let wire = heartbeat_wire_with(&report, &Measured::default(), &buffer.take_for_beat());
+    let mut checked = 0;
+    for (key, value) in want.as_object().expect("an object") {
+        assert_eq!(&wire[key.as_str()], value, "{key}: {wire}");
+        checked += 1;
+    }
+    let errs = violations(&schema_def("heartbeat"), &wire);
+    assert!(errs.is_empty(), "{errs:?}");
+    eprintln!(
+        "airing items round-tripped: {}; fixture keys matched: {checked}",
+        items.len()
+    );
+    assert_eq!(checked, 4, "state, programmePhase, airings, airingsDropped");
+}
+
+/// The vendored refusal: one key the page never writes (`sponsorName`) on the first item refuses the
+/// whole beat (item and beat are strict). The reader refuses that line before it is buffered, and
+/// takes the other three; less that key, the fixture is the good one.
+#[test]
+fn the_vendored_unknown_key_line_is_refused_before_it_is_buffered() {
+    let bad = fixture("heartbeat-invalid-airing-unknown-key.json");
+    assert!(!violations(&schema_def("heartbeat"), &bad).is_empty());
+    let mut cleaned = bad.clone();
+    cleaned["airings"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("sponsorName")
+        .expect("the planted key");
+    assert_eq!(
+        cleaned,
+        fixture("heartbeat-airings.json"),
+        "the one key is the only difference"
+    );
+    let mut checked = 0;
+    for (i, item) in bad["airings"].as_array().unwrap().iter().enumerate() {
+        let read = parse_sponsor_line(&page_line(item)).expect("a sponsor line");
+        if i == 0 {
+            assert_eq!(read, Err(LineRefusal::KeySet), "{item}");
+        } else {
+            assert!(read.is_ok(), "{i}: {read:?}");
+        }
+        checked += 1;
+    }
+    eprintln!("unknown-key fixture lines read: {checked}");
+    assert_eq!(checked, 4);
+}
+
+/// No airings, no keys: a beat with an empty batch is the beat without one, key for key (what every
+/// beat is while the keys are off).
+#[test]
+fn a_beat_with_no_airings_carries_neither_key() {
+    let mut checked = 0;
+    for (r, m) in [
+        (report(), Measured::default()),
+        (report(), full_measured()),
+        (stopped(ExitReason::Ended, Some("drained")), full_measured()),
+    ] {
+        let with = heartbeat_wire_with(&r, &m, &AiringBatch::default());
+        assert!(
+            with.get("airings").is_none() && with.get("airingsDropped").is_none(),
+            "{with}"
+        );
+        assert!(
+            violations(&schema_def("heartbeat"), &with).is_empty(),
+            "the vendored def takes it: {with}"
+        );
+        checked += 1;
+    }
+    eprintln!("beats without airings checked: {checked}");
+    assert_eq!(checked, 3);
+}
+
+/// Fix round 1, m2: with no line to carry but a dropped total above 0 (lines a refused beat carried),
+/// the beat carries `airingsDropped` alone, as the vendored `heartbeat-full.json` does, and the
+/// vendored def takes it.
+#[test]
+fn a_beat_with_only_a_dropped_total_carries_airings_dropped_alone() {
+    let full = fixture("heartbeat-full.json");
+    assert!(
+        full.get("airings").is_none() && full["airingsDropped"].as_u64().is_some_and(|n| n > 0),
+        "web's full beat carries the count alone: {full}"
+    );
+    let mut buffer = AiringBuffer::default();
+    buffer.push(a_start(1));
+    buffer.push(a_start(2));
+    let refused = buffer.take_for_beat();
+    assert_eq!(buffer.drop_refused(&refused), 2);
+    let batch = buffer.take_for_beat();
+    assert!(batch.is_empty() && batch.dropped() == 2);
+    let mut checked = 0;
+    for r in [report(), stopped(ExitReason::Ended, Some("drained"))] {
+        let wire = heartbeat_wire_with(&r, &Measured::default(), &batch);
+        assert!(wire.get("airings").is_none(), "no line, no airings: {wire}");
+        assert_eq!(wire["airingsDropped"], 2, "{wire}");
+        let errs = violations(&schema_def("heartbeat"), &wire);
+        assert!(errs.is_empty(), "{errs:?}");
+        checked += 1;
+    }
+    eprintln!("dropped-only beats checked: {checked}");
+    assert_eq!(checked, 2);
+}
+
+/// PR C final review, I1: web main before R4 PR A, strict and without the airings keys (the vendored
+/// heartbeat def with `airings` and `airingsDropped` taken out), refuses a beat carrying the count
+/// alone, so every such beat would be lost. Web refusing that beat shuts the buffer, and the next beat,
+/// periodic or final, carries neither key: the pre-R4 def takes it, and so does the vendored one.
+#[test]
+fn after_a_refused_count_the_next_beat_is_one_web_without_the_keys_takes() {
+    let doc = contract();
+    let mut defs = doc["$defs"].clone();
+    let props = defs["heartbeat"]["properties"]
+        .as_object_mut()
+        .expect("the heartbeat's properties");
+    for key in ["airings", "airingsDropped"] {
+        assert!(props.remove(key).is_some(), "the vendored def declares {key}");
+    }
+    assert_eq!(
+        defs["heartbeat"]["additionalProperties"], false,
+        "web's heartbeat is strict"
+    );
+    let pre_r4 = jsonschema::validator_for(
+        &json!({ "$schema": doc["$schema"], "$defs": defs, "$ref": "#/$defs/heartbeat" }),
+    )
+    .expect("schema compiles");
+    let mut buffer = AiringBuffer::default();
+    buffer.push(a_start(1));
+    let lines = buffer.take_for_beat();
+    assert_eq!(buffer.drop_refused(&lines), 1);
+    let count = buffer.take_for_beat();
+    assert!(count.carries_only_the_count());
+    let mut checked = 0;
+    for r in [report(), stopped(ExitReason::Ended, Some("drained"))] {
+        let refused = heartbeat_wire_with(&r, &Measured::default(), &count);
+        assert!(
+            !violations(&pre_r4, &refused).is_empty(),
+            "pre-R4 web refuses the count: {refused}"
+        );
+        checked += 1;
+    }
+    assert_eq!(buffer.drop_refused(&count), 0);
+    assert!(buffer.is_shut());
+    assert!(!buffer.push(a_start(2)), "nothing held once shut");
+    for r in [report(), stopped(ExitReason::Ended, Some("drained"))] {
+        let wire = heartbeat_wire_with(&r, &Measured::default(), &buffer.take_for_beat());
+        assert!(
+            wire.get("airings").is_none() && wire.get("airingsDropped").is_none(),
+            "{wire}"
+        );
+        let errs = violations(&pre_r4, &wire);
+        assert!(errs.is_empty(), "pre-R4 web takes it: {errs:?}");
+        assert!(violations(&schema_def("heartbeat"), &wire).is_empty(), "{wire}");
+        checked += 1;
+    }
+    eprintln!("beats checked against web without the keys: {checked}");
+    assert_eq!(checked, 4);
+}
+
+/// The largest beat the buffer can give: 64 lines at web's bounds (ids of 80 UTF-16 units, a break
+/// kind of 40), every style and source, both kinds, and the largest dropped count, on a periodic and a
+/// final beat. Each validates against the vendored def.
+#[test]
+fn every_airings_beat_we_can_emit_validates() {
+    let id = |n: usize| format!("{n:02}{}", "m".repeat(78));
+    let styles = [AiringStyle::LowerThird, AiringStyle::Banner];
+    let sources = [
+        AiringSource::Rotation,
+        AiringSource::Scene,
+        AiringSource::Operator,
+    ];
+    let mut buffer = AiringBuffer::default();
+    for n in 0..AIRING_BUFFER_CAP {
+        let line = if n % 4 == 3 {
+            AiringLine::end(id(n), "2026-10-31T12:00:00Z".to_owned(), n % 8 == 3)
+        } else {
+            AiringLine::start(
+                id(n),
+                "c".repeat(80),
+                styles[n % 2],
+                sources[n % 3],
+                (n % 5 != 0).then(|| "b".repeat(40)),
+                "2026-10-31T12:00:00.123456Z".to_owned(),
+            )
+        };
+        buffer.push(line.expect("at web's bounds"));
+    }
+    let batch = buffer.take_for_beat();
+    assert_eq!(batch.lines().len(), 64);
+    let v = schema_def("heartbeat");
+    let mut checked = 0;
+    for r in [report(), stopped(ExitReason::Fatal, Some("boom"))] {
+        let wire = heartbeat_wire_with(&r, &full_measured(), &batch);
+        assert_eq!(wire["airings"].as_array().map(Vec::len), Some(64));
+        assert_eq!(
+            wire["airingsDropped"], 0,
+            "a measured zero rides with the airings"
+        );
+        let errs = violations(&v, &wire);
+        assert!(errs.is_empty(), "{errs:?}");
+        checked += 1;
+    }
+    // A dropped total past the cap rides as counted (a u32: always inside the contract's maximum).
+    let mut full = AiringBuffer::default();
+    for n in 0..AIRING_BUFFER_CAP + 3 {
+        full.push(a_start(n));
+    }
+    let wire = heartbeat_wire_with(&report(), &Measured::default(), &full.take_for_beat());
+    assert_eq!(wire["airingsDropped"], 3);
+    assert!(violations(&v, &wire).is_empty());
+    checked += 1;
+    let wire = heartbeat_wire_with(&report(), &Measured::default(), &batch);
+    let kinds = batch_kinds(&wire);
+    assert!(
+        kinds.contains(&"start") && kinds.contains(&"end"),
+        "both kinds: {kinds:?}"
+    );
+    eprintln!("airings beats validated: {checked}");
+    assert_eq!(checked, 3);
+}
+
+fn batch_kinds(wire: &Value) -> Vec<&str> {
+    wire["airings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["kind"].as_str().unwrap())
+        .collect()
+}
+
+/// A named edit of a valid wire.
+type Edit = (&'static str, fn(&mut Value));
+
+/// The vendored def is a real bound, not a pass-all: each edit of the good fixture is refused (so the
+/// "validates" tests above can fail).
+#[test]
+fn the_vendored_airings_def_refuses_each_shape_web_refuses() {
+    let v = schema_def("heartbeat");
+    let good = fixture("heartbeat-airings.json");
+    assert!(violations(&v, &good).is_empty());
+    let edits: Vec<Edit> = vec![
+        ("an unknown key", |w| w["airings"][0]["extra"] = json!(1)),
+        ("breakKind absent", |w| {
+            w["airings"][0].as_object_mut().unwrap().remove("breakKind");
+        }),
+        ("no kind", |w| {
+            w["airings"][1].as_object_mut().unwrap().remove("kind");
+        }),
+        ("an unknown kind", |w| w["airings"][1]["kind"] = json!("middle")),
+        ("an end with a start's key", |w| {
+            w["airings"][1]["cardId"] = json!("c")
+        }),
+        ("a style S8 lacks", |w| w["airings"][0]["style"] = json!("big")),
+        ("a source S8 lacks", |w| {
+            w["airings"][2]["source"] = json!("manual")
+        }),
+        ("a moment id of 81", |w| {
+            w["airings"][0]["momentId"] = json!("m".repeat(81))
+        }),
+        ("a break kind of 41", |w| {
+            w["airings"][0]["breakKind"] = json!("b".repeat(41))
+        }),
+        ("cutShort a string", |w| {
+            w["airings"][1]["cutShort"] = json!("false")
+        }),
+        ("an offset instant", |w| {
+            w["airings"][0]["at"] = json!("2026-10-31T14:02:11.250+00:00")
+        }),
+        ("an instant with no zone", |w| {
+            w["airings"][3]["at"] = json!("2026-10-31T14:02:26.410")
+        }),
+        ("65 items", |w| {
+            let one = w["airings"][0].clone();
+            w["airings"] = Value::Array(vec![one; 65]);
+        }),
+        ("a negative dropped", |w| w["airingsDropped"] = json!(-1)),
+        ("a fractional dropped", |w| w["airingsDropped"] = json!(1.5)),
+    ];
+    let mut checked = 0;
+    for (what, edit) in &edits {
+        let mut w = good.clone();
+        edit(&mut w);
+        assert!(
+            !violations(&v, &w).is_empty(),
+            "{what}: the vendored def took {w}"
+        );
+        checked += 1;
+    }
+    eprintln!("vendored airings refusals checked: {checked}");
+    assert_eq!(checked, edits.len());
+    assert_eq!(checked, 15);
+}
+
+/// Web's published `at` rule (zod's `datetime()` regex, on both items) is the domain's: for each
+/// instant, the vendored pattern and `is_utc_instant` give one verdict. Neither side is computed from
+/// the other.
+#[test]
+fn the_vendored_instant_pattern_is_the_domains_rule() {
+    let pattern = airing_item("start")["properties"]["at"]["pattern"].clone();
+    assert!(pattern.is_string(), "the start's at has a pattern");
+    assert_eq!(
+        airing_item("end")["properties"]["at"]["pattern"],
+        pattern,
+        "one rule for both items"
+    );
+    let rule = jsonschema::validator_for(&json!({ "type": "string", "pattern": pattern }))
+        .expect("the pattern compiles");
+    let instants = [
+        "2026-10-31T12:00:00.000Z",
+        "2026-10-31T12:00:00Z",
+        "2026-10-31T12:00Z",
+        "2026-10-31T12:00:00.123456789Z",
+        "2026-10-31T23:59:59.999Z",
+        "2024-02-29T00:00:00Z",
+        "2000-02-29T00:00:00Z",
+        "2026-04-30T00:00:00Z",
+        "2026-02-29T00:00:00Z",
+        "1900-02-29T00:00:00Z",
+        "2026-04-31T00:00:00Z",
+        "2026-13-01T00:00:00Z",
+        "2026-10-32T00:00:00Z",
+        "2026-10-31T24:00:00Z",
+        "2026-10-31T12:60:00Z",
+        "2026-10-31T12:00:60Z",
+        "2026-10-31T12:00:00.Z",
+        "2026-10-31T12:00:00.000",
+        "2026-10-31T12:00:00.000+00:00",
+        "2026-10-31T12:00:00.000z",
+        "2026-10-31 12:00:00.000Z",
+        "2026-10-31T12Z",
+        "2026-10-31",
+        "+2026-10-31T12:00:00Z",
+        "2026-10-31T12:00:00.000Z ",
+        "",
+    ];
+    let (mut taken, mut refused) = (0, 0);
+    for s in instants {
+        let published = rule.is_valid(&json!(s));
+        assert_eq!(published, is_utc_instant(s), "{s:?}");
+        if published {
+            taken += 1;
+        } else {
+            refused += 1;
+        }
+    }
+    eprintln!(
+        "instants judged by both rules: {} ({taken} taken, {refused} refused)",
+        instants.len()
+    );
+    assert!(taken >= 7 && refused >= 15, "anti-vacuity: both verdicts");
+}
+
+/// SC1 concern 6, settled on the vendored def: JSON Schema's `maxLength` counts code points, while
+/// zod's `.max(80)`, which web runs, counts UTF-16 units. The reader counts zod's (`domain::airings`),
+/// so it is the stricter side: an id of 41 "😀" (82 units, 41 code points) passes the published def but
+/// is refused before it is buffered, and web never sees it; one of 40 passes both.
+#[test]
+fn the_reader_counts_zods_units_where_the_published_length_counts_code_points() {
+    let v = schema_def("heartbeat");
+    let mut checked = 0;
+    for (n, reader_takes) in [(40, true), (41, false)] {
+        let mut wire = fixture("heartbeat-airings.json");
+        wire["airings"][0]["momentId"] = json!("😀".repeat(n));
+        assert!(
+            violations(&v, &wire).is_empty(),
+            "{n}: the published def counts code points"
+        );
+        let read = parse_sponsor_line(&page_line(&wire["airings"][0])).expect("a sponsor line");
+        assert_eq!(read.is_ok(), reader_takes, "{n}: {read:?}");
+        checked += 1;
+    }
+    assert_eq!(checked, 2);
 }

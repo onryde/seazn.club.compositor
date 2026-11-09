@@ -1,0 +1,9 @@
+# The sponsor-airings case (harness/cases/sponsor-airings.sh) only, added to compose.yml by
+# run-case.sh (CASE_COMPOSE). It turns the compositor's sponsor airings on (R4 task SC1:
+# `RELAY_AIRINGS`, off by default), so the sponsor lines the harness page logs ride the heartbeat
+# to fake-control. Here and not in compose.yml, so every other case runs with them off, as stg and
+# prod do until web reads the keys.
+services:
+  compositor:
+    environment:
+      RELAY_AIRINGS: "1"

@@ -119,8 +119,9 @@ fn the_plan_names_every_chaos_case_and_expands_the_repeats() {
         })
         .collect();
     // The case files that are not chaos cases (case_verdicts.rs's NOT_CHAOS, the same list): C13's
-    // smoke and Owed 81's two probe controls, each run by hand from harness.yml. Each must be a file.
-    let not_chaos = ["smoke", "owed81-noaudio", "owed81-align1"];
+    // smoke, Owed 81's two probe controls and R4 SC1's sponsor-airings, each run from harness.yml.
+    // Each must be a file.
+    let not_chaos = ["smoke", "owed81-noaudio", "owed81-align1", "sponsor-airings"];
     let before = files.len();
     files.retain(|c| !not_chaos.contains(&c.as_str()));
     assert_eq!(

@@ -1,12 +1,14 @@
 {
   "source": "onryde/seazn.club",
-  "commit": "4a9e18095804e8416a95684efedea326eea16a81",
+  "commit": "61a8cdd935ad2d9ff04b908e1ededff62ed04931",
   "files": {
-    "fixtures/relay-job.v1/README.md": "614debb1e5ff25a65d2dbe4ef8f017bbadf36028a9dd309bbca60d1063380b1c",
+    "fixtures/relay-job.v1/README.md": "d0921fe5493060f53980b3d417f4cbd9cae2cb1bf3e0ea984832f2a8a4567a41",
+    "fixtures/relay-job.v1/heartbeat-airings.json": "b080150b1fb565c0366ae19af032b57c1e151c32686226e4f34834d65d60b82f",
     "fixtures/relay-job.v1/heartbeat-final-fatal.json": "7cd633faeae7fa27cdaca24c2423bd8334f80d8bddafbc84aeb67f6221d8305e",
     "fixtures/relay-job.v1/heartbeat-final-hold.json": "904dbedaa116b4f2cedc3197d41cdb1964627132abe93595b24486062e42af1f",
     "fixtures/relay-job.v1/heartbeat-final-restart.json": "e919b31569bcca8532d2e155a55862d579a314bf15fd17df85399e80787198a1",
-    "fixtures/relay-job.v1/heartbeat-full.json": "870ec10ce292dad3e22aa5ec8143afcede475eb202b711df9bff404fc306f7bc",
+    "fixtures/relay-job.v1/heartbeat-full.json": "bbc6c1a2177157ff50bcafd169ff88bad93ac6e907245e3d6c8b5b49a7e6741d",
+    "fixtures/relay-job.v1/heartbeat-invalid-airing-unknown-key.json": "66f501b574a354d86366edc86f7bba0c9af82bb493a90a5fc1b6e7eee3f0cb8c",
     "fixtures/relay-job.v1/heartbeat-invalid-exit-reason.json": "f36021429de6d0bcd6a8f727de961195b340f2505938c2eeb80710542b14ac97",
     "fixtures/relay-job.v1/heartbeat-invalid-exit-while-playing.json": "2fb1943e5358d0bb6354b7a08d9ee0da7946a9dbb1f115ef4b4210b5378018c9",
     "fixtures/relay-job.v1/heartbeat-invalid-phase-channel.json": "b1b8867151c86d97c8cb5d0f666ff4544988952d21c866e5fa45cacc6fe657be",
@@ -28,6 +30,6 @@
     "fixtures/relay-job.v1/session-passthrough.json": "6e26aaaec3701ee50f08efb3044c1fd7192efd130e188c839ac7bbfb016d9f27",
     "fixtures/relay-job.v1/session-refused-delay-absent.json": "175099704a276cbecaf60f0381b100edda842487627203542f79342815267e15",
     "fixtures/relay-job.v1/session-refused-delay-mismatch.json": "3f45d9bba1866f4ef9060bcbcc21e9e5e901380089236616cf983fc052422c0f",
-    "relay-job.v1.json": "90a21541970c566d71a0634503708643c7c1c8de1d36730b6ca907f396d321fe"
+    "relay-job.v1.json": "54ba1d77b29b8881d29beb6dd8bf6671503602e7cbcc26de71d264abc36ddcac"
   }
 }

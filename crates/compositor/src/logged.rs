@@ -15,6 +15,7 @@
 //! - `Logger::log_sink`: the driver's own lines (`app::ports::LogSink`), in both driver modes.
 use std::fmt;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use adapters::redact::Scrubber;
@@ -22,6 +23,7 @@ use app::ports::{
     ControlPlane, FetchError, GraphicsRenderer, HeartbeatError, LogSink, Measured, ProgrammeOutput, Reply,
     SessionConfig, TargetSpec,
 };
+use domain::airings::AiringBatch;
 use domain::cef_health::CefHealth;
 use domain::config::OutputProfile;
 use domain::health::HealthReport;
@@ -160,6 +162,10 @@ impl LogSink for DriverLog {
     fn info(&mut self, line: &str) {
         self.0.info(line);
     }
+
+    fn warn(&mut self, line: &str) {
+        self.0.warn(line);
+    }
 }
 
 /// Logs the programme's lifecycle and delegates every call.
@@ -251,10 +257,17 @@ impl GraphicsRenderer for LoggedGraphics {
     }
 }
 
-/// Teaches the log each fetched session's credentials, and logs a final beat that failed.
+/// Teaches the log each fetched session's credentials, logs a final beat that failed, and says once a
+/// process (on either lane) that web refused a beat carrying sponsor airings (SC1 fix round 1, I2),
+/// and once that it refused one carrying only their dropped count, which turns them off (PR C final
+/// review, I1).
 pub struct LoggedPlane {
     inner: Box<dyn ControlPlane>,
     log: Logger,
+    /// The refusal has been said (shared with the final lane).
+    refusal_said: Arc<AtomicBool>,
+    /// The count's refusal, and the airings off, has been said (shared with the final lane).
+    shut_said: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for LoggedPlane {
@@ -265,7 +278,12 @@ impl fmt::Debug for LoggedPlane {
 
 impl LoggedPlane {
     pub fn new(inner: Box<dyn ControlPlane>, log: Logger) -> Self {
-        Self { inner, log }
+        Self {
+            inner,
+            log,
+            refusal_said: Arc::default(),
+            shut_said: Arc::default(),
+        }
     }
 }
 
@@ -278,8 +296,28 @@ impl ControlPlane for LoggedPlane {
         r
     }
 
-    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Reply, HeartbeatError> {
-        let r = self.inner.heartbeat(report, measured);
+    fn heartbeat_with(
+        &mut self,
+        report: &HealthReport,
+        measured: &Measured,
+        airings: &AiringBatch,
+    ) -> Result<Reply, HeartbeatError> {
+        let r = self.inner.heartbeat_with(report, measured, airings);
+        if let Err(HeartbeatError::Refused(code)) = &r {
+            if !airings.is_empty() && !self.refusal_said.swap(true, Ordering::SeqCst) {
+                self.log.warn(&format!(
+                    "web refused a beat carrying {} sponsor airings (status {code}): they are dropped and \
+                     counted in airingsDropped (said once)",
+                    airings.lines().len()
+                ));
+            }
+            if airings.carries_only_the_count() && !self.shut_said.swap(true, Ordering::SeqCst) {
+                self.log.warn(&format!(
+                    "web refused a beat carrying only airingsDropped (status {code}): sponsor airings are \
+                     off for the rest of this process, and no beat carries either key (said once)"
+                ));
+            }
+        }
         if report.exit.is_some() {
             match &r {
                 Ok(_) => {}
@@ -287,6 +325,9 @@ impl ControlPlane for LoggedPlane {
                     .log
                     .warn("final beat failed: web answered 410 (session gone)"),
                 Err(HeartbeatError::Transport(text)) => self.log.warn(&format!("final beat failed: {text}")),
+                Err(HeartbeatError::Refused(code)) => self
+                    .log
+                    .warn(&format!("final beat failed: web refused it (status {code})")),
             }
         }
         r
@@ -296,6 +337,8 @@ impl ControlPlane for LoggedPlane {
         Box::new(Self {
             inner: self.inner.final_lane(),
             log: self.log.clone(),
+            refusal_said: Arc::clone(&self.refusal_said),
+            shut_said: Arc::clone(&self.shut_said),
         })
     }
 }

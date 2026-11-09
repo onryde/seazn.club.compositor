@@ -32,20 +32,26 @@ use adapters::gst_programme::GstProgramme;
 use adapters::metrics_proc::ProcMetrics;
 use adapters::phase_http::{origin_of, AllowedOrigin, PhaseHttp, RELAY_PHASE_PORT};
 use adapters::stats::Stats;
+use app::airings::Airings;
 use app::control_worker;
 use app::driver::Driver;
+use app::frame_grab::{self, FrameGrabs, FrameWorker};
 use app::ports::{
-    ControlPlane, ControlQueue, GraphicsRenderer, Inbound, InputSource, InputSpec, Metrics, PhasePublisher,
-    Ports, ProgrammeOutput, TargetSpec,
+    ControlPlane, ControlQueue, FrameTap, FrameUpload, GraphicsRenderer, Inbound, InputSource, InputSpec,
+    Metrics, PhasePublisher, Ports, ProgrammeOutput, TargetSpec,
 };
 use crossbeam_channel::{bounded, Receiver, Sender};
+use domain::airings::{AiringLine, AiringSource, AiringStyle};
 use domain::cef_health::CefHealth;
 use domain::config::{OutputProfile, Thresholds};
 use domain::ladder::Rung;
 use domain::programme::{FrameChoice, ProgrammePhase};
 use domain::supervisor::{Event, SignalKind};
 use signal_hook::iterator::Signals;
-use testkit::fakes::{session_720p, CefKnob, FakeGraphics, FakeInput, FakeProgramme, Log, ScriptedPlane};
+use testkit::fakes::{
+    session_720p, CefKnob, FakeGraphics, FakeInput, FakeProgramme, FakeTap, Log, ScriptedPlane,
+    ScriptedUpload,
+};
 
 use crate::clock::Clock;
 use crate::env::{Drivers, Env, TestHooks};
@@ -353,15 +359,25 @@ pub fn assemble(
     }
 }
 
-/// The control plane for the mode, or the refusal's exit code (78, with its line: the token is never
-/// in it, `PlaneConfigError` carries no value).
-fn plane(env: &Env, t: &Thresholds, log: &Logger) -> Result<Box<dyn ControlPlane>, i32> {
+/// The control plane for the mode, and its frame uploader (R4 task SC2: web's frame endpoint, the
+/// same origin, session and token).
+struct Planes {
+    control: Box<dyn ControlPlane>,
+    frames: Box<dyn FrameUpload>,
+}
+
+/// The mode's `Planes`, or the refusal's exit code (78, with its line: the token is never in it,
+/// `PlaneConfigError` carries no value).
+fn plane(env: &Env, t: &Thresholds, log: &Logger) -> Result<Planes, i32> {
     let http = match env.drivers {
         Drivers::Live => true,
         Drivers::Fake => env.fake.control_http,
     };
     if !http {
-        return Ok(Box::new(ScriptedPlane::new(session_720p()).0));
+        return Ok(Planes {
+            control: Box::new(ScriptedPlane::new(session_720p()).0),
+            frames: Box::new(ScriptedUpload::new().0),
+        });
     }
     // Each request's bound is the beat interval: a beat never outlives the next one's turn. The final
     // beat's own is C07's FINAL_BEAT_TIMEOUT_MS.
@@ -371,7 +387,13 @@ fn plane(env: &Env, t: &Thresholds, log: &Logger) -> Result<Box<dyn ControlPlane
         env.job_token.clone(),
         t.heartbeat_interval_ms,
     ) {
-        Ok(p) => Ok(Box::new(p)),
+        Ok(p) => {
+            let frames = Box::new(p.frame_upload());
+            Ok(Planes {
+                control: Box::new(p),
+                frames,
+            })
+        }
         Err(e) => {
             log.error(&format!("control plane refused its configuration: {e}"));
             Err(78)
@@ -436,17 +458,33 @@ struct Media {
     stats: Arc<Stats>,
     /// CEF's child polls' PSS by kind, for the metrics' memory split (none with no CEF).
     cef: Option<CefMemory>,
+    /// R4 task SC2: the programme's frame tap, when the frame grabs are on (none when off: the
+    /// programme then has no probe at all).
+    tap: Option<Box<dyn FrameTap>>,
 }
 
-fn live_media(t: &Thresholds, tx: &Sender<Inbound>, log: &Logger, hooks: &TestHooks) -> Media {
+fn live_media(
+    t: &Thresholds,
+    tx: &Sender<Inbound>,
+    log: &Logger,
+    hooks: &TestHooks,
+    airings: &Airings,
+) -> Media {
     let frames = FrameStore::default();
     // First (Owed 53): its `new` installs the process's GStreamer log handler.
-    let graphics = CefGraphics::new(frames.clone(), tx.clone(), cef_fps(), t.cef_rss_cap_mb)
-        .with_log(log.adapter_sink());
+    let graphics = CefGraphics::new(
+        frames.clone(),
+        tx.clone(),
+        cef_fps(),
+        t.cef_rss_cap_mb,
+        airings.clone(),
+    )
+    .with_log(log.adapter_sink());
     arm_test_hooks(&graphics, hooks);
     let cef = graphics.memory();
     let mut programme = GstProgramme::new(frames.clone(), tx.clone()).with_log(log.adapter_sink());
     arm_programme_hooks(&mut programme, hooks);
+    let tap = programme_tap(&mut programme, airings.frames());
     let stats = programme.stats();
     let slot = ProfileSlot::default();
     let (input_tx, input_log, input_t) = (tx.clone(), log.clone(), t.clone());
@@ -462,6 +500,21 @@ fn live_media(t: &Thresholds, tx: &Sender<Inbound>, log: &Logger, hooks: &TestHo
         graphics: Box::new(graphics),
         stats,
         cef: Some(cef),
+        tap,
+    }
+}
+
+/// R4 task SC2: the programme's frame tap when the frame grabs are on, asked for before `start()`,
+/// which installs its probe (the programme is never rebuilt). Off, nothing is asked, so the programme
+/// has no probe at all. Public for a test of this decision alone (SC2 m7: `tests/wiring.rs`'s
+/// `the_programme_is_tapped_only_when_the_frame_grabs_are_on`, no GStreamer). That test does not see
+/// `live_media` call it: what kills a live media that never taps (W6) is the harness case
+/// sponsor-airings' `frame_posted` check, on CI (PR C final review, m1).
+pub fn programme_tap(programme: &mut GstProgramme, grabs: &FrameGrabs) -> Option<Box<dyn FrameTap>> {
+    if grabs.is_on() {
+        programme.frame_tap().map(|t| Box::new(t) as Box<dyn FrameTap>)
+    } else {
+        None
     }
 }
 
@@ -500,7 +553,30 @@ fn arm_programme_hooks(programme: &mut GstProgramme, hooks: &TestHooks) {
 #[cfg(not(feature = "test-hooks"))]
 fn arm_programme_hooks(_: &mut GstProgramme, _: &TestHooks) {}
 
-fn fake_media(env: &Env) -> Media {
+/// The moment id of the one sponsor line `COMPOSITOR_FAKE_SPONSOR_LINE` holds (fake mode).
+pub const FAKE_SPONSOR_MOMENT: &str = "1:sponsor.set_break";
+
+/// That line: a rotation start, as a live page logs one.
+fn fake_sponsor_line() -> Option<AiringLine> {
+    AiringLine::start(
+        FAKE_SPONSOR_MOMENT.to_owned(),
+        "0b8c2a3e-1f4d-4c6b-9a7e-5d2f8e1c3b4a".to_owned(),
+        AiringStyle::LowerThird,
+        AiringSource::Rotation,
+        Some("set_break".to_owned()),
+        "2026-10-31T12:00:00.000Z".to_owned(),
+    )
+    .ok()
+}
+
+/// The fake mode's media, over `airings`, the control worker's own handle (SC1 fix round 1, I3: the
+/// fake sponsor line goes where a live page's would).
+fn fake_media(env: &Env, airings: &Airings) -> Media {
+    if env.fake.sponsor_line {
+        if let Some(line) = fake_sponsor_line() {
+            airings.push(line);
+        }
+    }
     let calls = Log::default();
     let knob = CefKnob::default();
     if env.fake.zygote_gone {
@@ -518,7 +594,42 @@ fn fake_media(env: &Env) -> Media {
         graphics: Box::new(FakeGraphics(calls, knob)),
         stats: Arc::new(Stats::default()),
         cef: None,
+        tap: airings
+            .frames()
+            .is_on()
+            .then(|| Box::new(FakeTap::new().0) as Box<dyn FrameTap>),
     }
+}
+
+/// The sponsor airings' buffer `env` asks for (R4 task SC1; `RELAY_AIRINGS`), and the info line that
+/// says which: on, the live page's sponsor lines ride every beat; off, none does.
+pub fn sponsor_airings(env: &Env, log: &Logger) -> Airings {
+    let airings = if env.airings {
+        Airings::on()
+    } else {
+        Airings::off()
+    };
+    log.info(&format!(
+        "sponsor airings on the heartbeat: {}",
+        if airings.is_on() { "on" } else { "off" }
+    ));
+    airings
+}
+
+/// The sponsor frame grabs `env` asks for (R4 task SC2): on with the airings (`RELAY_AIRINGS`, the
+/// controller's ruling: one gate for both), on the process's clock, and the info line that says which.
+pub fn sponsor_frames(env: &Env, clock: &Arc<Clock>, log: &Logger) -> FrameGrabs {
+    let grabs = if env.airings {
+        let clock = Arc::clone(clock);
+        FrameGrabs::on(Arc::new(move || clock.now_ms()))
+    } else {
+        FrameGrabs::off()
+    };
+    log.info(&format!(
+        "sponsor frames: {}",
+        if grabs.is_on() { "on" } else { "off" }
+    ));
+    grabs
 }
 
 /// Builds every port for `env`'s mode and runs the loop; the process's exit code.
@@ -529,16 +640,41 @@ pub fn run(env: &Env, clock: &Arc<Clock>, log: &Logger, signals: Signals) -> i32
         log.error(&format!("signal handlers not installed: {e}"));
         return 70;
     }
-    let plane = match plane(env, &t, log) {
+    let Planes {
+        control: plane,
+        frames: frame_upload,
+    } = match plane(env, &t, log) {
         Ok(p) => p,
         Err(code) => return code,
     };
     let (phase, origin) = phase_endpoint(env, log);
-    let media = match env.drivers {
-        Drivers::Live => live_media(&t, &tx, log, &env.hooks),
-        Drivers::Fake => fake_media(env),
+    // The frame plan rides the airings handle before any clone of it is handed out.
+    let airings = sponsor_airings(env, log).with_frames(sponsor_frames(env, clock, log));
+    let mut media = match env.drivers {
+        Drivers::Live => live_media(&t, &tx, log, &env.hooks, &airings),
+        Drivers::Fake => fake_media(env, &airings),
     };
-    let control = control_worker::spawn(Box::new(LoggedPlane::new(plane, log.clone())), tx.clone());
+    // Kept to the end of `run`: dropping it ends the worker's thread.
+    let _frame_worker = match media.tap.take() {
+        Some(tap) => {
+            let worker = FrameWorker::new(airings.frames().clone(), tap, frame_upload, log.log_sink());
+            match frame_grab::spawn(worker) {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    log.warn(&format!(
+                        "sponsor frames: no worker thread ({e}); no frame is grabbed"
+                    ));
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let control = control_worker::spawn_with_airings(
+        Box::new(LoggedPlane::new(plane, log.clone())),
+        tx.clone(),
+        airings,
+    );
     let metrics = match media.cef {
         Some(cef) => ProcMetrics::new(media.stats).with_cef(move || cef.read()),
         None => ProcMetrics::new(media.stats),

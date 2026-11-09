@@ -10,6 +10,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use domain::airings::AiringBatch;
 use domain::cef_health::CefHealth;
 use domain::config::OutputProfile;
 use domain::health::HealthReport;
@@ -187,13 +188,19 @@ impl From<Desired> for Reply {
 
 /// A heartbeat's outcome when it is not a reply (amended 2026-10-18, wave gate 1 review I5;
 /// `docs/_INDEX.md` Owed 29). Only a 410 is `Gone`, on every beat, the final one included: web has
-/// ended the session (C08 maps it to `HeartbeatRefused(HeartbeatRefusal::Gone)`). Everything else,
-/// a 401, a 404, a 5xx, a reply that is not one, a network error or a timeout, is `Transport`
+/// ended the session (C08 maps it to `HeartbeatRefused(HeartbeatRefusal::Gone)`). A 400 or a 422 is
+/// `Refused`. Everything else, a 401, a 404, a 5xx, a reply that is not one, a network error or a
+/// timeout, is `Transport`
 /// (C08 maps it to `HeartbeatFailed`). The text is already redacted, and never carries the token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeartbeatError {
     Gone,
     Transport(String),
+    /// Web refused the beat's body: a 400 or a 422, its status kept (SC1 fix round 1, I2). The same
+    /// body is refused again, so the control worker drops the sponsor airings it carried (counted in
+    /// `airingsDropped`) instead of resending them until web calls the session lost. C08 maps it to
+    /// `HeartbeatFailed`, like `Transport`.
+    Refused(u16),
 }
 
 /// Values measured by adapters (absent ⇒ None ⇒ omitted on the wire, never sent as 0).
@@ -311,8 +318,20 @@ pub struct MemorySplit {
 pub trait ControlPlane: Send {
     fn fetch_session(&mut self) -> Result<SessionConfig, FetchError>;
     /// A report whose `exit` is `Some` is the final beat: one attempt, bounded by
-    /// `FINAL_BEAT_TIMEOUT_MS`. Its result is classified exactly like any other beat's.
-    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Reply, HeartbeatError>;
+    /// `FINAL_BEAT_TIMEOUT_MS`. Its result is classified exactly like any other beat's. `airings` is
+    /// the sponsor airings this beat carries (R4 task SC1; empty: the beat carries none, and no
+    /// `airings` key). Required of every plane, so a decorator cannot drop them by forgetting to pass
+    /// them on: the control worker calls this one alone.
+    fn heartbeat_with(
+        &mut self,
+        report: &HealthReport,
+        measured: &Measured,
+        airings: &AiringBatch,
+    ) -> Result<Reply, HeartbeatError>;
+    /// A beat that carries no airings.
+    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Reply, HeartbeatError> {
+        self.heartbeat_with(report, measured, &AiringBatch::default())
+    }
     /// A second instance for the final-beat lane (C08 review round 1, the coordinator's ruling), which
     /// the control worker runs on its own thread: its own connection, so a call in flight on this
     /// instance never holds a final beat up; and every credential this instance knows or LATER learns
@@ -394,6 +413,44 @@ pub trait PhasePublisher: Send {
 /// driver never logs either (C07 confirm pass; Owed 32).
 pub trait LogSink: Send {
     fn info(&mut self, line: &str);
+    /// A line a person should act on (R4 task SC2's frame worker: a frame dropped, said once). The
+    /// default writes it as `info`; C12's sink writes `level=warn`.
+    fn warn(&mut self, line: &str) {
+        self.info(line);
+    }
+}
+
+/// R4 task SC2 (spec 2026-10-27 §3.6.3): one programme frame, as the sponsor airing's proof. Only the
+/// frame worker's thread calls it, never the loop, and the programme never waits on it: the live tap
+/// (C09's programme) hands a frame over without blocking its streaming thread, and the copy and the
+/// encode happen on the caller's thread. It returns the next frame the programme composes after the
+/// call, as a JPEG at `FRAME_GRAB_SIZE` and `FRAME_GRAB_JPEG_QUALITY`, or why there is none; it waits
+/// at most `FRAME_GRAB_WAIT_MS` for the frame and `FRAME_ENCODE_WAIT_MS` for the JPEG. The text never
+/// carries a credential.
+pub trait FrameTap: Send {
+    fn grab(&mut self) -> Result<Vec<u8>, String>;
+}
+
+/// An upload attempt's failure (R4 task SC2, web's S9 frame endpoint), classified for
+/// `domain::frame_grab::after_upload`. The text is already redacted, and never carries the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameUploadError {
+    /// A 410: the session is gone.
+    Gone,
+    /// Any other status that is not a 2xx, 5xx or 410 (a 4xx, a redirect): web will not take this frame.
+    Refused(u16),
+    /// A 5xx, a network error or a timeout.
+    Failed(String),
+    /// The moment id cannot be one path segment of the URL (`domain::frame_grab::is_path_segment`):
+    /// nothing was sent. The plan never schedules such a grab; this is the uploader's own guard.
+    Unaddressable,
+}
+
+/// R4 task SC2: web's frame endpoint (task S9: `POST /api/internal/relay/sessions/{sid}/airings/
+/// {momentId}/frame`, `image/jpeg`, the session's job token as the bearer, answered 204). One attempt
+/// per call, bounded by `FRAME_UPLOAD_TIMEOUT_MS`; the frame worker decides any retry.
+pub trait FrameUpload: Send {
+    fn post_frame(&mut self, moment_id: &str, jpeg: &[u8]) -> Result<(), FrameUploadError>;
 }
 
 /// What the loop asks of the control worker. A `Heartbeat` whose report carries an `exit` is a final

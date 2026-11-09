@@ -32,6 +32,7 @@ use crossbeam_channel::{bounded, Receiver, Select, Sender, TryRecvError};
 use domain::health::{ExitDetail, HealthReport};
 use domain::supervisor::{Event, HeartbeatRefusal};
 
+use crate::airings::Airings;
 use crate::ports::{
     ControlPlane, ControlQueue, ControlRequest, FetchError, HeartbeatError, Inbound, Measured, Reply,
     SessionConfig,
@@ -137,8 +138,13 @@ impl ControlQueue for ControlHandle {
 }
 
 /// Starts the worker's two threads: `control` over `cp`, and `control-final` over
-/// `cp.final_lane()`. Their results go to `tx`.
+/// `cp.final_lane()`. Their results go to `tx`. No beat carries sponsor airings.
 pub fn spawn(cp: Box<dyn ControlPlane>, tx: Sender<Inbound>) -> ControlHandle {
+    spawn_with_airings(cp, tx, Airings::off())
+}
+
+/// `spawn`, with every beat carrying the sponsor airings `airings` holds (R4 task SC1; `post_beat`).
+pub fn spawn_with_airings(cp: Box<dyn ControlPlane>, tx: Sender<Inbound>, airings: Airings) -> ControlHandle {
     let (finals, finals_rx) = bounded(FINAL_SLOT);
     let (fetch, fetch_rx) = bounded(1);
     let (periodic, periodic_rx) = bounded(1);
@@ -148,12 +154,14 @@ pub fn spawn(cp: Box<dyn ControlPlane>, tx: Sender<Inbound>) -> ControlHandle {
         tx: tx.clone(),
         finals: finals_rx,
         posted: Arc::clone(&posted),
+        airings: airings.clone(),
     };
     let worker = Worker {
         cp,
         tx: tx.clone(),
         fetch: fetch_rx,
         periodic: periodic_rx.clone(),
+        airings,
     };
     for started in [
         thread::Builder::new()
@@ -190,6 +198,7 @@ struct FinalLane {
     tx: Sender<Inbound>,
     cp: Box<dyn ControlPlane>,
     posted: Arc<Posted>,
+    airings: Airings,
 }
 
 impl FinalLane {
@@ -227,7 +236,7 @@ impl FinalLane {
 
     /// Posts one final beat, acknowledges it for `flush`, and queues its result.
     fn post(&mut self, (h, m): Beat, unposted: &mut VecDeque<Inbound>) {
-        let r = self.cp.heartbeat(&h, &m);
+        let r = post_beat(&mut *self.cp, &self.airings, &h, &m);
         *locked(&self.posted.count) += 1;
         self.posted.cv.notify_all();
         unposted.push_back(replied(r));
@@ -245,6 +254,7 @@ struct Worker {
     tx: Sender<Inbound>,
     fetch: Receiver<()>,
     periodic: Receiver<Beat>,
+    airings: Airings,
 }
 
 impl Worker {
@@ -253,7 +263,7 @@ impl Worker {
             let (msg, edge) = match job {
                 Job::Fetch => (fetched(self.cp.fetch_session()), None),
                 Job::Periodic((h, m)) => {
-                    let r = self.cp.heartbeat(&h, &m);
+                    let r = post_beat(&mut *self.cp, &self.airings, &h, &m);
                     let edge = live_edge(&r);
                     (replied(r), edge)
                 }
@@ -297,6 +307,34 @@ impl Worker {
     }
 }
 
+/// One beat, periodic or final, with the sponsor airings held when it is posted (R4 task SC1; spec
+/// 2026-10-27 §3.6.2). The final beat is a beat like any other here, so it carries every line still
+/// held: that is its flush. A reply (C07's 200 with a heartbeat reply, the contract's 2xx) clears what
+/// this beat carried. Web refusing its body (`Refused`: a 400 or a 422) drops what it carried, counted
+/// in `airingsDropped`: the same body would be refused on every beat until web called the session
+/// lost (fix round 1, I2). A refused beat whose one airings key was `airingsDropped` turns the airings
+/// off for the process, so no later beat carries either key (PR C final review, I1: a web rolled back
+/// past the keys refuses every beat that carries them). Any other outcome (a 5xx, a transport error, a
+/// 410) keeps it for the next beat. A line pushed while the call was in flight stays whatever the
+/// outcome.
+fn post_beat(
+    cp: &mut dyn ControlPlane,
+    airings: &Airings,
+    h: &HealthReport,
+    m: &Measured,
+) -> Result<Reply, HeartbeatError> {
+    let batch = airings.for_beat();
+    let r = cp.heartbeat_with(h, m, &batch);
+    match &r {
+        Ok(_) => airings.ack_2xx(&batch),
+        Err(HeartbeatError::Refused(_)) => {
+            airings.drop_refused(&batch);
+        }
+        Err(HeartbeatError::Transport(_) | HeartbeatError::Gone) => {}
+    }
+    r
+}
+
 fn fetched(r: Result<SessionConfig, FetchError>) -> Inbound {
     match r {
         Ok(cfg) => Inbound::Session(cfg),
@@ -310,7 +348,7 @@ fn replied(r: Result<Reply, HeartbeatError>) -> Inbound {
     Inbound::Event(match r {
         Ok(reply) => Event::HeartbeatReply(reply.desired),
         Err(HeartbeatError::Gone) => Event::HeartbeatRefused(HeartbeatRefusal::Gone),
-        Err(HeartbeatError::Transport(_)) => Event::HeartbeatFailed,
+        Err(HeartbeatError::Transport(_) | HeartbeatError::Refused(_)) => Event::HeartbeatFailed,
     })
 }
 

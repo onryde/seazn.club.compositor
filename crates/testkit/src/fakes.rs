@@ -9,10 +9,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use app::ports::{
-    redacted_origin, ControlPlane, ControlQueue, ControlRequest, FetchError, GraphicsRenderer,
-    HeartbeatError, Inbound, InputSource, InputSpec, LogSink, Measured, Metrics, PhasePublisher, Ports,
-    ProgrammeOutput, Reply, SessionConfig, TargetSpec,
+    redacted_origin, ControlPlane, ControlQueue, ControlRequest, FetchError, FrameTap, FrameUpload,
+    FrameUploadError, GraphicsRenderer, HeartbeatError, Inbound, InputSource, InputSpec, LogSink, Measured,
+    Metrics, PhasePublisher, Ports, ProgrammeOutput, Reply, SessionConfig, TargetSpec,
 };
+use domain::airings::AiringBatch;
 use domain::cef_health::CefHealth;
 use domain::config::OutputProfile;
 use domain::health::HealthReport;
@@ -323,6 +324,9 @@ pub enum PlaneCall {
     Fetched,
     BeatStarted(HealthReport),
     Beat(HealthReport, Measured),
+    /// The sponsor airings a beat carried (R4 task SC1), recorded just before that beat's `Beat`, in
+    /// one step with it; absent when the beat carried neither key (no line, nothing dropped).
+    Airings(AiringBatch),
 }
 
 /// The scripted plane's record, readable from the test while the worker owns the plane.
@@ -345,8 +349,35 @@ impl PlaneLog {
             .collect()
     }
 
+    /// Every completed heartbeat's report and the airings it carried (empty when it carried none), in
+    /// order.
+    pub fn beat_airings(&self) -> Vec<(HealthReport, AiringBatch)> {
+        let calls = locked(&self.0);
+        let mut out = Vec::new();
+        for (i, c) in calls.iter().enumerate() {
+            if let PlaneCall::Beat(h, _) = c {
+                let carried = match i.checked_sub(1).map(|j| &calls[j]) {
+                    Some(PlaneCall::Airings(b)) => b.clone(),
+                    _ => AiringBatch::default(),
+                };
+                out.push((h.clone(), carried));
+            }
+        }
+        out
+    }
+
     fn push(&self, c: PlaneCall) {
         locked(&self.0).push(c);
+    }
+
+    /// A completed beat, with the airings it carried when it carried any, in one step: a beat of the
+    /// other lane cannot land between the two.
+    fn push_beat(&self, beat: PlaneCall, airings: &AiringBatch) {
+        let mut calls = locked(&self.0);
+        if !airings.carries_nothing() {
+            calls.push(PlaneCall::Airings(airings.clone()));
+        }
+        calls.push(beat);
     }
 
     /// Waits until `pred` holds over the calls, polling every 2 ms, for at most `timeout`. A bounded
@@ -458,11 +489,17 @@ impl ControlPlane for ScriptedPlane {
         r
     }
 
-    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Reply, HeartbeatError> {
+    fn heartbeat_with(
+        &mut self,
+        report: &HealthReport,
+        measured: &Measured,
+        airings: &AiringBatch,
+    ) -> Result<Reply, HeartbeatError> {
         self.log.push(PlaneCall::BeatStarted(report.clone()));
         let (delay, result) = (locked(&self.script).reply)(report);
         thread::sleep(delay);
-        self.log.push(PlaneCall::Beat(report.clone(), measured.clone()));
+        self.log
+            .push_beat(PlaneCall::Beat(report.clone(), measured.clone()), airings);
         result
     }
 
@@ -471,5 +508,144 @@ impl ControlPlane for ScriptedPlane {
             script: Arc::clone(&self.script),
             log: self.log.clone(),
         })
+    }
+}
+
+/// A JPEG's markers alone (SOI, a JFIF APP0 segment, EOI): the magic bytes web's frame endpoint checks
+/// first (S9), not a picture. `FakeTap`'s frame unless a test scripts another, and the fake mode's.
+pub const FAKE_FRAME_JPEG: &[u8] = &[
+    0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00,
+    0x01, 0x00, 0x00, 0xFF, 0xD9,
+];
+
+/// The grabs a `FakeTap` was asked for, readable after the tap moved into a worker.
+#[derive(Debug, Clone, Default)]
+pub struct TapLog(Arc<AtomicU64>);
+
+impl TapLog {
+    pub fn grabs(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// R4 task SC2's `FrameTap`: answers each grab from its script in order, then `FAKE_FRAME_JPEG` for
+/// ever; counts every grab.
+#[derive(Debug)]
+pub struct FakeTap {
+    answers: VecDeque<Result<Vec<u8>, String>>,
+    log: TapLog,
+}
+
+impl FakeTap {
+    pub fn new() -> (Self, TapLog) {
+        let log = TapLog::default();
+        (
+            Self {
+                answers: VecDeque::new(),
+                log: log.clone(),
+            },
+            log,
+        )
+    }
+
+    /// The first grabs' answers, in order.
+    pub fn answers(mut self, answers: Vec<Result<Vec<u8>, String>>) -> Self {
+        self.answers = answers.into();
+        self
+    }
+}
+
+impl FrameTap for FakeTap {
+    fn grab(&mut self) -> Result<Vec<u8>, String> {
+        self.log.0.fetch_add(1, Ordering::SeqCst);
+        self.answers
+            .pop_front()
+            .unwrap_or_else(|| Ok(FAKE_FRAME_JPEG.to_vec()))
+    }
+}
+
+/// One upload attempt a `ScriptedUpload` saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadCall {
+    pub moment_id: String,
+    pub jpeg: Vec<u8>,
+}
+
+/// A `ScriptedUpload`'s record: each attempt as it begins.
+#[derive(Debug, Clone, Default)]
+pub struct UploadLog(Arc<Mutex<Vec<UploadCall>>>);
+
+impl UploadLog {
+    pub fn calls(&self) -> Vec<UploadCall> {
+        locked(&self.0).clone()
+    }
+
+    /// The moment ids, one per attempt, in order.
+    pub fn moments(&self) -> Vec<String> {
+        locked(&self.0).iter().map(|c| c.moment_id.clone()).collect()
+    }
+
+    /// Waits until at least `n` attempts began, polling every 2 ms, for at most `timeout`.
+    pub fn wait_for(&self, n: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if locked(&self.0).len() >= n {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+type UploadAnswer = Box<dyn FnMut(usize) -> Result<(), FrameUploadError> + Send>;
+
+/// R4 task SC2's `FrameUpload`: records each attempt as it begins, then answers from its script, called
+/// with the attempt's index over the whole run (0 first; it may block, as a hung upload does). The
+/// default answers `Ok` (S9's 204) at once.
+pub struct ScriptedUpload {
+    log: UploadLog,
+    answer: UploadAnswer,
+}
+
+impl fmt::Debug for ScriptedUpload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScriptedUpload")
+            .field("attempts", &locked(&self.log.0).len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ScriptedUpload {
+    pub fn new() -> (Self, UploadLog) {
+        let log = UploadLog::default();
+        (
+            Self {
+                log: log.clone(),
+                answer: Box::new(|_| Ok(())),
+            },
+            log,
+        )
+    }
+
+    pub fn answer(mut self, f: impl FnMut(usize) -> Result<(), FrameUploadError> + Send + 'static) -> Self {
+        self.answer = Box::new(f);
+        self
+    }
+}
+
+impl FrameUpload for ScriptedUpload {
+    fn post_frame(&mut self, moment_id: &str, jpeg: &[u8]) -> Result<(), FrameUploadError> {
+        let n = {
+            let mut calls = locked(&self.log.0);
+            calls.push(UploadCall {
+                moment_id: moment_id.to_owned(),
+                jpeg: jpeg.to_vec(),
+            });
+            calls.len() - 1
+        };
+        (self.answer)(n)
     }
 }

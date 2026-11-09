@@ -6587,10 +6587,14 @@ fn the_blank_page_sweep_reds_a_false_reload_and_an_unpainted_page_on_both_paths(
     assert_eq!(checked, 6);
 }
 
-/// The case files that are not chaos cases, each run by hand from harness.yml: C13's smoke case
-/// (the harness's own end-to-end run) and Owed 81's two probe controls (F-029). The same list is in
-/// chaos_table.rs.
-const NOT_CHAOS: [&str; 3] = ["smoke", "owed81-noaudio", "owed81-align1"];
+/// The case files that are not chaos cases, each run from harness.yml: C13's smoke case (the
+/// harness's own end-to-end run), Owed 81's two probe controls (F-029), and R4 SC1's sponsor-airings
+/// case. The same list is in chaos_table.rs.
+const NOT_CHAOS: [&str; 4] = ["smoke", "owed81-noaudio", "owed81-align1", "sponsor-airings"];
+
+/// The NOT_CHAOS cases that are runs of their own, not one of smoke's controls (harness.yml runs both
+/// on every pull request).
+const NOT_CHAOS_RUNS: [&str; 2] = ["smoke", "sponsor-airings"];
 
 /// Every case file in harness/cases has a test here: a new case cannot ship unjudged.
 #[test]
@@ -6676,7 +6680,7 @@ fn every_not_chaos_control_drives_what_smoke_drives() {
         }
     };
     let mut checked = 0;
-    for case in NOT_CHAOS.iter().filter(|c| **c != "smoke") {
+    for case in NOT_CHAOS.iter().filter(|c| !NOT_CHAOS_RUNS.contains(c)) {
         let mut want: Vec<String> = smoke.lines().map(str::to_owned).collect();
         want.push(allowed(case).to_owned());
         let got: Vec<String> = drive(case).lines().map(str::to_owned).collect();
@@ -6684,7 +6688,8 @@ fn every_not_chaos_control_drives_what_smoke_drives() {
         checked += 1;
     }
     eprintln!("not-chaos controls checked against smoke's drive and stack: {checked}");
-    assert_eq!(checked, NOT_CHAOS.len() - 1);
+    assert_eq!(checked, NOT_CHAOS.len() - NOT_CHAOS_RUNS.len());
+    assert_eq!(checked, 2, "Owed 81's two controls");
 }
 
 /// Each `$t.<key>` a verdict filter reads (lib.jq, every case file, run-case.sh) and each
@@ -6987,4 +6992,291 @@ fn stays_on_air_reds_a_page_that_leaves_after_coming_back_in_every_leg_with_a_ba
         json!(0),
         "sty-empty"
     );
+}
+
+/// R4 SC1 fix round 1 (I3 c): the sponsor-airings case's run. The page logs its card's start 600 ms
+/// after fake-control serves the arming and its end 3 s later; the next beat after each carries it
+/// (with `airingsDropped: 0`), once. R4 SC2: fake-control received the card's frame 1.5 s after the
+/// start, once, a whole JPEG. `edit` changes the world before it is judged.
+fn sponsor_airings(edit: impl Fn(&mut World, i64, i64)) -> World {
+    let mut w = World::new(30);
+    let armed = w.at(5.0);
+    w.mark("armed", armed, json!({"page_sponsor_armed": true}));
+    w.control_state["page_sponsor_armed"] = json!(false);
+    w.control_state["page_sponsor_served_ms"] = json!(armed + 400);
+    let (start, end) = (armed + 1_000, armed + 4_000);
+    w.control_state["frames_posted"] = json!(1);
+    w.control_state["frames"] = json!([{"moment_segment": "harness-sponsor-1", "bytes": 21_734,
+        "jpeg": true, "received_ms": start + 1_520}]);
+    let start_line = json!({"kind": "start", "momentId": "harness-sponsor-1",
+        "cardId": "0b8c2a3e-1f4d-4c6b-9a7e-5d2f8e1c3b4a", "style": "lower_third",
+        "source": "rotation", "breakKind": null, "at": stamps(start).1});
+    let end_line = json!({"kind": "end", "momentId": "harness-sponsor-1", "at": stamps(end).1,
+        "cutShort": false});
+    for (at, line) in [(start, start_line), (end, end_line)] {
+        let (_, body) = w
+            .beats
+            .iter_mut()
+            .find(|(b, body)| *b > at && body["state"] == "playing")
+            .expect("a beat after the line");
+        match body["airings"].as_array_mut() {
+            Some(lines) => lines.push(line),
+            None => body["airings"] = json!([line]),
+        }
+        body["airingsDropped"] = json!(0);
+    }
+    edit(&mut w, start, end);
+    w
+}
+
+/// The card's `kind` line, wherever its beat is, changed by `f`.
+fn card_line(w: &mut World, kind: &str, f: impl Fn(&mut Value)) {
+    let mut found = 0;
+    for (_, body) in &mut w.beats {
+        if let Some(lines) = body.get_mut("airings").and_then(Value::as_array_mut) {
+            for l in lines.iter_mut().filter(|l| l["kind"] == kind) {
+                f(l);
+                found += 1;
+            }
+        }
+    }
+    assert_eq!(found, 1, "the card's {kind} line");
+}
+
+/// Each judged check the case declares reds on a world that breaks it: a resent start, a missing end,
+/// a dropped count, airings off, an unarmed card, an armed one never served, a cut-short end, an end
+/// stamped before its start or received on an earlier beat, a foreign line, a non-zero exit or a
+/// compositor still running, a restart, a stopped beat for another reason or a last beat not stopped,
+/// and (R4 SC2) no frame, two frames, a cut JPEG, another moment's, one past web's bound, and one that
+/// came before the 1.5 s delay or after the card's end.
+#[test]
+fn sponsor_airings_relays_the_cards_start_and_end_once_and_reds_each_way_it_can_go_wrong() {
+    let good = judge(&sponsor_airings(|_, _, _| {}), "sponsor-airings", "", "sa-good");
+    assert_pass(&good, "sa-good");
+    // SC2 polish (m8): the frame's receipt, moved; on either edge of the card's air time it passes.
+    let at = |edit: fn(i64, i64) -> i64| {
+        sponsor_airings(move |w, start, end| {
+            w.control_state["frames"][0]["received_ms"] = json!(edit(start, end));
+        })
+    };
+    for (tag, w) in [
+        ("sa-frame-at-delay", at(|start, _| start + 1_500)),
+        ("sa-frame-at-end", at(|_, end| end)),
+    ] {
+        assert_pass(&judge(&w, "sponsor-airings", "", tag), tag);
+    }
+    // A line on two beats: the 2xx did not clear it.
+    let resent = sponsor_airings(|w, start, _| {
+        let first = w
+            .beats
+            .iter()
+            .find(|(b, _)| *b > start)
+            .map(|(_, body)| body["airings"].clone())
+            .unwrap();
+        let (_, next) = w
+            .beats
+            .iter_mut()
+            .find(|(b, body)| *b > start && body.get("airings").is_none() && body["state"] == "playing")
+            .unwrap();
+        next["airings"] = first;
+        next["airingsDropped"] = json!(0);
+    });
+    let mut checked = 0;
+    let frame = |edit: fn(&mut Value)| sponsor_airings(move |w, _, _| edit(&mut w.control_state));
+    let reds: [(&str, World, &str); 22] = [
+        ("sa-resent", resent, "start_relayed_once"),
+        (
+            "sa-no-end",
+            sponsor_airings(|w, _, end| {
+                w.beats_in(end, i64::MAX, |b| {
+                    if let Some(o) = b.as_object_mut() {
+                        o.remove("airings");
+                        o.remove("airingsDropped");
+                    }
+                });
+            }),
+            "end_relayed_once",
+        ),
+        (
+            "sa-dropped",
+            sponsor_airings(|w, _, end| {
+                w.beats_in(end + 6_000, i64::MAX, |b| b["airingsDropped"] = json!(1))
+            }),
+            "none_dropped",
+        ),
+        (
+            "sa-off",
+            sponsor_airings(|w, _, _| {
+                w.beats_in(i64::MIN, i64::MAX, |b| {
+                    if let Some(o) = b.as_object_mut() {
+                        o.remove("airings");
+                        o.remove("airingsDropped");
+                    }
+                });
+            }),
+            "start_relayed_once",
+        ),
+        (
+            "sa-unarmed",
+            sponsor_airings(|w, _, _| {
+                w.marks.clear();
+                w.control_state["page_sponsor_served_ms"] = Value::Null;
+            }),
+            "armed",
+        ),
+        // Armed, but the page never polled it: fake-control never served the card.
+        (
+            "sa-unserved",
+            sponsor_airings(|w, _, _| w.control_state["page_sponsor_served_ms"] = Value::Null),
+            "sponsor_served",
+        ),
+        // The end says the card was cut short: not the page's own end.
+        (
+            "sa-cut-short",
+            sponsor_airings(|w, _, _| card_line(w, "end", |l| l["cutShort"] = json!(true))),
+            "end_relayed_once",
+        ),
+        // The end is stamped before the start.
+        (
+            "sa-end-first",
+            sponsor_airings(|w, start, _| {
+                card_line(w, "end", |l| l["at"] = json!(stamps(start - 1_000).1));
+            }),
+            "end_after_start",
+        ),
+        // The final review's SC1 #5: the end's stamps are in order, but its beat came before the
+        // start's (the end moved to the last beat at or before the start).
+        (
+            "sa-end-beat-first",
+            sponsor_airings(|w, start, end| {
+                let line = {
+                    let (_, body) = w
+                        .beats
+                        .iter_mut()
+                        .find(|(b, body)| *b > end && body["state"] == "playing")
+                        .unwrap();
+                    let line = body["airings"].as_array_mut().unwrap().pop().unwrap();
+                    if body["airings"].as_array().is_some_and(Vec::is_empty) {
+                        let o = body.as_object_mut().unwrap();
+                        o.remove("airings");
+                        o.remove("airingsDropped");
+                    }
+                    line
+                };
+                assert_eq!(line["kind"], "end", "the end's beat carries the end last");
+                let (_, earlier) = w
+                    .beats
+                    .iter_mut()
+                    .rev()
+                    .find(|(b, body)| *b <= start && body["state"] == "playing")
+                    .unwrap();
+                earlier["airings"] = json!([line]);
+                earlier["airingsDropped"] = json!(0);
+            }),
+            "end_after_start",
+        ),
+        // A line the page never logged rides beside the card's start.
+        (
+            "sa-foreign",
+            sponsor_airings(|w, _, _| {
+                let (_, body) = w
+                    .beats
+                    .iter_mut()
+                    .find(|(_, b)| b.get("airings").is_some())
+                    .unwrap();
+                body["airings"].as_array_mut().unwrap().push(json!({"kind": "end",
+                    "momentId": "another-moment", "at": "2026-10-24T12:00:09.000Z", "cutShort": true}));
+            }),
+            "only_the_card",
+        ),
+        // The run did not end as asked: a non-zero exit, a restart, a stopped beat for another reason.
+        (
+            "sa-exit-1",
+            sponsor_airings(|w, _, _| w.run_patch = Some(|r| r["compositor"]["exit_code"] = json!(1))),
+            "compositor_exit",
+        ),
+        // SC1 #5: the exit code reads 0, but the compositor never exited.
+        (
+            "sa-still-running",
+            sponsor_airings(|w, _, _| w.run_patch = Some(|r| r["compositor"]["status"] = json!("running"))),
+            "compositor_exit",
+        ),
+        (
+            "sa-restarted",
+            sponsor_airings(|w, _, _| w.run_patch = Some(|r| r["compositor"]["restarts"] = json!(1))),
+            "no_restarts",
+        ),
+        (
+            "sa-fatal",
+            sponsor_airings(|w, _, _| {
+                w.run_patch = Some(|r| r["last_beat"]["exitReason"] = json!("fatal"));
+            }),
+            "ended_beat",
+        ),
+        // SC1 #5: the last beat says "ended", but it is not a stopped beat.
+        (
+            "sa-not-stopped",
+            sponsor_airings(|w, _, _| {
+                w.run_patch = Some(|r| r["last_beat"]["state"] = json!("playing"));
+            }),
+            "ended_beat",
+        ),
+        // R4 SC2: the frame never came, came twice, came cut, came for another moment, or came
+        // larger than web takes.
+        (
+            "sa-no-frame",
+            frame(|c| {
+                c["frames_posted"] = json!(0);
+                c["frames"] = json!([]);
+            }),
+            "frame_posted",
+        ),
+        (
+            "sa-two-frames",
+            frame(|c| c["frames_posted"] = json!(2)),
+            "frame_posted",
+        ),
+        (
+            "sa-cut-frame",
+            frame(|c| c["frames"][0]["jpeg"] = json!(false)),
+            "frame_posted",
+        ),
+        (
+            "sa-other-frame",
+            frame(|c| c["frames"][0]["moment_segment"] = json!("another-moment")),
+            "frame_posted",
+        ),
+        (
+            "sa-big-frame",
+            frame(|c| c["frames"][0]["bytes"] = json!(262_145)),
+            "frame_posted",
+        ),
+        // SC2 polish (m8): a frame 1 ms inside the delay (`FRAME_GRAB_DELAY_MS`), or 1 ms after the
+        // card's end.
+        ("sa-early-frame", at(|start, _| start + 1_499), "frame_posted"),
+        ("sa-late-frame", at(|_, end| end + 1), "frame_posted"),
+    ];
+    for (tag, w, check) in &reds {
+        assert_fails(&judge(w, "sponsor-airings", "", tag), check, tag);
+        checked += 1;
+    }
+    eprintln!("sponsor-airings reds checked: {checked}");
+    assert_eq!(checked, reds.len());
+    // Every judged check the case declares has a red world here (the final review's SC1 #4): the
+    // checks are read off the good run's PASS lines, one per `require` and `require_run` (its measure
+    // prints MEASURE), so a check added to the case reds this until it has a red of its own.
+    let mut judged: Vec<&str> = good
+        .lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("PASS "))
+        .filter_map(|l| l.split([':', ' ']).next())
+        .collect();
+    judged.sort_unstable();
+    judged.dedup();
+    let mut named: Vec<&str> = reds.iter().map(|r| r.2).collect();
+    named.sort_unstable();
+    named.dedup();
+    eprintln!("sponsor-airings judged checks, each with a red: {}", judged.len());
+    assert!(!judged.is_empty(), "the good run printed no PASS line");
+    assert_eq!(named, judged, "the reds' checks are the case's judged checks");
 }

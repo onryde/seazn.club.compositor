@@ -132,6 +132,7 @@ fn fake_knobs_parse_in_fake_mode_only() {
     m.insert(env::COMPOSITOR_FAKE_CONTROL, "http".to_owned());
     m.insert(env::COMPOSITOR_FAKE_START_FAIL, "boom".to_owned());
     m.insert(env::COMPOSITOR_FAKE_ZYGOTE_GONE, "1".to_owned());
+    m.insert(env::COMPOSITOR_FAKE_SPONSOR_LINE, "1".to_owned());
     let live = parse(&m, true).unwrap();
     assert_eq!(live.fake, env::FakeKnobs::default(), "a live run ignores them");
     m.insert(env::COMPOSITOR_DRIVERS, "fake".to_owned());
@@ -139,14 +140,56 @@ fn fake_knobs_parse_in_fake_mode_only() {
     assert!(fake.control_http);
     assert_eq!(fake.start_fail.as_deref(), Some("boom"));
     assert!(fake.zygote_gone);
+    assert!(fake.sponsor_line);
+    for (key, off) in [("0", false), ("", false)] {
+        let mut b = m.clone();
+        b.insert(env::COMPOSITOR_FAKE_SPONSOR_LINE, key.to_owned());
+        assert_eq!(parse(&b, true).unwrap().fake.sponsor_line, off, "{key:?}");
+    }
     for (key, bad) in [
         (env::COMPOSITOR_FAKE_CONTROL, "https"),
         (env::COMPOSITOR_FAKE_ZYGOTE_GONE, "yes"),
+        (env::COMPOSITOR_FAKE_SPONSOR_LINE, "yes"),
     ] {
         let mut b = m.clone();
         b.insert(key, bad.to_owned());
         assert_eq!(parse(&b, true).err(), Some(EnvError::Invalid(key)), "{key}={bad}");
     }
+}
+
+/// R4 task SC1: `RELAY_AIRINGS` turns the sponsor airings on, in either mode. Unset (every host that
+/// passes only R1's four keys, ADR 0007), empty or `0` leaves them off; `1` turns them on; anything
+/// else is refused (78), so a typo never silently leaves them off.
+#[test]
+fn relay_airings_is_off_unless_set_to_1() {
+    let mut checked = 0;
+    for drivers in ["live", "fake"] {
+        let mut m = base();
+        m.insert(env::COMPOSITOR_DRIVERS, drivers.to_owned());
+        assert!(!parse(&m, true).unwrap().airings, "{drivers}: unset is off");
+        checked += 1;
+        for (value, want) in [("", Some(false)), ("0", Some(false)), ("1", Some(true))] {
+            m.insert(env::RELAY_AIRINGS, value.to_owned());
+            assert_eq!(
+                parse(&m, true).ok().map(|e| e.airings),
+                want,
+                "{drivers}: {value:?}"
+            );
+            checked += 1;
+        }
+        for bad in ["true", "on", "yes", "2", " 1", "1 ", "01"] {
+            m.insert(env::RELAY_AIRINGS, bad.to_owned());
+            assert_eq!(
+                parse(&m, true).err(),
+                Some(EnvError::Invalid(env::RELAY_AIRINGS)),
+                "{drivers}: {bad:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(env::RELAY_AIRINGS, "RELAY_AIRINGS");
+    eprintln!("RELAY_AIRINGS values checked: {checked}");
+    assert_eq!(checked, 22);
 }
 
 /// `Env`'s `Debug` never prints the token.

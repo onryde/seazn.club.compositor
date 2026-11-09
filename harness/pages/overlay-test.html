@@ -30,6 +30,13 @@
          real page keeps (R2005's line form). After `stale_after_ms` with no good /score.json answer
          the page logs `seazn:score-stale=true` once, and `seazn:score-stale=false` on the next good
          answer (case 7, score-down). Until fake-control has answered, no stale line is logged.
+       - `sponsor: true`, once, after `POST /control/page-sponsor` (R4 SC1, sponsor-airings): the
+         page logs one sponsor card's start line now and its end line SPONSOR_SHOWN_MS later, in
+         the page contract's form (spec 2026-10-27 §3.6.1: `seazn:sponsor:start {…}` and
+         `seazn:sponsor:end {…}`, keys in the spec's order; the compositor's
+         crates/adapters/src/sponsor_line.rs reads them). The moment is SPONSOR_MOMENT, which the
+         case's verdict reads back from the beats. Like the hang, a query switch cannot reach this
+         page, so the knob is fake-control's.
 
      What it says, on F-001's console channel (console.info, read from the `cefconsole` log
      category; never window.gstSendMsg, whose js-signal mode hangs start() and set_state(NULL)):
@@ -91,6 +98,25 @@
     requestAnimationFrame(tick);
   }
   if (q.get("static") !== "1") requestAnimationFrame(tick);
+
+  // R4 SC1: the sponsor card fake-control arms (the header's `sponsor`).
+  const SPONSOR_MOMENT = "harness-sponsor-1";
+  const SPONSOR_SHOWN_MS = 3000;
+  function sponsorCard() {
+    console.info("seazn:sponsor:start " + JSON.stringify({
+      momentId: SPONSOR_MOMENT,
+      cardId: "0b8c2a3e-1f4d-4c6b-9a7e-5d2f8e1c3b4a",
+      style: "lower_third",
+      source: "rotation",
+      breakKind: null,
+      at: new Date().toISOString(),
+    }));
+    setTimeout(() => console.info("seazn:sponsor:end " + JSON.stringify({
+      momentId: SPONSOR_MOMENT,
+      at: new Date().toISOString(),
+      cutShort: false,
+    })), SPONSOR_SHOWN_MS);
+  }
 
   function busy(ms) {
     // `ms` absent: the hang never ends.
@@ -183,6 +209,7 @@
         const c = await r.json();
         if (typeof c.stale_after_ms === "number") staleAfter = c.stale_after_ms;
         if (typeof c.poll_ms === "number" && c.poll_ms > 0) pollMs = c.poll_ms;
+        if (c.sponsor === true) sponsorCard();
         if (c.hang === true) {
           console.warn("hang starts");
           busy(null);

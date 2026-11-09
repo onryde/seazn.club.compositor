@@ -22,10 +22,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use app::ports::{
-    redacted_origin, ControlPlane, FetchError, HeartbeatError, InputSpec, Measured, Reply, SessionConfig,
-    TargetSpec, FINAL_BEAT_TIMEOUT_MS,
+    redacted_origin, ControlPlane, FetchError, FrameUpload, FrameUploadError, HeartbeatError, InputSpec,
+    Measured, Reply, SessionConfig, TargetSpec, FINAL_BEAT_TIMEOUT_MS,
 };
-use domain::config::OutputProfile;
+use domain::airings::{AiringBatch, AiringLine};
+use domain::config::{OutputProfile, FRAME_UPLOAD_TIMEOUT_MS};
+use domain::frame_grab::is_path_segment;
 use domain::health::{BeatState, ExitDetail, GraphicsStatus, HealthReport, LinkStatus, PhaseChannel};
 use domain::ladder::Rung;
 use domain::lifecycle::ExitReason;
@@ -34,6 +36,7 @@ use domain::supervisor::{Desired, Refusal};
 use serde_json::{Map, Value};
 
 use crate::redact::Scrubber;
+use crate::sponsor_line::{source_word, style_word};
 
 /// The contract's `maximum` on every integer it declares (2^53 − 1, the largest integer a JSON
 /// number carries exactly; `relay-job.v1.json`). A counter is written at most at it: a larger value
@@ -144,12 +147,17 @@ fn fps_wire(x: Option<f64>) -> Option<Value> {
 /// each `Measured` field until an adapter measures it, and `exitReason` / `exitDetail` on every beat
 /// but a `Stopped` one with an exit.
 pub fn heartbeat_wire(report: &HealthReport, measured: &Measured) -> Value {
-    wire(report, measured, &Scrubber::default())
+    heartbeat_wire_with(report, measured, &AiringBatch::default())
+}
+
+/// `heartbeat_wire`, carrying `airings` (R4 task SC1).
+pub fn heartbeat_wire_with(report: &HealthReport, measured: &Measured, airings: &AiringBatch) -> Value {
+    wire(report, measured, airings, &Scrubber::default())
 }
 
 /// `heartbeat_wire`, with `exitDetail` scrubbed of the values `scrubber` knows before it is
 /// redacted and capped (the cap comes last, so it never leaves a part of a value behind).
-fn wire(report: &HealthReport, measured: &Measured, scrubber: &Scrubber) -> Value {
+fn wire(report: &HealthReport, measured: &Measured, airings: &AiringBatch, scrubber: &Scrubber) -> Value {
     let mut m = Map::new();
     let mut put = |k: &str, v: Value| {
         m.insert(k.to_owned(), v);
@@ -195,6 +203,17 @@ fn wire(report: &HealthReport, measured: &Measured, scrubber: &Scrubber) -> Valu
     if let Some(n) = measured.mem_mb {
         put("memMb", int(n));
     }
+    // R4 task SC1: the sponsor airings, only when the beat carries some (off, it never does). The
+    // buffer's dropped total rides beside them, 0 included (a measured zero), and alone on a beat with
+    // no line once it is above 0 (fix round 1, m2): a total for the process, and an upper bound. Web
+    // refusing a beat that carried it alone shuts the buffer, and no later beat carries either key (PR
+    // C final review, I1; `AiringBuffer::drop_refused`).
+    if !airings.is_empty() {
+        put("airings", airings.lines().iter().map(airing_wire).collect());
+    }
+    if !airings.carries_nothing() {
+        put("airingsDropped", airings.dropped().into());
+    }
     // The exit keys ride only a `stopped` beat (the contract's if/then; web answers 400 otherwise).
     if let (BeatState::Stopped, Some(exit)) = (report.state, &report.exit) {
         put("exitReason", exit_reason_wire(exit.reason).into());
@@ -205,6 +224,34 @@ fn wire(report: &HealthReport, measured: &Measured, scrubber: &Scrubber) -> Valu
             .collect();
         if !detail.is_empty() {
             put("exitDetail", detail.into());
+        }
+    }
+    Value::Object(m)
+}
+
+/// One airing as web's S8 reads it (`RelayAiring`, a union tagged by `kind`, strict): the page's
+/// keys, `kind` first, `breakKind` null for a scene. The ids are sent as the page logged them (no
+/// scrubber: web upserts on the moment id, and the page's ids hold no credential).
+fn airing_wire(line: &AiringLine) -> Value {
+    let mut m = Map::new();
+    match line {
+        AiringLine::Start(s) => {
+            m.insert("kind".to_owned(), "start".into());
+            m.insert("momentId".to_owned(), s.moment_id().into());
+            m.insert("cardId".to_owned(), s.card_id().into());
+            m.insert("style".to_owned(), style_word(s.style()).into());
+            m.insert("source".to_owned(), source_word(s.source()).into());
+            m.insert(
+                "breakKind".to_owned(),
+                s.break_kind().map_or(Value::Null, Value::from),
+            );
+            m.insert("at".to_owned(), s.at().into());
+        }
+        AiringLine::End(e) => {
+            m.insert("kind".to_owned(), "end".into());
+            m.insert("momentId".to_owned(), e.moment_id().into());
+            m.insert("at".to_owned(), e.at().into());
+            m.insert("cutShort".to_owned(), e.cut_short().into());
         }
     }
     Value::Object(m)
@@ -539,6 +586,92 @@ impl HttpControlPlane {
     fn bearer(&self) -> String {
         format!("Bearer {}", self.token)
     }
+
+    /// R4 task SC2: the uploader for web's frame endpoint (S9), sharing this plane's token and
+    /// scrubber (what a fetch learned is masked in its errors too) with an agent of its own, bounded by
+    /// `FRAME_UPLOAD_TIMEOUT_MS` and built as `agent` builds every agent here: an upload never waits on
+    /// a beat's connection, nor a beat on an upload's.
+    pub fn frame_upload(&self) -> HttpFrameUpload {
+        HttpFrameUpload {
+            agent: agent(FRAME_UPLOAD_TIMEOUT_MS),
+            session_url: self.session_url.clone(),
+            token: self.token.clone(),
+            scrubber: Arc::clone(&self.scrubber),
+        }
+    }
+}
+
+/// `text` as one URL path segment: every byte but RFC 3986's unreserved (`A-Z a-z 0-9 - . _ ~`)
+/// percent-encoded, upper-case hex, so `:` and `/` in a moment id (`12:sponsor.over_end`) cannot end
+/// the segment, and web reads the id back by decoding it (S9's `[momentId]`). The dot-segments are
+/// refused before this (`domain::frame_grab::is_path_segment`): no encoding keeps them in place, since
+/// a URL parser resolves `%2e` as `.` (WHATWG URL).
+pub fn path_segment(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for b in text.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// R4 task SC2: one POST of a frame to web's frame endpoint (task S9:
+/// `POST /api/internal/relay/sessions/{sid}/airings/{momentId}/frame`, the JPEG as the body,
+/// `Content-Type: image/jpeg`, the job token as the bearer, as the heartbeat sends it). A 2xx is
+/// stored (S9 answers 204), a 410 is the session gone, a 5xx or no answer failed, and any other status
+/// refused. S9's 4xx are a token it refuses, another session's included, 401 (the heartbeat's own); an
+/// unknown session 404; a moment id outside web's grammar 400; a body past its bound 413; and one that
+/// is not a JPEG 415. Every error text is scrubbed of what the plane knows (the token and the
+/// session's credentials).
+pub struct HttpFrameUpload {
+    agent: ureq::Agent,
+    session_url: String,
+    token: String,
+    scrubber: Arc<Mutex<Scrubber>>,
+}
+
+impl fmt::Debug for HttpFrameUpload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpFrameUpload")
+            .field("origin", &redacted_origin(&self.session_url))
+            .field("token", &"****")
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpFrameUpload {
+    /// Where `moment_id`'s frame goes.
+    pub fn frame_url(&self, moment_id: &str) -> String {
+        format!("{}/airings/{}/frame", self.session_url, path_segment(moment_id))
+    }
+
+    fn failed(&self, text: &str) -> FrameUploadError {
+        FrameUploadError::Failed(locked(&self.scrubber).scrub(text))
+    }
+}
+
+impl FrameUpload for HttpFrameUpload {
+    fn post_frame(&mut self, moment_id: &str, jpeg: &[u8]) -> Result<(), FrameUploadError> {
+        if !is_path_segment(moment_id) {
+            return Err(FrameUploadError::Unaddressable);
+        }
+        let sent = self
+            .agent
+            .post(&self.frame_url(moment_id))
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .set("Content-Type", "image/jpeg")
+            .send_bytes(jpeg);
+        let (code, _) = exchange(sent).map_err(|e| self.failed(&format!("frame transport: {e}")))?;
+        match code {
+            200..=299 => Ok(()),
+            410 => Err(FrameUploadError::Gone),
+            500..=599 => Err(self.failed(&format!("frame refused: status {code}"))),
+            other => Err(FrameUploadError::Refused(other)),
+        }
+    }
 }
 
 impl ControlPlane for HttpControlPlane {
@@ -582,7 +715,12 @@ impl ControlPlane for HttpControlPlane {
         Ok(session)
     }
 
-    fn heartbeat(&mut self, report: &HealthReport, measured: &Measured) -> Result<Reply, HeartbeatError> {
+    fn heartbeat_with(
+        &mut self,
+        report: &HealthReport,
+        measured: &Measured,
+        airings: &AiringBatch,
+    ) -> Result<Reply, HeartbeatError> {
         let mut req = self
             .agent
             .post(&self.heartbeat_url)
@@ -591,13 +729,15 @@ impl ControlPlane for HttpControlPlane {
             // The final beat: one attempt, never delaying `Exit` past its bound (Owed 28).
             req = req.timeout(Duration::from_millis(self.timeout_ms.min(FINAL_BEAT_TIMEOUT_MS)));
         }
-        let body = wire(report, measured, &locked(&self.scrubber));
+        let body = wire(report, measured, airings, &locked(&self.scrubber));
         let sent = req.send_json(body);
         let (code, body) =
             exchange(sent).map_err(|e| self.transport(&format!("heartbeat transport: {e}")))?;
         match code {
             200 => {}
             410 => return Err(HeartbeatError::Gone),
+            // Web refused the body: sent again, it is refused again (fix round 1, I2).
+            400 | 422 => return Err(HeartbeatError::Refused(code)),
             other => return Err(self.transport(&format!("heartbeat refused: status {other}"))),
         }
         let reply = match body_of(&body) {

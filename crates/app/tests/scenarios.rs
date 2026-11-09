@@ -1,11 +1,20 @@
 //! The driver (C08) folding the REAL `Supervisor` through fakes for every port, on a manual clock.
 //! Every duration comes from `Thresholds::default()` (or a named override), never from the driver.
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{mpsc, Arc, Mutex, PoisonError};
+use std::time::Duration;
 
+use app::airings::Airings;
 use app::driver::Driver;
-use app::ports::{ControlRequest, Inbound, Measured, MemorySplit, Metrics, ProcStatus, SessionConfig};
-use domain::config::{OutputProfile, Thresholds, OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS};
+use app::frame_grab::{spawn, FrameGrabs, FrameWorker, GrabRun};
+use app::ports::{
+    ControlRequest, FrameUploadError, Inbound, Measured, MemorySplit, Metrics, ProcStatus, SessionConfig,
+};
+use domain::airings::{AiringLine, AiringSource, AiringStyle};
+use domain::config::{
+    OutputProfile, Thresholds, FRAME_GRAB_DELAY_MS, FRAME_GRAB_MIN_GAP_MS, OUTPUT_PROGRESS_POLL_MS,
+    OUTPUT_SINK_TIMEOUT_MS,
+};
 use domain::health::{ExitDetail, GraphicsStatus, HealthReport, LinkStatus};
 use domain::input_link::{BuildFacts, LossReason};
 use domain::ladder::Rung;
@@ -13,7 +22,10 @@ use domain::lifecycle::ExitReason;
 use domain::output_link::Encoded;
 use domain::programme::{FrameChoice, ProgrammePhase, SlateKind};
 use domain::supervisor::{Desired, Event, HeartbeatRefusal, Refusal, SignalKind};
-use testkit::fakes::{ports, session_720p, Call, FakeControl, FakeGraphics, FakeProgramme, Log};
+use testkit::fakes::{
+    ports, session_720p, Call, FakeControl, FakeGraphics, FakeLog, FakeProgramme, FakeTap, Log,
+    ScriptedUpload, FAKE_FRAME_JPEG,
+};
 
 const FAR: u64 = 100_000_000;
 /// The scenario's session arrives here (the brief's `boot`); its tick 0 is due at this instant.
@@ -2788,4 +2800,257 @@ fn no_counter_in_any_reply_writes_no_phone_live_line() {
     eprintln!("builds {builds} by {r}");
     assert_eq!(builds, 3, "setup: two connect timeouts");
     assert_eq!(phone_lines(&sim.log), Vec::<String>::new());
+}
+
+// ---- R4 task SC2: the frame grab beside the running programme ----------------------------------------
+//
+// The driver folds the programme on the manual clock while the frame plan, cued by the real `Airings`
+// handle, runs on the same instants. `FRAME_GRAB_DELAY_MS` and `FRAME_GRAB_MIN_GAP_MS` are pinned to the
+// spec's §3.6.3 in `domain::config`.
+
+fn sponsor_start(moment: &str) -> AiringLine {
+    AiringLine::start(
+        moment.to_owned(),
+        "card-1".to_owned(),
+        AiringStyle::LowerThird,
+        AiringSource::Rotation,
+        Some("set_break".to_owned()),
+        "2026-10-31T12:00:00.000Z".to_owned(),
+    )
+    .expect("within web's bounds")
+}
+
+/// A sim, the airings and their frame plan on one manual clock, and a worker stepped in line.
+struct FrameSim {
+    sim: Sim,
+    airings: Airings,
+    worker: FrameWorker,
+    uploads: testkit::fakes::UploadLog,
+    clock: Arc<AtomicU64>,
+    /// (instant, run) for every `run_due` that ran a grab.
+    runs: Vec<(u64, GrabRun)>,
+}
+
+impl FrameSim {
+    fn new() -> FrameSim {
+        let clock = Arc::new(AtomicU64::new(SESSION_AT));
+        let read = Arc::clone(&clock);
+        let grabs = FrameGrabs::on(Arc::new(move || read.load(Ordering::SeqCst)));
+        let airings = Airings::on().with_frames(grabs.clone());
+        let (tap, _) = FakeTap::new();
+        let (upload, uploads) = ScriptedUpload::new();
+        let worker = FrameWorker::new(
+            grabs,
+            Box::new(tap),
+            Box::new(upload),
+            Box::new(FakeLog(Log::default())),
+        );
+        FrameSim {
+            sim: Sim::new(th(), session_720p()),
+            airings,
+            worker,
+            uploads,
+            clock,
+            runs: Vec::new(),
+        }
+    }
+
+    /// The programme driven to `until`, the worker stepped at every millisecond on the way (the live
+    /// worker wakes at the due instant itself).
+    fn drive(&mut self, until: u64) {
+        let from = self.sim.now;
+        for at in from..until {
+            self.clock.store(at, Ordering::SeqCst);
+            if let Some(run) = self.worker.run_due(at) {
+                self.runs.push((at, run));
+            }
+            if self.sim.d.next_tick_at() <= at {
+                self.sim.tick(at);
+            }
+        }
+    }
+
+    fn push(&mut self, at: u64, line: AiringLine) {
+        self.drive(at);
+        self.clock.store(at, Ordering::SeqCst);
+        assert!(self.airings.push(line), "held");
+    }
+
+    fn posted(&self) -> Vec<(u64, String)> {
+        self.runs
+            .iter()
+            .filter_map(|(at, r)| match r {
+                GrabRun::Posted { moment_id, .. } => Some((*at, moment_id.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Every programme index from 0 up, once each, in order: the programme kept making frames.
+fn contiguous_pushes(log: &Log) -> usize {
+    let idx: Vec<u64> = pushes(log).iter().map(|p| p.0).collect();
+    let want: Vec<u64> = (0..idx.len() as u64).collect();
+    assert_eq!(idx, want, "a programme index missed or repeated");
+    idx.len()
+}
+
+/// The start line held at `t0`: one frame grabbed at `t0 + 1500` exactly, posted under its moment id,
+/// and nothing more in the next minute, while the programme's every tick keeps pushing.
+#[test]
+fn a_start_line_grabs_one_frame_after_1500_ms() {
+    let mut f = FrameSim::new();
+    let t0 = 2_000;
+    f.push(t0, sponsor_start("12:sponsor.over_end"));
+    f.drive(t0 + FRAME_GRAB_DELAY_MS);
+    assert_eq!(f.runs, vec![], "nothing before its instant");
+    f.drive(t0 + 60_000);
+    assert_eq!(f.posted(), vec![(t0 + 1_500, "12:sponsor.over_end".to_owned())]);
+    assert_eq!(f.runs.len(), 1);
+    let calls = f.uploads.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].jpeg, FAKE_FRAME_JPEG);
+    let frames = contiguous_pushes(&f.sim.log);
+    let fps = u64::from(OutputProfile::P720.fps);
+    eprintln!("programme frames over the run: {frames}");
+    assert!(
+        frames as u64 >= (t0 + 60_000 - SESSION_AT) * fps / 1_000 - 1,
+        "{frames}"
+    );
+}
+
+/// After a grab at `g`, a second start whose grab would land 1 ms inside the 20 s gap grabs nothing,
+/// ever; a third whose grab lands on the gap's edge is grabbed there. Starts of other moments, all of
+/// them: the gap is across all airings.
+#[test]
+fn a_second_start_inside_20_s_grabs_nothing() {
+    let mut f = FrameSim::new();
+    let t0 = 1_000;
+    f.push(t0, sponsor_start("a"));
+    let g = t0 + FRAME_GRAB_DELAY_MS;
+    let inside = g + FRAME_GRAB_MIN_GAP_MS - FRAME_GRAB_DELAY_MS - 1;
+    f.push(g + 100, sponsor_start("b"));
+    f.push(inside, sponsor_start("c"));
+    f.push(inside + 1, sponsor_start("d"));
+    f.drive(inside + 1 + 2 * FRAME_GRAB_MIN_GAP_MS);
+    assert_eq!(
+        f.posted(),
+        vec![(g, "a".to_owned()), (g + FRAME_GRAB_MIN_GAP_MS, "d".to_owned())],
+        "b and c fell inside the gap"
+    );
+    assert_eq!(f.uploads.moments(), vec!["a".to_owned(), "d".to_owned()]);
+    contiguous_pushes(&f.sim.log);
+}
+
+/// The live worker's thread, its upload hung and then failing (5xx) on both attempts, for two airings:
+/// the airings handle takes lines and gives beats while the upload hangs, and the failure is one line
+/// for the process.
+///
+/// The witness that nothing waits on the upload is `prompt`. The airings handle takes the plan's lock
+/// on every push, so a lock held across the upload makes it miss its 2 s bound on another thread. The
+/// frame count while the upload hangs (`made >= 299`) is NOT a witness (the final review's SC2 m4):
+/// the sim's ticks run on this thread and never reach the plan or the worker, so they pass whatever
+/// the worker does. It is kept to show the programme keeps its cadence beside a hung upload.
+#[test]
+fn a_failing_upload_logs_once_and_never_stalls_the_pipeline() {
+    let mut sim = Sim::new(th(), session_720p());
+    let clock = Arc::new(AtomicU64::new(SESSION_AT));
+    let read = Arc::clone(&clock);
+    let grabs = FrameGrabs::on(Arc::new(move || read.load(Ordering::SeqCst)));
+    let airings = Airings::on().with_frames(grabs.clone());
+    let (release, released) = mpsc::channel::<()>();
+    let (tap, _) = FakeTap::new();
+    let (upload, uploads) = ScriptedUpload::new();
+    let upload = upload.answer(move |_| {
+        released.recv().expect("the test holds the sender");
+        Err(FrameUploadError::Failed("frame refused: status 503".to_owned()))
+    });
+    let worker_log = Log::default();
+    let worker = FrameWorker::new(
+        grabs.clone(),
+        Box::new(tap),
+        Box::new(upload),
+        Box::new(FakeLog(worker_log.clone())),
+    );
+    let handle = spawn(worker).expect("spawn");
+
+    // The airings handle answers within a bound, from another thread: a lock held across the upload
+    // fails here rather than hanging the test.
+    let prompt = |airings: &Airings, line: Option<AiringLine>| {
+        let a = airings.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Some(line) = line {
+                a.push(line);
+            }
+            let batch = a.for_beat();
+            a.ack_2xx(&batch);
+            tx.send(()).ok();
+        });
+        rx.recv_timeout(Duration::from_secs(2)).is_ok()
+    };
+    let drive = |sim: &mut Sim, until: u64| {
+        while sim.d.next_tick_at() < until {
+            let at = sim.d.next_tick_at();
+            clock.store(at, Ordering::SeqCst);
+            sim.tick(at);
+        }
+        clock.store(until, Ordering::SeqCst);
+    };
+
+    let mut checked = 0;
+    for (k, moment) in ["a", "b"].into_iter().enumerate() {
+        let t0 = 1_000 + k as u64 * 2 * FRAME_GRAB_MIN_GAP_MS;
+        drive(&mut sim, t0);
+        assert!(prompt(&airings, Some(sponsor_start(moment))), "{moment}: push");
+        drive(&mut sim, t0 + FRAME_GRAB_DELAY_MS);
+        let wake = AiringLine::end("other".to_owned(), "2026-10-31T12:00:01.000Z".to_owned(), false)
+            .expect("bounds");
+        assert!(
+            prompt(&airings, Some(wake)),
+            "{moment}: a line, which wakes the worker"
+        );
+        for attempt in 1..=2 {
+            assert!(
+                uploads.wait_for(2 * k + attempt, Duration::from_secs(3)),
+                "{moment}: attempt {attempt}"
+            );
+            // The upload hangs: ten seconds of programme (cadence only, not the witness: see the doc
+            // above), and the handle carries on.
+            let before = pushes(&sim.log).len();
+            let from = sim.now;
+            drive(&mut sim, from + 10_000);
+            let made = pushes(&sim.log).len() - before;
+            assert!(
+                made >= 299,
+                "{moment}: {made} frames in 10 s while the upload hung"
+            );
+            let other = AiringLine::end("other".to_owned(), "2026-10-31T12:00:02.000Z".to_owned(), false)
+                .expect("bounds");
+            assert!(
+                prompt(&airings, Some(other)),
+                "{moment}: the handle waited on the upload"
+            );
+            release.send(()).expect("the worker waits");
+            checked += 1;
+        }
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while worker_log.lines().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(uploads.moments(), vec!["a", "a", "b", "b"]);
+    let lines = worker_log.lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("sponsor frame upload failed (frame refused: status 503) after 2 attempt(s)"),
+        "{lines:?}"
+    );
+    eprintln!(
+        "hung attempts checked: {checked}; programme frames {}",
+        contiguous_pushes(&sim.log)
+    );
+    assert_eq!(checked, 4);
+    drop(handle);
 }

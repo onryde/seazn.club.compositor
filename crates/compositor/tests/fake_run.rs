@@ -15,6 +15,7 @@ use adapters::control_http::parse_session;
 use adapters::phase_http::{origin_of, RELAY_PHASE_LONG_POLL_MAX_MS, RELAY_PHASE_PATH, RELAY_PHASE_PORT};
 use compositor::env;
 use compositor::logged::rfc3339_ms;
+use compositor::wiring::FAKE_SPONSOR_MOMENT;
 use domain::config::Thresholds;
 use serde_json::{json, Value};
 use testkit::fakes::session_720p;
@@ -191,10 +192,19 @@ struct Post {
 /// Each POST's answer: (delay before it, status, body).
 type Script = Arc<dyn Fn(usize, &Value) -> (Duration, u16, String) + Send + Sync>;
 
+/// R4 task SC2: one POST to the frame endpoint (S9), as it arrived.
+#[derive(Debug, Clone)]
+struct FramePost {
+    path: String,
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
+
 struct FakeControl {
     url: String,
     posts: Arc<Mutex<Vec<Post>>>,
     fetches: Arc<Mutex<usize>>,
+    frames: Arc<Mutex<Vec<FramePost>>>,
     server: Arc<tiny_http::Server>,
 }
 
@@ -222,12 +232,19 @@ impl FakeControl {
         let url = format!("http://{}", server.server_addr().to_ip().unwrap());
         let posts: Arc<Mutex<Vec<Post>>> = Arc::default();
         let fetches: Arc<Mutex<usize>> = Arc::default();
-        let (srv, p, f) = (Arc::clone(&server), Arc::clone(&posts), Arc::clone(&fetches));
+        let frames: Arc<Mutex<Vec<FramePost>>> = Arc::default();
+        let (srv, p, f, fr) = (
+            Arc::clone(&server),
+            Arc::clone(&posts),
+            Arc::clone(&fetches),
+            Arc::clone(&frames),
+        );
         thread::spawn(move || {
             for mut req in srv.incoming_requests() {
-                let (p, f, session, script) = (
+                let (p, f, fr, session, script) = (
                     Arc::clone(&p),
                     Arc::clone(&f),
+                    Arc::clone(&fr),
                     session.clone(),
                     Arc::clone(&script),
                 );
@@ -275,6 +292,25 @@ impl FakeControl {
                         p.lock().unwrap()[i].answered = Instant::now();
                         return;
                     }
+                    // S9's frame endpoint: `{base}/airings/{momentId}/frame`, answered 204.
+                    let frame_path = path
+                        .strip_prefix(&format!("{base}/airings/"))
+                        .is_some_and(|rest| rest.ends_with("/frame") && rest.matches('/').count() == 1);
+                    if *req.method() == tiny_http::Method::Post && frame_path {
+                        let mut body = Vec::new();
+                        let _ = req.as_reader().read_to_end(&mut body);
+                        let content_type = req
+                            .headers()
+                            .iter()
+                            .find(|h| h.field.equiv("Content-Type"))
+                            .map(|h| h.value.as_str().to_owned());
+                        fr.lock().unwrap().push(FramePost {
+                            path: path.clone(),
+                            content_type,
+                            body,
+                        });
+                        return respond(req, 204, String::new());
+                    }
                     respond(req, 404, refused("NOT_FOUND"))
                 });
             }
@@ -283,6 +319,7 @@ impl FakeControl {
             url,
             posts,
             fetches,
+            frames,
             server,
         }
     }
@@ -655,6 +692,121 @@ fn a_410_on_a_beat_exits_zero_within_a_second_and_posts_nothing_after() {
         posts.iter().all(|p| p.at <= first.answered),
         "a POST after the 410"
     );
+}
+
+/// SC1 fix round 1, I3: the binary's own wiring carries sponsor airings. `COMPOSITOR_FAKE_SPONSOR_LINE`
+/// holds one line in the handle the media were given; with `RELAY_AIRINGS=1` a POST to the real HTTP
+/// plane carries it, so the worker posts from that same handle (not `spawn`'s off one, nor a second
+/// buffer). Without the key, no POST carries either airings key; with it and no knob, none either
+/// (nothing is held that no page logged).
+fn sponsor_run(airings: bool, knob: bool) -> (Vec<Post>, String) {
+    let (posts, _, e) = sponsor_frame_run(airings, knob);
+    (posts, e)
+}
+
+/// `sponsor_run`, with the frames the fake's S9 endpoint was sent.
+fn sponsor_frame_run(airings: bool, knob: bool) -> (Vec<Post>, Vec<FramePost>, String) {
+    let fc = FakeControl::serve(fixture("session-composed-720p.json"), Arc::new(|_, _| live()));
+    let mut vars = fc.env(deadline_in(3_000));
+    if knob {
+        vars.push((env::COMPOSITOR_FAKE_SPONSOR_LINE, "1".to_owned()));
+    }
+    if airings {
+        vars.push((env::RELAY_AIRINGS, "1".to_owned()));
+    }
+    let mut run = Run::spawn(&vars);
+    let (code, _) = run.wait_exit(Duration::from_secs(30));
+    assert_eq!(code, Some(0), "{}", run.stderr());
+    assert_no_secret(&run);
+    let frames = fc.frames.lock().unwrap().clone();
+    (fc.posts(), frames, run.stderr())
+}
+
+/// R4 task SC2, the seam in the binary's own wiring: with `RELAY_AIRINGS=1` the fake sponsor line held
+/// for the beat plans a grab, the worker the binary spawned takes the fake tap's frame 1.5 s later, and
+/// the REAL uploader (`HttpControlPlane::frame_upload`) posts it once to S9's path, the moment id
+/// percent-encoded as one segment, as `image/jpeg`, under the session's bearer (the fake answers 401
+/// to any other). The path is written out by hand from S9's route.
+#[test]
+fn with_relay_airings_the_sponsor_line_posts_one_frame() {
+    let _s = serial();
+    let (_, frames, e) = sponsor_frame_run(true, true);
+    assert!(e.contains("msg=sponsor frames: on"), "{e}");
+    assert_eq!(frames.len(), 1, "{frames:?}\n{e}");
+    let f = &frames[0];
+    assert_eq!(
+        f.path,
+        format!("/api/internal/relay/sessions/{SID}/airings/1%3Asponsor.set_break/frame")
+    );
+    assert_eq!(f.content_type.as_deref(), Some("image/jpeg"));
+    assert_eq!(f.body, testkit::fakes::FAKE_FRAME_JPEG);
+    let posted = format!(
+        "msg=sponsor frame posted moment={FAKE_SPONSOR_MOMENT} bytes={} attempts=1",
+        testkit::fakes::FAKE_FRAME_JPEG.len()
+    );
+    assert_eq!(e.matches(&posted).count(), 1, "{e}");
+}
+
+/// The gate off, and on with no line: no frame is posted, and the start says the frames are off when
+/// the airings are.
+#[test]
+fn without_relay_airings_or_a_line_no_frame_is_posted() {
+    let _s = serial();
+    let mut checked = 0;
+    for (airings, knob, said) in [(false, true, "off"), (true, false, "on")] {
+        let (posts, frames, e) = sponsor_frame_run(airings, knob);
+        assert!(e.contains(&format!("msg=sponsor frames: {said}")), "{e}");
+        assert!(posts.len() >= 2, "the run beat: {posts:?}");
+        assert_eq!(frames.len(), 0, "{airings} {knob}: {frames:?}");
+        assert!(!e.contains("sponsor frame posted"), "{e}");
+        checked += 1;
+    }
+    assert_eq!(checked, 2);
+}
+
+#[test]
+fn with_relay_airings_a_posted_beat_carries_the_sponsor_line() {
+    let _s = serial();
+    let (posts, e) = sponsor_run(true, true);
+    assert!(e.contains("msg=sponsor airings on the heartbeat: on"), "{e}");
+    let carrying: Vec<&Post> = posts.iter().filter(|p| p.body.get("airings").is_some()).collect();
+    assert!(!carrying.is_empty(), "no POST carried the line: {posts:?}");
+    for p in &carrying {
+        let items = p.body["airings"].as_array().expect("an array");
+        assert_eq!(items.len(), 1, "{}", p.body);
+        assert_eq!(items[0]["kind"], "start", "{}", p.body);
+        assert_eq!(items[0]["momentId"], FAKE_SPONSOR_MOMENT, "{}", p.body);
+        assert_eq!(p.body["airingsDropped"], 0, "{}", p.body);
+    }
+    // The first 2xx cleared it: the final beat, posted last, carries none.
+    let last = posts.last().expect("a final beat");
+    assert_eq!(last.body["state"], "stopped", "{}", last.body);
+    assert!(last.body.get("airings").is_none(), "{}", last.body);
+    eprintln!("posts: {}, carrying the line: {}", posts.len(), carrying.len());
+}
+
+#[test]
+fn without_relay_airings_or_a_line_no_posted_beat_carries_either_key() {
+    let _s = serial();
+    let mut checked = 0;
+    for (airings, knob, said) in [(false, true, "off"), (true, false, "on")] {
+        let (posts, e) = sponsor_run(airings, knob);
+        assert!(
+            e.contains(&format!("msg=sponsor airings on the heartbeat: {said}")),
+            "{e}"
+        );
+        assert!(posts.len() >= 2, "a periodic and a final beat: {posts:?}");
+        for p in &posts {
+            assert!(
+                p.body.get("airings").is_none() && p.body.get("airingsDropped").is_none(),
+                "{}",
+                p.body
+            );
+            checked += 1;
+        }
+    }
+    eprintln!("posts without airings: {checked}");
+    assert!(checked >= 4);
 }
 
 /// C11b: a dead CEF zygote restarts the process in place: exit 75, the last POST the vendored

@@ -19,5 +19,6 @@
   "sinkSwaps": 1,
   "rung": "overlay_half_rate",
   "scoreStale": true,
-  "phaseChannel": "web"
+  "phaseChannel": "web",
+  "airingsDropped": 3
 }
