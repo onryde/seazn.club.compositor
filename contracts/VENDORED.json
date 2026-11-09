@@ -1,6 +1,6 @@
 {
   "source": "onryde/seazn.club",
-  "commit": "fef4751fafffadd6856fe588277c7434d4560670",
+  "commit": "61a8cdd935ad2d9ff04b908e1ededff62ed04931",
   "files": {
     "fixtures/relay-job.v1/README.md": "d0921fe5493060f53980b3d417f4cbd9cae2cb1bf3e0ea984832f2a8a4567a41",
     "fixtures/relay-job.v1/heartbeat-airings.json": "b080150b1fb565c0366ae19af032b57c1e151c32686226e4f34834d65d60b82f",
